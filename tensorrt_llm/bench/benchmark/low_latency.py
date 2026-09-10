@@ -19,7 +19,6 @@ from functools import partial
 from pathlib import Path
 
 import click
-import yaml
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
@@ -129,6 +128,15 @@ from tensorrt_llm.sampling_params import SamplingParams
     "length of dataset.",
 )
 @optgroup.option(
+    "--duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requests dropped at the deadline are excluded from the report, so the statistics cover the requests that "
+    "completed rather than the whole dataset.",
+)
+@optgroup.option(
     "--warmup",
     type=int,
     default=2,
@@ -175,18 +183,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
-@optgroup.group("Speculative Decode Options",
-                help="Runtime settings for executing a TensorRT LLM engine.")
-@optgroup.option(
-    "--medusa_choices",
-    type=click.Path(exists=True,
-                    readable=True,
-                    path_type=Path,
-                    resolve_path=True),
-    default=None,
-    required=False,
-    help="Path to a YAML file that defines the Medusa tree.",
-)
 @optgroup.group("Reporting Options",
                 help="Options for reporting benchmark results.",
                 cls=OptionGroup)
@@ -221,9 +217,15 @@ def latency_command(
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
 
-    # Speculative Decode Options
-    medusa_choices = params.get("medusa_choices")
     custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
     tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
@@ -300,12 +302,6 @@ def latency_command(
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
-    # Decoding Options
-    if medusa_choices is not None:
-        with open(medusa_choices, "r") as medusa_yml:
-            exec_settings["decoding_config"]["medusa_choices"] = \
-                yaml.load(medusa_yml, Loader=yaml.SafeLoader)
-
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
 
@@ -335,6 +331,7 @@ def latency_command(
         logger.info("Setting up latency benchmark.")
 
         llm = get_llm(runtime_config, kwargs)
+        startup_metrics = llm.startup_metrics
 
         ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
@@ -382,7 +379,8 @@ def latency_command(
                                 True,
                                 options.concurrency,
                                 iteration_writer.full_address,
-                                modality=options.modality))
+                                modality=options.modality,
+                                duration=options.duration))
 
         logger.info("Benchmark done. Reporting results...")
 
@@ -390,8 +388,13 @@ def latency_command(
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
-        report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, True)
+        report_utility = ReportUtility(statistics,
+                                       metadata,
+                                       runtime_config,
+                                       logger,
+                                       kwargs,
+                                       True,
+                                       startup_metrics=startup_metrics)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

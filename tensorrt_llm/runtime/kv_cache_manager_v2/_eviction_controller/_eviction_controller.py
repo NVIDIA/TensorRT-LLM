@@ -198,6 +198,8 @@ class PerLevelEvictionController:  # for one cache level
         ret = make_typed(lambda _: list[EvictablePage](), self.num_pool_groups)
         try:
             for pg_idx, count in typed_enumerate(min_num_pages):
+                if count < 0:
+                    raise ValueError("Eviction count must be non-negative")
                 policy = self._policies[pg_idx]
                 if (len(policy) + len(ret[pg_idx])) < count:
                     raise OutOfPagesError(f"Not enough pages to evict in group {pg_idx}")

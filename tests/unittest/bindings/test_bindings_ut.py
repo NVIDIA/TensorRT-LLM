@@ -1,14 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import pickle
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
+import tensorrt_llm.bindings.executor as _tbe
 from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.mapping import Mapping
 
@@ -195,22 +201,22 @@ def test_sampling_config():
         setattr(sampling_config, member, value)
         assert getattr(sampling_config, member) == value
 
-    float_array = [1., 2., 3.]
-    size_t_array = [1, 2, 3]
-    check_empty_then_set("temperature", float_array)
-    check_empty_then_set("min_length", size_t_array)
-    check_empty_then_set("repetition_penalty", float_array)
-    check_empty_then_set("presence_penalty", float_array)
-    check_empty_then_set("frequency_penalty", float_array)
-    check_empty_then_set("top_k", size_t_array)
-    check_empty_then_set("top_p", float_array)
-    check_empty_then_set("random_seed", size_t_array)
-    check_empty_then_set("top_p_decay", float_array)
-    check_empty_then_set("top_p_min", float_array)
-    check_empty_then_set("top_p_reset_ids", size_t_array)
-    check_empty_then_set("beam_search_diversity_rate", float_array)
-    check_empty_then_set("length_penalty", float_array)
-    check_empty_then_set("early_stopping", size_t_array)
+    # Fields are scalars on executor::SamplingConfig, not the one-element
+    # columns the removed runtime type used.
+    check_empty_then_set("temperature", 1.)
+    check_empty_then_set("min_tokens", 1)
+    check_empty_then_set("repetition_penalty", 1.)
+    check_empty_then_set("presence_penalty", 1.)
+    check_empty_then_set("frequency_penalty", 1.)
+    check_empty_then_set("top_k", 1)
+    check_empty_then_set("top_p", 1.)
+    check_empty_then_set("seed", 1)
+    check_empty_then_set("top_p_decay", 1.)
+    check_empty_then_set("top_p_min", 1.)
+    check_empty_then_set("top_p_reset_ids", 1)
+    check_empty_then_set("beam_search_diversity_rate", 1.)
+    check_empty_then_set("length_penalty", 1.)
+    check_empty_then_set("early_stopping", 1)
 
 
 def test_gpt_json_config():
@@ -337,9 +343,6 @@ def test_llm_request():
         "end_id": 100,
         "prompt_embedding_table": torch.tensor((10, 10)),
         "prompt_vocab_size": 2,
-        "embedding_bias": torch.tensor((10, 10)),
-        "stop_words_list": torch.tensor((10, 10)),
-        "bad_words_list": torch.tensor((10, 10)),
         "return_log_probs": True,
         "return_context_logits": False,
         "return_generation_logits": False
@@ -356,9 +359,6 @@ def test_llm_request():
     assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
-    assert torch.equal(llm_request.embedding_bias, kwargs["embedding_bias"])
-    assert torch.equal(llm_request.stop_words_list, kwargs["stop_words_list"])
-    assert torch.equal(llm_request.bad_words_list, kwargs["bad_words_list"])
 
     assert llm_request.get_num_tokens(0) == 3
     assert llm_request.max_beam_num_tokens == 3
@@ -416,6 +416,78 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
+def test_generation_only_llm_request_adopts_draft_tokens() -> None:
+    request_id = 42
+    first_gen_tokens = [100]
+    draft_tokens = [101, 102, 103]
+    llm_request_type = _tb.internal.batch_manager.LlmRequestType
+    context_phase_params = _tb.executor.ContextPhaseParams(
+        first_gen_tokens,
+        request_id,
+        None,
+        draft_tokens,
+        None,
+        None,
+    )
+
+    llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=context_phase_params,
+    )
+
+    assert llm_request.is_generation_only_request
+    assert llm_request.has_draft_tokens()
+    assert llm_request.num_draft_tokens == len(draft_tokens)
+    assert llm_request.draft_tokens == draft_tokens
+    assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+    late_llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+
+    assert late_llm_request.draft_tokens is None
+    assert late_llm_request.num_draft_tokens == 0
+
+    late_llm_request.context_phase_params = context_phase_params
+
+    assert late_llm_request.has_draft_tokens()
+    assert late_llm_request.num_draft_tokens == len(draft_tokens)
+    assert late_llm_request.draft_tokens == draft_tokens
+
+
+@pytest.mark.cpu_only
+def test_llm_request_kv_cache_transfer_metric_bindings():
+    request = _tb.internal.batch_manager.LlmRequest(
+        request_id=0,
+        max_new_tokens=5,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[0, 1, 2],
+        is_streaming=True,
+    )
+    offset = _tb.internal.batch_manager.LlmRequest.global_steady_clock_offset
+    offset = offset if offset is not None else timedelta()
+    start = timedelta(seconds=1.25)
+    end = timedelta(seconds=2.5)
+
+    request.set_kv_cache_transfer_start(start)
+    request.set_kv_cache_transfer_end(end)
+    request.set_kv_cache_size(128)
+
+    assert request.kv_cache_transfer_start == start + offset
+    assert request.kv_cache_transfer_end == end + offset
+    assert request.kv_cache_size == 128
+
+
 def test_Mpicomm():
     size1 = _tb.MpiComm.size()
     rank1 = _tb.MpiComm.rank()
@@ -432,31 +504,40 @@ def test_Mpicomm():
     assert size2 == session_size
 
 
-def test_SamplingConfig_pickle():
-    config = _tb.SamplingConfig()
-    config.beam_width = 5
-    config.num_return_sequences = 1
-    config.top_k = [1, 2]
-    config.top_p = [0.1, 0.2]
-    config.top_p_min = [1.0, 2.0]
-    config.top_p_reset_ids = [1, 2]
-    config.top_p_decay = [1.0, 2.0]
-    config.random_seed = [1, 2]
-    config.temperature = [1.0, 2.0]
-    config.min_length = [32, 64]
-    config.beam_search_diversity_rate = [1.0, 2.0]
-    config.repetition_penalty = [1.0, 2.0]
-    config.presence_penalty = [1.0, 2.0]
-    config.frequency_penalty = [1.0, 2.0]
-    config.length_penalty = [1.0, 2.0]
-    config.early_stopping = [1, 2]
-    config.no_repeat_ngram_size = [4, 6]
-    config.num_return_sequences = 1
-    config.min_p = [0.5, 0.5]
-    config.beam_width_array = [[2, 3, 4, 5]]
+@pytest.mark.cpu_only
+def test_SamplingConfig_is_executor_alias():
+    # `tensorrt_llm.bindings.SamplingConfig` used to be a distinct runtime type whose
+    # fields were one-element lists. It is now an alias of the executor type, which
+    # spells `min_tokens`/`seed` and stores scalars. Pin that contract so the rename
+    # cannot regress silently.
+    assert _tb.SamplingConfig is _tbe.SamplingConfig
 
-    config1 = pickle.loads(pickle.dumps(config))
-    assert config1 == config
+    config = _tb.SamplingConfig(beam_width=2)
+    assert config.beam_width == 2
+
+    config.temperature = 0.5  # exactly representable as a C++ float
+    config.top_k = 3
+    assert config.temperature == 0.5
+    assert config.top_k == 3
+
+    assert not hasattr(config, "min_length")
+    assert not hasattr(config, "random_seed")
+    config.min_tokens = 4
+    config.seed = 7
+    assert config.min_tokens == 4
+    assert config.seed == 7
+
+    # LlmRequest construction goes through this copy constructor, which is registered
+    # after the keyword constructor whose first parameter is an int.
+    copied = _tb.SamplingConfig(config)
+    assert copied.beam_width == 2
+    assert copied.temperature == 0.5
+
+    unpickled = pickle.loads(pickle.dumps(config))
+    assert unpickled.beam_width == 2
+    assert unpickled.temperature == 0.5
+    assert unpickled.min_tokens == 4
+    assert unpickled.seed == 7
 
 
 def test_KvCache_events_binding():

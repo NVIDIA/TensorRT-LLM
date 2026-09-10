@@ -20,7 +20,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <ostream>
 #include <sstream>
@@ -36,7 +36,7 @@ namespace tensorrt_llm::runtime
 class LoraCachePageManagerConfig
 {
 public:
-    explicit constexpr LoraCachePageManagerConfig(runtime::MemoryType memType, nvinfer1::DataType dType,
+    explicit constexpr LoraCachePageManagerConfig(runtime::MemoryType memType, tensorrt_llm::DataType dType,
         SizeType32 totalNumPages, SizeType32 maxPagesPerBlock, SizeType32 slotsPerPage, SizeType32 pageWidth,
         SizeType32 numCopyStreams)
         : mMemoryType(memType)
@@ -59,12 +59,12 @@ public:
         mMemoryType = memoryType;
     }
 
-    [[nodiscard]] nvinfer1::DataType constexpr getDataType() const noexcept
+    [[nodiscard]] tensorrt_llm::DataType constexpr getDataType() const noexcept
     {
         return mDataType;
     }
 
-    void constexpr setDataType(nvinfer1::DataType const& dtype) noexcept
+    void constexpr setDataType(tensorrt_llm::DataType const& dtype) noexcept
     {
         mDataType = dtype;
     }
@@ -131,7 +131,7 @@ public:
 
 private:
     runtime::MemoryType mMemoryType;
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
 
     /*
      * Number cache pages in the cache.
@@ -154,7 +154,7 @@ inline std::ostream& operator<<(std::ostream& os, LoraCachePageManagerConfig con
 {
     os << "{"
        << "memoryType=" << static_cast<typename std::underlying_type<runtime::MemoryType>::type>(c.getMemoryType())
-       << " dataType=" << static_cast<typename std::underlying_type<nvinfer1::DataType>::type>(c.getDataType())
+       << " dataType=" << static_cast<typename std::underlying_type<tensorrt_llm::DataType>::type>(c.getDataType())
        << " totalNumPages=" << c.getTotalNumPages() << " maxPagesPerBlock=" << c.getMaxPagesPerBlock()
        << " slotsPerPage=" << c.getSlotsPerPage() << " pageWidth=" << c.getPageWidth()
        << " initToZero=" << c.getInitToZero() << "}";

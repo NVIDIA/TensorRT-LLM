@@ -163,8 +163,7 @@ struct BatchedGemmData
         // This is used for either:
         //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is
         //   Dtype::Float32
-        //   * When the routing scales are applied to the input activations (only when output is not
-        //   transposed). The dtype is Dtype::Bfloat16
+        //   * One-sided per-token scaling. The dtype is Dtype::Bfloat16 by default.
         //
         // if (batchM (A is activations)):
         //     Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B)]
@@ -243,8 +242,7 @@ struct BatchedGemmData
         // This is used for either:
         //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is
         //   Dtype::Float32
-        //   * When the routing scales are applied to the input activations (only when output is
-        //   transposed). The dtype is Dtype::Bfloat16
+        //   * One-sided per-token scaling. The dtype is Dtype::Bfloat16 by default.
         //
         // if (batchM (B is weights)):
         //     Logical shape is [B, divUpMul(N, tileN)]
@@ -478,6 +476,35 @@ struct BatchedGemmData
         // [divUp(numTokens + numBatches * (tileM/N - 1), tileM/N)]
         int32_t const* mPtrCtaIdxXyToMnLimit;
 
+        // Map from permuted token index to expanded token index.
+        // Used for MoE finalize direct-store path when mUseCMultiCast is enabled.
+        // The dtype is int32_t. Set to nullptr when not using CMulticast.
+        int32_t const* mPtrPermutedIdxToExpandedIdx{nullptr};
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        //
+        // Multicast barrier parameters
+        //
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+
+        // When mUseCMultiCast is set, we require a barrier in global memory on each
+        // GPU to track completion of the multicast stores.
+        //
+        // The value of the barrier must be set to zero before the kernel is executed on any GPU.
+        // The barrier is self-resetting. It does not have to be reset by another kernel.
+        // When mUseCMultiCast is false, a nullptr may be passed.
+        uint32_t* mPtrMulticastCompletionBarUc;
+        uint32_t* mPtrMulticastCompletionBarMc;
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        //
+        // MoE finalize parameters for direct register-to-gmem store
+        //
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+
+        // Pointer to expert weights for MoE finalize.
+        // The dtype depends on the use case.
+        void const* mPtrExpertWeightsPtr{nullptr};
         // Global counter for SW-emulated dynamic tile scheduling. When dynamic scheduling is enabled,
         // must be initialized to gridDim.x * gridDim.y (gridDim.z is reserved for K-dim in CGA splitK)
         // before each kernel launch.
@@ -558,8 +585,9 @@ public:
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    BatchedGemmInterface(bool const exportsCubin = false, int32_t const numRotations = 1)
-        : mExportsCubin(exportsCubin)
+    BatchedGemmInterface(int32_t rankId = 0, bool const exportsCubin = false, int32_t const numRotations = 1)
+        : mRankId(rankId)
+        , mExportsCubin(exportsCubin)
         , mNumRotations(numRotations)
     {
     }
@@ -655,7 +683,12 @@ public:
             batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrClampLimit,
             batchedGemmData.mInputBuffers.mPtrGatedActAlpha, batchedGemmData.mInputBuffers.mPtrGatedActBeta,
             batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
-            batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
+            batchedGemmData.mProblemDimensions.mRank, batchedGemmData.mProblemDimensions.mWorldSize,
+            batchedGemmData.mInputBuffers.mPtrMulticastCompletionBarUc,
+            batchedGemmData.mInputBuffers.mPtrMulticastCompletionBarMc,
+            batchedGemmData.mInputBuffers.mPtrPermutedIdxToExpandedIdx,
+            batchedGemmData.mInputBuffers.mPtrExpertWeightsPtr, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+            batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
             batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
             numCtaBatch, batchedGemmData.mInputBuffers.mPtrDynamicTileCounter);
 
@@ -926,6 +959,7 @@ public:
 
         // Check options without modifications.
         return checkAndUpdateBatchedGemmOptions(options, config.mSm,
+            /* worldSize */ 1,
             /* updateOptions */ false);
     }
 
@@ -1013,6 +1047,8 @@ private:
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
 private:
+    // The rank id of the current device in the multi-gpu space.
+    int32_t mRankId;
     // Whether to export the cubin file.
     bool mExportsCubin;
     // The number of rotations.

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,23 +17,35 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
-#include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::batch_manager
 {
 
+// Single, process-global storage for the steady-clock offset. Keeping it in this
+// translation unit (rather than as an inline-static member reachable from every
+// shared object) guarantees that libtensorrt_llm.so and the nanobind extension
+// module observe the same value once either side calibrates it.
+std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset()
+{
+    static std::optional<std::chrono::steady_clock::duration> offset{std::nullopt};
+    return offset;
+}
+
 template <typename TTensor, typename TStream>
 runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
 {
-    runtime::SizeType32 beamWidth = mSamplingConfig.beamWidth; // For non-Variable-Beam-Width-Search
-    auto const& beamWidthArray = mSamplingConfig.beamWidthArray;
-    if (beamWidthArray.has_value())
+    runtime::SizeType32 beamWidth = mSamplingConfig.getBeamWidth(); // For non-Variable-Beam-Width-Search
+    auto const beamWidthArray = mSamplingConfig.getBeamWidthArray();
+    if (beamWidthArray.has_value() && !beamWidthArray.value().empty())
     {
+        auto const& requestBeamWidthArray = beamWidthArray.value();
         auto const iter = mDecodingIter + (forNextIteration ? 1 : 0);
-        // Clamped `decodingIter` into [0,kMaxBeamWidthArrayLength-1] as index
-        int const index
-            = std::max(std::min(iter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1, 0);
-        beamWidth = beamWidthArray.value()[0][index];
+        // Clamp `decodingIter` with the actual array length, so that decoding
+        // longer than the array holds the last width instead of reading past
+        // the end. kMaxBeamWidthArrayLength is only the capacity limit; the
+        // user array is not padded up to it.
+        int const index = std::max(std::min(iter, static_cast<int>(requestBeamWidthArray.size())) - 1, 0);
+        beamWidth = requestBeamWidthArray[index];
     }
     return beamWidth;
 }
@@ -91,7 +103,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     if ((isDisaggContextTransmissionState() || isDisaggContextCompleteState()) && isContextOnlyRequest())
     {
-        auto const reqBeamWidth = mSamplingConfig.beamWidth;
+        auto const reqBeamWidth = mSamplingConfig.getBeamWidth();
         std::vector<TokenIdType> firstGenTokens;
         for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
         {
@@ -230,7 +242,7 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
 {
     TLLM_CHECK_WITH_INFO(!isContextFinished(), "not supported after prefill");
 
-    if (mSamplingConfig.beamWidth == 0)
+    if (mSamplingConfig.getBeamWidth() == 0)
     {
         return true;
     }
@@ -302,8 +314,6 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
         mMaxNewTokens = maxNewTokens;
     }
 
-    TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
-
     // validate extra ids when enabling kv cache reuse with prompt table
     if (enableKVCacheReuse && mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value())
     {
@@ -330,16 +340,15 @@ std::shared_ptr<LlmRequest> LlmRequest::createChildRequest(RequestIdType request
     // To ensure different randomness across children, assign a unique random seed to each child
     // by adding its sequence index to the base seed. If no seed is provided, the parent's seed defaults to 0.
     using RandomSeedType = tensorrt_llm::executor::RandomSeedType;
-    if (childReq->mSamplingConfig.randomSeed.has_value())
+    if (auto const childSeed = childReq->mSamplingConfig.getSeed(); childSeed.has_value())
     {
-        childReq->mSamplingConfig.randomSeed->at(0) += static_cast<RandomSeedType>(childReq->mSequenceIndex);
+        childReq->mSamplingConfig.setSeed(childSeed.value() + static_cast<RandomSeedType>(childReq->mSequenceIndex));
     }
     else
     {
         RandomSeedType defaultSeed{0};
-        mSamplingConfig.randomSeed = std::vector<RandomSeedType>(1, defaultSeed);
-        childReq->mSamplingConfig.randomSeed
-            = std::vector<RandomSeedType>(1, defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
+        mSamplingConfig.setSeed(defaultSeed);
+        childReq->mSamplingConfig.setSeed(defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
     }
 
     mChildRequests.push_back(childReq);

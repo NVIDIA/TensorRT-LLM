@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2024-2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,11 +16,82 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/blob/main/llava/model/multimodal_encoder/
 
 import os
+from typing import Optional, Type
 
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
 
+from ..attention.backends.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
+
+# Legacy fallback for encoders that do not yet opt into atomic-item scheduling
+# or provide a model-specific item/token-to-segment mapping. Their encoder
+# forward is not runtime-budgeted, so configured item/token limits cannot
+# safely size fixed ``AttentionMetadata`` per-segment buffers.
+#
+# TODO: Replace this fallback as the remaining encoders provide model-specific
+# conversions from atomic item/token budgets to attention segments. The exact
+# conversion requires each encoder's minimum tokens per tile/window/segment, so
+# retain this worst-case capacity for models without that contract.
+# Runtime-scheduled Qwen and Mistral/Pixtral encoders override
+# ``get_encoder_attention_metadata_capacity`` and do not consume this fallback.
+_ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
+
+
+class MultimodalEncoderMixin:
+    """Encoder-side counterpart to ``MultimodalModelMixin``.
+
+    Marker + default ``setup_attn_metadata`` for multimodal encoders whose
+    ``AttentionMetadata`` is built by ``PyTorchModelEngine`` after model load
+    using the runtime encoder token budget (``max_num_tokens``).
+
+    Subclasses set ``metadata_cls`` in their own ``__init__`` (typically from
+    ``get_attention_backend(model_config.attn_backend).Metadata``) and either
+    use the default ``setup_attn_metadata`` below or override it for custom
+    Metadata kwargs (e.g. FlashInfer ``kv_layout``, multi-metadata encoders).
+    """
+    metadata_cls: Type[AttentionMetadata]
+    attn_metadata: Optional[AttentionMetadata] = None
+
+    def get_encoder_attention_metadata_capacity(
+            self, max_num_tokens: int) -> dict[str, int]:
+        """Map the token budget to model-internal attention sequences.
+
+        Keys name this encoder's attention metadata objects, so they are
+        model-specific: this default declares a single `attention` object,
+        while a windowed encoder such as Qwen2.5-VL declares `full_attention`
+        and `window_attention`. There is no fixed superset to enumerate.
+
+        The default conservatively allows one attention sequence per token.
+        Encoders with tighter geometry-aware bounds should override this.
+        """
+        return {
+            "attention": max(max_num_tokens, _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        }
+
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[dict[str, int]] = None,
+    ) -> None:
+        """Map encoder item/token budgets to attention metadata capacity."""
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=capacities["attention"],
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=None,
+        )
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        """Set an optional stable per-segment attention capacity.
+
+        Specialized encoders may override this hook. Keeping it separate from
+        `setup_attn_metadata` preserves that method's existing override
+        contract for external encoders.
+        """
 
 
 class VisionTower(nn.Module):

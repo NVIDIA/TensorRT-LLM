@@ -1,6 +1,6 @@
 import copy
 import dataclasses
-from typing import List, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 import torch
 from transformers import (AutoProcessor, AutoTokenizer, Gemma3Config,
@@ -17,7 +17,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
@@ -177,6 +177,22 @@ class Gemma3MultiModalProjector(torch.nn.Module):
     ))
 class Gemma3VLM(PreTrainedModel):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 — same VSWA rationale as
+        Gemma3ForCausalLM (the wrapped text model)."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
+
     def __init__(self, model_config: ModelConfig[Gemma3Config]):
         if _is_mm_disagg():
             raise NotImplementedError(
@@ -193,6 +209,8 @@ class Gemma3VLM(PreTrainedModel):
         self.image_token_ids = torch.tensor([config.image_token_index],
                                             dtype=torch.int32,
                                             device=self._device)
+        self._mm_token_ids = torch.tensor([config.image_token_index],
+                                          dtype=torch.int32)
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
@@ -297,7 +315,8 @@ class Gemma3VLM(PreTrainedModel):
             input_ids=input_ids,
             mm_embeds=mm_embeds,
             mm_token_ids=self.image_token_ids,
-            **kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
@@ -322,4 +341,4 @@ class Gemma3VLM(PreTrainedModel):
 
     @property
     def mm_token_ids(self):
-        return self.image_token_ids
+        return self._mm_token_ids

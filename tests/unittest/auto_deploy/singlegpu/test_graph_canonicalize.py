@@ -10,6 +10,8 @@ from torch.fx import symbolic_trace
 
 from tensorrt_llm._torch.auto_deploy.utils._graph import canonicalize_graph
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _OutOfOrderCastModule(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:

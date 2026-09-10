@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 #include <memory>
+#include <mutex>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
@@ -73,15 +74,33 @@ static void cudaHostFuncTrampoline(void* userData)
     }
 }
 
-std::optional<uintptr_t> launchHostFunc(
-    uintptr_t streamPtr, bool freeUserData, nb::callable pyHostFunc, nb::args pyArgs, nb::kwargs pyKwargs)
+std::optional<uintptr_t> launchHostFunc(uintptr_t streamPtr, bool freeUserData, bool lowLatency,
+    nb::callable pyHostFunc, nb::args pyArgs, nb::kwargs pyKwargs)
 {
     auto const stream = reinterpret_cast<cudaStream_t>(streamPtr);
 
     auto hostFuncUserData
         = std::make_unique<HostFuncUserData>(freeUserData, pyHostFunc, nb::tuple(pyArgs), nb::dict(pyKwargs));
 
-    cudaError_t err = cudaLaunchHostFunc(stream, cudaHostFuncTrampoline, hostFuncUserData.get());
+    cudaError_t err;
+#if CUDART_VERSION >= 13020
+    if (lowLatency)
+    {
+        err = cudaLaunchHostFunc_v2(stream, cudaHostFuncTrampoline, hostFuncUserData.get(), cudaHostTaskSpinWait);
+    }
+    else
+    {
+        err = cudaLaunchHostFunc(stream, cudaHostFuncTrampoline, hostFuncUserData.get());
+    }
+#else
+    if (lowLatency)
+    {
+        static std::once_flag sWarnOnce;
+        std::call_once(sWarnOnce,
+            []() { TLLM_LOG_WARNING("Low-latency host task dispatch requires CUDA 13.2+; falling back to default."); });
+    }
+    err = cudaLaunchHostFunc(stream, cudaHostFuncTrampoline, hostFuncUserData.get());
+#endif
     if (err != cudaSuccess)
     {
         throw std::runtime_error("Failed to launch host function.");
@@ -105,7 +124,9 @@ void freeHostFuncUserData(uintptr_t userDataPtr)
 
 void initHostFuncBindings(nb::module_& m)
 {
-    m.def("launch_hostfunc", &launchHostFunc, "Launch a Python host function to a CUDA stream");
+    m.def("launch_hostfunc", &launchHostFunc,
+        "Launch a Python host function to a CUDA stream. Set low_latency=True to use "
+        "spin-wait dispatch (requires CUDA 13.2+).");
     m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function");
 }
 } // namespace tensorrt_llm::nanobind::runtime

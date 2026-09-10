@@ -67,6 +67,8 @@ enum class FP4GemmType
 {
     W4A4_NVFP4_NVFP4,
     W4A8_MXFP4_MXFP8,
+    // W8A8 MXFP8 weight (e4m3 + UE8M0 1x32 block scales) x dynamic MXFP8 activation.
+    W8A8_MXFP8_MXFP8,
 };
 
 template <typename T, FP4GemmType gemmType = FP4GemmType::W4A4_NVFP4_NVFP4>

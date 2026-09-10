@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 
@@ -505,10 +506,7 @@ public:
             {
                 std::size_t gpuAlignment = 1;
                 CUmemAllocationProp const prop{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                    {
-                        CU_MEM_LOCATION_TYPE_DEVICE,
-                        device,
-                    }};
+                    CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}};
                 TLLM_CU_CHECK(
                     cuMemGetAllocationGranularity(&gpuAlignment, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
                 alignment = std::lcm(getpagesize(), gpuAlignment);

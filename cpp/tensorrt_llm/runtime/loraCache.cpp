@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include <memory>
 #include <mutex>
@@ -510,6 +511,48 @@ LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelC
     }
 }
 
+void LoraCache::setDataTypeCoordinated(
+    LoraCache& other, tensorrt_llm::DataType dataType, SizeType32 totalNumPages, SizeType32 otherTotalNumPages)
+{
+    if (&other == this)
+    {
+        // Locking mPagesMutex/mCacheMutex twice via the same std::scoped_lock call below would
+        // be undefined behavior (self-deadlock) for a non-recursive std::mutex.
+        TLLM_CHECK_WITH_INFO(
+            totalNumPages == otherTotalNumPages, "Cannot configure one LoRA cache with two different page capacities");
+        std::scoped_lock lock(mPagesMutex, mCacheMutex);
+        setDataTypeLocked(dataType, totalNumPages);
+        return;
+    }
+
+    std::scoped_lock lock(mPagesMutex, mCacheMutex, other.mPagesMutex, other.mCacheMutex);
+    setDataTypeLocked(dataType, totalNumPages);
+    other.setDataTypeLocked(dataType, otherTotalNumPages);
+}
+
+void LoraCache::setDataTypeLocked(tensorrt_llm::DataType dataType, std::optional<SizeType32> totalNumPages)
+{
+    TLLM_CHECK_WITH_INFO(mCacheMap.empty(), "Cannot change LoRA cache dtype after a task has been inserted");
+    auto const configuredNumPages = totalNumPages.value_or(mPageManagerConfig.getTotalNumPages());
+    if (mPageManagerConfig.getDataType() == dataType && mPageManagerConfig.getTotalNumPages() == configuredNumPages)
+    {
+        return;
+    }
+
+    // Release the old allocation before creating the replacement to avoid a
+    // temporary peak equal to both cache allocations.
+    mCachePageManager.reset();
+    mPageManagerConfig.setDataType(dataType);
+    mPageManagerConfig.setTotalNumPage(configuredNumPages);
+    mCachePageManager = std::make_unique<LoraCachePageManager>(mPageManagerConfig, *mBufferManager);
+}
+
+tensorrt_llm::DataType LoraCache::getDataType() const
+{
+    std::lock_guard<std::mutex> lock(mPagesMutex);
+    return mPageManagerConfig.getDataType();
+}
+
 template <typename T>
 void LoraCache::splitTransposeCpuInner(ITensor& output, ITensor const& input, SizeType32 tpSize, SizeType32 tpRank)
 {
@@ -537,15 +580,15 @@ void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeTyp
 
     switch (input.getDataType())
     {
-    case nvinfer1::DataType::kINT32: splitTransposeCpuInner<SizeType32>(output, input, tpSize, tpRank); break;
-    case nvinfer1::DataType::kFLOAT: splitTransposeCpuInner<float>(output, input, tpSize, tpRank); break;
-    case nvinfer1::DataType::kHALF: splitTransposeCpuInner<half>(output, input, tpSize, tpRank); break;
-    case nvinfer1::DataType::kINT8: splitTransposeCpuInner<int8_t>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kINT32: splitTransposeCpuInner<SizeType32>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kFLOAT: splitTransposeCpuInner<float>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kHALF: splitTransposeCpuInner<half>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kINT8: splitTransposeCpuInner<int8_t>(output, input, tpSize, tpRank); break;
 #ifdef ENABLE_FP8
-    case nvinfer1::DataType::kFP8: splitTransposeCpuInner<__nv_fp8_e4m3>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kFP8: splitTransposeCpuInner<__nv_fp8_e4m3>(output, input, tpSize, tpRank); break;
 #endif // ENABLE_FP8
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: splitTransposeCpuInner<__nv_bfloat16>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kBF16: splitTransposeCpuInner<__nv_bfloat16>(output, input, tpSize, tpRank); break;
 #endif // ENABLE_BF16
     default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
     }
@@ -561,6 +604,9 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK_WITH_INFO(!pages.empty(), "empty pages");
+    TLLM_CHECK_WITH_INFO(sourceWeights->getDataType() == pages.front()->getDataType(),
+        "Expected LoRA weights dtype %s to match cache dtype %s", sourceWeights->getDataTypeName(),
+        pages.front()->getDataTypeName());
 
     TensorPtr weights = sourceWeights->getShape().nbDims == 2
         ? sourceWeights
@@ -774,7 +820,6 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
     TLLM_CHECK_WITH_INFO(deviceCache.mPageManagerConfig.getMemoryType() == runtime::MemoryType::kGPU
             && !deviceCache.mDeviceBufferManagers.empty(),
         "The deviceCache must hold GPU memory and have at least one bufferManager / copy stream");
-
     // First get the taskValue from this cache
     // TaskValue& taskValue = copyTaskGetThisTaskValue(taskId);
     TaskValuePtr taskValue = [&]() -> TaskValuePtr
@@ -803,7 +848,14 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
     // TaskValue* otherTaskValuePtr = copyTaskGetOtherTaskValue(taskId, taskValue, deviceCache, markDone);
     std::optional<TaskValuePtr> optOtherTaskValuePtr = [&]() -> std::optional<TaskValuePtr>
     {
-        std::lock_guard<std::mutex> deviceCacheLock(deviceCache.mCacheMutex);
+        // Lock both caches' mCacheMutex (this=host, deviceCache=device): setDataTypeCoordinated
+        // holds both caches' mCacheMutex for the full duration of a host+device dtype swap, so
+        // locking both here too makes this dtype check and the following task-map insertion
+        // atomic with respect to cache reconfiguration. Locking deviceCache.mCacheMutex alone is
+        // not sufficient since mPageManagerConfig on the host side (this) is read here too.
+        std::scoped_lock cacheLock(mCacheMutex, deviceCache.mCacheMutex);
+        TLLM_CHECK_WITH_INFO(mPageManagerConfig.getDataType() == deviceCache.mPageManagerConfig.getDataType(),
+            "LoRA host and device cache dtypes must match");
         auto otherStatus = deviceCache.getStatus(taskId);
         if (kVALUE_STATUS_MISSING != otherStatus)
         {
@@ -873,7 +925,9 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
 
     bool otherIsDone;
     {
-        std::lock_guard<std::mutex> lk(mCacheMutex);
+        // otherTaskValue belongs to deviceCache's mCacheMap, so it must be guarded by
+        // deviceCache's mCacheMutex, not this (host) cache's mCacheMutex.
+        std::lock_guard<std::mutex> lk(deviceCache.mCacheMutex);
         otherIsDone = otherTaskValue->done;
         otherTaskValue->loadInProgress = false;
         otherTaskValue->loaded = true;

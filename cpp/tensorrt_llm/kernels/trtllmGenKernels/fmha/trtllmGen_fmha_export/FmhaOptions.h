@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "Dsv4Constants.h"
 #include "KernelTraits.h"
 #include <trtllm/gen/CudaArchDecl.h>
 #include <trtllm/gen/CudaRunner.h>
@@ -45,8 +46,12 @@ struct FmhaOptions : public KernelConfigBase {
   int mChunkedAttentionSize{0};
   // Dry-run: print a log but does not actually generate anything
   bool mDryRun{false};
+  // Token dimension reserved by the DSv4 FP32 or packed UE8M0 scale tensor. May be padded.
+  int32_t mDsv4ScaleBufM{0};
   // Enable the auto tuner.
   bool mEnablesAutoTuner{false};
+  // Select the grouped MLA generation kernel in the auto tuner.
+  bool mSelectsGroupedMla{false};
   // Enable the BF16Q+FP8KV K-only transform path. Disabled by default.
   bool mEnablesBf16QFp8KvKOnlyTransform{false};
   // Whether is exporting cubin.
@@ -109,6 +114,11 @@ struct FmhaOptions : public KernelConfigBase {
   int mSumOfSeqLensQ{512 * 2}, mSumOfSeqLensKv{512 * 2};
   // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
   bool mUsesSharedPagedKvIdx{false};
+  // Select the 2Qx1KV grouped-token schedule for GQA generation (decode) kernels. A fully
+  // populated 2Q tile halves the CTA count, which wins when the 2Q grid fits in one wave and the
+  // 1Q grid does not; the caller (e.g. FlashInfer's kernel selection) owns that shape/occupancy
+  // heuristic and sets this flag.
+  bool mUses2InstsQDecodeKernels{false};
   // Level of verbose information.
   int mVerbosity{1};
 
@@ -128,7 +138,9 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mChecksResults);
     TO_JSON(mChunkedAttentionSize);
     TO_JSON(mDryRun);
+    TO_JSON(mDsv4ScaleBufM);
     TO_JSON(mEnablesAutoTuner);
+    TO_JSON(mSelectsGroupedMla);
     TO_JSON(mEnablesBf16QFp8KvKOnlyTransform);
     TO_JSON(mIsExportingCubin);
     TO_JSON(mIsTracing);
@@ -158,6 +170,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mSumOfSeqLensQ);
     TO_JSON(mSumOfSeqLensKv);
     TO_JSON(mUsesSharedPagedKvIdx);
+    TO_JSON(mUses2InstsQDecodeKernels);
     TO_JSON(mVerbosity);
   }
 
@@ -194,6 +207,8 @@ struct FmhaOptionsFromArgs {
   bool mIsNumPrefetchedFmasSet{false};
   // Relative error tolerance.
   bool mIsRtolSet{false};
+  // Whether to use separate transformed K/V resources.
+  bool mIsSeparateTransformedKvSet{false};
   // Tile scheduler type.
   bool mIsTileSchedulerSet{false};
   // Whether to use an ordered sequence between softmax0 and softmax1.
@@ -232,6 +247,34 @@ struct FmhaConfig {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Whether the output dtype produces per-block scale factors.
+inline bool hasOutputSfs(tg::Dtype dtype) {
+  return dtype == tg::Dtype::E2m1 || dtype == tg::Dtype::MxE4m3;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Check whether the runtime skip-correction threshold is valid for the selected kernel.
+inline void checkSkipCorrThreshold(FmhaOptions const& options, float skipCorrThreshold) {
+  TLLM_CHECK_ERROR(skipCorrThreshold >= 0.f, "skipCorrThreshold must be non-negative.");
+  TLLM_CHECK_ERROR(skipCorrThreshold <= 0.f || options.mSkipsCorrWhenPossible,
+                   "A positive skipCorrThreshold requires skipsCorrWhenPossible.");
+
+  if (skipCorrThreshold > 0.f) {
+    auto const dtypeBmm2 = getDtypeBmm2(options);
+    TLLM_CHECK_ERROR(dtypeBmm2 != tg::Dtype::E2m1,
+                     "Threshold-based correction skipping does not support E2M1 BMM2.");
+    if (dtypeBmm2 == tg::Dtype::E4m3) {
+      // A skipped correction can increase the scaled P value by up to 2^threshold. The
+      // threshold-enabled P scale is 1.75, and 1.75 * 2^8 == 448, the E4M3 maximum, making 8 the
+      // recommended threshold.
+      TLLM_CHECK_ERROR(skipCorrThreshold <= 8.f, "skipCorrThreshold must be <= 8 for E4M3 BMM2.");
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Check if the options are valid or not.
 inline void checkFmhaOptions(FmhaOptions const& options,
                              FmhaOptionsFromArgs const& optionsFromArgs) {
@@ -242,6 +285,35 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // mNumInstsKv == 1 are supported.
   TLLM_CHECK_ERROR(((options.mNumInstsQ * options.mNumInstsKv) <= 2),
                    "Only two tile instances are supported");
+  if (isBf16QFp8KvFullTransformGeneration(options)) {
+    TLLM_CHECK_ERROR(options.mNumInstsQ == 1 && options.mNumInstsKv == 1,
+                     "BF16Q+FP8KV full-transform kernels require numInstsQ == 1 and "
+                     "numInstsKv == 1.");
+  }
+
+  if (options.mFusesDsv4InvRopeFp8Quant) {
+    bool const isSpecDecTree =
+      options.mIsCustomSpecDecodingGen && options.mSpecDecodingTargetMaxGenLen > 0;
+    bool const isSupportedDsv4FusionConfig =
+      options.mIsMlaGen && options.mSparseType == SparseType::DynamicTokenSparse &&
+      options.mFuseEpilogueIntoCorr && isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType) &&
+      options.mQkvLayout == QkvLayout::PagedKv && options.mDtypeQ == tg::Dtype::E4m3 &&
+      options.mDtypeK == tg::Dtype::E4m3 && options.mDtypeV == tg::Dtype::E4m3 &&
+      options.mDtypeOut == tg::Dtype::E4m3 && options.mHeadDimQk == kDsv4HeadDimQk &&
+      options.mHeadDimV == kDsv4HeadDimV && options.mHeadDimPerCtaV == kDsv4HeadDimPerCtaV &&
+      options.mHeadDimPerCtaV * options.mClusterDimX == options.mHeadDimV &&
+      options.mClusterDimX == 2 && options.mTileSizeQ == 64 && options.mTileSizeKv == 128 &&
+      options.mNumInstsQ == 1 && options.mNumInstsKv == 1 && !options.mSwapsMmaAb &&
+      options.mHeadDimPerStageKv == 0 && options.mMultiCtasKvMode == MultiCtasKvMode::Disabled &&
+      !options.mUseBlockSparseAttention && !isSpecDecTree;
+    TLLM_CHECK_ERROR(isSupportedDsv4FusionConfig,
+                     "DSv4 inverse-RoPE FP8 quant fusion only supports the fixed DSv4 sparse MLA "
+                     "generation keep-AB paged-KV E4M3 configuration with standard non-tree "
+                     "causal generation/context position semantics.");
+  }
+
+  TLLM_CHECK_ERROR(!options.mUsesDsv4Ue8m0ScaleO || options.mFusesDsv4InvRopeFp8Quant,
+                   "-dsv4ScaleFormat ue8m0 requires -fusesDsv4InvRopeFp8Quant true.");
 
   // The number of instances for Q and Kv must be set together.
   TLLM_CHECK_ERROR(optionsFromArgs.mIsNumInstsQSet == optionsFromArgs.mIsNumInstsKvSet,
@@ -285,8 +357,11 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                        "Only headDimQk > headDimV MLA kernels have been verified for Hopper");
     } else {
       if (isContextKernel(options.mFmhaKernelType)) {
-        TLLM_CHECK_ERROR(headDimQk == 192 && headDimV == 128,
-                         "Only headDimQk = 192, headDimV = 128 MLA kernels have been verified");
+        TLLM_CHECK_ERROR((headDimQk == 192 && headDimV == 128) ||
+                           (headDimQk == 128 && headDimV == 64),
+                         "Only headDimQk = 192, headDimV = 128 (DeepSeek context MLA) or "
+                         "headDimQk = 128, headDimV = 64 (Mistral Small 4 context MLA) kernels "
+                         "have been verified");
       } else {
         TLLM_CHECK_ERROR(options.mIsMlaGen && ((headDimQk == 576 && headDimV == 512) ||
                                                (headDimQk == 320 && headDimV == 256)),
@@ -355,21 +430,18 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "Consider using smaller tileSizeKv.");
   }
 
-#ifdef TLLM_PUBLIC_RELEASE
-  if (options.mDtypeKv == tg::Dtype::E2m1 && !options.mIsTrtllmLayout) {
-    TLLM_CHECK_ERROR(false, "E2m1 KV cache is not supported with public compiler.");
-  }
-#endif // TLLM_PUBLIC_RELEASE
-
   // PackedQkv layout does not support supportsDiffSeqLensForQAndKv.
   TLLM_CHECK_ERROR(!(isPackedQkv(options.mQkvLayout) && options.mSupportsDiffSeqLensForQAndKv),
                    "PackedQkv layout does not support supportsDiffSeqLensForQAndKv");
   // Q does not support E2m1 dtype.
   TLLM_CHECK_ERROR(options.mDtypeQ != tg::Dtype::E2m1, "Q does not suppot E2m1 dtype");
   // Make sure correct attention window size is set.
-  TLLM_CHECK_ERROR(!isSlidingOrChunkedCausalMask(options.mMaskType) ||
-                     options.mAttentionWindowSize > 0 || options.mChunkedAttentionSize > 0,
+  TLLM_CHECK_ERROR(!usesSlidingWindowMask(options.mMaskType) || options.mAttentionWindowSize > 0 ||
+                     options.mChunkedAttentionSize > 0,
                    "Please set correct sliding attention window size or chunked attention size");
+  TLLM_CHECK_ERROR(!isSlidingWindowCustomMask(options.mMaskType) ||
+                     (options.mAttentionWindowSize > 0 && options.mChunkedAttentionSize == 0),
+                   "SlidingWindowCustom requires attentionWindowSize without chunked attention");
   if (options.mChunkedAttentionSize > 0) {
     TLLM_CHECK_ERROR(options.mAttentionWindowSize >= options.mMaxSeqLenKv,
                      "sliding attention window size must be greater than or equal to maxSeqLenKv");
@@ -380,17 +452,20 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                      "Chunked attention size must be power of 2");
   }
 
-  // Special options for FP4.
-  if (options.mDtypeOut == tg::Dtype::E2m1) {
-    // FP4 output only supports fuseEpilogueIntoCorr.
+  // Special options for block-scaled outputs.
+  if (fmha::hasOutputSfs(options.mDtypeOut)) {
     TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                     "FP4 output only supports fuseEpilogueIntoCorr");
-    // Make sure the number of sf per row can be divided by 4, required for interleaved SF layout.
-    // Details can be seen in DtypeUtils.h: E2m1Utils::getSfOffset.
-    int32_t hiddenDim = options.mNumHeadsQ * headDimQk;
-    auto kernelTraits = getKernelTraitsFromOptions(options);
-    TLLM_CHECK_ERROR((hiddenDim / kernelTraits.mNumEltsPerSf) % 4 == 0,
-                     "Current hiddenDim is not supported for FP4 output");
+                     "E2m1 / MxE4m3 output only supports fuseEpilogueIntoCorr");
+
+    // Make sure the number of SFs per row can be divided by 4, required for interleaved SF layout.
+    int32_t numEltsPerSfO = tg::dtypeNumEltsPerSf(options.mDtypeOut);
+    int32_t hiddenDim = options.mNumHeadsQ * options.mHeadDimV;
+    TLLM_CHECK_ERROR(options.mHeadDimV % numEltsPerSfO == 0,
+                     "headDimV must be divisible by the output SF group size");
+    TLLM_CHECK_ERROR(hiddenDim % numEltsPerSfO == 0,
+                     "hiddenDim must be divisible by the output SF group size");
+    TLLM_CHECK_ERROR((hiddenDim / numEltsPerSfO) % 4 == 0,
+                     "Current hiddenDim is not compatible with interleaved SF layout");
   }
 
   // If we decide to use Sage Attention, the number of elements per block must be a power-of-two.
@@ -487,15 +562,56 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     }
   }
 
-  // The mGroupsTokensHeadsQ only works with GQA generation kernels.
+  // groupsTokensHeadsQ is allowed for GQA gen and explicitly selected MLA gen kernels.
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(!options.mIsMlaGen,
-                     "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
+    TLLM_CHECK_ERROR(!options.mIsMlaGen
+                       || options.mSelectsGroupedMla,
+                     "MLA generation with mGroupsTokensHeadsQ requires mSelectsGroupedMla.");
   }
 
+#ifdef TLLM_RUBIN_FEATURES
+  if (options.mFineGrainedForceValid) {
+    TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
+                     "fineGrainedForceValid is only supported with fuseEpilogueIntoCorr");
+    TLLM_CHECK_ERROR(!tg::dtypeIsBlockFmt(options.mDtypeOut),
+                     "fineGrainedForceValid does not support block scaling outputs");
+    TLLM_CHECK_ERROR(isDisabled(options.mMultiCtasKvMode),
+                     "fineGrainedForceValid does not support multi-CTA mode");
+    TLLM_CHECK_ERROR(
+      isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType) ||
+        isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType),
+      "fineGrainedForceValid has not been tested with context or generation kernel types.");
 
+    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
+                     "FineGrained producer is not compatible with 2 CTA mode");
+
+    TLLM_CHECK_ERROR(
+      options.mHeadDimPerStageKv == 0,
+      "FineGrained producer is only compatible with a single iteration of the head dim loop");
+
+    // TODO Are there more features that are not compatible?
+  }
+  if (options.mFineGrainedProducer) {
+    TLLM_CHECK_ERROR(options.mFineGrainedForceValid, "fineGrainedProducer requires fineGrainedForceValid");
+  }
+#endif // TLLM_RUBIN_FEATURES
+
+#ifdef TLLM_RUBIN_FEATURES
+  if (options.mUsesSpcompress) {
+    TLLM_CHECK_ERROR(options.mCudaArch == tg::CudaArch::Sm107a,
+                     "Sparse attention is only supported on sm_107a.");
+    TLLM_CHECK_ERROR(options.mFmhaKernelType == FmhaKernelType::Context,
+                     "Sparse attention is only supported with context kernel.");
+    TLLM_CHECK_ERROR(options.mDtypeQ == tg::Dtype::E4m3 || options.mDtypeQ == tg::Dtype::E4m3,
+                     "Sparse attention is only supported with e4m3.");
+    TLLM_CHECK_ERROR(options.mClusterDimX == 1,
+                     "Sparse attention is not compatible with 2 CTA mode.");
+    TLLM_CHECK_ERROR(!isCustomMask(options.mMaskType),
+                     "Sparse attention is not compatible with custom mask.");
+  }
+#endif // TLLM_RUBIN_FEATURES
 
   // For transformed K/V, MmaOrder must be Pv0_Qk0_Pv1_Qk1.
   if (options.mDtypeQ != options.mDtypeKv) {
@@ -505,7 +621,17 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mEnablesBf16QFp8KvKOnlyTransform) {
     TLLM_CHECK_ERROR(usesKOnlyTransformPipeline(options),
                      "BF16Q+FP8KV K-only transform is only supported for non-MLA Blackwell "
-                     "generation kernels with BF16 Q, E4M3 K/V, and H64/H128.");
+                     "generation kernels with BF16 Q, E4M3 K/V, and H64/H128/H256.");
+    TLLM_CHECK_ERROR(!options.mSeparateTransformedKv,
+                     "BF16Q+FP8KV K-only transform cannot be combined with separateTransformedKv.");
+  }
+  if (options.mSeparateTransformedKv) {
+    TLLM_CHECK_ERROR(!usesKOnlyTransformPipeline(options),
+                     "BF16Q+FP8KV K-only transform cannot be combined with separateTransformedKv.");
+    TLLM_CHECK_ERROR(supportsSeparateTransformedKv(options),
+                     "separateTransformedKv is only supported by BF16Q+E4M3KV full-transform "
+                     "generation kernels on Blackwell with numInstsQ=1, numInstsKv=1, and equal "
+                     "H64/H128/H256 K/V heads.");
   }
 
   if (options.mMmaOrder == MmaOrder::Qk0_Qk1_Pv0_Pv1) {
@@ -588,6 +714,28 @@ inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& o
   // Enable variable sequence if minSeqLenQ < maxSeqLenQ or minSeqLenKv < maxSeqLenKv.
   options.mSupportsVarSeqLens |=
     (options.mMinSeqLenQ < options.mMaxSeqLenQ) || (options.mMinSeqLenKv < options.mMaxSeqLenKv);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Update the runtime DSv4 inverse-RoPE + FP8 quant layout. This must run after the sample sequence
+// lengths have been generated because the compact benchmark layout depends on mSumOfSeqLensQ.
+inline void updateDsv4InvRopeFp8QuantOptions(FmhaOptions& options) {
+  if (!options.mFusesDsv4InvRopeFp8Quant) {
+    return;
+  }
+
+  TLLM_CHECK_ERROR(options.mNumHeadsQ % kDsv4HeadsPerGroup == 0,
+                   "numHeadsQ must be divisible by the DSv4 packed output head group size.");
+
+  if (options.mDsv4ScaleBufM == 0) {
+    int32_t constexpr scaleTokenAlignment = 4;
+    int32_t const numPackedTokens = options.mSumOfSeqLensQ;
+    int32_t const paddedScaleBufM =
+      (numPackedTokens + scaleTokenAlignment - 1) / scaleTokenAlignment * scaleTokenAlignment;
+    options.mDsv4ScaleBufM = paddedScaleBufM;
+  }
+  TLLM_CHECK_ERROR(options.mDsv4ScaleBufM > 0, "Dsv4ScaleBufM must be initialized.");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

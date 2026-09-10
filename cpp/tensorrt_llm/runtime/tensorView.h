@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferView.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -45,19 +46,19 @@ public:
         mDims.d[0] = size;
     }
 
-    TensorView(IBuffer::SharedPtr const& buffer, size_t offset, size_t size, nvinfer1::Dims const& dims)
+    TensorView(IBuffer::SharedPtr const& buffer, size_t offset, size_t size, tensorrt_llm::Dims const& dims)
         : BufferView{buffer, offset, size}
         , mDims{dims}
     {
         Base::resize(ITensor::volumeNonNegative(dims));
     }
 
-    [[nodiscard]] nvinfer1::Dims const& getShape() const override
+    [[nodiscard]] tensorrt_llm::Dims const& getShape() const override
     {
         return mDims;
     }
 
-    void reshape(nvinfer1::Dims const& dims) override
+    void reshape(tensorrt_llm::Dims const& dims) override
     {
         Base::resize(ITensor::volumeNonNegative(dims));
         mDims = dims;
@@ -81,6 +82,6 @@ private:
         return shape.nbDims > 0 && shape.d[0] > 0 ? ITensor::volume(shape) / shape.d[0] : 0;
     }
 
-    nvinfer1::Dims mDims{};
+    tensorrt_llm::Dims mDims{};
 };
 } // namespace tensorrt_llm::runtime

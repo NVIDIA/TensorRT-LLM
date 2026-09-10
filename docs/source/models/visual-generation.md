@@ -12,12 +12,13 @@ Visual generation models based on diffusion transformers (DiT) have become the s
 TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion models, with a pipeline architecture separate from the LLM inference path. Key capabilities include:
 
 - A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.
-- Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
+- Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), FlashInfer FP16/BF16 dense prefill (`FLASHINFER`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
-- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100).
+- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100), and FlashInfer block-scaled MXFP8/NVFP4 on `FLASHINFER`.
 - Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
+- CPU offloading to reduce peak GPU memory usage.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
 ## Supported Models
@@ -28,34 +29,59 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `black-forest-labs/FLUX.2-dev` | Text-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
+| `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` | Text-to-Video (VSA) |
 | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
+| `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
+| `Qwen/Qwen-Image-Layered` | Image-to-Image |
+| `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
+| `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
+| `zai-org/GLM-Image` | Text-to-Image |
+
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
-|---|---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image** [^2] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **FLUX.1** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FastWan 2.2** | Yes | Yes | No | No | No | No [^7] | No | No | Yes | Yes | Yes | No | No | No | No |
+| **LTX-2** | Yes | Yes | Yes [^4] | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
+| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^2]: Qwen-Image ships a native BF16 implementation with per-module numerical parity vs `diffusers.QwenImagePipeline` (cosine >= 0.999 on the full 20B transformer) and `trtllm-serve` / `/v1/images/generations` support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required. 
+[^2]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires `CUTEDSL` on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.
+
+[^3]: Wan 2.2 has two stage transformers; TeaCache requires explicit `teacache.coefficients` (high-noise) and `teacache.coefficients_2` (low-noise). There is no built-in coefficient table for Wan 2.2.
+
+[^4]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
+
+[^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing and returns one RGBA image per generated layer by default. Set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, and Tensor Parallelism are not enabled for this pipeline yet.
+
+[^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 
 ## Quick Start
 
@@ -82,11 +108,59 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 | `/v1/images/generations` | POST | Synchronous image generation |
 | `/v1/images/edits` | POST | Image editing |
 | `/v1/videos` | POST | Asynchronous video generation |
-| `/v1/videos/generations` | POST | Synchronous video generation |
+| `/v1/videos/sync` | POST | Synchronous video generation |
+| `/v1/videos/generations` | POST | Deprecated alias of `/v1/videos/sync` (kept for back-compat) |
 | `/v1/videos/{id}` | GET | Video status / metadata |
 | `/v1/videos/{id}/content` | GET | Download generated video |
 | `/v1/videos/{id}` | DELETE | Delete generated video |
 | `/v1/videos` | GET | List all videos |
+
+The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; the video is downloadable via `/content` once `completed`.
+
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400; the same switch also rejects a reference sent with `format="path"`, since both ask the server to trust a local filesystem path. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
+
+### Reference Inputs
+
+Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
+
+| `format` | Content | Notes |
+|---|---|---|
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. |
+| `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
+| `base64` | Base64 text | A `data:` URI is also accepted. |
+| `bytes` | Raw `bytes` | Python API only. |
+
+Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`, and a request is validated against that declaration before generation begins. References are resolved to raw bytes on the coordinator, so a worker never needs a filesystem shared with the client.
+
+Most models take a single reference whose role is unambiguous:
+
+```python
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
+
+vg = VisualGen(model="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+params = vg.default_params
+params.image_reference = MediaRef(content="start.png", format="path")
+output = vg.generate(inputs="the scene comes alive with gentle motion", params=params)
+```
+
+Models that accept the same modality in more than one role need `role`. Wan 2.1 I2V takes a first frame and an optional last frame:
+
+```python
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
+
+vg = VisualGen(model="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
+params = vg.default_params
+params.image_reference = [
+    MediaRef(content="start.png", format="path", role="first_frame"),
+    MediaRef(content="end.png", format="path", role="last_frame"),
+]
+```
+
+FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
+
+The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
 
 ## Optimizations
 
@@ -109,13 +183,106 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 
 Omit `quant_config` for BF16/FP16 baseline.
 
+#### Wan VAE NVFP4
+
+The VAE can represent a substantial fraction of end-to-end latency in distilled
+video-generation pipelines with few denoising steps. Blackwell Tensor Cores offer
+up to four times the peak NVFP4 compute throughput of BF16, making VAE Conv3d
+operators an important optimization target. FP4 VAE replaces eligible native VAE
+Conv3d operators with NVFP4 weight-and-activation kernels while retaining BF16
+outputs.
+
+Linear-layer, attention, and VAE quantization are selected independently. Use
+`quant_config` for transformer linear layers,
+`attention_config.quant_attention_config` for attention, and
+`vae_config.quant_conv_config` for VAE convolutions.
+NVFP4 VAE execution currently supports native Wan-family VAEs on SM100 and
+SM103 GPUs. Unsupported pipelines and algorithms fail before
+pipeline construction. On an unsupported device, an explicit NVFP4 request
+fails; checkpoint-driven NVFP4 instead uses dequantized BF16 operators.
+
+By default, `vae_config.quant_conv_config` is unset (`None`) and VAE
+convolutions follow the checkpoint metadata. A high-precision checkpoint
+remains high precision. A packed NVFP4 checkpoint selects NVFP4 execution
+automatically and reuses any valid calibrated activation scales; layers without
+one derive it dynamically.
+
+To quantize eligible Wan Conv3d layers from a high-precision checkpoint and
+derive activation scales dynamically, use the shorthand configuration:
+
+```yaml
+vae_config:
+  quant_conv_config:
+    quant_algo: NVFP4
+    dynamic: true
+```
+
+The `quant_conv_config.dynamic` shorthand sets both weight and activation
+modes. Configure them independently when their sources differ. For example,
+packed NVFP4 weights with rank-local dynamic activation scales use:
+
+```yaml
+vae_config:
+  quant_conv_config:
+    quant_algo: NVFP4
+    config_groups:
+      default:
+        weights:
+          dynamic: false
+        input_activations:
+          dynamic: true
+```
+
+`weights.dynamic: true` requires high-precision checkpoint weights, while
+`false` requires packed NVFP4 weights. `input_activations.dynamic: false`
+requires a valid calibrated checkpoint scale for every selected convolution;
+`true` derives rank-local activation scales at runtime. Do not specify both the
+top-level shorthand and `config_groups`.
+
+The optional `ignore` list excludes matching VAE modules. With a
+high-precision checkpoint, excluded convolutions remain in BF16. With a packed
+NVFP4 checkpoint, their weights can only be dequantized back to BF16; the
+original high-precision weights cannot be recovered.
+
+See the [Model Optimizer diffusion example](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers#wan-22-vae-nvfp4-conv3d-implicit-gemm)
+for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.
+
+### Runtime LoRA
+
+VisualGen can preload a local LoRA adapter at startup and fuse its deltas into transformer weights before warmup, CUDA graph capture, and cache acceleration setup. Configure this through `VisualGenArgs.runtime_lora_config` in Python or YAML:
+
+```yaml
+runtime_lora_config:
+  path: /path/to/adapter-or-safetensors
+  target_components:
+    - transformer
+```
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen import RuntimeLoRAConfig
+
+args = VisualGenArgs(
+    model="/path/to/model",
+    runtime_lora_config=RuntimeLoRAConfig(
+        path="/path/to/adapter-or-safetensors",
+        target_components=["transformer"],
+    ),
+)
+```
+
+The loader accepts safetensors adapters that use Comfy/Kohya-style `lora_down` / `lora_up` keys or PEFT-style `lora_A` / `lora_B` keys. It applies `.alpha` tensors when present, and reads `lora_alpha` from a colocated `adapter_config.json` for PEFT adapters. `scale` multiplies the resulting alpha/rank factor.
+
+By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.
+
 ### Quantized Attention
 
-In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
+In addition to linear-layer quantization, VisualGen supports several **attention-level** quantization recipes, which define the Q/K/V data types and scaling granularity used inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
 
 - **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
 - **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
 
+- **FlashInfer block-scaled attention** (`FLASHINFER` backend): Uses FlashInfer's architecture-specific FMHA. On SM100/SM103 (B200/B300), set `qk_dtype` to `mxfp8` or `nvfp4` with `v_dtype: fp8`. On SM120/SM121 (RTX PRO 6000), only dense Q/K/V NVFP4 self-attention is supported, using `qk_dtype: nvfp4` and `v_dtype: nvfp4`; this path requires a sequence length divisible by 128.
 
 Python API for SageAttention:
 
@@ -155,6 +322,23 @@ args = VisualGenArgs(
 )
 ```
 
+Python API for FlashInfer MXFP8 on B200/B300:
+
+```python
+from tensorrt_llm import VisualGenArgs
+
+args = VisualGenArgs(
+    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    attention_config={
+        "backend": "FLASHINFER",
+        "quant_attention_config": {
+            "qk_dtype": "mxfp8",
+            "v_dtype": "fp8",
+        },
+    },
+)
+```
+
 ### CUDA Graphs
 
 VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See [VisualGen CUDA Graphs](../visual-gen/features/cuda-graph.md) for capture scope, graph keys, and sparse-attention phase behavior.
@@ -175,7 +359,7 @@ cache_config:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for FLUX.2 and Wan 2.1. |
+| `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for all other supported models. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
 | `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
 
@@ -222,6 +406,47 @@ args = VisualGenArgs(
 
 **Wan 2.2 dual-transformer note:** Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All `CacheDiTConfig` parameters apply to both stacks, except `max_warmup_steps` and `max_cached_steps`: the low-noise stack always uses fixed internal caps (`max_warmup_steps=2`, `max_cached_steps=20`) regardless of user config.
 
+### Video Sparse Attention (VSA)
+
+VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a block-sparse CuTe kernel over only those blocks. The two outputs are blended with learned gates.
+
+**Requirements:**
+- VSA-fine-tuned checkpoint: [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not have the learned VSA gates.
+- Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.
+- `CUTEDSL` attention backend.
+- Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.
+
+**`vsa_sparsity`** controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.
+
+Python API:
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
+
+args = VisualGenArgs(
+    model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
+    attention_config=AttentionConfig(
+        backend="CUTEDSL",
+        sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+    ),
+)
+```
+
+YAML (for use with `--visual_gen_args` or `trtllm-serve`):
+
+```yaml
+attention_config:
+  backend: CUTEDSL
+  sparse_attention_config:
+    algorithm: vsa
+    vsa_sparsity: 0.90
+```
+
+### CPU Offloading
+
+CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
+
 ### Multi-GPU Parallelism
 
 Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
@@ -234,6 +459,13 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+
+For multi-node execution, VisualGen relies on the external launcher to terminate
+the remaining ranks when any rank exits. `torchrun` provides this behavior. With
+SLURM, launch the VisualGen rank group with `srun --kill-on-bad-exit=1`; without
+this option, surviving ranks can continue running and retain GPU memory after a
+peer or the coordinator exits.
+
 ## Developer Guide
 
 ### Architecture Overview

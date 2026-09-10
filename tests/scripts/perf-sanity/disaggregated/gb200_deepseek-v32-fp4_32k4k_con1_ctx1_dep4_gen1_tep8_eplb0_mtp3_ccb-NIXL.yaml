@@ -65,7 +65,8 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: MTP
       max_draft_len: 3
@@ -102,5 +103,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 32832
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     speculative_config: *id001

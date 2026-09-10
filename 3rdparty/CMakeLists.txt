@@ -101,10 +101,26 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   # Extract optional fields with error handling
   string(JSON DEP_GIT_SHALLOW            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "git_shallow")
   string(JSON DEP_SOURCE_SUBDIR          ERROR_VARIABLE _err GET "${DEP_OBJECT}" "source_subdir")
+  string(JSON DEP_GIT_SUBMODULES         ERROR_VARIABLE _git_submodules_error GET "${DEP_OBJECT}" "git_submodules")
   string(JSON DEP_GIT_SUBMODULES_RECURSE ERROR_VARIABLE _err GET "${DEP_OBJECT}" "git_submodules_recurse")
   string(JSON DEP_USE_URL                ERROR_VARIABLE _err GET "${DEP_OBJECT}" "use_url")
   string(JSON DEP_PATCH_FILE            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "patch_file")
   # cmake-format: on
+
+  if(DEP_NAME STREQUAL "cutlass")
+    set(TRTLLM_CUTLASS_TAG "${DEP_GIT_TAG}")
+  elseif(DEP_NAME STREQUAL "msa")
+    # MSA JIT-compiles against the CUTLASS headers staged by TRT-LLM. Force
+    # revalidation when TRT-LLM changes its CUTLASS pin.
+    set(MSA_VALIDATED_CUTLASS_TAG "v4.4.2")
+    if(NOT MSA_VALIDATED_CUTLASS_TAG STREQUAL TRTLLM_CUTLASS_TAG)
+      message(
+        FATAL_ERROR
+          "MSA ${DEP_GIT_TAG} was validated with CUTLASS ${MSA_VALIDATED_CUTLASS_TAG}, "
+          "but fetch_content.json selects ${TRTLLM_CUTLASS_TAG}. Revalidate MSA and "
+          "update MSA_VALIDATED_CUTLASS_TAG.")
+    endif()
+  endif()
 
   # Build FetchContent_Declare arguments
   set(FETCH_ARGS "${DEP_NAME}")
@@ -135,11 +151,15 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
       PATCH_COMMAND
       bash
       -c
-      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || echo 'Patch already applied, skipping.'"
+      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || patch -p1 --reverse --batch --dry-run -i '${_patch_file}' || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2 && false)"
     )
   endif()
 
-  FetchContent_Declare(${FETCH_ARGS})
+  if(_git_submodules_error STREQUAL "NOTFOUND")
+    FetchContent_Declare(${FETCH_ARGS} GIT_SUBMODULES "${DEP_GIT_SUBMODULES}")
+  else()
+    FetchContent_Declare(${FETCH_ARGS})
+  endif()
 
   # Special handling: Export deep_ep commit to global property
   if(DEP_NAME STREQUAL "deep_ep_download")

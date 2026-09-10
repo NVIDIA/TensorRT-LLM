@@ -18,7 +18,7 @@
 
 #include "cutlass/gemm_coord.h"
 #include "tensorrt_llm/common/config.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -45,7 +45,7 @@ namespace kernels
  */
 void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu, void** ptrBGpu,
     void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu, bool isLoraIn,
-    nvinfer1::DataType dataType, int minKN, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream);
+    tensorrt_llm::DataType dataType, int minKN, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream);
 
 /**
  * @brief CUDA Graph compatible wrapper for split-K grouped GEMM operations.
@@ -55,7 +55,7 @@ void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problem
  */
 void cudaGraphSplitKGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
-    bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN,
+    bool isLoraIn, tensorrt_llm::DataType dataType, int splitKSlices, int minKN,
     cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, int64_t* splitKOffsetsGpu, cudaStream_t stream);
 
 } // namespace kernels

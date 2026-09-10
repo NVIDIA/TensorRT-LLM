@@ -102,9 +102,9 @@ Mappings most often missed by adapters:
 | Concern | Module | Non-obvious wiring |
 |---------|--------|--------------------|
 | Linear | `_torch.modules.linear.Linear` | Pass `mapping=model_config.mapping`, `tensor_parallel_mode=TensorParallelMode.{COLUMN,ROW,NONE}`, `allreduce_strategy=model_config.allreduce_strategy`. Every quant scheme (FP8 / NVFP4 / W4A8 / AWQ / weight-only) is automatic — never substitute `nn.Linear`. |
-| Attention (text **and** vision) | `_torch.modules.attention.Attention` (variants: `qk_norm_attention.QKNormRoPEAttention` for QK-norm + YARN; `attention.MLA` for DeepSeek-style) | Same module runs the LLM and the multimodal encoder. For the encoder side, build an ad-hoc `attn_metadata` per forward and pass `predefined_attention_mask=PredefinedAttentionMask.FULL` (or windowed). Reference: `Qwen2_5_VLVisionAttention.prepare_attn_metadata`. |
+| Attention (text **and** vision) | `_torch.attention.attention.Attention` (variants: `qk_norm_attention.QKNormRoPEAttention` for QK-norm + YARN; `mla.MLA` for DeepSeek-style) | Same module runs the LLM and the multimodal encoder. For the encoder side, build an ad-hoc `attn_metadata` per forward and pass `predefined_attention_mask=PredefinedAttentionMask.FULL` (or windowed). Reference: `Qwen2_5_VisionModel.prepare_attn_metadata`. |
 | MLP / Gated MLP | `_torch.modules.mlp.MLP`, `_torch.modules.gated_mlp.GatedMLP`, `_torch.modules.swiglu.swiglu` | `GatedMLP` covers the SwiGLU pattern (gate + up + silu + down) with fused gate/up weights — don't roll it from two `Linear`s and `F.silu`. Plain `MLP` for non-gated cases. Both inherit the same TP / quant story as `Linear`. Reference: `Qwen2_5_VLMLP`. |
-| RoPE | `_torch.modules.rotary_embedding.{RotaryEmbedding, MRotaryEmbedding}` | `MRotaryEmbedding` (mRoPE) is for the **LLM** side of mRoPE-using VLMs (Qwen-VL family), with `mrope_section`-aware cos/sin slicing and 3D `position_ids`. The encoder's internal 2D RoPE uses plain `RotaryEmbedding`. |
+| RoPE | `_torch.attention.rotary_embedding.{RotaryEmbedding, MRotaryEmbedding}` | `MRotaryEmbedding` (mRoPE) is for the **LLM** side of mRoPE-using VLMs (Qwen-VL family), with `mrope_section`-aware cos/sin slicing and 3D `position_ids`. The encoder's internal 2D RoPE uses plain `RotaryEmbedding`. |
 
 ### LLM backbone — reuse via AutoModel
 
@@ -212,7 +212,7 @@ Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern belo
 
 ```python
 class {Name}VisionModel(nn.Module):
-    """Multimodal encoder. Composes _torch.modules.{Attention,Linear,RMSNorm,GatedMLP,RotaryEmbedding}."""
+    """Multimodal encoder. Composes _torch.attention.{attention.Attention, rotary_embedding.RotaryEmbedding} and _torch.modules.{linear.Linear, rms_norm.RMSNorm, gated_mlp.GatedMLP}."""
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         # Concat pixel_values across all requests, build per-image attn_metadata
@@ -304,7 +304,18 @@ class {Name}Model(PreTrainedModel):
 
 ### Phase 3 — Input processor + dummy builder
 
-Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and `BaseMultimodalDummyInputsBuilder` (drives engine warmup / profiling — the base shrinks dummy image resolution until the synthetic prompt fits `input_seq_len`). Colocate in the modeling file. Reference: `Qwen3VLInputProcessorBase`.
+Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and `BaseMultimodalDummyInputsBuilder` (drives engine warmup / KV-cache profiling). Colocate in the modeling file. References: `Qwen3VLInputProcessorBase` (image+video), `Mistral3InputProcessor` (Pixtral).
+
+**Encoder KV-cache memory profiling (deterministic dummy sizing).** The KV-cache profiler sizes the encoder's memory contribution by running the encoder **once** on a worst-case dummy (held resident through the peak measurement), **decoupled** from the text-only LLM dummy. To opt in, the model exposes `encode_multimodal_inputs` (via `MultimodalModelMixin`) and the input processor implements the existing `BaseMultimodalDummyInputsBuilder` contract:
+
+- `get_mm_max_tokens_per_item(max_num_encoder_tokens=None) -> {modality: tokens}` — report bounded startup maxima when the argument is `None`, or the largest legal item per modality under a concrete runtime token budget.
+- `get_dummy_mm_data(*, max_num_encoder_tokens, mm_counts, dtype) -> multimodal_data` — build the profiler-selected per-modality item counts **directly** as processed encoder tensors (no PIL image + HF-processor round-trip).
+
+Following vLLM's separation of common budgeting from model processing geometry, the profiler selects the largest legal runtime workload and computes its repetition count under `encoder_max_num_tokens` and `encoder_max_batch_size`. It passes the resulting plan (for example, `{"image": 8}`) to the concrete processor's `get_dummy_mm_data`; the processor owns only geometry and tensor layout. Qwen builds `pixel_values`/`*_grid_thw`; Mistral builds `pixel_values`/`image_sizes` and uses its private `_vit_tokens` helper so the LLM-side Pixtral hashing count is unchanged. A model without the contract falls back to a text-only dummy (encoder memory unaccounted). Don't hardcode the encoder attention workspace (`max_num_*=8192`): inherit `MultimodalEncoderMixin` and let the engine size it via `setup_attn_metadata` at load.
+
+The workspace dimension comes from `encoder_max_num_tokens`, falling back to the LLM-side `max_num_tokens` when unset. `encoder_max_batch_size` independently bounds the number of atomic items in a multimodal encoder iteration and falls back to `max_batch_size`. The profiler resolves both limits into `mm_counts` before calling `get_dummy_mm_data`. Model-internal attention sequence counts are not the item batch size; they are derived separately from the token budget and model geometry.
+
+> Mixed image+video+audio models profile the supported modality with the largest legal per-item workload under the configured limits. Runtime mixed-modality requests still share the same aggregate token limit.
 
 Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model text-prompt path. **Don't override `__call__`**: the base class's concrete `__call__` dispatches here for text prompts, and also detokenizes `prompt_token_ids → prompt` and falls through to here for non-fast-path VLMs. `call_with_text_prompt` does:
 
@@ -433,6 +444,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 
 **Input processor**
 - [ ] Subclasses both `BaseMultimodalInputProcessor` and `BaseMultimodalDummyInputsBuilder`.
+- [ ] Encoder KV-cache profiling: implements the deterministic dummy contract (`get_mm_max_tokens_per_item` + `get_dummy_mm_data`) and the model exposes `encode_multimodal_inputs`; encoder inherits `MultimodalEncoderMixin` (no hardcoded `max_num_*=8192` — sized by `setup_attn_metadata`). Skipping these = text-only dummy, encoder memory unaccounted.
 - [ ] `call_with_text_prompt` (not `__call__` — that's the base-class dispatcher) runs HF AutoProcessor + tokenizer, builds `multimodal_data` by modality, computes `mrope_config` on CPU, `_postprocess`-rewrites mm token ids to the OOV sentinel.
 - [ ] `mm_processor_kwargs` flow-through preserved. (Tokenized fast path is optional: set `supports_token_id_mm_expansion = True` + implement `get_text_with_mm_placeholders` / `expand_prompt_token_ids_for_mm`; otherwise the base class detokenizes token-ID inputs automatically.)
 - [ ] `_attach_multimodal_embeddings_impl` implemented (not the `attach_multimodal_embeddings` wrapper) if `@support_multimodal_disaggregated`.

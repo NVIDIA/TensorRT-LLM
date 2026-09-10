@@ -276,7 +276,13 @@ class HCHead(nn.Module):
         if not _cuda_available:
             raise RuntimeError("CUDA MHC kernels not available")
         dtype = x.dtype
-        x_bf16 = x.to(torch.bfloat16).contiguous()
+        # The CUDA head consumes a flat ``[M, mult, hidden]`` tensor. Preserve any
+        # leading dims (e.g. ``[batch, block, mult, hidden]`` from the DSpark draft
+        # block) by collapsing to a single token axis and restoring afterwards;
+        # the RMS-norm + weighted sum is independent per token, so this matches the
+        # reference ``hc_head`` which keeps the leading dims.
+        lead = x.shape[:-2]
+        x_bf16 = x.reshape(-1, self.mult, self.hidden_size).to(torch.bfloat16).contiguous()
         y = mhc_hc_head_cuda(
             x_bf16,
             self.fn,
@@ -287,7 +293,7 @@ class HCHead(nn.Module):
             norm_eps=self.norm_eps,
             eps=self.eps,
         )
-        return y.to(dtype)
+        return y.reshape(*lead, self.hidden_size).to(dtype)
 
     def skip_forward(self, x: torch.Tensor) -> torch.Tensor:
         """Skip HCHead computation for pipeline parallelism on non-last ranks."""

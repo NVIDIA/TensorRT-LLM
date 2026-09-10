@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -7,20 +7,20 @@ from transformers import Qwen3MoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 RenormalizeMoeRoutingMethod,
-                                 RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe, get_moe_cls)
-from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
+                             MoEImplClass, RenormalizeMoeRoutingMethod,
+                             RenormalizeNaiveMoeRoutingMethod,
+                             RoutingMethodType, TRTLLMGenFusedMoE, create_moe,
+                             resolve_moe_cls)
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention
@@ -38,7 +38,7 @@ class Qwen3Gate(nn.Module):
         dtype: Optional[torch.dtype] = None,
         apply_routing: bool = False,
         routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
-        moe_backend_cls: Type[MoE] = CutlassFusedMoE,
+        moe_backend_cls: MoEImplClass = CutlassFusedMoE,
     ):
         super().__init__()
         self.top_k = top_k
@@ -111,7 +111,16 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend_cls=get_moe_cls(model_config, layer_idx=layer_idx),
+            moe_backend_cls=resolve_moe_cls(
+                model_config,
+                routing=RoutingMethodType.Renormalize,
+                # Match the create_moe call below, which passes no bias and no
+                # swiglu alpha/beta. Left unknown, gates that create_moe
+                # rejects abstain here and the gate would name a backend the
+                # layer does not run.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            ),
         )
 
         self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA
@@ -134,6 +143,7 @@ class Qwen3MoE(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
@@ -151,6 +161,7 @@ class Qwen3MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if not do_finalize:
@@ -225,6 +236,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[Dict[str, torch.Tensor]] = None,
         deepstack_embeds: Optional[List[torch.Tensor]] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -241,6 +253,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
             mrope_config=mrope_config,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -272,6 +285,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if deepstack_embeds is not None and self.layer_idx in range(
@@ -417,7 +431,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
         )
         self.preload_weight_modules = self.model.preload_weight_modules
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

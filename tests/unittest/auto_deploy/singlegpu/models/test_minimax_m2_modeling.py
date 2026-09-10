@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Hierarchical equivalence tests for MiniMax-M2 AutoDeploy custom model.
@@ -10,6 +10,7 @@ transformers natively), so we include minimal standalone reference classes.
 
 from typing import Tuple
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -519,6 +520,7 @@ def test_full_model_equivalence():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_export():
     """Model can be exported with torch.export and produces correct output."""
     device = "cpu"

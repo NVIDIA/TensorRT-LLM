@@ -1,0 +1,35 @@
+methods:
+  __init__:
+    parameters:
+      acceptance_rate_threshold:
+        annotation: Optional[float]
+        default: null
+      acceptance_rate_window_size:
+        annotation: Optional[Annotated[int, Ge(ge=0)]]
+        default: null
+      allow_advanced_sampling:
+        annotation: bool
+        default: false
+      draft_len_schedule:
+        annotation: Optional[dict[int, int]]
+        default: null
+      load_format:
+        annotation: Optional[str]
+        default: null
+      max_concurrency:
+        annotation: Optional[Annotated[int, Gt(gt=0)]]
+        default: null
+      max_draft_len:
+        annotation: Optional[Annotated[int, Ge(ge=0)]]
+        default: null
+      max_total_draft_tokens:
+        annotation: Optional[int]
+        default: null
+      speculative_model:
+        annotation: Union[str, pathlib.Path, NoneType]
+        default: null
+      use_rejection_sampling:
+        annotation: bool
+        default: false
+    return_annotation: None
+properties: {}

@@ -86,8 +86,8 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --batch-size 32 --seq-len-q 4
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --layer-indices 5,6,7,8
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --layer-indices 5,6,7,8
 
-# Scale DEP=16 to 4 GPUs: reduces the number of experts; uses MNNVL A2A if applicable
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP
+# Scale DEP=16 to 4 GPUs: reduces the number of experts
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend CUTEDSL
 
 # Scale TEP=16 to 4 GPUs: reduces the number of attention heads and experts
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --no-enable-attention-dp
@@ -100,9 +100,31 @@ NP=1 ./mpi_launch.sh ./run.sh config_gen.yaml --model nvidia/NVIDIA-Nemotron-3-N
 NP=2 ./mpi_launch.sh ./run.sh config_ctx.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --mamba-ssm-cache-dtype float16 --batch-size 4
 NP=2 ./mpi_launch.sh ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-Instruct --layer-indices 6,7 --no-enable-attention-dp --mamba-ssm-cache-dtype float16 --batch-size 512
 
+# Run Kimi K3 (KimiLinear: KDA + MLA hybrid), $K3 being a local checkpoint directory.
+# Layer indices are 0-based, so 4,5,6,7 is three KDA layers followed by one full-attention
+# (MLA) layer -- one full period of the 3:1 pattern. Layer 0 is the only dense layer.
+# --moe-backend must be TRTLLM: the SiTU routed experts support only TRTLLM and
+# MEGAMOE_DEEPGEMM, the config files default to CUTLASS, and of those two only TRTLLM is in
+# the balance-method whitelist -- MEGAMOE_DEEPGEMM additionally needs
+# --balance-method NotModified. GEN also builds a prefill runner, so
+# --moe-backend-for-prefill must be set to match.
+# The attn-residual snapshot stack grows one entry every attn_res_block_size (12) layers and
+# is seeded from layer_indices[0], so a slice at 0,1,2,3 measures a cheaper attn_res than one
+# at 48,49,50,51.
+NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1
+
+# Run Kimi K3 with 3 draft tokens per step (seq_len_q = 1 + 3). --spec-max-draft-len makes
+# the cache manager allocate the KDA multi-token verify buffers; without it the run stops
+# with an error. No sampler exists here, so no draft is ever accepted.
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --batch-size 32 --seq-len-q 4 --spec-max-draft-len 3
+
+# Run Kimi K3 at the serving parallelism (DEP16, see examples/kimi_k3/eval_extra_llm_options.yaml)
+NP=16 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1 --moe-max-num-tokens 33024 --use-low-precision-moe-combine
+
 # Run with DeepEP A2A
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_ctx.yaml --moe-backend WIDEEP
-NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_ALLTOALL_METHOD=DeepEP ./run.sh config_gen.yaml --moe-backend WIDEEP
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
+NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # Run with imbalanced ranks: in addition to activating all experts, the specified ratio of tokens is sent to rank 0
 # Note: if balance ratio is 0, the "activate all experts" behavior is not applied
@@ -157,14 +179,14 @@ python3 scripts/build_wheel.py --cuda_architectures native --no-venv --skip_buil
 **Step 3:** Run benchmarks to generate profiles. Run the following command on the controller node, where `NODES` &le; the number of allocated nodes:
 
 ```bash
-# Run DeepSeek-R1 NVFP4 with wide EP; uses MNNVL A2A if applicable
-NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+# Run DeepSeek-R1 NVFP4 with wide EP
+NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # Run with TRTLLMGen
 NODES=4 NP=16 ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend TRTLLM
 
 # Run with DeepEPLowLatency
-NODES=4 NP=16 TRTLLM_FORCE_ALLTOALL_METHOD=DeepEPLowLatency ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend WIDEEP
+NODES=4 NP=16 TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY ./slurm_launch.sh ./run.sh config_gen.yaml --moe-backend CUTEDSL
 
 # You can run 4-GPU and 8-GPU tasks without reallocating the Slurm job
 NODES=1 NP=4 ./slurm_launch.sh ./run.sh config_ctx.yaml
@@ -187,7 +209,7 @@ Run with OpenMPI:
 
 ```bash
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --batch-size 1,2,4 --seq-len-q 1024,8192
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend WIDEEP --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --scaled-from 16 --moe-backend CUTEDSL --batch-size 32,64,128,256,512 --seq-len-q 1,2,3,4
 ```
 
 ## Parse profiles
@@ -255,21 +277,22 @@ Two E2E traces are required because the two pieces of information cannot be capt
           calibration_file_path: profiles/calibration_data.json
       ```
 
-   2. Set `TLLM_PROFILE_START_STOP` to a range that captures some iterations (typically tens of iterations) of the GEN phase. Ensure that every iteration has the same batch size. Capture 5 extra iterations at the beginning, because the first 5 iterations are treated as warm-ups and will be dropped by the parser by default.
+   2. Set `TLLM_PROFILE_START_STOP` to a range that captures some iterations (typically tens of iterations) of the GEN phase. Ensure that every iteration has the same batch size. Capture 5 extra iterations at the beginning, because the first 5 iterations are treated as warm-ups and will be dropped by the parser by default. Calibration data is collected for the iterations `[start, stop)`, i.e. the stop iteration itself is not collected.
 
    3. Capture per-rank nsys profiles; each rank should produce a separate file.
 
       Place `nsys profile` after `mpirun` or `srun`. To minimize profiling overhead and file size, there is no need to capture samples or GPU metrics.
+
+      Trace the whole process instead of gating the collection with `-c cudaProfilerApi`: recent nsys versions export kernels launched by CUDA graphs that were instantiated before the capture range opened without runtime correlation, which breaks `parse_e2e.py`, and stopping the collection mid-run can hang the executor (the engine captures its CUDA graphs during warmup, before any capture range can open). `parse_e2e.py` selects the analyzed iterations via `--start-iter`/`--stop-iter` instead.
 
       If you use `trtllm-serve` or `trtllm-bench`, use the following command order. If you use `examples/disaggregated/slurm/benchmark/submit.py`, setting `gen_profile_range` is sufficient.
 
       ```bash
       NP=$NP ./mpi_launch.sh middleware/mpi_env_from_ompi \
       nsys profile \
-          -t cuda,nvtx \
+          -t cuda,nvtx -s none \
           --cpuctxsw none --cuda-event-trace false \
           --cuda-graph-trace node \
-          -c cudaProfilerApi --capture-range-end stop \
           -o profiles/report_e2e_collect_rank%q{RANK}.nsys-rep \
           --force-overwrite true \
       trtllm-llmapi-launch \
@@ -306,7 +329,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
        --balance-method NotModified \
        --replay-file-path profiles/calibration_data.json \
        --replay-start-iter 47 \
-       --replay-stop-iter 67
+       --replay-stop-iter 66
    ```
 
    Argument explanations:
@@ -320,7 +343,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
    | `--seq-len-q 1` | Should match (1 + MTP) of the end-to-end run. |
    | `--seq-len-kv-cache 2090` | An estimate of the average context length for the captured iterations. The first 5 iterations should be excluded from this estimate because they will be dropped by the parser. |
    | `--replay-file-path` | The calibration file obtained from Step 1. |
-   | `--replay-start-iter` and `--replay-stop-iter` | Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations because they will be dropped by the parser. |
+   | `--replay-start-iter` and `--replay-stop-iter` | Both inclusive. The calibration file contains the end-to-end `TLLM_PROFILE_START_STOP` iterations `[start, stop)`. Do not replay the first 5 iterations because they will be dropped by the parser. |
 
 4. Parse end-to-end profiles with `parse_e2e.py`, and parse layer-wise benchmarks profiles with `parse.py`.
 
@@ -330,6 +353,8 @@ Two E2E traces are required because the two pieces of information cannot be capt
        --graph-trace profiles/report_e2e_collect_rank%.nsys-rep \
        --layer-indices 5,6,7 \
        --warmup-times 5 \
+       --start-iter 42 \
+       --stop-iter 66 \
        -o profiles/report_e2e_collect_rank%.json
    seq 0 $((NP - 1)) | xargs -I% python3 parse.py \
        --world-size $NP \
@@ -351,7 +376,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
 Limitations:
 
 1. Pipeline parallelism is not supported.
-2. Only the CUTLASS and WIDEEP MoE backends are supported.
+2. Only the CUTEDSL, CUTLASS, DEEPGEMM and TRTLLM MoE backends are supported.
 3. Only tested with the GEN phase and attention DP.
 
 ## Developer utilities
@@ -369,8 +394,30 @@ Limitations:
 
 1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
 
-   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `WIDEEP`) and `--moe-backend-for-prefill DEEPGEMM` (or `WIDEEP`) options.
+   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `CUTEDSL`) and `--moe-backend-for-prefill DEEPGEMM` options.
 
 2. Error `huggingface_hub.errors.HfHubHTTPError: 429 Client Error: Too Many Requests for url: https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2/resolve/main/config.json`.
 
    Please use a local model through the `--model` option, or follow Hugging Face's instructions: "We had to rate limit your IP. To continue using our service, create a HF account or login to your existing account, and make sure you pass a HF_TOKEN if you're using the API."
+
+3. Error `Routing results are not replaced` with a MoE backend that routes inside the kernel.
+
+   `--balance-method` overrides routing in Python, so it needs the top-k to be computed outside the MoE kernel. Under attention DP that is always the case; with `--no-enable-attention-dp` the top-k can be fused into the kernel instead. Either add `-x TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1` or set `--balance-method NotModified`.
+
+4. Error `Kimi K3 needs --spec-max-draft-len N for seq_len_q N+1`.
+
+   Kimi K3's multi-token verify path reads speculative KDA state buffers that the cache manager only allocates when it is built with a speculative config. Add `--spec-max-draft-len` equal to `seq_len_q - 1`. Note that the harness has no sampler, so no draft is ever accepted and the result is the zero-acceptance corner of the verify kernel, not a steady-state number.
+
+5. Error `AttributeError: 'KimiLinearConfig' object has no attribute 'n_routed_experts'` with `--scaled-from`.
+
+   Weak scaling rewrites `n_routed_experts`, which Kimi K3's config does not have (it uses `num_experts`). `--scaled-from` is not supported for this model.
+
+6. Numbers look plausible but a factor of ~10 too slow on a hybrid model.
+
+   Several model fast paths fall back silently. Check these lines in the rank-0 log:
+
+   - `KDA kernel dispatch: prefill=optimized decode=optimized verify=optimized`
+   - `fused prefill/decode/verify projections on <N> KDA layers` — `N` must equal the number of KDA layers in `--layer-indices`; `0` means every KDA layer is running the reference path (~70 us/layer of glue around a ~5 us kernel)
+   - `Mamba Cache (kda-replay) is allocated` — only with `--spec-max-draft-len`; without it the legacy per-step verify buffers are used instead
+
+   For reference, Kimi K3 on 4 GPUs (DEP4, one GB200 node) with `--layer-indices 4,5,6,7` and `--load-format DUMMY` runs ~60 ms per CTX iteration at `--batch-size 1 --seq-len-q 8193`, and ~4.2 ms per GEN iteration at `--batch-size 32 --seq-len-q 4 --seq-len-kv-cache 8193 --spec-max-draft-len 3`.

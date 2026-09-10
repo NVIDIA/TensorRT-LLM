@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
@@ -48,7 +49,7 @@ TEST_F(BlockIteratorTest, BasicTest)
     auto constexpr mNumLayers = 5;
     auto constexpr mBlockSize = 32;
     auto const cacheShape = tr::ITensor::makeShape({mNumPrimaryBlocks, mNumLayers, 2, mBlockSize});
-    constexpr nvinfer1::DataType dtype{tr::TRTDataType<DataType>::value};
+    constexpr tensorrt_llm::DataType dtype{tr::TRTDataType<DataType>::value};
     tr::ITensor::SharedPtr pool = tr::BufferManager::cpu(cacheShape, dtype);
     std::vector<SizeType32> blockIds(mNumPrimaryBlocks);
     std::iota(blockIds.begin(), blockIds.end(), 0);
@@ -75,7 +76,7 @@ TEST_F(BlockIteratorTest, BasicTest)
 
 TEST_F(BlockIteratorTest, CacheManagerTest)
 {
-    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
     auto constexpr numLayers = 12;
     auto constexpr numKvHeads = 6;
     auto constexpr sizePerHead = 16;
@@ -108,7 +109,7 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     SizeType32 constexpr maxNewTokens{0};
-    tr::SamplingConfig const samplingConfig{beamWidth};
+    tensorrt_llm::executor::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
 
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});

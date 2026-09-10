@@ -42,6 +42,9 @@ class AttnLifeCycle(NamedTuple):
         start = BlockOrdinal(min(num_blocks, self.num_sink_blocks))
         if self.window_size is None:
             return HalfOpenRange(start, start)
+        # `+ 1` is intentional: attention always runs for >= 1 in-flight input
+        # token at position `history_length`, so the live window is
+        # [history_length + 1 - window_size, history_length]. Do not drop it.
         return HalfOpenRange(
             start,
             BlockOrdinal(max(start, (history_length + 1 - self.window_size) // tokens_per_block)),

@@ -1,22 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import random
 import unittest
 from collections import defaultdict
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional, Union
+from unittest import mock
 
 import torch
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
-                                                   FlashInferAttentionMetadata)
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.backends import (FlashInferAttention,
+                                                    FlashInferAttentionMetadata)
+from tensorrt_llm._torch.attention.backends import \
+    flashinfer as flashinfer_backend
+from tensorrt_llm._torch.attention.backends.flashinfer import (
+    FlashInferWrappers, PlanParams)
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
@@ -60,6 +71,538 @@ class CUDAGraphTestScenario:
 
 
 class TestFlashInferAttention(unittest.TestCase):
+
+    def test_swa_page_sanitization_uses_local_window_order(self) -> None:
+        metadata = object.__new__(FlashInferAttentionMetadata)
+        metadata.kv_cache_manager = SimpleNamespace(
+            layer_offsets={
+                4: 0,
+                5: 1,
+                6: 2
+            },
+            max_attention_window_vec=[128, None, 128],
+        )
+
+        sliding_page_indices = torch.tensor([BAD_PAGE_INDEX, 3],
+                                            dtype=torch.int32)
+        metadata._sanitize_swa_page_indices(sliding_page_indices, layer_idx=4)
+        torch.testing.assert_close(sliding_page_indices,
+                                   torch.tensor([0, 3], dtype=torch.int32))
+
+        full_page_indices = torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32)
+        metadata._sanitize_swa_page_indices(full_page_indices, layer_idx=5)
+        torch.testing.assert_close(
+            full_page_indices,
+            torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32),
+        )
+
+    def test_attention_layer_indices_ignore_zero_kv_layers(self) -> None:
+
+        class FakeHybridManager:
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1, 30: 2}
+                self.num_kv_heads_per_layer = [8, 0, 8]
+
+            def is_attention_layer(self, layer_idx: int) -> bool:
+                return layer_idx != 20
+
+        self.assertEqual(
+            flashinfer_backend._get_attention_layer_indices(
+                FakeHybridManager()), [10, 30])
+
+    def test_attention_layer_indices_support_v1_manager(self) -> None:
+
+        class FakeV1Manager:
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1}
+
+        self.assertEqual(
+            flashinfer_backend._get_attention_layer_indices(FakeV1Manager()),
+            [10, 20])
+
+    def test_hybrid_v2_metadata_uses_first_attention_layer_for_prepare(
+            self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        class FakeHybridManager:
+            blocks_in_primary_pool = 4
+            max_blocks_per_seq = 4
+            tokens_per_block = 32
+            is_vswa = False
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1}
+                self.layer_to_pool_mapping_dict = {0: 0, 1: 0}
+
+            def is_attention_layer(self, layer_idx: int) -> bool:
+                return layer_idx == 20
+
+            def get_layer_page_index_scale(self, layer_idx: int) -> int:
+                return 1
+
+        manager = FakeHybridManager()
+        manager.get_buffers = mock.Mock(
+            side_effect=lambda layer_idx: torch.empty(4) if layer_idx == 20 else
+            self.fail("recurrent layer queried for KV buffers"))
+        manager.get_batch_cache_indices_flat = mock.Mock(
+            return_value=torch.tensor([2], dtype=torch.int32))
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.zeros(1, dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[1],
+            ),
+            max_num_requests=1,
+            max_num_tokens=1,
+            kv_cache_manager=manager,
+            request_ids=[7],
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
+            mamba_metadata=False,
+        )
+
+        self.assertEqual(metadata._primary_kv_layer_idx, 20)
+        manager.get_buffers.assert_called_once_with(20)
+
+        metadata.prepare()
+
+        manager.get_batch_cache_indices_flat.assert_called_once_with(
+            [7], [1], layer_idx=20)
+
+    def test_generation_page_table_uses_reserved_block_count(self):
+        manager = SimpleNamespace(get_batch_cache_indices=mock.Mock(
+            return_value=[list(range(325))]))
+
+        self.assertEqual(
+            flashinfer_backend._get_page_table_num_blocks(manager, [98, 99],
+                                                          [3, 324],
+                                                          num_contexts=1),
+            [3, 325],
+        )
+        manager.get_batch_cache_indices.assert_called_once_with([99])
+
+    def test_decode_query_width_is_part_of_plan_params(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=3,
+            max_num_tokens=18,
+        )
+
+        def return_plan_params(plan_params, _flashinfer_backend):
+            return plan_params
+
+        with mock.patch.object(
+                metadata,
+                "_plan_with_params",
+                side_effect=return_plan_params,
+        ):
+            single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([1, 1, 1], dtype=torch.int32)
+            larger_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int32)
+            metadata._uses_full_generation_page_table = True
+            full_page_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._uses_full_generation_page_table = False
+            metadata._is_shared_kv_draft_view = True
+            shared_draft_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._is_shared_kv_draft_view = False
+            metadata.seq_lens = torch.tensor([6, 6], dtype=torch.int32)
+            multi_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([6, 6, 6], dtype=torch.int32)
+            larger_batch_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+
+        self.assertEqual(single_token_plan.q_len_per_req, 1)
+        self.assertEqual(larger_single_token_plan.q_len_per_req, 1)
+        self.assertEqual(single_token_plan, larger_single_token_plan)
+        self.assertEqual(single_token_plan, full_page_single_token_plan)
+        self.assertEqual(single_token_plan, shared_draft_single_token_plan)
+        self.assertEqual(multi_token_plan.q_len_per_req, 6)
+        self.assertNotEqual(single_token_plan, multi_token_plan)
+        # The live generation batch size deliberately does not key the cache. Eager metadata
+        # replans every wrapper on each prepare() and sizes their block tables by
+        # max_num_requests, so keying on it would allocate a fresh wrapper per batch size seen.
+        self.assertEqual(multi_token_plan, larger_batch_plan)
+
+        metadata.seq_lens = torch.tensor([6, 5], dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "uniform query length"):
+            metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+
+    def test_cuda_graph_metadata_owns_a_private_plan_cache(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=4,
+            max_num_tokens=16,
+        )
+        plan_params = PlanParams(
+            num_heads=32,
+            num_kv_heads=4,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            attention_mask_type=AttentionMaskType.causal,
+        )
+        eager_wrappers = FlashInferWrappers(is_planned=True)
+        metadata._plan_params_to_wrappers[plan_params] = eager_wrappers
+
+        graph_metadata = metadata.create_cuda_graph_metadata(2)
+
+        # Wrappers belong to a metadata instance, and the runner builds one metadata per captured
+        # batch size. That partitioning -- not the cache key -- is what keeps a graph wrapper from
+        # being reused across batch sizes, so PlanParams need not carry the generation batch size.
+        self.assertTrue(graph_metadata.is_cuda_graph)
+        self.assertIsNot(graph_metadata._plan_params_to_wrappers,
+                         metadata._plan_params_to_wrappers)
+        self.assertEqual(graph_metadata._plan_params_to_wrappers, {})
+        self.assertIs(metadata._plan_params_to_wrappers[plan_params],
+                      eager_wrappers)
+
+    def test_generation_page_table_keeps_logical_positions(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        kv_cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=256),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+        try:
+            kv_cache_manager.add_dummy_requests([0], [32],
+                                                is_gen=True,
+                                                max_num_draft_tokens=3)
+            reserved_blocks = kv_cache_manager.get_batch_cache_indices([0])
+            self.assertEqual(len(reserved_blocks[0]), 2)
+
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.full((1, ), 4, dtype=torch.int32),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=[28],
+                    use_full_generation_page_table=True,
+                ),
+                max_num_requests=1,
+                max_num_tokens=4,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=[0],
+            )
+            metadata.prepare()
+
+            self.assertEqual(metadata.num_blocks, [2])
+            torch.testing.assert_close(
+                metadata.paged_kv_indptr_decode[:2],
+                torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
+            )
+            torch.testing.assert_close(
+                metadata._paged_kv_last_page_len[:1],
+                torch.tensor([32], dtype=torch.int32, device="cuda"),
+            )
+            torch.testing.assert_close(
+                metadata._logical_kv_lens[:1],
+                torch.tensor([32], dtype=torch.int32, device="cuda"),
+            )
+            torch.testing.assert_close(
+                metadata.positions,
+                torch.tensor([28, 29, 30, 31], dtype=torch.int32,
+                             device="cuda"),
+            )
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_spec_decode_offsets_update_append_and_decode_lengths(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        kv_cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=256),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+        try:
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.full((2, ), 4, dtype=torch.int32),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(use_cache=True),
+                max_num_requests=2,
+                max_num_tokens=8,
+                kv_cache_manager=kv_cache_manager,
+            )
+            cached_token_lens = torch.tensor([31, 62],
+                                             dtype=torch.int32,
+                                             device="cuda")
+            positions = torch.tensor([31, 32, 33, 34, 62, 63, 64, 65],
+                                     dtype=torch.int32,
+                                     device="cuda")
+            metadata._cached_token_lens[:2].copy_(cached_token_lens)
+            metadata._logical_kv_lens[:2].copy_(cached_token_lens + 4)
+            metadata._uses_full_generation_page_table = True
+            metadata._positions[:8].copy_(positions)
+            kv_lens_buffer = torch.tensor([35, 66],
+                                          dtype=torch.int32,
+                                          device="cuda")
+            metadata._plan_params_to_wrappers = {
+                object():
+                FlashInferWrappers(
+                    is_planned=True,
+                    decode_wrapper=SimpleNamespace(
+                        _kv_lens_buffer=kv_lens_buffer),
+                )
+            }
+            offsets = torch.tensor([-3, -1], dtype=torch.int32, device="cuda")
+
+            metadata.apply_spec_decode_kv_lens_offsets(
+                offsets,
+                num_generations=2,
+                tokens_per_generation=4,
+            )
+
+            torch.testing.assert_close(
+                metadata._cached_token_lens[:2],
+                torch.tensor([28, 61], dtype=torch.int32, device="cuda"),
+            )
+            torch.testing.assert_close(
+                metadata._logical_kv_lens[:2],
+                torch.tensor([32, 65], dtype=torch.int32, device="cuda"),
+            )
+            torch.testing.assert_close(
+                metadata._positions[:8],
+                torch.tensor([28, 29, 30, 31, 61, 62, 63, 64],
+                             dtype=torch.int32,
+                             device="cuda"),
+            )
+            torch.testing.assert_close(
+                kv_lens_buffer,
+                torch.tensor([32, 65], dtype=torch.int32, device="cuda"),
+            )
+
+            metadata.apply_spec_decode_kv_lens_offsets(
+                offsets,
+                num_generations=2,
+                tokens_per_generation=4,
+                restore=True,
+            )
+            torch.testing.assert_close(metadata._cached_token_lens[:2],
+                                       cached_token_lens)
+            torch.testing.assert_close(metadata._logical_kv_lens[:2],
+                                       cached_token_lens + 4)
+            torch.testing.assert_close(metadata._positions[:8], positions)
+            torch.testing.assert_close(
+                kv_lens_buffer,
+                torch.tensor([35, 66], dtype=torch.int32, device="cuda"),
+            )
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_separate_kv_draft_metadata_uses_draft_manager(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            self.skipTest("FlashInfer trtllm-gen requires SM100 or SM103")
+
+        def create_manager():
+            return KVCacheManager(
+                KvCacheConfig(max_tokens=256),
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=128,
+                tokens_per_block=32,
+                max_seq_len=64,
+                max_batch_size=2,
+                mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                dtype=tensorrt_llm.bindings.DataType.BF16,
+            )
+
+        target_manager = create_manager()
+        draft_manager = create_manager()
+        try:
+            target_manager.add_dummy_requests([0, 1], [31, 45], is_gen=True)
+            draft_manager.add_dummy_requests([0, 1], [31, 45],
+                                             is_gen=True,
+                                             max_num_draft_tokens=3)
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.ones(2, dtype=torch.int32),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=[30, 44],
+                ),
+                max_num_requests=2,
+                max_num_tokens=8,
+                kv_cache_manager=target_manager,
+                request_ids=[0, 1],
+                is_cuda_graph=True,
+            )
+            metadata.prepare()
+            draft_metadata = metadata.get_draft_metadata(draft_manager)
+
+            self.assertIs(draft_metadata.kv_cache_manager, draft_manager)
+            self.assertFalse(hasattr(metadata, "kv_lens_cuda"))
+            torch.testing.assert_close(
+                draft_metadata.kv_lens_cuda[:2],
+                torch.tensor([31, 45], dtype=torch.int32, device="cuda"),
+            )
+            draft_blocks = draft_manager.get_batch_cache_indices([0, 1])
+            self.assertEqual(draft_metadata.num_blocks,
+                             list(map(len, draft_blocks)))
+
+            layer = FlashInferAttention(
+                layer_idx=0,
+                num_heads=1,
+                num_kv_heads=1,
+                head_dim=128,
+                flashinfer_backend="trtllm-gen",
+            )
+            q = torch.randn(2, 128, dtype=torch.bfloat16, device="cuda")
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+            self.assertEqual(
+                layer.forward(q, k, v, draft_metadata).shape, q.shape)
+            for wrappers in draft_metadata._plan_params_to_wrappers.values():
+                torch.testing.assert_close(
+                    wrappers.decode_wrapper._kv_lens_buffer[:2],
+                    draft_metadata.kv_lens_cuda[:2],
+                )
+
+            with mock.patch.object(
+                    draft_metadata,
+                    "_plan_with_params",
+                    wraps=draft_metadata._plan_with_params,
+            ) as replan, mock.patch.object(
+                    draft_metadata,
+                    "_build_decode_block_tables",
+            ) as refresh_block_tables:
+                metadata.prepare()
+            replan.assert_not_called()
+            self.assertEqual(refresh_block_tables.call_count,
+                             len(draft_metadata._plan_params_to_wrappers))
+        finally:
+            target_manager.shutdown()
+            draft_manager.shutdown()
+
+    def test_ragged_no_kv_cuda_graph_uses_stable_indptr_aliases(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        class FakeRaggedWrapper:
+
+            def plan(self, **kwargs):
+                self.plan_kwargs = kwargs
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+            num_contexts=2,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=2,
+            max_num_tokens=8,
+        )
+        metadata.is_cuda_graph = True
+        plan_params = PlanParams(
+            num_heads=2,
+            num_kv_heads=2,
+            head_dim=4,
+            q_dtype=torch.float16,
+            kv_dtype=torch.float16,
+            attention_mask_type=AttentionMaskType.padding,
+        )
+        wrapper = FakeRaggedWrapper()
+
+        with mock.patch.object(
+                flashinfer_backend.flashinfer,
+                "BatchPrefillWithRaggedKVCacheWrapper",
+                FakeRaggedWrapper,
+        ):
+            metadata._plan_ragged_no_kv(plan_params, wrapper, "cudnn")
+
+        self.assertIn("kv_indptr", wrapper.plan_kwargs)
+        self.assertNotIn("v_indptr", wrapper.plan_kwargs)
+        self.assertNotIn("o_indptr", wrapper.plan_kwargs)
 
     @parameterized.expand([
         Scenario(num_layers=1,
@@ -666,3 +1209,108 @@ class TestFlashInferAttention(unittest.TestCase):
                 "cudnn",
                 msg="No-KV ragged prefill should use FlashInfer's cudnn backend",
             )
+
+    def test_ragged_prefill_no_kv_cache_with_cuda_graphs(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        device = torch.device("cuda")
+        num_heads = 8
+        num_kv_heads = 8
+        head_dim = 80
+        hidden_size = num_heads * head_dim
+        dtype = torch.bfloat16
+        per_sequence_token_counts = [24, 56]
+        num_context_sequences = len(per_sequence_token_counts)
+        total_tokens = sum(per_sequence_token_counts)
+        max_num_requests = 8
+
+        seq_lens = torch.tensor(
+            per_sequence_token_counts,
+            dtype=torch.int,
+            pin_memory=prefer_pinned(),
+        )
+        request_ids = list(range(1, num_context_sequences + 1))
+
+        attn_metadata_ref = TestingFlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=num_context_sequences,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max(total_tokens * 2, 8192),
+            kv_cache_manager=None,
+            request_ids=request_ids,
+        )
+        attn_metadata_cuda_graph = TestingFlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=num_context_sequences,
+            is_cuda_graph=True,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max(total_tokens * 2, 8192),
+            kv_cache_manager=None,
+            request_ids=request_ids,
+        )
+        attn_metadata_ref.prompt_lens = list(per_sequence_token_counts)
+        attn_metadata_cuda_graph.prompt_lens = list(per_sequence_token_counts)
+        attn_metadata_ref.prepare()
+        attn_metadata_cuda_graph.prepare()
+
+        layer = FlashInferAttention(
+            layer_idx=0,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+        )
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        query_states = torch.randn(
+            total_tokens,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        key_states = torch.randn(
+            total_tokens,
+            num_kv_heads * head_dim,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        value_states = torch.randn(
+            total_tokens,
+            num_kv_heads * head_dim,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+
+        result_ref = layer.forward(
+            query_states,
+            key_states,
+            value_states,
+            attn_metadata_ref,
+            attention_mask=PredefinedAttentionMask.FULL,
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        for _ in range(2):
+            layer.forward(
+                query_states,
+                key_states,
+                value_states,
+                attn_metadata_cuda_graph,
+                attention_mask=PredefinedAttentionMask.FULL,
+            )
+
+        with torch.cuda.graph(graph):
+            result_actual = layer.forward(
+                query_states,
+                key_states,
+                value_states,
+                attn_metadata_cuda_graph,
+                attention_mask=PredefinedAttentionMask.FULL,
+            )
+
+        graph.replay()
+        torch.testing.assert_close(result_actual, result_ref, atol=1e-2, rtol=0)

@@ -1,99 +1,102 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Exercise the real MX checkpoint loader pre-transfer SourceIdentity gate.
+"""Exercise the real ModelExpress identity gate before RDMA mutation."""
 
-These tests drive `MXCheckpointLoader._source_identity_compatible` directly —
-the single decision point the MX `load_weights` path consults before starting
-a P2P transfer. Upstream `modelexpress` is never imported: the discovery
-client / identity builder are passed as stubs, and the publisher-identity fetch
-seam is patched, so the gate logic runs against real `SourceIdentity` objects
-without any model, GPU, or RDMA.
-"""
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from _source_identity_fakes import FakeMapping
-from _source_identity_fakes import make_identity as _identity
+import pytest
+from _source_identity_fakes import make_identity
 
-from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
+from tensorrt_llm._torch.weight_sharing import (
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    SOURCE_IDENTITY_FORMAT_VERSION,
+)
+
+pytest.importorskip("modelexpress")
+
+import modelexpress.load_strategy as load_strategy  # noqa: E402
+from modelexpress.engines import trtllm  # noqa: E402
+from modelexpress.load_strategy import rdma_strategy  # noqa: E402
 
 
-def _new_loader(local_identity, source_identity, fetched=True):
-    """Construct a loader bypassing heavy base __init__, wire the seams."""
-    loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
-    loader._local_source_identity = local_identity
-    # Patch the single fetch seam to return the publisher identity (or None).
-    loader._fetch_source_identity = lambda *a, **k: source_identity if fetched else None
-    return loader
+def _identity(*, transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1):
+    return replace(
+        make_identity(model_name="meta-llama/Llama-3.1-8B-Instruct"),
+        transform_abi_id=transform_abi_id,
+    )
 
 
-# MxClient / build_identity are only forwarded to the (patched) fetch seam.
-_STUB_CLIENT = object()
-_STUB_BUILD = object()
+def _mx_modules():
+    return trtllm, load_strategy, rdma_strategy
 
 
-def test_gate_proceeds_on_matching_identity():
-    local = _identity(attn_backend="TRTLLM")
-    source = _identity(attn_backend="TRTLLM")
-    loader = _new_loader(local, source)
-    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is True
-
-
-def test_gate_falls_back_on_mismatch():
-    local = _identity(attn_backend="TRTLLM")
-    source = _identity(attn_backend="FLASHINFER")
-    loader = _new_loader(local, source)
-    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is False
-
-
-def test_gate_falls_back_when_no_local_identity():
-    # MX must not consume shared weights unless the receiver identity exists.
-    loader = _new_loader(None, _identity())
-    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is False
-
-
-def test_gate_falls_back_when_source_identity_unavailable():
-    # Publisher identity not yet fetchable (upstream metadata channel pending);
-    # reject P2P and fall back to disk rather than sharing unverified weights.
-    local = _identity()
-    loader = _new_loader(local, None, fetched=False)
-    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is False
-
-
-def test_fetch_source_identity_returns_none_until_upstream_wired():
-    # The seam currently returns None by contract; this pins that behavior so
-    # the day it is wired to real MX metadata, the change is deliberate.
-    loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
-    assert loader._fetch_source_identity("ckpt", _STUB_CLIENT, _STUB_BUILD) is None
-
-
-def test_load_weights_pops_source_identity_kwarg():
-    # source_identity must be consumed by load_weights and never leak into the
-    # HfCheckpointLoader disk-fallback signature. With no server URL configured
-    # the loader takes the disk-fallback path; we only assert the kwarg is
-    # stored and not forwarded.
-    loader = MXCheckpointLoader.__new__(MXCheckpointLoader)
-    loader._mx_server_url = None
-    loader._p2p_succeeded = False
-    captured = {}
-
-    def fake_fallback(checkpoint_dir, mapping, *, reason=None, **kwargs):
-        captured["kwargs"] = kwargs
-        return {}
-
-    loader._fallback_to_disk = fake_fallback
+def test_real_adapter_serializes_authoritative_trt_identity():
+    trtllm, _, _ = _mx_modules()
     identity = _identity()
-    loader.load_weights("ckpt", mapping=FakeMapping(), model=None, source_identity=identity)
-    assert loader._local_source_identity is identity
-    assert "source_identity" not in captured["kwargs"]
-    assert "model" not in captured["kwargs"]
+
+    mx_identity = trtllm.build_mx_identity(
+        identity,
+        transform_protocol_version=1,
+    )
+    serialized = json.loads(mx_identity.extra_parameters["trtllm_source_identity"])
+
+    assert serialized == {
+        key: value for key, value in identity.to_dict().items() if key != "model_name"
+    }
+    assert serialized["format_version"] == SOURCE_IDENTITY_FORMAT_VERSION
+    assert serialized["transform_abi_id"] == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+
+
+@pytest.mark.parametrize(
+    "incompatible_identity",
+    [
+        _identity(transform_abi_id="trtllm-llama-target-layout-v2"),
+        replace(_identity(), format_version=SOURCE_IDENTITY_FORMAT_VERSION - 1),
+        replace(_identity(), backend_fingerprint="different-backend"),
+        replace(
+            _identity(),
+            artifact_identity=replace(_identity().artifact_identity, digest="1" * 64),
+        ),
+    ],
+    ids=["transform-abi", "format", "backend", "artifact"],
+)
+def test_incompatible_identity_falls_back_before_receiver_mutation(
+    incompatible_identity,
+):
+    trtllm, load_strategy, rdma_strategy = _mx_modules()
+    target_identity = trtllm.build_mx_identity(
+        _identity(),
+        transform_protocol_version=1,
+    )
+    published_identity = trtllm.build_mx_identity(
+        incompatible_identity,
+        transform_protocol_version=1,
+    )
+
+    class _Client:
+        def __init__(self):
+            self.queried_identity = None
+
+        def list_sources(self, *, identity, status_filter):
+            self.queried_identity = identity
+            instances = [MagicMock()] if identity == published_identity else []
+            return SimpleNamespace(instances=instances)
+
+    client = _Client()
+    ctx = SimpleNamespace(
+        mx_client=client,
+        identity=target_identity,
+        global_rank=0,
+        worker_rank=0,
+    )
+    result = load_strategy.LoadResult(value=MagicMock(), model=MagicMock())
+
+    with pytest.raises(load_strategy.StrategyFailed) as error:
+        rdma_strategy.RdmaStrategy().load(result, ctx)
+
+    assert error.value.mutated is False
+    assert client.queried_identity == target_identity
+    assert target_identity != published_identity

@@ -44,23 +44,23 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
 from ..distributed import AllReduce, AllReduceParams, allgather
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import create_moe
-from ..modules.fused_moe.interface import MoEWeightLoadingMode
-from ..modules.fused_moe.routing import MiniMaxM2MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import create_moe
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
+from ..moe.fused_moe.routing import MiniMaxM2MoeRoutingMethod
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, create_lm_head_tp_mapping
 from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
@@ -377,8 +377,8 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
 
     Inherits from ``MiniMaxM2MoeRoutingMethod`` so the TRTLLMGen
     ``_extract_routing_params`` helper recognises us via ``isinstance`` and
-    feeds the bias pointer to the kernel. The MiniMax2 C++ routing path
-    hard-codes ``routeScale = 1.0f`` (see ``runner.cu``), so
+    feeds the bias pointer to the kernel. The generic MiniMax2 metadata does
+    not supply a route scale and therefore defaults to ``1.0f``, so
     ``routed_scaling_factor`` is applied to the MoE output in
     ``Step3p7MoE.forward`` instead of inside the kernel.
     """
@@ -402,6 +402,7 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
     def apply(
         self,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = torch.sigmoid(router_logits.to(torch.float32))
         scores_with_bias = scores + self.router_bias.unsqueeze(0)
@@ -902,7 +903,7 @@ class Step3p7MoE(nn.Module):
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             use_dp_padding=False,
         )
-        # TRTLLMGen MiniMax2 kernel hard-codes routeScale=1.0, so apply
+        # Step3p7 uses the generic MiniMax2 metadata with routeScale=1.0, so apply
         # ``routed_scaling_factor`` to the MoE output here (mathematically
         # equivalent to scaling each topk weight).
         if self.routed_scaling_factor != 1.0:

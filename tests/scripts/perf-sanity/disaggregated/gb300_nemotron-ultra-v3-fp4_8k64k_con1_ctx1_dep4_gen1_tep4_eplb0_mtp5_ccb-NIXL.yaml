@@ -1,0 +1,120 @@
+# Nemotron-3-Ultra-550B-A55B (mixed NVFP4 weights + FP8 KV + fp16 Mamba cache),
+# disaggregated E2E, 8K ISL / 64K OSL. Operating point 3 of 3 on the DISAGG-E2E
+# 8K/64K Pareto frontier (packaged 2026-07-23 by evwu):
+#   LATENCY-oriented endpoint -- max tps/user (~436 tps/user).
+#   gen = TEP4 bs1 mtp5, 1 ctx : 1 gen instance, concurrency 1.
+#   Physical footprint: 4 (ctx) + 4 (1 gen x 4) = 8 GPUs / 2 GB300 nodes.
+# The captured configs ran on 1.3.0rc16 (points 01/02 ran on rc19) and spelled the
+# MTP depth as speculative_config.num_nextn_predict_layers; that field was removed
+# from the user-facing MTPDecodingConfig on main (StrictBaseModel now rejects it),
+# so it is translated here to the canonical max_draft_len (same value, 5).
+metadata:
+  model_name: nemotron_ultra_v3_fp4
+  precision: fp4
+  model_dir_name: Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k
+  supported_gpus:
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 8k64k
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: --gres=gpu:4
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 8
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '1'
+  input_length: 8192
+  output_length: 65536
+  # Random synthetic dataset: the captured run used a fixed 8192/65536 dataset
+  # (nemotron-ultra-8192-65536-...json) that is not committed; leaving
+  # <dataset_file> as a placeholder makes test_perf_sanity.py fall through to the
+  # random-dataset benchmark path, matching the GLM-5 / DSv4-Pro perf-sanity pattern.
+  dataset_file: <dataset_file>
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_PURGE_DELAY=0
+  gen_worker_env_var: TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3 TRTLLM_USE_MAMBA_REPLAY=1
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+profiling:
+  nsys_on: false
+worker_config:
+  gen:
+    print_iter_log: true
+    max_batch_size: 1
+    max_num_tokens: 6
+    max_seq_len: 73984
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    enable_lm_head_tp_in_adp: false
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 4]
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+      dtype: fp8
+      mamba_ssm_cache_dtype: float16
+      mamba_ssm_philox_rounds: 5
+      mamba_ssm_stochastic_rounding: true
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      max_tokens_in_buffer: 8448
+      kv_transfer_timeout_ms: 600000
+      backend: NIXL
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
+    speculative_config: &id001
+      decoding_type: MTP
+      max_draft_len: 5
+    num_postprocess_workers: 4
+    stream_interval: 20
+  ctx:
+    print_iter_log: true
+    max_batch_size: 8
+    max_num_tokens: 8448
+    max_seq_len: 8448
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: true
+    cuda_graph_config: null
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+      dtype: fp8
+      mamba_ssm_cache_dtype: float16
+      mamba_ssm_philox_rounds: 5
+      mamba_ssm_stochastic_rounding: true
+    moe_config:
+      backend: CUTEDSL
+      max_num_tokens: 65536
+    cache_transceiver_config:
+      max_tokens_in_buffer: 8448
+      kv_transfer_timeout_ms: 600000
+      backend: NIXL
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: true
+    speculative_config: *id001

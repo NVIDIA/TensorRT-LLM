@@ -313,7 +313,7 @@ def make_mxfp4_sharding_load_hook(
     if moe_tp_size > 1:
         # Lazy import: TRT-LLM-only helper. Keeps this module importable in
         # standalone (no tensorrt_llm) so its transforms still register.
-        from tensorrt_llm._torch.modules.fused_moe.quantization import _get_weight_alignment
+        from tensorrt_llm._torch.moe.fused_moe.quantization import _get_weight_alignment
 
         alignment_tp = _get_weight_alignment(
             _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, intermediate_size
@@ -801,7 +801,7 @@ class QuantizeMXFP4MOE(BaseTransform):
             # weight-alignment size that the trtllm-gen runner expects.
             if moe_tp_size > 1:
                 # Lazy import: TRT-LLM-only helper (see module-level note above).
-                from tensorrt_llm._torch.modules.fused_moe.quantization import _get_weight_alignment
+                from tensorrt_llm._torch.moe.fused_moe.quantization import _get_weight_alignment
 
                 alignment_tp = _get_weight_alignment(
                     _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, i_size
@@ -945,7 +945,7 @@ class QuantizeMXFP4MOE(BaseTransform):
             # 88.02%).
             tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
             if tp_size > 1:
-                from .sharding import _get_dist_ops
+                from .sharding_ir import _get_dist_ops
 
                 _, all_reduce_op = _get_dist_ops("auto")
                 view_node = next(

@@ -1,10 +1,10 @@
 import gc
-import os
-import sys
 import unittest
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+import pytest
 from gc_utils import assert_resource_freed
+
+pytestmark = pytest.mark.cpu_only
 
 # A global list to simulate a leak
 LEAKY_HOLD = []

@@ -20,24 +20,27 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
+from .mapping import PARALLEL_MODE_SYNTAX_HINT, _resolve_mapping_layout, is_named_parallel_mode
 from .routing import _per_rank_tokens
 from .search import (
     _coerce_str_tuple,
+    _default_parallel_axis_values,
     _maybe_auto_enable_search_axes,
     _parse_analysis,
     _parse_search_axes,
     _resolve_search_from_args,
 )
 from .specs import (
+    _ACTIVATIONS,
     _ALL_BACKENDS,
     _COMM_METHODS,
     _ROUTING_METHODS,
@@ -83,6 +86,17 @@ def _resolve_benchmark_context(args: argparse.Namespace) -> _BenchmarkContext:
 
 
 def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int) -> Dict[str, Any]:
+    # A parallel-mode sweep can mix attention-DP and attention-TP layouts, so
+    # there is no single header-level token distribution. Candidate rows carry
+    # the resolved distribution; leave the shared workload metadata unset.
+    per_rank_num_tokens: Optional[List[List[int]]] = None
+    if not ctx.search.parallel_modes:
+        enable_dp = bool(_resolve_mapping_layout(ctx.base_config, world_size)[2])
+        per_rank_num_tokens = [
+            _per_rank_tokens(workload, world_size, enable_dp=enable_dp)
+            for workload in ctx.workloads
+        ]
+
     return {
         "benchmark": "bench_moe",
         "launcher": launcher,
@@ -91,10 +105,30 @@ def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int)
         "world_size": world_size,
         "analysis": list(ctx.analysis) or ["summary"],
         "workloads": [
-            w.to_dict(per_rank_num_tokens=_per_rank_tokens(w, world_size)) for w in ctx.workloads
+            w.to_dict(
+                per_rank_num_tokens=(
+                    per_rank_num_tokens[index] if per_rank_num_tokens is not None else None
+                )
+            )
+            for index, w in enumerate(ctx.workloads)
         ],
         "base_config": ctx.base_config.to_dict(),
     }
+
+
+def _parallel_mode_arg(value: str) -> str:
+    """Argparse ``type`` for ``--parallel_mode``.
+
+    A fixed ``choices=`` tuple cannot express the hybrid ``(D|T)TP<k>EP<m>``
+    grammar, so validation happens here instead. The four legacy names and
+    ``CUSTOM`` are accepted exactly as before.
+    """
+    mode = str(value).upper()
+    if mode == "CUSTOM" or is_named_parallel_mode(mode):
+        return mode
+    raise argparse.ArgumentTypeError(
+        f"invalid parallel mode {value!r}; {PARALLEL_MODE_SYNTAX_HINT}"
+    )
 
 
 def _add_search_arguments(parser: argparse.ArgumentParser) -> None:
@@ -147,7 +181,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=sorted(BUILT_IN_MODELS.keys()),
         help=(
-            "Built-in model shape. Examples: deepseek_v3, qwen1.5_moe. "
+            "Built-in model shape. Example: deepseek_v3. "
             "Omit only when passing all custom shape fields below."
         ),
     )
@@ -188,6 +222,24 @@ def parse_args() -> argparse.Namespace:
         help="DeepSeek-style number of routing groups kept per token.",
     )
     model_group.add_argument(
+        "--n_shared_experts",
+        type=int,
+        default=None,
+        help="Number of shared experts to fuse into the routed-expert grouped "
+        "GEMM (DeepSeek-style). Only takes effect on the TRTLLM backend with "
+        "FP8_BLOCK_SCALES and dp_size==1; ignored by other backends. Default 0.",
+    )
+    model_group.add_argument(
+        "--shared_expert_mode",
+        type=lambda s: str(s).lower(),
+        default="fused",
+        choices=["fused", "unfused"],
+        help="How shared experts (n_shared_experts>0) are realized: 'fused' folds "
+        "them into the routed grouped GEMM (PR #11143); 'unfused' runs the routed "
+        "MoE plus a separate shared GatedMLP and sums them (pre-fusion baseline, "
+        "for measuring fusion's net benefit). Default fused.",
+    )
+    model_group.add_argument(
         "--quant",
         type=lambda s: QuantAlgo[str(s).upper()] if s is not None else None,
         default=None,
@@ -204,6 +256,13 @@ def parse_args() -> argparse.Namespace:
             "default; custom shapes must specify an explicit method."
         ),
     )
+    model_group.add_argument(
+        "--activation",
+        type=lambda s: str(s).upper(),
+        default=None,
+        choices=sorted(_ACTIVATIONS),
+        help="Expert activation. Defaults to the model's value, else SWIGLU.",
+    )
 
     workload_group = parser.add_argument_group("Workload shape")
     workload_group.add_argument(
@@ -214,8 +273,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         required=False,
         help=(
-            "Global token counts to sweep. Each value is balanced across ranks "
-            "with any remainder on rank 0. Example: --balanced_total_num_tokens 64 256 1024."
+            "Global token counts to sweep. Each value is balanced across ranks, "
+            "spreading any remainder one token per leading rank (e.g. world_size=4, "
+            "tokens=2 -> [1, 1, 0, 0]). Example: --balanced_total_num_tokens 64 256 1024."
         ),
     )
 
@@ -303,15 +363,17 @@ def parse_args() -> argparse.Namespace:
     parallel_group = parser.add_argument_group("Parallel layout")
     parallel_group.add_argument(
         "--parallel_mode",
-        type=str,
+        type=_parallel_mode_arg,
         nargs="+",
         default=("DEP",),
-        choices=("DEP", "TEP", "DTP", "TTP", "CUSTOM"),
+        metavar="MODE",
         help=(
             "Parallel layout(s) to benchmark. Pass multiple values to sweep, e.g. "
             "--parallel_mode DEP TEP. DEP=attention DP + MoE EP; TEP=attention TP + "
-            "MoE EP; DTP/TTP use MoE TP; CUSTOM requires --moe_ep_size and "
-            "--moe_tp_size and must be passed alone."
+            "MoE EP; DTP/TTP use MoE TP. Hybrid MoE TP x EP layouts have their own "
+            "sweepable names, (D|T)TP<k>EP<m> with moe_tp_size=k and moe_ep_size=m "
+            "(e.g. DTP2EP2, TTP2EP4); k*m must equal world_size. CUSTOM requires "
+            "--moe_ep_size and --moe_tp_size and must be passed alone."
         ),
     )
     parallel_group.add_argument(
@@ -370,6 +432,14 @@ def parse_args() -> argparse.Namespace:
     )
     timing_group.add_argument("--warmup", type=int, default=1, help="Warmup iterations per case.")
     timing_group.add_argument("--iters", type=int, default=12, help="Timed iterations per case.")
+    timing_group.add_argument(
+        "--nsys",
+        action="store_true",
+        default=False,
+        help="Emit an NVTX range + cudaProfilerStart/Stop around the measured MoE forward "
+        "(after warmup) so `nsys profile -c cudaProfilerApi` captures only that region. "
+        "Disables CUPTI kernel breakdown (conflicts with nsys). Latency measurement is unchanged.",
+    )
     timing_group.add_argument(
         "--fast_autotune",
         action="store_true",
@@ -509,33 +579,27 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
             routing_method=routing,
             n_group=args.n_group,
             topk_group=args.topk_group,
+            n_shared_experts=int(args.n_shared_experts) if args.n_shared_experts is not None else 0,
+            shared_expert_mode=args.shared_expert_mode,
+            activation_type=args.activation or "SWIGLU",
         )
 
-    # Built-in model with optional per-field overrides.
-    if routing == "AUTO":
-        routing = base.routing_method
-
-    quant_name: Optional[str]
+    # Built-in model: override only what the CLI actually provided, so any
+    # preset field without a flag (swiglu_*, situ_*, ...) is inherited.
+    overrides: Dict[str, Any] = {"shared_expert_mode": args.shared_expert_mode}
+    if routing != "AUTO":
+        overrides["routing_method"] = routing
     if args.quant is not None:
-        quant_name = args.quant.name
-    else:
-        quant_name = base.quant_algo
-    return ModelSpec(
-        name=base.name,
-        num_experts=int(args.num_experts) if args.num_experts is not None else base.num_experts,
-        top_k=int(args.top_k) if args.top_k is not None else base.top_k,
-        hidden_size=int(args.hidden_size) if args.hidden_size is not None else base.hidden_size,
-        intermediate_size=int(args.intermediate_size)
-        if args.intermediate_size is not None
-        else base.intermediate_size,
-        quant_algo=quant_name,
-        routing_method=routing,
-        n_group=args.n_group if args.n_group is not None else base.n_group,
-        topk_group=args.topk_group if args.topk_group is not None else base.topk_group,
-        swiglu_alpha=base.swiglu_alpha,
-        swiglu_beta=base.swiglu_beta,
-        swiglu_limit=base.swiglu_limit,
-    )
+        overrides["quant_algo"] = args.quant.name
+    if args.activation is not None:
+        overrides["activation_type"] = args.activation
+    for field in ("num_experts", "top_k", "hidden_size", "intermediate_size", "n_shared_experts"):
+        if getattr(args, field) is not None:
+            overrides[field] = int(getattr(args, field))
+    for field in ("n_group", "topk_group"):
+        if getattr(args, field) is not None:
+            overrides[field] = getattr(args, field)
+    return replace(base, **overrides)
 
 
 def _resolve_workloads_from_args(args: argparse.Namespace) -> List[WorkloadSpec]:
@@ -608,8 +672,51 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
 
     parallel_mode = parallel_list[0] if parallel_list else "DEP"
 
+    explicit_sizes = args.moe_ep_size is not None or args.moe_tp_size is not None
+
+    search_axes = _parse_search_axes(args.search)
+    parallel_search_enabled = "parallel" in search_axes or "full" in search_axes
+    if parallel_search_enabled:
+        provided = set(getattr(args, "_cli_provided", set()))
+        config_parallel_modes = tuple(
+            (getattr(args, "_config_search_axes", {}) or {}).get("parallel_mode", ())
+        )
+        if "parallel_mode" in provided:
+            effective_parallel_modes = parallel_list
+        elif config_parallel_modes:
+            effective_parallel_modes = config_parallel_modes
+        else:
+            effective_parallel_modes = _default_parallel_axis_values(
+                int(getattr(args, "world_size", 1) or 1)
+            )
+    else:
+        effective_parallel_modes = parallel_list
+
+    # A hybrid (D|T)TP<k>EP<m> name already spells the grid out; combining it with
+    # explicit size flags would silently discard one of the two intents. Explicit
+    # sizes also cannot describe more than one candidate in a parallel-mode sweep.
+    if explicit_sizes:
+        if len(effective_parallel_modes) != 1:
+            raise ValueError(
+                "--moe_ep_size/--moe_tp_size describe one CUSTOM layout and cannot be "
+                "combined with a parallel-mode sweep; drop the size flags or pass "
+                "--parallel_mode CUSTOM alone."
+            )
+        selected_mode = effective_parallel_modes[0]
+        if selected_mode not in ("DEP", "TEP", "DTP", "TTP", "CUSTOM"):
+            raise ValueError(
+                f"--parallel_mode={selected_mode} already specifies "
+                "moe_tp_size/moe_ep_size; drop --moe_ep_size/--moe_tp_size, or use "
+                "--parallel_mode CUSTOM with them."
+            )
+        if parallel_search_enabled and selected_mode != "CUSTOM":
+            raise ValueError(
+                "--moe_ep_size/--moe_tp_size require --parallel_mode CUSTOM when "
+                "parallel search is enabled; named layouts ignore explicit size flags."
+            )
+
     # parallel_mode CUSTOM if explicit EP/TP overrides are present.
-    if (args.moe_ep_size is not None or args.moe_tp_size is not None) and parallel_mode in (
+    if explicit_sizes and parallel_mode in (
         "DEP",
         "TEP",
         "DTP",
@@ -684,10 +791,14 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
     def normalize_search_axis(key: str, value: Any) -> Optional[Tuple[str, ...]]:
         """Project a config-file search-axis entry onto ``args`` (list form).
 
-        Returns the tuple of canonical values if it should be recorded as a
-        sweep axis in ``_config_search_axes`` (multi-value or backend=ALL).
-        Returns ``None`` when the value was instead written to the matching
-        ``args.<key>`` scalar-list flag.
+        Returns the tuple of canonical values to record as a sweep axis in
+        ``_config_search_axes``, or ``None`` when the entry carries no explicit
+        axis of its own. Living in the ``search`` block *is* the explicit
+        request, so a single-value entry is recorded too -- otherwise it would
+        fall through to the world-size default set and be silently replaced
+        (and, combined with explicit --moe_ep_size/--moe_tp_size, rejected as a
+        sweep). ``backend=ALL`` is the one entry that genuinely means "no
+        explicit set, expand to everything".
         """
         if key in provided:
             return None
@@ -701,9 +812,9 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
             set_if_unset("backend", ("ALL",))
             return None
         if len(values) == 1:
-            # Single-value config entry behaves like a CLI scalar default.
+            # Still seed the matching scalar flag (base-config resolution reads
+            # it), but record the axis as well.
             set_if_unset(key, values)
-            return None
         return values
 
     if search_cfg:

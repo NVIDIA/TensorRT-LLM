@@ -62,7 +62,8 @@ def spin_wait(
     ip: Optional[ir.InsertionPoint] = None,
 ) -> Boolean:
     """Spin until condition is true, or do one condition check with peek_only."""
-    current = cute.arch.load(ptr, ptr.dtype, cop="cg", loc=loc, ip=ip)
+    # The first load must be acquire to build the mem order.
+    current = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")
     if cutlass.const_expr(peek_only):
         # One-shot peek: forward the condition Boolean to the caller.
         return Boolean(condition(current))
@@ -70,7 +71,7 @@ def spin_wait(
         # Load with L1 cache bypass (ld.global.cg)
         if cutlass.const_expr(fail_sleep_cycles > 0):
             _nanosleep(fail_sleep_cycles, loc=loc, ip=ip)
-        current = cute.arch.load(ptr, ptr.dtype, cop="cg", loc=loc, ip=ip)
+        current = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")
     # Spin-path: condition was satisfied; uniformize return type with the
     # peek path so callers always see a Boolean.
     return Boolean(True)
@@ -80,8 +81,7 @@ def spin_wait(
 # Cluster-DSMEM helpers (for atomic_counter dynamic scheduler)
 # =============================================================================
 #
-# Ported from cute_dsl_kernel_library/dsl_kernels/moe/moe_persistent_scheduler.py
-# (lines 79-145).  Used by the fused fc1+fc2 mega scheduler when
+# Used by the fused fc1+fc2 mega scheduler when
 # load_balance_mode == 'atomic_counter' to
 # implement the leader-CTA atom.add + DSMEM broadcast cluster-tile-idx
 # fetch protocol.  ``atom.add`` itself uses cute.arch.atomic_add (the

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/tensor.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -53,17 +54,17 @@ DataType Tensor::getDataType() const
     }
     switch (mTensor->getDataType())
     {
-    case nvinfer1::DataType::kBOOL: return DataType::kBOOL;
-    case nvinfer1::DataType::kINT8: return DataType::kINT8;
-    case nvinfer1::DataType::kINT32: return DataType::kINT32;
-    case nvinfer1::DataType::kUINT8: return DataType::kUINT8;
-    case nvinfer1::DataType::kFP8: return DataType::kFP8;
-    case nvinfer1::DataType::kHALF: return DataType::kFP16;
-    case nvinfer1::DataType::kFLOAT: return DataType::kFP32;
-    case nvinfer1::DataType::kBF16: return DataType::kBF16;
-    case nvinfer1::DataType::kINT64: return DataType::kINT64;
-    case nvinfer1::DataType::kINT4: [[fallthrough]] /* do nothing */;
-    case nvinfer1::DataType::kFP4: [[fallthrough]] /* do nothing */;
+    case tensorrt_llm::DataType::kBOOL: return DataType::kBOOL;
+    case tensorrt_llm::DataType::kINT8: return DataType::kINT8;
+    case tensorrt_llm::DataType::kINT32: return DataType::kINT32;
+    case tensorrt_llm::DataType::kUINT8: return DataType::kUINT8;
+    case tensorrt_llm::DataType::kFP8: return DataType::kFP8;
+    case tensorrt_llm::DataType::kHALF: return DataType::kFP16;
+    case tensorrt_llm::DataType::kFLOAT: return DataType::kFP32;
+    case tensorrt_llm::DataType::kBF16: return DataType::kBF16;
+    case tensorrt_llm::DataType::kINT64: return DataType::kINT64;
+    case tensorrt_llm::DataType::kINT4: [[fallthrough]] /* do nothing */;
+    case tensorrt_llm::DataType::kFP4: [[fallthrough]] /* do nothing */;
     default: TLLM_THROW("Unsupported data type");
     }
 }
@@ -135,19 +136,19 @@ tr::ITensor::Shape toDims(Shape const& shape)
     return dims;
 }
 
-nvinfer1::DataType toDataType(DataType dataType)
+tensorrt_llm::DataType toDataType(DataType dataType)
 {
     switch (dataType)
     {
-    case DataType::kBOOL: return nvinfer1::DataType::kBOOL;
-    case DataType::kUINT8: return nvinfer1::DataType::kUINT8;
-    case DataType::kINT8: return nvinfer1::DataType::kINT8;
-    case DataType::kINT32: return nvinfer1::DataType::kINT32;
-    case DataType::kINT64: return nvinfer1::DataType::kINT64;
-    case DataType::kBF16: return nvinfer1::DataType::kBF16;
-    case DataType::kFP8: return nvinfer1::DataType::kFP8;
-    case DataType::kFP16: return nvinfer1::DataType::kHALF;
-    case DataType::kFP32: return nvinfer1::DataType::kFLOAT;
+    case DataType::kBOOL: return tensorrt_llm::DataType::kBOOL;
+    case DataType::kUINT8: return tensorrt_llm::DataType::kUINT8;
+    case DataType::kINT8: return tensorrt_llm::DataType::kINT8;
+    case DataType::kINT32: return tensorrt_llm::DataType::kINT32;
+    case DataType::kINT64: return tensorrt_llm::DataType::kINT64;
+    case DataType::kBF16: return tensorrt_llm::DataType::kBF16;
+    case DataType::kFP8: return tensorrt_llm::DataType::kFP8;
+    case DataType::kFP16: return tensorrt_llm::DataType::kHALF;
+    case DataType::kFP32: return tensorrt_llm::DataType::kFLOAT;
     case DataType::kUNKNOWN: TLLM_THROW("Unsupported data type");
     }
 

@@ -7,22 +7,29 @@ import gc
 import json
 import os
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import safetensors.torch
 import torch
 import torch.distributed as dist
+from diffusers.utils.torch_utils import randn_tensor
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
-from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import (
+    BasePipeline,
+    ExtraParamSchema,
+    RefSlotSpec,
+    RoleSpec,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
@@ -44,6 +51,7 @@ from .ltx2_core.types import (
     VideoPixelShape,
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
+from .parallel_vae import tile_parallel_decode
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
@@ -619,6 +627,16 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    def __init__(self, model_config):
+        _sa_cfg = model_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for LTX-2."
+            )
+        super().__init__(model_config)
+
     @classmethod
     def resolve_variant(cls, config):
         if getattr(config, "cache_backend", None) == "cache_dit":
@@ -782,8 +800,14 @@ class LTX2Pipeline(BasePipeline):
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
             model_config=model_config,
+            **self._extra_transformer_kwargs(),
         )
         self.transformer._transformer_config = vars(cfg)
+
+    def _extra_transformer_kwargs(self) -> dict:
+        """Extra LTXModel constructor kwargs; empty for the base one-stage
+        pipeline. Subclasses override to add topology-specific kwargs."""
+        return {}
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)
@@ -1015,17 +1039,19 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
-        # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
-        # To re-enable, uncomment the following lines and verify coefficients.
-        # register_extractor(
-        #     "LTXModel",
-        #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
-        # )
-        # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
-
-        # Cache-DiT
-        if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
-            self._setup_cache_acceleration(self.transformer, coefficients=None)
+        # LTX-2: single transformer (one DiT for video+audio); TeaCache only with
+        # explicit coefficients. Cache acceleration itself is enabled by the
+        # loader after torch.compile (see PipelineLoader.load).
+        if self.transformer is not None and self.pipeline_config.cache_backend == "teacache":
+            if self.pipeline_config.teacache.coefficients is None:
+                raise ValueError(
+                    "TeaCache on LTX-2 requires explicit teacache.coefficients "
+                    "(no built-in coefficient table)."
+                )
+            register_extractor(
+                "LTXModel",
+                LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
+            )
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
@@ -1045,6 +1071,31 @@ class LTX2Pipeline(BasePipeline):
             self.tokenizer_max_length = self.tokenizer.model_max_length
 
         logger.info("LTX2 pipeline post-load complete")
+
+    def setup_parallel_vae(self) -> None:
+        """Enable tile-parallel VAE decode for LTX-2.
+
+        LTX-2 decodes via ``self.video_decoder`` (not ``self.vae``), so the base
+        ``setup_parallel_vae`` — which gates on ``self.vae`` + the halo-shaped
+        ``ParallelVAEFactory`` — never engages. Set the global
+        ``_parallel_vae_enabled`` flag directly from config + mapping so
+        ``decode_latents`` routes the decode to ``vae_ranks``; the tile-shard +
+        ``all_reduce`` happens in ``decode_video_fn`` via ``tile_parallel_decode``.
+        The flag is global (computed identically on every rank).
+        """
+        parallel_cfg = self.pipeline_config.parallel
+        vgm = self.pipeline_config.visual_gen_mapping
+        self._parallel_vae_enabled = (
+            parallel_cfg.parallel_vae_size > 1
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and vgm is not None
+        )
+        if self._parallel_vae_enabled and self.rank == 0:
+            logger.info(
+                f"LTX-2 tile-parallel VAE enabled: vae_ranks={vgm.vae_ranks}, "
+                f"parallel_vae_size={parallel_cfg.parallel_vae_size}"
+            )
 
     # ------------------------------------------------------------------
     # Text encoding
@@ -1184,10 +1235,10 @@ class LTX2Pipeline(BasePipeline):
         Returns:
             Tensor of shape ``(1, 3, 1, H, W)`` in ``[-1, 1]``.
         """
-        if isinstance(image, str):
+        if isinstance(image, bytes):
             from PIL import Image
 
-            pil_img = Image.open(image).convert("RGB")
+            pil_img = Image.open(BytesIO(image)).convert("RGB")
             pil_img = pil_img.resize((width, height), Image.LANCZOS)
             import numpy as np
 
@@ -1330,9 +1381,19 @@ class LTX2Pipeline(BasePipeline):
             ),
         }
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
+            ),
+        }
+
     def infer(self, req):
         """Run inference with request parameters."""
         extra = req.params.extra_params or {}
+        refs = req.params.image_reference
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
@@ -1346,7 +1407,7 @@ class LTX2Pipeline(BasePipeline):
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
-            image=req.params.image,
+            image=refs[0].content if refs else None,
             image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
@@ -1437,7 +1498,7 @@ class LTX2Pipeline(BasePipeline):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # Build guider params
         video_guider_params = MultiModalGuiderParams(
@@ -1563,7 +1624,7 @@ class LTX2Pipeline(BasePipeline):
         self.transformer.configure_audio_ulysses(audio_shape.frames)
 
         # ---- 4. Generate initial noise / image conditioning ---------------
-        latents = torch.randn(
+        latents = randn_tensor(
             video_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1593,7 +1654,9 @@ class LTX2Pipeline(BasePipeline):
             )
             mask_5d[:, :, :1, :, :] = 1.0 - cond_strength
 
-            noise = torch.randn_like(latents)
+            noise = randn_tensor(
+                latents.shape, generator=generator, device=latents.device, dtype=latents.dtype
+            )
             latents = noise * mask_5d + latents * (1.0 - mask_5d)
 
             # Token-space mask for per-token timesteps (after patchification)
@@ -1616,7 +1679,7 @@ class LTX2Pipeline(BasePipeline):
 
         latents = self.video_patchifier.patchify(latents)
 
-        audio_latents = torch.randn(
+        audio_latents = randn_tensor(
             audio_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1642,8 +1705,9 @@ class LTX2Pipeline(BasePipeline):
         )
 
         # ---- 6. Prepare scheduler / timesteps ---------------------------
-        latents_5d = torch.randn(
+        latents_5d = randn_tensor(
             video_shape.to_torch_shape(),
+            generator=generator,
             device=self.device,
         )
         self.scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
@@ -1985,37 +2049,56 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_video_fn(vid_latents):
             vid_latents = self.video_patchifier.unpatchify(vid_latents, video_shape)
-
-            if output_type == "latent":
-                return vid_latents
-
             vid_latents = vid_latents.to(self.dtype)
             tiling_config = TilingConfig.default()
-            chunks = list(
-                self.video_decoder.tiled_decode(
+            if self._parallel_vae_enabled:
+                # Tile-parallel: shard tiled_decode's tiles across vae_ranks and
+                # all_reduce the blend buffer. Output matches serial tiled_decode
+                # up to bf16 re-association. decode_latents calls this only on
+                # vae_ranks, so the all_reduce over vgm.vae_group is collective.
+                vgm = self.pipeline_config.visual_gen_mapping
+                video = tile_parallel_decode(
+                    self.video_decoder,
                     vid_latents,
                     tiling_config,
+                    pg=vgm.vae_group,
                     generator=generator,
                 )
-            )
-            video = torch.cat(chunks, dim=2)
+            else:
+                chunks = list(
+                    self.video_decoder.tiled_decode(
+                        vid_latents,
+                        tiling_config,
+                        generator=generator,
+                    )
+                )
+                video = torch.cat(chunks, dim=2)
             video = postprocess_video_tensor(video)
             return video
 
         def decode_audio_fn(aud_latents):
             aud_latents = self.audio_patchifier.unpatchify(aud_latents, audio_shape)
-
-            if output_type == "latent":
-                return aud_latents
-
             aud_latents = aud_latents.to(self.dtype)
             return decode_audio(aud_latents, self.audio_decoder, self.vocoder)
 
-        video, audio = self.decode_latents(
-            latents=latents,
-            decode_fn=decode_video_fn,
-            extra_latents={"audio": (audio_latents, decode_audio_fn)},
-        )
+        if output_type == "latent":
+            # Latent output is a local unpatchify with no VAE work, and every
+            # rank already holds the full latents after the denoise loop —
+            # return them on every rank. decode_latents' vae_ranks/rank-0 gate
+            # exists to skip real VAE decode only; the two-stage handoff
+            # consumes these latents in place with zero collectives.
+            video = self.video_patchifier.unpatchify(latents, video_shape)
+            audio = (
+                self.audio_patchifier.unpatchify(audio_latents, audio_shape)
+                if audio_latents is not None
+                else None
+            )
+        else:
+            video, audio = self.decode_latents(
+                latents=latents,
+                decode_fn=decode_video_fn,
+                extra_latents={"audio": (audio_latents, decode_audio_fn)},
+            )
 
         if self.rank == 0:
             logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")

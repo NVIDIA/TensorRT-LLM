@@ -41,10 +41,14 @@ def reset_parameters(model: torch.nn.Module):
 
 
 def fp8_compatible():
+    if torch.cuda.device_count() == 0:
+        return False
     return torch.cuda.get_device_capability(0) >= (8, 9)
 
 
 def fp4_compatible():
+    if torch.cuda.device_count() == 0:
+        return False
     return torch.cuda.get_device_capability(0) >= (10, 0)
 
 

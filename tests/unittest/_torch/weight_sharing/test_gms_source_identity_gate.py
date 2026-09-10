@@ -29,6 +29,8 @@ from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import SourceIdentityMismatchError
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeCheckpointLoader:
     """Minimal checkpoint-loader stub exposing `checkpoint_format`."""
@@ -75,6 +77,14 @@ def test_gate_raises_on_mismatch():
     writer = _identity(attn_backend="FLASHINFER")
     loader = _new_loader(local)
     # No disk fallback for GMS: an incompatible writer must raise.
+    with pytest.raises(SourceIdentityMismatchError):
+        loader._check_gms_source_identity(_FakeGMSBackend(writer))
+
+
+def test_gate_raises_on_checkpoint_artifact_mismatch():
+    local = _identity(artifact_key="fine-tune-a")
+    writer = _identity(artifact_key="fine-tune-b")
+    loader = _new_loader(local)
     with pytest.raises(SourceIdentityMismatchError):
         loader._check_gms_source_identity(_FakeGMSBackend(writer))
 

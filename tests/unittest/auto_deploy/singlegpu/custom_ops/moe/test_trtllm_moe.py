@@ -574,7 +574,7 @@ FP4_TEST_SHAPES = [
 
 # Scale the input and weights to prevent large absolute values.
 FP4_X_GEN_SCALE = 0.5
-FP4_W_GEN_SCALE = 0.1
+FP4_W_GEN_SCALE = 0.075
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)

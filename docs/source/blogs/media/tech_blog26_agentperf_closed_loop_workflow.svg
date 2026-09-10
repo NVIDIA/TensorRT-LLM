@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="815" viewBox="0 0 1800 815" role="img" aria-labelledby="title desc">
+  <title id="title">AA-AgentPerf closed-loop request workflow</title>
+  <desc id="desc">A simulated agent sends the next recorded turn with its accumulated conversation. The inference deployment routes the request using conversation or cache affinity, reuses matching KV blocks, prefills only the uncached suffix, optionally retrieves the KV cache on the generation side in disaggregated serving, and streams the generated response. The client drains the complete response, simulates tool time when needed, advances the trajectory, and sends the next turn.</desc>
+
+  <defs>
+    <style>
+      .lane-title { font: 700 17px "NVIDIA Sans", Arial, sans-serif; letter-spacing: 1.2px; }
+      .box-title { font: 700 20px "NVIDIA Sans", Arial, sans-serif; fill: #111827; }
+      .box-text { font: 400 16px "NVIDIA Sans", Arial, sans-serif; fill: #475569; }
+      .step { font: 700 16px "NVIDIA Sans", Arial, sans-serif; fill: #ffffff; }
+      .path-label { font: 600 16px "NVIDIA Sans", Arial, sans-serif; fill: #1e40af; }
+      .callout-title { font: 700 18px "NVIDIA Sans", Arial, sans-serif; fill: #365314; }
+      .callout-text { font: 400 16px "NVIDIA Sans", Arial, sans-serif; fill: #4d7c0f; }
+      .legend { font: 400 16px "NVIDIA Sans", Arial, sans-serif; fill: #475569; }
+    </style>
+
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#65a30d"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="815" fill="#ffffff"/>
+
+  <g transform="translate(0,-85)">
+  <!-- Client and harness lane -->
+  <rect x="40" y="110" width="1720" height="225" rx="18" fill="#f7fee7" stroke="#bef264" stroke-width="1.5"/>
+  <rect x="68" y="128" width="310" height="34" rx="17" fill="#d9f99d"/>
+  <text x="223" y="151" text-anchor="middle" class="lane-title" fill="#365314">CLIENT / AGENT HARNESS</text>
+
+  <!-- Inference lane -->
+  <rect x="40" y="370" width="1720" height="425" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+  <rect x="68" y="388" width="310" height="34" rx="17" fill="#dbeafe"/>
+  <text x="223" y="411" text-anchor="middle" class="lane-title" fill="#1e3a8a">INFERENCE DEPLOYMENT</text>
+
+  <!-- Client box 1 -->
+  <rect x="100" y="185" width="300" height="105" rx="14" fill="#ecfccb" stroke="#76b900" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="128" cy="213" r="18" fill="#4d7c0f"/>
+  <text x="128" y="219" text-anchor="middle" class="step">1</text>
+  <text x="158" y="218" class="box-title">Send recorded turn</text>
+  <text x="125" y="250" class="box-text">Accumulated conversation</text>
+  <text x="125" y="274" class="box-text">and the next request</text>
+
+  <!-- Client box 8 -->
+  <rect x="500" y="185" width="300" height="105" rx="14" fill="#ecfccb" stroke="#76b900" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="528" cy="213" r="18" fill="#4d7c0f"/>
+  <text x="528" y="219" text-anchor="middle" class="step">8</text>
+  <text x="558" y="218" class="box-title">Advance trajectory</text>
+  <text x="525" y="250" class="box-text">Next recorded turn or</text>
+  <text x="525" y="274" class="box-text">next assigned trajectory</text>
+
+  <!-- Client box 7 -->
+  <rect x="900" y="185" width="300" height="105" rx="14" fill="#fff7ed" stroke="#fb923c" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="928" cy="213" r="18" fill="#ea580c"/>
+  <text x="928" y="219" text-anchor="middle" class="step">7</text>
+  <text x="958" y="218" class="box-title">Simulate tool time</text>
+  <text x="925" y="250" class="box-text">Only for turns with a tool call</text>
+  <text x="925" y="274" class="box-text">Client-side delay · no LLM compute</text>
+
+  <!-- Client box 6 -->
+  <rect x="1300" y="185" width="400" height="105" rx="14" fill="#ecfccb" stroke="#76b900" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="1328" cy="213" r="18" fill="#4d7c0f"/>
+  <text x="1328" y="219" text-anchor="middle" class="step">6</text>
+  <text x="1358" y="218" class="box-title">Receive complete response</text>
+  <text x="1325" y="250" class="box-text">Drain the stream and assemble chunks</text>
+  <text x="1325" y="274" class="box-text">Record TTFT and output speed</text>
+
+  <!-- Client return-path arrows -->
+  <path d="M 1300 237 L 1214 237" fill="none" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M 900 237 L 814 237" fill="none" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M 500 237 L 414 237" fill="none" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <!-- Server box 2 -->
+  <rect x="120" y="500" width="330" height="160" rx="14" fill="#ffffff" stroke="#0284c7" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="150" cy="530" r="19" fill="#0369a1"/>
+  <text x="150" y="536" text-anchor="middle" class="step">2</text>
+  <text x="183" y="536" class="box-title">Route + prefix lookup</text>
+  <text x="150" y="573" class="box-text">Conversation-aware or cache-aware</text>
+  <text x="150" y="598" class="box-text">worker and rank selection</text>
+  <text x="150" y="628" class="box-text">Reuse matching resident KV blocks</text>
+
+  <!-- Server box 3 -->
+  <rect x="520" y="500" width="330" height="160" rx="14" fill="#ffffff" stroke="#0284c7" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="550" cy="530" r="19" fill="#0369a1"/>
+  <text x="550" y="536" text-anchor="middle" class="step">3</text>
+  <text x="583" y="536" class="box-title">Prefill uncached suffix</text>
+  <text x="550" y="573" class="box-text">Reuse removes the cached prefix</text>
+  <text x="550" y="598" class="box-text">from new prefill computation</text>
+  <text x="550" y="628" class="box-text">Context side produces the first token</text>
+
+  <!-- Server box 4 -->
+  <rect x="950" y="500" width="330" height="160" rx="14" fill="#f8fafc" stroke="#38bdf8" stroke-width="2" stroke-dasharray="9 7" filter="url(#shadow)"/>
+  <circle cx="980" cy="530" r="19" fill="#0284c7"/>
+  <text x="980" y="536" text-anchor="middle" class="step">4</text>
+  <text x="1013" y="536" class="box-title">Retrieve KV cache</text>
+  <text x="980" y="573" class="box-text">Returned context metadata locates</text>
+  <text x="980" y="598" class="box-text">the KV cache for the generation side</text>
+  <text x="980" y="628" class="box-text">Disaggregated serving only</text>
+
+  <!-- Server box 5 -->
+  <rect x="1350" y="500" width="330" height="160" rx="14" fill="#ffffff" stroke="#0284c7" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="1380" cy="530" r="19" fill="#0369a1"/>
+  <text x="1380" y="536" text-anchor="middle" class="step">5</text>
+  <text x="1413" y="536" class="box-title">Generate + stream</text>
+  <text x="1380" y="573" class="box-text">Continue decoding the response</text>
+  <text x="1380" y="598" class="box-text">on the same worker or a</text>
+  <text x="1380" y="623" class="box-text">separate generation worker</text>
+
+  <!-- Main request arrows -->
+  <path d="M 250 290 C 250 360, 285 420, 285 486" fill="none" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M 450 580 L 506 580" fill="none" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <!-- Disaggregated path -->
+  <path d="M 850 580 L 936 580" fill="none" stroke="#2563eb" stroke-width="3" stroke-dasharray="9 7" marker-end="url(#arrowBlue)"/>
+  <path d="M 1280 580 L 1336 580" fill="none" stroke="#2563eb" stroke-width="3" stroke-dasharray="9 7" marker-end="url(#arrowBlue)"/>
+  <text x="1100" y="476" text-anchor="middle" class="path-label">Disaggregated path</text>
+
+  <!-- Aggregated bypass -->
+  <path d="M 850 520 C 980 438, 1220 438, 1350 520" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#arrowBlue)"/>
+  <text x="1100" y="449" text-anchor="middle" class="path-label">Aggregated serving · same worker</text>
+
+  <!-- Response returns to client -->
+  <path d="M 1515 500 C 1515 420, 1500 356, 1500 304" fill="none" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <!-- Conversation-affinity callout -->
+  <rect x="120" y="690" width="730" height="68" rx="12" fill="#f7fee7" stroke="#a3e635" stroke-width="1.5"/>
+  <text x="145" y="719" class="callout-title">Conversation affinity helps preserve reuse across turns</text>
+  <text x="145" y="744" class="callout-text">Later turns prefer the worker and rank that hold the accumulated conversation prefix.</text>
+  <path d="M 285 660 L 285 680" fill="none" stroke="#65a30d" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#arrowGreen)"/>
+
+  <!-- Legend -->
+  <rect x="440" y="846" width="18" height="18" rx="3" fill="#ffffff" stroke="#0284c7" stroke-width="2"/>
+  <text x="470" y="861" class="legend">Inference work</text>
+
+  <rect x="680" y="846" width="18" height="18" rx="3" fill="#fff7ed" stroke="#fb923c" stroke-width="2"/>
+  <text x="710" y="861" class="legend">Client-simulated tool time</text>
+
+  <line x1="1010" y1="855" x2="1060" y2="855" stroke="#65a30d" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#arrowGreen)"/>
+  <text x="1075" y="861" class="legend">Conversation affinity and prefix reuse</text>
+
+  </g>
+</svg>

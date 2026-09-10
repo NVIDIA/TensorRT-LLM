@@ -18,6 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
+import pytest
+
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     Field,
@@ -28,6 +30,8 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _NestedConfig(StrictBaseModel):
@@ -81,7 +85,7 @@ def test_collect_llm_api_config_allows_approved_string_converters_only():
     # Path, which is dropped because it is not an allowlisted scalar, while
     # union_backend's allowlisted str is captured. No production telemetry field
     # is Union[str, Path]; the only real Union allowlist fields are
-    # Union[str, Enum] (sampler_type, load_format). See CR-E (declined).
+    # Union[str, Enum] (load_format). See CR-E (declined).
     class _StringConfig(StrictBaseModel):
         backend: Optional[str] = Field(
             default="pytorch",
@@ -140,7 +144,7 @@ def test_sanitize_allowlist_is_value_fail_closed_for_non_scalars():
     (bool/int/float/str) or None. Excluding Union-with-Any/Path from allowlist
     eligibility at the type level is therefore unnecessary for safety, and a
     coarse rule would also break legitimate Union[str, Enum] allowlist fields
-    such as sampler_type and load_format (verified captured elsewhere).
+    such as load_format (verified captured elsewhere).
     """
     from tensorrt_llm.usage import llmapi_config
 
@@ -482,24 +486,6 @@ def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
     assert by_path["int_field"].kind == "value"
 
 
-def test_collect_llm_api_config_captures_star_attention_backend():
-    """attn_backend allowlist recognizes the real FLASHINFER_STAR_ATTENTION value.
-
-    The recognized set mirrors get_attention_backend dispatch; the previously
-    listed FLASH_ATTENTION is not a real backend and is removed.
-    """
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        attn_backend="FLASHINFER_STAR_ATTENTION",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["attn_backend"] == "FLASHINFER_STAR_ATTENTION"
-    assert meta["capture_succeeded"] is True
-
-
 def test_collect_llm_api_config_swallows_expected_capture_errors(monkeypatch):
     """The inner net stays fail-silent for the expected sanitizer error family."""
     from tensorrt_llm.usage import llmapi_config
@@ -575,29 +561,6 @@ def test_collect_llm_api_config_captures_nested_config_value_fields():
     assert config["moe_config.backend"] == "AUTO"
 
 
-def test_collect_llm_api_config_captures_quant_algo_cross_module():
-    """quant_config.quant_algo (QuantConfig in modeling_utils.py) is captured.
-
-    QuantConfig is defined outside llm_args.py but the collector recurses into
-    any nested pydantic model, so marking the field at its definition site is
-    sufficient. quant_config is a real model field only on TrtLlmArgs.
-    """
-    from tensorrt_llm.llmapi.llm_args import TrtLlmArgs
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.quantization.mode import QuantAlgo
-
-    args = TrtLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["quant_config.quant_algo"] == "FP8"
-    assert meta["capture_succeeded"] is True
-
-
 def test_field_wrapper_preserves_callable_json_schema_extra_with_metadata():
     """Preserve callable json_schema_extra when adding status/telemetry metadata.
 
@@ -663,29 +626,29 @@ def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
     assert meta["unsafe_excluded"] is False
 
 
-def test_collect_llm_api_config_captures_quant_algo_none():
-    """quant_config.quant_algo defaults to None and is captured as null."""
-    from tensorrt_llm.llmapi.llm_args import TrtLlmArgs
+def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
+    """transceiver_runtime is a single Optional[Literal] categorical.
 
-    args = TrtLlmArgs(model="/customer/private/Llama", skip_tokenizer_init=True)
+    Regression: a two-branch Literal union (Optional[Literal['CPP','PYTHON']]
+    | Literal['auto']) would not unwrap to a top-level Literal, degrading the
+    manifest kind to 'value' and making the sanitizer reject all three
+    strings. Every allowed value plus None must be captured, not excluded.
+    """
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
-    config, _ = _loads_payloads(args)
+    for runtime in ("CPP", "PYTHON", "auto", None):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime=runtime
+            ),
+        )
 
-    assert config["quant_config.quant_algo"] is None
+        config, meta = _loads_payloads(args)
 
-
-def test_collect_llm_api_config_captures_sampler_type_categorical():
-    """sampler_type is a bounded Union[str, SamplerType] categorical allowlist."""
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        sampler_type="TorchSampler",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["sampler_type"] == "TorchSampler"
-    assert meta["capture_succeeded"] is True
+        assert config["cache_transceiver_config.transceiver_runtime"] == runtime
+        assert meta["capture_succeeded"] is True
 
 
 def test_collect_llm_api_config_redacts_out_of_allowlist_categorical_str():
@@ -734,20 +697,18 @@ def test_collect_llm_api_config_captures_gms_load_format():
     assert meta["capture_succeeded"] is True
 
 
-def test_collect_llm_api_config_captures_backend_allowlist_on_trt_args():
-    """TrtLlmArgs inherits backend as Optional[str] -> bounded categorical allowlist."""
-    from tensorrt_llm.llmapi.llm_args import TrtLlmArgs
+def test_collect_llm_api_config_captures_checkpoint_io_policy() -> None:
+    for policy in ("auto", "rank_striped_read_ahead"):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            checkpoint_io_policy=policy,
+        )
 
-    args = TrtLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        backend="tensorrt",
-    )
+        config, meta = _loads_payloads(args)
 
-    config, meta = _loads_payloads(args)
-
-    assert config["backend"] == "tensorrt"
-    assert meta["capture_succeeded"] is True
+        assert config["checkpoint_io_policy"] == policy
+        assert meta["capture_succeeded"] is True
 
 
 def _walk_captured_keys(model) -> set[str]:
@@ -766,16 +727,12 @@ def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
     """
     from tensorrt_llm.llmapi.llm_args import (
         AutoDecodingConfig,
-        MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
     )
 
     mtp = MTPDecodingConfig(num_nextn_predict_layers=1)
     assert _walk_captured_keys(mtp) >= {"decoding_type"}
-
-    medusa = MedusaDecodingConfig(max_draft_len=1, medusa_choices=[[0]])
-    assert _walk_captured_keys(medusa) >= {"decoding_type"}
 
     ngram = NGramDecodingConfig(max_draft_len=1, max_matching_ngram_size=2)
     assert _walk_captured_keys(ngram) >= {"decoding_type"}
@@ -815,8 +772,12 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     assert _walk_captured_keys(SkipSoftmaxAttentionConfig()) >= {"algorithm"}
 
 
-def test_background_reporter_keeps_initial_report_when_config_capture_fails(monkeypatch):
+def test_background_reporter_keeps_initial_report_when_config_capture_fails(
+    monkeypatch, enable_telemetry
+):
     sent_payloads = []
+
+    assert usage_lib.apply_usage_session_config()
 
     monkeypatch.setattr(usage_lib, "_MAX_HEARTBEATS", 0)
     monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")

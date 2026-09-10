@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,19 +17,30 @@
 
 #include "cutlass/gemm_coord.h"
 #include "tensorrt_llm/common/config.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
 
+inline constexpr int kFp8TmaAlignment = 16;
+
 int64_t getGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
+
+//! @brief Returns the parameter workspace size for the FP8 grouped GEMM path.
+//!
+//! The FP8 path (CUTLASS 3.x) stores problem shapes, pointer arrays, and
+//! cute stride arrays on the device. This function returns the required bytes.
+int64_t getFp8GroupedGemmParamsWorkSpaceSize(int64_t problemCount);
+
+//! @brief Returns whether the FP8 grouped GEMM kernel for an SM version is present in this build.
+bool supportsFp8GroupedGemm(int smVersion);
 
 void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkspace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream);
+    bool isLoraIn, tensorrt_llm::DataType dataType, int minKN, cudaStream_t stream);
 
 } // namespace kernels
 

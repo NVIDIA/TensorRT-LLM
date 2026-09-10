@@ -24,11 +24,24 @@ from typing import Optional, Tuple
 
 import torch
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
+
+
+def _install_cutlass_dsl_compatibility() -> None:
+    """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
+    import cutlass.cute as cute
+
+    for name in ("ThrCopy", "ThrMma"):
+        if not hasattr(cute.core, name) and hasattr(cute, name):
+            setattr(cute.core, name, getattr(cute, name))
+    if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
+        cute.make_fragment = cute.make_rmem_tensor
+
 
 _flash_attn_fwd_import_error = None
 try:
+    _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import _flash_attn_fwd
 except (ImportError, OSError) as e:
     _flash_attn_fwd = None
@@ -74,7 +87,8 @@ class FlashAttn4Attention(AttentionBackend):
         seqused_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
-        output, lse = _flash_attn_fwd(
+        # FA4's private forward API may append diagnostics that this backend does not consume.
+        output, lse, *_ = _flash_attn_fwd(
             q,
             k,
             v,
@@ -89,6 +103,7 @@ class FlashAttn4Attention(AttentionBackend):
             mask_mod=None,
             block_sparse_tensors=None,
             return_lse=True,
+            num_splits=0,
         )
         return output, lse
 

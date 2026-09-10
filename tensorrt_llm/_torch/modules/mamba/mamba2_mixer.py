@@ -24,12 +24,10 @@ from torch import nn
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...attention_backend import AttentionMetadata
+from ...attention.backends import AttentionMetadata
 from ...model_config import ModelConfig
 from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ...speculative import SpecMetadata
@@ -75,7 +73,6 @@ class Mamba2Mixer(nn.Module):
         super().__init__()
 
         config = config or ModelConfig()
-        self.mapping = config.mapping
 
         if config.mapping.enable_attention_dp:
             self.mapping = Mapping(
@@ -150,32 +147,52 @@ class Mamba2Mixer(nn.Module):
             allreduce_strategy=config.allreduce_strategy)
 
         # A
-        self.A = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.A = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
+                              requires_grad=False)
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        # TODO: Update head_dims once flashinfer is updated.
-        # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
-        supported_head_dims = [64, 128]
-        self._use_flashinfer = head_dim in supported_head_dims
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
-        # SR needs fp16 cache.  Replay and flashinfer each supply a Philox impl;
-        # custom_op does not.  Only use_replay is resolved per-forward (from the
-        # cache manager), so precompute both gate values here.
-        sr_base = (self._stochastic_rounding_requested
-                   and self._mamba_ssm_cache_dtype == torch.float16)
-        # Keep replay SSM-cache writes on the same stochastic-rounding policy
-        # as flashinfer; the replay kernel masks stale slots before using them.
-        self._stochastic_rounding_for_replay = sr_base
-        self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
+
+        # TODO: Update head_dims once flashinfer is updated.
+        # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
+        supported_head_dims = [64, 128]
+        # flashinfer supports some head group ratios:
+        # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.14/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
+        supported_head_group_ratios = [1, 2, 4, 8, 16, 32, 64]
+        supported_d_states = [64, 128, 256]
+        head_group_ratio = (self.tp_nheads //
+                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
+        self._use_flashinfer = (head_dim in supported_head_dims and
+                                head_group_ratio in supported_head_group_ratios
+                                and d_state in supported_d_states)
+
+        self._stochastic_rounding_for_replay = (
+            self._stochastic_rounding_requested
+            and self._mamba_ssm_cache_dtype == torch.float16)
+        self._stochastic_rounding_for_flashinfer = self._stochastic_rounding_for_replay and self._use_flashinfer
 
         self._use_mtp_custom_op = os.environ.get(
             "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
+
+        # in_proj emits token-major and the SSD consumes token-major; the two
+        # transposes around the prefill conv exist only to satisfy the
+        # channel-major kernel's layout. The channel-last kernel takes its
+        # strides off the tensors, so feeding it a channel-last view of the
+        # projection removes both transposes without adding a kernel.
+        #
+        # The transposes, not the convolution, are the bulk of that block: on
+        # B300 at ISL 32k they cost as much as the conv itself, so dropping them
+        # takes the block from 27.5ms to 12.9ms per prefill (23 layers), of which
+        # only 0.8ms comes from the kernel swap itself.
+        #
+        # Results move by up to one bf16 ulp -- the layout change is bit-exact,
+        # the accumulation order is not. Set TRTLLM_MAMBA_TOKEN_MAJOR_CONV=0 to
+        # fall back to the channel-major kernel plus transposes.
+        self._token_major_conv = os.environ.get("TRTLLM_MAMBA_TOKEN_MAJOR_CONV",
+                                                "1") == "1"
 
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
@@ -200,16 +217,13 @@ class Mamba2Mixer(nn.Module):
                     key="stochastic_rounding_disabled")
 
         # D
-        self.D = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.D = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
+                              requires_grad=False)
 
         # dt_bias
-        self.dt_bias = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.dt_bias = nn.Parameter(torch.empty(self.tp_nheads,
+                                                dtype=torch.float32),
+                                    requires_grad=False)
 
         # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
         # Disable fused RMSNorm+NVFP4 when LoRA is configured.
@@ -253,22 +267,32 @@ class Mamba2Mixer(nn.Module):
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    def post_load_weights(self):
-        """Post-process after loading weights."""
+    def cache_derived_state(self) -> None:
+        """Recompute state derived from loaded weights."""
         if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
                 self.norm.hidden_size, self.norm.group_size)
                 and self.norm.nvfp4_scale is None):
             self._try_attach_nvfp4_scale()
 
         # Pre-expand A, D, dt_bias for the decode path.
-        self._A_expanded = repeat(self.A,
-                                  "h -> h p n",
-                                  p=self.head_dim,
-                                  n=self.d_state).to(dtype=torch.float32)
-        self._dt_bias_expanded = repeat(self.dt_bias,
-                                        "h -> h p",
-                                        p=self.head_dim)
-        self._D_expanded = repeat(self.D, "h -> h p", p=self.head_dim)
+        # On first call: register as non-persistent buffers so the addresses are
+        # stable for CUDA-graph capture.  On subsequent calls (e.g. update_weights):
+        # update in-place so the captured addresses remain valid.
+        a_exp = repeat(self.A, "h -> h p n", p=self.head_dim,
+                       n=self.d_state).to(dtype=torch.float32)
+        dt_exp = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+        d_exp = repeat(self.D, "h -> h p", p=self.head_dim)
+        if '_A_expanded' not in self._buffers:
+            self.register_buffer('_A_expanded', a_exp, persistent=False)
+            self.register_buffer('_dt_bias_expanded', dt_exp, persistent=False)
+            self.register_buffer('_D_expanded', d_exp, persistent=False)
+        else:
+            self._A_expanded.copy_(a_exp)
+            self._dt_bias_expanded.copy_(dt_exp)
+            self._D_expanded.copy_(d_exp)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
@@ -299,17 +323,10 @@ class Mamba2Mixer(nn.Module):
 
         state_indices = mamba_metadata.state_indices[:num_prefills +
                                                      num_decodes]
-        if use_cpp_mamba_cache_manager():
-            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                self.layer_idx)
-            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                self.layer_idx)
-            layer_cache = None  # Not used in C++ path
-        else:
-            layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
-                self.layer_idx)
-            conv_states = layer_cache.conv
-            ssm_states = layer_cache.temporal
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
+            self.layer_idx)
+        conv_states = layer_cache.conv
+        ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)
@@ -348,28 +365,71 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
-            # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
-            xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
-                                                    self.tp_d_inner,
-                                                    self.tp_conv_dim)
-            xbc_p = causal_conv1d_fn(xbc_p_t,
-                                     self.conv1d.weight,
-                                     self.conv1d.bias,
-                                     activation="silu",
-                                     conv_states=conv_states,
-                                     has_initial_state=has_initial_states,
-                                     query_start_loc=cu_seqlens,
-                                     cache_indices=state_indices_p)
+            if self._token_major_conv:
+                # in_proj emits token-major, and the SSD wants token-major, so
+                # the two transposes around the conv only exist to satisfy the
+                # channel-major kernel's layout. The channel-last kernel takes
+                # its strides off the tensors, so feeding it a channel-last
+                # *view* of the projection and asking it to write token-major
+                # removes both transposes without adding any kernel.
+                #
+                # `out` must not alias `x`: the kernel splits each sequence into
+                # token chunks and every chunk reads a halo the previous one
+                # wrote, so writing back over the input would race across blocks.
+                xbc_p_t = zxbcdt[:num_prefill_tokens,
+                                 self.tp_d_inner:self.tp_d_inner +
+                                 self.tp_conv_dim].t()
+                xbc_p_out = torch.empty(num_prefill_tokens,
+                                        self.tp_conv_dim,
+                                        dtype=zxbcdt.dtype,
+                                        device=zxbcdt.device).t()
+                causal_conv1d_fn(
+                    xbc_p_t,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    query_start_loc=cu_seqlens,
+                    cache_indices=state_indices_p,
+                    has_initial_state=has_initial_states,
+                    conv_states=conv_states,
+                    activation="silu",
+                    out=xbc_p_out,
+                )
+                # Token-major result: x/B/C are plain views, no split kernel.
+                xbc_p_tm = xbc_p_out.t()
+                bc = self.tp_ngroups * self.d_state
+                x_p = xbc_p_tm[:, :self.tp_d_inner].view(
+                    num_prefill_tokens, self.tp_nheads,
+                    self.head_dim).unsqueeze(0)
+                B_p = xbc_p_tm[:, self.tp_d_inner:self.tp_d_inner + bc].view(
+                    num_prefill_tokens, self.tp_ngroups,
+                    self.d_state).unsqueeze(0)
+                C_p = xbc_p_tm[:, self.tp_d_inner + bc:].view(
+                    num_prefill_tokens, self.tp_ngroups,
+                    self.d_state).unsqueeze(0)
+            else:
+                # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
+                xbc_p_t = extract_transpose_xbc_prefill(zxbcdt,
+                                                        num_prefill_tokens,
+                                                        self.tp_d_inner,
+                                                        self.tp_conv_dim)
+                xbc_p = causal_conv1d_fn(xbc_p_t,
+                                         self.conv1d.weight,
+                                         self.conv1d.bias,
+                                         activation="silu",
+                                         conv_states=conv_states,
+                                         has_initial_state=has_initial_states,
+                                         query_start_loc=cu_seqlens,
+                                         cache_indices=state_indices_p)
 
-            # Fused kernel to avoid expensive .contiguous() calls after split/rearrange.
-            x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
-                xbc_p,
-                self.tp_d_inner,
-                self.tp_ngroups,
-                self.d_state,
-                self.tp_nheads,
-                self.head_dim,
-            )
+                # Fused kernel to avoid expensive .contiguous() calls after split/rearrange.
+                x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
+                    xbc_p,
+                    self.tp_d_inner,
+                    self.tp_ngroups,
+                    self.d_state,
+                    self.tp_nheads,
+                    self.head_dim,
+                )
             dt_p = dt_p.unsqueeze(0)
 
             initial_states = None
@@ -430,16 +490,47 @@ class Mamba2Mixer(nn.Module):
                         f"{draft_token_num} must match fixed replay step "
                         f"width {replay_step_width}.")
 
-                intermediate_state_indices = _cached_arange(
-                    attn_metadata.kv_cache_manager.get_max_resource_count(),
-                    state_indices_d.device)[:num_decodes]
+                # Dynamic-tree verify uses per-request links; linear MTP skips it.
+                is_dyn_tree = getattr(spec_metadata, 'is_spec_dec_dynamic_tree',
+                                      False)
+                retrieve_next_token = retrieve_next_sibling = None
+                retrieve_parent_token = None
+                if is_dyn_tree:
+                    if use_replay:
+                        raise NotImplementedError(
+                            "Dynamic-tree Mamba verify is not supported with "
+                            "the replay SSM-cache path (TRTLLM_USE_MAMBA_REPLAY)."
+                        )
+                    retrieve_next_token = spec_metadata.retrieve_next_token
+                    retrieve_next_sibling = spec_metadata.retrieve_next_sibling
+                    assert (retrieve_next_token is not None
+                            and retrieve_next_sibling is not None), (
+                                "Dynamic-tree verify requires retrieve link "
+                                "tensors on spec_metadata.")
+                    retrieve_next_token = retrieve_next_token[:num_decodes]
+                    retrieve_next_sibling = retrieve_next_sibling[:num_decodes]
+                    # conv1d fills parent links used by tree-aware SSM restore.
+                    retrieve_parent_token = torch.empty(
+                        (num_decodes, draft_token_num),
+                        dtype=torch.int32,
+                        device=state_indices_d.device)
 
-                # Reshape for batch processing
-                xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
-                                            -1).transpose(1, 2)
+                # Prefer the cache_manager-owned arange; cached fallback storage
+                # can be recycled by CUDA graph warmup.
+                _km_isi = getattr(attn_metadata.kv_cache_manager,
+                                  'intermediate_state_indices', None)
+                if _km_isi is not None:
+                    intermediate_state_indices = _km_isi[:num_decodes]
+                else:
+                    intermediate_state_indices = _cached_arange(
+                        attn_metadata.kv_cache_manager.get_max_resource_count(),
+                        state_indices_d.device)[:num_decodes]
+
+                # Use reshape because dynamic-tree tokens may be non-contiguous.
+                xbc_d_reshaped = xbc_d.reshape(num_decodes, draft_token_num,
+                                               -1).transpose(1, 2)
 
                 def conv1d():
-                    # TODO:support tree structure [TRTLLM-10320]
                     xbc_d_processed = causal_conv1d_update_triton(
                         xbc_d_reshaped,
                         conv_states,
@@ -449,11 +540,15 @@ class Mamba2Mixer(nn.Module):
                         conv_state_indices=state_indices_d[:num_decodes],
                         intermediate_conv_window=intermediate_conv_states,
                         intermediate_state_indices=intermediate_state_indices,
+                        # None on linear MTP.
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_parent_token=retrieve_parent_token,
                         # PDL chain: conv1d → precompute → main (replay only)
                         launch_dependent_kernels=use_replay,
                     )
 
-                    return xbc_d_processed.transpose(1, 2).view(
+                    return xbc_d_processed.transpose(1, 2).reshape(
                         num_decode_tokens, -1)
 
             else:
@@ -588,13 +683,23 @@ class Mamba2Mixer(nn.Module):
                         state_batch_indices=state_batch_indices,
                         disable_state_update=True,
                         intermediate_state_indices=intermediate_state_indices,
+                        # None for linear MTP; tree parent map for dynamic tree.
+                        retrieve_parent_token=retrieve_parent_token,
                     )
                 else:
                     # Triton kernel + flashinfer need contiguous for alignment.
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
-                    self.selective_state_update_func(
+                    if is_dyn_tree:
+                        # flashinfer SSU cannot restore tree-parent states.
+                        ssu_func = selective_state_update_native
+                        ssu_extra = dict(
+                            retrieve_parent_token=retrieve_parent_token)
+                    else:
+                        ssu_func = self.selective_state_update_func
+                        ssu_extra = {}
+                    ssu_func(
                         ssm_states,
                         x_d_4d,
                         dt_d_4d,
@@ -611,6 +716,7 @@ class Mamba2Mixer(nn.Module):
                         intermediate_states_buffer=intermediate_ssm_states,
                         cache_steps=draft_token_num,
                         intermediate_state_indices=intermediate_state_indices,
+                        **ssu_extra,
                         **philox_kwargs,
                     )
             else:

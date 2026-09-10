@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,128 +12,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Compatibility shim for ``tensorrt_llm.lora_helper``.
 
-from typing import Dict, List, Literal, Optional
+Will be removed once all usages are migrated to
+``tensorrt_llm._torch.peft.lora.config``.
 
-from pydantic import Field
+DO NOT ADD ANYTHING TO THIS FILE.
+"""
 
-from tensorrt_llm.llmapi.utils import StrictBaseModel
+import warnings
 
+from tensorrt_llm._torch.peft.lora.config import (  # noqa: F401
+    LoraConfig,
+    get_default_trtllm_modules_to_hf_modules,
+    get_missing_qkv_modules_from_lora_modules,
+)
 
-def get_missing_qkv_modules_from_lora_modules(
-        lora_target_modules: List[str]) -> List[str]:
-    """Get missing QKV modules from LoRA target modules.
+warnings.warn(
+    "tensorrt_llm.lora_helper has moved to "
+    "tensorrt_llm._torch.peft.lora.config and will be removed in a future "
+    "release.",
+    FutureWarning,
+    stacklevel=2,
+)
 
-    In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or
-    all disabled at the same time. However, some lora checkpoints (e.g. BART) only contain two of them,
-    so we use zero tensor to fill the missing ones.
-    """
-    missing_qkv_modules = []
-    if any(x in lora_target_modules for x in ["attn_q", "attn_k", "attn_v"]):
-        for lora_module in ["attn_q", "attn_k", "attn_v"]:
-            if lora_module not in lora_target_modules:
-                missing_qkv_modules.append(lora_module)
-    if any(x in lora_target_modules
-           for x in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]):
-        for lora_module in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]:
-            if lora_module not in lora_target_modules:
-                missing_qkv_modules.append(lora_module)
-    return missing_qkv_modules
-
-
-def get_default_trtllm_modules_to_hf_modules():
-    """Get default mapping from TensorRT-LLM module names to HuggingFace module names."""
-    return {
-        "attn_q": "q_proj",
-        "attn_k": "k_proj",
-        "attn_v": "v_proj",
-        "attn_qkv": "qkv_proj",
-        "attn_dense": "o_proj",
-        "mlp_h_to_4h": "gate_proj",
-        "mlp_4h_to_h": "down_proj",
-        "mlp_gate": "up_proj",
-        "mlp_gate_up": "gate_up_proj",
-        "moe_h_to_4h": "w1",
-        "moe_4h_to_h": "w2",
-        "moe_gate": "w3",
-        "moe_router": "gate",
-        "shared_expert_h_to_4h": "shared_expert.gate_proj",
-        "shared_expert_4h_to_h": "shared_expert.down_proj",
-        "shared_expert_gate": "shared_expert.up_proj",
-        "mamba_in_proj": "in_proj",
-        "mamba_out_proj": "out_proj",
-        "moe_latent_fc1": "fc1_latent_proj",
-        "moe_latent_fc2": "fc2_latent_proj",
-    }
-
-
-def use_lora(
-    model,
-    lora_config: "LoraConfig",
-    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
-):
-    """Use LoRA with the given model and configuration.
-
-    This function is a wrapper that delegates to the appropriate loading function
-    based on the LoRA checkpoint source.
-    """
-    if lora_config.lora_ckpt_source == "nemo":
-        from .lora_manager import load_nemo_lora
-        load_nemo_lora(model, lora_config)
-    elif lora_config.lora_ckpt_source == "hf":
-        from .lora_manager import load_hf_lora
-        load_hf_lora(model, lora_config, trtllm_modules_to_hf_modules)
-    else:
-        raise ValueError(
-            f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
-
-
-class LoraConfig(StrictBaseModel):
-    lora_dir: List[str] = Field(
-        default_factory=list,
-        description="List of directories containing LoRA adapter checkpoints. "
-        "For HuggingFace format, expects adapter_model.bin/.safetensors and adapter_config.json. "
-        "For NeMo format, expects .nemo files. If empty, lora_target_modules must be provided."
-    )
-    lora_ckpt_source: Literal["hf", "nemo"] = Field(
-        default="hf",
-        description=
-        "Checkpoint format: 'hf' for HuggingFace PEFT format, 'nemo' for NeMo format. "
-        "NeMo only supports attn_qkv module.")
-    max_lora_rank: int = Field(
-        default=64,
-        description=
-        "Maximum LoRA rank across all adapters, used to pre-allocate workspace memory. "
-        "Set to the actual max rank of your adapters to reduce memory usage.")
-    lora_target_modules: List[str] = Field(
-        default_factory=list,
-        description="TensorRT-LLM module names where LoRA is applied "
-        "(e.g., ['attn_q', 'attn_k', 'attn_v'], ['attn_qkv'], ['mlp_gate', 'mlp_up']). "
-        "If empty and lora_dir is provided, inferred from checkpoint.")
-    trtllm_modules_to_hf_modules: Dict[str, str] = Field(
-        default_factory=dict,
-        description=
-        "Mapping from TensorRT-LLM module names to HuggingFace module names "
-        "(e.g., {'attn_q': 'q_proj'}). If empty, uses default mappings.")
-    max_loras: Optional[int] = Field(
-        default=None,
-        description=
-        "Maximum number of LoRA adapters that can be loaded simultaneously in GPU memory. "
-        "Controls device-side LoRA cache size.")
-    max_cpu_loras: Optional[int] = Field(
-        default=None,
-        description=
-        "Maximum number of LoRA adapters that can be stored in CPU memory. "
-        "Controls host-side cache for prefetching adapters before moving to GPU."
-    )
-    swap_gate_up_proj_lora_b_weight: bool = Field(
-        default=True,
-        description=
-        "Whether to swap gate/up projection order in fused gate_up_proj LoRA B weights. "
-        "Set to False for models like Phi-4-MM that use a different weight order."
-    )
-
-    @property
-    def missing_qkv_modules(self) -> List[str]:
-        return get_missing_qkv_modules_from_lora_modules(
-            self.lora_target_modules)
+__all__ = [
+    "LoraConfig",
+    "get_default_trtllm_modules_to_hf_modules",
+    "get_missing_qkv_modules_from_lora_modules",
+]

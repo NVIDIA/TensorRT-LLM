@@ -87,6 +87,9 @@ def _load_config(checkpoint_dir: str) -> dict:
 # in bf16. The CPU component tests construct their modules directly in float32.
 _GPU_DTYPE = torch.bfloat16
 
+# Mirror the engine's ``encoder_max_num_tokens`` runtime budget.
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
+
 
 def _make_tiny_vision_config(
     width: int = 64,
@@ -161,11 +164,13 @@ def _vision_attention_model_config(vision_config: PretrainedConfig) -> ModelConf
 
 def _vision_attn_metadata(seq_lens):
     """Context-only (no KV cache) attention metadata for a flat varlen stream."""
-    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
     md = get_attention_backend("TRTLLM").Metadata(
-        max_num_requests=64,
-        max_num_tokens=max(8192, int(sum(seq_lens))),
+        # Non-fan-out: one attention sequence per image, so the request count is
+        # exactly len(seq_lens) and the token count the actual sum.
+        max_num_requests=len(seq_lens),
+        max_num_tokens=int(sum(seq_lens)),
         kv_cache_manager=None,
     )
     md.num_contexts = len(seq_lens)
@@ -175,6 +180,22 @@ def _vision_attn_metadata(seq_lens):
     md.max_seq_len = max(seq_lens)
     md.prepare()
     return md
+
+
+def _setup_encoder_attn_metadata(module, max_num_tokens: int = _ENCODER_TEST_MAX_NUM_TOKENS):
+    """Mirror the engine's ``setup_mm_encoder_attn_metadata`` walk.
+
+    The encoder builds its ``AttentionMetadata`` via the engine-driven
+    ``MultimodalEncoderMixin.setup_attn_metadata`` after model load; standalone
+    tests that construct the encoder/tower directly must do the same before the
+    encoder forward. Returns ``module`` for chaining.
+    """
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+
+    for m in module.modules():
+        if isinstance(m, MultimodalEncoderMixin):
+            m.setup_attn_metadata(max_num_tokens=max_num_tokens)
+    return module
 
 
 @torch.no_grad()
@@ -428,7 +449,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
 
         width, patch, image = 64, 8, 64
         vision_cfg = _make_tiny_vision_config(width=width, patch_size=patch, image_size=image)
-        enc = (
+        enc = _setup_encoder_attn_metadata(
             Step3p7VisionEncoder(
                 _vision_attention_model_config(vision_cfg), vision_cfg, dtype=_GPU_DTYPE
             )
@@ -448,7 +469,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
 
         width, patch, image = 64, 8, 128  # base grid 16
         vision_cfg = _make_tiny_vision_config(width=width, patch_size=patch, image_size=image)
-        enc = (
+        enc = _setup_encoder_attn_metadata(
             Step3p7VisionEncoder(
                 _vision_attention_model_config(vision_cfg), vision_cfg, dtype=_GPU_DTYPE
             )
@@ -478,7 +499,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         """``_encode`` runs the encoder + projector to the text hidden size."""
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
 
-        tower = (
+        tower = _setup_encoder_attn_metadata(
             Step3p7VisionTower(
                 _make_tiny_vision_model_config(
                     text_hidden_size=32, width=64, patch_size=8, image_size=64
@@ -502,7 +523,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
         from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-        tower = (
+        tower = _setup_encoder_attn_metadata(
             Step3p7VisionTower(
                 _make_tiny_vision_model_config(
                     text_hidden_size=32, width=64, patch_size=8, image_size=64
@@ -548,7 +569,7 @@ class TestStep3p7VisionTower(unittest.TestCase):
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
         from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-        tower = (
+        tower = _setup_encoder_attn_metadata(
             Step3p7VisionTower(
                 _make_tiny_vision_model_config(
                     text_hidden_size=32, width=64, patch_size=8, image_size=64

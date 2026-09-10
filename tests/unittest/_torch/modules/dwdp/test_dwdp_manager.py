@@ -26,6 +26,8 @@ lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.pyexecutor.dwdp import (
     DwdpManager,
@@ -34,6 +36,8 @@ from tensorrt_llm._torch.pyexecutor.dwdp import (
 )
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_config(dwdp_size: int = 2) -> DwdpConfig:

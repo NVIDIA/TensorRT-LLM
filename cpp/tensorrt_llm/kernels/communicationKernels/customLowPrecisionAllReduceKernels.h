@@ -19,8 +19,8 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <vector>
@@ -111,15 +111,15 @@ struct LowPrecisionAllReduceParams
     uint64_t* ag_notify_peer_inside_numa_flags[LP_ALLREDUCE_MAX_BLOCKS * 4]; // 3*flags , 3 is other rank inside numa
 
     static LowPrecisionAllReduceParams deserialize(
-        size_t tpSize, size_t tpRank, nvinfer1::DataType dataType, int token_num, int hidden_size);
+        size_t tpSize, size_t tpRank, tensorrt_llm::DataType dataType, int token_num, int hidden_size);
     static LowPrecisionAllReduceParams deserialize_hier(
-        size_t tpSize, size_t tpRank, nvinfer1::DataType dataType, int token_num, int hidden_size);
+        size_t tpSize, size_t tpRank, tensorrt_llm::DataType dataType, int token_num, int hidden_size);
 };
 
 bool lowPrecisionConfigurationSupported(size_t msg_size, size_t n_ranks);
 
 void customLowPrecisionAllReduce(
-    kernels::LowPrecisionAllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream);
+    kernels::LowPrecisionAllReduceParams& params, tensorrt_llm::DataType dataType, cudaStream_t stream);
 
 int32_t max_workspace_size_lowprecision(int32_t tp_size);
 } // namespace kernels

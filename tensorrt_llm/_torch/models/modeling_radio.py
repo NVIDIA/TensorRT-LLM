@@ -6,8 +6,8 @@ import copy
 import dataclasses
 import math
 from collections import namedtuple
-from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
-                    Type, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Mapping,
+                    NamedTuple, Optional, Sequence, Tuple, Type, Union)
 
 import torch
 import torch.nn as nn
@@ -16,15 +16,24 @@ from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.attention_backend import \
+from tensorrt_llm._torch.attention import attention as trtllm_attention
+from tensorrt_llm._torch.attention.backends import AttentionMetadata
+from tensorrt_llm._torch.attention.backends import \
     interface as attention_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.modules import attention as trtllm_attention
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MultimodalEncoderMixin
+from tensorrt_llm._torch.models.multimodal_encoder_graph import (
+    EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
+    MultimodalEncoderGraphRunner)
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
+from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 
 InputDimT = Union[int, Tuple[int, int]]
 
@@ -550,7 +559,7 @@ class Block(nn.Module):
         return x
 
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     """ Vision Transformer.
 
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
@@ -745,22 +754,64 @@ class VisionTransformer(nn.Module):
 
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
+        self._attn_backend = model_config.attn_backend
+
+        # Establish default encoder AttentionMetadata at construction (legacy
+        # 8192 requests, `model_config.max_num_tokens`) so the CUDA-graph runner
+        # / metadata provider can read `self.attn_metadata` before the engine
+        # re-sizes it via `setup_attn_metadata`.
+        self.setup_attn_metadata(max_num_tokens=model_config.max_num_tokens)
+
+        # CUDA-graph runner for the block stack. None means graphs are off and
+        # the eager path is always taken; the caller opts in via
+        # `enable_blocks_cuda_graph`. Initialized here (not in
+        # `setup_attn_metadata`) so it is always present regardless of call
+        # order.
+        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
+
+    def setup_attn_metadata(self, max_num_tokens: int) -> None:
+        # Override the default to add `kv_layout="NHD"` for FlashInfer.
+        # FlashInfer's original default is "NHD"; TRT-LLM switched the default
+        # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
+        # (kv_cache_manager=None) computes k/v directly from input, which is
+        # always in NHD format ([tokens, heads, dim]).
+        # Floor the request capacity at the same legacy fallback as the mixin
+        # default while allowing one attention segment per encoder token.
+        capacities = self.get_encoder_attention_metadata_capacity(
+            max_num_tokens)
         metadata_kwargs = dict(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=model_config.max_num_tokens,
+            max_num_requests=capacities["attention"],
+            max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
-        if model_config.attn_backend == "FLASHINFER":
-            # FlashInfer's original default kv_layout is "NHD". TRT-LLM changed
-            # the default to "HND" for paged KV cache paths (see PR #6917).
-            # For ModelingRadio ragged prefill (kv_cache_manager=None), we
-            # explicitly use "NHD" because ragged k/v tensors computed directly
-            # from input are always in NHD format ([tokens, heads, dim]).
+        if self._attn_backend == "FLASHINFER":
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
-    def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
-                              attn_metadata: AttentionMetadata):
+    def enable_blocks_cuda_graph(
+        self,
+        config: "MultimodalEncoderCudaGraphConfig",
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Build the block-stack runner from `config` and capture startup graphs.
+
+        The caller must ensure the model parameters already live on `device`
+        (or on a CUDA device discoverable from `self.parameters()`); captures
+        are recorded immediately.
+        """
+        if self._blocks_graph_runner is not None:
+            return
+
+        graph_runner = self._build_blocks_graph_runner(config)
+        if device is None:
+            device = next(self.parameters()).device
+        graph_runner.capture_all(device)
+        self._blocks_graph_runner = graph_runner
+
+    def prepare_attn_metadata(
+            self, batch_size: int, seq_lengths: List[int],
+            attn_metadata: AttentionMetadata) -> AttentionMetadata:
         """
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
@@ -786,7 +837,7 @@ class VisionTransformer(nn.Module):
                          x: torch.Tensor,
                          image_sizes: Optional[List[Tuple[int, int]]] = None,
                          num_frames: Optional[int] = None) -> torch.Tensor:
-        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm).
+        """Forward through embeddings, transformer blocks, and post-transformer norm.
 
         Args:
             x: Input pixel values.
@@ -825,8 +876,7 @@ class VisionTransformer(nn.Module):
         hidden_size = x.shape[-1]
         # Need flatten batch/seq_len for trtllm attention.
         x = x.reshape(-1, hidden_size)
-        for block in self.blocks:
-            x = block(x, attn_metadata=attn_metadata)
+        x = self._run_blocks(x, attn_metadata)
 
         # Reshape back from flattened.
         if packed_batch_size is not None:
@@ -838,6 +888,103 @@ class VisionTransformer(nn.Module):
 
         x = self.norm(x)
         return x
+
+    def _build_blocks_graph_runner(
+        self, config: "MultimodalEncoderCudaGraphConfig"
+    ) -> MultimodalEncoderGraphRunner:
+        input_specs = {
+            "x":
+            EncoderGraphTensorSpec(shape=(self.embed_dim, ),
+                                   dtype=self.model_config.torch_dtype,
+                                   token_dim=0),
+        }
+        output_specs = {"x": 0}
+        return MultimodalEncoderGraphRunner(
+            encoder_fn=self._encoder_graph_fn,
+            metadata_provider=_VisionEncoderMetadataProvider(self),
+            input_specs=input_specs,
+            output_specs=output_specs,
+            config=config,
+        )
+
+    # This is what gets passed to the `MultimodalEncoderGraphRunner`.
+    def _encoder_graph_fn(
+        self,
+        inputs: Mapping[str, torch.Tensor],
+        md: AttentionMetadata,
+    ) -> Dict[str, torch.Tensor]:
+        return {"x": self._run_blocks_eager(inputs["x"], md)}
+
+    def _run_blocks(self, x: torch.Tensor,
+                    attn_metadata: AttentionMetadata) -> torch.Tensor:
+        # RADIO runs outside the compiled LM region and receives its vision
+        # metadata explicitly. Keep both graph replay and eager fallback off
+        # the custom-op path, which resolves the LM metadata from extra_attrs.
+        with torch_compiling(False):
+            if self._blocks_graph_runner is not None:
+                seq_lengths = attn_metadata.seq_lens.tolist()
+                output = self._blocks_graph_runner.maybe_run(
+                    seq_lengths=seq_lengths,
+                    inputs={"x": x},
+                )
+                if output is not None:
+                    return output["x"]
+            return self._run_blocks_eager(x, attn_metadata)
+
+    def _run_blocks_eager(self, x: torch.Tensor,
+                          attn_metadata: AttentionMetadata) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x, attn_metadata=attn_metadata)
+        return x
+
+
+class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
+    """Bridges the multimodal encoder graph runner to the model's eager metadata path.
+
+    `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
+    `AttentionMetadata.seq_lens`'s setter into the in-place `copy_` branch (see
+    `attention/backends/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
+    to run against captured CUDA graphs.
+
+    The runner double-checks via its `data_ptr` stability assertion against `graph_critical_attrs`.
+    """
+
+    # `_seq_lens_cuda` is the on-device buffer the captured attention kernels read sequence lengths
+    # from; the `seq_lens` setter copies into it in place when `is_cuda_graph=True`.
+    # FlashInfer also owns a persistent workspace buffer that backs its captured ragged-prefill run.
+    graph_critical_attrs: Sequence[str]
+
+    def __init__(self, vit: VisionTransformer) -> None:
+        self._vit = vit
+        self.graph_critical_attrs = ("_seq_lens_cuda", )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            self.graph_critical_attrs += (
+                "workspace_buffer",
+                "_ragged_qo_indptr_buf",
+                "_ragged_kv_indptr_buf",
+            )
+
+    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
+        vit = self._vit
+        metadata_kwargs = dict(
+            max_num_requests=max(vit.attn_metadata.max_num_requests,
+                                 key.num_contexts),
+            max_num_tokens=max(vit.attn_metadata.max_num_tokens,
+                               key.total_tokens),
+            kv_cache_manager=None,
+        )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            metadata_kwargs["kv_layout"] = "NHD"
+        md = vit.metadata_cls(**metadata_kwargs)
+        md.is_cuda_graph = True
+        return md
+
+    def refresh_in_place(self, metadata: AttentionMetadata,
+                         padded_seq_lengths: Sequence[int]) -> None:
+        # Reuse the eager path so both modes go through the same setter logic; the captured graph
+        # holds the metadata's tensor addresses.
+        self._vit.prepare_attn_metadata(len(padded_seq_lengths),
+                                        list(padded_seq_lengths), metadata)
 
 
 class RADIOVisionModelBase(nn.Module):
@@ -1012,6 +1159,21 @@ class RADIOVisionModelBase(nn.Module):
         return fmt_feat
 
 
+def split_fused_qkv(name: str, tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Split a fused ``attn.qkv`` weight or bias into its q/k/v projections.
+
+    The row order here is the only place the fusion order is written down, so
+    anything that builds an ``attn.qkv`` tensor for this loader has to match it.
+    """
+    dim_shape = tensor.shape[0] // 3
+    return {
+        name.replace('attn.qkv.', 'attn.q_proj.'): tensor[:dim_shape],
+        name.replace('attn.qkv.', 'attn.k_proj.'):
+        tensor[dim_shape:2 * dim_shape],
+        name.replace('attn.qkv.', 'attn.v_proj.'): tensor[2 * dim_shape:],
+    }
+
+
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
@@ -1025,16 +1187,20 @@ class RADIOVisionModel(PreTrainedModel):
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
                  disable_quantization: bool = True,
-                 vision_attn_backend: Optional[str] = "FLASHINFER"):
+                 vision_attn_backend: Optional[str] = "FLASHINFER",
+                 encoder_cuda_graph_config: Optional[
+                     "MultimodalEncoderCudaGraphConfig"] = None):
         """
         Args:
             model_config: Model configuration.
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
             vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
+            encoder_cuda_graph_config: Optional CUDA graph capture configuration for the vision tower.
         """
         config = model_config.pretrained_config
         super().__init__(config)
+        self._encoder_cuda_graph_config = encoder_cuda_graph_config
 
         self.model_config = copy.deepcopy(model_config)
         if self.model_config.quant_config is not None:
@@ -1063,11 +1229,12 @@ class RADIOVisionModel(PreTrainedModel):
         img_size = VIT_TIMM_CONFIG_BY_NAME[model_name].img_size
         mlp_ratio = intermediate_size / embed_dim
 
-        # Build the model.
+        # Build the model. C-RADIOv4-H omits `in_chans`, `input_size` and `drop`
+        # from the RADIO argument bag, so these reads tolerate their absence.
         in_chans = 3
-        if args.in_chans is not None:
+        if getattr(args, 'in_chans', None) is not None:
             in_chans = args.in_chans
-        elif args.input_size is not None:
+        elif getattr(args, 'input_size', None) is not None:
             in_chans = args.input_size[0]
         vit_model = VisionTransformer(
             img_size=img_size,
@@ -1077,7 +1244,7 @@ class RADIOVisionModel(PreTrainedModel):
             depth=depth,
             num_heads=num_attention_heads,
             mlp_ratio=mlp_ratio,
-            drop_rate=args.drop,
+            drop_rate=getattr(args, 'drop', 0.0),
             special_args=args,
             model_config=self.model_config,
         )
@@ -1091,30 +1258,41 @@ class RADIOVisionModel(PreTrainedModel):
         input_conditioner = nn.Identity()
         input_conditioner.dtype = config.torch_dtype
 
-        adaptor_names = config.adaptor_names or []
+        # C-RADIOv4 configs omit these three fields; absent means "not configured",
+        # which is the only case these guards accept anyway.
+        adaptor_names = getattr(config, 'adaptor_names', None) or []
         if len(adaptor_names) > 0:
             raise ValueError(
                 "Adaptor names are not supported for RADIO models.")
         adaptors = dict()
 
         feature_normalizer = None
-        if config.feature_normalizer_config is not None:
+        if getattr(config, 'feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Feature normalizer is not supported for RADIO models.")
 
         inter_feature_normalizer = None
-        if config.inter_feature_normalizer_config is not None:
+        if getattr(config, 'inter_feature_normalizer_config', None) is not None:
             raise ValueError(
                 "Intermediate feature normalizer is not supported for RADIO models."
             )
+
+        # C-RADIOv4 renames both: `max_img_size` is `max_resolution`, and
+        # `image_size` the preferred (square) resolution. `vitdet_window_size`
+        # has no v4 counterpart; None is the constructor's own default.
+        max_resolution = (config.max_resolution if hasattr(
+            config, 'max_resolution') else config.max_img_size)
+        preferred_resolution = (config.preferred_resolution if hasattr(
+            config, 'preferred_resolution') else Resolution(
+                config.image_size, config.image_size))
 
         self.radio_model = RADIOVisionModelBase(
             vit_model,
             input_conditioner,
             patch_size=config.patch_size,
-            max_resolution=config.max_resolution,
-            window_size=config.vitdet_window_size,
-            preferred_resolution=config.preferred_resolution,
+            max_resolution=max_resolution,
+            window_size=getattr(config, 'vitdet_window_size', None),
+            preferred_resolution=preferred_resolution,
             adaptors=adaptors,
             feature_normalizer=feature_normalizer,
             inter_feature_normalizer=inter_feature_normalizer,
@@ -1167,14 +1345,8 @@ class RADIOVisionModel(PreTrainedModel):
         for name in model_weights:
             # Handle with weights and bias for vision transformer's qkv projection.
             if "attn.qkv." in name:
-                q_name = name.replace("attn.qkv.", "attn.q_proj.")
-                k_name = name.replace("attn.qkv.", "attn.k_proj.")
-                v_name = name.replace("attn.qkv.", "attn.v_proj.")
-                dim_shape = model_weights[name].shape[0] // 3
-                converted_weights[q_name] = model_weights[name][:dim_shape]
-                converted_weights[k_name] = model_weights[name][dim_shape:2 *
-                                                                dim_shape]
-                converted_weights[v_name] = model_weights[name][2 * dim_shape:]
+                converted_weights.update(
+                    split_fused_qkv(name, model_weights[name]))
             else:
                 converted_weights[name] = model_weights[name]
         pattern_mapping = {
@@ -1185,6 +1357,17 @@ class RADIOVisionModel(PreTrainedModel):
         modeling_utils._load_weights_impl(self.radio_model.model,
                                           converted_weights,
                                           params_map=pattern_mapping)
+
+    def enable_blocks_cuda_graph(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Forward the configuration to the inner VisionTransformer."""
+        if self._encoder_cuda_graph_config is None:
+            return
+        self.radio_model.model.enable_blocks_cuda_graph(
+            self._encoder_cuda_graph_config, device=device)
 
     def forward(self,
                 x: torch.Tensor,

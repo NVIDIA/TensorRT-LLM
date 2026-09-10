@@ -69,10 +69,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     )
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
-            skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
         )
 
         module_name = kwargs.get("module_name", None)
@@ -81,13 +80,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if module_name is not None and self._is_disabled(module_name, ckpt_sparse_attention_config):
             return None
 
-        disabled_until_timestep = self.disabled_until_timestep
-        if disabled_until_timestep is None:
-            disabled_until_timestep = (
-                skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
-                    ckpt_sparse_attention_config
-                )
-            )
+        disabled_until_timestep = self.resolve_disabled_until_timestep(
+            checkpoint_config=ckpt_sparse_attention_config,
+        )
 
         threshold_scale_factor = self.resolve_threshold_scale_factor(ckpt_sparse_attention_config)
         if threshold_scale_factor is None:
@@ -104,13 +99,40 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             return None
         return SkipSoftmaxParams(scheduler=scheduler)
 
+    def resolve_disabled_until_timestep(
+        self,
+        *,
+        checkpoint_config: Optional[Dict[str, Any]] = None,
+        pretrained_config: Any = None,
+    ) -> Optional[float]:
+        """Resolve the user override or checkpoint-provided timestep cutoff.
+
+        Exactly one of ``checkpoint_config`` (a raw checkpoint config dict) or
+        ``pretrained_config`` (the model's pretrained config object/dict) is
+        expected per call site; both default to ``None`` so a mistyped keyword
+        raises ``TypeError`` here instead of silently resolving to ``None``.
+        """
+        if self.disabled_until_timestep is not None:
+            return self.disabled_until_timestep
+
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
+            skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
+        )
+
+        ckpt_sparse_attention_config = self._ckpt_sparse_attention_config_from_kwargs(
+            {"checkpoint_config": checkpoint_config, "pretrained_config": pretrained_config}
+        )
+        return skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
+            ckpt_sparse_attention_config
+        )
+
     def _is_disabled(
         self,
         module_name: str,
         ckpt_sparse_attention_config: Optional[Dict[str, Any]],
     ) -> bool:
         """Return whether skip-softmax should be disabled for this layer."""
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_ignore_from_ckpt_sparse_attention_config,
         )
 
@@ -145,7 +167,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
         sparsity = self.target_sparsity
         if sparsity is None:
-            from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
                 skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
             )
 
@@ -162,7 +184,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if sparsity is None:
             return None
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_formula_from_ckpt_sparse_attention_config,
         )
 
@@ -197,3 +219,26 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             if isinstance(sparse_config, dict):
                 return sparse_config
         return None
+
+
+class VideoSparseAttentionConfig(StrictBaseModel):
+    """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
+
+    Two-stage hybrid attention: a coarse mean-pooled stage over (4,4,4) cubes
+    and a block-sparse fine stage over the top-K cubes selected per head.
+    vsa_sparsity controls the fraction of cubes dropped on the fine stage.
+    """
+
+    algorithm: Literal["vsa"] = PydanticField(
+        "vsa",
+        description="Sparse attention algorithm discriminator.",
+    )
+    vsa_sparsity: float = PydanticField(
+        0.9,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of cubes dropped on the fine stage. 0.0 keeps all cubes "
+            "(dense fine stage); values closer to 1.0 keep fewer cubes."
+        ),
+    )

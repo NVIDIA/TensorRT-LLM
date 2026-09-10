@@ -19,6 +19,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
 from .transformer_flux import FluxTransformer2DModel
@@ -57,6 +58,14 @@ class FluxPipeline(BasePipeline):
         ):
             raise ValueError(
                 "FluxPipeline does not support CFG parallelism. Please set cfg_size to 1."
+            )
+
+        _sa_cfg = pipeline_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for FLUX."
             )
 
         super().__init__(pipeline_config)
@@ -231,11 +240,13 @@ class FluxPipeline(BasePipeline):
                         "return_dict",
                     ],
                     return_dict_default=False,
+                    return_tuple_when_return_dict_false=True,
                 )
             )
 
-            # TeaCache or Cache-DiT
-            self._setup_cache_acceleration(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
+            # TeaCache or Cache-DiT: resolve coefficients here; the loader enables
+            # cache acceleration after torch.compile (see PipelineLoader.load).
+            self._apply_teacache_coefficients(FLUX_TEACACHE_COEFFICIENTS)
 
     @property
     def default_generation_params(self):
@@ -303,7 +314,7 @@ class FluxPipeline(BasePipeline):
             raise ValueError(f"num_images_per_prompt must be >= 1, got {num_images_per_prompt}")
         batch_size = len(prompt) * num_images_per_prompt
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # Encode prompt
         logger.info("Encoding prompt...")

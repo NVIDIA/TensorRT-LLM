@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,8 +40,8 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
     static constexpr SizeType32 nvfp4_scale_granularity = 16;
     static constexpr SizeType32 step_k_scale = step_k / nvfp4_scale_granularity;
     static constexpr SizeType32 tile_k = step_k * BLOCK_SIZE;
-    auto tile_id_m = static_cast<SizeType32>(blockIdx.x * TILE_M);
-    auto tile_id_n = static_cast<SizeType32>(blockIdx.y * TILE_N);
+    auto tile_id_m = static_cast<SizeType32>(blockIdx.y * TILE_M);
+    auto tile_id_n = static_cast<SizeType32>(blockIdx.x * TILE_N);
     auto tid = static_cast<SizeType32>(threadIdx.x);
     float tile_a[step_k];
     float tile_w[TILE_N * step_k];
@@ -185,7 +185,10 @@ template <typename InputType, typename OutputType, typename ScaleType, SizeType3
 void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
 {
     dim3 block(BLOCK_SIZE);
-    dim3 grid(params.m / TILE_M, params.n / TILE_N);
+    // N rides grid.x: its tile count is unbounded (a quantized LM head can be hundreds of
+    // thousands wide) and only grid.x allows more than 65535 blocks. M is safe on grid.y
+    // because it never exceeds cudaCoreGemmTemplateMaxM.
+    dim3 grid(params.n / TILE_N, params.m / TILE_M);
 
     if (tensorrt_llm::common::getEnvEnablePDL())
     {

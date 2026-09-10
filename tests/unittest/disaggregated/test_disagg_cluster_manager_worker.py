@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import subprocess
 import tempfile
 import time
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -11,14 +15,116 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
 from tensorrt_llm.serve.cluster_storage import (WatchEventType,
                                                 create_cluster_storage,
-                                                create_cluster_storage_client)
+                                                create_cluster_storage_client,
+                                                key_time)
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
                                                     DisaggClusterWorker)
+
+pytestmark = pytest.mark.cpu_only
 
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 
 storage_types = ["http", "etcd"]
+
+
+def worker_config(cluster_uri="http://localhost:18000"):
+    return DisaggClusterConfig(cluster_uri=cluster_uri,
+                               cluster_name="test",
+                               minimal_instances=MinimalInstances(
+                                   context_servers=1, generation_servers=1),
+                               inactive_timeout_sec=INACTIVE_TIMEOUT,
+                               heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+
+
+@pytest.mark.asyncio
+async def test_registration_failure_without_retry_returns_false():
+    config = worker_config()
+    storage = AsyncMock()
+    storage.set.return_value = False
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+
+    registered = await worker.register_worker(retry_interval=0)
+
+    assert not registered
+    assert worker._last_heartbeat == 0
+    assert worker._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_recovery_overwrites_stale_registration():
+    config = worker_config()
+    storage = AsyncMock()
+    storage.expire.return_value = False
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+    worker._last_heartbeat = 0
+    worker._registration_expires_at = key_time() + config.inactive_timeout_sec
+    worker._heartbeat_task = asyncio.current_task()
+
+    async def stop_after_registration(*args, **kwargs):
+        worker._stop = True
+        return True
+
+    storage.set.side_effect = stop_after_registration
+
+    await asyncio.wait_for(worker._heartbeat(),
+                           timeout=config.inactive_timeout_sec * 2)
+
+    # Retrying is only worth it when the refresh stalled; "not refreshed" is a
+    # final answer, so burning the TTL window on it would only delay recovery.
+    assert storage.expire.await_count == 1, (
+        "a definitive refusal must not be retried inside the TTL window")
+    storage.set.assert_awaited_once_with(worker.worker_key,
+                                         ANY,
+                                         overwrite_if_exists=True,
+                                         ttl=config.inactive_timeout_sec)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_survives_stalled_refresh_within_ttl():
+    """A stalled refresh RPC must not let a live worker's registration lapse.
+
+    The storage client bounds a request only by its own coarse timeout, which
+    can exceed the whole TTL. If the heartbeat spends the window on a single
+    attempt, the coordinator evicts a healthy worker mid-request, so the
+    refresh must retry inside the window instead.
+    """
+    config = worker_config()
+    storage = AsyncMock()
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+
+    refreshed_at = []
+    stalls_left = 1
+
+    async def stalled_then_ok(*args, **kwargs):
+        nonlocal stalls_left
+        if stalls_left > 0:
+            stalls_left -= 1
+            # Far longer than the TTL, as a stuck client-side timeout would be.
+            await asyncio.sleep(config.inactive_timeout_sec * 5)
+        refreshed_at.append(key_time())
+        worker._stop = True
+        return True
+
+    storage.expire.side_effect = stalled_then_ok
+    worker._last_heartbeat = key_time()
+    worker._registration_expires_at = (key_time() + config.inactive_timeout_sec)
+    deadline = worker._registration_expires_at
+    worker._heartbeat_task = asyncio.current_task()
+
+    await asyncio.wait_for(worker._heartbeat(),
+                           timeout=config.inactive_timeout_sec * 4)
+
+    assert storage.expire.await_count > 1, (
+        "a stalled refresh must be retried, not awaited for the whole window")
+    assert refreshed_at, "the refresh never succeeded"
+    assert refreshed_at[0] < deadline, (
+        f"refresh landed at {refreshed_at[0]} after the registration expired "
+        f"at {deadline}")
+    storage.set.assert_not_awaited()
 
 
 def get_uri(storage_type):
@@ -32,13 +138,7 @@ def get_uri(storage_type):
 
 @pytest.fixture(scope="module")
 def config(request):
-    cluster_uri = get_uri(request.param)
-    return DisaggClusterConfig(cluster_uri=cluster_uri,
-                               cluster_name="test",
-                               minimal_instances=MinimalInstances(
-                                   context_servers=1, generation_servers=1),
-                               inactive_timeout_sec=INACTIVE_TIMEOUT,
-                               heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+    return worker_config(get_uri(request.param))
 
 
 @pytest.fixture(scope="module")

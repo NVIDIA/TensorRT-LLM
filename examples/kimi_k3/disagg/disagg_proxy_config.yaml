@@ -1,0 +1,23 @@
+# Kimi K3 disaggregated serving - proxy configuration for
+# `trtllm-serve disaggregated -c disagg_proxy_config.yaml`.
+#
+# Modeled on examples/disaggregated/disagg_config.yaml. The proxy routes
+# each request to a context server for prefill, then to a generation
+# server for decode; the KV + KDA state moves ctx -> gen through the
+# cache transceiver configured in the worker configs (NIXL, Python V2
+# runtime - see ctx_config.yaml / gen_config_no_sa.yaml).
+#
+# Replace hostnames/ports with the actual worker endpoints (each K3
+# worker spans 16 GPUs = 4 NVL72 nodes; the URL is rank 0's node).
+hostname: localhost
+port: 8000
+model: <model_path>
+backend: "pytorch"
+context_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  urls:
+    - "localhost:8002"

@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestImpl.h"
@@ -308,35 +309,6 @@ size_t Serialization::serializedSize(AdditionalModelOutput const& additionalMode
     return totalSize;
 }
 
-// ExternalDraftTokensConfig
-ExternalDraftTokensConfig Serialization::deserializeExternalDraftTokensConfig(std::istream& is)
-{
-    auto tokens = su::deserialize<VecTokens>(is);
-    auto logits = su::deserialize<std::optional<Tensor>>(is);
-    auto acceptanceThreshold = su::deserialize<std::optional<FloatType>>(is);
-    auto fastLogits = su::deserialize<std::optional<bool>>(is);
-
-    return ExternalDraftTokensConfig{std::move(tokens), std::move(logits), acceptanceThreshold, fastLogits};
-}
-
-void Serialization::serialize(ExternalDraftTokensConfig const& config, std::ostream& os)
-{
-    su::serialize(config.mTokens, os);
-    su::serialize(config.mLogits, os);
-    su::serialize(config.mAcceptanceThreshold, os);
-    su::serialize(config.mFastLogits, os);
-}
-
-size_t Serialization::serializedSize(ExternalDraftTokensConfig const& config)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(config.mTokens);
-    totalSize += su::serializedSize(config.mLogits);
-    totalSize += su::serializedSize(config.mAcceptanceThreshold);
-    totalSize += su::serializedSize(config.mFastLogits);
-    return totalSize;
-}
-
 // PromptTuningConfig
 PromptTuningConfig Serialization::deserializePromptTuningConfig(std::istream& is)
 {
@@ -622,12 +594,13 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
     auto indexerKCacheUseFp4 = su::deserialize<bool>(is);
+    auto indexerLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
     // RNN config (optional)
     auto hasRnnConfig = su::deserialize<bool>(is);
     std::optional<CacheState::RnnModelConfig> rnnModelConfig;
     std::vector<SizeType32> rnnLayerNumPerPP;
-    nvinfer1::DataType convStateDataType{nvinfer1::DataType::kFLOAT};
-    nvinfer1::DataType ssmStateDataType{nvinfer1::DataType::kFLOAT};
+    tensorrt_llm::DataType convStateDataType{tensorrt_llm::DataType::kFLOAT};
+    tensorrt_llm::DataType ssmStateDataType{tensorrt_llm::DataType::kFLOAT};
     if (hasRnnConfig)
     {
         CacheState::RnnModelConfig rnnCfg;
@@ -641,15 +614,15 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
         rnnCfg.mNumHeads = su::deserialize<decltype(CacheState::RnnModelConfig::mNumHeads)>(is);
         rnnCfg.mConvSectionLayout
             = static_cast<CacheState::RnnModelConfig::ConvSectionLayout>(su::deserialize<SizeType32>(is));
-        convStateDataType = su::deserialize<nvinfer1::DataType>(is);
-        ssmStateDataType = su::deserialize<nvinfer1::DataType>(is);
+        convStateDataType = su::deserialize<tensorrt_llm::DataType>(is);
+        ssmStateDataType = su::deserialize<tensorrt_llm::DataType>(is);
         rnnLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
         rnnModelConfig = std::move(rnnCfg);
     }
     CacheState cacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
         DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize,
-        indexerKCacheUseFp4};
+        indexerKCacheUseFp4, indexerLayerNumPerPP};
     if (rnnModelConfig.has_value())
     {
         cacheState.setRnnConfig(
@@ -679,6 +652,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
     su::serialize(state.getIndexerKCacheUseFp4(), os);
+    su::serialize(state.mIndexerLayerNumPerPP, os);
     // RNN config (optional)
     su::serialize(state.mRnnCacheState.has_value(), os);
     if (state.mRnnCacheState.has_value())
@@ -721,6 +695,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());
     totalSize += su::serializedSize(state.getIndexerKCacheUseFp4());
+    totalSize += su::serializedSize(state.mIndexerLayerNumPerPP);
     // RNN config (optional)
     totalSize += su::serializedSize(state.mRnnCacheState.has_value());
     if (state.mRnnCacheState.has_value())
@@ -764,6 +739,8 @@ DataTransceiverState Serialization::deserializeDataTransceiverState(std::istream
     {
         state.setCacheState(std::move(cacheState).value());
     }
+    auto isArbitraryTransferState = su::deserialize<decltype(DataTransceiverState::mIsArbitraryTransferState)>(is);
+    state.setIsArbitraryTransferState(isArbitraryTransferState);
     return state;
 }
 
@@ -771,6 +748,7 @@ void Serialization::serialize(DataTransceiverState const& state, std::ostream& o
 {
     su::serialize(state.mCommState, os);
     su::serialize(state.mCacheState, os);
+    su::serialize(state.mIsArbitraryTransferState, os);
 }
 
 std::vector<char> Serialization::serialize(DataTransceiverState const& state)
@@ -789,6 +767,7 @@ size_t Serialization::serializedSize(DataTransceiverState const& state)
     size_t totalSize = 0;
     totalSize += su::serializedSize(state.mCommState);
     totalSize += su::serializedSize(state.mCacheState);
+    totalSize += su::serializedSize(state.mIsArbitraryTransferState);
     return totalSize;
 }
 
@@ -858,7 +837,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto badWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto stopWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto embeddingBias = su::deserialize<std::optional<Tensor>>(is);
-    auto externalDraftTokensConfig = su::deserialize<std::optional<ExternalDraftTokensConfig>>(is);
     auto pTuningConfig = su::deserialize<std::optional<PromptTuningConfig>>(is);
     auto multimodalInput = su::deserialize<std::optional<MultimodalInput>>(is);
     auto multimodalEmbedding = su::deserialize<std::optional<Tensor>>(is);
@@ -877,7 +855,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto encoderOutputLength = su::deserialize<std::optional<SizeType32>>(is);
     auto crossAttentionMask = su::deserialize<std::optional<Tensor>>(is);
     auto numReturnSequences = su::deserialize<SizeType32>(is);
-    auto eagleConfig = su::deserialize<std::optional<EagleConfig>>(is);
     auto skipCrossAttnBlocks = su::deserialize<std::optional<Tensor>>(is);
     auto guidedDecodingParams = su::deserialize<std::optional<GuidedDecodingParams>>(is);
     auto languageAdapterUid = su::deserialize<std::optional<SizeType32>>(is);
@@ -890,12 +867,11 @@ Request Serialization::deserializeRequest(std::istream& is)
 
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
-        std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
-        std::move(multimodalEmbedding), std::move(mRopeConfig), std::move(loraConfig), lookaheadConfig,
-        std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::nullopt,
-        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
+        std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
+        std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
+        std::nullopt, std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
+        std::move(crossAttentionMask), numReturnSequences, std::move(skipCrossAttnBlocks),
         std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
 
@@ -1219,124 +1195,6 @@ size_t serializedSize(AdditionalOutput const& additionalOutput)
     return totalSize;
 }
 
-// ExecutorConfig
-ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
-{
-    auto maxBeamWidth = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxBeamWidth)>(is);
-    auto maxBatchSize = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxBatchSize)>(is);
-    auto maxNumTokens = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxNumTokens)>(is);
-    auto schedulerConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getSchedulerConfig)>(is);
-    auto kvCacheConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getKvCacheConfig)>(is);
-    auto enableChunkedContext = su::deserializeWithGetterType<decltype(&ExecutorConfig::getEnableChunkedContext)>(is);
-    auto normalizeLogProbs = su::deserializeWithGetterType<decltype(&ExecutorConfig::getNormalizeLogProbs)>(is);
-    auto iterStatsMaxIterations
-        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getIterStatsMaxIterations)>(is);
-    auto requestStatsMaxIterations
-        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getRequestStatsMaxIterations)>(is);
-    auto batchingType = su::deserializeWithGetterType<decltype(&ExecutorConfig::getBatchingType)>(is);
-    auto parallelConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getParallelConfig)>(is);
-    auto peftCacheConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getPeftCacheConfig)>(is);
-    auto decodingConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getDecodingConfig)>(is);
-    auto useGpuDirectStorage = su::deserializeWithGetterType<decltype(&ExecutorConfig::getUseGpuDirectStorage)>(is);
-    auto gpuWeightsPercent = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGpuWeightsPercent)>(is);
-    auto maxQueueSize = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxQueueSize)>(is);
-    auto extendedRuntimePerfKnobConfig
-        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getExtendedRuntimePerfKnobConfig)>(is);
-    auto debugConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getDebugConfig)>(is);
-    auto recvPollPeriodMs = su::deserializeWithGetterType<decltype(&ExecutorConfig::getRecvPollPeriodMs)>(is);
-    auto maxSeqIdleMicroseconds
-        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxSeqIdleMicroseconds)>(is);
-    auto specDecConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getSpecDecConfig)>(is);
-    auto guidedDecodingConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGuidedDecodingConfig)>(is);
-    auto additionalModelOutputs
-        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getAdditionalModelOutputs)>(is);
-    auto cacheTransceiverConfig
-        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getCacheTransceiverConfig)>(is);
-    auto gatherGenerationLogits
-        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGatherGenerationLogits)>(is);
-    auto promptTableOffloading = su::deserializeWithGetterType<decltype(&ExecutorConfig::getPromptTableOffloading)>(is);
-    auto enableTrtOverlap = su::deserializeWithGetterType<decltype(&ExecutorConfig::getEnableTrtOverlap)>(is);
-
-    return ExecutorConfig{maxBeamWidth, schedulerConfig, kvCacheConfig, enableChunkedContext, normalizeLogProbs,
-        iterStatsMaxIterations, requestStatsMaxIterations, batchingType, maxBatchSize, maxNumTokens, parallelConfig,
-        peftCacheConfig, std::nullopt, decodingConfig, useGpuDirectStorage, gpuWeightsPercent, maxQueueSize,
-        extendedRuntimePerfKnobConfig, debugConfig, recvPollPeriodMs, maxSeqIdleMicroseconds, specDecConfig,
-        guidedDecodingConfig, additionalModelOutputs, cacheTransceiverConfig, gatherGenerationLogits,
-        promptTableOffloading, enableTrtOverlap};
-}
-
-size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
-{
-    TLLM_CHECK_WITH_INFO(!executorConfig.getLogitsPostProcessorConfig().has_value(),
-        "Serialization of executorConfig with logitsPostProcessor is currently not supported.");
-
-    // Compute the size of serialized buffer
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(executorConfig.getMaxBeamWidth());
-    totalSize += su::serializedSize(executorConfig.getMaxBatchSize());
-    totalSize += su::serializedSize(executorConfig.getMaxNumTokens());
-    totalSize += su::serializedSize(executorConfig.getSchedulerConfig());
-    totalSize += su::serializedSize(executorConfig.getKvCacheConfig());
-    totalSize += su::serializedSize(executorConfig.getEnableChunkedContext());
-    totalSize += su::serializedSize(executorConfig.getNormalizeLogProbs());
-    totalSize += su::serializedSize(executorConfig.getIterStatsMaxIterations());
-    totalSize += su::serializedSize(executorConfig.getRequestStatsMaxIterations());
-    totalSize += su::serializedSize(executorConfig.getBatchingType());
-    totalSize += su::serializedSize(executorConfig.getParallelConfig());
-    totalSize += su::serializedSize(executorConfig.getPeftCacheConfig());
-    totalSize += su::serializedSize(executorConfig.getDecodingConfig());
-    totalSize += su::serializedSize(executorConfig.getUseGpuDirectStorage());
-    totalSize += su::serializedSize(executorConfig.getGpuWeightsPercent());
-    totalSize += su::serializedSize(executorConfig.getMaxQueueSize());
-    totalSize += su::serializedSize(executorConfig.getExtendedRuntimePerfKnobConfig());
-    totalSize += su::serializedSize(executorConfig.getDebugConfig());
-    totalSize += su::serializedSize(executorConfig.getRecvPollPeriodMs());
-    totalSize += su::serializedSize(executorConfig.getMaxSeqIdleMicroseconds());
-    totalSize += su::serializedSize(executorConfig.getSpecDecConfig());
-    totalSize += su::serializedSize(executorConfig.getGuidedDecodingConfig());
-    totalSize += su::serializedSize(executorConfig.getAdditionalModelOutputs());
-    totalSize += su::serializedSize(executorConfig.getCacheTransceiverConfig());
-    totalSize += su::serializedSize(executorConfig.getGatherGenerationLogits());
-    totalSize += su::serializedSize(executorConfig.getPromptTableOffloading());
-    totalSize += su::serializedSize(executorConfig.getEnableTrtOverlap());
-
-    return totalSize;
-}
-
-void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream& os)
-{
-    TLLM_CHECK_WITH_INFO(!executorConfig.getLogitsPostProcessorConfig().has_value(),
-        "Serialization of executorConfig with logitsPostProcessor is currently not supported.");
-
-    su::serialize(executorConfig.getMaxBeamWidth(), os);
-    su::serialize(executorConfig.getMaxBatchSize(), os);
-    su::serialize(executorConfig.getMaxNumTokens(), os);
-    su::serialize(executorConfig.getSchedulerConfig(), os);
-    su::serialize(executorConfig.getKvCacheConfig(), os);
-    su::serialize(executorConfig.getEnableChunkedContext(), os);
-    su::serialize(executorConfig.getNormalizeLogProbs(), os);
-    su::serialize(executorConfig.getIterStatsMaxIterations(), os);
-    su::serialize(executorConfig.getRequestStatsMaxIterations(), os);
-    su::serialize(executorConfig.getBatchingType(), os);
-    su::serialize(executorConfig.getParallelConfig(), os);
-    su::serialize(executorConfig.getPeftCacheConfig(), os);
-    su::serialize(executorConfig.getDecodingConfig(), os);
-    su::serialize(executorConfig.getUseGpuDirectStorage(), os);
-    su::serialize(executorConfig.getGpuWeightsPercent(), os);
-    su::serialize(executorConfig.getMaxQueueSize(), os);
-    su::serialize(executorConfig.getExtendedRuntimePerfKnobConfig(), os);
-    su::serialize(executorConfig.getDebugConfig(), os);
-    su::serialize(executorConfig.getRecvPollPeriodMs(), os);
-    su::serialize(executorConfig.getMaxSeqIdleMicroseconds(), os);
-    su::serialize(executorConfig.getSpecDecConfig(), os);
-    su::serialize(executorConfig.getGuidedDecodingConfig(), os);
-    su::serialize(executorConfig.getAdditionalModelOutputs(), os);
-    su::serialize(executorConfig.getCacheTransceiverConfig(), os);
-    su::serialize(executorConfig.getGatherGenerationLogits(), os);
-    su::serialize(executorConfig.getPromptTableOffloading(), os);
-    su::serialize(executorConfig.getEnableTrtOverlap(), os);
-}
-
 // KvCacheConfig
 KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
 {
@@ -1427,7 +1285,9 @@ SchedulerConfig Serialization::deserializeSchedulerConfig(std::istream& is)
     auto capacitySchedulerPolicy = su::deserialize<CapacitySchedulerPolicy>(is);
     auto contextChunkingPolicy = su::deserialize<std::optional<ContextChunkingPolicy>>(is);
     auto dynamicBatchConfig = su::deserialize<std::optional<DynamicBatchConfig>>(is);
-    return SchedulerConfig{capacitySchedulerPolicy, contextChunkingPolicy, dynamicBatchConfig};
+    auto enablePrefixAwareScheduling = su::deserialize<bool>(is);
+    return SchedulerConfig{
+        capacitySchedulerPolicy, contextChunkingPolicy, dynamicBatchConfig, enablePrefixAwareScheduling};
 }
 
 void Serialization::serialize(SchedulerConfig const& schedulerConfig, std::ostream& os)
@@ -1435,6 +1295,7 @@ void Serialization::serialize(SchedulerConfig const& schedulerConfig, std::ostre
     su::serialize(schedulerConfig.getCapacitySchedulerPolicy(), os);
     su::serialize(schedulerConfig.getContextChunkingPolicy(), os);
     su::serialize(schedulerConfig.getDynamicBatchConfig(), os);
+    su::serialize(schedulerConfig.getEnablePrefixAwareScheduling(), os);
 }
 
 size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
@@ -1443,6 +1304,7 @@ size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
     totalSize += su::serializedSize(schedulerConfig.getCapacitySchedulerPolicy());
     totalSize += su::serializedSize(schedulerConfig.getContextChunkingPolicy());
     totalSize += su::serializedSize(schedulerConfig.getDynamicBatchConfig());
+    totalSize += su::serializedSize(schedulerConfig.getEnablePrefixAwareScheduling());
     return totalSize;
 }
 
@@ -1453,7 +1315,9 @@ CacheTransceiverConfig Serialization::deserializeCacheTransceiverConfig(std::ist
     auto maxTokensInBuffer = su::deserialize<std::optional<size_t>>(is);
     auto kvTransferTimeoutMs = su::deserialize<std::optional<int>>(is);
     auto kvTransferSenderFutureTimeoutMs = su::deserialize<std::optional<int>>(is);
-    return CacheTransceiverConfig{backendType, maxTokensInBuffer, kvTransferTimeoutMs, kvTransferSenderFutureTimeoutMs};
+    auto kvTransferPollIntervalMs = su::deserialize<std::optional<int>>(is);
+    return CacheTransceiverConfig{
+        backendType, maxTokensInBuffer, kvTransferTimeoutMs, kvTransferSenderFutureTimeoutMs, kvTransferPollIntervalMs};
 }
 
 void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os)
@@ -1462,6 +1326,7 @@ void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConf
     su::serialize(cacheTransceiverConfig.getMaxTokensInBuffer(), os);
     su::serialize(cacheTransceiverConfig.getKvTransferTimeoutMs(), os);
     su::serialize(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(), os);
+    su::serialize(cacheTransceiverConfig.getKvTransferPollIntervalMs(), os);
 }
 
 size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig)
@@ -1471,6 +1336,7 @@ size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTranscei
     totalSize += su::serializedSize(cacheTransceiverConfig.getMaxTokensInBuffer());
     totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferTimeoutMs());
     totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferPollIntervalMs());
     return totalSize;
 }
 
@@ -1499,41 +1365,6 @@ size_t Serialization::serializedSize(ExtendedRuntimePerfKnobConfig const& extend
     totalSize += su::serializedSize(extendedRuntimePerfKnobConfig.getEnableContextFMHAFP32Acc());
     totalSize += su::serializedSize(extendedRuntimePerfKnobConfig.getCudaGraphMode());
     totalSize += su::serializedSize(extendedRuntimePerfKnobConfig.getCudaGraphCacheSize());
-    return totalSize;
-}
-
-// ParallelConfig
-ParallelConfig Serialization::deserializeParallelConfig(std::istream& is)
-{
-    auto commType = su::deserialize<CommunicationType>(is);
-    auto commMode = su::deserialize<CommunicationMode>(is);
-    auto deviceIds = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
-    auto participantids = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
-    auto orchestratorConfig = su::deserialize<std::optional<OrchestratorConfig>>(is);
-    auto numNodes = su::deserialize<std::optional<SizeType32>>(is);
-
-    return ParallelConfig{commType, commMode, deviceIds, participantids, orchestratorConfig, numNodes};
-}
-
-void Serialization::serialize(ParallelConfig const& parallelConfig, std::ostream& os)
-{
-    su::serialize(parallelConfig.getCommunicationType(), os);
-    su::serialize(parallelConfig.getCommunicationMode(), os);
-    su::serialize(parallelConfig.getDeviceIds(), os);
-    su::serialize(parallelConfig.getParticipantIds(), os);
-    su::serialize(parallelConfig.getOrchestratorConfig(), os);
-    su::serialize(parallelConfig.getNumNodes(), os);
-}
-
-size_t Serialization::serializedSize(ParallelConfig const& parallelConfig)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(parallelConfig.getCommunicationType());
-    totalSize += su::serializedSize(parallelConfig.getCommunicationMode());
-    totalSize += su::serializedSize(parallelConfig.getDeviceIds());
-    totalSize += su::serializedSize(parallelConfig.getParticipantIds());
-    totalSize += su::serializedSize(parallelConfig.getOrchestratorConfig());
-    totalSize += su::serializedSize(parallelConfig.getNumNodes());
     return totalSize;
 }
 
@@ -1589,32 +1420,6 @@ size_t Serialization::serializedSize(PeftCacheConfig const& peftCacheConfig)
     return totalSize;
 }
 
-// OrchestratorConfig
-OrchestratorConfig Serialization::deserializeOrchestratorConfig(std::istream& is)
-{
-    auto isOrchestrator = su::deserialize<bool>(is);
-    auto path = su::deserialize<std::string>(is);
-    auto spawnProcesses = su::deserialize<bool>(is);
-    // Note we ignore mpiComm since we don't need to exchange it
-    return OrchestratorConfig{isOrchestrator, path, nullptr, spawnProcesses};
-}
-
-void Serialization::serialize(OrchestratorConfig const& orchestratorConfig, std::ostream& os)
-{
-    su::serialize(orchestratorConfig.getIsOrchestrator(), os);
-    su::serialize(orchestratorConfig.getWorkerExecutablePath(), os);
-    su::serialize(orchestratorConfig.getSpawnProcesses(), os);
-}
-
-size_t Serialization::serializedSize(OrchestratorConfig const& orchestratorConfig)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(orchestratorConfig.getIsOrchestrator());
-    totalSize += su::serializedSize(orchestratorConfig.getWorkerExecutablePath());
-    totalSize += su::serializedSize(orchestratorConfig.getSpawnProcesses());
-    return totalSize;
-}
-
 // DecodingMode
 DecodingMode Serialization::deserializeDecodingMode(std::istream& is)
 {
@@ -1658,58 +1463,6 @@ size_t Serialization::serializedSize(LookaheadDecodingConfig const& lookaheadDec
     totalSize += su::serializedSize(lookaheadDecodingConfig.getNgramSize());
     totalSize += su::serializedSize(lookaheadDecodingConfig.getWindowSize());
     totalSize += su::serializedSize(lookaheadDecodingConfig.getVerificationSetSize());
-    return totalSize;
-}
-
-// EagleConfig
-EagleConfig Serialization::deserializeEagleConfig(std::istream& is)
-{
-    auto eagleChoices = su::deserialize<std::optional<EagleChoices>>(is);
-    auto isGreedySampling = su::deserialize<bool>(is);
-    auto posteriorThreshold = su::deserialize<std::optional<float>>(is);
-    auto useDynamicTree = su::deserialize<bool>(is);
-    auto dynamicTreeMaxTopK = su::deserialize<std::optional<SizeType32>>(is);
-
-    return EagleConfig{eagleChoices, isGreedySampling, posteriorThreshold, useDynamicTree, dynamicTreeMaxTopK};
-}
-
-void Serialization::serialize(EagleConfig const& eagleConfig, std::ostream& os)
-{
-    su::serialize(eagleConfig.getEagleChoices(), os);
-    su::serialize(eagleConfig.isGreedySampling(), os);
-    su::serialize(eagleConfig.getPosteriorThreshold(), os);
-    su::serialize(eagleConfig.useDynamicTree(), os);
-    su::serialize(eagleConfig.getDynamicTreeMaxTopK(), os);
-}
-
-size_t Serialization::serializedSize(EagleConfig const& eagleConfig)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(eagleConfig.getEagleChoices());
-    totalSize += su::serializedSize(eagleConfig.isGreedySampling());
-    totalSize += su::serializedSize(eagleConfig.getPosteriorThreshold());
-    totalSize += su::serializedSize(eagleConfig.useDynamicTree());
-    totalSize += su::serializedSize(eagleConfig.getDynamicTreeMaxTopK());
-
-    return totalSize;
-}
-
-// SpeculativeDecodingConfig
-SpeculativeDecodingConfig Serialization::deserializeSpeculativeDecodingConfig(std::istream& is)
-{
-    auto fastLogits = su::deserialize<decltype(SpeculativeDecodingConfig::fastLogits)>(is);
-    return SpeculativeDecodingConfig(fastLogits);
-}
-
-void Serialization::serialize(SpeculativeDecodingConfig const& specDecConfig, std::ostream& os)
-{
-    su::serialize(specDecConfig.fastLogits, os);
-}
-
-size_t Serialization::serializedSize(SpeculativeDecodingConfig const& specDecConfig)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(specDecConfig.fastLogits);
     return totalSize;
 }
 
@@ -1842,18 +1595,14 @@ DecodingConfig Serialization::deserializeDecodingConfig(std::istream& is)
 {
     auto decodingMode = su::deserialize<std::optional<DecodingMode>>(is);
     auto lookaheadDecodingConfig = su::deserialize<std::optional<LookaheadDecodingConfig>>(is);
-    auto medusaChoices = su::deserialize<std::optional<MedusaChoices>>(is);
-    auto eagleConfig = su::deserialize<std::optional<EagleConfig>>(is);
 
-    return DecodingConfig{decodingMode, lookaheadDecodingConfig, medusaChoices, eagleConfig};
+    return DecodingConfig{decodingMode, lookaheadDecodingConfig};
 }
 
 void Serialization::serialize(DecodingConfig const& decodingConfig, std::ostream& os)
 {
     su::serialize(decodingConfig.getDecodingMode(), os);
     su::serialize(decodingConfig.getLookaheadDecodingConfig(), os);
-    su::serialize(decodingConfig.getMedusaChoices(), os);
-    su::serialize(decodingConfig.getEagleConfig(), os);
 }
 
 size_t Serialization::serializedSize(DecodingConfig const& decodingConfig)
@@ -1861,39 +1610,6 @@ size_t Serialization::serializedSize(DecodingConfig const& decodingConfig)
     size_t totalSize = 0;
     totalSize += su::serializedSize(decodingConfig.getDecodingMode());
     totalSize += su::serializedSize(decodingConfig.getLookaheadDecodingConfig());
-    totalSize += su::serializedSize(decodingConfig.getMedusaChoices());
-    totalSize += su::serializedSize(decodingConfig.getEagleConfig());
-    return totalSize;
-}
-
-// DebugConfig
-DebugConfig Serialization::deserializeDebugConfig(std::istream& is)
-{
-    auto debugInputTensors = su::deserializeWithGetterType<decltype(&DebugConfig::getDebugInputTensors)>(is);
-    auto debugOutputTensors = su::deserializeWithGetterType<decltype(&DebugConfig::getDebugOutputTensors)>(is);
-    auto debugTensorNames = su::deserialize<std::remove_cv_t<
-        std::remove_reference_t<std::invoke_result_t<decltype(&DebugConfig::getDebugTensorNames), DebugConfig>>>>(is);
-    auto debugTensorsMaxIterations
-        = su::deserializeWithGetterType<decltype(&DebugConfig::getDebugTensorsMaxIterations)>(is);
-
-    return DebugConfig{debugInputTensors, debugOutputTensors, debugTensorNames, debugTensorsMaxIterations};
-}
-
-void Serialization::serialize(DebugConfig const& debugConfig, std::ostream& os)
-{
-    su::serialize(debugConfig.getDebugInputTensors(), os);
-    su::serialize(debugConfig.getDebugOutputTensors(), os);
-    su::serialize(debugConfig.getDebugTensorNames(), os);
-    su::serialize(debugConfig.getDebugTensorsMaxIterations(), os);
-}
-
-size_t Serialization::serializedSize(DebugConfig const& debugConfig)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(debugConfig.getDebugInputTensors());
-    totalSize += su::serializedSize(debugConfig.getDebugOutputTensors());
-    totalSize += su::serializedSize(debugConfig.getDebugTensorNames());
-    totalSize += su::serializedSize(debugConfig.getDebugTensorsMaxIterations());
     return totalSize;
 }
 

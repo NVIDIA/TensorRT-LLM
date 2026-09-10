@@ -32,6 +32,7 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 
 #include <gtest/gtest.h>
@@ -66,7 +67,7 @@ class LoraManagerTest
 {
 protected:
     LoraManagerTest()
-        : mModelConfig(1, 2, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT)
+        : mModelConfig(1, 2, 2, 0, 1, 4, tensorrt_llm::DataType::kFLOAT)
     {
     }
 
@@ -87,7 +88,7 @@ protected:
 
     PeftTable getPeftTable(SizeType32 tpRank = 0)
     {
-        auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+        auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
         modelConfig.setMlpHiddenSize(32);
         auto worldConfig = WorldConfig(2, 2, 1, 3);
         std::vector<LoraModule> modules{
@@ -102,7 +103,7 @@ protected:
         };
         modelConfig.setLoraModules(modules);
         auto pageConfig = LoraCachePageManagerConfig(
-            runtime::MemoryType::kCPU, nvinfer1::DataType::kFLOAT, 2 * 8, 6, 64, 4 * 16, 1);
+            runtime::MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 2 * 8, 6, 64, 4 * 16, 1);
         pageConfig.setInitToZero(true);
         LoraCache loraCache(pageConfig, modelConfig, worldConfig, *mManager);
 
@@ -213,7 +214,7 @@ static void checkLoraTensors(LoraManager const& loraManager, std::vector<int64_t
         auto expectedTensor = expectedTensors.find(fieldName)->second;
         auto actualTensor = inputTensors.find(fieldName)->second;
         ITensor::shapeEquals(expectedTensor->getShape(), actualTensor->getShape());
-        if (expectedTensor->getDataType() == nvinfer1::DataType::kINT64)
+        if (expectedTensor->getDataType() == tensorrt_llm::DataType::kINT64)
         {
             auto expT = bufferCast<int64_t>(*expectedTensor);
             auto actT = bufferCast<int64_t>(*actualTensor);
@@ -308,7 +309,7 @@ TEST_P(LoraManagerTest, fillInputTensors)
     bool const isDora = GetParam();
 
     LoraManager loraManager;
-    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
+    auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, tensorrt_llm::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
     auto worldConfig = WorldConfig(1, 1, 1, 0);
     std::vector<LoraModule> modules{
@@ -332,9 +333,9 @@ TEST_P(LoraManagerTest, fillInputTensors)
     auto numLayers = static_cast<SizeType32>(modelConfig.getNbAttentionLayers());
     SizeType32 numSeqs = 4;
     TensorPtr weightsPtrs
-        = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs, 3}), nvinfer1::DataType::kINT64);
+        = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs, 3}), tensorrt_llm::DataType::kINT64);
     TensorPtr adapterSizes
-        = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs}), nvinfer1::DataType::kINT32);
+        = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs}), tensorrt_llm::DataType::kINT32);
 
     mManager->setZero(*weightsPtrs);
     mManager->setZero(*adapterSizes);

@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Optional, Union
 
-from ..bindings.executor import DecodingMode
 from ..mapping import Mapping
 from . import MODEL_MAP
 from .modeling_utils import QuantConfig
@@ -53,8 +52,7 @@ class AutoModelForCausalLM:
 
     @staticmethod
     def get_trtllm_model_class(hf_model_or_dir: Union[str, Path],
-                               trust_remote_code: bool = False,
-                               decoding_mode: DecodingMode = None):
+                               trust_remote_code: bool = False):
         import transformers
 
         hf_model_or_dir = Path(hf_model_or_dir) if not isinstance(
@@ -65,15 +63,8 @@ class AutoModelForCausalLM:
 
         hf_config = transformers.AutoConfig.from_pretrained(
             hf_model_or_dir, trust_remote_code=trust_remote_code)
-        if decoding_mode is not None:
-            if decoding_mode.isMedusa():
-                hf_arch = 'MedusaForCausalLM'
-            elif decoding_mode.isEagle():
-                hf_arch = 'EagleForCausalLM'
-            else:
-                raise NotImplementedError(f"Unknown speculative decoding mode.")
-        elif hasattr(hf_config,
-                     'architectures') and hf_config.architectures is not None:
+        if hasattr(hf_config,
+                   'architectures') and hf_config.architectures is not None:
             hf_arch = hf_config.architectures[0]
         elif hasattr(hf_config,
                      'model_type') and hf_config.model_type.find('mamba') != -1:

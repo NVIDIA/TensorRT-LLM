@@ -32,10 +32,8 @@ from ..utils.node_utils import get_op_schema, is_op
 from ..utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from .interface import apply_export_patches
 
-try:
-    from modelopt.torch.quantization.utils import export_torch_mode as torch_export_context
-except ImportError:
-    torch_export_context = nullcontext
+# modelopt quantization support has been removed; use a null export context.
+torch_export_context = nullcontext
 
 
 # =====================================================================

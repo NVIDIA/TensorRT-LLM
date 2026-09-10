@@ -1,20 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging as _logger
 import os as _os
 import pathlib as _pl
 import shutil
 import sys as _sys
-import time
+
+# Declared above the cpp_common import: this covers every file in this
+# directory, but only for imports that run after it, and cpp_common reaches
+# build_wheel while this conftest is still executing.
+__extra_import_path__ = ["~/scripts"]
 
 import defs.cpp.cpp_common as _cpp
 import pytest
-
-build_script_dir = _pl.Path(
-    __file__).parent.resolve().parent.parent.parent.parent / "scripts"
-assert build_script_dir.is_dir()
-_sys.path.append(str(build_script_dir))
-
 from build_wheel import main as build_trt_llm
-from defs.conftest import llm_models_root
 
 
 @pytest.fixture(scope="session")
@@ -33,16 +45,6 @@ def build_dir(build_type):
 @pytest.fixture(scope="session")
 def cpp_resources_dir():
     return _pl.Path("cpp") / "tests" / "resources"
-
-
-@pytest.fixture(scope="session")
-def model_cache():
-    return llm_models_root()
-
-
-@pytest.fixture(scope="session")
-def model_cache_arg(model_cache):
-    return ["--model_cache", model_cache] if model_cache else []
 
 
 @pytest.fixture(scope="session")
@@ -83,17 +85,6 @@ def lora_setup(root_dir, cpp_resources_dir, python_exe):
         "--num-loras=128",
     ]
 
-    generate_gpt2_lora_data_args_tp1 = [
-        python_exe,
-        f"{cpp_script_dir}/generate_test_lora_weights.py",
-        f"--out-dir={cpp_data_dir}/lora-test-weights-gpt2-tp1",
-        "--tp-size=1",
-        "--hidden-size=768",
-        "--num-layers=12",
-        "--config-ids-filter=0",
-        "--no-generate-cache-pages",
-    ]
-
     generate_lora_data_args_prefetch_task_3 = [
         python_exe,
         f"{cpp_script_dir}/generate_test_lora_weights.py",
@@ -113,45 +104,12 @@ def lora_setup(root_dir, cpp_resources_dir, python_exe):
     _cpp.run_command(generate_lora_data_args_tp1, cwd=root_dir, timeout=100)
     _cpp.run_command(generate_lora_data_args_tp2, cwd=root_dir, timeout=100)
     _cpp.run_command(generate_multi_lora_tp2_args, cwd=root_dir, timeout=100)
-    _cpp.run_command(generate_gpt2_lora_data_args_tp1,
-                     cwd=root_dir,
-                     timeout=100)
     _cpp.run_command(generate_lora_data_args_prefetch_task_3,
                      cwd=root_dir,
                      timeout=100)
     _cpp.run_command(generate_lora_data_args_prefetch_task_5,
                      cwd=root_dir,
                      timeout=100)
-
-
-@pytest.fixture(scope="session")
-def install_additional_requirements(python_exe, root_dir):
-
-    def _install(model_name: str):
-        if model_name == "mamba":
-            _cpp.run_command(
-                [python_exe, "-m", "pip", "install", "transformers>=4.39.0"],
-                cwd=root_dir,
-                env=_os.environ,
-                timeout=300,
-            )
-
-        elif model_name == "recurrentgemma":
-            _cpp.run_command(
-                [
-                    python_exe,
-                    "-m",
-                    "pip",
-                    "install",
-                    "-r",
-                    "examples/models/core/recurrentgemma/requirements.txt",
-                ],
-                cwd=root_dir,
-                env=_os.environ,
-                timeout=300,
-            )
-
-    return _install
 
 
 @pytest.fixture(scope="session")
@@ -168,7 +126,6 @@ def build_google_tests(request, build_type):
         use_ccache=True,
         clean=True,
         generator="Ninja",
-        trt_root="/usr/local/tensorrt",
         nixl_root="/opt/nvidia/nvda_nixl",
         skip_building_wheel=True,
         extra_make_targets=["google-tests"],
@@ -176,49 +133,44 @@ def build_google_tests(request, build_type):
 
 
 @pytest.fixture(scope="session")
-def build_benchmarks(build_google_tests, build_dir, build_type):
+def build_kv_cache_compression_tests(request, build_type):
+    """Build only the standalone NVFP4 cold-page kernel gtest.
 
-    make_benchmarks = [
-        "cmake",
-        "--build",
-        ".",
-        "--config",
-        build_type,
-        "-j",
-        "--target",
-        "benchmarks",
-    ]
+    The binary uses NO_TLLM_LINKAGE, so this skips the full-library
+    build that build_google_tests pays for.
+    """
+    cuda_arch = f"{request.param}-real"
 
-    _cpp.run_command(make_benchmarks, cwd=build_dir, timeout=300)
+    _logger.info(f"Using CUDA arch: {cuda_arch}")
 
+    build_trt_llm(
+        build_type=build_type,
+        cuda_architectures=cuda_arch,
+        job_count=12,
+        use_ccache=True,
+        generator="Ninja",
+        nixl_root="/opt/nvidia/nvda_nixl",
+        skip_building_wheel=True,
+        configure_only=True,
+    )
 
-@pytest.fixture(scope="session")
-def prepare_model(
-    root_dir,
-    cpp_resources_dir,
-    python_exe,
-    model_cache_arg,
-    install_additional_requirements,
-):
-
-    def _prepare(model_name: str, run_fp8=False):
-        install_additional_requirements(model_name)
-
-        start_time = time.time()
-
-        _cpp.prepare_model_tests(
-            model_name=model_name,
-            python_exe=python_exe,
-            root_dir=root_dir,
-            resources_dir=cpp_resources_dir,
-            model_cache_arg=model_cache_arg,
-        )
-
-        duration = time.time() - start_time
-        print(f"Built model: {model_name}")
-        print(f"Duration: {duration} seconds")
-
-    return _prepare
+    build_dir = _cpp.find_build_dir(build_type)
+    _cpp.run_command(
+        [
+            "cmake",
+            "--build",
+            str(build_dir),
+            "--config",
+            build_type,
+            "--parallel",
+            "12",
+            "--target",
+            "nvfp4ColdPageKernelsTest",
+        ],
+        cwd=build_dir,
+        env=_os.environ,
+        timeout=1800,
+    )
 
 
 @pytest.fixture(scope="function", autouse=True)

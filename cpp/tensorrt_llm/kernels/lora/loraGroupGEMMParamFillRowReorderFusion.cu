@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_scan.cuh>
@@ -358,7 +359,7 @@ void launchLoraGroupGEMMParamFillRowReorderFusion(int32_t* in_sizes, int32_t* ou
     int64_t a_base, int64_t d_base, int64_t d_prime_base, int32_t const* slot_counts, int32_t const* slot_ranks,
     int64_t const* slot_offsets, int32_t const* module_out_sizes, int64_t const* module_out_prefix,
     int64_t const* b_ptrs, int64_t const* b_prime_ptrs, void const* input, int64_t const* sorted_ids,
-    int32_t module_count, nvinfer1::DataType dtype, cudaStream_t stream)
+    int32_t module_count, tensorrt_llm::DataType dtype, cudaStream_t stream)
 {
     // Determine block dimensions (1D)
     // Requirements: 1) >= max_lora_count * module_count 2) >= 256 3) divisible by 32

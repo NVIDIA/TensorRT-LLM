@@ -437,6 +437,7 @@ def test_llama3_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_llama3_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -447,6 +448,7 @@ def test_llama3_config_registration():
     assert hasattr(config, "head_dim")
 
 
+@pytest.mark.cpu_only
 def test_llama3_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
@@ -461,6 +463,7 @@ def test_llama3_gqa_structure():
     assert not hasattr(attn, "k_norm"), "Llama attention should NOT have k_norm"
 
 
+@pytest.mark.cpu_only
 def test_llama3_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()

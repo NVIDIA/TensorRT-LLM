@@ -17,12 +17,11 @@
 
 from pathlib import Path
 from typing import Any, ClassVar, Dict
+from unittest.mock import patch
 
 import pytest
 import torch
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import ExperimentConfig, main
-from test_common.llm_data import hf_id_to_local_model_dir
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -31,6 +30,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleConfig,
     EagleDrafterForCausalLM,
     EagleRMSNorm,
+    EagleWrapper,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
@@ -39,6 +39,10 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
     infer_draft_embedding_size,
     is_any_lin_op,
 )
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 NEMOTRON_SUPER_MODEL_HUB_ID = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -174,6 +178,7 @@ def _build_small_draft_factory(
     )
 
 
+@pytest.mark.cpu_only
 def test_eagle_rmsnorm_keeps_fp32_weights():
     norm = EagleRMSNorm(hidden_size=16)
 
@@ -324,3 +329,51 @@ def test_infer_draft_hidden_size_from_exported_draft_graph(
     embd, in_eagle_drafter = infer_draft_embedding_size(gm, linear_nodes)
     assert embd == hidden_size
     assert in_eagle_drafter is expected_is_eagle
+
+
+###############################################################################
+# sample_greedy broadcast gating (regression for #13134 + attention-DP fix).
+#
+# - TP replication: argmax across ranks can diverge due to FP noise; the
+#   broadcast keeps acceptance patterns consistent.
+# - Attention-DP: each rank holds a different slice of the global batch, so
+#   per-rank tokens are legitimately different and the broadcast would
+#   corrupt peers' state. The gate is `EagleWrapperConfig.enable_attention_dp`,
+#   plumbed through to `EagleWrapper.enable_attention_dp`.
+###############################################################################
+
+
+def _make_bare_wrapper(enable_attention_dp: bool) -> EagleWrapper:
+    """Construct a minimally-initialized EagleWrapper for testing sample_greedy.
+
+    sample_greedy only reads self.enable_attention_dp; bypass __init__ to avoid
+    requiring a real target/draft submodule pair.
+    """
+    wrapper = EagleWrapper.__new__(EagleWrapper)
+    wrapper.enable_attention_dp = enable_attention_dp
+    return wrapper
+
+
+def test_sample_greedy_skips_broadcast_under_attention_dp():
+    wrapper = _make_bare_wrapper(enable_attention_dp=True)
+    logits = torch.tensor([[0.1, 0.9], [0.8, 0.2]])
+    with patch("tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle.broadcast") as mock_bc:
+        ret = wrapper.sample_greedy(logits)
+
+    mock_bc.assert_not_called()
+    assert ret.tolist() == [1, 0]
+
+
+def test_sample_greedy_broadcasts_under_tp_replication():
+    wrapper = _make_bare_wrapper(enable_attention_dp=False)
+    logits = torch.tensor([[0.1, 0.9], [0.8, 0.2]])
+    with patch("tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle.broadcast") as mock_bc:
+        ret = wrapper.sample_greedy(logits)
+
+    mock_bc.assert_called_once()
+    args, kwargs = mock_bc.call_args
+    # `broadcast(ret, src=0)` -- positional ret, src may be kwarg or positional.
+    assert args[0] is ret
+    src = kwargs.get("src", args[1] if len(args) > 1 else None)
+    assert src == 0
+    assert ret.tolist() == [1, 0]

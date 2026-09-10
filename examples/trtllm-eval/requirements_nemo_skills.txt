@@ -1,0 +1,36 @@
+# Python dependencies for the in-process NeMo-Skills accuracy benches
+# (gpqa_ns, ifbench, scicode_ns, hle_aa) and their integration guards.
+#
+# Install on top of a TensorRT-LLM environment (torch / tensorrt_llm already
+# present); see install_nemo_skills.sh, which wraps this plus the NeMo-Skills
+# package and the dataset / grader preparation.
+#
+# nemo_skills itself is installed separately (it pulls heavy transitive deps):
+#   pip install --no-deps "nemo-skills @ git+https://github.com/NVIDIA/NeMo-Skills.git@da85a881d972e6fec847b90cf553a0bf9bf10638"
+
+# Core: math / multichoice graders (gpqa_ns, and math-style benches).
+latex2sympy2_extended
+math_verify
+sympy
+
+# ifbench: allenai/IFBench grader stack.
+setuptools<81
+absl-py
+langdetect
+nltk
+immutabledict
+spacy
+emoji
+syllapy
+
+# scicode_ns: in-container code-execution sandbox + reference-data reader.
+flask
+psutil
+ipython
+h5py
+gdown
+matplotlib
+
+# Integration-test (pytest) harness deps, if not already in the image.
+parameterized
+mako

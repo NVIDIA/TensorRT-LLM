@@ -14,7 +14,8 @@ from ..llmapi.utils import print_traceback_on_error
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import ErrorResponse, is_llm_response
+from .postprocessor_hook import load_post_processor_hook
+from .utils import ErrorResponse, bucket_responses_by_frontend, is_llm_response
 
 if TYPE_CHECKING:
     from ..disaggregated_params import DisaggregatedParams
@@ -31,6 +32,12 @@ __all__ = [
 class PostprocArgs:
     first_iteration: bool = True
     num_prompt_tokens: Optional[int] = None
+    # Subtracted from num_prompt_tokens when reporting usage. Lets servers
+    # exclude generation-prompt stub tokens the vendor accounting treats as
+    # pending output (e.g. Kimi K3's 3-token channel opener) without changing
+    # what the model sees. num_prompt_tokens itself is overwritten by the
+    # executor on the postproc-worker path, so the offset must be separate.
+    num_prompt_tokens_offset: int = 0
     tokenizer: Optional[TransformersTokenizer] = None
     ctx_usage: Optional[Any] = None
 
@@ -46,6 +53,10 @@ class PostprocWorkerConfig:
     ''' The config for the postprocess worker. '''
     num_postprocess_workers: int = 0
     postprocess_tokenizer_dir: Optional[str] = None
+    # Dotted import path of the user post-processing hook, or
+    # None. NOTE: distinct from ``PostprocParams.post_processor``, which is the
+    # per-endpoint response *formatter* (a Callable), not this hook.
+    post_processor_hook: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
@@ -81,18 +92,22 @@ class PostprocWorker:
     def __init__(
         self,
         pull_pipe_addr: tuple[str, Optional[bytes]],
-        push_pipe_addr: tuple[str, Optional[bytes]],
+        push_pipe_addrs: List[tuple[str, Optional[bytes]]],
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
+        post_processor_hook: Optional[str] = None,
     ):
         '''
         Args:
             pull_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the input IPC.
-            push_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the output IPC.
+            push_pipe_addrs: The addresses and HMAC keys of the output IPC
+                lanes, one per frontend (a single-element list in
+                single-frontend mode).
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
+            post_processor_hook (Optional[str]): Import path of the user post-processing hook; built once and threaded onto each record.
         '''
 
         self._records: Dict[int, GenerationResult] = {}
@@ -101,17 +116,30 @@ class PostprocWorker:
                                       is_async=True,
                                       is_server=False,
                                       name="postprocess_pull_pipe")
-        self._push_pipe = ZeroMqQueue(address=push_pipe_addr,
-                                      is_async=True,
-                                      is_server=False,
-                                      socket_type=zmq.PUSH,
-                                      name="postprocess_push_pipe")
+        self._push_pipes = [
+            ZeroMqQueue(address=addr,
+                        is_async=True,
+                        is_server=False,
+                        socket_type=zmq.PUSH,
+                        name=f"postprocess_push_pipe_{i}")
+            for i, addr in enumerate(push_pipe_addrs)
+        ]
         self._to_stop = asyncio.Event()
 
         self._q = deque()
 
-        # Load the tokenizer and share in all records
-        self._tokenizer = load_hf_tokenizer(tokenizer_dir)
+        # Load the tokenizer and share in all records.
+        # Guard against a None tokenizer_dir: transformers'
+        # PreTrainedConfig._get_config_dict coerces it via str(None) → "None",
+        # which then becomes a HEAD request to huggingface.co/None/...
+        self._tokenizer = load_hf_tokenizer(
+            tokenizer_dir) if tokenizer_dir is not None else None
+
+        # Build the user post-processing hook once, like the
+        # tokenizer above; threaded onto each record in ``_handle_input``.
+        self._post_processor_hook = (
+            load_post_processor_hook(post_processor_hook)
+            if post_processor_hook else None)
 
     @staticmethod
     def default_record_creator(
@@ -144,6 +172,10 @@ class PostprocWorker:
                 # TODO: support variant creation later
                 self._records[req_id] = self._record_creator(
                     input, self._tokenizer)
+                # Thread the hook onto the record here rather than
+                # via record_creator, so custom record_creators keep working.
+                self._records[
+                    req_id]._post_processor_hook = self._post_processor_hook
                 if input.disaggregated_params is not None:
                     self._records[
                         req_id]._disaggregated_params = input.disaggregated_params
@@ -175,11 +207,19 @@ class PostprocWorker:
         ''' Batched IPC send. '''
         async for batch in self._mainloop():
             if batch is None:
-                # notify dispatch_result corountine to quit
-                await self._push_pipe.put_async(None)
+                # notify the dispatch_result coroutine in every frontend to
+                # quit
+                for pipe in self._push_pipes:
+                    await pipe.put_async(None)
                 break
             assert isinstance(batch, list)
-            await self._push_pipe.put_async(batch)
+            if len(self._push_pipes) == 1:
+                await self._push_pipes[0].put_async(batch)
+                continue
+            for frontend_id, sub_batch in enumerate(
+                    bucket_responses_by_frontend(batch, len(self._push_pipes))):
+                if sub_batch:
+                    await self._push_pipes[frontend_id].put_async(sub_batch)
 
     async def _mainloop(self):
         ''' The loop for handle_response and keep producing outputs. '''
@@ -202,6 +242,11 @@ class PostprocWorker:
                 res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                     inp)
                 record = self._records.get(client_id)
+                # A `terminate` verdict forces the record done;
+                # honor it so the stream stops and the record is popped without
+                # waiting for the engine's own is_final.
+                if record is not None and record._done:
+                    is_final = True
                 should_abort = record._aborted if record else False
                 finish_reason = record.outputs[0].finish_reason if (
                     record and record.outputs
@@ -221,7 +266,7 @@ class PostprocWorker:
                         num_generated_tokens=num_generated_tokens,
                     ))
                 if is_final:
-                    self._records.pop(client_id)
+                    self._records.pop(client_id, None)
             except Exception as e:
                 logger.error(
                     f"Postprocessing error for client {client_id}: {e}\n"
@@ -267,10 +312,14 @@ class PostprocWorker:
 
 @print_traceback_on_error
 def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
-                         feedout_ipc_addr: tuple[str, Optional[bytes]],
-                         tokenizer_dir: str, record_creator: Callable):
+                         feedout_ipc_addrs: List[tuple[str, Optional[bytes]]],
+                         tokenizer_dir: str,
+                         record_creator: Callable,
+                         post_processor_hook: Optional[str] = None):
+    # Pass the hook import path; PostprocWorker builds it once.
     worker = PostprocWorker(feedin_ipc_addr,
-                            feedout_ipc_addr,
+                            feedout_ipc_addrs,
                             tokenizer_dir=tokenizer_dir,
-                            record_creator=record_creator)
+                            record_creator=record_creator,
+                            post_processor_hook=post_processor_hook)
     worker.start()

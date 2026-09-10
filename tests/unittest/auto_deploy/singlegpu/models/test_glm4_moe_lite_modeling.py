@@ -215,6 +215,7 @@ def test_glm4_moe_lite_model_can_be_exported():
     assert torch.isfinite(logits2).all(), "Logits should not contain NaN or Inf"
 
 
+@pytest.mark.cpu_only
 def test_glm4_moe_lite_config_registration():
     """Test that the config is properly registered or model_type is correct."""
     # Create a config and verify model_type
@@ -229,6 +230,7 @@ def test_glm4_moe_lite_config_registration():
     assert hasattr(config, "qk_rope_head_dim")
 
 
+@pytest.mark.cpu_only
 def test_glm4_moe_lite_layer_types():
     """Test that layer 0 uses dense MLP and later layers use MoE."""
     config = _create_small_config()
@@ -248,6 +250,7 @@ def test_glm4_moe_lite_layer_types():
         )
 
 
+@pytest.mark.cpu_only
 def test_glm4_moe_lite_expert_structure():
     """Test that experts have correct structure for checkpoint loading."""
     config = _create_small_config()

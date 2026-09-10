@@ -36,6 +36,9 @@ import textwrap
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 AUTO_DEPLOY_SRC = os.path.join(REPO_ROOT, "tensorrt_llm", "_torch", "auto_deploy")
 

@@ -488,6 +488,7 @@ def test_moe_equivalence_and_converter():
     assert_rmse_close(actual, expected, rmse_ratio_tol=0.02, msg="MoE: ")
 
 
+@pytest.mark.cpu_only
 def test_moe_fused_checkpoint_hook_expands_static_fp8_scales():
     config = _small_text_config()
     moe = Mistral4MoE(config)
@@ -522,6 +523,7 @@ def test_moe_fused_checkpoint_hook_expands_static_fp8_scales():
     assert "experts.down_proj_activation_scale" not in state_dict
 
 
+@pytest.mark.cpu_only
 def test_moe_fused_checkpoint_hook_uses_owned_expert_ids():
     config = _small_text_config()
     moe = Mistral4MoE(config)
@@ -602,6 +604,7 @@ def test_decoder_layer_equivalence():
     assert_rmse_close(actual, expected, rmse_ratio_tol=0.05, msg="Decoder layer: ")
 
 
+@pytest.mark.cpu_only
 def test_full_model_equivalence_cpu():
     device = "cpu"
     dtype = torch.float32
@@ -628,6 +631,7 @@ def test_top_level_wrapper_inputs_embeds_path():
     torch.testing.assert_close(wrapper_logits, ref_logits, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.cpu_only
 def test_mistral3_wrappers_do_not_forward_none_inputs_embeds():
     class RecordingModule(nn.Module):
         def __init__(self):
@@ -705,6 +709,7 @@ def test_exported_mistral4_graph_has_valid_layer_subgraphs():
     assert "MLP" in layer_types
 
 
+@pytest.mark.cpu_only
 def test_registration():
     assert (
         AutoModelForCausalLMFactory._custom_model_mapping["Mistral4TextConfig"]

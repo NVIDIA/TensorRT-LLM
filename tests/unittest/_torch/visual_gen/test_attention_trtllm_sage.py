@@ -7,8 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention_backend import interface as attention_backend_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_backend_utils
+from tensorrt_llm._torch.attention.backends import interface as attention_backend_interface
+from tensorrt_llm._torch.attention.backends import utils as attention_backend_utils
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 
@@ -88,7 +88,7 @@ def _test_attention_trtllm_sage(
         sparse_attention_config.to_sparse_params() if sparse_attention_config is not None else None
     )
     attention_cls = attention_backend_utils.get_attention_backend(
-        "TRTLLM", sparse_attention_config=sparse_attention_config
+        "TRTLLM", sparse_params=sparse_params
     )
     attention = attention_cls(
         layer_idx=0,

@@ -13,16 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 4-GPU Cosmos3-Super with FP8 dynamic quantization (CFG + Ulysses + parallel VAE).
+# 4-GPU Cosmos3-Super with (CFG + Ulysses + parallel VAE).
 # Launch with 4 processes, e.g. torchrun --nproc_per_node=4 ...
 # Model: nvidia/Cosmos3-Super
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
 # GPU layout: cfg_size=2 (positive | negative) x ulysses_size=2 (sequence split).
-quant_config:
-  quant_algo: FP8
-  dynamic: true
-  ignore: ["language_model.*", "vae2llm", "llm2vae", "time_embedder.*"]
 attention_config:
   backend: VANILLA
 parallel_config:

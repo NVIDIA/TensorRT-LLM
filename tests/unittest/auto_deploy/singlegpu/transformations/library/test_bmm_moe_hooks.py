@@ -22,6 +22,8 @@ from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
     _bmm_moe_gate_up_split_hook,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def gate_up_stacked_weight():

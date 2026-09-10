@@ -84,6 +84,19 @@ struct MXSMTypeAdapter<__2SM>
     using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmMxf8f6f4Sm100;
 };
 
+namespace detail
+{
+template <typename T, typename = void>
+struct has_bias_ptr : std::false_type
+{
+};
+
+template <typename T>
+struct has_bias_ptr<T, std::void_t<decltype(std::declval<T&>().bias_ptr)>> : std::true_type
+{
+};
+} // namespace detail
+
 #ifdef PLACEHOLDER_KERNELS
 
 template <typename T, typename CTA_M, typename CTA_N, typename CTA_K, typename CGA_M, typename CGA_N, typename CGA_K,
@@ -187,7 +200,10 @@ typename Gemm::Arguments prepareGemmArgsSm100(void* D, void const* A, void const
     operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
     auto& fusion_args = operator_args.epilogue.thread;
     fusion_args.alpha_ptr = static_cast<ElementCompute const*>(global_sf);
-    fusion_args.bias_ptr = static_cast<ElementD const*>(bias);
+    if constexpr (detail::has_bias_ptr<std::decay_t<decltype(fusion_args)>>::value)
+    {
+        fusion_args.bias_ptr = static_cast<ElementD const*>(bias);
+    }
 
     operator_args.problem_shape = cute::make_shape(m, n, k, batch_count);
 

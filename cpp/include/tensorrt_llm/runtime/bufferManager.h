@@ -17,10 +17,10 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include <NvInferRuntime.h>
 
 #include <cstring>
 #include <memory>
@@ -62,63 +62,63 @@ public:
         }
     }
 
-    static auto constexpr kBYTE_TYPE = nvinfer1::DataType::kUINT8;
+    static auto constexpr kBYTE_TYPE = tensorrt_llm::DataType::kUINT8;
 
     //! \brief Allocates an `IBuffer` of the given size on the GPU, using cudaMallocAsync.
-    [[nodiscard]] IBufferPtr gpu(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;
+    [[nodiscard]] IBufferPtr gpu(std::size_t size, tensorrt_llm::DataType type = kBYTE_TYPE) const;
 
     //! \brief Allocates an `ITensor` of the given dimensions on the GPU, using cudaMallocAsync.
-    [[nodiscard]] ITensorPtr gpu(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE) const;
+    [[nodiscard]] ITensorPtr gpu(tensorrt_llm::Dims dims, tensorrt_llm::DataType type = kBYTE_TYPE) const;
 
     //! \brief Allocates an `IBuffer` of the given size on the GPU, using cudaMalloc.
-    [[nodiscard]] static IBufferPtr gpuSync(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static IBufferPtr gpuSync(std::size_t size, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `ITensor` of the given dimensions on the GPU, using cudaMalloc.
-    [[nodiscard]] static ITensorPtr gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static ITensorPtr gpuSync(tensorrt_llm::Dims dims, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size on the CPU.
-    [[nodiscard]] static IBufferPtr cpu(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static IBufferPtr cpu(std::size_t size, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `ITensor` of the given dimensions on the CPU.
-    [[nodiscard]] static ITensorPtr cpu(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static ITensorPtr cpu(tensorrt_llm::Dims dims, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates a pinned `IBuffer` of the given size on the CPU.
-    [[nodiscard]] static IBufferPtr pinned(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static IBufferPtr pinned(std::size_t size, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU.
-    [[nodiscard]] static ITensorPtr pinned(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static ITensorPtr pinned(tensorrt_llm::Dims dims, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates a pinned `IBuffer` of the given size on the CPU in the default memory pool.
-    [[nodiscard]] static IBufferPtr pinnedPool(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static IBufferPtr pinnedPool(std::size_t size, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates a pinned `ITensor` of the given dimensions on the CPU in the default memory pool.
-    [[nodiscard]] static ITensorPtr pinnedPool(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static ITensorPtr pinnedPool(tensorrt_llm::Dims dims, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `IBuffer` of the given size in UVM.
-    [[nodiscard]] static IBufferPtr managed(std::size_t size, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static IBufferPtr managed(std::size_t size, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `ITensor` of the given dimensions in UVM.
-    [[nodiscard]] static ITensorPtr managed(nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE);
+    [[nodiscard]] static ITensorPtr managed(tensorrt_llm::Dims dims, tensorrt_llm::DataType type = kBYTE_TYPE);
 
     //! \brief Allocates an `ITensor` of the given dimensions for NVLS
-    [[nodiscard]] static ITensorPtr ipcNvls(std::set<int> ranks, nvinfer1::Dims dims, nvinfer1::DataType type);
+    [[nodiscard]] static ITensorPtr ipcNvls(std::set<int> ranks, tensorrt_llm::Dims dims, tensorrt_llm::DataType type);
 
     //! \brief Allocates an `IBuffer` of the given size and memory type.
     [[nodiscard]] IBufferPtr allocate(
-        MemoryType memoryType, std::size_t size, nvinfer1::DataType type = kBYTE_TYPE) const;
+        MemoryType memoryType, std::size_t size, tensorrt_llm::DataType type = kBYTE_TYPE) const;
 
     //! \brief Allocates an `ITensor` of the given dimensions and memory type.
     [[nodiscard]] ITensorPtr allocate(
-        MemoryType memoryType, nvinfer1::Dims dims, nvinfer1::DataType type = kBYTE_TYPE) const;
+        MemoryType memoryType, tensorrt_llm::Dims dims, tensorrt_llm::DataType type = kBYTE_TYPE) const;
 
     //! \brief Create an empty `IBuffer` of the given memory type. It may be resized later.
-    [[nodiscard]] IBufferPtr emptyBuffer(MemoryType memoryType, nvinfer1::DataType type = kBYTE_TYPE) const
+    [[nodiscard]] IBufferPtr emptyBuffer(MemoryType memoryType, tensorrt_llm::DataType type = kBYTE_TYPE) const
     {
         return allocate(memoryType, 0, type);
     }
 
     //! \brief Create an empty `ITensor` of the given memory type. It may be reshaped later.
-    [[nodiscard]] ITensorPtr emptyTensor(MemoryType memoryType, nvinfer1::DataType type = kBYTE_TYPE) const
+    [[nodiscard]] ITensorPtr emptyTensor(MemoryType memoryType, tensorrt_llm::DataType type = kBYTE_TYPE) const
     {
         return allocate(memoryType, ITensor::makeShape({}), type);
     }
@@ -167,7 +167,7 @@ public:
 
     //! \brief Copy `src` into a new `ITensor` with a potentially different memory type.
     template <typename T>
-    [[nodiscard]] ITensorPtr copyFrom(T* src, nvinfer1::Dims dims, MemoryType memoryType) const
+    [[nodiscard]] ITensorPtr copyFrom(T* src, tensorrt_llm::Dims dims, MemoryType memoryType) const
     {
         auto buffer = allocate(memoryType, dims, TRTDataType<std::remove_cv_t<T>>::value);
         copy(src, *buffer);
@@ -176,7 +176,7 @@ public:
 
     //! \brief Copy `src` into a new `ITensor` with a potentially different memory type.
     template <typename T>
-    [[nodiscard]] ITensorPtr copyFrom(std::vector<T> const& src, nvinfer1::Dims dims, MemoryType memoryType) const
+    [[nodiscard]] ITensorPtr copyFrom(std::vector<T> const& src, tensorrt_llm::Dims dims, MemoryType memoryType) const
     {
         TLLM_CHECK_WITH_INFO(src.size() == ITensor::volumeNonNegative(dims),
             common::fmtstr("[TensorRT-LLM][ERROR] Incompatible size %lu and dims %s", src.size(),

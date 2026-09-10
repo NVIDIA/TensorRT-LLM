@@ -527,14 +527,10 @@ public:
   }
 
   // Signal completion of stage and move to the next stage
-  inline __device__ void arrive() {
-    mPipeline.arrive();
-  }
+  inline __device__ void arrive() { mPipeline.arrive(); }
 
   // Wait on a stage to be unlocked
-  inline __device__ void wait() {
-    mPipeline.wait();
-  }
+  inline __device__ void wait() { mPipeline.wait(); }
 
 private:
   Params mParams;
@@ -1023,9 +1019,7 @@ public:
   }
 
   // Get pipeline
-  [[nodiscard]] inline __device__ Pipeline& get_pipeline() {
-    return mPipeline;
-  }
+  [[nodiscard]] inline __device__ Pipeline& get_pipeline() { return mPipeline; }
 
 private:
   // The pipeline.
@@ -1068,7 +1062,8 @@ public:
                                                          ClusterShape clusterShape,
                                                          InitBarriers = {},
                                                          InitMasks = {},
-                                                         int32_t barInitWarpId = 0)
+                                                         int32_t barInitWarpId = 0,
+                                                         uint16_t customReleaseMask = 0)
     : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
                 reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 Params{transactionBytes,
@@ -1083,6 +1078,7 @@ public:
                 clusterShape,
                 InitMasks{}}
     , mBlockIdMask{0}
+    , mCustomReleaseMask{customReleaseMask}
     , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
       if (warpId == barInitWarpId) {
@@ -1121,7 +1117,9 @@ public:
     // Override the original consumer_release to use the umma_peer_mask instead of multicast mask.
     uint64_t* smemPtr = reinterpret_cast<uint64_t*>(&mEmptyBarrierPtr[state.index()]);
     if constexpr (IsMma2Sm) {
-      cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr, mBlockIdMask);
+      cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr,
+                                                 mCustomReleaseMask == 0 ? mBlockIdMask
+                                                                         : mCustomReleaseMask);
     } else {
       cutlass::arch::umma_arrive(smemPtr);
     }
@@ -1175,6 +1173,8 @@ private:
   Pipeline mPipeline;
   // The blockId mask.
   uint16_t mBlockIdMask;
+  // The custom release mask. Zero keeps the default peer mask.
+  uint16_t mCustomReleaseMask;
   // The empty barrier pointer.
   EmptyBarrier* mEmptyBarrierPtr;
   // Does it use 2CTA UTCMMA ?
@@ -1213,7 +1213,9 @@ public:
                                                               ClusterShape clusterShape,
                                                               InitBarriers = {},
                                                               InitMasks = {},
-                                                              int32_t barInitWarpId = 0)
+                                                              int32_t barInitWarpId = 0,
+                                                              uint16_t customReleaseMask = 0,
+                                                              uint16_t customTmaMbarMask = 0)
     : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
                 reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 warpId,
@@ -1228,11 +1230,28 @@ public:
                        barInitWarpId},
                 clusterShape,
                 InitBarriers{},
-                InitMasks{}} {}
+                InitMasks{}}
+    , mCustomReleaseMask{customReleaseMask}
+    , mCustomTmaMbarMask{customTmaMbarMask}
+    , mFullBarrierPtr{reinterpret_cast<FullBarrier*>(fullBarrierPtr)}
+    , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)}
+    , mTransactionBytes{transactionBytes}
+    , mIsProducerWarp{warpId == barInitWarpId}
+    , mIsProducerCta{size(clusterShape) == 1 ||
+                     (cute::block_id_in_cluster().x % cute::size<0>(AtomThrShapeMNK{}) == 0)} {}
 
   // Consumer release the barrier.
   inline __device__ void consumer_release(PipelineState const& state) {
-    mPipeline.consumer_release(state);
+    if constexpr (IsMma2Sm) {
+      if (mCustomReleaseMask != 0) {
+        uint64_t* smemPtr = reinterpret_cast<uint64_t*>(&mEmptyBarrierPtr[state.index()]);
+        cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr, mCustomReleaseMask);
+      } else {
+        mPipeline.consumer_release(state);
+      }
+    } else {
+      mPipeline.consumer_release(state);
+    }
   }
 
   // Consumer try to wait at the barrier..
@@ -1251,7 +1270,23 @@ public:
   // Arrive the producer barrier with the transaction_bytes at the same time.
   inline __device__ void producer_acquire(PipelineState const& state, int32_t t = int32_t{0}) {
     cutlass::ProducerToken token = reinterpret_cast<cutlass::ProducerToken const&>(t);
-    mPipeline.producer_acquire(state, token);
+    if constexpr (IsMma2Sm) {
+      if (mCustomTmaMbarMask != 0) {
+        if (token == cutlass::BarrierStatus::WaitAgain) {
+          mEmptyBarrierPtr[state.index()].wait(state.phase());
+        }
+
+        uint32_t const laneIdx = cutlass::canonical_lane_idx();
+        uint32_t const laneMask = laneIdx < 16 ? (uint32_t{1} << laneIdx) : 0;
+        uint32_t const pred = static_cast<uint32_t>(
+          mIsProducerWarp && mIsProducerCta && ((uint32_t{mCustomTmaMbarMask} & laneMask) != 0));
+        mFullBarrierPtr[state.index()].arrive_and_expect_tx(mTransactionBytes, laneIdx, pred);
+      } else {
+        mPipeline.producer_acquire(state, token);
+      }
+    } else {
+      mPipeline.producer_acquire(state, token);
+    }
   }
 
   // Producer arrive at the barrier. It does nothing.
@@ -1276,13 +1311,21 @@ public:
   }
 
   // Get pipeline
-  [[nodiscard]] inline __device__ Pipeline& get_pipeline() {
-    return mPipeline;
-  }
+  [[nodiscard]] inline __device__ Pipeline& get_pipeline() { return mPipeline; }
 
 private:
   // The pipeline.
   Pipeline mPipeline;
+  // The custom release mask. Zero keeps the wrapped pipeline release behavior.
+  uint16_t mCustomReleaseMask;
+  // The full-barrier mask that mirrors the TMALDG mbarrier multicast targets.
+  uint16_t mCustomTmaMbarMask;
+  FullBarrier* mFullBarrierPtr;
+  EmptyBarrier* mEmptyBarrierPtr;
+  uint32_t mTransactionBytes;
+  bool mIsProducerWarp;
+  bool mIsProducerCta;
+  static constexpr bool IsMma2Sm = cute::size(AtomThrShapeMNK{}) > 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

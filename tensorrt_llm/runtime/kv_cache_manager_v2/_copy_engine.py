@@ -245,7 +245,13 @@ class StagingBuffer:
         if self.min_size > manager.size:
             raise ValueError(f"Requested min_size {self.min_size} is too large for the manager")
         with manager.mutex:
-            self._size = min(self.max_size, manager._suggest_next_max_size_unsafe())
+            # If the tail cannot satisfy min_size, wrap to the front before allocating.
+            available = manager._suggest_next_max_size_unsafe()
+            if self.min_size > available:
+                manager.next = 0
+                available = manager._suggest_next_max_size_unsafe()
+            assert self.min_size <= available
+            self._size = max(min(self.max_size, available), self.min_size)
             self.start_grain = manager.next
             manager.next += self.num_grains
             assert manager.next <= manager.num_grains

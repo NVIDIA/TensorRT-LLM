@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .base_checkpoint_loader import BaseCheckpointLoader
 from .hf.afmoe_weight_mapper import AfmoeHfWeightMapper
 from .hf.checkpoint_loader import HfCheckpointLoader
 from .hf.config_loader import HfConfigLoader
+from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .hf.gemma3_weight_mapper import Gemma3HfWeightMapper
 from .hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from .hf.llama4_weight_mapper import Llama4HfWeightMapper
@@ -15,6 +19,7 @@ from .hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from .hf.qwen3_next_weight_mapper import Qwen3NextHfWeightMapper
 from .hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from .hf.qwen4_exp_weight_mapper import Qwen4ExpHfWeightMapper
 from .hf.weight_loader import HfWeightLoader
 from .hf.weight_mapper import HfWeightMapper
 from .mistral.checkpoint_loader import (MistralCheckpointLoader,
@@ -34,5 +39,6 @@ __all__ = [
     "Qwen3_5MoeHfWeightMapper", "Qwen3NextHfWeightMapper",
     "Gemma4HfWeightMapper", "LlavaNextHfWeightMapper",
     "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
-    "MXCheckpointLoader", "Qwen3VLHfWeightMapper"
+    "MXCheckpointLoader", "Qwen3VLHfWeightMapper", "Cosmos3HfWeightMapper",
+    "Qwen4ExpHfWeightMapper"
 ]

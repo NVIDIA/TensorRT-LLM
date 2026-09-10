@@ -423,6 +423,7 @@ def test_skywork_r1v2_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_skywork_r1v2_config_parsing():
     """Test that SkyworkChatConfig correctly wraps the llm_config as a Qwen2Config."""
     config = _create_small_chat_config()
@@ -433,6 +434,7 @@ def test_skywork_r1v2_config_parsing():
     assert config.llm_config.num_key_value_heads == 2
 
 
+@pytest.mark.cpu_only
 def test_skywork_r1v2_gqa_structure():
     """Test that attention uses GQA with bias on QKV."""
     model = SkyworkR1V2ForConditionalGeneration(_create_small_chat_config())
@@ -446,6 +448,7 @@ def test_skywork_r1v2_gqa_structure():
     assert attn.o_proj.bias is None
 
 
+@pytest.mark.cpu_only
 def test_skywork_r1v2_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format.
 

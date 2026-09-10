@@ -176,15 +176,10 @@ def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")
 
 
-@pytest.mark.parametrize("model", ["Qwen2-0.5B"])
+@pytest.mark.parametrize("model", ["Qwen3/Qwen3-0.6B"])
 def test_llmapi_kv_cache_connector(llm_root, llm_venv, model):
     script_path = Path(
         llm_root) / "examples" / "llm-api" / "llm_kv_cache_connector.py"
     model_path = f"{llm_models_root()}/{model}"
 
     venv_check_call(llm_venv, [str(script_path), model_path])
-
-
-def test_llmapi_tensorrt_engine(llm_root, engine_dir, llm_venv):
-    _run_llmapi_example(llm_root, engine_dir, llm_venv,
-                        "_tensorrt_engine/quickstart_example.py")

@@ -92,7 +92,7 @@ Here we set `LOCAL_USER=1` argument to set up the local user instead of root acc
 Here we compile the source inside the container:
 
 ``` bash
-python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --cuda_architectures "90-real;100-real"  --python_bindings --clean
+python3 ./scripts/build_wheel.py --cuda_architectures "90-real;100-real" --clean
 ```
 You can set the cuda_architectures to "100-real" if targeting Blackwell only, and "90-real" to target Hopper only to save some build time.
 
@@ -211,7 +211,8 @@ cuda_graph_config:
   - 2
   - 1
 print_iter_log: true
-kv_cache_dtype: fp8
+kv_cache_config:
+  dtype: fp8
 enable_attention_dp: true
 EOF
 trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4

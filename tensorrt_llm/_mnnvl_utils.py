@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import errno
 import functools
 import os
 import platform
 import sys
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from enum import Enum
+from typing import Any, List, Optional, Protocol, Union
 
 import pynvml
 import torch
@@ -32,6 +35,141 @@ from ._dlpack_utils import pack_strided_memory
 from ._utils import get_sm_version, mpi_comm
 from .logger import logger
 from .mapping import Mapping
+
+_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S = 20.0
+_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S = 0.01
+_MNNVL_CHECKPOINT_REQUEST_CLEANUP_TIMEOUT_S = 0.1
+_MNNVL_CHECKPOINT_ALLGATHER_TAG = 31415
+_MNNVL_CHECKPOINT_ORPHANED_REQUESTS: list[Any] = []
+
+
+class MnnvlCheckpointCommunicator(Protocol):
+    """Structural contract required by bounded MNNVL checkpoint collectives."""
+
+    def Get_rank(self) -> int:
+        """Return this process's rank in the communicator."""
+        ...
+
+    def Get_size(self) -> int:
+        """Return the communicator size."""
+        ...
+
+    def barrier(self) -> None:
+        """Synchronize all communicator members."""
+        ...
+
+    def allgather(self, value: Any) -> list[Any]:
+        """Gather a Python object from every communicator member."""
+        ...
+
+    def isend(self, value: Any, *, dest: int, tag: int) -> Any:
+        """Start a nonblocking Python-object send."""
+        ...
+
+    def irecv(self, *, source: int, tag: int) -> Any:
+        """Start a nonblocking Python-object receive."""
+        ...
+
+
+def _cancel_checkpoint_requests(requests: list[Any]) -> None:
+    """Bound cancellation cleanup so timeout handling cannot hang in MPI."""
+    for request in requests:
+        try:
+            request.Cancel()
+        except Exception as error:
+            logger.warning(f"Failed to cancel MNNVL checkpoint request: {error}")
+
+    pending_requests = list(requests)
+    cleanup_timeout_s = min(
+        _MNNVL_CHECKPOINT_REQUEST_CLEANUP_TIMEOUT_S,
+        _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S,
+    )
+    deadline = time.monotonic() + cleanup_timeout_s
+    while pending_requests:
+        incomplete_requests = []
+        for request in pending_requests:
+            try:
+                ready, _ = request.test()
+            except Exception as error:
+                logger.warning(f"Failed to poll MNNVL checkpoint request cleanup: {error}")
+                incomplete_requests.append(request)
+                continue
+            if not ready:
+                incomplete_requests.append(request)
+        pending_requests = incomplete_requests
+        if not pending_requests or time.monotonic() >= deadline:
+            break
+        time.sleep(_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S)
+
+    if pending_requests:
+        # An active receive must not be freed: mpi4py owns its receive buffer,
+        # and MPI may still write into it. Keep the wrappers alive until the
+        # enclosing fail-closed path terminates the worker.
+        _MNNVL_CHECKPOINT_ORPHANED_REQUESTS.extend(pending_requests)
+        logger.error(
+            f"Retaining {len(pending_requests)} active MNNVL checkpoint requests "
+            "until worker termination"
+        )
+
+
+def _checkpoint_allgather(
+    comm: MnnvlCheckpointCommunicator,
+    value: Any,
+    *,
+    operation: str,
+) -> list[Any]:
+    """Run a bounded object allgather over nonblocking point-to-point requests.
+
+    Production mpi4py communicators provide ``isend`` and ``irecv`` but no
+    nonblocking object allgather. The blocking fallback is retained only for
+    lightweight test communicators that do not implement point-to-point APIs.
+    """
+    isend = getattr(comm, "isend", None)
+    irecv = getattr(comm, "irecv", None)
+    if isend is None or irecv is None:
+        return comm.allgather(value)
+
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    results: list[Any] = [None] * size
+    results[rank] = value
+    receive_requests: dict[int, Any] = {}
+    send_requests: list[Any] = []
+    try:
+        for peer in range(size):
+            if peer != rank:
+                receive_requests[peer] = irecv(
+                    source=peer,
+                    tag=_MNNVL_CHECKPOINT_ALLGATHER_TAG,
+                )
+        for peer in range(size):
+            if peer != rank:
+                send_requests.append(
+                    isend(
+                        value,
+                        dest=peer,
+                        tag=_MNNVL_CHECKPOINT_ALLGATHER_TAG,
+                    )
+                )
+        if not receive_requests:
+            return results
+        deadline = time.monotonic() + _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S
+        while receive_requests or send_requests:
+            for peer, request in list(receive_requests.items()):
+                ready, result = request.test()
+                if ready:
+                    results[peer] = result
+                    del receive_requests[peer]
+            send_requests = [request for request in send_requests if not request.test()[0]]
+            if not receive_requests and not send_requests:
+                return results
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for MNNVL checkpoint {operation} allgather")
+            time.sleep(_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S)
+        return results
+    except Exception:
+        _cancel_checkpoint_requests([*receive_requests.values(), *send_requests])
+        raise
 
 
 def _check_cu_result(cu_func_ret):
@@ -51,14 +189,41 @@ def _check_cu_result(cu_func_ret):
         return None
 
 
+class _MnnvlAllocationState(Enum):
+    MAPPED = "mapped"
+    PREPARING = "preparing"
+    UNMAPPED = "unmapped"
+    RESTORING = "restoring"
+    BROKEN = "broken"
+
+
+@dataclass
+class _MnnvlAllocationRecord:
+    comm: Any
+    comm_size: int
+    comm_rank: int
+    comm_membership: tuple[int, ...]
+    aligned_size: int
+    mem_handles: List[Any]
+    start_address: int
+    rank_stride: int
+    address_offset: int
+    # Parallel layout comm was split for, so _checkpoint_restore_complete() can publish a
+    # replacement communicator together with the layout it serves. Defaults to empty for
+    # records built without one, which only costs a redundant Split() later.
+    comm_signature: tuple[int, ...] = ()
+    state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
+    pending_comm: Any = None
+
+
 class MnnvlMemory:
     """MNNVL memory management for tensor parallel (TP) operations."""
 
     # Shared across all subclasses (global/device state).
     initialized: bool = False
-    allocation_granularity: int = 0
     fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
+    force_fabric_handle: bool = False
 
     # Per-class state attributes. These will be auto-initialized for each subclass
     # to avoid polluting the parent class's state. Use callable (e.g., dict) for mutable defaults.
@@ -66,18 +231,28 @@ class MnnvlMemory:
         "current_mem_offset": 0,
         "current_rank_stride": 0,  # stride for ranks and also address space size.
         "current_start_address": 0,
+        # Rank count the current address range was reserved for; see
+        # new_mnnvl_memory_address() and _address_window_fits().
+        "current_address_comm_size": 0,
         "comm": None,  # MPI communicator.
+        # Parallel layout "comm" was split for; see comm_layout_signature().
+        "comm_signature": None,
         "allocated_map": dict,  # callable for fresh dict.
         "address_refcnt": dict,  # callable for fresh dict.
+        # Derived from get_allocation_prop(), whose handle type differs per class.
+        "allocation_granularity": 0,
     }
 
     # Initialize per-class state for the base class.
     current_mem_offset: int = 0
     current_rank_stride: int = 0
     current_start_address: int = 0
+    current_address_comm_size: int = 0
     comm = None
+    comm_signature = None
     allocated_map = {}
     address_refcnt = {}
+    allocation_granularity: int = 0
 
     def __init_subclass__(cls, **kwargs):
         """Auto-initialize per-class attributes for each subclass to avoid sharing state with parent."""
@@ -98,39 +273,137 @@ class MnnvlMemory:
             if hasattr(self, "ptr"):
                 type(self).close_mnnvl_memory(self.ptr)
 
+    @property
+    def mapped(self) -> bool:
+        """Whether the allocation is mapped and ready for data-path access."""
+        return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
+
     def as_torch_strided_tensor(self, dtype):
-        num_segments = type(self).comm.Get_size()
+        # Describe the allocation with the layout it was created under, recorded at
+        # allocation time, rather than with the current class-level communicator: the
+        # latter is rebuilt when the parallel layout changes (see get_comm), while this
+        # memory keeps the segment count it was actually mapped with.
+        num_segments = type(self).allocated_map[self.ptr].comm_size
         return pack_strided_memory(
             self.ptr, self.segment_size, self.rank_stride, num_segments, dtype, MnnvlMemory.dev_id
         )
+
+    @property
+    def local_mem_handle(self) -> int:
+        """Return the local rank's CUmemGenericAllocationHandle."""
+        record = type(self).allocated_map[self.ptr]
+        # mem_handles is indexed by rank within the communicator that exported it, so
+        # the index has to come from the same record and not from the current
+        # class-level communicator, whose rank may refer to a different layout.
+        return int(record.mem_handles[record.comm_rank])
 
     @staticmethod
     def initialize():
         if not MnnvlMemory.initialized:
             # use a dummy torch CUDA tensor to trigger CUDA context initialization
             _ = torch.empty(1, device="cuda")
-            # ensure nvml is initialized.
-            try:
-                pynvml.nvmlDeviceGetCount()
-            except pynvml.NVMLError_Uninitialized:
-                pynvml.nvmlInit()
+            MnnvlMemory._ensure_nvml_initialized()
             MnnvlMemory.initialized = True
 
+    @staticmethod
+    def _ensure_nvml_initialized() -> None:
+        """Initialize NVML when it has not already been initialized."""
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
+
+    @staticmethod
+    def comm_layout_signature(mapping: Mapping) -> tuple[int, ...]:
+        """Summarize the parallel layout that get_comm() splits `mapping` along.
+
+        Only rank-invariant sizes are included, never per-rank ids. MPI_Comm_split is
+        collective, so every rank must reach the same "is the cached communicator still
+        valid" verdict; a signature that could differ between ranks would let some ranks
+        return the cache while the others entered Split(), which deadlocks.
+
+        Every size a comm_split_color_key() implementation reads has to appear here,
+        including the ones it reads only through Mapping: moe_tp_rank is
+        tp_rank // (moe_ep_size * moe_cluster_size). moe_cluster_size does not follow from
+        the other entries either, because Mapping derives moe_world_size as tp_size alone
+        under Ulysses CP and as tp_size * cp_size otherwise, so two mappings can agree on
+        everything else listed here and still split into different groups.
+        """
+        return (
+            mapping.world_size,
+            mapping.pp_size,
+            mapping.cp_size,
+            mapping.tp_size,
+            mapping.moe_tp_size,
+            mapping.moe_ep_size,
+            mapping.moe_cluster_size,
+        )
+
     @classmethod
-    def get_comm(cls, mapping: Mapping):
-        """Get TP-based communicator (ranks grouped by PP+CP+MOE_TP, ordered by TP rank)."""
-        if cls.comm is not None:
-            return cls.comm
-        comm = mpi_comm().Split(
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP+CP+MOE_TP, ordering each group by TP rank."""
+        return (
             (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
             + mapping.moe_tp_rank,
             mapping.tp_rank,
         )
-        cls.comm = comm
-        return comm
 
-    @staticmethod
-    def get_allocation_prop(dev_id: int):
+    @classmethod
+    def get_comm(cls, mapping: Mapping) -> MnnvlCheckpointCommunicator:
+        """Get the communicator for `mapping`, creating it on first use.
+
+        The communicator is cached per class, and one process can serve several
+        mappings in sequence (CI reuses an MPI worker pool across tests). Reusing a
+        communicator built for a different parallel layout is not merely suboptimal:
+        its size is recorded at allocation time and becomes the leading dimension of the
+        resulting workspace (see as_torch_strided_tensor), so the mismatch surfaces later
+        as a shape check failing inside a kernel instead of being caught at its source.
+        Rebuild the communicator whenever the layout changes.
+        """
+        signature = cls.comm_layout_signature(mapping)
+        if cls.comm is not None:
+            if cls.comm_signature == signature:
+                return cls.comm
+            logger.warning(
+                f"[{cls.__name__}] cached communicator was created for parallel layout "
+                f"{cls.comm_signature}, but {signature} is requested; recreating it."
+            )
+            cls.drop_cached_comm()
+        color, key = cls.comm_split_color_key(mapping)
+        cls.comm = mpi_comm().Split(color, key)
+        cls.comm_signature = signature
+        return cls.comm
+
+    @classmethod
+    def drop_cached_comm(cls) -> None:
+        """Forget the cached communicator without freeing it.
+
+        MPI_Comm_free is collective, and no local test can decide whether to call it.
+        Allocations enter allocated_map collectively, through the allgathers in
+        open_mnnvl_memory(), but leave it through MnnvlMemory.__del__, that is by per-rank
+        object lifetime. "Is anyone still using this communicator" is therefore a question
+        each rank can answer differently, and one rank would return while another entered
+        the free. A restored communicator is not this class's to free either: it is
+        supplied by its caller and only has to satisfy MnnvlCheckpointCommunicator, which
+        does not include Free() (see _checkpoint_restore_complete).
+
+        Dropping the reference leaks the underlying MPI_Comm, because mpi4py does not free
+        a communicator when its Python object is collected, so the handle lives until
+        MPI_Finalize. That is also what this class did before it could rebuild at all. The
+        leak grows with the number of layout transitions, not with the number of distinct
+        layouts: only one communicator is cached, so returning to an earlier layout splits a
+        fresh one instead of reusing it. That is no transitions outside a reused test worker,
+        and one per layout change inside one. Keying the cache by signature would bound it by
+        distinct layouts instead, and is safe to add later because the signature is rank
+        invariant (see test_comm_layout_signature_is_rank_invariant); reclaiming a
+        communicator would still have to happen on a path that is already collective on every
+        rank, not on this lookup.
+        """
+        cls.comm = None
+        cls.comm_signature = None
+
+    @classmethod
+    def get_allocation_prop(cls, dev_id: int):
         location = cuda.CUmemLocation()
         location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         location.id = dev_id
@@ -141,7 +414,7 @@ class MnnvlMemory:
         # May need to find a better way to handle this.
         arch = platform.machine().lower()
         is_on_aarch64 = "aarch64" in arch
-        if is_on_aarch64:
+        if cls.force_fabric_handle or is_on_aarch64:
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
             )
@@ -152,19 +425,19 @@ class MnnvlMemory:
         allocation_prop.location = location
         return allocation_prop
 
-    @staticmethod
-    def get_allocation_granularity(dev_id: int):
-        if MnnvlMemory.allocation_granularity != 0:
-            return MnnvlMemory.allocation_granularity
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+    @classmethod
+    def get_allocation_granularity(cls, dev_id: int):
+        if cls.allocation_granularity != 0:
+            return cls.allocation_granularity
+        allocation_prop = cls.get_allocation_prop(dev_id)
         option = cuda.CUmemAllocationGranularity_flags(
             cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
         )
         granularity = _check_cu_result(
             cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
         )
-        MnnvlMemory.allocation_granularity = granularity
-        return MnnvlMemory.allocation_granularity
+        cls.allocation_granularity = granularity
+        return cls.allocation_granularity
 
     @classmethod
     def new_mnnvl_memory_address(cls, mapping: Mapping, size: int):
@@ -180,6 +453,199 @@ class MnnvlMemory:
         cls.current_start_address = int(ptr)
         cls.current_rank_stride = current_rank_stride
         cls.current_mem_offset = 0
+        cls.current_address_comm_size = comm_size
+
+    @classmethod
+    def _address_window_fits(cls, aligned_size: int, comm_size: int) -> bool:
+        """Whether the reserved address range can host one more allocation.
+
+        A reservation is one slot of current_rank_stride bytes per rank of the communicator
+        that asked for it (see new_mnnvl_memory_address), so fitting is not only about the
+        bytes left in a slot: an allocation made for a communicator of a different size
+        must not share it. A larger one would map its extra ranks past the end of the range
+        (_create_and_map_handles walks rank_stride * rank for every rank of the current
+        communicator), and either size mixed into one range would leave
+        close_mnnvl_memory() computing the range's length from whichever allocation happens
+        to close last, while cuMemAddressFree requires the exact length that was reserved.
+        """
+        return (
+            cls.current_mem_offset + aligned_size <= cls.current_rank_stride
+            and comm_size == cls.current_address_comm_size
+        )
+
+    @classmethod
+    def _create_and_map_handles(
+        cls,
+        comm,
+        aligned_size: int,
+        start_address: int,
+        rank_stride: int,
+        address_offset: int,
+    ) -> List[Any]:
+        local_handle = None
+        exported_handle = None
+        pidfds = []
+        remote_fds = []
+        mem_handles = [None] * comm.Get_size()
+        mapped_rank_ptrs = []
+        is_fabric = False
+        try:
+            local_error = None
+            local_handle_data = None
+            local_pid = None
+            try:
+                dev_id = int(_check_cu_result(cuda.cuCtxGetDevice()))
+                assert dev_id == MnnvlMemory.dev_id, (
+                    f"Different dev_id found dev_id={dev_id} but "
+                    f"MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
+                )
+                allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+                is_fabric = (
+                    allocation_prop.requestedHandleTypes
+                    == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                )
+                local_handle = _check_cu_result(
+                    cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+                )
+                exported_handle = _check_cu_result(
+                    cuda.cuMemExportToShareableHandle(
+                        local_handle, allocation_prop.requestedHandleTypes, 0
+                    )
+                )
+                local_handle_data = exported_handle.data if is_fabric else int(exported_handle)
+                local_pid = os.getpid()
+            except Exception as error:
+                local_error = f"{type(error).__name__}: {error}"
+
+            exported_by_rank = _checkpoint_allgather(
+                comm,
+                {
+                    "error": local_error,
+                    "handle": local_handle_data,
+                    "is_fabric": is_fabric,
+                    "pid": local_pid,
+                },
+                operation="handle export",
+            )
+            export_errors = [
+                f"rank {rank}: {payload['error']}"
+                for rank, payload in enumerate(exported_by_rank)
+                if payload["error"] is not None
+            ]
+            if export_errors:
+                raise RuntimeError(
+                    "MNNVL handle export failed before mapping:\n" + "\n".join(export_errors)
+                )
+            fabric_modes = {payload["is_fabric"] for payload in exported_by_rank}
+            if len(fabric_modes) != 1:
+                raise RuntimeError("MNNVL ranks selected inconsistent shareable handle types")
+            is_fabric = fabric_modes.pop()
+            if is_fabric:
+                all_handles_data = [payload["handle"] for payload in exported_by_rank]
+            else:
+                all_exported_fds = [payload["handle"] for payload in exported_by_rank]
+                all_pids = [payload["pid"] for payload in exported_by_rank]
+                syscall = ctypes.CDLL(None, use_errno=True).syscall
+                fd_import_error = None
+                try:
+                    for pid in all_pids:
+                        pidfd = syscall(434, pid, 0)
+                        if pidfd < 0:
+                            err = ctypes.get_errno()
+                            raise RuntimeError(
+                                f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                            )
+                        pidfds.append(pidfd)
+                    for pidfd, fd in zip(pidfds, all_exported_fds):
+                        remote_fd = syscall(438, pidfd, fd, 0)
+                        if remote_fd < 0:
+                            err = ctypes.get_errno()
+                            error_msg = (
+                                f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno "
+                                f"{err}: {os.strerror(err)}."
+                            )
+                            if err == errno.EPERM:
+                                error_msg += (
+                                    " Permission denied. If running in a container, try adding "
+                                    "--cap-add=SYS_PTRACE to your docker run command."
+                                )
+                            elif err == errno.ENOSYS:
+                                error_msg += (
+                                    " This may be due to kernel version (requires Linux 5.6+)."
+                                )
+                            raise RuntimeError(error_msg)
+                        remote_fds.append(remote_fd)
+                except Exception as error:
+                    fd_import_error = f"{type(error).__name__}: {error}"
+
+                fd_import_errors = _checkpoint_allgather(
+                    comm,
+                    fd_import_error,
+                    operation="POSIX file descriptor import readiness",
+                )
+                failed_ranks = [
+                    f"rank {rank}: {error}"
+                    for rank, error in enumerate(fd_import_errors)
+                    if error is not None
+                ]
+                if failed_ranks:
+                    raise RuntimeError(
+                        "MNNVL POSIX file descriptor import failed on one or more ranks:\n"
+                        + "\n".join(failed_ranks)
+                    )
+                all_handles_data = remote_fds
+
+            access_desc = cuda.CUmemAccessDesc()
+            access_desc.location = allocation_prop.location
+            access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            for rank, handle_data in enumerate(all_handles_data):
+                rank_ptr = start_address + rank_stride * rank + address_offset
+                handle = (
+                    local_handle
+                    if rank == comm.Get_rank()
+                    else _check_cu_result(
+                        cuda.cuMemImportFromShareableHandle(
+                            handle_data, allocation_prop.requestedHandleTypes
+                        )
+                    )
+                )
+                mem_handles[rank] = handle
+                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, handle, 0))
+                mapped_rank_ptrs.append(rank_ptr)
+                _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [access_desc], 1))
+            return mem_handles
+        except Exception:
+            for rank_ptr in reversed(mapped_rank_ptrs):
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
+                except RuntimeError as error:
+                    logger.warning(f"Failed to unmap incomplete MNNVL allocation: {error}")
+
+            handles_to_release = [handle for handle in mem_handles if handle is not None]
+            if local_handle is not None and mem_handles[comm.Get_rank()] is None:
+                handles_to_release.append(local_handle)
+            for handle in handles_to_release:
+                try:
+                    _check_cu_result(cuda.cuMemRelease(handle))
+                except RuntimeError as error:
+                    logger.warning(f"Failed to release incomplete MNNVL allocation: {error}")
+            raise
+        finally:
+            for pidfd in pidfds:
+                try:
+                    os.close(pidfd)
+                except OSError as error:
+                    logger.warning(f"Failed to close MNNVL pidfd: {error}")
+            for remote_fd in remote_fds:
+                try:
+                    os.close(remote_fd)
+                except OSError as error:
+                    logger.warning(f"Failed to close imported MNNVL file descriptor: {error}")
+            if not is_fabric and exported_handle is not None:
+                try:
+                    os.close(int(exported_handle))
+                except OSError as error:
+                    logger.warning(f"Failed to close exported MNNVL file descriptor: {error}")
 
     @classmethod
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):
@@ -196,132 +662,68 @@ class MnnvlMemory:
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
+        comm_membership = tuple(int(rank) for rank in comm.allgather(mapping.rank))
+        if len(comm_membership) != comm_size:
+            raise RuntimeError(
+                "MNNVL communicator membership size does not match its rank count: "
+                f"{len(comm_membership)} != {comm_size}"
+            )
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
         assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
-        granularity = MnnvlMemory.get_allocation_granularity(dev_id)
+        granularity = cls.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
-        if cls.current_mem_offset + aligned_size > cls.current_rank_stride:
-            cls.new_mnnvl_memory_address(mapping, aligned_size)
-
-        assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
-
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
-        allocated_mem_handle = _check_cu_result(
-            cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
-        )
-        exported_fabric_handle = _check_cu_result(
-            cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
-            )
-        )
-        pidfds = []
-        remote_fds = []
-        try:
-            if (
-                allocation_prop.requestedHandleTypes
-                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            ):
-                all_handles_data = comm.allgather(exported_fabric_handle.data)
-            else:
-                all_handles_data = comm.allgather(exported_fabric_handle)
-                all_pids = comm.allgather(os.getpid())
-                libc = ctypes.CDLL(None, use_errno=True)
-                syscall = libc.syscall
-                SYS_pidfd_open = 434
-                SYS_pidfd_getfd = 438
-                for i, pid in enumerate(all_pids):
-                    pidfd = syscall(SYS_pidfd_open, pid, 0)
-                    if pidfd < 0:
-                        err = ctypes.get_errno()
-                        raise RuntimeError(
-                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                        )
-                    pidfds.append(pidfd)
-
-                for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
-                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                    if remote_fd < 0:
-                        err = ctypes.get_errno()
-                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                        if err == 1:  # EPERM
-                            error_msg += (
-                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                                "to your docker run command."
-                            )
-                        else:
-                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                        raise RuntimeError(error_msg)
-                    remote_fds.append(remote_fd)
-
-                all_handles_data = remote_fds
-        except Exception:
-            # Release resources on failure path to avoid leaks; then re-raise.
-            if isinstance(exported_fabric_handle, int):
-                try:
-                    os.close(exported_fabric_handle)
-                except OSError as e:
-                    logger.warning(
-                        "Failed to close exported shareable handle on error: %s",
-                        e,
-                    )
-            try:
-                _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
-            except RuntimeError as e:
-                logger.warning(
-                    "cuMemRelease failed during error cleanup (original error will be raised): %s",
-                    e,
-                )
-            for _pidfd in pidfds:
-                try:
-                    os.close(_pidfd)
-                except OSError:
-                    pass
-            for _rfd in remote_fds:
-                try:
-                    os.close(_rfd)
-                except OSError:
-                    pass
-            raise
-        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
-        # can use buf = memoryview(data) to import if using plain buffer for data.
-
-        madesc = cuda.CUmemAccessDesc()
-        madesc.location = allocation_prop.location
-        madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-
-        mem_handles = [None] * comm_size
-
-        for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = (
-                cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
-            )
-            if i == comm_rank:
-                # Local memory mapping
-                mem_handles[i] = allocated_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, allocated_mem_handle, 0))
-            else:
-                # Fabric memory mapping
-                imported_mem_handle = _check_cu_result(
-                    cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, allocation_prop.requestedHandleTypes
-                    )
-                )
-                mem_handles[i] = imported_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0))
-
-            _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
-
-        ptr = cls.current_start_address + cls.current_mem_offset
-        stride = cls.current_rank_stride
-        cls.allocated_map[ptr] = (
-            mapping,
-            aligned_size,
-            mem_handles,
+        previous_address_state = (
             cls.current_start_address,
             cls.current_rank_stride,
             cls.current_mem_offset,
+            cls.current_address_comm_size,
+        )
+        reserved_new_address = not cls._address_window_fits(aligned_size, comm_size)
+        if reserved_new_address:
+            cls.new_mnnvl_memory_address(mapping, aligned_size)
+
+        assert cls._address_window_fits(aligned_size, comm_size)
+
+        try:
+            mem_handles = cls._create_and_map_handles(
+                comm,
+                aligned_size,
+                cls.current_start_address,
+                cls.current_rank_stride,
+                cls.current_mem_offset,
+            )
+        except Exception:
+            if reserved_new_address:
+                try:
+                    device_ptr = cuda.CUdeviceptr(cls.current_start_address)
+                    _check_cu_result(
+                        cuda.cuMemAddressFree(device_ptr, comm_size * cls.current_rank_stride)
+                    )
+                except RuntimeError as error:
+                    logger.warning(f"cuMemAddressFree failed during error cleanup: {error}")
+                else:
+                    (
+                        cls.current_start_address,
+                        cls.current_rank_stride,
+                        cls.current_mem_offset,
+                        cls.current_address_comm_size,
+                    ) = previous_address_state
+            raise
+        ptr = cls.current_start_address + cls.current_mem_offset
+        stride = cls.current_rank_stride
+        cls.allocated_map[ptr] = _MnnvlAllocationRecord(
+            comm=comm,
+            comm_size=comm_size,
+            comm_rank=comm_rank,
+            comm_membership=comm_membership,
+            comm_signature=cls.comm_layout_signature(mapping),
+            aligned_size=aligned_size,
+            mem_handles=mem_handles,
+            start_address=cls.current_start_address,
+            rank_stride=cls.current_rank_stride,
+            address_offset=cls.current_mem_offset,
         )
         cls.address_refcnt[cls.current_start_address] = (
             cls.address_refcnt.get(cls.current_start_address, 0) + 1
@@ -332,33 +734,221 @@ class MnnvlMemory:
 
     @classmethod
     def close_mnnvl_memory(cls, ptr: int):
-        mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
-            cls.allocated_map.pop(ptr)
-        )
-        comm = cls.get_comm(mapping)
-        comm_size = comm.Get_size()
-        for i in range(comm_size):
-            rank_ptr = start_address + i * rank_stride + address_offset
-            _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
-            _check_cu_result(cuda.cuMemRelease(mem_handles[i]))
-        cls.address_refcnt[start_address] -= 1
+        record = cls.allocated_map[ptr]
+        if record.state not in (
+            _MnnvlAllocationState.MAPPED,
+            _MnnvlAllocationState.UNMAPPED,
+        ):
+            logger.warning(
+                f"Skipping cleanup of MNNVL allocation in terminal state {record.state.value}"
+            )
+            return
+        cls.allocated_map.pop(ptr)
+        if record.state is _MnnvlAllocationState.MAPPED:
+            cls._unmap_and_release_handles(record)
+        cls.address_refcnt[record.start_address] -= 1
 
-        if cls.address_refcnt[start_address] == 0:
-            cls.address_refcnt.pop(start_address)
-            device_ptr = cuda.CUdeviceptr(start_address)
-            _check_cu_result(cuda.cuMemAddressFree(device_ptr, comm_size * rank_stride))
-            if start_address == cls.current_start_address:
+        if cls.address_refcnt[record.start_address] == 0:
+            cls.address_refcnt.pop(record.start_address)
+            device_ptr = cuda.CUdeviceptr(record.start_address)
+            # cuMemAddressFree wants the exact length that was reserved. Taking it from this
+            # record is sound because _address_window_fits() only lets allocations share a
+            # range when their communicators agree on size.
+            _check_cu_result(
+                cuda.cuMemAddressFree(device_ptr, record.comm_size * record.rank_stride)
+            )
+            if record.start_address == cls.current_start_address:
                 cls.current_start_address = 0
                 cls.current_rank_stride = 0
                 cls.current_mem_offset = 0
+                cls.current_address_comm_size = 0
+
+    @classmethod
+    def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
+        first_error = None
+        for rank in range(record.comm_size):
+            rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
+            try:
+                _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+            except RuntimeError as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            try:
+                _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
+            except RuntimeError as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                record.mem_handles[rank] = None
+        if first_error is not None:
+            raise first_error
+
+    def checkpoint_prepare(self) -> None:
+        """Detach local backing handles while retaining graph-visible VA.
+
+        The engine checkpoint coordinator is responsible for quiescing and
+        invoking this operation on every rank. No collective follows the CUDA
+        mutation, so a local failure cannot strand peers in a trailing barrier.
+        """
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        if record.state is _MnnvlAllocationState.UNMAPPED:
+            return
+        if record.state is not _MnnvlAllocationState.MAPPED:
+            raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
+        record.state = _MnnvlAllocationState.PREPARING
+        try:
+            torch.cuda.synchronize()
+            cls._unmap_and_release_handles(record)
+            record.mem_handles = [None] * record.comm_size
+        except Exception:
+            record.state = _MnnvlAllocationState.BROKEN
+            raise
+        record.state = _MnnvlAllocationState.UNMAPPED
+
+    def checkpoint_fail_closed(self) -> None:
+        """Make a timed-out checkpoint allocation terminal.
+
+        A timeout means ranks may have reached different checkpoint phases.
+        The allocation must not be reused by a later checkpoint attempt.
+        """
+        record = type(self).allocated_map[self.ptr]
+        record.state = _MnnvlAllocationState.BROKEN
+        record.pending_comm = None
+
+    def checkpoint_restore(self, comm: MnnvlCheckpointCommunicator) -> bool:
+        """Remap fresh handles while keeping data-path access disabled."""
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        if record.state is _MnnvlAllocationState.MAPPED:
+            return False
+        if record.state is not _MnnvlAllocationState.UNMAPPED:
+            raise RuntimeError(f"Cannot restore MNNVL allocation in {record.state.value} state")
+        comm_size = comm.Get_size()
+        comm_rank = comm.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
+            raise RuntimeError(
+                "Cannot restore MNNVL memory with a communicator that differs from "
+                "the graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
+        try:
+            comm_membership = tuple(
+                int(rank)
+                for rank in _checkpoint_allgather(
+                    comm,
+                    self.mapping.rank,
+                    operation="communicator membership",
+                )
+            )
+        except Exception:
+            self.checkpoint_fail_closed()
+            raise
+        if comm_membership != record.comm_membership:
+            raise RuntimeError(
+                "Cannot restore MNNVL memory with a communicator whose ordered "
+                "membership differs from the graph-visible allocation layout: "
+                f"{comm_membership} != {record.comm_membership}"
+            )
+        record.state = _MnnvlAllocationState.RESTORING
+        local_error = None
+        try:
+            torch.cuda.synchronize()
+            record.mem_handles = cls._create_and_map_handles(
+                comm,
+                record.aligned_size,
+                record.start_address,
+                record.rank_stride,
+                record.address_offset,
+            )
+        except TimeoutError:
+            record.state = _MnnvlAllocationState.BROKEN
+            raise
+        except Exception as error:
+            local_error = f"{type(error).__name__}: {error}"
+
+        try:
+            restore_errors = _checkpoint_allgather(
+                comm,
+                local_error,
+                operation="mapping readiness",
+            )
+        except Exception:
+            self._checkpoint_restore_failed()
+            raise
+        failed_ranks = [
+            f"rank {rank}: {error}"
+            for rank, error in enumerate(restore_errors)
+            if error is not None
+        ]
+        if failed_ranks:
+            self._checkpoint_restore_failed()
+            raise RuntimeError(
+                "MNNVL checkpoint restore failed on one or more ranks:\n" + "\n".join(failed_ranks)
+            )
+        record.pending_comm = comm
+        return True
+
+    def _checkpoint_restore_complete(self) -> None:
+        """Publish a restored allocation after frontend protocol readiness."""
+        record = type(self).allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.RESTORING:
+            raise RuntimeError(f"Cannot complete MNNVL restore in {record.state.value} state")
+        if record.pending_comm is None:
+            raise RuntimeError("Cannot complete MNNVL restore without a replacement communicator")
+        record.comm = record.pending_comm
+        # Publish the replacement communicator together with the layout it serves.
+        # checkpoint_restore() validates the incoming communicator against this record
+        # alone (same size, rank and ordered membership), never against the class cache,
+        # which may since have been rebuilt for a different layout; setting comm while
+        # comm_signature still described that other layout would make get_comm() report a
+        # hit for it and hand this communicator out instead. An empty record signature
+        # clears the cache signature so the next get_comm() splits again rather than
+        # matching anything. The displaced communicator is dropped without Free(),
+        # because MPI_Comm_free is collective and this path is per-allocation.
+        type(self).comm = record.comm
+        type(self).comm_signature = record.comm_signature or None
+        record.pending_comm = None
+        record.state = _MnnvlAllocationState.MAPPED
+
+    def _checkpoint_restore_failed(self) -> None:
+        """Make a failed frontend restore terminal and fail closed."""
+        record = type(self).allocated_map[self.ptr]
+        if record.state is _MnnvlAllocationState.RESTORING:
+            for rank, handle in enumerate(record.mem_handles):
+                if handle is None:
+                    continue
+                rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+                except RuntimeError as error:
+                    logger.warning(
+                        f"Failed to unmap unpublished MNNVL restore for rank {rank}: {error}"
+                    )
+                try:
+                    _check_cu_result(cuda.cuMemRelease(handle))
+                except RuntimeError as error:
+                    logger.warning(
+                        "Failed to release unpublished MNNVL restore handle "
+                        f"for rank {rank}: {error}"
+                    )
+                else:
+                    record.mem_handles[rank] = None
+            record.state = _MnnvlAllocationState.BROKEN
+            record.pending_comm = None
 
     @staticmethod
     @functools.cache
     def support_nvlink(dev_id: int, need_all_up: bool = True):
+        # Do not rely on other modules having initialized NVML as an import side effect.
+        MnnvlMemory._ensure_nvml_initialized()
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
         available_links = 0
+        probed_links = link_count
         for link_idx in range(link_count):
             try:
                 if pynvml.nvmlDeviceGetNvLinkCapability(
@@ -368,13 +958,66 @@ class MnnvlMemory:
                     is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
                     if is_active:
                         active_links += 1
-            except pynvml.NVMLError_NotSupported:
+            except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
                 continue
-        return (
+            except pynvml.NVMLError_InvalidArgument:
+                # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures;
+                # the driver rejects indices past this GPU's link count (18 on GB200).
+                probed_links = link_idx
+                break
+        supported = (
             active_links == available_links and available_links > 0
             if need_all_up
             else available_links > 0
         )
+        logger.info(
+            f"[MnnvlMemory] dev {dev_id} NVLink: {active_links}/{available_links} links up "
+            f"({probed_links} of {link_count} link indices accepted by the driver), "
+            f"need_all_up={need_all_up}, supported={supported}"
+        )
+        return supported
+
+    @staticmethod
+    @functools.cache
+    def _is_pcie_nvl_sku(dev_id: int) -> bool:
+        """Return whether visible H100/H200 GPUs form PCIe-connected NVLink islands."""
+        # H100/H200 NVL PCIe SKUs bond GPUs into local NVLink islands joined
+        # only through PCIe/SYS. Per-device NVLink state therefore cannot
+        # distinguish them from an NVSwitch fabric.
+        device_name = torch.cuda.get_device_name(dev_id).upper()
+        # NVML may report SYSTEM between peers on later NVSwitch platforms, so
+        # use this fallback only for the affected Hopper SKUs.
+        if not any(sku in device_name for sku in ("H100", "H200")):
+            return False
+
+        if " NVL" in device_name:
+            return True
+
+        try:
+            MnnvlMemory._ensure_nvml_initialized()
+            self_handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            for peer_id in range(pynvml.nvmlDeviceGetCount()):
+                if peer_id == dev_id:
+                    continue
+                peer_handle = pynvml.nvmlDeviceGetHandleByIndex(peer_id)
+                if (
+                    pynvml.nvmlDeviceGetTopologyCommonAncestor(self_handle, peer_handle)
+                    == pynvml.NVML_TOPOLOGY_SYSTEM
+                ):
+                    # SYSTEM is only a distance classification. A dual-socket
+                    # HGX can still provide NVLink P2P to such a peer through
+                    # NVSwitch. Split islands instead have local NVLink but no
+                    # NVLink P2P path to the SYSTEM peer.
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        self_handle,
+                        peer_handle,
+                        pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return MnnvlMemory.support_nvlink(dev_id, need_all_up=False)
+        except pynvml.NVMLError:
+            return False
+        return False
 
     @staticmethod
     def supports_mnnvl() -> bool:
@@ -388,8 +1031,16 @@ class MnnvlMemory:
         if get_sm_version() in (120, 121):
             return False
         dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
+            return False
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
+
+
+class CftMnnvlMemory(MnnvlMemory):
+    """MNNVL memory with FABRIC handles so CFT logical endpoints can bind it."""
+
+    force_fabric_handle: bool = True
 
 
 class HelixCpMnnvlMemory(MnnvlMemory):
@@ -401,16 +1052,12 @@ class HelixCpMnnvlMemory(MnnvlMemory):
     """
 
     @classmethod
-    def get_comm(cls, mapping: Mapping):
-        """Get CP-based communicator (ranks grouped by PP+TP+MOE_TP, ordered by CP rank)."""
-        if cls.comm is not None:
-            return cls.comm
-        comm = mpi_comm().Split(
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP+TP, ordering each group by CP rank."""
+        return (
             mapping.pp_rank * mapping.tp_size + mapping.tp_rank,
             mapping.cp_rank,
         )
-        cls.comm = comm
-        return comm
 
 
 def init_helix_cp_comm(mapping: Mapping) -> None:
@@ -482,6 +1129,68 @@ class MnnvlMoe:
             MnnvlMoe.moe_prepare_workspace.as_torch_strided_tensor(torch.uint64)
         )
         return MnnvlMoe.moe_prepare_workspace_tensor
+
+    @staticmethod
+    def checkpoint_prepare() -> None:
+        """Detach TRT-native two-sided MoE workspaces for checkpointing."""
+        for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace):
+            if workspace is not None:
+                workspace.checkpoint_prepare()
+
+    @staticmethod
+    def checkpoint_restore(comm: MnnvlCheckpointCommunicator) -> None:
+        """Restore TRT-native two-sided MoE workspaces at their original virtual addresses."""
+        workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+        restored_workspaces = []
+        try:
+            for workspace in workspaces:
+                if workspace is not None and workspace.checkpoint_restore(comm):
+                    restored_workspaces.append(workspace)
+            if not restored_workspaces:
+                return
+            restored_main_workspace = any(
+                workspace is MnnvlMoe.moe_workspace for workspace in restored_workspaces
+            )
+            local_error = None
+            try:
+                if restored_main_workspace and MnnvlMoe.moe_workspace_tensor is not None:
+                    assert MnnvlMoe.moe_mapping is not None
+                    torch.ops.trtllm.moe_initialize_workspace(
+                        MnnvlMoe.moe_workspace_tensor,
+                        MnnvlMoe.moe_mapping.moe_ep_rank,
+                        MnnvlMoe.moe_mapping.moe_ep_size,
+                    )
+                torch.cuda.synchronize()
+            except Exception as error:
+                local_error = f"{type(error).__name__}: {error}"
+            readiness_errors = _checkpoint_allgather(
+                comm,
+                local_error,
+                operation="two-sided frontend readiness",
+            )
+            failed_ranks = [
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(readiness_errors)
+                if error is not None
+            ]
+            if failed_ranks:
+                raise RuntimeError(
+                    "Native two-sided MoE restore failed on one or more ranks:\n"
+                    + "\n".join(failed_ranks)
+                )
+        except Exception:
+            for workspace in restored_workspaces:
+                workspace._checkpoint_restore_failed()
+            raise
+        for workspace in restored_workspaces:
+            workspace._checkpoint_restore_complete()
+
+    @staticmethod
+    def require_mapped() -> None:
+        """Reject kernel access while either native MoE workspace is detached."""
+        for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace):
+            if workspace is not None and not workspace.mapped:
+                raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
 
     @staticmethod
     def compute_target_rank_id(

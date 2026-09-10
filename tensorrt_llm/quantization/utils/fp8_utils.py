@@ -150,6 +150,44 @@ def resmooth_to_fp8_e8m0(
     return weight, weight_scale
 
 
+def transform_k128_scales_to_cutedsl_mxfp8_layout(
+    weight_scale: torch.Tensor,
+    mn: int,
+    k: int,
+) -> torch.Tensor:
+    """Convert K128 block scales to CuTe DSL's K32 R128c4 MXFP8 layout.
+
+    The source tensor has one FP32 UE8M0-compatible scale per 128x128 weight
+    block.  The CuTe DSL MXFP8 GEMM consumes one UE8M0 byte per 1x32 block in
+    the standard R128c4 layout.  Preserve the original K128 quantization by
+    replicating every source scale into its four corresponding K32 slots.
+
+    Args:
+        weight_scale: float32 tensor of shape (ceil_div(mn, 128), k // 128).
+        mn: Number of weight rows (the MN extent); k must be a multiple of 128.
+        k: Weight K extent.
+
+    Returns:
+        uint8 tensor holding pad_up(mn, 128) * (k // 32) UE8M0 scales in R128c4 layout.
+    """
+    if weight_scale.dtype != torch.float32 or weight_scale.dim() != 2:
+        raise ValueError(
+            "weight_scale must be a 2D float32 K128 block-scale tensor")
+    if k % 128 != 0:
+        raise ValueError(f"K={k} must be divisible by 128")
+
+    expected_shape = (ceil_div(mn, 128), k // 128)
+    if tuple(weight_scale.shape) != expected_shape:
+        raise ValueError(f"weight_scale shape must be {expected_shape}, got "
+                         f"{tuple(weight_scale.shape)}")
+
+    per_row_scale = weight_scale.repeat_interleave(128, dim=0)[:mn]
+    ue8m0_scale = (per_row_scale.contiguous().view(torch.int32) >> 23).to(
+        torch.uint8)
+    k32_scale = ue8m0_scale.repeat_interleave(4, dim=1)
+    return torch.ops.trtllm.block_scale_interleave(k32_scale.contiguous())
+
+
 def get_m_alignment_for_contiguous_layout():
     return 128
 
@@ -369,6 +407,8 @@ def _silu_and_mul_post_quant_kernel(
     BLOCK: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -408,6 +448,15 @@ def _silu_and_mul_post_quant_kernel(
                 mask=local_mask < size_k,
                 other=0.0,
             ).to(tl.float32)
+            if HAS_SWIGLU_LIMIT:
+                # gate is fp32; clamp directly. up is in input dtype (bf16/fp16);
+                # cast the limit constant to that dtype to avoid a fp32 round-trip
+                # on every element.
+                gate = tl.minimum(gate, SWIGLU_LIMIT)
+                limit_native = tl.cast(SWIGLU_LIMIT, input_ptr.dtype.element_ty)
+                neg_limit_native = tl.cast(-SWIGLU_LIMIT,
+                                           input_ptr.dtype.element_ty)
+                up = tl.maximum(tl.minimum(up, limit_native), neg_limit_native)
             gate = gate / (1 + tl.exp(-gate))
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
@@ -438,6 +487,7 @@ def silu_and_mul_masked_post_quant_fwd(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     """
     input shape [g, m, k]
@@ -445,6 +495,11 @@ def silu_and_mul_masked_post_quant_fwd(
     output_scale [g, k // 4, m // 2 // 128], dtype int32
     quant_group_size int
     masked_m shape [g]
+    swiglu_limit optional Python float (uniform across experts); when provided,
+        the gate input is clamped to (-inf, limit] before silu and the up
+        branch is clamped to [-limit, limit] before the multiply. Baked into
+        the kernel as a constexpr — caller supplies a host-side float, no
+        per-expert tensor / global load.
     """
 
     assert input.is_contiguous()
@@ -477,6 +532,10 @@ def silu_and_mul_masked_post_quant_fwd(
         BLOCK_NUM_PER_EXPERT,
         expert_num,
     )
+    # Gate on > 0 (matching torch.ops.trtllm.silu_and_mul) so a 0.0/negative
+    # limit is a no-op clamp rather than collapsing all activations to 0.
+    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0.0
+    swiglu_limit_value = float(swiglu_limit) if has_swiglu_limit else 0.0
     _silu_and_mul_post_quant_kernel[grid](
         input,
         *input.stride(),
@@ -492,6 +551,8 @@ def silu_and_mul_masked_post_quant_fwd(
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        SWIGLU_LIMIT=swiglu_limit_value,
     )
     output_scale = output_scale.transpose(1, 2)[:, :m, :]
     check_sf_layout(

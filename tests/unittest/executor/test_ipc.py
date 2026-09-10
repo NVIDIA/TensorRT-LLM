@@ -7,6 +7,8 @@ import zmq
 
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
+pytestmark = pytest.mark.cpu_only
+
 
 class TestIpcBasics:
     """Test basic synchronous IPC operations."""
@@ -287,6 +289,25 @@ class TestIpcBasics:
             assert received == test_data
         finally:
             client.close()
+            server.close()
+
+    def test_put_nowait_raises_without_peer(self):
+        """A nonblocking PUSH send reports a missing peer immediately."""
+        server = ZeroMqQueue(
+            address=None,
+            socket_type=zmq.PUSH,
+            is_server=True,
+            is_async=False,
+            name="test_nowait_server",
+            use_hmac_encryption=True,
+        )
+
+        try:
+            start_time = time.monotonic()
+            with pytest.raises(zmq.Again):
+                server.put_nowait({"message": "no peer"})
+            assert time.monotonic() - start_time < 1.0
+        finally:
             server.close()
 
 

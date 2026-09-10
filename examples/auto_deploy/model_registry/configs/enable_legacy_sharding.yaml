@@ -1,0 +1,19 @@
+# Force the legacy heuristic sharding pipeline (detect_sharding +
+# sharding_transform_executor), bypassing the sharding-IR auto-detector.
+#
+# The AutoDeploy default in tensorrt_llm/_torch/auto_deploy/config/default.yaml
+# enables apply_sharding_hints, which auto-detects sharding-IR markers in the
+# exported FX graph (presence of torch.ops.auto_deploy.all_reduce nodes) and
+# falls back to the legacy pipeline when none are present. Use this override
+# only when you need to FORCE legacy on a model whose modeling file does have
+# IR markers (for example, when the IR port has a known bug and you need a
+# quick rollback while it's being fixed).
+#
+# Use via yaml_extra in models.yaml or --yaml-extra on the command line.
+transforms:
+  apply_sharding_hints:
+    enabled: false
+  detect_sharding:
+    enabled: true
+  sharding_transform_executor:
+    enabled: true

@@ -1,0 +1,21 @@
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+max_batch_size: 32
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+moe_config:
+  # TRTLLM chunking bound. Kimi's MegaMoE path privately raises this to
+  # max_num_tokens * dp_size for per-rank SymmBuffer capacity.
+  max_num_tokens: 33024
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

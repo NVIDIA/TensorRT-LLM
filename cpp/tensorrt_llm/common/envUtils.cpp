@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -259,6 +260,12 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvEnableCascadeMmha()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
+    return enable;
+}
+
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
 {
     static std::once_flag flag;
@@ -266,6 +273,20 @@ bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
 
     std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL"); });
     return enabled;
+}
+
+static std::atomic<bool> gFineGrainedSyncDisabledOverride{false};
+
+void setFineGrainedSyncDisabledOverride(bool disabled)
+{
+    gFineGrainedSyncDisabledOverride.store(disabled, std::memory_order_relaxed);
+}
+
+bool getEnvUseFineGrainedSync()
+{
+    // Deliberately uncached: tests flip the env var between cases within one process.
+    return !gFineGrainedSyncDisabledOverride.load(std::memory_order_relaxed)
+        && getBoolEnv("TLLM_USE_FINE_GRAINED_SYNC");
 }
 
 bool getEnvUseUCXKvCache()
@@ -395,6 +416,12 @@ bool getEnvTryZCopyForKVCacheTransfer()
     return zcopyForSysmmetricKVCache;
 }
 
+bool getEnvDisaggEnableInflightCancel()
+{
+    static bool const enabled = getBoolEnv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL");
+    return enabled;
+}
+
 bool getEnvForceDeterministic()
 {
     static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");
@@ -493,16 +520,16 @@ bool getEnvKVCacheTransferAllBlocksForWindow()
     return allBlocksForWindow;
 }
 
-uint16_t getEnvNixlPort()
+bool getEnvKVCachePoolUseFabricMemory()
 {
-    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
-    return nixlPort;
+    static bool const useFabricMemory = getBoolEnv("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY");
+    return useFabricMemory;
 }
 
-bool getEnvNixlEnableCoalesce()
+bool getEnvNixlDisableCoalesce()
 {
-    static bool const enableCoalesce = getBoolEnv("TRTLLM_NIXL_ENABLE_COALESCE");
-    return enableCoalesce;
+    static bool const disableCoalesce = getBoolEnv("TRTLLM_NIXL_DISABLE_COALESCE");
+    return disableCoalesce;
 }
 
 bool getEnvDisaggBenchmarkGenOnly()

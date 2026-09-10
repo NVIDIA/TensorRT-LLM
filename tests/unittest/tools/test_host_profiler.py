@@ -29,7 +29,6 @@ import tempfile
 import pytest
 
 # Add path for test utilities
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
@@ -80,6 +79,7 @@ def _patch_mpi_pool_session_for_env(mocker, env_vars: dict):
     mocker.patch.object(MpiPoolSession, "_start_mpi_pool", patched_start_mpi_pool)
 
 
+@pytest.mark.cpu_only
 def test_add_and_clear_targets():
     """Test add_*, clear_targets(), and chaining work correctly."""
     profiler = HostProfiler(use_defaults=False)
@@ -105,6 +105,7 @@ def test_add_and_clear_targets():
     assert len(profiler.targets) == 1
 
 
+@pytest.mark.cpu_only
 def test_defaults_and_clear():
     """Test that defaults are loaded and can be cleared."""
     profiler = HostProfiler(use_defaults=True)
@@ -121,6 +122,7 @@ def test_defaults_and_clear():
     assert "os.path.join" in profiler.list_targets()
 
 
+@pytest.mark.cpu_only
 def test_profiling_cycle_and_report_validation():
     """Test complete profiling cycle and validate report format.
 
@@ -208,6 +210,7 @@ def test_profiling_cycle_and_report_validation():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_env_functions_replaces_defaults():
     """Test TLLM_LINE_PROFILER_FUNCTIONS replaces default targets.
 
@@ -251,6 +254,7 @@ def test_env_functions_replaces_defaults():
             os.unlink(output_path)
 
 
+@pytest.mark.cpu_only
 def test_iteration_aware_profiling():
     """Test iteration-aware profiling using TLLM_PROFILE_START_STOP.
 
@@ -282,7 +286,7 @@ def test_iteration_aware_profiling():
 
             for i in range(20):
                 profiler.notify_iteration(i)
-                _sample_function_to_profile(10)
+                _sample_function_to_profile(0)
 
             assert profiler.stop() is True
 
@@ -291,10 +295,15 @@ def test_iteration_aware_profiling():
 
         assert "Timer unit:" in range_content
         assert "_sample_function_to_profile" in range_content
-        range_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", range_content, re.MULTILINE)
-        range_max = max(int(h) for h in range_hits if int(h) > 0)
-        assert range_max <= 6, (
-            f"Expected hits ~5 (iterations 5-9), got max {range_max}. "
+        # Count function-call invocations via lines that fire exactly once per call
+        # (e.g. `total = 0`, `return total`). max() picks up the inner-loop body
+        # (~n hits per call) and conflates body iterations with call counts.
+        range_hits = [
+            int(h) for h in re.findall(r"^\s+\d+\s+(\d+)\s+", range_content, re.MULTILINE)
+        ]
+        range_min = min(h for h in range_hits if h > 0)
+        assert range_min == 5, (
+            f"Expected hits from 5 profiled calls, got min once-per-call hits {range_min}. "
             "Iteration filtering may not be working."
         )
 
@@ -312,7 +321,7 @@ def test_iteration_aware_profiling():
             # notify_iteration is a no-op when not iteration-aware
             for i in range(20):
                 profiler.notify_iteration(i)
-                _sample_function_to_profile(10)
+                _sample_function_to_profile(0)
 
             assert profiler.stop() is True
 
@@ -320,12 +329,12 @@ def test_iteration_aware_profiling():
             full_content = f.read()
 
         assert "_sample_function_to_profile" in full_content
-        full_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", full_content, re.MULTILINE)
-        full_max = max(int(h) for h in full_hits if int(h) > 0)
-        assert full_max >= 20, f"Expected hits >= 20 (all iterations), got {full_max}"
+        full_hits = [int(h) for h in re.findall(r"^\s+\d+\s+(\d+)\s+", full_content, re.MULTILINE)]
+        full_min = min(h for h in full_hits if h > 0)
+        assert full_min == 20, f"Expected 20 calls (all iterations), got {full_min}"
 
-        # Sanity: iteration-ranged hits should be much less than full
-        assert range_max < full_max
+        # Sanity: iteration-ranged call count should be much less than full
+        assert range_min < full_min
     finally:
         for p in (range_output, full_output):
             if os.path.exists(p):

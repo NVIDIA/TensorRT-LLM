@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -42,6 +45,11 @@ ACCURACY_CONFIG = {
     'default': (2e-2, 5e-2),
     'gemma3': (5e-1, 5e-1),
 }
+
+# Mirror the engine's ``encoder_max_num_tokens`` runtime budget. The encoder
+# ``AttentionMetadata`` is sized once at load to this maximum; each forward
+# re-preps it with the real per-image sequence lengths.
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
 @dataclass(repr=False)
@@ -108,6 +116,9 @@ class TestSiglipVisionModel(unittest.TestCase):
 
         tllm_model = SiglipVisionModel(
             model_config, use_post_layernorm=True).to(dtype).to(device)
+        # Engine normally calls this after model load; standalone tests must do it themselves.
+        tllm_model.setup_attn_metadata(
+            max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
         tllm_model.load_weights(hf_model.state_dict())
 
         # Prepare inputs - create random pixel values for images

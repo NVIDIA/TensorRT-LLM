@@ -7,9 +7,9 @@ import pytest
 import torch
 from utils.util import skip_blackwell
 
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
 
 def generate_attn_scenarios(num_q_heads_kv_heads: List[Tuple[int, int]],
@@ -176,7 +176,6 @@ scenarios = generate_attn_scenarios(num_q_heads_kv_heads, head_dim, num_layers,
 
 # skip for blackwell
 @skip_blackwell
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5247232")
 # Convert parameterized tests to pytest parametrize
 @pytest.mark.parametrize("accuracy", [(1e-2, 1e-2)],
                          ids=lambda x: f"atol={x[0]} rtol={x[1]}")

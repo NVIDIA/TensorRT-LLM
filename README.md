@@ -8,9 +8,9 @@ TensorRT LLM
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/NVIDIA/TensorRT-LLM)
 [![python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/downloads/release/python-3123/)
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
-[![cuda](https://img.shields.io/badge/cuda-13.1.1-green)](https://developer.nvidia.com/cuda-downloads)
-[![torch](https://img.shields.io/badge/torch-2.10.0-green)](https://pytorch.org)
-[![version](https://img.shields.io/badge/release-1.3.0rc20-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
+[![cuda](https://img.shields.io/badge/cuda-13.2.1-green)](https://developer.nvidia.com/cuda-downloads)
+[![torch](https://img.shields.io/badge/torch-2.12.0-green)](https://pytorch.org)
+[![version](https://img.shields.io/badge/release-1.3.0rc26-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/LICENSE)
 
 [Architecture](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](https://nvidia.github.io/TensorRT-LLM/developer-guide/perf-overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://nvidia.github.io/TensorRT-LLM/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap)
@@ -21,6 +21,18 @@ TensorRT LLM
 ## Tech Blogs
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
+
+* [09/02] Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.md)
+
+* [08/20] Evaluating Agentic Serving with Trace Replay and Job-Level Metrics
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.md)
+
+* [07/17] DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md)
+
+* [07/01] Scaling Video Generation Across NVL72 Rack with TensorRT-LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md)
 
 * [05/15] Joint Optimization of Agent Applications and TensorRT-LLM
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.md)
@@ -306,12 +318,16 @@ deployment, and not linked to users. The data we collect includes:
 - Ingress point (e.g., LLM API, CLI, serve command)
 - Deployment duration (via periodic heartbeats)
 - GPU SKUs, count, memory, and CUDA version
-- Model architecture class name (e.g., `LlamaForCausalLM`)
+- Public model architecture class name (e.g., `LlamaForCausalLM`); architectures
+  outside the checked-in public allowlist are sent only as a deterministic
+  SHA-256 hash, never as the original free-form name
 - Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
 - System information (OS platform, Python version, CPU architecture, CPU count)
 - TRT-LLM version and backend
 - Feature summary flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
 - Disaggregated serving metadata (role and deployment ID)
+- Process-local LLM lifecycle counts (initialization attempts, successful and active instances, peak concurrency, and initialization failures)
+- Bounded terminal status for instrumented processes (known exit code or signal, termination category, lifecycle phase, component, and reporting source)
 - Selected LLM API configuration values: parallelism, dtype, KV cache, scheduler, CUDA graph, and compile settings
 - Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
 
@@ -325,6 +341,13 @@ To disable telemetry data collection, use any of the following methods:
 - **File-based**: Create the file `~/.config/trtllm/do_not_track`
 - **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`
 - **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
+
+CLI terminal telemetry may report that an argument or YAML configuration was
+invalid. The terminal event records only categorical termination and lifecycle
+metadata, never the raw argument or YAML text. Other telemetry events collect
+the selected, sanitized configuration fields listed above. The
+environment-variable, file-based, and CLI-flag opt-outs are all applied before
+CLI and YAML validation.
 
 The telemetry collection code is fully open source and auditable at
 [`tensorrt_llm/usage/`](./tensorrt_llm/usage/). For a detailed field-by-field

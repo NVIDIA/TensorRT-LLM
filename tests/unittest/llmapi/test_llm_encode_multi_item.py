@@ -20,9 +20,9 @@ import torch
 from transformers import AutoTokenizer
 from utils.util import assert_no_cuda_sync
 
-import tensorrt_llm._torch.attention_backend.flashinfer as trtllm_flashinfer
+import tensorrt_llm._torch.attention.backends.flashinfer as trtllm_flashinfer
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.attention_backend import AttentionMetadata
+from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3Model
 from tensorrt_llm._torch.speculative import SpecMetadata
@@ -405,7 +405,7 @@ def test_unsupported_attention_backend(
         llm,
         pytest.raises(
             ValueError,
-            match=".*Attention does not support multi-item scoring.*",
+            match=".*The selected attention backend does not support multi-item scoring.*",
         ),
     ):
         llm.encode(prompt_inputs, batch_indexed_model_output=False)

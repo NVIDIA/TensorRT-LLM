@@ -66,13 +66,13 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ParameterUpdateInfo,
     ShardingTransformConfig,
     ShardingTransformContainer,
-    _load_hook,
-    _split_tensor_for_tp,
 )
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import (
     _fp8_block_scale_pipeline_cache_spec,
+    _load_hook,
     _shard_scale_and_hook,
     _split_fp8_block_scale,
+    _split_tensor_for_tp,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.common import hash_payload
@@ -95,6 +95,9 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
     is_linear_op,
 )
 from tensorrt_llm._torch.auto_deploy.utils.pipeline_cache_hooks import mark_pipeline_cache_hook
+
+pytestmark = pytest.mark.cpu_only
+
 
 _COUNTERS = {
     "build": 0,

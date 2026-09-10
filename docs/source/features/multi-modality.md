@@ -26,15 +26,29 @@ Further optimizations are under development and will be updated as they become a
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).
 
+## Optional dependencies
+
+Video input decoding uses OpenCV (`cv2`) and is not installed by default. Install it only for models with video inputs:
+
+```bash
+pip install opencv-python-headless
+```
+
+Image-only and text-only workflows do not require this package.
+
 ## Examples
 
 The following examples demonstrate how to use TensorRT LLM's multimodal support in various scenarios, including quick run examples, serving endpoints, and performance benchmarking.
 
 ### Quick start
 
-Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py):
+Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py). The script imports helpers from its sibling file [`quickstart_advanced.py`](source:examples/llm-api/quickstart_advanced.py), so run it from a checkout of the `examples/llm-api/` directory rather than as a single downloaded file:
 
 ```bash
+# Get the examples directory first; quickstart_multimodal.py imports from
+# quickstart_advanced.py next to it.
+git clone --depth 1 https://github.com/NVIDIA/TensorRT-LLM.git
+cd TensorRT-LLM/examples/llm-api
 python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image --disable_kv_cache_reuse
 ```
 

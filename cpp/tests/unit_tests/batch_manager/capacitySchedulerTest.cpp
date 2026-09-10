@@ -20,21 +20,23 @@
 
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/disaggTransferAdmissionController.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
-#include <NvInferPlugin.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
@@ -110,6 +112,28 @@ private:
     SizeType32 mMaxHostPages;
 };
 
+/// @brief Peft mock whose page demand varies per request id.
+/// @details PeftCacheManager::determineNumPages resolves the LoRA task id against the host cache and
+/// falls back to the request's own LoraConfig, so two requests carrying the same task id can report
+/// different page counts.
+class PerRequestMockPeftCacheManager : public MockPeftCacheManager
+{
+public:
+    PerRequestMockPeftCacheManager(std::map<uint64_t, SizeType32> pagesByRequestId, SizeType32 maxDevicePages)
+        : MockPeftCacheManager(0, maxDevicePages)
+        , mPagesByRequestId(std::move(pagesByRequestId))
+    {
+    }
+
+    [[nodiscard]] SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const override
+    {
+        return mPagesByRequestId.at(llmRequest->mRequestId);
+    }
+
+private:
+    std::map<uint64_t, SizeType32> mPagesByRequestId;
+};
+
 class CapacitySchedulerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
 
@@ -131,7 +155,7 @@ protected:
         auto const nbKvHeads = 10;
         auto constexpr sizePerHead = 1;
         auto const maxNumBlocks = tc::divUp(maxNumTokens, tokensPerBlock);
-        auto const kvDtype = nvinfer1::DataType::kHALF;
+        auto const kvDtype = tensorrt_llm::DataType::kHALF;
         CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -153,7 +177,7 @@ protected:
         tensorrt_llm::executor::PriorityType priority = tensorrt_llm::executor::Request::kDefaultPriority,
         LlmRequestState state = LlmRequestState::kCONTEXT_INIT)
     {
-        tensorrt_llm::runtime::SamplingConfig samplingConfig;
+        tensorrt_llm::executor::SamplingConfig samplingConfig;
         uint64_t reqId = optionalReqId.value_or((rand() % INT64_MAX) + 1);
         auto req = std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig, false);
         req->setPriority(priority);
@@ -362,7 +386,7 @@ int runTest(CapacityScheduler& capacityScheduler,
             if (llmReq->isDisaggGenerationInitState())
             {
                 kvCacheManager->addSequenceBatch(
-                    {{{llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth}}},
+                    {{{llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.getBeamWidth()}}},
                     {std::ref(*llmReq)});
                 llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
                 llmReq->setContextCurrentPosition(llmReq->mPromptLen);
@@ -387,11 +411,12 @@ int runTest(CapacityScheduler& capacityScheduler,
                 {
                     // We need to perform initialization work for the first context chunk.
                     kvCacheManager->addSequenceBatch(
-                        {{{llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth}}}, {std::ref(*llmReq)});
+                        {{{llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.getBeamWidth()}}},
+                        {std::ref(*llmReq)});
                     if (crossKvCacheManager)
                     {
-                        crossKvCacheManager->addSequenceBatch(
-                            {{{llmReq->mRequestId, llmReq->getEncoderOutputLen(), llmReq->mSamplingConfig.beamWidth}}},
+                        crossKvCacheManager->addSequenceBatch({{{llmReq->mRequestId, llmReq->getEncoderOutputLen(),
+                                                                  llmReq->mSamplingConfig.getBeamWidth()}}},
                             {std::ref(*llmReq)});
                     }
                 }
@@ -803,6 +828,129 @@ TEST_F(CapacitySchedulerTest, DisaggGenInitMaxUtilization)
 
     int expectedNumIters = (sinkTokenLen == 0) ? 119 : 125;
     EXPECT_EQ(numIterations, expectedNumIters);
+}
+
+TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
+{
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 90;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager
+            = getKvCacheManager(2, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq);
+        auto peftCacheManager = getPeftCacheManager();
+
+        int32_t maxNewTokens = 40;
+        int32_t promptLen = 10;
+        auto transferReq = createRequest(promptLen, maxNewTokens, 0, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+        auto pendingReq = createRequest(promptLen, maxNewTokens, 1, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
+        kvCacheManager->addSequenceBatch(
+            {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.getBeamWidth()}}},
+            {std::ref(*transferReq)});
+
+        RequestList saturatedActiveRequests{transferReq, pendingReq};
+        auto saturatedScheduler = CapacityScheduler(1, capacitySchedulerPolicy, kvCacheManager != nullptr);
+        auto [saturatedRequests, saturatedDisaggGenInitRequests, saturatedPausedRequests]
+            = saturatedScheduler(saturatedActiveRequests, kvCacheManager, peftCacheManager);
+        EXPECT_TRUE(saturatedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(saturatedDisaggGenInitRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(saturatedPausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+
+        RequestList activeRequestsWithCapacity{transferReq, pendingReq};
+        auto schedulerWithCapacity = CapacityScheduler(2, capacitySchedulerPolicy, kvCacheManager != nullptr);
+        auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+            = schedulerWithCapacity(activeRequestsWithCapacity, kvCacheManager, peftCacheManager);
+        EXPECT_TRUE(fittingRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1u) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId)
+            << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+    }
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionDisabledPreservesCandidates)
+{
+    auto req0 = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto req1 = createRequest(20, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(std::nullopt, 10);
+    auto result = controller.select(RequestList{}, RequestVector{req0, req1});
+
+    EXPECT_FALSE(controller.enabled());
+    ASSERT_EQ(result.admittedRequests.size(), 2u);
+    EXPECT_EQ(result.admittedRequests.at(0)->mRequestId, req0->mRequestId);
+    EXPECT_EQ(result.admittedRequests.at(1)->mRequestId, req1->mRequestId);
+    EXPECT_EQ(result.deferredRequestCount, 0u);
+    EXPECT_FALSE(result.limitedByBudget);
+    EXPECT_FALSE(result.isBlockedByActiveTransfers());
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionUsesFcfsEstimatedBlockBudget)
+{
+    auto activeTransferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto req1 = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto req2 = createRequest(20, 40, 2, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto req3 = createRequest(10, 40, 3, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(/*maxTokensInBuffer=*/30, /*tokensPerBlock=*/10);
+    auto result = controller.select(RequestList{activeTransferReq}, RequestVector{req1, req2, req3});
+
+    ASSERT_EQ(result.admittedRequests.size(), 1u);
+    EXPECT_EQ(result.admittedRequests.front()->mRequestId, req1->mRequestId);
+    EXPECT_EQ(result.activeTransferBlocks, 1u);
+    EXPECT_EQ(result.admittedTransferBlocks, 1u);
+    EXPECT_EQ(result.deferredRequestCount, 2u);
+    EXPECT_TRUE(result.limitedByBudget);
+    EXPECT_FALSE(result.isBlockedByActiveTransfers());
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionReportsActiveTransferBudgetBlock)
+{
+    auto activeTransferReq = createRequest(20, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(/*maxTokensInBuffer=*/20, /*tokensPerBlock=*/10);
+    auto result = controller.select(RequestList{activeTransferReq}, RequestVector{pendingReq});
+
+    EXPECT_TRUE(result.admittedRequests.empty());
+    EXPECT_EQ(result.activeTransferBlocks, 2u);
+    EXPECT_EQ(result.admittedTransferBlocks, 0u);
+    EXPECT_EQ(result.deferredRequestCount, 1u);
+    EXPECT_TRUE(result.limitedByBudget);
+    EXPECT_TRUE(result.isBlockedByActiveTransfers());
+}
+
+TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionAdmitsOversizedHeadWhenIdle)
+{
+    auto oversizedReq = createRequest(30, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto laterReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+
+    DisaggTransferAdmissionController controller(/*maxTokensInBuffer=*/10, /*tokensPerBlock=*/10);
+    auto result = controller.select(RequestList{}, RequestVector{oversizedReq, laterReq});
+
+    ASSERT_EQ(result.admittedRequests.size(), 1u);
+    EXPECT_EQ(result.admittedRequests.front()->mRequestId, oversizedReq->mRequestId);
+    EXPECT_EQ(result.activeTransferBlocks, 0u);
+    EXPECT_EQ(result.admittedTransferBlocks, 3u);
+    EXPECT_EQ(result.deferredRequestCount, 1u);
+    EXPECT_TRUE(result.limitedByBudget);
+    EXPECT_FALSE(result.isBlockedByActiveTransfers());
 }
 
 TEST_F(CapacitySchedulerTest, RequestsSortedByPriorities)
@@ -1696,6 +1844,158 @@ TEST_F(CapacitySchedulerTest, DelayDuplicateRequest)
             EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), promptLen / kvCacheTokensPerBlock * 2);
         }
     }
+}
+
+TEST_F(CapacitySchedulerTest, PrefixAwareSchedulingDisabledDoesNotDelayDuplicateRequest)
+{
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    bool enableReuse = true;
+    bool enablePrefixAwareScheduling = false;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kMAX_UTILIZATION, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens,
+            kvCacheMaxNumTokensPerSeq, /*sinkTokenLength=*/0, /*enableReuse=*/enableReuse);
+        auto peftCacheManager = getPeftCacheManager();
+        auto capacityScheduler = CapacityScheduler(maxNumRequests, capacitySchedulerPolicy, kvCacheManager != nullptr,
+            /*twoStepsLookAhead=*/false, /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+            /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE,
+            /*enablePrefixAwareScheduling=*/enablePrefixAwareScheduling);
+
+        int32_t maxNewTokens = 2;
+        int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+
+        auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 1);
+        std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+        RequestList activeRequests;
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 0, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 1, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 2, 1234));
+
+        auto [scheduled, disaggInit, paused] = capacityScheduler(activeRequests, *kvCacheManager, peftCacheManager);
+
+        EXPECT_EQ(scheduled.size(), 3u);
+        EXPECT_TRUE(disaggInit.empty());
+        EXPECT_TRUE(paused.empty());
+        for (auto const& req : activeRequests)
+        {
+            EXPECT_EQ(req->getEstimatedReusableTokens(), 0);
+        }
+    }
+}
+
+// A request must never be deferred on behalf of a contributor that was not scheduled in the same
+// iteration. beneficialToSkip used to register the checked request's own firstNewBlock before any
+// budget check had run, so a contribution could be recorded for a request that never got admitted.
+
+TEST_F(CapacitySchedulerTest, MaxUtilizationPauseRetryDoesNotSelfSkip)
+{
+    // On a failed admission MaxUtilization pauses a started request and retries the *same* request
+    // without advancing reqIt. If the first attempt already registered that request's firstNewBlock,
+    // the retry finds its own key in the set and skips itself -- evicting a running request for
+    // nobody and wasting the capacity the pause just freed.
+    //
+    // Block budget, chosen so that *both* assertions below discriminate:
+    //   pool                        7 blocks
+    //   requestG holds              5 blocks (45-token prompt)  -> 2 free on entry
+    //   requestA / requestB need    3 blocks each (21-token prompt)
+    // A's first attempt fails (3 > 2) and forces the pause; after it, 7 blocks are free, so A fits
+    // (3) and B would fit too (3 + 3 = 6 <= 7). B is therefore absent from `scheduled` only because
+    // it deferred to A's contribution -- not because it ran out of blocks.
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokens = 70; // 7 blocks
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens,
+        kvCacheMaxNumTokensPerSeq, /*sinkTokenLength=*/0, enableReuse);
+    auto peftCacheManager = getPeftCacheManager();
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+
+    // requestA and requestB are duplicates: same tokens, so the same firstNewBlock.
+    int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+    auto sharedTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(sharedTokens->begin(), sharedTokens->end(), 0);
+    auto requestA = createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/0);
+    auto requestB = createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/1);
+
+    // requestG is started and holds real blocks. It is the only eviction victim the reverse search
+    // over [reqIt, reqItEnd) can find, so it must sit *after* A and B in the active list.
+    // 45 tokens -> 5 blocks, leaving 2 of the 7 free: not enough for A's 3.
+    int32_t genPromptLen = 45;
+    auto genTokens = std::make_shared<std::vector<int32_t>>(genPromptLen);
+    std::iota(genTokens->begin(), genTokens->end(), 1000); // distinct prefix: not a duplicate of A/B
+    auto requestG = createRequest(genTokens, /*maxNewTokens=*/5, /*optionalReqId=*/2);
+    kvCacheManager->addSequenceBatch(
+        {{{requestG->mRequestId, requestG->mPromptLen, requestG->mSamplingConfig.getBeamWidth()}}},
+        {std::ref(*requestG)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*requestG);
+    requestG->addNewTokens({7});
+    requestG->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+
+    RequestList activeRequests;
+    activeRequests.push_back(requestA);
+    activeRequests.push_back(requestB);
+    activeRequests.push_back(requestG);
+
+    auto [scheduled, disaggInit, paused] = capacityScheduler(activeRequests, *kvCacheManager, peftCacheManager);
+
+    // requestG is evicted to make room, so requestA must actually be admitted on the retry.
+    // Before the fix: paused == {G}, scheduled == {} -- the pause bought nothing.
+    ASSERT_EQ(paused.size(), 1u);
+    EXPECT_EQ(paused.front()->mRequestId, requestG->mRequestId);
+    ASSERT_EQ(scheduled.size(), 1u);
+    EXPECT_EQ(scheduled.front()->mRequestId, requestA->mRequestId);
+    // requestB correctly defers: it will reuse the blocks requestA is about to contribute. The
+    // post-pause budget leaves room for it (see the block budget above), so its absence here is the
+    // beneficial-to-skip decision and nothing else -- drop the skip check and this becomes {A, B}.
+    EXPECT_TRUE(disaggInit.empty());
+}
+
+TEST_F(CapacitySchedulerTest, GuaranteedNoEvictUnscheduledRequestDoesNotDeferDuplicate)
+{
+    // In GUARANTEED_NO_EVICT a PEFT-page shortage is the one admission failure that neither breaks
+    // the loop nor is caught by the block-shortage branch, so a contribution registered at check
+    // time outlives the request that failed. A later request sharing that block must still be
+    // admitted.
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    bool enableReuse = true;
+
+    auto kvCacheManager = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens,
+        kvCacheMaxNumTokensPerSeq, /*sinkTokenLength=*/0, enableReuse);
+    // Request 0 demands more PEFT pages than are available; request 1 fits.
+    std::shared_ptr<BasePeftCacheManager> peftCacheManager
+        = std::make_shared<PerRequestMockPeftCacheManager>(std::map<uint64_t, SizeType32>{{0, 20}, {1, 5}},
+            /*maxDevicePages=*/10);
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+
+    // Same tokens *and* same LoRA task id, so both requests map to the same BlockKey.
+    int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+    auto sharedTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(sharedTokens->begin(), sharedTokens->end(), 0);
+
+    RequestList activeRequests;
+    activeRequests.push_back(createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/0, /*loraTaskId=*/7));
+    activeRequests.push_back(createRequest(sharedTokens, /*maxNewTokens=*/5, /*optionalReqId=*/1, /*loraTaskId=*/7));
+
+    auto [scheduled, disaggInit, paused] = capacityScheduler(activeRequests, *kvCacheManager, peftCacheManager);
+
+    ASSERT_EQ(scheduled.size(), 1u);
+    EXPECT_EQ(scheduled.front()->mRequestId, 1u);
+    EXPECT_TRUE(disaggInit.empty());
+    EXPECT_TRUE(paused.empty());
 }
 
 TEST_F(CapacitySchedulerTest, DelayDuplicateRequestChunked)

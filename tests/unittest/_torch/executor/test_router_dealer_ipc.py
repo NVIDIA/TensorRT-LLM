@@ -8,6 +8,8 @@ import zmq
 
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
+pytestmark = pytest.mark.cpu_only
+
 
 @contextmanager
 def router_dealer_pair(use_hmac_encryption=True,

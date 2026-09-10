@@ -19,6 +19,10 @@ The materialiser:
 
 * turns the per-rank slot dispatch matrix into a flat list of expert ids,
 * repacks it column-major so each token row spans different destinations,
+* repacks it group-aware instead for grouped routing methods (DeepSeek-V3 style
+  ``noaux_tc``), keeping every token row within ``topk_group`` expert groups so
+  the routing kernel can realise the plan, and falling back to the column-major
+  packing when the requested histogram cannot satisfy that constraint,
 * runs a small repair pass to enforce per-token expert uniqueness,
 * derives uniform top-k scales,
 * observes the realised plan to compute slot / token traffic and per-rank
@@ -27,7 +31,7 @@ The materialiser:
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -55,14 +59,21 @@ def _flatten_plan_slots_for_rank(
     experts_per_rank: int,
     moe_ep_size: int,
 ) -> List[int]:
-    """Flatten one plan row into expert ids while preserving slot counts."""
-    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    """Flatten one plan row into expert ids while preserving slot counts.
+
+    ``local_num_tokens`` is derived from the dispatch-matrix row sum rather
+    than from ``per_rank_num_tokens[src_rank]``.  In MoE-TP + attention-DP
+    layouts (DTP / CUSTOM-DP) the dispatch matrix is EP-axis indexed while
+    ``per_rank_num_tokens`` is world-rank indexed; the row sum is always the
+    correct EP-axis aggregate (``source_tokens[src_rank] * top_k``).
+    """
     row = list(plan.dispatch_matrix[src_rank])
-    if sum(row) != local_num_tokens * top_k:
+    row_sum = sum(row)
+    if top_k > 0 and row_sum % top_k != 0:
         raise ValueError(
-            f"dispatch_matrix row sum ({sum(row)}) must equal local_num_tokens*top_k "
-            f"({local_num_tokens * top_k}) for rank {src_rank}"
+            f"dispatch_matrix row {src_rank} sum ({row_sum}) is not divisible by top_k ({top_k})"
         )
+    local_num_tokens = row_sum // top_k if top_k > 0 else 0
 
     flat: List[int] = []
     for dst in range(moe_ep_size):
@@ -93,6 +104,129 @@ def _pack_slots_column_major(flat: List[int], local_num_tokens: int, top_k: int)
         t_idx = i % local_num_tokens
         out[t_idx][k_idx] = val
     return out
+
+
+def _pack_slots_group_aware(
+    flat: List[int],
+    local_num_tokens: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    num_experts: int,
+) -> Optional[List[List[int]]]:
+    """Pack flat slots so every token row spans at most ``topk_group`` groups.
+
+    Grouped routing methods (DeepSeek-V3 style ``noaux_tc``) score a group by
+    the sum of its top-2 expert scores and then keep only ``topk_group``
+    groups. The high/low logits built by ``_project_router_logits_for_plan``
+    give a group with >=2 selected experts a score of ``2*sigmoid(high)``, a
+    group with exactly one ``sigmoid(high) + sigmoid(low)``, and an unselected
+    group ``2*sigmoid(low)``. Column-major packing spreads a token's ``top_k``
+    slots over every group, so all groups tie on the middle value and the
+    kernel's tie-break decides which ``topk_group`` survive -- collapsing the
+    load onto the lowest-indexed groups (and therefore the lowest-indexed EP
+    ranks) no matter what the plan asked for.
+
+    Packing each token into at most ``topk_group`` groups instead makes the
+    selected groups score strictly above the unselected ones, so the routing
+    kernel reproduces the plan exactly.
+
+    Each token takes the group with the most unused experts left plus the
+    ``topk_group - 1`` emptiest non-empty groups, then draws experts from those
+    round-robin. Pairing the fullest group with the emptiest ones drains
+    stragglers while a group that can still carry the rest is open; picking
+    groups by a rotation fixed up front instead keeps landing on groups that
+    are already empty, and gives up on layouts that are in fact packable --
+    most visibly for small ``local_num_tokens``, where a balanced plan only
+    populates a fraction of the experts. Equally loaded groups are ordered by a
+    per-token rotation, so a balanced plan -- where capacity never decides --
+    still spreads consecutive tokens over different groups.
+
+    ``flat`` is consumed as a multiset, so the realised per-expert slot counts
+    still match ``plan.expert_histogram`` exactly.
+
+    The packing is greedy and does not backtrack, so it returns ``None`` for a
+    histogram it cannot place -- always for a genuinely unsatisfiable one (a
+    hotspot needing more groups per token than ``topk_group``), and in rare
+    cases for one a full search could still place. The caller then falls back
+    to column-major packing, and ``_classify_native_projection`` reports
+    ``status="projected"`` because it inspects the materialised ids, so the
+    fallback is never silent.
+    """
+    if local_num_tokens <= 0 or top_k <= 0 or n_group <= 1:
+        return None
+    if num_experts % n_group != 0:
+        return None
+    experts_per_group = num_experts // n_group
+    # A token cannot need more slots than ``topk_group`` groups can supply
+    # with distinct experts.
+    if top_k > topk_group * experts_per_group:
+        return None
+
+    # Remaining slot count per expert, bucketed by group.
+    pools: List[Dict[int, int]] = [{} for _ in range(n_group)]
+    for eid in flat:
+        g = eid // experts_per_group
+        if g >= n_group:
+            return None
+        pools[g][eid] = pools[g].get(eid, 0) + 1
+
+    out: List[List[int]] = []
+    for t in range(local_num_tokens):
+        live = [g for g in range(n_group) if pools[g]]
+        if not live:
+            return None
+
+        def rotated(g: int, _t: int = t) -> int:
+            return (g - _t) % n_group
+
+        fullest = max(live, key=lambda g: (len(pools[g]), -rotated(g)))
+        others = sorted(
+            (g for g in live if g != fullest), key=lambda g: (len(pools[g]), rotated(g))
+        )
+        chosen = [fullest] + others[: topk_group - 1]
+
+        row: List[int] = []
+        while len(row) < top_k:
+            progressed = False
+            for g in chosen:
+                if len(row) == top_k:
+                    break
+                eid = _take_loaded_expert(pools[g], exclude=set(row))
+                if eid is not None:
+                    row.append(eid)
+                    progressed = True
+            if not progressed:
+                break
+        if len(row) != top_k or len(set(row)) != top_k:
+            return None
+        out.append(row)
+
+    if any(sum(pool.values()) > 0 for pool in pools):
+        # Slots left over means the rows do not reproduce the histogram.
+        return None
+    return out
+
+
+def _take_loaded_expert(pool: Dict[int, int], exclude: Set[int]) -> Optional[int]:
+    """Take the expert with the most remaining slots, skipping ``exclude``.
+
+    Draining the experts with the largest remaining slot count first keeps the
+    per-expert histogram from developing a tail of leftovers that no token can
+    absorb. ``pool`` is mutated in place; ``None`` means nothing usable is left.
+    """
+    best = None
+    for eid, count in pool.items():
+        if eid in exclude:
+            continue
+        if best is None or count > pool[best] or (count == pool[best] and eid < best):
+            best = eid
+    if best is None:
+        return None
+    pool[best] -= 1
+    if pool[best] == 0:
+        del pool[best]
+    return best
 
 
 def _repair_duplicate_experts(out: List[List[int]], top_k: int) -> None:
@@ -160,6 +294,7 @@ def _materialize_selected_experts_for_rank(
     moe_ep_size: int,
     device: torch.device,
     scale_dtype: torch.dtype,
+    group_constraint: Optional[Tuple[int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Materialise ``[local_num_tokens, top_k]`` expert ids + uniform scales.
 
@@ -173,16 +308,42 @@ def _materialize_selected_experts_for_rank(
          per-token expert ids stay distinct in practice.
       4. Run a small repair pass that swaps duplicated expert ids between
          rows until each token has ``top_k`` distinct experts.
+
+    ``group_constraint`` is ``(n_group, topk_group)`` for routing methods that
+    enforce DeepSeek-V3 style expert grouping. When set, step 3 is replaced by
+    :func:`_pack_slots_group_aware`, which keeps each token inside at most
+    ``topk_group`` groups so the routing kernel can realise the plan exactly
+    (see that function for why column-major packing cannot). The group-aware
+    packer falls back to the column-major path when the requested histogram
+    cannot satisfy the constraint.
     """
-    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    # Derive the effective token count from the dispatch-matrix row sum so that
+    # MoE-TP + attention-DP layouts (DTP / CUSTOM-DP) are handled correctly.
+    # In those layouts the row sum equals the aggregated source tokens for the
+    # EP rank, while per_rank_num_tokens[src_rank] would only reflect one DP
+    # shard's contribution.
+    row_sum = sum(plan.dispatch_matrix[src_rank])
+    local_num_tokens = row_sum // max(top_k, 1)
     if local_num_tokens == 0:
         ids = torch.zeros((0, top_k), dtype=torch.int32, device=device)
         scales = torch.zeros((0, top_k), dtype=scale_dtype, device=device)
         return ids, scales
 
     flat = _flatten_plan_slots_for_rank(plan, src_rank, top_k, experts_per_rank, moe_ep_size)
-    out = _pack_slots_column_major(flat, local_num_tokens, top_k)
-    _repair_duplicate_experts(out, top_k)
+    out = None
+    if group_constraint is not None:
+        n_group, topk_group = group_constraint
+        out = _pack_slots_group_aware(
+            list(flat),
+            local_num_tokens,
+            top_k,
+            int(n_group),
+            int(topk_group),
+            num_experts=int(experts_per_rank) * int(moe_ep_size),
+        )
+    if out is None:
+        out = _pack_slots_column_major(flat, local_num_tokens, top_k)
+        _repair_duplicate_experts(out, top_k)
 
     ids = torch.tensor(out, dtype=torch.int32, device=device)
     scales = _make_uniform_topk_scales(local_num_tokens, top_k, device=device, dtype=scale_dtype)

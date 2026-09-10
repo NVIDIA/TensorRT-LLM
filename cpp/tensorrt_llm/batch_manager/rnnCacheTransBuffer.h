@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/baseTransBuffer.h"
-#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -43,11 +42,6 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using CacheState = executor::kv_cache::CacheState;
 
-    /// @brief Constructor for slot-based path (CppMambaCacheManager with RnnStateManager).
-    /// @param rnnStateManager Pointer to the RNN state manager.
-    /// @param maxNumTokens Optional maximum number of tokens for buffer sizing.
-    RnnCacheTransBufferManager(RnnStateManager* rnnStateManager, std::optional<size_t> maxNumTokens = std::nullopt);
-
     /// @brief Constructor for unified pool path (CppMambaHybridCacheManager).
     /// Computes buffer sizes from the KV cache manager's recurrent state pool metadata.
     /// @param kvCacheManager Pointer to the KV cache manager with unified pool.
@@ -63,26 +57,15 @@ public:
     static size_t preAllocBufferSize(
         size_t rnnStateSizeBytes, std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig);
 
-    /// @brief Get the RNN state manager.
-    [[nodiscard]] RnnStateManager* getRnnStateManager() const noexcept
-    {
-        return mRnnStateManager;
-    }
-
     [[nodiscard]] BufferKind getBufferKind() const override
     {
         return BufferKind::kRNN;
     }
 
 private:
-    /// @brief Compute transfer buffer size from RNN state configuration.
-    static size_t computeTransferBufferSize(RnnStateManager* rnnStateManager, std::optional<size_t> maxNumTokens);
-
     /// @brief Compute transfer buffer size from unified pool metadata.
     static size_t computeTransferBufferSizeFromPool(kv_cache_manager::BaseKVCacheManager* kvCacheManager,
         executor::kv_cache::CacheState const& cacheState, std::optional<size_t> maxNumTokens);
-
-    RnnStateManager* mRnnStateManager{nullptr};
 };
 
 } // namespace tensorrt_llm::batch_manager::rnn_state_manager

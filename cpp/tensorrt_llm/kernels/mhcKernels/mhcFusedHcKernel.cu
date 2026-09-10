@@ -129,9 +129,9 @@ static bool isSupportedFhcHiddenRuntime(int hidden_size)
 }
 
 // Validate the tcgen05 MMA fused-HC compile-time shape contract. Hidden must
-// be divisible into BLOCK_K tiles, kNumSplits must evenly divide those tiles,
-// and the hidden dimension must be a multiple of BF16_VEC_LI (per-thread vector
-// load granularity in the Phase 4 layer_input loop). The (Hidden % team-stride)
+// be divisible into BLOCK_K tiles, and the hidden dimension must be a multiple
+// of BF16_VEC_LI (per-thread vector load granularity in the Phase 4
+// layer_input loop). The (Hidden % team-stride)
 // alignment is no longer required: the layer_input loop has a scalar-vec tail
 // that handles the residue after the vectorized main loop. Keep this in sync
 // with the Python tactic filter (_fused_hc_mma_ks_supported in mhc_cuda.py).
@@ -144,7 +144,13 @@ static constexpr bool isSupportedFhcMmaKS()
     constexpr uint32_t hTilesPerHc = Hidden / FHC_BLOCK_K;
     constexpr uint32_t bf16VecLi = 8;
 
-    return Hidden % FHC_BLOCK_K == 0 && hTilesPerHc % KS == 0 && Hidden % bf16VecLi == 0;
+    // The kernels distribute remainder tiles over their first splits, so KS need
+    // not divide hTilesPerHc. Keep the uneven surface to the two measured H=7168
+    // shapes rather than instantiating every split count.
+    constexpr bool evenSplit = hTilesPerHc % KS == 0;
+    constexpr bool singleWaveSplit = Hidden == FHC_HIDDEN_PRO && (KS == 53 || KS == 106);
+
+    return Hidden % FHC_BLOCK_K == 0 && KS <= hTilesPerHc && (evenSplit || singleWaveSplit) && Hidden % bf16VecLi == 0;
 }
 
 static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gmemInner, uint64_t gmemOuter,
@@ -187,13 +193,13 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
 // CUDA-graph capture: cuTensorMapEncodeTiled is a pure host function that does
 // not record any stream operation, so cache miss inside capture is safe. The
 // descriptor is passed by value as __grid_constant__; the recorded graph node
-// holds those bytes and replays correctly under workspace-stable replay
-// (already enforced by _FusedHcWorkspaceCache in mhc_cuda.py).
+// holds those bytes and replays correctly while captured tensor addresses
+// remain stable for the lifetime of the graph.
 //
 // Eviction: LRU bounded to kTmaDescCacheCap entries per thread. Eager mode
 // without CUDA-graph capture sees the PyTorch caching allocator hand out
-// fresh `base` pointers when the workspace cache misses, so the unbounded
-// version would grow on every shape transition. 128 entries × ~256 B = ~32 KB
+// fresh `base` pointers as public outputs are allocated, so the unbounded
+// version would grow across shape transitions. 128 entries × ~256 B = ~32 KB
 // per host thread — fits in L1, sized to cover the working set of any single
 // model (~4-8 distinct shapes × 4 descriptors each = O(20) live, with
 // headroom for shape transitions).
@@ -335,8 +341,10 @@ static FusedRoutFn pickFhc(uint32_t ks)
     case 16: return fhcInstanceIfSupported<Hidden, 16>();
     case 28: return fhcInstanceIfSupported<Hidden, 28>();
     case 32: return fhcInstanceIfSupported<Hidden, 32>();
+    case 53: return fhcInstanceIfSupported<Hidden, 53>();
     case 56: return fhcInstanceIfSupported<Hidden, 56>();
     case 64: return fhcInstanceIfSupported<Hidden, 64>();
+    case 106: return fhcInstanceIfSupported<Hidden, 106>();
     case 112: return fhcInstanceIfSupported<Hidden, 112>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
@@ -619,8 +627,10 @@ static FusedAllInOneFn pickFhcAllInOne(uint32_t ks)
     case 16: return fhcAllInOneInstanceIfSupported<Hidden, 16, kFuseNorm>();
     case 28: return fhcAllInOneInstanceIfSupported<Hidden, 28, kFuseNorm>();
     case 32: return fhcAllInOneInstanceIfSupported<Hidden, 32, kFuseNorm>();
+    case 53: return fhcAllInOneInstanceIfSupported<Hidden, 53, kFuseNorm>();
     case 56: return fhcAllInOneInstanceIfSupported<Hidden, 56, kFuseNorm>();
     case 64: return fhcAllInOneInstanceIfSupported<Hidden, 64, kFuseNorm>();
+    case 106: return fhcAllInOneInstanceIfSupported<Hidden, 106, kFuseNorm>();
     case 112: return fhcAllInOneInstanceIfSupported<Hidden, 112, kFuseNorm>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }

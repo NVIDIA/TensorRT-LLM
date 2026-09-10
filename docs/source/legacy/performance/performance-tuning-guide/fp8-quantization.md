@@ -2,6 +2,10 @@
 
 # FP8 Quantization
 
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
+
 Quantization is a technique that allows models to run in lower precisions like int8 and fp8 while maintaining acceptable output quality. Running in lower precisions can greatly boost performance, significantly increasing throughput and decreasing latency. The tradeoff is a drop in output quality, but in many cases the output quality is still acceptable and many real world deployments utilize quantization. If you want to learn more about quantization refer to [Mastering LLM Techniques - Inference Optimization](https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/)
 
 This section walks through enabling fp8 quantization and highlight some fp8 quantization specific configuration options for boosting performance. It also continues the case study of Llama-3.3-70B split across 4 H100-sxm-80GB GPUs via tensor parallelism and showcase the effects of enabling these configuration options on performance.
@@ -58,7 +62,7 @@ For an example of how to build an fp8 engine using the [TensorRT-LLM CLI workflo
 
 ## FP8 "Baseline" Performance
 
-Benchmarking the engine produced by the example above yielded the following performance results. Note that we enabled some of the build flags we mentioned [earlier](./useful-build-time-flags.md) (multiple profiles, paged_context_fmha) and also tuned max batch size and max num tokens. This is done to give a sense of what performance is achievable if you tune an fp8 engine but exclude options that have been tailored for quantization. We recommend disabling the gemm plugin for quantized engines which is why it is not included here (it is off by default). Reduce fusion has a quantization specific optimization that will be covered later. For the remainder of this page we will refer to this setup as the "baseline" numbers for fp8.
+Benchmarking the engine produced by the example above yielded the following performance results. Note that we enabled some of the build flags we mentioned earlier (multiple profiles, paged_context_fmha) and also tuned max batch size and max num tokens. This is done to give a sense of what performance is achievable if you tune an fp8 engine but exclude options that have been tailored for quantization. We recommend disabling the gemm plugin for quantized engines which is why it is not included here (it is off by default). Reduce fusion has a quantization specific optimization that will be covered later. For the remainder of this page we will refer to this setup as the "baseline" numbers for fp8.
 
 
 | Metric                           | Value     |
@@ -95,7 +99,7 @@ If you are using the [CLI flow for building engines](./benchmarking-default-perf
 
 ## Reduce Norm Fusion with User Buffers for Llama Models
 
-The [Reduce Norm Fusion](./useful-build-time-flags.md#reduce-norm-fusion-plugin-for-llama-models) feature is supported for fp8. An additional optimization called "User Buffers" is also supported for fp8 models. The user buffer feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.
+The Reduce Norm Fusion feature is supported for fp8. An additional optimization called "User Buffers" is also supported for fp8 models. The user buffer feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.
 
 
 ### Enabling Reduce Norm Fusion with User Buffers
@@ -162,7 +166,7 @@ In this case, the GEMM + SwiGLU plugin performs almost equivalently to when it w
 
 ## Low Latency GEMM Plugin
 
-Previously we mentioned the [GEMM Plugin](./useful-build-time-flags.md#gemm-plugin) feature. Although it has fp8 support we recommend disabling it (by default it is disabled). However for low-latency scenarios in fp8 we recommend trying the low latency GEMM plugin to see if it is effective for your workload.
+Previously we mentioned the GEMM Plugin feature. Although it has fp8 support we recommend disabling it (by default it is disabled). However for low-latency scenarios in fp8 we recommend trying the low latency GEMM plugin to see if it is effective for your workload.
 
 ### Enabling Low Latency GEMM plugin
 

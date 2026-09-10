@@ -797,9 +797,32 @@ class MetricsCollector:
                 self._log_gauge(self.spec_decode_draft_overhead,
                                 spec_stats["draftOverhead"])
 
-        # Per-iteration KV cache stats (aggregated across window sizes)
-        if kv_iter := iteration_stats.get("kvCacheIterationStats"):
-            # Aggregate across all window sizes
+        # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
+        # storage/transfer counters by pool group; legacy V1 uses window stats.
+        kv_iter = iteration_stats.get("kvCacheIterationStats")
+        kv_iter_by_lifecycle = iteration_stats.get(
+            "kvCacheIterationStatsByLifecycle")
+        kv_iter_by_pool_group = iteration_stats.get(
+            "kvCacheIterationStatsByPoolGroup")
+        kv_iter_by_cold_pool_group = iteration_stats.get(
+            "kvCacheIterationStatsByColdPoolGroup")
+        if (kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group
+                or kv_iter_by_cold_pool_group):
+            # Prefer lifecycle-level attention stats when present. An SSM-only
+            # lifecycle report must not hide the legacy/window-level attention
+            # aggregate. Missing kind remains attention-compatible.
+            attention_lifecycle_stats = {
+                key: stats
+                for key, stats in (kv_iter_by_lifecycle or {}).items()
+                if stats.get("kind", "attention") == "attention"
+            }
+            reuse_stats = attention_lifecycle_stats or kv_iter or {}
+            pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
+            # Host/disk blocks come from the cold pool-group view, the only V2 view that reports them:
+            # cold levels group lifecycles independently of the hot level, so a hot pool group cannot
+            # own a cold one, and this view accounts for every cold block exactly once. Legacy V1 has
+            # no such view and keeps its cold counters on the window stats, hence the fallback.
+            secondary_stats = kv_iter_by_cold_pool_group or pool_group_stats
             total_secondary_max = 0
             total_secondary_used = 0
             total_reused = 0
@@ -811,19 +834,23 @@ class MetricsCollector:
             total_offload_bytes = 0
             total_intra_device_copy_bytes = 0
 
-            for ws_stats in kv_iter.values():
-                total_secondary_max += ws_stats.get("secondaryMaxNumBlocks", 0)
-                total_secondary_used += ws_stats.get("secondaryUsedNumBlocks",
-                                                     0)
-                total_reused += ws_stats.get("iterReusedBlocks", 0)
-                total_full_reused += ws_stats.get("iterFullReusedBlocks", 0)
-                total_partial_reused += ws_stats.get("iterPartialReusedBlocks",
-                                                     0)
-                total_missed += ws_stats.get("iterMissedBlocks", 0)
-                total_gen_alloc += ws_stats.get("iterGenAllocBlocks", 0)
-                total_onboard_bytes += ws_stats.get("iterOnboardBytes", 0)
-                total_offload_bytes += ws_stats.get("iterOffloadBytes", 0)
-                total_intra_device_copy_bytes += ws_stats.get(
+            for stats in reuse_stats.values():
+                total_reused += stats.get("iterReusedBlocks", 0)
+                total_full_reused += stats.get("iterFullReusedBlocks", 0)
+                total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
+                total_missed += stats.get("iterMissedBlocks", 0)
+
+            for stats in secondary_stats.values():
+                total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
+                total_secondary_used += stats.get("secondaryUsedNumBlocks", 0)
+
+            # The cold view deliberately omits the per-iteration delta fields, so these stay on the
+            # hot pool-group view where they are actually tracked.
+            for stats in pool_group_stats.values():
+                total_gen_alloc += stats.get("iterGenAllocBlocks", 0)
+                total_onboard_bytes += stats.get("iterOnboardBytes", 0)
+                total_offload_bytes += stats.get("iterOffloadBytes", 0)
+                total_intra_device_copy_bytes += stats.get(
                     "iterIntraDeviceCopyBytes", 0)
 
             # Gauges

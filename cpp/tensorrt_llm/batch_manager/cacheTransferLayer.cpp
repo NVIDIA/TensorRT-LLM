@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
@@ -54,8 +55,7 @@ void CacheTransferLayer::validateSupport(executor::DataTransceiverState const& p
 
     if (mRnnFormatter && selfHasRnn)
     {
-        // Both slot-based (CppMambaCacheManager) and unified pool (CppMambaHybridCacheManager)
-        // paths now use RnnCacheFormatter.
+        // Unified pool path (CppMambaHybridCacheManager) uses RnnCacheFormatter.
         if (peerHasRnn)
         {
             TLLM_CHECK_WITH_INFO(mRnnFormatter->inquireSupport(mCacheState, peerState.getCacheState().value()),
@@ -122,7 +122,8 @@ void CacheTransferLayer::unformat(TransferSession& session) const
 }
 
 void CacheTransferLayer::setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
-    std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
+    std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
+    tensorrt_llm::DataType ssmStateDataType)
 {
     mCacheState.setRnnConfig(
         std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);

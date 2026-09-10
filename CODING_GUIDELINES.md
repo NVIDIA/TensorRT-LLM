@@ -534,7 +534,7 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 
 **Model Structure:**
 - Inherit from `StrictBaseModel` (which sets `extra="forbid"`) to fail fast when users specify invalid field names
-- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MedusaDecodingConfig`, etc.)
+- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MTPDecodingConfig`, etc.)
 - **Do not define `__init__` methods** - this bypasses Pydantic's validation and type coercion, and can cause subtle bugs with model inheritance. Instead:
   - For validation logic, use `@field_validator` or `@model_validator`
   - For post-validation initialization (e.g. setting up private fields and state), use [`model_post_init()`](https://docs.pydantic.dev/latest/api/base_model/#pydantic.BaseModel.model_post_init)
@@ -550,6 +550,9 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 - Use `Literal["value1", "value2"]` instead of `str` when a field should only accept certain values
 - Prefer `PositiveInt`, `NonNegativeInt`, `NonNegativeFloat`, `PositiveFloat`, `Field(gt=0)`, `Field(ge=0)`, etc. for numeric constraints instead of defining custom validators
 - Use `Field(min_length=1)` to enforce minimum length of a list
+
+- After changing LLM args or nested configs, run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
+  `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
 
 **Validation:**
 - Use `@field_validator` and `@model_validator` instead of manual `validate()` or `is_valid()` methods

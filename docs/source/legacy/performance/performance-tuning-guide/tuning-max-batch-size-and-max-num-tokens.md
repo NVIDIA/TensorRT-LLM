@@ -97,7 +97,7 @@ For this particular workload max num tokens of 2048 provides the best performanc
 
 ## Revisiting Paged Context Attention and Context Chunking
 
-[Previously](./useful-build-time-flags.md#paged-context-attention) we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Having now understood the TensorRT-LLM scheduler we can now explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
+Previously we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Having now understood the TensorRT-LLM scheduler we can now explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
 
 The [visualization](#understanding-the-trt-llm-scheduler) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However with context chunking, this is no longer the case, and the first chunk of Request 3 would be able to be scheduled.
 
@@ -107,7 +107,7 @@ This is extremely beneficial for several reasons. Firstly it eliminates the poss
 
 ## Conclusion
 
-The TensorRT-LLM Scheduler plays a large role in performance, and properly tuning it can provide significant performance uplifts. In the case-study example, tuning max batch size and max num tokens provided the following boosts to performance when compared to the [results from the previous page](./useful-build-time-flags.md#conclusion):
+The TensorRT-LLM Scheduler plays a large role in performance, and properly tuning it can provide significant performance uplifts. In the case-study example, tuning max batch size and max num tokens provided the following boosts to performance when compared to the results from the previous page:
 
 | Metric                           | Build-Time Flags ON | Tuned Max Batch Size and Max Num Tokens | % Improvement |
 | -------------------------------- | ------------------- | --------------------------------------- | ------------- |

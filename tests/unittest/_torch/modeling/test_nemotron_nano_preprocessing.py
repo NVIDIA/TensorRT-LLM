@@ -32,6 +32,8 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.inputs.multimodal_data import AudioData
 
+pytestmark = pytest.mark.cpu_only
+
 
 def make_tiler(**overrides):
     """Create a DynamicResolutionImageTiler with sensible defaults."""
@@ -539,9 +541,9 @@ class TestAudioInputProcessor:
         proc = _make_audio_processor()
         audio = np.random.randn(16000).astype(np.float32)
         text = f"Listen: {AUDIO_PLACEHOLDER}"
-        input_ids, audio_inputs = proc._process_audio(text, [(audio, 16000)])
+        audio_inputs, expanded_text = proc._process_audio(text, [(audio, 16000)])
 
-        assert isinstance(input_ids, torch.Tensor)
+        assert isinstance(expanded_text, str)
         assert {
             "input_audio_features",
             "feature_attention_mask",

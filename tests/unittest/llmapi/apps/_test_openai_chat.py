@@ -22,7 +22,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["pytorch"])
 def backend(request):
     return request.param
 
@@ -70,8 +70,6 @@ def server(model_name: str, backend: str, extra_llm_api_options: bool,
     args = ["--backend", f"{backend}"]
     args.extend(["--kv_cache_free_gpu_memory_fraction",
                  "0.2"])  # for co-existence with other servers
-    if backend == "trt":
-        args.extend(["--max_beam_width", "4"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
@@ -518,21 +516,9 @@ server_with_custom_sampler = make_server_with_custom_sampler_fixture('chat')
 
 
 @pytest.mark.asyncio(loop_scope='function')
-@pytest.mark.parametrize(
-    'server_with_custom_sampler',
-    [
-        {
-            'sampler_type': "TorchSampler"
-        },  # torch_sampler
-        {
-            'sampler_type': "TRTLLMSampler"
-        },  # trtllm_sampler
-    ],
-    indirect=True,
-    ids=['torch_sampler', 'trtllm_sampler'])
 async def test_chat_completion_with_logit_bias_effect(
         server_with_custom_sampler, model_name: str) -> None:
-    '''Test that logit bias affects output as expected for both samplers (chat endpoint).'''
+    '''Test that logit bias affects output as expected (chat endpoint).'''
     client = server_with_custom_sampler.get_async_client()
     await logit_bias_effect_helper(client, model_name, 'chat')
 
@@ -546,9 +532,6 @@ async def test_chat_completion_with_invalid_logit_bias(
 
 def test_chat_cached_tokens(client: openai.OpenAI, model_name: str,
                             backend: str, extra_llm_api_options: bool):
-    if backend == "trt":
-        pytest.skip("Cached tokens is not supported in trt backend yet")
-
     messages = [{
         "role": "system",
         "content": "A system message"
@@ -587,9 +570,6 @@ def test_chat_cached_tokens(client: openai.OpenAI, model_name: str,
 async def test_chat_cached_tokens_stream(async_client: openai.AsyncOpenAI,
                                          model_name: str, backend: str,
                                          extra_llm_api_options: bool):
-    if backend == "trt":
-        pytest.skip("Cached tokens is not supported in trt backend yet")
-
     messages = [{
         "role": "system",
         "content": "A system message"

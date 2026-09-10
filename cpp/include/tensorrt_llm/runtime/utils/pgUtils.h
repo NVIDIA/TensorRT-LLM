@@ -86,6 +86,8 @@ c10::intrusive_ptr<c10d::ProcessGroup> get_local_pg();
 void init_pg(c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_world,
     c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_local);
 
+void shutdown_pg();
+
 // Tensor wrapping utilities for ProcessGroup operations
 inline torch::Tensor wrap_tensor(torch::Tensor data)
 {

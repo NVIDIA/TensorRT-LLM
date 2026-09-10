@@ -1,4 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from torch import nn
@@ -65,8 +70,24 @@ class BaseCheckpointLoader(ABC):
                                                mapping=mapping,
                                                **kwargs)
 
+    @contextmanager
+    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
+                            **kwargs) -> Iterator[dict[str, Any]]:
+        """Keep loader-specific work alive while weights are materialized."""
+        yield self.load_weights(checkpoint_dir, mapping=mapping, **kwargs)
+
     def is_weights_preloaded(self) -> bool:
         """Whether the last load wrote weights directly into the model."""
+        return False
+
+    def is_post_transform_weights_preloaded(self) -> bool:
+        """Whether the last direct preload delivered post-transform weights.
+
+        This is narrower than :meth:`is_weights_preloaded`: a loader may write
+        bytes directly into the model while those bytes still use the raw
+        checkpoint layout. Return True only when the source identity was
+        verified and the incoming bytes can safely skip module transform hooks.
+        """
         return False
 
     def post_load_apply(self,

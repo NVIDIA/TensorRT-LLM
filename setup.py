@@ -14,6 +14,9 @@
 # limitations under the License.
 import os
 import platform
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -55,6 +58,13 @@ def sanity_check():
             'If you are attempting to use the pip development mode (editable installation), '
             'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
+    if not (Path(__file__).resolve().parent / "3rdparty" /
+            "fmha_sm100").is_dir():
+        raise ImportError(
+            'The `fmha_sm100` package is missing. Please execute '
+            '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
+            '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
+            'from a published wheel.')
 
 
 def get_version():
@@ -70,7 +80,35 @@ def get_version():
     if version is None:
         raise RuntimeError(f"Could not set version from {version_file}")
 
+    # For develop / editable installs (`pip install -e .` or
+    # `python setup.py develop`), append the git commit hash as a PEP 440
+    # local version segment so the installed package is identifiable,
+    # e.g. "1.3.0rc21+58d8964d13".
+    is_develop = any(arg in sys.argv for arg in ("develop", "editable_wheel"))
+    if is_develop:
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short=10", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            commit = ""
+        commit = re.sub(r"[^A-Za-z0-9.]", "", commit)
+        if commit:
+            version = f"{version}+{commit}"
+
     return version
+
+
+def get_project_urls() -> dict[str, str]:
+    source_commit = os.getenv("TRTLLM_BUILD_SOURCE_COMMIT")
+    if not source_commit:
+        return {}
+
+    return {
+        "Source Commit":
+        f"https://github.com/NVIDIA/TensorRT-LLM/commit/{source_commit}",
+    }
 
 
 def get_license():
@@ -109,6 +147,15 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+openengine_deps, _ = parse_requirements(Path("requirements-openengine.txt"))
+mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
+# Gateway protocol adapters are opt-in extras: the default installation must
+# not carry any gateway protobuf package. Each gateway owns a dedicated
+# requirements-<gateway>.txt as the single source of truth for its pins; CI
+# stages that exercise a gateway install that file explicitly, and the file
+# may carry gateway-specific options (such as an --extra-index-url) without
+# affecting the default dependency graph.
+grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -116,15 +163,13 @@ if constraints_file.exists():
 
 if on_windows:
     package_data = [
-        'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-        'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd', "include/**/*"
+        'libs/th_common.dll', 'libs/tensorrt_llm.dll', 'bindings.*.pyd',
+        "include/**/*"
     ]
 else:
     package_data = [
-        'bin/executorWorker',
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
-        'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -147,7 +192,6 @@ else:
         'deep_gemm/include/**/*',
         'deep_gemm/*.py',
         'deep_gemm_cpp_tllm.*.so',
-        'scripts/install_tensorrt.sh',
         'flash_mla/LICENSE',
         'flash_mla/*.py',
         'flash_mla_cpp_tllm.*.so',
@@ -163,14 +207,11 @@ else:
 package_data += [
     'bindings/*.pyi',
     'bindings/**/*.pyi',
-    'tools/plugin_gen/templates/*',
-    'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
     "_torch/auto_deploy/config/*.yaml",
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
-    '_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so',
     'usage/schemas/*.json',
 ]
 
@@ -209,6 +250,73 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
         source_owned_package_data_prefixes)
 
 
+def warn_on_build_skew(precompiled_location: str) -> None:
+    """Warn when the source checkout differs from this one where it matters.
+
+    The precompiled artifacts are reused as they are, never rebuilt, so any
+    difference in what feeds the native build makes them stale. This is
+    advisory: it never fails the install, since the two checkouts are often
+    meant to differ (that is the point of reusing a build) and only some of
+    those differences matter.
+    """
+    import subprocess
+
+    NATIVE_BUILD_INPUTS = [
+        "cpp/", "3rdparty/", "setup.py", "scripts/build_wheel.py",
+        "requirements.txt"
+    ]
+
+    def head_of(checkout: str) -> str | None:
+        try:
+            done = subprocess.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                                  capture_output=True,
+                                  text=True,
+                                  check=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() or None
+
+    source_head = head_of(precompiled_location)
+    current_head = head_of(".")
+    if source_head is None or current_head is None:
+        print("Cannot check for build skew: one of the two checkouts is not a "
+              "git repository. Make sure the precompiled artifacts were built "
+              "from these sources.")
+        return
+    if source_head == current_head:
+        return
+
+    stale = ("Import errors mentioning 'rebuild and install' after this may be "
+             "ABI skew; rebuild, or pick a precompiled source that matches.")
+    try:
+        # Both revisions are reachable here when the two checkouts are
+        # worktrees of one clone, which is the case this is meant to catch.
+        done = subprocess.run(
+            ["git", "diff", "--name-only", source_head, current_head, "--"] +
+            NATIVE_BUILD_INPUTS,
+            capture_output=True,
+            text=True,
+            check=True)
+    except (OSError, subprocess.SubprocessError):
+        print(
+            f"WARNING: the precompiled artifacts come from {source_head[:12]} "
+            f"but this checkout is {current_head[:12]}, and the difference "
+            f"could not be inspected from here. {stale}")
+        return
+
+    changed = done.stdout.split()
+    if not changed:
+        return
+    shown = ", ".join(changed[:3])
+    if len(changed) > 3:
+        shown += ", ..."
+    count = f"{len(changed)} file" + ("s" if len(changed) > 1 else "")
+    print(
+        f"WARNING: the precompiled artifacts come from {source_head[:12]} but "
+        f"this checkout is {current_head[:12]}; {count} feeding the "
+        f"native build changed ({shown}). {stale}")
+
+
 def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                              workspace: str) -> None:
     """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
@@ -218,6 +326,9 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
     - Local directory (git clone structure): e.g., /home/dev/TensorRT-LLM
     - Local wheel file: e.g., /path/to/tensorrt_llm-*.whl
     - Remote URL: Downloads and extracts from URL (wheel or tar.gz)
+
+    With TRTLLM_PRECOMPILED_LINK=1 a local directory is symlinked instead of
+    copied, so several checkouts can share one build tree.
     """
     import fnmatch
     import shutil
@@ -227,12 +338,31 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
 
     from setuptools.errors import SetupError
 
+    # Only a local directory can be linked; a wheel or a URL has no build tree
+    # to point at.
+    link_artifacts = os.getenv("TRTLLM_PRECOMPILED_LINK", "0") not in ("", "0")
+    if link_artifacts and not os.path.isdir(precompiled_location):
+        raise SetupError(
+            "TRTLLM_PRECOMPILED_LINK=1 requires TRTLLM_PRECOMPILED_LOCATION to "
+            "be a local directory in git-clone layout, but got "
+            f"{precompiled_location}.")
+    # Linking a checkout onto itself would unlink the real artifacts and
+    # replace them with symlinks that point to themselves, destroying the
+    # build tree this mode is meant to share.
+    if link_artifacts and os.path.realpath(
+            precompiled_location) == os.path.realpath("."):
+        raise SetupError(
+            "TRTLLM_PRECOMPILED_LINK=1 needs a source checkout separate from "
+            "this one, but TRTLLM_PRECOMPILED_LOCATION resolves to the current "
+            "directory.")
+
     # Handle local directory (assuming repo structure)
     if os.path.isdir(precompiled_location):
         precompiled_location = os.path.abspath(precompiled_location)
         print(
             f"Using local directory as precompiled source: {precompiled_location}"
         )
+        warn_on_build_skew(precompiled_location)
         source_tensorrt_llm = os.path.join(precompiled_location, "tensorrt_llm")
         if not os.path.isdir(source_tensorrt_llm):
             raise SetupError(
@@ -276,8 +406,52 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 dst_dir = os.path.dirname(dst_file)
                 if dst_dir:
                     os.makedirs(dst_dir, exist_ok=True)
-                print(f"Copying {rel_path} from local directory.")
-                shutil.copy2(src_file, dst_file)
+                if link_artifacts:
+                    if os.path.lexists(dst_file):
+                        os.unlink(dst_file)
+                    print(f"Linking {rel_path} from local directory.")
+                    os.symlink(os.path.abspath(src_file), dst_file)
+                else:
+                    print(f"Copying {rel_path} from local directory.")
+                    # Drop a stale symlink from a prior link-mode run so
+                    # copy2 writes a real file instead of following the link
+                    # into the shared build tree.
+                    if os.path.islink(dst_file):
+                        os.unlink(dst_file)
+                    shutil.copy2(src_file, dst_file)
+
+        source_fmha = os.path.join(precompiled_location, "3rdparty",
+                                   "fmha_sm100")
+        if not os.path.isdir(source_fmha):
+            raise SetupError(
+                f"Precompiled directory {precompiled_location} predates MSA "
+                "packaging and does not contain 3rdparty/fmha_sm100. Use a "
+                "precompiled source built with MSA packaging support.")
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        if link_artifacts:
+            if os.path.islink(dst_fmha) and os.path.realpath(
+                    dst_fmha) == os.path.realpath(source_fmha):
+                # Already points at this source; leave the shared link alone.
+                print(f"Keeping existing fmha_sm100 symlink: {dst_fmha}")
+            else:
+                # A stale link (pointing at a different source) or a real
+                # directory: replace it so fmha_sm100 tracks the same source
+                # as the other linked artifacts.
+                if os.path.islink(dst_fmha):
+                    os.unlink(dst_fmha)
+                elif os.path.isdir(dst_fmha):
+                    shutil.rmtree(dst_fmha)
+                # copytree() creates the parent below; os.symlink() does not.
+                os.makedirs(os.path.dirname(dst_fmha), exist_ok=True)
+                print(f"Linking fmha_sm100 from local directory: {source_fmha}")
+                os.symlink(source_fmha, dst_fmha)
+        else:
+            print(f"Copying fmha_sm100 from local directory: {source_fmha}")
+            if os.path.islink(dst_fmha):
+                os.unlink(dst_fmha)
+            elif os.path.isdir(dst_fmha):
+                shutil.rmtree(dst_fmha)
+            shutil.copytree(source_fmha, dst_fmha)
         return
 
     # Handle local file or remote URL
@@ -313,6 +487,18 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         wheel_path = precompiled_path
 
     with zipfile.ZipFile(wheel_path) as wheel:
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        wheel_has_fmha = any(
+            file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
+        if not wheel_has_fmha:
+            raise SetupError(
+                f"Precompiled wheel {wheel_path} predates MSA packaging and "
+                "does not contain fmha_sm100. Use a precompiled wheel built "
+                "with MSA packaging support.")
+        if os.path.islink(dst_fmha):
+            os.unlink(dst_fmha)
+        elif os.path.isdir(dst_fmha):
+            shutil.rmtree(dst_fmha)
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):
@@ -321,6 +507,15 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             # Keep source-owned package data local so Python-only schema edits
             # layer over precompiled wheels.
             if should_skip_precompiled_package_data(file.filename):
+                continue
+
+            # Top-level MSA package in the wheel; stage under 3rdparty for
+            # setuptools package_dir, matching scripts/build_wheel.py.
+            if file.filename.startswith("fmha_sm100/"):
+                print(
+                    f"Extracting and including {file.filename} from precompiled wheel."
+                )
+                wheel.extract(file, path="3rdparty")
                 continue
 
             # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -406,6 +601,36 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
+# fmha_sm100 is staged under 3rdparty/ by scripts/build_wheel.py from the
+# CMake FetchContent tree (same packaging role as tensorrt_llm/deep_ep).
+msa_package_dir = {"fmha_sm100": "3rdparty/fmha_sm100"}
+packages += ["fmha_sm100"]
+
+
+def get_build_state_options():
+    """Optionally redirect setuptools build state out of the source tree.
+
+    When TRTLLM_WHEEL_STAGING_DIR is set (e.g. by scripts/build_wheel.py
+    --build_root), the setuptools staging tree (build/) and *.egg-info are
+    written there instead of into the checkout. This keeps metadata-heavy
+    churn off slow network filesystems; behavior is unchanged when unset.
+    """
+    staging_dir = os.environ.get("TRTLLM_WHEEL_STAGING_DIR")
+    if not staging_dir:
+        return {}
+    staging = Path(staging_dir)
+    egg_base = staging / "egg-info"
+    egg_base.mkdir(parents=True, exist_ok=True)
+    return {
+        "build": {
+            "build_base": str(staging / "build")
+        },
+        "egg_info": {
+            "egg_base": str(egg_base)
+        },
+    }
+
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
@@ -420,6 +645,7 @@ setup(
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
     packages=packages,
+    package_dir=msa_package_dir,
     exclude_package_data=exclude_package_data,
     # TODO Add windows support for python bindings.
     classifiers=[
@@ -429,18 +655,25 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
-        'tensorrt_llm': package_data,
+        'tensorrt_llm':
+        package_data,
         'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
+        'fmha_sm100': [
+            '*.py',
+            'csrc/**/*',
+            'cute/**/*',
+            'cutlass/include/**/*',
+            'cutlass/tools/util/include/**/*',
+            'cutlass/LICENSE.txt',
+        ],
     },
     license_files=get_license(),
     entry_points={
         'console_scripts': [
-            'trtllm-build=tensorrt_llm.commands.build:main',
-            'trtllm-prune=tensorrt_llm.commands.prune:main',
-            'trtllm-refit=tensorrt_llm.commands.refit:main',
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
             'trtllm-eval=tensorrt_llm.commands.eval:main'
@@ -448,14 +681,14 @@ setup(
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
-        "devel": devel_deps,
-        # MX remains prototype-only and is intentionally not declared as an
-        # optional package extra until its external dependency completes OSS
-        # allowlist onboarding. Keep install instructions in docs/PR text
-        # rather than packaging metadata.
+        "devel": devel_deps + grpc_smg_deps,
+        "openengine": openengine_deps,
+        "mx": mx_deps,
+        "grpc-smg": grpc_smg_deps,
     },
     zip_safe=True,
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.10, <4")
+    python_requires=">=3.10, <4",
+    project_urls=get_project_urls())

@@ -65,7 +65,9 @@ Welcome to TensorRT LLM's Documentation!
    features/feature-combination-matrix.md
    features/attention.md
    features/disagg-serving.md
+   features/embeddings.md
    features/kvcache.md
+   features/kv-cache-compression.md
    features/long-sequence.md
    features/lora.md
    features/multi-modality.md
@@ -75,9 +77,11 @@ Welcome to TensorRT LLM's Documentation!
    features/quantization.md
    features/sampling.md
    features/additional-outputs.md
+   features/post-processor-hook.md
    features/guided-decoding.md
    features/speculative-decoding.md
    features/checkpoint-loading.md
+   features/model-express.md
    features/auto_deploy/auto-deploy.md
    features/auto_deploy/transforms.rst
    features/ray-orchestrator.md
@@ -98,8 +102,10 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/dev-containers.md
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
-   developer-guide/telemetry.md
+   developer-guide/kv-cache-cold-page-codec.md
+   developer-guide/kv-cache-compression-development.md
    developer-guide/sparse-attention-development-guide.md
+   developer-guide/telemetry.md
 
 
 .. toctree::
@@ -127,10 +133,9 @@ Welcome to TensorRT LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Use TensorRT Engine
-   :hidden:
+   :caption: Migration
 
-   legacy/tensorrt_quickstart.md
+   legacy/tensorrt-backend-removal.md
 
 Indices and tables
 ==================

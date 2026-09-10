@@ -24,13 +24,77 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
+
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEProblem,
+    canonical_activation,
+    canonical_quant,
+)
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, get_backend_class
-from .mapping import _resolve_mapping_layout
+from .mapping import (
+    _resolve_mapping_layout,
+    default_hybrid_parallel_modes,
+    parallel_mode_enable_attention_dp,
+)
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
-_FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM"})
+_FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"})
+
+# Comm methods whose workspace is MNNVL symmetric memory (MnnvlMemory), and which
+# therefore inherit its cross-node handle-exchange constraint.
+_MNNVL_COMM_METHODS = ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED")
+
+
+def _is_deepep_feasible(num_ranks: int) -> bool:
+    """Return True if DeepEP supports the given EP rank count on this node topology.
+
+    Intranode: num_ranks in {2, 4, 8} and num_ranks == local_mpi_size().
+    Internode: exactly 8 ranks per node, with 2/4/8/16 RDMA nodes.
+    Mirrors the feasibility check in communication/deep_ep.py::DeepEP._is_deepep_feasible.
+    """
+    _INTRANODE_RANKS = {2, 4, 8}
+    _REQUIRED_LOCAL_SIZE = 8
+    _INTERNODE_RDMA_NODES = {2, 4, 8, 16}
+    mpi_size = local_mpi_size()
+    if num_ranks == mpi_size and num_ranks in _INTRANODE_RANKS:
+        return True
+    if mpi_size != _REQUIRED_LOCAL_SIZE:
+        return False
+    return (num_ranks // mpi_size) in _INTERNODE_RDMA_NODES
+
+
+def _is_mnnvl_comm_feasible(num_ranks: int) -> bool:
+    """Return True if MNNVL-backed comm can cover this many ranks on this system.
+
+    Within a single node the symmetric-memory allocation handles are exchanged
+    over pidfd_getfd, which always works. Spanning nodes additionally requires
+    fabric handles: a POSIX file descriptor is a node-local kernel object, so
+    importing one from a peer PID on another node fails with ESRCH and the whole
+    candidate dies in MnnvlMemory with a build error rather than a skip.
+
+    The handle type is read off the same allocation prop that
+    ``MnnvlMemory.open_mnnvl_memory`` branches on, instead of re-deriving it from
+    the CPU architecture here, so this gate opens by itself if fabric handles
+    ever become available on x86 (see the TODO in ``get_allocation_prop``).
+    """
+    if num_ranks <= local_mpi_size():
+        return True
+    allocation_prop = MnnvlMemory.get_allocation_prop(torch.cuda.current_device())
+    return (
+        allocation_prop.requestedHandleTypes
+        == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    )
 
 
 def _check_backend_can_implement(
@@ -38,20 +102,41 @@ def _check_backend_can_implement(
     quant_algo: Optional[QuantAlgo],
     dtype_activation: torch.dtype,
     swiglu_gptoss_style: bool,
+    activation_type: ActivationType,
 ) -> Tuple[bool, Optional[str]]:
-    """Resolve backend_str to its MoE class and forward to can_implement."""
+    """Resolve backend_str to its MoE class and ask whether it can serve this.
+
+    The topology-dependent gates are deliberately not exercised here: this runs
+    before ``_resolve_mapping_layout``, and the EP / comm constraints get their
+    own explicit checks in :func:`is_candidate_valid` with better messages.
+    """
     try:
         backend_cls = get_backend_class(MoeBackendType(backend_str.upper()))
     except (ImportError, KeyError, RuntimeError, ValueError) as exc:
         return False, f"unknown MoE backend {backend_str!r}: {exc}"
+    problem = MoEProblem(
+        quant=canonical_quant(quant_algo),
+        dtype_act=dtype_activation,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+        # Defaults to SwiGLU when unset, which would make every upstream
+        # activation gate evaluate the wrong activation.
+        activation=canonical_activation(activation_type),
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=0,
+        env=collect_moe_environment(),
+    )
     try:
-        return backend_cls.can_implement(
-            quant_algo=quant_algo,
-            dtype_activation=dtype_activation,
-            swiglu_gptoss_style=swiglu_gptoss_style,
-        )
+        verdict = backend_cls.can_implement(problem, deployment)
     except Exception as exc:
         return False, (f"{backend_cls.__name__}.can_implement raised {type(exc).__name__}: {exc}")
+    if verdict.eligible:
+        return True, None
+    return False, f"{verdict.reject_reason.value}: {verdict.detail}"
 
 
 def _expand_axis(values: Iterable[Any], default: Any) -> Tuple[Any, ...]:
@@ -62,6 +147,24 @@ def _expand_axis(values: Iterable[Any], default: Any) -> Tuple[Any, ...]:
 def _comm_axis_for_backend(backend: Any, comm_methods: Tuple[Any, ...]) -> Tuple[Any, ...]:
     if str(backend).upper() in _FUSED_COMM_BACKENDS:
         return ("NONE",)
+    return comm_methods
+
+
+def _comm_axis_for_parallel_mode(pmode: str, comm_methods: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Collapse comm axis to AUTO for parallel modes without attention DP.
+
+    Non-AUTO forced comm methods require enable_attention_dp=True (see
+    is_candidate_valid). TEP, TTP and the hybrid ``TTP<k>EP<m>`` names have
+    enable_dp=False, so only AUTO is ever valid for them. Generating
+    forced-comm candidates for these modes only produces prune rows — handle
+    it at generation time instead. CUSTOM mode is passed through unchanged
+    (validated separately).
+    """
+    enable_dp = parallel_mode_enable_attention_dp(pmode)
+    if enable_dp is None:
+        return comm_methods  # CUSTOM: layout not known from the name, keep as-is
+    if not enable_dp:
+        return ("AUTO",)
     return comm_methods
 
 
@@ -88,7 +191,13 @@ def expand_search(
     for backend, pmode, cgraph, combine in itertools.product(
         backends, parallel_modes, cuda_graph_options, combine_options
     ):
-        for comm in _comm_axis_for_backend(backend, comm_methods):
+        effective_comm = _comm_axis_for_backend(backend, comm_methods)
+        # For non-fused backends apply parallel-mode comm constraint at
+        # generation time so TEP/TTP always get comm=AUTO instead of
+        # generating forced-comm candidates that are immediately pruned.
+        if effective_comm != ("NONE",):
+            effective_comm = _comm_axis_for_parallel_mode(pmode, effective_comm)
+        for comm in effective_comm:
             candidate = replace(
                 base_config,
                 backend=str(backend).upper(),
@@ -110,7 +219,11 @@ def is_candidate_valid(
     """Return ``(ok, reason)`` based on backend / mapping / comm gates."""
     # Backend can_implement gate.
     ok, reason = _check_backend_can_implement(
-        config.backend, model.quant_algo_enum, act_dtype, model.swiglu_gptoss_style
+        config.backend,
+        model.quant_algo_enum,
+        act_dtype,
+        model.swiglu_gptoss_style,
+        model.activation_type_enum,
     )
     if not ok:
         return False, reason
@@ -121,6 +234,100 @@ def is_candidate_valid(
     except ValueError as exc:
         return False, str(exc)
 
+    # DenseGEMM only supports TP; any EP configuration (TEP, DEP, custom ep>1) is unsupported.
+    if config.backend.upper() == "DENSEGEMM" and moe_ep > 1:
+        return False, (
+            f"DENSEGEMM does not support EP (ep_size={moe_ep}); "
+            "use TEP/DEP only with other backends"
+        )
+
+    # MegaMoE backends are EP-only; DTP/TTP are invalid.
+    if config.backend.upper() in _FUSED_COMM_BACKENDS and moe_tp > 1:
+        return False, (
+            f"{config.backend.upper()} does not support MoE-TP (moe_tp_size={moe_tp}); "
+            "use DEP/TEP modes only"
+        )
+
+    # MegaMoEDeepGemm does not support TEP: its DeepGEMM fp8_fp4_mega_moe kernel
+    # assumes the MoE input is partitioned across ranks (single rank, or DEP with
+    # ep_size == parallel_size). TEP replicates the input TP-wide, so
+    # MegaMoEDeepGemm.__init__ raises NotImplementedError (enable_attention_dp=False,
+    # parallel_size>1). Prune here so the sweep records status="skipped" instead of a
+    # hard build failure.
+    if config.backend.upper() == "MEGAMOE_DEEPGEMM" and not enable_dp and world_size > 1:
+        return False, (
+            f"MEGAMOE_DEEPGEMM does not support TEP (enable_attention_dp=False, "
+            f"parallel_size={world_size}>1); use DEP with ep_size==parallel_size "
+            "or enable attention-DP"
+        )
+
+    # DENSEGEMM DTP: FC2 kernel requires (intermediate_size / moe_tp_size) % 256 == 0.
+    # DENSEGEMM __init__ only checks the full intermediate_size, so a model like
+    # DeepSeek V3 (intermediate_size=2048, 2048%256=0) passes __init__ but fails
+    # at runtime with moe_tp_size=16 (2048/16=128, 128%256!=0).
+    if config.backend.upper() == "DENSEGEMM" and moe_ep == 1 and moe_tp > 1:
+        if model.intermediate_size % moe_tp != 0:
+            return False, (
+                f"DENSEGEMM DTP: intermediate_size={model.intermediate_size} "
+                f"not divisible by moe_tp_size={moe_tp}"
+            )
+        per_tp_k = model.intermediate_size // moe_tp
+        _DENSEGEMM_MMA_TILE_K = 256
+        if per_tp_k % _DENSEGEMM_MMA_TILE_K != 0:
+            return False, (
+                f"DENSEGEMM DTP moe_tp_size={moe_tp}: intermediate_size/tp={per_tp_k} "
+                f"not aligned to FC2 MMA tile-K={_DENSEGEMM_MMA_TILE_K}"
+            )
+
+    # NVFP4 on CuteDSL / TRTLLM-Gen requires the per-partition intermediate size
+    # (intermediate_size / moe_tp_size) to be a multiple of the NVFP4 weight
+    # alignment (128). Unlike CUTLASS (which pads intermediate_size_per_partition
+    # up to 128), these backends use the unpadded logical size when laying out the
+    # block-scale tensor and fail during weight load: CUTEDSL raises a reshape
+    # RuntimeError (e.g. "shape '[-1, 192, 448]' is invalid for input of size
+    # 114688" — 192 padded to 256) and TRTLLM-Gen hits `assert intermediate_size %
+    # weight_alignment == 0`. Prune the unsupported combo with a clear reason
+    # instead of letting it crash mid-sweep. Example: DeepSeek-V4-Pro
+    # (intermediate_size=3072) at moe_tp_size=32 -> 3072/32=96, 96%128!=0.
+    if (
+        config.backend.upper() in ("CUTEDSL", "TRTLLM")
+        and model.quant_algo_enum == QuantAlgo.NVFP4
+        and moe_tp > 1
+    ):
+        _NVFP4_WEIGHT_ALIGNMENT = 128
+        if model.intermediate_size % moe_tp != 0:
+            return False, (
+                f"{config.backend.upper()} NVFP4: intermediate_size="
+                f"{model.intermediate_size} not divisible by moe_tp_size={moe_tp}"
+            )
+        per_tp_k = model.intermediate_size // moe_tp
+        if per_tp_k % _NVFP4_WEIGHT_ALIGNMENT != 0:
+            return False, (
+                f"{config.backend.upper()} NVFP4 moe_tp_size={moe_tp}: "
+                f"intermediate_size/tp={per_tp_k} not aligned to NVFP4 weight "
+                f"alignment={_NVFP4_WEIGHT_ALIGNMENT} (CUTLASS pads to 128, "
+                f"CUTEDSL/TRTLLM do not)"
+            )
+
+    # FP8_BLOCK_SCALES: DeepSeekFP8BlockScalesFusedMoEMethod.load_weights asserts
+    # intermediate_size_per_partition % 128 == 0 on the VANILLA path bench_moe uses,
+    # so a misaligned shard kills the MPI step at weight load. Not backend-scoped:
+    # CUTLASS/DeepGemm/TRTLLM-Gen/CuteDSL share that method and none pads here.
+    # Example: DeepSeek-V3 (intermediate_size=2048) at moe_tp_size=32 -> 64, 64%128!=0.
+    if model.quant_algo_enum == QuantAlgo.FP8_BLOCK_SCALES and moe_tp > 1:
+        _FP8_QUANT_BLOCK_SIZE = 128
+        if model.intermediate_size % moe_tp != 0:
+            return False, (
+                f"FP8_BLOCK_SCALES: intermediate_size={model.intermediate_size} "
+                f"not divisible by moe_tp_size={moe_tp}"
+            )
+        per_tp_k = model.intermediate_size // moe_tp
+        if per_tp_k % _FP8_QUANT_BLOCK_SIZE != 0:
+            return False, (
+                f"FP8_BLOCK_SCALES moe_tp_size={moe_tp}: intermediate_size/tp="
+                f"{per_tp_k} not aligned to FP8 quant block size={_FP8_QUANT_BLOCK_SIZE}"
+            )
+
     # Forced communication on non-DP / MoE-TP paths.
     forced = config.comm_method.upper()
     if forced not in ("AUTO", "NONE"):
@@ -130,6 +337,19 @@ def is_candidate_valid(
             return False, f"comm_method={forced} requires moe_tp_size=1 (got {moe_tp})"
         if world_size == 1:
             return False, f"comm_method={forced} has no effect at world_size=1"
+        if forced in _MNNVL_COMM_METHODS and not _is_mnnvl_comm_feasible(moe_ep):
+            return False, (
+                f"comm_method={forced}: MNNVL symmetric memory cannot span nodes here "
+                f"(moe_ep_size={moe_ep} > local_mpi_size={local_mpi_size()}, and this "
+                f"platform exchanges allocation handles as POSIX fds, not fabric "
+                f"handles); use an NVL-domain cluster or a non-MNNVL comm method"
+            )
+        if forced == "DEEPEP" and not _is_deepep_feasible(moe_ep):
+            return False, (
+                f"comm_method={forced}: moe_ep_size={moe_ep} not supported by DeepEP topology "
+                f"(local_mpi_size={local_mpi_size()}; supported: intranode {{2,4,8}}, "
+                f"internode 8-ranks/node x {{2,4,8,16}} nodes)"
+            )
 
     return True, None
 
@@ -278,7 +498,18 @@ def _parse_search_axes(value: Any) -> Tuple[str, ...]:
     return tuple(out)
 
 
-_DEFAULT_PARALLEL_AXIS_VALUES: Tuple[str, ...] = ("DEP", "TEP", "DTP", "TTP")
+_BASE_PARALLEL_AXIS_VALUES: Tuple[str, ...] = ("DEP", "TEP", "DTP", "TTP")
+
+
+def _default_parallel_axis_values(world_size: int) -> Tuple[str, ...]:
+    """Default ``--search parallel`` expansion for a world size.
+
+    The four presets plus the even-split hybrid grids, so a bare
+    ``--search parallel`` compares pure EP, pure MoE-TP and the balanced middle
+    instead of only the extremes. World sizes with no non-degenerate split
+    (``< 4``) keep the historical four-value expansion.
+    """
+    return _BASE_PARALLEL_AXIS_VALUES + default_hybrid_parallel_modes(world_size)
 
 
 def _axis_values_from_args(
@@ -349,7 +580,7 @@ def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec)
             cli_dest="parallel_mode",
             cli_flag_name="--parallel_mode",
             config_key="parallel_mode",
-            full_set=_DEFAULT_PARALLEL_AXIS_VALUES,
+            full_set=_default_parallel_axis_values(int(getattr(args, "world_size", 1) or 1)),
         )
     if "comm" in enabled_axes:
         comm_methods = _axis_values_from_args(

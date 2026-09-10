@@ -101,7 +101,6 @@ Module names longer than 8 characters are abbreviated to fit the fixed-width tag
 | `deep_ep` | `deep_ep ` |
 | `deep_gemm` | `deepgemm` |
 | `executor` | `executor` |
-| `executor_worker` | `exec_wkr` |
 | `flash_mla` | `flashmla` |
 | `kernels` | `kernels ` |
 | `layers` | `layers  ` |
@@ -123,3 +122,68 @@ export TLLM_LOG_LEVEL_BY_MODULE="debug:_torch,runtime;info:serve"
 ```
 
 This example sets the global level to `warning` but enables `debug` output for `_torch` and `runtime` modules, and `info` for `serve`. Valid levels: `trace`, `debug`, `verbose`, `info`, `warning`, `error`, `internal_error`.
+
+## Multi-Rank Crash Handling
+
+When one rank's executor loop dies in a multi-rank job, the peer ranks have
+nothing to fail on: they sit in a collective waiting for a rank that will never
+arrive. Left alone they hold every GPU in the job until an external wall-clock
+kill.
+
+To avoid that, a rank whose executor loop crashes tears the whole job down
+(`MPI_Abort`, falling back to self-`SIGKILL`) after a short grace period. The
+grace exists so cleaner paths can win the race: if the crash is reported to a
+client first — the caller gets the real traceback — the kill stands down, so a
+symmetric crash still ends in N tracebacks rather than a bare exit 137.
+
+**This is on by default for multi-rank runs.** Single-rank runs are unaffected;
+there are no peers to strand.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TLLM_RANK_CRASH_HARD_KILL_GRACE` | `10` | Seconds to wait before killing the job. `0` kills immediately. Any negative value (e.g. `-1`) **disables** the kill entirely — peers then fall back to the hang detector. Unparsable and non-finite values (`nan`, `inf`) fall back to the default. |
+
+```bash
+# Opt out: let the hang detector handle it instead (slower, but no world kill).
+export TLLM_RANK_CRASH_HARD_KILL_GRACE=-1
+```
+
+Use the escape hatch when you would rather have peer ranks reach their own
+timeouts — for example when attaching a debugger to a surviving rank, or when a
+harness collects per-rank state that a job-wide abort would destroy.
+
+## DeepGEMM Barrier Timeout
+
+The DeepGEMM MegaMoE kernels synchronize expert-parallel ranks with in-kernel
+barriers that self-abort after a fixed wall-clock budget, defaulting to 60
+seconds. When the budget is exceeded the kernel prints a diagnostic and trips a
+device-side assert, which poisons the CUDA context — so the first Python-level
+traceback usually points at whatever unrelated kernel ran next, not at the
+barrier:
+
+```text
+DeepGEMM grid sync timeout (60s): sm=114, thread=0, grid_sync_idx=0, ...
+DeepGEMM NVLink barrier timeout (60s): rank=5, counter=1381, signal=8, target=16, ...
+```
+
+Read `signal` against `target`: `signal=8, target=16` means only 8 of the 16
+ranks ever arrived at the barrier.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DG_JIT_BARRIER_TIMEOUT_SECONDS` | `60` | Wall-clock budget, in seconds, for DeepGEMM's in-kernel grid-sync and NVLink barriers. Values `<= 0` are ignored and the built-in default applies. |
+
+```bash
+# Give a large expert-parallel group more headroom before the barrier self-aborts.
+export DG_JIT_BARRIER_TIMEOUT_SECONDS=300
+```
+
+The value is baked into the kernels at JIT compile time and participates in the
+JIT cache key, so changing it recompiles the affected kernels rather than
+silently reusing a cached binary.
+
+This is primarily a diagnostic knob: raising it distinguishes a slow-but-healthy
+rendezvous (all ranks eventually arrive and the run proceeds) from a genuine
+hang or a rank-count mismatch (the same `signal`/`target` split reappears at the
+larger budget). Prefer fixing the underlying imbalance over permanently raising
+the budget, since a longer timeout also delays detection of real hangs.

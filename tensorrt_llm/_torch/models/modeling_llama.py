@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -15,12 +15,12 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -29,19 +29,19 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
+                             MoEWeightLoadingMode, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
@@ -484,7 +484,7 @@ class Llama4DecoderLayer(DecoderLayer):
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
-        # When post_load_weights() chains layernorms across layers,
+        # When setup_aliases() chains layernorms across layers,
         # this flag is set to True to skip the input layernorm in
         # forward() since it is handled by the previous layer.
         self.skip_input_layernorm = False
@@ -709,7 +709,7 @@ class LlamaDecoderLayer(DecoderLayer):
             quantize_type="nvfp4"
             if not self.disable_nvfp4_layernorm_fusion and self.is_nvfp4
             and not (differ_pp_stage_with_previous_layer) else None)
-        # When post_load_weights() chains layernorms across layers,
+        # When setup_aliases() chains layernorms across layers,
         # this flag is set to True to skip the input layernorm in
         # forward() since it is handled by the previous layer.
         self.skip_input_layernorm = False
@@ -983,7 +983,7 @@ class Llama4Model(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        # When post_load_weights() chains the final norm into the
+        # When setup_aliases() chains the final norm into the
         # last decoder layer, this flag is set to True to skip
         # applying it again in forward().
         self.skip_norm = False
@@ -1088,7 +1088,7 @@ class LlamaModel(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        # When post_load_weights() chains the final norm into the
+        # When setup_aliases() chains the final norm into the
         # last decoder layer, this flag is set to True to skip
         # applying it again in forward().
         self.skip_norm = False
@@ -1134,13 +1134,20 @@ class LlamaModel(DecoderModel):
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
+
     def __init__(
         self,
         model_config: ModelConfig[LlamaConfig],
     ):
         super().__init__(LlamaModel(model_config), model_config)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1293,6 +1300,15 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     def tokenizer(self) -> AutoTokenizer:
         return self._tokenizer
 
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Surface the in-vocab image placeholder so
+        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
+        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
+        ``>= vocab_size`` fallback (which would miss all positions now that
+        the OOV remap in __call__/load_tokenizer is gone).
+        """
+        return torch.tensor([self.image_token_index], dtype=torch.int32)
+
     @property
     def model_path(self) -> str:
         return self._model_path
@@ -1425,8 +1441,9 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
             **kwargs)
         token_ids = text_inputs.input_ids.squeeze()
 
-        # Replace image token indices with out-of-vocabulary tokens
-        token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+        # Keep image_token_index in-vocab so the model engine can locate mm
+        # positions via ``torch.isin(input_ids, mm_token_ids)`` without the
+        # legacy ``vocab_size + 1`` remap.
         # Concatenate all multimodal embeddings
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings,
@@ -1464,8 +1481,8 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
             **truncate_kwargs)
         if images:
             token_ids = processed["input_ids"].squeeze()
-            # for fuse_input_embeds
-            token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+            # Keep image_token_index in-vocab; mm positions are located by
+            # the model engine via ``torch.isin(input_ids, mm_token_ids)``.
 
             multimodal_data = {}
             multimodal_data["image"] = {
@@ -1506,6 +1523,20 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         if not DISAGG:
             self.mm_encoder = Llama4VisionEncoder(full_model_config)
 
+        # Surface the in-vocab image placeholder to the model engine's
+        # ``runners.prepare_multimodal_indices`` so it selects the ``torch.isin``
+        # predicate. Read from ``full_model_config`` (the top-level Llama4Config
+        # holds ``image_token_index``; the text-only swapped config above does
+        # not).
+        self._mm_token_ids = torch.tensor(
+            [full_model_config.pretrained_config.image_token_index],
+            dtype=torch.int32,
+        )
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1528,9 +1559,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                     for multimodal_param in multimodal_params
                 ]
 
-        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens,
-                                                     input_ids, mm_embeds,
-                                                     **kwargs)
+        input_ids, inputs_embeds = fuse_input_embeds(
+            self.model.embed_tokens,
+            input_ids,
+            mm_embeds,
+            mm_token_ids=self.mm_token_ids,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
+        )
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,
@@ -1564,7 +1600,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             if had_mm_encoder:
                 self.mm_encoder = saved_mm_encoder
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1577,7 +1613,11 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
-@register_auto_model("MistralForCausalLM")
+# NOTE: deliberately NOT decorated with @register_auto_model: the
+# "MistralForCausalLM" architecture is owned by modeling_mistral (which, under
+# the previous eager import order, always overwrote this legacy registration).
+# With the model zoo imported lazily, a duplicate registration here would make
+# the resolved class depend on import order.
 class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
     def __init__(

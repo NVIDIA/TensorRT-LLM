@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -208,6 +209,8 @@ struct QKVPreprocessingParams
     bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
     bool generation_phase{false};
+    // The input contains Q only and the existing KV cache must not be updated.
+    bool q_only_input{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};
@@ -242,42 +245,42 @@ struct QKVPreprocessingParams
         {
             ss << "seq_lens: "
                << *(runtime::ITensor::wrap(
-                      (void*) seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+                      (void*) seq_lens, tensorrt_llm::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
         }
         if (cache_seq_lens && batch_size > 0)
         {
             ss << "cache_seq_lens: "
-               << *(runtime::ITensor::wrap(
-                      (void*) cache_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+               << *(runtime::ITensor::wrap((void*) cache_seq_lens, tensorrt_llm::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size})));
         }
         if (encoder_seq_lens && batch_size > 0)
         {
             ss << "encoder_seq_lens: "
-               << *(runtime::ITensor::wrap(
-                      (void*) encoder_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+               << *(runtime::ITensor::wrap((void*) encoder_seq_lens, tensorrt_llm::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size})));
         }
         if (cu_seq_lens && batch_size > 0)
         {
             ss << "cu_seq_lens: "
                << *(runtime::ITensor::wrap(
-                      (void*) cu_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+                      (void*) cu_seq_lens, tensorrt_llm::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
         }
         if (cu_kv_seq_lens && batch_size > 0)
         {
             ss << "cu_kv_seq_lens: "
-               << *(runtime::ITensor::wrap(
-                      (void*) cu_kv_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+               << *(runtime::ITensor::wrap((void*) cu_kv_seq_lens, tensorrt_llm::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size})));
         }
         if (sparse_kv_offsets)
         {
             ss << "sparse_kv_offsets: "
-               << *(runtime::ITensor::wrap((void*) sparse_kv_offsets, nvinfer1::DataType::kINT32,
+               << *(runtime::ITensor::wrap((void*) sparse_kv_offsets, tensorrt_llm::DataType::kINT32,
                       runtime::ITensor::makeShape({batch_size + 1})));
         }
         if (rotary_embedding_inv_freq && batch_size > 0 && rotary_embedding_dim > 0)
         {
             ss << "rotary_embedding_inv_freq: "
-               << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, nvinfer1::DataType::kFLOAT,
+               << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, tensorrt_llm::DataType::kFLOAT,
                       runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
         }
         ss << "rotary_coef_cache_buffer: " << rotary_coef_cache_buffer << std::endl;
@@ -307,6 +310,7 @@ struct QKVPreprocessingParams
         ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "generation_phase: " << generation_phase << std::endl;
+        ss << "q_only_input: " << q_only_input << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 
         return ss.str();
@@ -416,6 +420,16 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 template <typename T, typename KVCacheBuffer>
 void invokeDebugSparseKvCacheParams(
     QKVPreprocessingParams<T, KVCacheBuffer> params, int* debug_output, cudaStream_t stream);
+
+//! Compact a uniform group of KVCacheManagerV2 layer pools in one batched launch
+//! (per request and head, moves are ascending and never overtake their sources:
+//! the copy runs in place).
+template <typename T>
+void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
+    int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
+    int64_t sourceLayerStride, int64_t sourceHeadStride, int32_t const* sparseKvOffsets,
+    int32_t const* destinationBases, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
+    cudaStream_t stream);
 
 template <typename T, typename KVCacheBuffer>
 void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)

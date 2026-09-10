@@ -5,6 +5,7 @@ backend: "pytorch"
 cuda_graph_config: null
 disable_overlap_scheduler: True
 perf_metrics_max_requests: 1000
+return_perf_metrics: true
 context_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -13,6 +14,7 @@ context_servers:
   perf_metrics_max_requests: 1000
   cache_transceiver_config:
     backend: DEFAULT
+    transceiver_runtime: CPP
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -21,3 +23,4 @@ generation_servers:
   perf_metrics_max_requests: 1000
   cache_transceiver_config:
     backend: DEFAULT
+    transceiver_runtime: CPP

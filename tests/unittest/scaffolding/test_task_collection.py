@@ -2,12 +2,16 @@ import copy
 from enum import Enum
 from typing import List
 
+import pytest
+
 from tensorrt_llm.scaffolding import (AssistantMessage, ChatTask, Controller,
                                       DropKVCacheTask, DropKVCacheWorkerTag,
                                       ParallelProcess, ScaffoldingLlm, Task,
                                       TaskCollection, TaskStatus, UserMessage,
                                       Worker, drop_kv_cache_scope,
                                       sub_request_node, with_task_collection)
+
+pytestmark = pytest.mark.cpu_only
 
 
 class DummyTask(Task):

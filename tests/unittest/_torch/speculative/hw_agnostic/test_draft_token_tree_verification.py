@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 
 import torch
@@ -11,8 +9,6 @@ from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def run_test(
@@ -67,7 +63,7 @@ def run_test(
         .tolist()
     )
     input_new_tokens_list = input_new_tokens.tolist()
-    num_accepted_draft_tokens = torch_sampler._process_draft_tokens_tree(
+    num_accepted_draft_tokens = torch_sampler._two_model_spec_dec._process_draft_tokens_tree(
         request=input_request,
         new_tokens_tensor=input_new_tokens,
         new_tokens_list=input_new_tokens_list,

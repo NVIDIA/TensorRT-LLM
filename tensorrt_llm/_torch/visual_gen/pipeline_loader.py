@@ -6,6 +6,7 @@ Flow:
 2. Create pipeline via AutoPipeline.from_config() with MetaInit
 3. Load weights with on-the-fly quantization if dynamic_weight_quant=True
 4. Call pipeline.post_load_weights()
+5. Apply runtime LoRA adapters after all post-load hooks finish
 
 Dynamic Quantization:
 - If quant_config specifies FP8/NVFP4 and dynamic_weight_quant=True:
@@ -21,8 +22,10 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+    CUTE_AVAILABLE,
+)
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -177,6 +180,7 @@ class PipelineLoader:
         4. Load transformer weights via pipeline.load_transformer_weights()
         5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
+        7. Apply runtime LoRA adapters after all post-load hooks finish
 
         Args:
             checkpoint_dir: Local path or HF Hub model ID (uses ``args.model`` if not provided)
@@ -221,6 +225,21 @@ class PipelineLoader:
             logger.info(f"Quantization: {config.quant_config.quant_algo.name}")
             logger.info(f"Dynamic weight quant: {config.dynamic_weight_quant}")
 
+        _attn_backend = config.attention.backend
+        _sa_cfg = config.attention.sparse_attention_config
+        if (
+            _attn_backend == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        ):
+            kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
+            logger.info(
+                f"Attention backend: CUTEDSL (algorithm=vsa, "
+                f"sparsity={_sa_cfg.vsa_sparsity}, fine-stage={kernel_path})"
+            )
+        else:
+            logger.info(f"Attention backend: {_attn_backend}")
+
         # =====================================================================
         # STEP 1b: Build VisualGenMapping (must precede model creation)
         # =====================================================================
@@ -236,9 +255,10 @@ class PipelineLoader:
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
 
-        # Convert meta tensors to CUDA tensors
-        self._materialize_meta_tensors(pipeline)
-        pipeline.to(self.device)
+        # Convert meta tensors to their runtime devices. Offloaded submodules
+        # stay on CPU until they are explicitly staged.
+        cpu_offload_modules = self._get_load_time_cpu_offload_modules(pipeline)
+        self._materialize_meta_tensors(pipeline, cpu_offload_modules)
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
@@ -278,6 +298,8 @@ class PipelineLoader:
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+        pipeline._setup_runtime_lora()
+        pipeline.initialize_offload_pipeline()
 
         if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128
@@ -285,15 +307,17 @@ class PipelineLoader:
         else:
             logger.info("torch.compile disabled by config")
 
+        # Cache acceleration (TeaCache / Cache-DiT) is enabled AFTER torch.compile
+        # on purpose: Cache-DiT captures references to the transformer block
+        # modules at enable time, while torch_compile() replaces the block lists
+        # with compiled copies. If Cache-DiT were enabled first, it would keep
+        # running the stale eager blocks and torch.compile would contribute
+        # nothing.
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline._setup_cache_acceleration()
+
         if not skip_warmup:
-            if config.torch_compile.enable_autotune:
-                with autotune(
-                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
-                    skip_dynamic_tuning_buckets=True,
-                ):
-                    pipeline.warmup()
-            else:
-                pipeline.warmup()
+            pipeline.warmup()
             logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
         else:
             logger.info("Warmup skipped (skip_warmup=True)")
@@ -313,20 +337,83 @@ class PipelineLoader:
         )
         return pipeline
 
-    def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:
+    def _get_load_time_cpu_offload_modules(self, pipeline: "BasePipeline") -> list[torch.nn.Module]:
+        """Return offloaded modules that should materialize on CPU at load time.
+
+        The offload manager is initialized only after weights and quantization
+        hooks run, but MetaInit materialization happens before loading. This
+        helper mirrors the pipeline's configured stages so offloaded towers never
+        need to materialize on GPU first.
         """
-        Convert meta tensors to CUDA tensors.
+        available_components = pipeline.offload_pipeline_components()
+        modules: list[torch.nn.Module] = []
+        seen: set[int] = set()
+
+        for stage in pipeline.offloader.filter_available_stages(
+            pipeline.offloader.stages(), available_components
+        ):
+            for component in stage:
+                offload_module = available_components[component]
+                module_id = id(offload_module)
+                if module_id not in seen:
+                    modules.append(offload_module)
+                    seen.add(module_id)
+
+        return modules
+
+    def _materialize_meta_tensors(
+        self,
+        module: torch.nn.Module,
+        cpu_offload_modules: Optional[list[torch.nn.Module]] = None,
+    ) -> None:
+        """
+        Convert meta tensors to tensors on their runtime devices.
 
         Meta tensors are placeholders that don't allocate GPU memory.
         After model structure is defined, we materialize them to real tensors.
+        Submodules listed in ``cpu_offload_modules`` are materialized on CPU and
+        skipped by the final move to ``self.device`` so checkpoint loading never
+        needs the full offloaded tower resident on GPU.
         """
-        memo = {}
+        cpu_offload_modules = cpu_offload_modules or []
+        meta_device = torch.device("meta")
+
+        cpu_memo = {}
+
+        def init_cpu_tensor(t: torch.Tensor) -> torch.Tensor:
+            if t.device != meta_device:
+                return t.to("cpu")
+            if t not in cpu_memo:
+                cpu_memo[t] = torch.empty_like(t, device="cpu")
+            return cpu_memo[t]
+
+        for offload_module in cpu_offload_modules:
+            offload_module._apply(init_cpu_tensor)
+
+        cpu_tensor_ids = self._collect_module_tensor_ids(cpu_offload_modules)
+        target_memo = {}
 
         def init_meta_tensor(t: torch.Tensor) -> torch.Tensor:
-            if t.device != torch.device("meta"):
+            if id(t) in cpu_tensor_ids:
                 return t
-            if t not in memo:
-                memo[t] = torch.empty_like(t, device=self.device)
-            return memo[t]
+            if t.device != meta_device:
+                return t.to(self.device)
+            if t not in target_memo:
+                target_memo[t] = torch.empty_like(t, device=self.device)
+            return target_memo[t]
 
         module._apply(init_meta_tensor)
+
+    @staticmethod
+    def _collect_module_tensor_ids(modules: list[torch.nn.Module]) -> set[int]:
+        """Collect parameter and buffer object IDs owned by ``modules``."""
+        tensor_ids: set[int] = set()
+        for module in modules:
+            for child in module.modules():
+                for param in child._parameters.values():
+                    if param is not None:
+                        tensor_ids.add(id(param))
+                for buffer in child._buffers.values():
+                    if buffer is not None:
+                        tensor_ids.add(id(buffer))
+        return tensor_ids

@@ -34,14 +34,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
     from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
-    from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -161,12 +160,17 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
     backend = "nccl" if use_cuda else "gloo"
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, backend, test_fn, port),
-        nprocs=world_size,
-        join=True,
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, backend, test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 
@@ -823,6 +827,7 @@ def _logic_init_guard_missing_head_attrs(rank, world_size):
         assert "head_dim" in str(e) or "num_heads" in str(e), f"Unexpected RuntimeError: {e}"
 
 
+@pytest.mark.cpu_only
 class TestAttn2DAttentionInitGuards:
     """Attention2DAttention.__init__ rejects invalid inner backends."""
 

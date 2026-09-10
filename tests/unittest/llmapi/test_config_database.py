@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
@@ -36,6 +36,9 @@ from .yaml_validation_harness import (
     mock_cuda_for_schema_validation,
     validate_torch_llm_args_config,
 )
+
+pytestmark = pytest.mark.cpu_only
+
 
 CONFIG_ROOT = Path(__file__).parents[3] / "examples" / "configs"
 REPO_ROOT = CONFIG_ROOT.parent.parent
@@ -101,7 +104,7 @@ def _get_default_values_for_config(config_path: Path) -> dict:
 
     model = entry["model"]
     arch = entry["arch"]
-    model_cls = MODEL_CLASS_MAPPING.get(arch)
+    model_cls = get_registered_model_class(arch)
     if not model_cls or not hasattr(model_cls, "get_model_defaults"):
         return global_default
 
@@ -228,7 +231,7 @@ def test_database_yaml_config_serve_cli(config_path: Path):
     mock_pytorch_llm = mock.Mock(return_value=mock_llm)
 
     with (
-        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
         mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
         mock.patch("tensorrt_llm.commands.serve.PyTorchLLM", mock_pytorch_llm),
         mock.patch("tensorrt_llm.commands.serve.OpenAIServer", _MockOpenAIServer),
@@ -268,7 +271,7 @@ def test_serve_cli_passes_middlewares_to_launch_server():
     )
 
     with (
-        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
         mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
         mock.patch("tensorrt_llm.commands.serve.launch_server") as mock_launch_server,
     ):
@@ -287,9 +290,35 @@ def test_serve_cli_passes_middlewares_to_launch_server():
     assert mock_launch_server.call_args.args[4] == middleware
 
 
+def test_serve_cli_enable_visual_gen_routes_to_visual_gen():
+    with (
+        mock.patch(
+            "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+            return_value=False,
+        ),
+        mock.patch("tensorrt_llm.commands.serve.launch_server") as mock_launch_server,
+        mock.patch(
+            "tensorrt_llm.commands.serve.launch_visual_gen_server"
+        ) as mock_launch_visual_gen_server,
+    ):
+        serve_main(
+            args=["dummy/model", "--enable_visual_gen"],
+            standalone_mode=False,
+        )
+
+    mock_launch_server.assert_not_called()
+    mock_launch_visual_gen_server.assert_called_once()
+    assert mock_launch_visual_gen_server.call_args.args[:4] == (
+        "localhost",
+        8000,
+        "dummy/model",
+        None,
+    )
+
+
 def test_serve_cli_rejects_middleware_with_grpc():
     with (
-        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),
         mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
     ):
         with pytest.raises(ValueError, match="Argument 'middleware' is not supported"):

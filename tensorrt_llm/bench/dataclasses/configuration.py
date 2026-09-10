@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, Literal, Optional, Set, Union
 
 from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
@@ -82,7 +82,8 @@ class RuntimeConfig(BaseModel):
         if self.backend in backend_config_map:
             llm_args.update(backend_config_map[self.backend]())
 
-        kv_cache_config = self.settings_config.get_kvcache_config().__dict__
+        kv_cache_config = self.settings_config.get_kvcache_config().model_dump(
+            exclude_unset=True)
         backend_cache_config = llm_args.pop("kv_cache_config", {})
         llm_args["kv_cache_config"] = backend_cache_config | kv_cache_config
 
@@ -139,7 +140,6 @@ class PerformanceOptions:
 
 
 class DecodingConfig(BaseModel):
-    medusa_choices: Optional[List[List[int]]] = None
     decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
 
     @field_validator("decoding_mode")
@@ -149,23 +149,10 @@ class DecodingConfig(BaseModel):
                           SpeculativeDecodingMode]) -> SpeculativeDecodingMode:
         return SpeculativeDecodingMode(value)
 
-    @model_validator(mode="after")
-    def validate_speculative_decoding(self) -> DecodingConfig:
-        if self.medusa_choices and self.decoding_mode != SpeculativeDecodingMode.MEDUSA:
-            raise RuntimeError(
-                "Attempting to use set Medusa choices with a non-Medusa engine."
-                " Verify that you are using a Medusa engine.")
-
-        return self
-
     def get_decoding_config(self) -> trtllm.DecodingConfig:
         """Create a populated TRT-LLM DecodingConfig."""
-        kwargs = {"decoding_mode": SPECULATIVE_MAP[self.decoding_mode]()}
-
-        if self.medusa_choices is not None:
-            kwargs["medusa_choices"] = self.medusa_choices
-
-        return trtllm.DecodingConfig(**kwargs)
+        return trtllm.DecodingConfig(
+            decoding_mode=SPECULATIVE_MAP[self.decoding_mode]())
 
 
 class ExecutorSettingsConfig(BaseModel):

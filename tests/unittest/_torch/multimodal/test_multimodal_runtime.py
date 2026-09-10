@@ -14,6 +14,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           maybe_compute_mm_embed_cumsum)
 
+pytestmark = pytest.mark.cpu_only
+
 # Embedding dim kept small — functions under test only index along dim 0.
 _EMBED_DIM = 4
 

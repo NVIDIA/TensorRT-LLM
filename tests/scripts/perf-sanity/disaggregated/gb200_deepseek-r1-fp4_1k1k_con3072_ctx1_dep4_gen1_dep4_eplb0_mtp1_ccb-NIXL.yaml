@@ -55,7 +55,7 @@ worker_config:
       max_batch_size: 768
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.9
+      free_gpu_memory_fraction: 0.95
       dtype: fp8
     moe_config:
       backend: CUTEDSL
@@ -63,7 +63,8 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: MTP
       num_nextn_predict_layers: 1
@@ -90,5 +91,6 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+      transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     speculative_config: *id001

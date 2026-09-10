@@ -16,6 +16,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/MiniMaxReduceRMSKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
@@ -816,7 +817,7 @@ void dispatch_dtype(MiniMaxReduceRMSParams const& params)
     bool use_float4 = (params.allreduce_in_k != nullptr) && (params.hidden_dim * params.nranks == 6144)
         && (params.hidden_dim_k * params.nranks == 1024);
 
-    if (params.dtype == nvinfer1::DataType::kHALF)
+    if (params.dtype == tensorrt_llm::DataType::kHALF)
     {
         if (use_float4)
         {
@@ -827,7 +828,7 @@ void dispatch_dtype(MiniMaxReduceRMSParams const& params)
             minimax_reduce_rms_kernel_launcher<half, NRanks>(params);
         }
     }
-    else if (params.dtype == nvinfer1::DataType::kBF16)
+    else if (params.dtype == tensorrt_llm::DataType::kBF16)
     {
         if (use_float4)
         {
@@ -838,7 +839,7 @@ void dispatch_dtype(MiniMaxReduceRMSParams const& params)
             minimax_reduce_rms_kernel_launcher<__nv_bfloat16, NRanks>(params);
         }
     }
-    else if (params.dtype == nvinfer1::DataType::kFLOAT)
+    else if (params.dtype == tensorrt_llm::DataType::kFLOAT)
     {
         if (use_float4)
         {

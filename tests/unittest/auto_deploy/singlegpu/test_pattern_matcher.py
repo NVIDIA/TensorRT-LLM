@@ -12,6 +12,8 @@ from tensorrt_llm._torch.auto_deploy.utils.pattern_matcher import (
     register_ad_pattern,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _LateCastMultiOutputModule(nn.Module):
     def forward(

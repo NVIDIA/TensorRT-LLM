@@ -15,19 +15,29 @@
 from typing import Optional
 
 import click
+import yaml
 
 import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
-from .._tensorrt_engine import LLM
-from ..evaluate import (AIME2025, AIME2026, GSM8K, MMLU, MMMU, CnnDailymail,
-                        CoVoST2, GPQADiamond, GPQAExtended, GPQAMain,
-                        JsonModeEval, LongBenchV1, LongBenchV2, MMMUPro)
-from ..llmapi import BuildConfig, KvCacheConfig
-from ..llmapi.llm_utils import update_llm_args_with_extra_options
+from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
+                        ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
+                        GPQAExtended, GPQAMain, GPQANemoSkills, IFBench,
+                        ImageGenerationEval, JsonModeEval, LongBenchV1,
+                        LongBenchV2, MMMUPro, SciCode)
+from ..llmapi import KvCacheConfig
+from ..llmapi.llm_args import TorchLlmArgs
+from ..llmapi.llm_utils import update_llm_args_with_extra_dict
 from ..logger import logger, severity_map
+from ..usage import apply_usage_session_config
 from ..usage import config as _telemetry_config
+from ._telemetry import TelemetryGroup, apply_raw_config_telemetry_opt_out
 from .utils import collect_explicit_cli_keys
+
+# CLI defaults are sourced from the TorchLlmArgs field defaults so they stay in
+# lock-step with the args class and can't drift.
+_LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+_IMAGE_GENERATION_EVAL_COMMAND = "image_generation_eval"
 
 # Map Click parameter names to the LlmArgs field name (or merge-function CLI
 # scalar name) used by `update_llm_args_with_extra_options`.
@@ -40,7 +50,11 @@ _CLICK_TO_LLM_ARG = {
 }
 
 
-@click.group()
+@click.group(
+    cls=TelemetryGroup,
+    telemetry_usage_context=_telemetry_config.UsageContext.CLI_EVAL,
+    telemetry_component="llm",
+)
 @click.option(
     "--model",
     required=True,
@@ -62,7 +76,7 @@ _CLICK_TO_LLM_ARG = {
 )
 @click.option(
     "--backend",
-    type=click.Choice(["pytorch", "tensorrt"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
     help="The backend to use for evaluation. Default is pytorch backend.")
 @click.option('--log_level',
@@ -71,23 +85,23 @@ _CLICK_TO_LLM_ARG = {
               help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
-              default=BuildConfig.model_fields["max_beam_width"].default,
+              default=_LLM_ARGS_FIELDS["max_beam_width"].default,
               help="Maximum number of beams for beam search decoding.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.model_fields["max_num_tokens"].default,
+    default=_LLM_ARGS_FIELDS["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch."
 )
 @click.option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.model_fields["max_seq_len"].default,
+    default=None,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
 @click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
@@ -144,6 +158,15 @@ def main(ctx, model: str, tokenizer: Optional[str],
          telemetry: bool):
     logger.set_level(log_level)
 
+    if ctx.invoked_subcommand == _IMAGE_GENERATION_EVAL_COMMAND:
+        ctx.obj = {
+            "model": model,
+            "extra_llm_api_options": extra_llm_api_options,
+            "log_level": log_level,
+            "telemetry": telemetry,
+        }
+        return
+
     explicit_cli_keys = collect_explicit_cli_keys(
         exclude=("extra_llm_api_options", "config"),
         translate=_CLICK_TO_LLM_ARG)
@@ -185,23 +208,38 @@ def main(ctx, model: str, tokenizer: Optional[str],
                         max_num_tokens=max_num_tokens,
                         max_beam_width=max_beam_width,
                         max_seq_len=max_seq_len)
-    elif backend == 'tensorrt':
-        llm_cls = LLM
-        build_config = BuildConfig(max_batch_size=max_batch_size,
-                                   max_num_tokens=max_num_tokens,
-                                   max_beam_width=max_beam_width,
-                                   max_seq_len=max_seq_len)
-        llm_args.update(build_config=build_config)
     else:
         raise click.BadParameter(
             f"{backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
+    # Pre-check YAML telemetry settings before full config validation.
     if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(
+        with open(extra_llm_api_options, 'r') as f:
+            llm_args_extra_dict = yaml.safe_load(f)
+        if llm_args_extra_dict is None:
+            llm_args_extra_dict = {}
+        elif not isinstance(llm_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+        apply_raw_config_telemetry_opt_out(
+            llm_args_extra_dict,
+            usage_context=_telemetry_config.UsageContext.CLI_EVAL,
+            component="llm",
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
+        llm_args = update_llm_args_with_extra_dict(
             llm_args,
+            llm_args_extra_dict,
             extra_llm_api_options,
             explicit_cli_keys=explicit_cli_keys)
+
+    # Update telemetry state or disable the early session.
+    apply_usage_session_config(
+        llm_args.get("telemetry_config"),
+        default_usage_context=_telemetry_config.UsageContext.CLI_EVAL.value,
+        component="llm",
+        lifecycle_phase="config_validation",
+    )
 
     profiler.start("trtllm init")
     llm = llm_cls(**llm_args)
@@ -228,6 +266,13 @@ main.add_command(LongBenchV1.command)
 main.add_command(LongBenchV2.command)
 main.add_command(AIME2025.command)
 main.add_command(AIME2026.command)
+main.add_command(GPQANemoSkills.command)
+main.add_command(IFBench.command)
+main.add_command(SciCode.command)
+main.add_command(ImageGenerationEval.command)
+main.add_command(HLE.command)
+main.add_command(AALCR.command)
+main.add_command(ArenaHard.command)
 
 if __name__ == "__main__":
     main()

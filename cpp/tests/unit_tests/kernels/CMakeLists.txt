@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -13,9 +13,9 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
-add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
+add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
@@ -33,15 +33,19 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
-  remove_compile_definition(mixtureOfExpertsInternalTest
-                            USING_OSS_CUTLASS_MOE_GEMM)
+  # The internal-path variant includes headers (quantization.h) that only ship
+  # with the internal cutlass kernels sources; the prebuilt tarball provides the
+  # library and a reduced header set only.
+  if(INTERNAL_CUTLASS_KERNELS_PATH)
+    add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
+    remove_compile_definition(mixtureOfExpertsInternalTest
+                              USING_OSS_CUTLASS_MOE_GEMM)
+  endif()
 endif()
 
 add_gtest(ropeTest ropeTest.cu)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
 add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
@@ -81,17 +85,14 @@ foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
   endif()
 endforeach()
 
-set(SAMPLING_KERNEL_TEST_SRC
-    sampling/samplingTest.cpp sampling/samplingTopKTest.cpp
-    sampling/samplingTopPTest.cpp sampling/samplingAirTopPTest.cpp
-    sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
-add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
-
 set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp
     routing/routingCustomTest.cpp routing/routingDeepSeekTest.cpp)
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
+
+add_gtest(blockScaleMoeActivationTest blockScaleMoeActivationTest.cu)
+add_gtest(blockScaleMoeFinalizeTest blockScaleMoeFinalizeTest.cu)
 
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
@@ -101,6 +102,22 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
 endif()
 
-add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
+
+set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
+    nvfp4ColdPageKernelsTest.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/logger.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/stringUtils.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/tllmException.cpp)
+add_gtest(nvfp4ColdPageKernelsTest "${NVFP4_COLD_PAGE_KERNEL_TEST_SRC}"
+          NO_TLLM_LINKAGE)
+target_include_directories(
+  nvfp4ColdPageKernelsTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+target_link_libraries(nvfp4ColdPageKernelsTest PRIVATE CUDA::cudart
+                                                       CUDA::cuda_driver)

@@ -22,6 +22,7 @@
 #include <cuda/cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 #include "CutlassPipeline.h"
 #include "CutlassBarrier.h"
 #include "CutlassUtils.h"
@@ -297,16 +298,17 @@ template <int32_t TileSizePerCtaQ,
           int32_t HeadDimPerCta,
           int32_t NumWarpGrpThreads,
           bool GroupsTokensHeadsQ,
-          bool IsE4m3Bmm,
           bool UsesCgaReduction,
           typename DtypeO,
-          typename DtypePartialO>
+          typename DtypePartialO,
+          typename DtypeSfO = cutlass::float_e4m3_t>
 inline __device__ void reducePartialO(DtypeO* oPtr,
                                       DtypePartialO const* partialOPtr,
                                       float const* partialStatsPtr,
                                       float const* attentionSinksPtr,
                                       float* softmaxStatsPtr,
                                       float softmaxScaleLog2,
+                                      float softmaxPScale,
                                       int32_t numCtasKv,
                                       int32_t warpGrpThreadIdx,
                                       int32_t ctaIdxKvForReduction,
@@ -315,7 +317,7 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
                                       trtllm::dev::fast_mod_div numHeadsQPerKvDivisor,
                                       int32_t numValidRows,
                                       bool storesSoftmaxStats,
-                                      cutlass::float_e4m3_t* oSfPtr = nullptr,
+                                      DtypeSfO* oSfPtr = nullptr,
                                       float sfScale = 0.f,
                                       int32_t sfBaseRowIdx = 0) {
 
@@ -455,9 +457,8 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
     if (attentionSinksPtr != nullptr) {
       float attentionSinkVal =
         exp2f(attentionSinksPtr[localHeadIdxO] * CUDART_L2E_F - maxVal * softmaxScaleLog2);
-      // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
-      // has also included the 448.f quantization scale.
-      sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
+      // Multiply the attention sink value by the quantization scale included in the sum value.
+      sumVal += attentionSinkVal * softmaxPScale;
     }
 
     // Stores the final softmax stats values to global memory if needed (Helix attention, which
@@ -465,8 +466,8 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
     if (storesSoftmaxStats && isValidRow && headDimIdx == 0) {
       // The softmaxScale.
       float softmaxScale = (softmaxScaleLog2 * (1.f / CUDART_L2E_F));
-      // The sumScale to unscale the 448.f quantization scale from P.
-      float sumScale = IsE4m3Bmm ? (1.f / 448.f) : 1.f;
+      // The sumScale to unscale the softmaxPScale quantization scale from P.
+      float sumScale = 1.f / softmaxPScale;
       // The final max and sum values.
       float2 stats{maxVal * softmaxScale, sumVal * sumScale};
       // Store the final max and sum values to global memory.
@@ -474,9 +475,9 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
     }
 
     // The final normalized scale.
-    // If the output data type is e4m3, make sure that sumVal is divided by the quantization scale
-    // (448.f), so 1.0f / (sumVal / 448.f) = 448.f / sumVal.
-    float normalizedScale{IsE4m3Bmm ? (448.f / sumVal) : (1.0f / sumVal)};
+    // Make sure that sumVal is divided by the quantization scale, so
+    // 1.0f / (sumVal / softmaxPScale) = softmaxPScale / sumVal.
+    float normalizedScale{softmaxPScale / sumVal};
     float2 normalizedScale2{normalizedScale, normalizedScale};
 
     // Apply the normalized scale to the reduced O values.
@@ -486,11 +487,14 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
     }
 
     // Convert the float values to DtypeO, and Store it to global memory.
-    if constexpr (std::is_same_v<DtypeO, cutlass::float_e2m1_t>) {
-      // The number of E2m1 elements packed in a byte.
-      int32_t constexpr NumE2m1EltsPerByte = 2;
+    constexpr bool IsMxE4m3Output = std::is_same_v<DtypeO, cutlass::float_e4m3_t> &&
+                                    std::is_same_v<DtypeSfO, cutlass::float_ue8m0_t>;
+    constexpr bool IsE2m1Output = std::is_same_v<DtypeO, cutlass::float_e2m1_t>;
+    if constexpr (IsMxE4m3Output || IsE2m1Output) {
+      // The number of output elements packed in a byte.
+      int32_t constexpr NumEltsPerDstByte = IsE2m1Output ? 2 : 1;
       // The number of elements per sf.
-      int32_t constexpr NumEltsPerSf = 16;
+      int32_t constexpr NumEltsPerSf = IsE2m1Output ? 16 : 32;
       // The number of cols of SF per block.
       int32_t constexpr NumColsPerSfBlock = 4;
       // The size of each SF block.
@@ -518,8 +522,9 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
         storeGmemSfOffset =
           sfColIdx / NumColsPerSfBlock * NumBytesPerSfBlock + sfColIdx % NumColsPerSfBlock;
       }
+
       convertAndStoreToGmem<DtypeO>(
-        reinterpret_cast<char*>(oPtr + gmemStoreOffset / NumE2m1EltsPerByte),
+        reinterpret_cast<char*>(oPtr + gmemStoreOffset / NumEltsPerDstByte),
         reinterpret_cast<char*>(oSfPtr) + storeGmemSfOffset,
         outputVals,
         sfScale,
@@ -539,11 +544,11 @@ template <int32_t TileSizePerCtaQ,
           int32_t HeadDimPerCta,
           int32_t NumWarpGrpThreads,
           bool GroupsTokensHeadsQ,
-          bool IsE4m3Bmm,
           bool UsesCgaReduction,
           typename DtypeO,
           typename DtypePartialO,
-          typename Barrier>
+          typename Barrier,
+          typename DtypeSfO = cutlass::float_e4m3_t>
 inline __device__ void reducePartialO(DtypeO* oPtr,
                                       DtypePartialO const* partialOPtr,
                                       float const* partialStatsPtr,
@@ -552,6 +557,7 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
                                       Barrier* transactionBarrier,
                                       int32_t completionBytes,
                                       float softmaxScaleLog2,
+                                      float softmaxPScale,
                                       int32_t numCtasKv,
                                       int32_t warpGrpThreadIdx,
                                       int32_t ctaIdxKvForReduction,
@@ -560,7 +566,7 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
                                       trtllm::dev::fast_mod_div numHeadsQPerKvDivisor,
                                       int32_t numValidRows,
                                       bool storesSoftmaxStats,
-                                      cutlass::float_e4m3_t* oSfPtr = nullptr,
+                                      DtypeSfO* oSfPtr = nullptr,
                                       float sfScale = 0.f,
                                       int32_t sfBaseRowIdx = 0) {
 
@@ -583,13 +589,13 @@ inline __device__ void reducePartialO(DtypeO* oPtr,
                  HeadDimPerCta,
                  NumWarpGrpThreads,
                  GroupsTokensHeadsQ,
-                 IsE4m3Bmm,
                  UsesCgaReduction>(oPtr,
                                    partialOPtr,
                                    partialStatsPtr,
                                    attentionSinksPtr,
                                    softmaxStatsPtr,
                                    softmaxScaleLog2,
+                                   softmaxPScale,
                                    numCtasKv,
                                    warpGrpThreadIdx,
                                    ctaIdxKvForReduction,

@@ -462,8 +462,17 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
                     False,
                 )
+                # ``fp4_quantize`` returns the (swizzled) block scale as a flat
+                # 1-D tensor, but ``default_scales`` registers the buffer with the
+                # padded 2-D ``(padded_m, padded_n)`` cutlass shape -- the same
+                # shape the unified-HF-checkpoint branch below produces. Reshape
+                # here so this on-the-fly (bf16 ModelOpt) path stays consistent
+                # with the registered buffer and the HF path; otherwise the flat
+                # scale fails ``load_state_dict`` with a size mismatch.
+                m_w, n_w = weight.shape
+                padded_m, padded_n = self._pad_m_n(m_w, n_w // TRTLLM_NVFP4_SCALING_VECTOR_SIZE)
                 state_dict[weight_name] = weight_fp4
-                state_dict[weight_name + "_scale"] = weight_scale
+                state_dict[weight_name + "_scale"] = weight_scale.reshape(padded_m, padded_n)
                 state_dict[weight_name + "_scale_2"] = weight_scale_2
                 state_dict[alpha_name] = 1 / torch.clamp(
                     weight_scale_2 * state_dict[input_scale_name], min=1e-30

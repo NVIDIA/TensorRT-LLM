@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import os
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+
+
+def make_noise_generator(seed: int, device: torch.device | str) -> torch.Generator:
+    """Create the RNG used to sample a pipeline's initial noise.
+
+    Defaults to an **on-device** generator (``device``), matching mainstream
+    diffusion serving (vLLM-omni and SGLang-Diffusion default the noise generator
+    to the compute device) and TRT-LLM's own LLM sampling path, so a fixed seed
+    reproduces the same latent as before on a given GPU.
+
+    Set ``TLLM_VISUALGEN_CPU_RNG=1`` to force a **CPU** generator instead: the
+    caller samples on CPU and copies to the device (``diffusers.randn_tensor`` does
+    this automatically), so a fixed seed yields an identical latent across GPU
+    archs -- an on-device ``torch.randn`` keys its Philox stream to an
+    SM-count-dependent thread grid, so e.g. sm_100 and sm_107 draw different noise
+    for the same seed. Useful for cross-hardware validation or bit-reproducible
+    serving, at the cost of one small host draw plus an H2D copy.
+
+    If a per-request device choice is ever needed, promote this to a
+    ``generator_device`` request/config field (as vLLM-omni / SGLang-Diffusion do).
+    """
+    gen_device = "cpu" if os.environ.get("TLLM_VISUALGEN_CPU_RNG") == "1" else device
+    return torch.Generator(device=gen_device).manual_seed(seed)
 
 
 @torch.compile
@@ -43,6 +67,65 @@ def as_tuple(x):
     return x if isinstance(x, tuple) else (x, x)
 
 
+def classify_worker_error(exc: BaseException) -> str | None:
+    """Failure class for the response channel: "client", "capacity", or None.
+
+    Keyed off built-in exception types rather than a VisualGen-specific
+    hierarchy: ``ValueError`` means the request's content was unusable
+    (400), ``MemoryError`` means a valid request did not fit (503), and
+    anything else is an unclassified runtime failure (500). Detail travels
+    in the message. ``torch.cuda.OutOfMemoryError`` is spelled out because
+    it derives from ``RuntimeError``, not ``MemoryError``.
+    """
+    if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
+        return "capacity"
+    if isinstance(exc, ValueError):
+        return "client"
+    return None
+
+
+def synchronize_media_prepare_status(exc: Exception | None) -> None:
+    """All-rank convergence point between media prepare and model collectives.
+
+    Every rank decodes/prepares its media independently; a rank that failed
+    while others proceed into the transformer's collectives would hang the
+    job. All ranks call this with their local outcome; if any failed, the
+    lowest failing rank's error class + message is broadcast, the failing
+    rank(s) re-raise their own exception, and every healthy rank raises a
+    reconstructed equivalent in lockstep. Runs on CPU tensors so
+    the hybrid (``cpu:gloo``) process group carries it even when the failure
+    was CUDA/NVDEC initialization. Converges *caught* failures only — a fatal
+    process or context death is beyond its reach.
+    """
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        if exc is not None:
+            raise exc
+        return
+
+    healthy_sentinel = 2**31 - 1
+    rank = dist.get_rank()
+    flag = torch.tensor([rank if exc is not None else healthy_sentinel], dtype=torch.int64)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    failing_rank = int(flag.item())
+    if failing_rank == healthy_sentinel:
+        return
+
+    payload = [None]
+    if rank == failing_rank:
+        payload = [(classify_worker_error(exc), str(exc))]
+    dist.broadcast_object_list(payload, src=failing_rank)
+
+    if exc is not None:
+        raise exc
+    kind, message = payload[0]
+    message = f"[rank {failing_rank}] {message}"
+    if kind == "client":
+        raise ValueError(message)
+    if kind == "capacity":
+        raise MemoryError(message)
+    raise RuntimeError(message)
+
+
 class SequenceSharder:
     """Block-shard / all-gather a tensor along its sequence dimension.
 
@@ -55,7 +138,7 @@ class SequenceSharder:
     uniformly for sequence parallelism (CP × Ulysses).
 
     Models call ``shard(...)`` / ``gather(...)`` / ``shard_rope(...)`` directly;
-    when the sharder is inactive (``size == 1`` or runtime-disabled) every
+    when the sharder is inactive (``size == 1``) every
     method is a no-op pass-through so the call sites do not need an
     ``if is_active`` guard.
 
@@ -65,11 +148,25 @@ class SequenceSharder:
     seq axis from a ``seq_len`` argument).
     """
 
-    def __init__(self, size: int, rank: int, group: Optional[ProcessGroup]):
+    def __init__(
+        self,
+        size: int,
+        rank: int,
+        group: Optional[ProcessGroup],
+        gather_index: Optional[List[int]] = None,
+    ):
         self._size = size
         self._rank = rank
         self._group = group
-        self._enabled = size > 1
+        # Optional shard-order permutation: gather_index[s] = the GROUP rank that
+        # holds shard s. Needed when shard indices don't follow group-rank order
+        # (dist.new_group sorts its rank list, so a group built from a permuted
+        # rank list still numbers members by ascending global rank).
+        if gather_index is not None and sorted(gather_index) != list(range(size)):
+            raise ValueError(
+                f"gather_index must be a permutation of range({size}), got {gather_index}"
+            )
+        self._gather_index = gather_index
 
     # ------------------------------------------------------------------
     # Factory
@@ -122,7 +219,7 @@ class SequenceSharder:
     # ------------------------------------------------------------------
     @property
     def is_active(self) -> bool:
-        return self._enabled and self._size > 1
+        return self._size > 1
 
     @property
     def size(self) -> int:
@@ -135,18 +232,6 @@ class SequenceSharder:
     @property
     def group(self) -> Optional[ProcessGroup]:
         return self._group
-
-    def disable(self) -> None:
-        """Run as if ``size == 1``.
-
-        Used by LTX2's stage-2 single-rank execution path where the
-        non-primary workers have already exited.
-        """
-        self._enabled = False
-
-    def enable(self) -> None:
-        """Re-enable sharding after :meth:`disable` (no-op if size == 1)."""
-        self._enabled = self._size > 1
 
     # ------------------------------------------------------------------
     # Shard
@@ -162,7 +247,7 @@ class SequenceSharder:
         """Contiguous block-shard ``tensor`` along ``dim``.
 
         Returns ``tensor`` unchanged when:
-          * the sharder is inactive (``size == 1`` or runtime-disabled),
+          * the sharder is inactive (``size == 1``),
           * ``tensor is None``,
           * ``expected_seq_len`` is given and ``tensor.shape[dim]`` doesn't
             match — used by LTX2 to skip dataclass fields whose seq axis
@@ -198,7 +283,9 @@ class SequenceSharder:
         start = self._rank * chunk
         idx = [slice(None)] * tensor.ndim
         idx[dim] = slice(start, start + chunk)
-        return tensor[tuple(idx)]
+        # A dim>=1 block slice is non-contiguous when a leading dim is >1 (e.g.
+        # batched CFG B=2); fused DiT kernels need a dense buffer. No-op at B==1.
+        return tensor[tuple(idx)].contiguous()
 
     def shard_rope(
         self,
@@ -247,6 +334,8 @@ class SequenceSharder:
         tensor = tensor.contiguous()
         parts = [torch.empty_like(tensor) for _ in range(self._size)]
         dist.all_gather(parts, tensor, group=self._group)
+        if self._gather_index is not None:
+            parts = [parts[g] for g in self._gather_index]
         out = torch.cat(parts, dim=dim)
 
         if unpad_to is not None:

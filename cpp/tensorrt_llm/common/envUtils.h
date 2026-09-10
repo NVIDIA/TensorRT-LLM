@@ -55,10 +55,21 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Whether the experimental cascade attention kernel is enabled (replaces
+// masked_multihead_attention_kernel for beam-search decoding).
+// Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
+bool getEnvEnableCascadeMmha();
+
 // Whether PDL is enabled for MoE Renormalize routing kernel.
 // Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
 // Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL();
+
+// Set TLLM_USE_FINE_GRAINED_SYNC=1 to select fine-grained sync MoE kernel variants on SM107.
+bool getEnvUseFineGrainedSync();
+
+// Forces getEnvUseFineGrainedSync() to false while set; used by the autotuner during profiling.
+void setFineGrainedSyncDisabledOverride(bool disabled);
 
 template <typename KernelFn, typename... Args>
 inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
@@ -110,6 +121,9 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
+// Opt-in for disaggregated KV transfer in-flight cancellation and fail-closed transfer-buffer quarantine.
+bool getEnvDisaggEnableInflightCancel();
+
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
 
@@ -139,9 +153,10 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
-uint16_t getEnvNixlPort();
+bool getEnvKVCachePoolUseFabricMemory();
 
-bool getEnvNixlEnableCoalesce();
+// Whether to disable coalescing of contiguous NIXL transfer descriptors (coalescing is on by default).
+bool getEnvNixlDisableCoalesce();
 
 bool getEnvDisaggBenchmarkGenOnly();
 

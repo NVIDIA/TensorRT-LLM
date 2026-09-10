@@ -27,9 +27,57 @@ def update_quant_config_from_compressed_tensors(
     if config_groups is None:
         raise ValueError(f"config_groups is not set in {hf_quant_config}.")
 
-    weights_quant_config = config_groups["group_0"]["weights"]
-    inputs_quant_config = config_groups["group_0"]["input_activations"]
+    # compressed-tensors keys config_groups by group name: custom recipes use
+    # "group_0"; named preset schemes (e.g. FP8_DYNAMIC) use the scheme name.
+    # This path applies a single algo globally, so resolve to one group.
+    group_config = config_groups.get("group_0")
+    if group_config is None:
+        if len(config_groups) != 1:
+            raise ValueError(
+                f"Expected 'group_0' or exactly one config group, got {sorted(config_groups)}."
+            )
+        group_config = next(iter(config_groups.values()))
+    weights_quant_config = group_config["weights"]
     weights_quant_strategy = weights_quant_config["strategy"]
+
+    # kv_cache_scheme (llm-compressor): FP8 per-tensor KV cache. Handled
+    # before the weight-algo branches so recipes that early-return (MXFP4
+    # pack-quantized) still pick up the KV-cache quantization.
+    kv_cache_scheme = hf_quant_config.get("kv_cache_scheme")
+    if kv_cache_scheme is not None:
+        if kv_cache_scheme.get("num_bits") == 8 and kv_cache_scheme.get("type") == "float":
+            if quant_config.kv_cache_quant_algo in (None, QuantAlgo.FP8):
+                quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            else:
+                raise ValueError(
+                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, "
+                    "conflicting with FP8 KV cache from HF quant config."
+                )
+        else:
+            raise ValueError(f"Unsupported kv_cache_scheme: {kv_cache_scheme}.")
+
+    # MXFP4 pack-quantized (weight-only): FP4 E2M1 weights packed two per
+    # uint8 with per-32-group uint8 E8M0 scales and no activation
+    # quantization (e.g. Kimi K3 routed experts). Handled before reading the
+    # input-activation strategy, which is null for weight-only recipes.
+    if hf_quant_config.get("format") == "mxfp4-pack-quantized" or (
+        weights_quant_config["num_bits"] == 4
+        and weights_quant_config.get("type") == "float"
+        and weights_quant_strategy == "group"
+        and group_config.get("input_activations") is None
+    ):
+        group_size = weights_quant_config["group_size"]
+        if group_size != 32:
+            raise ValueError(f"Unsupported group_size: {group_size}. Supported: 32 for MXFP4.")
+        quant_config.quant_algo = QuantAlgo.W4A16_MXFP4
+        quant_config.group_size = group_size
+        hf_exclude_modules = hf_quant_config.get("modules_to_not_convert", None)
+        quant_config.exclude_modules = list(
+            set((hf_exclude_modules or []) + hf_quant_config.get("ignore", []))
+        )
+        return
+
+    inputs_quant_config = group_config["input_activations"]
     inputs_quant_strategy = inputs_quant_config["strategy"]
 
     if weights_quant_config["num_bits"] == 8:
@@ -74,20 +122,6 @@ def update_quant_config_from_compressed_tensors(
             f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
             "Supported: 8 (FP8) or 4 (NVFP4)."
         )
-
-    # kv_cache_scheme (llm-compressor): FP8 per-tensor KV cache.
-    kv_cache_scheme = hf_quant_config.get("kv_cache_scheme")
-    if kv_cache_scheme is not None:
-        if kv_cache_scheme.get("num_bits") == 8 and kv_cache_scheme.get("type") == "float":
-            if quant_config.kv_cache_quant_algo in (None, QuantAlgo.FP8):
-                quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-            else:
-                raise ValueError(
-                    f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, "
-                    "conflicting with FP8 KV cache from HF quant config."
-                )
-        else:
-            raise ValueError(f"Unsupported kv_cache_scheme: {kv_cache_scheme}.")
 
     hf_exclude_modules = hf_quant_config.get("modules_to_not_convert", None)
     if hf_exclude_modules is not None:

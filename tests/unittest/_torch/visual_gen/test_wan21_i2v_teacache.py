@@ -171,7 +171,7 @@ def _assert_i2v_teacache(
             seed=INFER_SEED,
         )
 
-    stats = pipeline.transformer_cache_backend.get_stats()
+    stats = pipeline.cache_accelerator.get_stats()
 
     print(f"\n  ===== TeaCache — Wan 2.1 {model} single-stage {height}x{width} =====")
     print(
@@ -252,5 +252,5 @@ class TestWan22_I2V_TeaCacheRaisesError:
             model=WAN22_I2V_A14B_PATH,
             cache_config=TeaCacheConfig(),
         )
-        with pytest.raises(ValueError, match="TeaCache is not supported for Wan 2\\.2"):
+        with pytest.raises(ValueError, match=r"Wan 2\.2 TeaCache requires explicit"):
             PipelineLoader(args).load(skip_warmup=True)

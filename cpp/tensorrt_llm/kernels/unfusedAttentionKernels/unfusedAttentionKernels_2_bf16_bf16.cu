@@ -26,6 +26,7 @@ namespace kernels
 #ifdef ENABLE_BF16
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(__nv_bfloat16, __nv_bfloat16, KVBlockArray);
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(__nv_bfloat16, __nv_bfloat16, KVLinearBuffer);
+INSTANTIATE_SPARSE_KV_CACHE_COMPACT_LAYERS(__nv_bfloat16);
 #endif
 
 } // namespace kernels

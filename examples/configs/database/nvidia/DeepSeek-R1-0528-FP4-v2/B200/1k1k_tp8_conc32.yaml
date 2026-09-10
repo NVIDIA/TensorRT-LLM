@@ -1,4 +1,4 @@
-max_batch_size: 512
+max_batch_size: 32
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 32
@@ -15,5 +15,5 @@ speculative_config:
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8
 trust_remote_code: true
-max_num_tokens: 3136
-max_seq_len: 2068
+max_num_tokens: 1216
+max_seq_len: 2304

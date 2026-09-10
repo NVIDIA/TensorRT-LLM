@@ -16,6 +16,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
@@ -718,9 +719,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 
 bool use_fp32_acc()
 {
-    // we use fp16 acc type by default due to keep align with nccl
+    // FP32 accumulation is the default: native-dtype accumulation measurably hurts
+    // accuracy on models with large residual-stream outliers.
+    // Opt out with ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0 to restore the legacy behavior.
     static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
-    return fp32_acc != nullptr;
+    return fp32_acc == nullptr || fp32_acc[0] != '0';
 }
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
@@ -795,15 +798,15 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     }
 
 #define DISPATCH_DTYPE(NRanks)                                                                                         \
-    if (params.dtype == nvinfer1::DataType::kHALF)                                                                     \
+    if (params.dtype == tensorrt_llm::DataType::kHALF)                                                                 \
     {                                                                                                                  \
         DISPATCH_PATTERN(half, NRanks);                                                                                \
     }                                                                                                                  \
-    else if (params.dtype == nvinfer1::DataType::kBF16)                                                                \
+    else if (params.dtype == tensorrt_llm::DataType::kBF16)                                                            \
     {                                                                                                                  \
         DISPATCH_PATTERN(__nv_bfloat16, NRanks);                                                                       \
     }                                                                                                                  \
-    else if (params.dtype == nvinfer1::DataType::kFLOAT)                                                               \
+    else if (params.dtype == tensorrt_llm::DataType::kFLOAT)                                                           \
     {                                                                                                                  \
         DISPATCH_PATTERN(float, NRanks);                                                                               \
     }                                                                                                                  \

@@ -41,6 +41,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 )
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
+pytestmark = pytest.mark.cpu_only
+
 
 @dataclass
 class MockPrefixReuseSummary:
@@ -912,7 +914,7 @@ class TestPyMicroBatchSchedulerChunking:
     def test_sort_by_lora_task_id(self):
         """
         Requests are sorted by lora_task_id for performance.
-        C++ ref: sortRequests in inflightBatchingUtils.cpp
+        C++ ref: sortRequests in microBatchScheduler.cpp
         """
         scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
         r0 = _make_request(0, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=5)
@@ -1478,9 +1480,9 @@ class TestContextChunkingDirect:
 class TestForceChunkPolicy:
     """
     Tests for FORCE_CHUNK chunking policy in PyMicroBatchScheduler.
-    FORCE_CHUNK always chunks every context request to at most chunk_unit_size
-    tokens per scheduling step, regardless of whether the full context would fit
-    in the budget.
+    FORCE_CHUNK advances context requests to expected snapshot points. Without
+    a remaining snapshot point, it avoids artificial boundaries and consumes
+    the full remaining context unless the scheduling budget requires chunking.
 
     Aligned with C++ ForceChunkTest in microBatchSchedulerTest.cpp.
     """
@@ -1513,12 +1515,12 @@ class TestForceChunkPolicy:
             )
 
     # --- Direct _set_ctx_requests_chunk_size tests ---
-    # C++ ref: ForceChunkTest::Basic through CapacityAcrossIterations
+    # C++ ref: ForceChunkTest direct chunk-size tests.
 
-    def test_basic(self):
+    def test_without_snapshot_points_uses_remaining_context(self):
         """
-        A single request with prompt_len > chunk_unit_size is chunked to unit_size.
-        C++ ref: ForceChunkTest.Basic
+        A request without snapshot points is not split at chunk_unit_size.
+        C++ ref: ForceChunkTest.NoSnapshotPointsUsesRemainingContext
         """
         config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
         scheduler = PyMicroBatchScheduler(
@@ -1526,11 +1528,11 @@ class TestForceChunkPolicy:
         )
         reqs = [make_context_request(0, prompt_len=30)]
         scheduler._set_ctx_requests_chunk_size(reqs, None)
-        assert reqs[0].context_chunk_size == 10
+        assert reqs[0].context_chunk_size == 30
 
     def test_prompt_smaller_than_unit(self):
         """
-        When prompt_len < chunk_unit_size, chunk_size = prompt_len (min).
+        Without snapshot points, a short prompt is consumed in full.
         C++ ref: ForceChunkTest.PromptSmallerThanUnit
         """
         config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=20)
@@ -1543,7 +1545,7 @@ class TestForceChunkPolicy:
 
     def test_exact_unit_size(self):
         """
-        When prompt_len == chunk_unit_size, chunk_size = prompt_len.
+        Without snapshot points, an exact-unit prompt is consumed in full.
         C++ ref: ForceChunkTest.ExactUnitSize
         """
         config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
@@ -1556,7 +1558,8 @@ class TestForceChunkPolicy:
 
     def test_multiple_requests(self):
         """
-        Each request independently gets min(remaining, unit_size).
+        Requests without snapshot points independently consume their remaining
+        contexts.
         C++ ref: ForceChunkTest.MultipleRequests
         """
         config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
@@ -1569,13 +1572,14 @@ class TestForceChunkPolicy:
             make_context_request(2, prompt_len=5),
         ]
         scheduler._set_ctx_requests_chunk_size(reqs, None)
-        assert reqs[0].context_chunk_size == 10
-        assert reqs[1].context_chunk_size == 10
-        assert reqs[2].context_chunk_size == 5  # min(5, 10)
+        assert reqs[0].context_chunk_size == 25
+        assert reqs[1].context_chunk_size == 15
+        assert reqs[2].context_chunk_size == 5
 
     def test_capacity_limits(self):
         """
-        When capacity is limited, later requests get chunk_size=0.
+        Budget truncation is aligned to chunk_unit_size; later requests with
+        less than one unit available are delayed.
         C++ ref: ForceChunkTest.CapacityLimits
         """
         config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
@@ -1587,13 +1591,13 @@ class TestForceChunkPolicy:
             make_context_request(1, prompt_len=30),
         ]
         scheduler._set_ctx_requests_chunk_size(reqs, capacity=15)
-        # req0 gets 10, req1 would push total to 20 > 15 → 0
+        # req0 is budget-truncated to 10; only 5 remain, so req1 gets 0.
         assert reqs[0].context_chunk_size == 10
         assert reqs[1].context_chunk_size == 0
 
     def test_capacity_exact_fit(self):
         """
-        When capacity exactly accommodates all chunks.
+        Capacity can exactly accommodate two requested snapshot chunks.
         C++ ref: ForceChunkTest.CapacityExactFit
         """
         config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
@@ -1604,17 +1608,53 @@ class TestForceChunkPolicy:
             make_context_request(0, prompt_len=30),
             make_context_request(1, prompt_len=30),
         ]
+        for req in reqs:
+            req.expect_snapshot_points = [10]
         scheduler._set_ctx_requests_chunk_size(reqs, capacity=20)
         assert reqs[0].context_chunk_size == 10
         assert reqs[1].context_chunk_size == 10
 
+    def test_expected_snapshot_points(self):
+        """
+        Expected snapshot points are absolute context positions.
+        C++ ref: ForceChunkTest.ExpectedChunkingPoints
+        """
+        reqs = [make_context_request(0, prompt_len=30)]
+        reqs[0].expect_snapshot_points = [12, 25]
+
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [12], "iter 1")
+
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [25], "iter 2")
+
+        self._chunk_iteration(reqs, 10)
+        self._expect_positions(reqs, [30], "iter 3")
+
+    def test_capacity_rounds_expected_snapshot_down_to_unit(self):
+        """
+        Capacity truncation rounds expected chunks down to chunk_unit_size.
+        C++ ref: ForceChunkTest.CapacityRoundsExpectedChunkDownToUnit
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64, max_num_tokens=1000, ctx_chunk_config=config
+        )
+        reqs = [make_context_request(0, prompt_len=50)]
+        reqs[0].expect_snapshot_points = [30]
+
+        scheduler._set_ctx_requests_chunk_size(reqs, capacity=25)
+
+        assert reqs[0].context_chunk_size == 20
+
     def test_multi_iteration(self):
         """
-        A request with prompt_len=25 and chunk_unit_size=10 processes in 3
-        iterations: chunk 1: 10, chunk 2: 10, chunk 3: 5.
+        Snapshot points at 10 and 20 split a 25-token prompt into three
+        iterations.
         C++ ref: ForceChunkTest.MultiIteration
         """
         reqs = [make_context_request(0, prompt_len=25)]
+        reqs[0].expect_snapshot_points = [10, 20]
 
         # Iteration 1
         self._chunk_iteration(reqs, 10)
@@ -1630,14 +1670,16 @@ class TestForceChunkPolicy:
 
     def test_multi_request_multi_iteration(self):
         """
-        Two requests with different lengths processed over multiple iterations.
-        prompt_len={25, 12}, chunk_unit_size=10.
+        Two requests with different snapshot boundaries are processed over
+        multiple iterations.
         C++ ref: ForceChunkTest.MultiRequestMultiIteration
         """
         reqs = [
             make_context_request(0, prompt_len=25),
             make_context_request(1, prompt_len=12),
         ]
+        reqs[0].expect_snapshot_points = [10, 20]
+        reqs[1].expect_snapshot_points = [10]
 
         # Iteration 1: both get 10
         self._chunk_iteration(reqs, 10)
@@ -1653,14 +1695,16 @@ class TestForceChunkPolicy:
 
     def test_capacity_across_iterations(self):
         """
-        With limited capacity, some requests may be delayed to later iterations.
-        prompt_len={25, 25}, chunk_unit_size=10, capacity=15.
+        With limited capacity, requests sharing snapshot points may be delayed
+        to later iterations.
         C++ ref: ForceChunkTest.CapacityAcrossIterations
         """
         reqs = [
             make_context_request(0, prompt_len=25),
             make_context_request(1, prompt_len=25),
         ]
+        for req in reqs:
+            req.expect_snapshot_points = [10, 20]
 
         # Iteration 1: req0=10, req1=0 (10+10=20 > 15)
         self._chunk_iteration(reqs, 10, capacity=15)
@@ -1685,11 +1729,11 @@ class TestForceChunkPolicy:
     # --- Full scheduler.schedule() tests ---
     # C++ ref: ForceChunkTest::FullSchedulerPath through FullSchedulerWithGeneration
 
-    def test_full_scheduler_path(self):
+    def test_full_scheduler_without_snapshot_points_avoids_chunking(self):
         """
-        FORCE_CHUNK always re-chunks even when all contexts fit within the
-        token budget. Test via the full schedule() path.
-        C++ ref: ForceChunkTest.FullSchedulerPath
+        FORCE_CHUNK does not introduce a boundary when no snapshot is needed
+        and the full context fits. Test via the full schedule() path.
+        C++ ref: ForceChunkTest.FullSchedulerWithoutSnapshotPoints
         """
         config = ContextChunkingConfig(ChunkingPolicy.FORCE_CHUNK, chunk_unit_size=10)
         scheduler = PyMicroBatchScheduler(
@@ -1697,9 +1741,8 @@ class TestForceChunkPolicy:
         )
         req = make_context_request(0, prompt_len=30)
         _enc, ctx, gen = scheduler.schedule([req], set())
-        # Despite budget=100 >> prompt=30, FORCE_CHUNK limits chunk to unit_size=10.
         assert len(ctx) == 1
-        assert ctx[0].context_chunk_size == 10
+        assert ctx[0].context_chunk_size == 30
         assert len(gen) == 0
 
     def test_full_scheduler_multiple_requests(self):
@@ -1720,8 +1763,8 @@ class TestForceChunkPolicy:
         assert len(ctx) == 3
         # Find by request_id since sorting may reorder.
         chunks = {r.request_id: r.context_chunk_size for r in ctx}
-        assert chunks[0] == 10
-        assert chunks[1] == 10
+        assert chunks[0] == 25
+        assert chunks[1] == 15
         assert chunks[2] == 5
 
     def test_full_scheduler_with_generation(self):
@@ -1741,7 +1784,8 @@ class TestForceChunkPolicy:
         _enc, ctx, gen = scheduler.schedule(requests, set())
         assert len(gen) == 1
         assert len(ctx) == 1
-        # Budget remaining = 15 - 1 (gen) = 14; chunk = min(30, 10) = 10
+        # Budget remaining = 14, so the 30-token context is rounded down to
+        # one 10-token chunk-unit boundary.
         assert ctx[0].context_chunk_size == 10
 
 
@@ -2373,6 +2417,7 @@ class TestSimpleUnifiedScheduler:
         assert hasattr(output, "paused_requests")
         assert hasattr(output, "fitting_disagg_gen_init_requests")
         assert hasattr(output, "num_fitting_requests")
+        assert len(output.recompute_paused_requests) == 0
         assert len(output.context_requests) == 1
         assert len(output.generation_requests) == 1
         assert len(output.encoder_requests) == 0
@@ -2849,6 +2894,35 @@ class TestPyCapacitySchedulerKVCacheReuse:
         assert fitting[0].request_id == 0
         assert len(paused) == 0
 
+    def test_prefix_aware_scheduling_disabled_does_not_delay_duplicates(self) -> None:
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+
+        def fail_analyze_prefix_reuse(
+            unique_tokens: object, req: LlmRequest
+        ) -> MockPrefixReuseSummary:
+            raise AssertionError("prefix reuse should not be probed when scheduling is disabled")
+
+        kv.analyze_prefix_reuse = fail_analyze_prefix_reuse
+        scheduler = PyCapacityScheduler(
+            max_num_requests=3,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+            enable_prefix_aware_scheduling=False,
+        )
+        tokens = list(range(21))
+        r0 = _make_request(0, prompt_len=21, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=21, input_tokens=tokens)
+        r2 = _make_request(2, prompt_len=21, input_tokens=tokens)
+        fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
+
+        assert [req.request_id for req in fitting] == [0, 1, 2]
+        assert len(disagg) == 0
+        assert len(paused) == 0
+        assert kv.enable_block_reuse is True
+        assert r0.estimated_reusable_tokens == 0
+        assert r1.estimated_reusable_tokens == 0
+        assert r2.estimated_reusable_tokens == 0
+
     def test_delay_duplicate_request_chunked(self):
         """C++ ref: DelayDuplicateRequestChunked"""
         kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5, enable_block_reuse=True)
@@ -3003,6 +3077,148 @@ class TestPyCapacitySchedulerKVCacheReuse:
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         # No reuse: both scheduled together
         assert len(fitting) == 2
+
+
+class PausingMockKVCacheManager(MockKVCacheManager):
+    """Mock whose scheduling free-block pool grows when a sequence is paused.
+
+    The base mock's ``scheduling_remove_sequence`` is a no-op, so the
+    MaxUtilization pause-then-retry path never actually frees capacity there.
+    This mirrors ``WindowBlockManager::schedulingReleaseBlocks``, which returns
+    the victim's blocks to the scheduling free count.
+    """
+
+    def __init__(self, *args, blocks_released_on_pause: int = 5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._blocks_released_on_pause = blocks_released_on_pause
+        self.paused_request_ids: list[int] = []
+
+    def scheduling_remove_sequence(self, req_id: int):
+        self.paused_request_ids.append(req_id)
+        self._num_free_blocks += self._blocks_released_on_pause
+
+
+class PerRequestMockPeftCacheManager(MockPeftCacheManager):
+    """Peft mock whose page demand varies per request id.
+
+    ``PeftCacheManager::determineNumPages`` resolves the LoRA task id against
+    the host cache and falls back to the request's own ``LoraConfig``, so two
+    requests carrying the same task id can report different page counts.
+    """
+
+    def __init__(self, max_pages: int, pages_by_request_id: dict):
+        super().__init__(max_pages=max_pages)
+        self._pages_by_request_id = pages_by_request_id
+
+    def determine_num_pages(self, req) -> int:
+        return self._pages_by_request_id[req.py_request_id]
+
+
+class TestPyCapacitySchedulerContributionRegistration:
+    """
+    A request must not be deferred on behalf of a contributor that was not
+    scheduled in the same iteration.
+
+    ``_beneficial_to_skip`` used to register the checked request's own
+    ``first_new_block`` before any budget check had run, so a contribution could
+    be recorded for a request that never got admitted.
+
+    C++ ref: capacitySchedulerTest.cpp
+    ``MaxUtilizationPauseRetryDoesNotSelfSkip`` /
+    ``GuaranteedNoEvictUnscheduledRequestDoesNotDeferDuplicate``.
+    """
+
+    def test_beneficial_to_skip_does_not_mutate_contribution_sets(self):
+        """The check is pure; only ``_register_contributed_blocks`` may write."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=3,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        req = _make_request(0, prompt_len=21, input_tokens=list(range(21)))
+        ctx_blocks: set = set()
+        cross_blocks: set = set()
+
+        assert scheduler._beneficial_to_skip(req, ctx_blocks, cross_blocks) is False
+        assert ctx_blocks == set()
+        assert cross_blocks == set()
+
+        scheduler._register_contributed_blocks(req, ctx_blocks, cross_blocks)
+        assert len(ctx_blocks) == 1
+        # Now that the contributor is registered, a duplicate defers to it.
+        dup = _make_request(1, prompt_len=21, input_tokens=list(range(21)))
+        assert scheduler._beneficial_to_skip(dup, ctx_blocks, cross_blocks) is True
+
+    def test_max_utilization_retry_after_pause_does_not_self_skip(self):
+        """MaxUtilization: the request a pause made room for must be admitted.
+
+        On a failed admission the loop pauses a started request and retries the
+        *same* request without advancing ``req_it``. If the first attempt had
+        already registered that request's ``first_new_block``, the retry saw its
+        own key in the set and skipped itself — evicting a running request for
+        nobody.
+        """
+        # Block budget, chosen so that *both* assertions below discriminate:
+        #   free on entry            3 blocks
+        #   every request needs      5 blocks (blocks_per_request)
+        #   the pause releases      10 blocks -> 13 free
+        # a's first attempt fails (5 > 3) and forces the pause; after it a fits (5) and b would fit
+        # too (5 + 5 = 10 <= 13). b is therefore absent from `fitting` only because it deferred to
+        # a's contribution -- not because it ran out of blocks.
+        kv = PausingMockKVCacheManager(
+            num_free_blocks=3,
+            blocks_per_request=5,
+            enable_block_reuse=True,
+            blocks_released_on_pause=10,
+        )
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        tokens = list(range(21))
+        # a and b are duplicates; g is started and sits *after* them, so it is
+        # the only eviction victim the reverse search over [req_it, req_it_end)
+        # can find.
+        a = _make_request(0, prompt_len=21, input_tokens=tokens)
+        b = _make_request(1, prompt_len=21, input_tokens=tokens)
+        g = make_generation_request(2)
+
+        fitting, disagg, paused = scheduler.schedule_request([a, b, g])
+
+        # Before the fix: paused == [2], fitting == [] -- the pause bought nothing.
+        assert [r.request_id for r in paused] == [2], "g should be paused to make room for a"
+        # a is admitted on the retry; b correctly defers to a's contribution. The post-pause budget
+        # leaves room for b (see above), so its absence is the beneficial-to-skip decision and
+        # nothing else -- drop the skip check and this becomes [0, 1].
+        assert [r.request_id for r in fitting] == [0]
+        assert len(disagg) == 0
+
+    def test_guaranteed_no_evict_peft_shortage_does_not_defer_duplicate(self):
+        """GUARANTEED_NO_EVICT: a PEFT-page shortage is the one failure that
+        neither breaks the loop nor is caught by the block-shortage branch, so
+        a contribution registered at check time outlived the request that
+        failed. A later request sharing that block must still be admitted."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+        peft = PerRequestMockPeftCacheManager(max_pages=10, pages_by_request_id={0: 20, 1: 5})
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            peft_cache_manager=peft,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        )
+        tokens = list(range(21))
+        # Same prompt and same LoRA task id => same block key, so r1 is a
+        # duplicate of r0. r0 demands more PEFT pages than are available.
+        r0 = _make_request(0, prompt_len=21, input_tokens=tokens, lora_task_id=7)
+        r1 = _make_request(1, prompt_len=21, input_tokens=tokens, lora_task_id=7)
+
+        fitting, disagg, paused = scheduler.schedule_request([r0, r1])
+
+        assert [r.request_id for r in fitting] == [1]
+        assert len(disagg) == 0
+        assert len(paused) == 0
 
 
 class TestPyCapacitySchedulerDisaggAdvanced:

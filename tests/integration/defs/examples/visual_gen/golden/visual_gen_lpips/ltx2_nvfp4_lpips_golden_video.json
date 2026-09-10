@@ -1,0 +1,28 @@
+{
+  "video": "ltx2_nvfp4_lpips_golden_video.mp4",
+  "model": "LTX-2 BF16 two-stage",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "A woman with long brown hair and light skin smiles at the camera while standing in a sunlit park, her hair gently blowing in the breeze as she tilts her head slightly to the side.",
+  "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
+  "height": 512,
+  "width": 768,
+  "num_frames": 49,
+  "num_inference_steps": 8,
+  "guidance_scale": 4.0,
+  "frame_rate": 24.0,
+  "seed": 42,
+  "feature_config": {
+    "quantization": "NVFP4",
+    "cuda_graph": false
+  },
+  "torch_compile": false,
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.39.0",
+  "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
+  "tensorrt_llm_version": "1.3.0rc21",
+  "tensorrt_llm_commit": "b2131b181f5be6717cd302a0b53c22c6a70c65b3",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm@sha256:475999862b896593159f10f486e16a748e7b7abb5cee558932a59ea6fc690d6b",
+  "sha256": "246651c299973a05f7bc305820b5a09e660289a1bd9ade17da21765edd61fd48"
+}

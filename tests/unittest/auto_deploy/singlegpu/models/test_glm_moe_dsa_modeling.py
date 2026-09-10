@@ -476,6 +476,7 @@ def _copy_full_model_weights_hf_to_custom(hf_model, custom_model):
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 def test_glm_moe_dsa_config_registration():
     """Test that the config is properly registered."""
     config = _create_small_config()
@@ -488,6 +489,7 @@ def test_glm_moe_dsa_config_registration():
     assert hasattr(config, "moe_layer_freq")
 
 
+@pytest.mark.cpu_only
 def test_glm_moe_dsa_config_nested_rope_parameters():
     """Test that nested rope_parameters extracts rope_theta correctly."""
     config = GlmMoeDsaConfig(
@@ -499,6 +501,7 @@ def test_glm_moe_dsa_config_nested_rope_parameters():
     assert config2.rope_theta == 10000.0
 
 
+@pytest.mark.cpu_only
 def test_glm_moe_dsa_layer_types():
     """Test that first layers use dense MLP and later layers use MoE."""
     config = _create_small_config()
@@ -514,6 +517,7 @@ def test_glm_moe_dsa_layer_types():
         assert type(layer_mlp).__name__ == "GlmMoeDsaMoE"
 
 
+@pytest.mark.cpu_only
 def test_glm_moe_dsa_expert_structure():
     """Test that experts have correct structure for checkpoint loading."""
     config = _create_small_config()

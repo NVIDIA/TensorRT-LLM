@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 @Library(['trtllm-jenkins-shared-lib@main']) _
 import groovy.json.JsonSlurper
 
@@ -8,6 +23,8 @@ def createKubernetesPodConfig()
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
     def image = "urm.nvidia.com/docker/ubuntu:24.04"
+    // release mode requires a longer pod lifetime to survive the manual license review window
+    def scannerSleepSeconds = (params?.scanMode == 'release') ? '345600' : '7200'
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -34,8 +51,8 @@ def createKubernetesPodConfig()
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                   - name: pulse-container-scanner
-                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:6.1.2
-                    command: ['sleep', '7200']
+                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:stable
+                    command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
                       requests:
@@ -52,7 +69,7 @@ def createKubernetesPodConfig()
                       runAsGroup: 0
                   - name: pulse-oss-scanner
                     image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable
-                    command: ['sleep', '7200']
+                    command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
                       requests:
@@ -83,6 +100,11 @@ def getLLMRepo () {
     if (params.repoUrlKey == "tensorrt_llm_internal") {
         withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
             LLM_REPO = DEFAULT_LLM_REPO
+        }
+    }
+    if (params.repoUrlKey == "tensorrt_llm_github_sync") {
+        withCredentials([string(credentialsId: 'github-llm-repo-sync', variable: 'GITHUB_LLM_REPO_SYNC')]) {
+            LLM_REPO = GITHUB_LLM_REPO_SYNC
         }
     }
     if (params.repoUrlKey == "github_fork") {
@@ -121,16 +143,28 @@ def validateRef() {
     }
 }
 
+def savePipelineScripts() {
+    // Capture the pipeline's own version of the scan scripts before the workspace
+    // is overwritten by checkoutSource() with params.ref. This ensures the script
+    // logic always matches the Groovy that is actually running.
+    trtllm_utils.setupGitMirror()
+    checkout scm
+    sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
+    sh "cp scripts/generate_lock_file.py /tmp/generate_lock_file.py"
+}
+
 def checkoutSource ()
 {
     trtllm_utils.setupGitMirror()
     def LLM_REPO = getLLMRepo()
     sh "git config --global --add safe.directory ${env.WORKSPACE}"
     def ref = params.ref
-    trtllm_utils.checkoutSource(LLM_REPO, ref, env.WORKSPACE, false, true)
+    trtllm_utils.checkoutSource(LLM_REPO, ref, env.WORKSPACE, true, true)
 }
 
 def getPulseToken(serviceId, scopes) {
+    def maxRetries = 3
+    def retryDelaySec = 10
     def token
     //Configure credential 'starfleet-client-id' under Jenkins Credential Manager
     withCredentials([usernamePassword(
@@ -138,12 +172,29 @@ def getPulseToken(serviceId, scopes) {
         usernameVariable: 'SF_CLIENT_ID',
         passwordVariable: 'SF_CLIENT_SECRET'
     )]) {
-        // Do not save AUTH_HEADER to a groovy variable since that
-        // will expose the auth_header without being masked
-        token= sh(script: """
-            AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
-            curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
-        """, returnStdout: true).trim()
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                // Do not save AUTH_HEADER to a groovy variable since that
+                // will expose the auth_header without being masked
+                token = sh(script: """
+                    AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
+                    curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
+                """, returnStdout: true).trim()
+            } catch (Exception e) {
+                echo "getPulseToken attempt ${attempt}/${maxRetries} failed: ${e.getMessage()}"
+                token = ""
+            }
+            if (token && token != "null") {
+                break
+            }
+            if (attempt < maxRetries) {
+                echo "getPulseToken returned an empty token (attempt ${attempt}/${maxRetries}), retrying in ${retryDelaySec}s..."
+                sleep(retryDelaySec)
+            }
+        }
+    }
+    if (!token || token == "null") {
+        error("getPulseToken failed to obtain a valid token after ${maxRetries} attempts")
     }
     return token
 }
@@ -157,7 +208,7 @@ def generateLockFiles(llmRepo, ref)
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
         sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
         sh "git config --global user.name \"TensorRT LLM\""
-        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
+        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 /tmp/generate_lock_file.py"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
@@ -166,10 +217,11 @@ def generateLockFiles(llmRepo, ref)
             echo "Running from specific commit '${ref}', skipping lock file push to branch"
         } else if (params.repoUrlKey == "github_fork") {
             echo "Running against a fork repo, skipping lock file push to branch"
+        } else if (params.scanMode == 'release') {
+            echo "Running in release mode, skipping lock file push to branch"
         } else {
             sh "git status"
-            sh "git add -u security_scanning/"
-            sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' -o -name 'metadata.json' \\))"
+            sh "git add security_scanning/"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
             withCredentials([
                 string(credentialsId: 'svc_tensorrt_gitlab_api_token_no_username_as_string', variable: 'GITLAB_API_TOKEN'),
@@ -199,12 +251,12 @@ def sonarScan()
 {
     container("cpu") {
         def sonarScannerCliVer = "8.0.0.6341"
-        sh "wget https://repo1.maven.org/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        sh "wget https://maven-central.storage-download.googleapis.com/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "unzip sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref}"
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName} -Dsonar.exclusions=cpp/build/**,**/*.lock,**/*.cubin,**/*.zst,**/*.tar.zst,**/cubin/**,3rdparty/**,docs/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.ico,**/*.pdf,**/*.whl,**/*.egg-info/**,security_scanning/**"
         }
     }
 }
@@ -227,13 +279,22 @@ def pulseScanSourceCode(llmRepo, ref) {
             "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
             "PULSE_SCAN_OVERRIDE=false"
         ]) {
-            sh 'pulse scan --no-fail --exclude-detectors PIP --sbom .'
+            trtllm_utils.llmRetry(3, "pulse scan source code", {
+                sh 'pulse scan --no-fail --exclude-detectors PIP,SETUPTOOLS --sbom .'
+            })
         }
     }
     container("cpu") {
         def outputDir = "scan_report/source_code"
         sh "mkdir -p ${outputDir}"
-        sh "unzip -p sbom.zip \"*.json\" > ${outputDir}/sbom.json"
+        sh """
+            sbom_zip=\$(find . -maxdepth 2 -name 'sbom*.zip' | head -1)
+            if [ -n "\$sbom_zip" ]; then
+                unzip -p "\$sbom_zip" "*.json" > ${outputDir}/sbom.json
+            else
+                echo "WARNING: sbom.zip not found; listing workspace for diagnostics:"
+            fi
+        """
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
     }
 }
@@ -260,6 +321,36 @@ def pulseScanContainer(llmRepo, ref) {
     }
     container("pulse-container-scanner") {
         sh "apk add jq curl"
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'trtllm-artifactory-credentials',
+                usernameVariable: 'ARTIFACTORY_USER',
+                passwordVariable: 'ARTIFACTORY_PASSWORD'
+            ),
+            usernamePassword(
+                credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                usernameVariable: 'GITLAB_REGISTRY_USER',
+                passwordVariable: 'GITLAB_REGISTRY_PASSWORD'
+            ),
+            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+        ]) {
+            sh '''
+                set +x
+                mkdir -p /root/.docker
+                ARTIFACTORY_AUTH="$(printf '%s' "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')"
+                GITLAB_REGISTRY_AUTH="$(printf '%s' "${GITLAB_REGISTRY_USER}:${GITLAB_REGISTRY_PASSWORD}" | base64 | tr -d '\n')"
+                jq -n \
+                    --arg artifactoryAuth "${ARTIFACTORY_AUTH}" \
+                    --arg gitlabRegistry "${DEFAULT_GIT_URL}:5005" \
+                    --arg gitlabRegistryAuth "${GITLAB_REGISTRY_AUTH}" \
+                    '{auths: {
+                        "artifactory.nvidia.com": {auth: $artifactoryAuth},
+                        ($gitlabRegistry): {auth: $gitlabRegistryAuth}
+                    }}' > /root/.docker/config.json
+                unset ARTIFACTORY_AUTH GITLAB_REGISTRY_AUTH
+                set -x
+            '''
+        }
         def token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20scan.anchore")
         if (!token) {
             throw new Exception("Invalid token get")
@@ -273,10 +364,12 @@ def pulseScanContainer(llmRepo, ref) {
                 def outputDir = "scan_report/${key}"
                 sh "mkdir -p ${outputDir}"
                 echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
-                sh(
-                    script: "pulse-cli -n \$NSPECT_ID scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
-                    label: "Scan ${entry.image}"
-                )
+                trtllm_utils.llmRetry(3, "pulse-cli scan ${entry.image}", {
+                    sh(
+                        script: "pulse-cli -n \$NSPECT_ID scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
+                        label: "Scan ${entry.image}"
+                    )
+                })
             }
         }
     }
@@ -285,9 +378,9 @@ def pulseScanContainer(llmRepo, ref) {
 def processScanResults(ref) {
     container("cpu") {
         def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-scan/posting"
+        def ELASTICSEARCH_PREAPPROVED_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-pre-approve/posting"
         def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
         def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
-        def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
         def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
         def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
         def postMergeArgs = ""
@@ -300,34 +393,74 @@ def processScanResults(ref) {
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             withEnv([
                 "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
+                "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
                 "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                 "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
-                "TRTLLM_ES_INDEX_PREAPPROVED_BASE=${TRTLLM_ES_INDEX_PREAPPROVED_BASE}",
                 "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
             ]) {
                 sh """
                     python3 -m venv venv
-                    venv/bin/pip install requests elasticsearch==7.13.4
+                    venv/bin/pip install 'requests>=2.32.4,<3' elasticsearch==7.13.4
                 """
+                def skipArgs = ""
+                def sbomExists = fileExists("${pwd()}/scan_report/source_code/sbom.json")
+                if (!params.runSourceCodeScanning || !sbomExists) {
+                    if (!sbomExists && params.runSourceCodeScanning) {
+                        echo "WARNING: Source code SBOM not found at scan_report/source_code/sbom.json; skipping SBOM analysis."
+                    }
+                    skipArgs += " --skip-source-code"
+                }
+                if (!params.runContainerScanning) {
+                    skipArgs += " --skip-container"
+                }
                 def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
                 def output = withEnv(["LICENSE_CHECK_TOKEN=${token}"]) {
                     sh(script: """
-                        venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
+                        venv/bin/python /tmp/pulse_in_pipeline_scanning/main.py \
                             --build-url ${pipelineUrl} \
                             --build-number ${env.BUILD_NUMBER} \
                             --ref ${ref} \
                             --report-directory ${pwd()}/scan_report \
-                            --scan-mode ${params.scanMode}
+                            --scan-mode ${params.scanMode}${skipArgs}
                     """, returnStdout: true).trim()
                 }
-                echo "Scan result: ${output}"
                 def result = new JsonSlurper().parseText(output)
                 if (result.status == "unstable") {
                     echo "New risks detected: ${result.detail}"
+                    if (result.needs_manual_review) {
+                        needsManualReview = true
+                        manualReviewUrl = pipelineUrl
+                        def candidates = result.preapproved_candidates ?: []
+                        writeJSON file: "${pwd()}/preapproved_candidates.json",
+                                  json: candidates
+                    }
+                    if (result.detected_licenses) {
+                        def colWidths = [scan_type: 9, dependency_name: 15, license: 7, corrected_license: 17, is_nvidia_proprietary: 17]
+                        result.detected_licenses.each { entry ->
+                            colWidths.scan_type             = Math.max(colWidths.scan_type,             entry.scan_type.toString().length())
+                            colWidths.dependency_name       = Math.max(colWidths.dependency_name,       entry.dependency_name.toString().length())
+                            colWidths.license               = Math.max(colWidths.license,               entry.license.toString().length())
+                            colWidths.corrected_license     = Math.max(colWidths.corrected_license,     entry.corrected_license.toString().length())
+                            colWidths.is_nvidia_proprietary = Math.max(colWidths.is_nvidia_proprietary, entry.is_nvidia_proprietary.toString().length())
+                        }
+                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 13}-+-${'-' * colWidths.is_nvidia_proprietary}-+"
+                        def rows = [sep,
+                                    "| ${'SCAN TYPE'.padRight(colWidths.scan_type)} | ${'DEPENDENCY NAME'.padRight(colWidths.dependency_name)} | ${'LICENSE'.padRight(colWidths.license)} | ${'CORRECTED LICENSE'.padRight(colWidths.corrected_license)} | IS PERMISSIVE | ${'IS NV PROPRIETARY'.padRight(colWidths.is_nvidia_proprietary)} |",
+                                    sep]
+                        result.detected_licenses.each { entry ->
+                            rows << "| ${entry.scan_type.toString().padRight(colWidths.scan_type)} | ${entry.dependency_name.toString().padRight(colWidths.dependency_name)} | ${entry.license.toString().padRight(colWidths.license)} | ${entry.corrected_license.toString().padRight(colWidths.corrected_license)} | ${entry.is_permissive.toString().padRight(13)} | ${entry.is_nvidia_proprietary.toString().padRight(colWidths.is_nvidia_proprietary)} |"
+                        }
+                        rows << sep
+                        detectedLicensesTable = "Non-permissive licenses detected:\n${rows.join('\n')}"
+                        if (params.scanMode == "monitor") {
+                            echo detectedLicensesTable
+                            currentBuild.description = "⚠️ Non-permissive licenses detected — click 'Console Output' to review"
+                        }
+                    }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
-                    currentBuild.result = 'UNSTABLE'
+                    scanResultUnstable = true
                 } else {
                     echo "No new risks detected."
                 }
@@ -336,22 +469,30 @@ def processScanResults(ref) {
     }
 }
 
+needsManualReview = false
+manualReviewUrl = ""
+detectedLicensesTable = ""
+scanResultUnstable = false
+manuallyApproved = false
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig()
     }
     parameters {
         string(name: 'ref', defaultValue: 'main', description: 'Branch name or commit SHA (7–40 hex chars) to check out; branch push steps are skipped when a commit SHA is provided')
-        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'github_fork'], description: "The repo url to process")
+        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'tensorrt_llm_github_sync', 'github_fork'], description: "The repo url to process")
         string(name: 'forkOwner', defaultValue: '', description: 'Name of the fork owner, need to select \"github_fork\" for repoUrlKey, otherwise it will be ignored')
         string(name: 'postMergePipelineName', defaultValue: '', description: 'Optional: post-merge pipeline job name to associate with this scan')
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
-        choice(name: 'scanMode', choices: ['monitor','release'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
+        choice(name: 'scanMode', choices: ['monitor','release','pre_merge'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
+        booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
+        booleanParam(name: 'runContainerScanning', defaultValue: true, description: 'Run Container Scanning (Pulse container scan)')
+        booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
     }
     options {
         skipDefaultCheckout()
         timestamps()
-        timeout(time: 150, unit: 'MINUTES')
     }
     environment {
         LLM_REPO = getLLMRepo()
@@ -371,6 +512,7 @@ pipeline {
                 script {
                     container("cpu") {
                         installTools()
+                        savePipelineScripts()
                         checkoutSource()
                         validateRef()
                     }
@@ -378,16 +520,23 @@ pipeline {
             }
         }
         stage('Run TRT-LLM PLC Jobs') {
+            options { timeout(time: 90, unit: 'MINUTES') }
             parallel {
                 stage("Source Code OSS Scanning") {
+                    when {
+                        expression { return params.runSourceCodeScanning }
+                    }
                     steps {
                         script {
-                            generateLockFiles(env.LLM_REPO, env.REF)
+                             generateLockFiles(env.LLM_REPO, env.REF)
                             pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }
                 }
                 stage("Container Scanning") {
+                    when {
+                        expression { return params.runContainerScanning }
+                    }
                     steps {
                         script {
                             pulseScanContainer(env.LLM_REPO, env.REF)
@@ -395,6 +544,9 @@ pipeline {
                     }
                 }
                 stage("SonarQube Code Analysis") {
+                    when {
+                        expression { return params.runSonarQube }
+                    }
                     steps {
                         script {
                             sonarScan()
@@ -404,11 +556,58 @@ pipeline {
             }
         }
         stage("Process In Pipeline Scan Result") {
+            options { timeout(time: 60, unit: 'MINUTES') }
             steps {
                 script {
                     processScanResults(env.REF)
                 }
             }
         }
+        stage("Manual License Review") {
+            when {
+                expression { return needsManualReview }
+            }
+            steps {
+                script {
+                    if (detectedLicensesTable) {
+                        echo detectedLicensesTable
+                    }
+                    currentBuild.description = "⚠️ Manual approval required — click 'Console Output' to review licenses, then approve or abort"
+                    withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+                        def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
+                        writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]
+                        sh "curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/slack_payload.json \$PLC_SLACK_WEBHOOK"
+                    }
+                    timeout(time: 96, unit: 'HOURS') {
+                        input(
+                            message: "New licenses detected in release mode. Please review the licenses listed above and confirm they are all approved for release.",
+                            ok: "Approve"
+                        )
+                    }
+                    manuallyApproved = true
+                    container("cpu") {
+                        def ELASTICSEARCH_PREAPPROVED_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-pre-approve/posting"
+                        def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
+                        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
+                        withEnv([
+                            "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
+                            "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
+                            "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
+                        ]) {
+                            sh "venv/bin/python /tmp/pulse_in_pipeline_scanning/submit_preapproved_candidates.py ${pwd()}/preapproved_candidates.json"
+                        }
+                    }
+                }
+            }
+        }
     } // stages
+    post {
+        always {
+            script {
+                if (scanResultUnstable && !manuallyApproved) {
+                    currentBuild.result = 'UNSTABLE'
+                }
+            }
+        }
+    }
 } // pipeline

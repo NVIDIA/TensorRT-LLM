@@ -20,13 +20,12 @@
 #include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/runtime/eagleModule.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
 #include "tensorrt_llm/runtime/jsonSerialization.h"
-#include "tensorrt_llm/runtime/lookaheadModule.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/runtimeDefaults.h"
+#include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -80,14 +79,14 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     return value;
 }
 
-nvinfer1::DataType strToDType(std::string type)
+tensorrt_llm::DataType strToDType(std::string type)
 {
-    static std::map<std::string, nvinfer1::DataType> const typeMap = {{"int64", nvinfer1::DataType::kINT64},
-        {"int32", nvinfer1::DataType::kINT32}, {"int", nvinfer1::DataType::kINT32},
-        {"float32", nvinfer1::DataType::kFLOAT}, {"bfloat16", nvinfer1::DataType::kBF16},
-        {"float16", nvinfer1::DataType::kHALF}, {"bool", nvinfer1::DataType::kBOOL},
-        {"uint8", nvinfer1::DataType::kUINT8}, {"int8", nvinfer1::DataType::kINT8}, {"fp8", nvinfer1::DataType::kFP8},
-        {"int4", nvinfer1::DataType::kINT4}};
+    static std::map<std::string, tensorrt_llm::DataType> const typeMap = {{"int64", tensorrt_llm::DataType::kINT64},
+        {"int32", tensorrt_llm::DataType::kINT32}, {"int", tensorrt_llm::DataType::kINT32},
+        {"float32", tensorrt_llm::DataType::kFLOAT}, {"bfloat16", tensorrt_llm::DataType::kBF16},
+        {"float16", tensorrt_llm::DataType::kHALF}, {"bool", tensorrt_llm::DataType::kBOOL},
+        {"uint8", tensorrt_llm::DataType::kUINT8}, {"int8", tensorrt_llm::DataType::kINT8},
+        {"fp8", tensorrt_llm::DataType::kFP8}, {"int4", tensorrt_llm::DataType::kINT4}};
 
     TLLM_CHECK_WITH_INFO(typeMap.count(type) > 0, type + " not found in strToDtype.");
     return typeMap.at(type);
@@ -140,14 +139,14 @@ std::vector<ModelConfig::LayerType> buildLayerTypes(
     return result;
 }
 
-ModelConfig parseMultimodalConfig(Json const& json, nvinfer1::DataType dataType)
+ModelConfig parseMultimodalConfig(Json const& json, tensorrt_llm::DataType dataType)
 {
     return ModelConfig{128, 10, 10, 0, 1, 128,
         dataType}; // use dummy values because vision engines of multimodal models does not record this info in config
 }
 
 ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType32 tensorParallelism,
-    SizeType32 contextParallelism, nvinfer1::DataType dataType)
+    SizeType32 contextParallelism, tensorrt_llm::DataType dataType)
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
     auto const multiModalName = parseJsonFieldOptional<std::string>(config, "model_name");
@@ -248,14 +247,14 @@ ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType
     modelConfig.setLayerTypes(layerTypes);
 
     // Set logits datatype
-    auto logitsDtype = nvinfer1::DataType::kFLOAT;
+    auto logitsDtype = tensorrt_llm::DataType::kFLOAT;
     if (logitsDtypeStr == "float32")
     {
-        logitsDtype = nvinfer1::DataType::kFLOAT;
+        logitsDtype = tensorrt_llm::DataType::kFLOAT;
     }
     else if (logitsDtypeStr == "float16")
     {
-        logitsDtype = nvinfer1::DataType::kHALF;
+        logitsDtype = tensorrt_llm::DataType::kHALF;
     }
     else
     {
@@ -490,15 +489,15 @@ GptJsonConfig parseJson(InputType&& input)
     {
         if (precision == "float32")
         {
-            return nvinfer1::DataType::kFLOAT;
+            return tensorrt_llm::DataType::kFLOAT;
         }
         if (precision == "float16")
         {
-            return nvinfer1::DataType::kHALF;
+            return tensorrt_llm::DataType::kHALF;
         }
         if (precision == "bfloat16")
         {
-            return nvinfer1::DataType::kBF16;
+            return tensorrt_llm::DataType::kBF16;
         }
         TLLM_THROW("Model data type '%s' not supported", precision.c_str());
     }();
@@ -591,8 +590,9 @@ GptJsonConfig parseJson(InputType&& input)
             TLLM_CHECK_WITH_INFO(medusaHeads.has_value() && maxDraftLen > 0,
                 "Both num_medusa_heads and max_draft_len have to be provided for Medusa model");
 
-            auto medusaModule = std::make_shared<MedusaModule>(medusaHeads.value(), maxDraftLen);
-            modelConfig.setSpeculativeDecodingModule(medusaModule);
+            auto speculativeDecodingModule
+                = std::make_shared<SpeculativeDecodingModule>(medusaHeads.value(), maxDraftLen, maxDraftLen);
+            modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
         }
         else
         {
@@ -601,7 +601,8 @@ GptJsonConfig parseJson(InputType&& input)
             {
                 TLLM_CHECK_WITH_INFO(
                     maxDraftLen > 0, "max_draft_len has to be larger than 0 for Lookahead decoding model");
-                auto lookaheadDecodingModule = std::make_shared<LookaheadModule>(maxDraftLen, maxDraftLen);
+                auto lookaheadDecodingModule
+                    = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, maxDraftLen);
                 modelConfig.setSpeculativeDecodingModule(lookaheadDecodingModule);
             }
             else if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
@@ -617,8 +618,6 @@ GptJsonConfig parseJson(InputType&& input)
                 auto const& pretrainedConfig = json.at("pretrained_config");
 
                 auto const numEagleLayers = parseJsonFieldOr(pretrainedConfig, "num_eagle_layers", 0);
-                auto const& eagleConfig = pretrainedConfig.at("eagle_net_config");
-                auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
                 auto const maxNonLeafNodesPerLayer
                     = pretrainedConfig.at("max_non_leaves_per_layer").template get<SizeType32>();
 
@@ -626,8 +625,10 @@ GptJsonConfig parseJson(InputType&& input)
                 TLLM_CHECK_WITH_INFO(numEagleLayers > 0, "num_eagle_layers has to be larger than 0 for eagle decoding");
                 TLLM_CHECK_WITH_INFO(
                     maxNonLeafNodesPerLayer > 0, "max_non_leaves_per_layer has to be larger than 0 for eagle decoding");
-                auto eagleModule = std::make_shared<EagleModule>(
-                    numEagleLayers, maxDraftLen, numEagleNetLayers, maxNonLeafNodesPerLayer);
+                // Number of paths is maxDecodingTokens = maxDecodingDraftTokens + 1 to account for very flat
+                // trees with depth 1.
+                auto eagleModule
+                    = std::make_shared<SpeculativeDecodingModule>(numEagleLayers, maxDraftLen, maxDraftLen + 1);
                 modelConfig.setSpeculativeDecodingModule(eagleModule);
             }
         }

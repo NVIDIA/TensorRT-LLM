@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -407,17 +408,6 @@ TEST(SerializeUtilsTest, Nested)
             texec::SamplingConfig{1, 1, 0.05, 0.2}, texec::SamplingConfig{2, std::nullopt}});
         testSerializeDeserialize(val);
     }
-    {
-        auto const val = std::make_optional(texec::ExternalDraftTokensConfig({1, 1}));
-        auto const size = su::serializedSize(val);
-        std::ostringstream oss;
-        su::serialize(val, oss);
-        EXPECT_EQ(oss.str().size(), size);
-
-        std::istringstream iss(oss.str());
-        auto const val2 = su::deserialize<std::optional<texec::ExternalDraftTokensConfig>>(iss);
-        EXPECT_EQ(val2.value().getTokens(), val.value().getTokens());
-    }
 }
 
 TEST(SerializeUtilsTest, ResultResponse)
@@ -502,23 +492,29 @@ TEST(SerializeUtilsTest, KvCacheConfig)
 
 TEST(SerializeUtilsTest, SchedulerConfig)
 {
-    texec::SchedulerConfig schedulerConfig(
-        texec::CapacitySchedulerPolicy::kMAX_UTILIZATION, texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED);
+    texec::SchedulerConfig defaultSchedulerConfig;
+    EXPECT_TRUE(defaultSchedulerConfig.getEnablePrefixAwareScheduling());
+
+    texec::DynamicBatchConfig dynamicBatchConfig{/*enableBatchSizeTuning=*/true,
+        /*enableMaxNumTokensTuning=*/true, /*dynamicBatchMovingAverageWindow=*/64};
+    texec::SchedulerConfig schedulerConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, dynamicBatchConfig, false);
     auto schedulerConfig2 = serializeDeserialize(schedulerConfig);
     EXPECT_EQ(schedulerConfig.getCapacitySchedulerPolicy(), schedulerConfig2.getCapacitySchedulerPolicy());
     EXPECT_EQ(schedulerConfig.getContextChunkingPolicy(), schedulerConfig2.getContextChunkingPolicy());
-}
+    EXPECT_EQ(schedulerConfig, schedulerConfig2);
+    ASSERT_TRUE(schedulerConfig2.getDynamicBatchConfig().has_value());
+    EXPECT_TRUE(schedulerConfig2.getDynamicBatchConfig()->getEnableBatchSizeTuning());
+    EXPECT_TRUE(schedulerConfig2.getDynamicBatchConfig()->getEnableMaxNumTokensTuning());
+    EXPECT_EQ(schedulerConfig2.getDynamicBatchConfig()->getDynamicBatchMovingAverageWindow(), 64);
+    EXPECT_FALSE(schedulerConfig2.getEnablePrefixAwareScheduling());
 
-TEST(SerializeUtilsTest, ParallelConfig)
-{
-    texec::ParallelConfig parallelConfig(texec::CommunicationType::kMPI, texec::CommunicationMode::kLEADER,
-        std::vector<texec::SizeType32>{1, 2, 7}, std::vector<texec::SizeType32>{0, 1, 4});
-
-    auto parallelConfig2 = serializeDeserialize(parallelConfig);
-    EXPECT_EQ(parallelConfig.getCommunicationType(), parallelConfig2.getCommunicationType());
-    EXPECT_EQ(parallelConfig.getCommunicationMode(), parallelConfig2.getCommunicationMode());
-    EXPECT_EQ(parallelConfig.getDeviceIds(), parallelConfig2.getDeviceIds());
-    EXPECT_EQ(parallelConfig.getParticipantIds(), parallelConfig2.getParticipantIds());
+    texec::SchedulerConfig differentDynamicBatchConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED,
+        texec::DynamicBatchConfig{/*enableBatchSizeTuning=*/false, /*enableMaxNumTokensTuning=*/true,
+            /*dynamicBatchMovingAverageWindow=*/64},
+        false);
+    EXPECT_FALSE(schedulerConfig == differentDynamicBatchConfig);
 }
 
 TEST(SerializeUtilsTest, PeftCacheConfig)
@@ -534,14 +530,6 @@ TEST(SerializeUtilsTest, LookaheadDecodingConfig)
     EXPECT_EQ(lookaheadDecodingConfig.getNgramSize(), lookaheadDecodingConfig2.getNgramSize());
     EXPECT_EQ(lookaheadDecodingConfig.getWindowSize(), lookaheadDecodingConfig2.getWindowSize());
     EXPECT_EQ(lookaheadDecodingConfig.getVerificationSetSize(), lookaheadDecodingConfig2.getVerificationSetSize());
-}
-
-TEST(SerializeUtilsTest, EagleConfig)
-{
-    texec::EagleChoices eagleChoices{{{0, 1, 2}}};
-    auto eagleConfig = texec::EagleConfig(eagleChoices);
-    auto eagleConfig2 = serializeDeserialize(eagleConfig);
-    EXPECT_EQ(eagleConfig.getEagleChoices(), eagleConfig2.getEagleChoices());
 }
 
 TEST(SerializeUtilsTest, KvCacheRetentionConfig)
@@ -580,45 +568,6 @@ TEST(SerializeUtilsTest, DecodingConfig)
         EXPECT_EQ(specDecodingConfig.getDecodingMode(), specDecodingConfig2.getDecodingMode());
         EXPECT_EQ(specDecodingConfig.getLookaheadDecodingConfig(), specDecodingConfig2.getLookaheadDecodingConfig());
     }
-
-    {
-        texec::DecodingMode decodingMode{texec::DecodingMode::Medusa()};
-        texec::MedusaChoices medusaChoices{{{0, 1, 2}}};
-        auto specDecodingConfig = texec::DecodingConfig(decodingMode, std::nullopt, medusaChoices);
-        auto specDecodingConfig2 = serializeDeserialize(specDecodingConfig);
-        EXPECT_EQ(specDecodingConfig.getDecodingMode(), specDecodingConfig2.getDecodingMode());
-        EXPECT_EQ(specDecodingConfig.getMedusaChoices(), specDecodingConfig2.getMedusaChoices());
-    }
-
-    {
-        texec::DecodingMode decodingMode{texec::DecodingMode::Eagle()};
-        texec::EagleChoices eagleChoices{{{0, 1, 2}}};
-        texec::EagleConfig eagleConfig{eagleChoices};
-        auto specDecodingConfig = texec::DecodingConfig(decodingMode, std::nullopt, std::nullopt, eagleConfig);
-        auto specDecodingConfig2 = serializeDeserialize(specDecodingConfig);
-        EXPECT_EQ(specDecodingConfig.getDecodingMode(), specDecodingConfig2.getDecodingMode());
-        EXPECT_EQ(specDecodingConfig.getEagleConfig()->getEagleChoices(),
-            specDecodingConfig2.getEagleConfig()->getEagleChoices());
-    }
-}
-
-TEST(SerializeUtilsTest, DebugConfig)
-{
-    texec::DebugConfig debugConfig(true, true, {"test"}, 3);
-    auto debugConfig2 = serializeDeserialize(debugConfig);
-    EXPECT_EQ(debugConfig.getDebugInputTensors(), debugConfig2.getDebugInputTensors());
-    EXPECT_EQ(debugConfig.getDebugOutputTensors(), debugConfig2.getDebugOutputTensors());
-    EXPECT_EQ(debugConfig.getDebugTensorNames(), debugConfig2.getDebugTensorNames());
-    EXPECT_EQ(debugConfig.getDebugTensorsMaxIterations(), debugConfig2.getDebugTensorsMaxIterations());
-}
-
-TEST(SerializeUtilsTest, OrchestratorConfig)
-{
-    auto orchConfig = texec::OrchestratorConfig(false, std::filesystem::current_path().string(), nullptr, false);
-    auto orchConfig2 = serializeDeserialize(orchConfig);
-    EXPECT_EQ(orchConfig.getIsOrchestrator(), orchConfig2.getIsOrchestrator());
-    EXPECT_EQ(orchConfig.getWorkerExecutablePath(), orchConfig2.getWorkerExecutablePath());
-    EXPECT_EQ(orchConfig.getSpawnProcesses(), orchConfig2.getSpawnProcesses());
 }
 
 TEST(SerializeUtilsTest, KvCacheStats)
@@ -733,7 +682,8 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
     {
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-        state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, nvinfer1::DataType::kFLOAT});
+        state->setCacheState(
+            texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, tensorrt_llm::DataType::kFLOAT});
         auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 0, state.release(), VecTokens{10, 20});
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
@@ -808,52 +758,6 @@ TEST(SerializeUtilsTest, GuidedDecodingParams)
     auto guidedDecodingParams2 = serializeDeserialize(guidedDecodingParams);
     EXPECT_EQ(guidedDecodingParams.getGuideType(), guidedDecodingParams2.getGuideType());
     EXPECT_EQ(guidedDecodingParams.getGuide(), guidedDecodingParams2.getGuide());
-}
-
-TEST(SerializeUtilsTest, ExecutorConfig)
-{
-    texec::ExecutorConfig executorConfig(2, texec::SchedulerConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION),
-        texec::KvCacheConfig(true), true, false, 500, 200, texec::BatchingType::kSTATIC, 128, 64,
-        texec::ParallelConfig(texec::CommunicationType::kMPI, texec::CommunicationMode::kORCHESTRATOR),
-        texec::PeftCacheConfig(10), std::nullopt,
-        texec::DecodingConfig(texec::DecodingMode::Lookahead(), texec::LookaheadDecodingConfig(3, 5, 7)), false, 0.5f,
-        8, texec::ExtendedRuntimePerfKnobConfig(true), texec::DebugConfig(true), 60000000, 180000000,
-        texec::SpeculativeDecodingConfig(true),
-        texec::GuidedDecodingConfig(
-            texec::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR, std::initializer_list<std::string>{"eos"}),
-        std::vector{tensorrt_llm::executor::AdditionalModelOutput{"output_name"}},
-        texec::CacheTransceiverConfig(std::nullopt, 1024, 100, 1000), true, true, true);
-    auto executorConfig2 = serializeDeserialize(executorConfig);
-
-    EXPECT_EQ(executorConfig.getMaxBeamWidth(), executorConfig2.getMaxBeamWidth());
-    EXPECT_EQ(executorConfig.getSchedulerConfig(), executorConfig2.getSchedulerConfig());
-    EXPECT_EQ(executorConfig.getKvCacheConfig().getEnableBlockReuse(),
-        executorConfig2.getKvCacheConfig().getEnableBlockReuse());
-    EXPECT_EQ(executorConfig.getEnableChunkedContext(), executorConfig2.getEnableChunkedContext());
-    EXPECT_EQ(executorConfig.getNormalizeLogProbs(), executorConfig2.getNormalizeLogProbs());
-    EXPECT_EQ(executorConfig.getIterStatsMaxIterations(), executorConfig2.getIterStatsMaxIterations());
-    EXPECT_EQ(executorConfig.getRequestStatsMaxIterations(), executorConfig2.getRequestStatsMaxIterations());
-    EXPECT_EQ(executorConfig.getBatchingType(), executorConfig2.getBatchingType());
-    EXPECT_EQ(executorConfig.getMaxBatchSize(), executorConfig2.getMaxBatchSize());
-    EXPECT_EQ(executorConfig.getMaxNumTokens(), executorConfig2.getMaxNumTokens());
-    EXPECT_EQ(executorConfig.getParallelConfig().value().getCommunicationMode(),
-        executorConfig2.getParallelConfig().value().getCommunicationMode());
-    EXPECT_EQ(executorConfig.getPeftCacheConfig(), executorConfig2.getPeftCacheConfig());
-    EXPECT_EQ(executorConfig.getDecodingConfig(), executorConfig2.getDecodingConfig());
-    EXPECT_EQ(executorConfig.getUseGpuDirectStorage(), executorConfig2.getUseGpuDirectStorage());
-    EXPECT_EQ(executorConfig.getGpuWeightsPercent(), executorConfig2.getGpuWeightsPercent());
-    EXPECT_EQ(executorConfig.getMaxQueueSize(), executorConfig2.getMaxQueueSize());
-    EXPECT_EQ(executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig2.getExtendedRuntimePerfKnobConfig());
-    EXPECT_EQ(executorConfig.getDebugConfig(), executorConfig2.getDebugConfig());
-    EXPECT_EQ(executorConfig.getRecvPollPeriodMs(), executorConfig2.getRecvPollPeriodMs());
-    EXPECT_EQ(executorConfig.getMaxSeqIdleMicroseconds(), executorConfig2.getMaxSeqIdleMicroseconds());
-    EXPECT_EQ(executorConfig.getSpecDecConfig(), executorConfig2.getSpecDecConfig());
-    EXPECT_EQ(executorConfig.getGuidedDecodingConfig(), executorConfig2.getGuidedDecodingConfig());
-    EXPECT_EQ(executorConfig.getAdditionalModelOutputs(), executorConfig2.getAdditionalModelOutputs());
-    EXPECT_EQ(executorConfig.getCacheTransceiverConfig(), executorConfig2.getCacheTransceiverConfig());
-    EXPECT_EQ(executorConfig.getGatherGenerationLogits(), executorConfig2.getGatherGenerationLogits());
-    EXPECT_EQ(executorConfig.getPromptTableOffloading(), executorConfig2.getPromptTableOffloading());
-    EXPECT_EQ(executorConfig.getEnableTrtOverlap(), executorConfig2.getEnableTrtOverlap());
 }
 
 TEST(SerializeUtilsTest, RequestStats)
@@ -1068,6 +972,8 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferTimeoutMs(), cacheTransceiverConfig2.getKvTransferTimeoutMs());
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(),
         cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
+    EXPECT_EQ(
+        cacheTransceiverConfig.getKvTransferPollIntervalMs(), cacheTransceiverConfig2.getKvTransferPollIntervalMs());
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)
@@ -1533,7 +1439,7 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     texec::SizeType32 pp = 1;
     texec::SizeType32 cp = 1;
     std::vector<texec::SizeType32> attentionLayerNumPerPP{static_cast<texec::SizeType32>(nbKvHeadsPerLayer.size())};
-    auto dataType = nvinfer1::DataType::kFLOAT;
+    auto dataType = tensorrt_llm::DataType::kFLOAT;
     auto attentionType = CacheState::AttentionType::kDEFAULT;
     int kvFactor = 2;
     bool enableAttentionDP = false;
@@ -1544,10 +1450,13 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     bool hasIndexerKCache = true;
     texec::SizeType32 indexerDimPerHead = 96;
     texec::SizeType32 indexerKCacheQuantBlockSize = 128;
+    bool indexerKCacheUseFp4 = false;
+    // Masked indexer pool: fewer indexer layers than attention layers.
+    std::vector<texec::SizeType32> indexerLayerNumPerPP{1};
 
     CacheState state{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tp, pp, cp, attentionLayerNumPerPP, dataType,
         attentionType, kvFactor, enableAttentionDP, dpRank, dpSize, enableBlockReuse, enablePartialReuse,
-        hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+        hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize, indexerKCacheUseFp4, indexerLayerNumPerPP};
 
     std::ostringstream oss;
     texec::Serialization::serialize(state, oss);
@@ -1569,4 +1478,8 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     EXPECT_EQ(state.getHasIndexerKCache(), state2.getHasIndexerKCache());
     EXPECT_EQ(state.getIndexerDimPerHead(), state2.getIndexerDimPerHead());
     EXPECT_EQ(state.getIndexerKCacheQuantBlockSize(), state2.getIndexerKCacheQuantBlockSize());
+    EXPECT_EQ(state.getIndexerKCacheUseFp4(), state2.getIndexerKCacheUseFp4());
+    EXPECT_EQ(state.getIndexerLayerNumPerPP(), state2.getIndexerLayerNumPerPP());
+    EXPECT_EQ(state.getIndexerLayerNumPerPP(), indexerLayerNumPerPP);
+    EXPECT_EQ(state, state2);
 }

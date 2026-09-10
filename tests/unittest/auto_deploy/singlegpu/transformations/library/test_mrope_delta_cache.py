@@ -14,6 +14,7 @@
 # limitations under the License.
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 import yaml
@@ -24,6 +25,8 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache import (
     InitializeMropeDeltaCache,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _repo_root() -> Path:

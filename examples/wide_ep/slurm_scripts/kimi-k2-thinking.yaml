@@ -66,13 +66,14 @@ worker_config:
       free_gpu_memory_fraction: 0.6
       dtype: fp8
     moe_config:
-      backend: WIDEEP
+      backend: CUTEDSL
       use_low_precision_moe_combine: true
       load_balancer:
         num_slots: 416
         layer_updates_per_iter: 1
     cache_transceiver_config:
       backend: UCX
+      transceiver_runtime: CPP
       max_tokens_in_buffer: 8448
     stream_interval: 20
     num_postprocess_workers: 4
@@ -94,5 +95,6 @@ worker_config:
       dtype: fp8
     cache_transceiver_config:
       backend: UCX
+      transceiver_runtime: CPP
       max_tokens_in_buffer: 8448
     trust_remote_code: true

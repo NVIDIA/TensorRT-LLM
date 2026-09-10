@@ -2,6 +2,10 @@
 
 # Numerical Precision
 
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
+
 This document describes the different quantization recipes implemented in TensorRT-LLM and contains a support matrix
 for the different models.
 

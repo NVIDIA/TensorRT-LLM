@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -164,21 +164,14 @@ private:
 // NCCL Version Check
 //==============================================================================
 
+// Returns true if NCCL window buffers (ncclMemAlloc / ncclCommWindowRegister)
+// are supported for the given real SM version, integrated-device flag, and runtime NCCL version.
+// Exposed for focused unit testing of platform/version gates.
+bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion);
+
 // Returns true if the compile-time and runtime NCCL versions support window buffers
-// (ncclMemAlloc / ncclCommWindowRegister).
-inline bool isNcclWindowSupported()
-{
-#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
-    int version = 0;
-    if (ncclGetVersion(&version) != ncclSuccess)
-    {
-        return false;
-    }
-    return version >= NCCL_VERSION(2, 28, 0);
-#else
-    return false;
-#endif
-}
+// and the current CUDA device is not in a known-unsupported platform/version set.
+bool isNcclWindowSupported();
 
 //==============================================================================
 // NCCL Window Buffer Allocation
@@ -265,11 +258,22 @@ public:
     NCCLWindowAllocator& operator=(NCCLWindowAllocator&&) = delete;
 
 private:
+    friend class NCCLWindowAllocatorTestAccess;
+
     NCCLWindowAllocator() = default;
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
     NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle);
+
+    // Record a failed new symmetric allocation (assumes mMutex is already locked).
+    void recordSymmetricFailureLocked(ncclComm_t comm, size_t size);
+
+    using CudaGetLastErrorFunc = cudaError_t (*)();
+
+    // Drain the sticky CUDA error left by a failed symmetric allocation.
+    static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
+        int localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
 
     // Search for a buffer by pointer (assumes mMutex is already locked)
     NCCLWindowBuffer searchBufferLocked(ncclComm_t comm, void* ptr) const;
@@ -289,6 +293,10 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
+    // Smallest request size that is known to fail collectively for each communicator.
+    // Requests below the recorded size may still succeed and already-pooled buffers are always
+    // reused before consulting this cache.
+    std::unordered_map<ncclComm_t, size_t> mMinSymmetricFailureSize;
 };
 
 // RAII wrapper for NCCL window buffers

@@ -40,7 +40,6 @@ try:
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
     from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
-    from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     MODULES_AVAILABLE = True
@@ -104,12 +103,17 @@ def run_test_in_distributed(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, "nccl", test_fn, port),
-        nprocs=world_size,
-        join=True,
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, "nccl", test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 
