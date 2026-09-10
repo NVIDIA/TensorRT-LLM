@@ -50,14 +50,14 @@ Tested on Ubuntu 24.04.
 Before the pre-built Python wheel can be installed via `pip`, a few
 prerequisites must be put into place:
 
-Install CUDA Toolkit 13.2 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+Install CUDA Toolkit 13.4 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
 and make sure `CUDA_HOME` environment variable is properly set.
 
-The `cuda-compat-13-2` package may be required depending on your system's NVIDIA GPU
+The `cuda-compat-13-4` package may be required depending on your system's NVIDIA GPU
 driver version. For additional information, refer to the [CUDA Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html).
 
 ```bash
-# By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+# By default, the PyTorch CUDA 12.8 package is installed. Install the CUDA 13 one instead: cu130 is PyTorch's only CUDA 13 channel, and it runs on the toolkit above through CUDA minor version compatibility.
 pip3 install torch==2.12.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
 sudo apt-get -y install libopenmpi-dev
@@ -141,7 +141,38 @@ There are some known limitations when you pip install the pre-built TensorRT LLM
     to discover a SLURM installation in the usual places.
     ```
 
-2. Prevent `pip` from replacing existing PyTorch installation
+2. Open MPI 5 rejects a long hostname when spawning workers
+
+    Where the MPI implementation is Open MPI 5 -- which the release container now provides, since
+    its base image ships it -- PMIx refuses the handshake behind `MPI_Comm_spawn` if the hostname
+    is 31 characters or longer. TensorRT LLM spawns its workers that way, so on a host with a long
+    name, a Kubernetes pod for instance, startup fails with:
+
+    ```text
+    mpi4py.MPI.Exception: MPI_ERR_UNKNOWN: unknown error
+    ```
+
+    Export a shorter `PMIX_HOSTNAME` in the environment TensorRT LLM starts from. PMIx only uses
+    the value to identify the node during the handshake, so it does not have to resolve; any short
+    string will do. On a single node, for example:
+
+    ```bash
+    export PMIX_HOSTNAME=trtllm-node
+    ```
+
+    Across several nodes the name has to stay **distinct per node**. A single constant would make
+    PMIx treat every rank as co-located and its locality decisions would be wrong, so derive the
+    name from the real hostname instead of hard-coding one:
+
+    ```bash
+    export PMIX_HOSTNAME="n-$(hostname | sha1sum | cut -c1-12)"
+    ```
+
+    Set it in the environment of the process that spawns the workers. Passing it through
+    `mpirun -x PMIX_HOSTNAME` does not reach them, because Open MPI rebuilds the `PMIX_*`
+    variables in every process it launches.
+
+3. Prevent `pip` from replacing existing PyTorch installation
 
    On certain systems, particularly Ubuntu 22.04, users installing TensorRT LLM would find that their existing, CUDA 13.0 compatible PyTorch installation (e.g., `torch==2.9.0+cu130`) was being uninstalled by `pip`. It was then replaced by a CUDA 12.8 version (`torch==2.9.0`), causing the TensorRT LLM installation to be unusable and leading to runtime errors.
 
