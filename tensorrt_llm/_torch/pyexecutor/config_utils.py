@@ -3,7 +3,7 @@
 
 import dataclasses
 from collections.abc import Mapping as AbcMapping
-from typing import List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 import transformers
@@ -11,6 +11,9 @@ import transformers
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
 
 
 def resolve_cache_transceiver_config(
@@ -311,6 +314,22 @@ def is_mla(config):
             config, "qk_rope_head_dim", None):
         return True
     return False
+
+
+def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
+    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path."""
+    return (is_mla(model_config.pretrained_config)
+            and model_config.attn_backend == "TRTLLM"
+            and model_config.sparse_attention_config is None
+            and not is_hybrid_linear(model_config.pretrained_config))
+
+
+def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
+    """Use the resolved quantization, never the requested cache dtype."""
+    quant_config = getattr(model_config, "quant_config", None)
+    return (quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+            and supports_fp4_mla_attention(model_config))
 
 
 def is_minimax_m3(sparse_attention_config):

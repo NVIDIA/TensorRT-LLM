@@ -500,15 +500,10 @@ SMEM_P4_PV_SFB_EXTRA_COL_STRIDE = -1
 SMEM_P4_PV_SFB_S2T_STRIDE_BYTES = 128
 SMEM_P4_PV_SFB_CP_GROUP_ONE = False
 SMEM_P4_QK_COMPLETION_MBARS = SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-_EXPLICIT_TORCH_STREAM: torch.cuda.Stream | None = None
 
 
 def _current_cu_stream() -> cuda.CUstream:
-    global _EXPLICIT_TORCH_STREAM
-    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") == "1":
-        if _EXPLICIT_TORCH_STREAM is None:
-            _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
-        torch.cuda.set_stream(_EXPLICIT_TORCH_STREAM)
+    """Use the caller's stream for launch ordering and CUDA graph capture."""
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
