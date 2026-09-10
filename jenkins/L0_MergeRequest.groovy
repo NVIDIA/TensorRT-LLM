@@ -963,6 +963,12 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
         // Download the touch DB only for PRs in the coverage-tier pilot.
         def coverageDb = _cbtsCoverageAudit(pipeline)
+        def coveragePatchInput = null
+        if (coverageDb?.patch_input) {
+            coveragePatchInput = new groovy.json.JsonSlurper().parseText(
+                readFile("${LLM_ROOT}/${coverageDb.patch_input}"))
+            changedFiles = (coveragePatchInput.changed_files ?: []).unique()
+        }
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -975,10 +981,13 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         def diffs = [:]
         if (filesNeedingDiff) {
-            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-            def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
-                : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            def fileChanges = coveragePatchInput?.diffs
+            if (fileChanges == null) {
+                def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+                fileChanges = githubPrApiUrl != null
+                    ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+                    : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            }
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
                 [(filePath): fileChanges[filePath] ?: ""]
@@ -1062,7 +1071,7 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 }
 
 // Check pilot eligibility, then fetch and audit the touch DB; artifact.py's
-// {path, meta} verbatim, or null on failure.
+// prepared paths and compatibility-diff metadata verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
@@ -1073,7 +1082,13 @@ def _cbtsCoverageAudit(pipeline)
         def readyJson = ""
         def prAuthor = ""
         def pilotEligible = false
-        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'),
+            string(credentialsId: 'default-llm-repo', variable: 'CBTS_COVERAGE_GIT_REPO'),
+        ]) {
             prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
@@ -1097,6 +1112,16 @@ def _cbtsCoverageAudit(pipeline)
             return null
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        if (ready.patch_diff_kind == "cumulative") {
+            pipeline.echo("CBTS audit: Tier 2 will use cumulative diff " +
+                          "${ready.patch_diff_base_commit.take(10)}.." +
+                          "${ready.patch_diff_head_commit.take(10)}, not the GitHub PR diff " +
+                          "${ready.pr_base_commit.take(10)}.." +
+                          "${ready.patch_diff_head_commit.take(10)}")
+        } else {
+            pipeline.echo("CBTS audit: coverage compatibility used GitHub PR diff " +
+                          "${ready.patch_diff_base_commit.take(10)}..${ready.patch_diff_head_commit.take(10)}")
+        }
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
         return ready
     } catch (InterruptedException e) {
