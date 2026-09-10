@@ -469,6 +469,8 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         layer_types=layer_types,
         sliding_window=sliding_window,
     )
+    config = hybrid._model_engine.model.model_config.pretrained_config
+    config.head_dim, config.global_head_dim = 256, 128
     uniform = _make_creator(
         tpb,
         [_make_mock_request(max_seq_len - 1), _make_mock_request(1)],
@@ -523,7 +525,7 @@ def test_hybrid_linear_attention_scales_by_num_pool_groups():
     ],
     ids=["multiple_window_sizes", "missing_window"],
 )
-def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
+def test_plain_v2_collapses_unsupported_full_sliding_metadata(
     sliding_window,
     use_sliding_window,
 ):
@@ -550,7 +552,7 @@ def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
         layer_types=["full_attention", "full_attention"],
     )
 
-    assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
+    assert hybrid._get_token_num_for_estimation() == uniform._get_token_num_for_estimation()
 
 
 def test_vswa_max_attention_window_fallback_scales():
@@ -604,6 +606,8 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         layer_types=layer_types,
         sliding_window=sliding_window,
     )
+    config = c._model_engine.model.model_config.pretrained_config
+    config.head_dim, config.global_head_dim = 256, 128
 
     total_tokens = c._get_token_num_for_estimation()
     per_pool_tokens = total_tokens // 2  # 2 pool groups
