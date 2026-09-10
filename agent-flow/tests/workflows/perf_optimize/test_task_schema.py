@@ -32,7 +32,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
         "max_attempts_per_item": 3,
         "max_items_per_round": 3,
         "item_execution": "parallel",
-        "parallel_engine": "dag",
+        "parallel_engine": "threads",
         "approaches": ["config", "code"],
         "accept_fraction": 0.5,
         "noise_floor_pct": 1.0,

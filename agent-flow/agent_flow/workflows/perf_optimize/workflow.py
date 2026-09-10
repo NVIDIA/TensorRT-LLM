@@ -1010,10 +1010,10 @@ class PerfOptimizeWorkflow:
             if entry.get("status") not in ("candidate_ready", "failed")
         ]
         if pending:
-            if self._parallel_engine() == "threads":
-                self._run_item_threads(state, pending, log)
-            else:
+            if self._parallel_engine() == "dag":
                 self._run_item_graph(state, pending, log)
+            else:
+                self._run_item_threads(state, pending, log)
 
         if not state.batch_completed:
             append_workflow_event(
@@ -1034,6 +1034,13 @@ class PerfOptimizeWorkflow:
         log,
     ) -> None:
         """Drive one round's pending items through the concurrent DAG engine.
+
+        The ``parallel_engine: dag`` opt-in. Equivalent to
+        :meth:`_run_item_threads` for this workflow's purposes — same batch,
+        same ledger, same Integrator — but expressed on the shared engine, so
+        the round gains what the engine gains (pause/replan, cross-node
+        dependencies) at the cost of a second scheduling mechanism to reason
+        about. That trade is why it is opt-in rather than the default.
 
         The graph is flat: the items all fork from the same frozen base, and the
         Integrator runs after this returns rather than as a fan-in node.
@@ -1101,14 +1108,14 @@ class PerfOptimizeWorkflow:
         pending: list[dict[str, Any]],
         log,
     ) -> None:
-        """Drive one round's pending items through the pre-engine thread pool.
+        """Drive one round's pending items through this workflow's thread pool.
 
-        The ``parallel_engine: threads`` fallback to :meth:`_run_item_graph`.
-        With no scheduler there is no isolation provider either, so each item's
-        worktree is created here, up front, by :meth:`_ensure_item_runtime` —
-        the serial path's call — from the path and branch the ledger already
-        records. Nothing else changes: the item loop and everything downstream
-        of the batch never learn which engine dispatched them.
+        The default. With no scheduler there is no isolation provider either, so
+        each item's worktree is created here, up front, by
+        :meth:`_ensure_item_runtime` — the serial path's call — from the path
+        and branch the ledger already records. The item loop and everything
+        downstream of the batch never learn which engine dispatched them, which
+        is what lets :meth:`_run_item_graph` be a drop-in alternative.
         """
         for entry in pending:
             self._ensure_item_runtime(state, entry)
@@ -1127,10 +1134,17 @@ class PerfOptimizeWorkflow:
                 except BaseException as exc:  # preserve other completed item results
                     errors.append(exc)
         if errors:
-            raise RuntimeError(
-                f"{len(errors)} parallel optimization item(s) failed; "
-                f"first error: {type(errors[0]).__name__}: {errors[0]}"
-            ) from errors[0]
+            if len(errors) > 1:
+                print_message(
+                    f"[bold red]✗ {len(errors)} parallel optimization items failed; "
+                    f"aborting on the first[/bold red]",
+                    log,
+                )
+            # Re-raise the original, not a summary ``RuntimeError`` wrapping it:
+            # the exception's type and message are what a reader needs to
+            # diagnose the abort, and :meth:`_run_item_graph` propagates them
+            # too. How a crash reads must not depend on which engine ran it.
+            raise errors[0]
 
     def _integrator_verdict_defect(
         self,
@@ -1224,12 +1238,11 @@ class PerfOptimizeWorkflow:
     def _parallel_engine(self) -> str:
         """Which engine runs ``item_execution: parallel`` for this campaign.
 
-        ``dag`` (the default) is the shared ``agent_flow.orchestration``
-        scheduler; ``threads`` is the pre-engine thread pool, kept so a campaign
-        can fall back without giving up parallelism. Read off the resolved
-        ``workspace/task.yaml``, which is written once on the fresh run — so a
-        campaign keeps the engine it started under for its whole life, and a
-        finished workspace still says which one produced its numbers.
+        ``threads`` (the default) is this workflow's own thread pool; ``dag``
+        opts into the shared ``agent_flow.orchestration`` scheduler. Read off
+        the resolved ``workspace/task.yaml``, which is written once on the fresh
+        run — so a campaign keeps the engine it started under for its whole
+        life, and a finished workspace still says which one produced its numbers.
         """
         return str(self._optimize_block()["parallel_engine"])
 

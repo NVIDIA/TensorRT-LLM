@@ -2617,10 +2617,10 @@ def test_crash_mid_accept_is_logged_and_leaves_resumable_checkpoint(tmp_path, mo
     as a deliberate exit. The abort must be logged and the checkpoint left
     at the evaluator stage so a plain re-run retries the accept.
 
-    The scheduler propagates the *original* exception rather than the summary
-    ``RuntimeError`` the hand-rolled thread pool used to raise, so the assertion
-    is on the underlying git failure — the type and message a reader needs to
-    diagnose the abort, which the old wrapper flattened away.
+    The assertion is on the underlying git failure — the type and message a
+    reader needs to diagnose the abort. Both engines propagate the *original*
+    exception rather than a summary ``RuntimeError`` wrapping it, so this holds
+    whichever one dispatched the batch (here, the default).
     """
     from agent_flow.workflows.perf_optimize import gitops as gitops_module
 
@@ -4741,7 +4741,7 @@ def test_a_rejected_item_never_blocks_its_siblings_from_integrating(tmp_path, fa
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [
-        # Unset ⇒ the pre-engine behavior: the pool was sized to the batch.
+        # Unset ⇒ follow the batch size, as sizing the pool to it always did.
         (None, 3),
         (1, 1),
         (2, 2),
@@ -4756,7 +4756,9 @@ def test_max_parallel_items_bounds_concurrency_independently_of_the_batch(
 
     The batch size is a statement about planning breadth; how many
     ``trtllm-serve`` instances the hardware can host at once is a separate fact,
-    and before the engine landed the two were the same number by construction.
+    and before the knob existed the two were the same number by construction.
+    Pinned on the ``dag`` engine here; ``threads`` gets the same treatment in
+    ``test_the_threads_engine_also_honors_max_parallel_items``.
     """
     seen: list[int] = []
     real_scheduler = workflow_module.NodeScheduler
@@ -4767,7 +4769,7 @@ def test_max_parallel_items_bounds_concurrency_independently_of_the_batch(
 
     monkeypatch.setattr(workflow_module, "NodeScheduler", spy)
 
-    optimize: dict = {"max_rounds": 1, "max_items_per_round": 3}
+    optimize: dict = {"max_rounds": 1, "max_items_per_round": 3, "parallel_engine": "dag"}
     if configured is not None:
         optimize["max_parallel_items"] = configured
     task = _write_task(tmp_path, {"optimize": optimize})
@@ -4883,10 +4885,10 @@ def test_a_concurrent_real_git_batch_isolates_every_item(tmp_path, engine):
 
 
 def test_the_threads_engine_runs_a_batch_without_the_scheduler(tmp_path, fake_git, monkeypatch):
-    """``parallel_engine: threads`` fans out without building a scheduler.
+    """The default engine fans out without building a scheduler at all.
 
-    A fallback that still runs the engine is not a fallback, so the scheduler is
-    made un-constructible. The round must nonetheless land where the DAG engine
+    The scheduler is made un-constructible, so this fails if the default ever
+    silently becomes ``dag``. The round must still land where the DAG engine
     lands it: both items accepted through one Integrator verdict.
     """
 
@@ -4934,9 +4936,9 @@ def test_the_threads_engine_runs_a_batch_without_the_scheduler(tmp_path, fake_gi
 def test_the_threads_engine_also_honors_max_parallel_items(tmp_path, fake_git, monkeypatch):
     """The concurrency cap is a statement about the machine, not about an engine.
 
-    The pre-engine pool was sized to the batch, so a campaign falling back to
-    ``threads`` would otherwise silently lose the ability to say "this node
-    hosts one ``trtllm-serve`` at a time".
+    The thread pool used to be sized to the batch, so without this the default
+    engine would silently lack the ability to say "this node hosts one
+    ``trtllm-serve`` at a time" that ``dag`` has.
     """
     real_pool = workflow_module.ThreadPoolExecutor
     seen: list[int] = []

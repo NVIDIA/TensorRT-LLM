@@ -112,8 +112,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override `optimize.parallel_engine` from task.yaml on a fresh "
         "run: which engine fans out an `item_execution: parallel` batch. "
-        "`dag` drives it through the shared agent_flow.orchestration "
-        "scheduler; `threads` uses the pre-engine thread pool. To compare "
+        "`threads` (the default) uses this workflow's own thread pool; `dag` "
+        "opts into the shared agent_flow.orchestration scheduler. To compare "
         "them, point two --workspace directories at one task.yaml and vary "
         "only this flag — each workspace's resolved task.yaml then records "
         "the engine it ran under. "
