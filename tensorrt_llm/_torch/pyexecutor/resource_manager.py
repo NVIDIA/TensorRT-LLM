@@ -48,7 +48,7 @@ from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
                        nvtx_range)
 from ...logger import logger
 from ...mapping import Mapping
-from .config_utils import uses_vswa_kv_cache_layout
+from .config_utils import has_fp4_kv_cache, uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .scheduler import ScheduledRequests
@@ -1577,8 +1577,7 @@ class KVCacheManager(BaseResourceManager):
         mla = hasattr(config,
                       "kv_lora_rank") and config.kv_lora_rank is not None
         quant_config = model_config.quant_config
-        if (mla and quant_config is not None
-                and quant_config.quant_mode.has_fp4_kv_cache()):
+        if mla and has_fp4_kv_cache(quant_config):
             raise ValueError(
                 "FP4 MLA cache sizing requires Fp4MlaKVCacheManagerV2; "
                 "KVCacheManager V1 is not supported.")
