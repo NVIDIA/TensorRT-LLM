@@ -1086,11 +1086,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def coverageContext = _cbtsCoverageAudit(pipeline)
         def coverageDb = coverageContext?.db
         def coveragePilotEligible = coverageContext?.pilotEligible ?: false
-        def coveragePatchInput = null
-        if (coverageDb?.patch_input) {
-            coveragePatchInput = new groovy.json.JsonSlurper().parseText(
-                readFile("${LLM_ROOT}/${coverageDb.patch_input}"))
-        }
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -1126,19 +1121,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
         if (coverageDb) {
             mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
-        }
-        if (coveragePatchInput) {
-            def coverageDiffs = filesNeedingDiff.collectEntries { filePath ->
-                [(filePath): coveragePatchInput.diffs[filePath] ?: ""]
-            }
-            def coverageInputJson = groovy.json.JsonOutput.toJson([
-                changed_files: changedFiles,
-                diffs: coverageDiffs,
-                post_merge: testFilter[(IS_POST_MERGE)] ?: false,
-            ])
-            def coverageInputPath = "${LLM_ROOT}/cbts_coverage_input.json"
-            writeFile file: coverageInputPath, text: coverageInputJson
-            mainCmd += " --coverage-input cbts_coverage_input.json"
         }
         def output = sh(script: mainCmd, returnStdout: true)
 
@@ -1251,17 +1233,7 @@ def _cbtsCoverageAudit(pipeline)
             return [db: null, pilotEligible: pilotEligible]
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
-        if (ready.patch_diff_kind == "cumulative") {
-            pipeline.echo("CBTS audit: Tier 2 will evaluate the current PR files using " +
-                          "cumulative per-file diffs from " +
-                          "${ready.patch_diff_base_commit.take(10)}.." +
-                          "${ready.patch_diff_head_commit.take(10)}, not the GitHub PR diff " +
-                          "${ready.pr_base_commit.take(10)}.." +
-                          "${ready.patch_diff_head_commit.take(10)}")
-        } else {
-            pipeline.echo("CBTS audit: coverage compatibility used GitHub PR diff " +
-                          "${ready.patch_diff_base_commit.take(10)}..${ready.patch_diff_head_commit.take(10)}")
-        }
+        pipeline.echo("CBTS audit: PR diff applies cleanly to the latest coverage DB")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
         return [db: ready, pilotEligible: pilotEligible]
     } catch (InterruptedException e) {
