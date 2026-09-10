@@ -1657,6 +1657,12 @@ class MemoryUpdateRequest(OpenAIBaseModel):
         description="Memory tags to release/resume, e.g. ['model', 'kv_cache']")
 
 
+class RuntimeMemoryUpdateRequest(OpenAIBaseModel):
+    tags: Optional[List[str]] = Field(
+        default=None,
+        description="Memory tags to release/resume; omit to select defaults")
+
+
 class UpdateWeightsRequest(OpenAIBaseModel):
     weights: Optional[Dict[str, str]] = Field(
         default=None,
