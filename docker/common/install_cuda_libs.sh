@@ -7,14 +7,22 @@ set -ex
 CUDA_VER="13.4" # image reports CUDA_VERSION=13.4.1.012
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.25.0.28-1" # TODO(dlfw-26.08): exact internal build, not yet on the public CUDA apt repo (public max is 9.25.0.15-1)
+# The DLFW 26.08 image ships cuDNN 9.25.0.28, an internal build the public CUDA repo does not
+# carry (it has 9.25.0.15-1, 9.25.1.1-1 and 9.26.0.51-1). Pin the closest published version so
+# that every image -- the DLFW-based one included -- ends up on a cuDNN anyone can install from
+# the public repo, and the tests therefore validate that combination rather than one only NGC
+# can reproduce. The version guard below does not match on DLFW, so its cuDNN is deliberately
+# purged and reinstalled at this version.
+CUDNN_VER="9.25.1.1-1"
 NCCL_VER="2.30.7-1+cuda13.3"
 CUBLAS_VER="13.7.0.27-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"
-CUDA_RUNTIME="13.4.49-1" # TODO(dlfw-26.08): rockylinux only; the public cuda-toolkit-13-4-* rpms are not released yet
-CUDA_DRIVER_VERSION="615.65.02-1.el8" # TODO(dlfw-26.08): rockylinux only; taken from the image's CUDA_DRIVER_VERSION, re-check the rpm release suffix once cuda-compat-13-4 is published
+CUDA_RUNTIME="13.4.49-1" # rockylinux only
+# rockylinux only. CUDA 13.4.1 ships cuda-compat-13-4 at 615.71.09; the DLFW image itself
+# reports CUDA_DRIVER_VERSION=615.65.02, which was never published as an rpm.
+CUDA_DRIVER_VERSION="615.71.09-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -111,14 +119,14 @@ install_ubuntu_requirements() {
 
 install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
-    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
     CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
 
     ARCH=$(uname -m)
     if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
     if [ "$ARCH" = "aarch64" ];then ARCH1="aarch64" && ARCH2="aarch64sbsa" && ARCH3="sbsa";fi
 
-    # Download and install packages
+    # Download and install packages. As on Ubuntu, cuBLAS ships as libcublas-<CUDA_MAJOR>-<CUDA_MINOR>;
+    # the libcublas<CUBLAS_MAJOR>-cuda-<CUDA_MAJOR> rpms are a separate, older series that stops at 13.6.
     for pkg in \
         "libnccl-${NCCL_VER}.${ARCH1}" \
         "libnccl-devel-${NCCL_VER}.${ARCH1}" \
@@ -126,8 +134,8 @@ install_rockylinux_requirements() {
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
-        "libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}" \
-        "libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}"; do
+        "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
+        "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
         wget --retry-connrefused --timeout=180 --tries=10 --continue "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
 
@@ -142,8 +150,8 @@ install_rockylinux_requirements() {
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
-        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm \
-        libcublas${CUBLAS_MAJOR_VER}-devel-cuda-${CUDA_MAJOR_VER}-${CUBLAS_VER}.${ARCH1}.rpm
+        libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
+        libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
 
     # Clean up
     rm -f *.rpm
