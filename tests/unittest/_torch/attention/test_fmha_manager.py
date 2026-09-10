@@ -70,6 +70,36 @@ def test_manager_does_not_retain_attention() -> None:
     assert manager.fmha_libs == []
 
 
+def test_manager_does_not_construct_libraries_missing_capabilities() -> None:
+    events: list[tuple] = []
+
+    class _UnsupportedFmha(FakeFmha):
+        @classmethod
+        def _is_available(cls, attn: TrtllmAttention) -> bool:
+            raise AssertionError("Capability rejection must precede implementation probing.")
+
+        def __init__(self, attn: TrtllmAttention) -> None:
+            raise AssertionError("A library missing a required capability must not be constructed.")
+
+    class _SupportedFmha(FakeFmha):
+        supports_skip_correction = True
+
+        def __init__(self, attn: TrtllmAttention) -> None:
+            super().__init__(attn, "supported", events)
+
+    attn = FakeAttention()
+    attn.skip_correction_threshold = 0.1
+    with patch.object(
+        fmha_manager,
+        "get_enabled_fmha_lib_classes",
+        return_value=[_UnsupportedFmha, _SupportedFmha],
+    ):
+        manager = FmhaManager(attn)
+
+    assert len(manager.fmha_libs) == 1
+    assert isinstance(manager.fmha_libs[0], _SupportedFmha)
+
+
 def test_select_non_mla_fmha_combines_supported_phases() -> None:
     events: list[tuple] = []
     attn, manager = _make_manager()
@@ -868,6 +898,7 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
 
     attn = TrtllmAttention.__new__(TrtllmAttention)
     attn.is_mla_enable = False
+    attn.skip_correction_threshold = 0.0
     metadata = _make_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))
