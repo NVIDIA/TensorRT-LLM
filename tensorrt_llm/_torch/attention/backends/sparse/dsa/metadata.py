@@ -38,6 +38,7 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # Indexer MQA-logits are currently always fp32. The dtype is part of the
 # CuTe DSL Top-K compile key, so warmup must use the runtime dtype.
 _INDEXER_LOGITS_DTYPE = torch.float32
+_MAX_RADIX_BLOCKS_PER_ROW = 10
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
@@ -84,6 +85,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     num_sparse_topk: int
     # TopK for dynamic sparse MLA
     sparse_mla_topk: int
+    radix_aux_indices: Optional[torch.Tensor] = field(default=None, init=False)
+    radix_aux_logits: Optional[torch.Tensor] = field(default=None, init=False)
     # max number of draft tokens
     max_draft_tokens: int = 0
     # Indexer head dimension
@@ -159,6 +162,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._group_remap_batched = {}
         self.num_ctx_mla_kv_tokens = 0
         self.nvfp4_mla_context_fp8_scratch = None
+        self._radix_rows_per_sequence = 1
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -778,6 +782,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
+    def _create_radix_aux_buffers(self, capture_graph: bool) -> None:
+        max_num_rows = self.max_num_sequences * self._radix_rows_per_sequence
+        radix_shape = (max_num_rows, _MAX_RADIX_BLOCKS_PER_ROW, self.num_sparse_topk)
+        self.radix_aux_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            radix_shape,
+            cache_name="radix_aux_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.radix_aux_logits = self.get_empty(
+            self.cuda_graph_buffers,
+            radix_shape,
+            cache_name="radix_aux_logits",
+            dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
+
     def create_buffers_for_indexer(self, capture_graph=False):
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -1003,6 +1025,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
+        self._create_radix_aux_buffers(capture_graph)
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
@@ -1102,6 +1125,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_contexts=num_contexts,
         )
         self.max_draft_tokens = max_draft_len
+        rows_per_sequence = max(1 + max_draft_len, 1 + (max_total_draft_tokens or 0))
+        if is_spec_dec_dynamic_tree and spec_tree_manager is not None:
+            rows_per_sequence = max(rows_per_sequence, spec_tree_manager._internal_buf_dim)
+        resize_radix_workspace = rows_per_sequence != self._radix_rows_per_sequence
+        self._radix_rows_per_sequence = rows_per_sequence
         capture_graph = self.is_cuda_graph
         max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
         if (
@@ -1114,6 +1142,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
+        if resize_radix_workspace:
+            self._create_radix_aux_buffers(capture_graph)
 
     def _update_indexer_k_cache_block_offsets(self) -> torch.Tensor:
         """Refresh INDEX_KEY offsets and return their physical pool slots."""
