@@ -815,8 +815,7 @@ class CUDAGraphRunner:
                 logger.debug(
                     "replay() got no mrope_delta_read_seq_slots for a "
                     "use_mrope graph; filling the static buffer with the "
-                    "dummy seq slot instead of copying real values.",
-                    key=f"cuda_graph_mrope_delta_read_seq_slots_omitted_{key}")
+                    "dummy seq slot instead of copying real values.")
                 mrope_dummy_seq_slot = self.config.max_num_tokens * self.config.mapping.pp_size
                 static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
                     mrope_dummy_seq_slot)
