@@ -44,7 +44,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (DisaggWorkerRole, MultimodalConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -614,6 +615,50 @@ def _terminate_attached_frontends(children: list) -> None:
             child.kill()
 
 
+# Only CONTEXT and GENERATION name a half of a disaggregated deployment. The
+# other ServerRole values (MM_ENCODER, VISUAL_GEN, EMBEDDING) are distinct model
+# types rather than one phase of a split model, so they map to no worker role
+# and leave the engine's behaviour unchanged.
+_DISAGG_WORKER_ROLE_BY_SERVER_ROLE = {
+    ServerRole.CONTEXT: DisaggWorkerRole.CONTEXT,
+    ServerRole.GENERATION: DisaggWorkerRole.GENERATION,
+}
+
+# The same roles keyed by the disaggregated config's own 'ctx'/'gen' spelling
+# (`CtxGenServerConfig.type`), which is what the MPI launcher has on hand.
+_DISAGG_WORKER_ROLE_BY_SERVER_TYPE = {
+    "ctx": DisaggWorkerRole.CONTEXT,
+    "gen": DisaggWorkerRole.GENERATION,
+}
+
+
+def _as_worker_role(value: Any) -> DisaggWorkerRole:
+    """Coerce a configured `_disagg_worker_role`, or reject it with guidance.
+
+    The value can come from a user's YAML, so a bad one is ordinary input, not
+    an internal error. `'ctx'` gets a specific hint because it is the spelling
+    the same file uses for `CtxGenServerConfig.type`.
+    """
+    try:
+        return DisaggWorkerRole(value)
+    except ValueError:
+        valid = ", ".join(repr(role.value) for role in DisaggWorkerRole)
+        suggestion = ""
+        # YAML can produce an unhashable value (a list or a mapping), which
+        # would make the `in` lookup below raise TypeError out of this handler.
+        if isinstance(value,
+                      str) and value in _DISAGG_WORKER_ROLE_BY_SERVER_TYPE:
+            suggestion = (
+                f" Did you mean "
+                f"{_DISAGG_WORKER_ROLE_BY_SERVER_TYPE[value].value!r}? "
+                f"{value!r} is the server-type spelling used by the "
+                f"context_servers / generation_servers blocks, not this field's."
+            )
+        raise ValueError(
+            f"Invalid _disagg_worker_role {value!r} in the server "
+            f"configuration. Valid roles are {valid}.{suggestion}") from None
+
+
 def launch_server(
         host: str,
         port: int,
@@ -631,7 +676,8 @@ def launch_server(
         num_media_load_workers: int = 8,
         multi_frontend_enabled: bool = True,
         internal_disagg_auth_key: Optional[str] = None,
-        report_addr: Optional[str] = None):
+        report_addr: Optional[str] = None,
+        disagg_worker_role: Optional[DisaggWorkerRole] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -697,6 +743,22 @@ def launch_server(
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
+            # MM_ENCODER and friends map to no worker role: they are separate
+            # model types, not halves of a split model.
+            worker_role = (disagg_worker_role or
+                           _DISAGG_WORKER_ROLE_BY_SERVER_ROLE.get(server_role))
+            if worker_role is not None:
+                # Launch topology wins over a configured value: trusting a
+                # YAML block that names the opposite role would skip capture the
+                # worker needs, surfacing only as generation running eagerly.
+                configured = llm_args.get("_disagg_worker_role")
+                if configured is not None and _as_worker_role(
+                        configured) is not worker_role:
+                    logger.warning(
+                        f"Ignoring _disagg_worker_role={configured!r} from the "
+                        f"server configuration: this worker is launched as "
+                        f"{worker_role.value}.")
+                llm_args["_disagg_worker_role"] = worker_role
             llm = PyTorchLLM(**llm_args)
         elif backend == '_autodeploy':
             from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -2536,10 +2598,13 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[int(instance_idx)]
 
-    # Set disagg role for telemetry (server_cfg.type is 'ctx' or 'gen')
-    role_map = {"ctx": "context", "gen": "generation"}
-    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
-        server_cfg.type, "")
+    # Telemetry and the engine read one value, so the two cannot drift. Passed
+    # to launch_server separately from server_role, which this launcher leaves
+    # unset: server_role also selects HTTP routes and names the perf-metrics
+    # file, and neither should change here.
+    disagg_worker_role = _DISAGG_WORKER_ROLE_BY_SERVER_TYPE.get(server_cfg.type)
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = (
+        disagg_worker_role.value if disagg_worker_role is not None else "")
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
@@ -2558,6 +2623,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
                   llm_args=llm_args,
+                  disagg_worker_role=disagg_worker_role,
                   **launch_kwargs)
 
 

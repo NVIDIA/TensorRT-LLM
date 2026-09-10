@@ -3681,6 +3681,18 @@ class WaitingQueuePolicy(StrEnum):
     PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
 
 
+class DisaggWorkerRole(StrEnum):
+    """This worker's fixed role under disaggregated serving.
+
+    Set by the launcher rather than inferred from traffic: a generation
+    worker's first steps look like context steps, so the fact has to be handed
+    down. See `TorchLlmArgs.disagg_worker_role`.
+    """
+
+    CONTEXT = "context"  # prefill only; never runs a pure-generation step
+    GENERATION = "generation"  # decode; context steps only for its own handoff
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -5741,6 +5753,17 @@ class TorchLlmArgs(BaseLlmArgs):
         "noticeably slower and costs extra memory, in exchange for lower "
         "per-step sampling overhead.",
         status="prototype")
+
+    # Aliased and excluded like `mpi_session`: launcher-injected, not public.
+    disagg_worker_role: Optional[DisaggWorkerRole] = Field(
+        default=None,
+        description="This worker's fixed role under disaggregated serving, set "
+        "by the launcher from the deployment topology. Lets the engine skip "
+        "startup work for a phase this worker will never run: a context worker "
+        "always carries a context request, so it can never replay a "
+        "pure-generation CUDA graph. Leave unset for aggregated serving.",
+        exclude=True,
+        alias="_disagg_worker_role")
 
     enable_speculative_beam_history_d2h: bool = Field(
         default=False,
