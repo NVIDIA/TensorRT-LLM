@@ -34,6 +34,7 @@ def test_nvfp4_dspark_bench_override(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, backend: str
 ) -> None:
     monkeypatch.setenv("TRTLLM_TOTAL_GPU_COUNT", "8")
+    monkeypatch.setenv("LLM_MODELS_ROOT", str(tmp_path))
     monkeypatch.setattr(perf_test.PerfTestConfig, "get_benchmark_type", lambda self: "gpt")
     monkeypatch.setattr(perf_test, "get_model_dir", lambda name: "/models/dspark")
     runner = object.__new__(perf_test.MultiMetricPerfTest)
@@ -66,3 +67,10 @@ def test_empty_moe_backend_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_TOTAL_GPU_COUNT", "8")
     with pytest.raises(AssertionError, match="moe backend must not be empty"):
         perf_test.PerfTestConfig().load_from_str(f"{_CASE}-moe:")
+
+
+def test_moe_backend_rejected_for_non_pytorch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_TOTAL_GPU_COUNT", "8")
+    non_pytorch_case = _CASE.replace("-bench-pytorch-", "-bench-")
+    with pytest.raises(AssertionError, match="moe backend overrides require the pytorch backend"):
+        perf_test.PerfTestConfig().load_from_str(f"{non_pytorch_case}-moe:AUTO")
