@@ -364,10 +364,12 @@ def _estimate_swa_cache_size(
     return size_per_token, size_per_request
 
 
-def _get_kv_reserve_draft_tokens(spec_config, *, is_draft: bool) -> int:
-    """Return the same speculative KV reserve used by runtime resize paths."""
+def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, int]:
+    """Return draft-token reserve and total capacity headroom over history."""
+    from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
+
     if spec_config is None:
-        return 0
+        return 0, BASE_GENERATION_TOKEN_COUNT
     reserve = spec_config.max_total_draft_tokens
     if (
         is_draft
@@ -376,7 +378,11 @@ def _get_kv_reserve_draft_tokens(spec_config, *, is_draft: bool) -> int:
     ):
         draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
         reserve = max(reserve, draft_loop_tokens)
-    return reserve
+    dynamic_reserve = reserve - spec_config.max_total_draft_tokens
+    headroom = (
+        get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
+    )
+    return reserve, headroom
 
 
 def _estimate_cache_size_components(
@@ -410,17 +416,6 @@ def _estimate_cache_size_components(
         full_attn_size + generation_swa_size,
         generation_swa_per_request,
     )
-
-
-def _get_generation_kv_capacity_headroom(spec_config, *, is_draft: bool) -> int:
-    """Maximum capacity lead over history used by generation KV allocation."""
-    from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
-
-    if spec_config is None:
-        return BASE_GENERATION_TOKEN_COUNT
-    reserve = _get_kv_reserve_draft_tokens(spec_config, is_draft=is_draft)
-    dynamic_reserve = reserve - spec_config.max_total_draft_tokens
-    return get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
 
 
 def _get_single_swa_pool_slot_bytes(
@@ -1089,11 +1084,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self._supports_reuse_match_backoff:
             self.reuse_match_backoff = 0
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
-        self._kv_reserve_draft_tokens = _get_kv_reserve_draft_tokens(
-            spec_config, is_draft=self.is_draft
-        )
-        self._generation_kv_capacity_headroom = _get_generation_kv_capacity_headroom(
-            spec_config, is_draft=self.is_draft
+        self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
+            _get_generation_kv_capacity(spec_config, is_draft=self.is_draft)
         )
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
@@ -4244,7 +4236,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 backoff,
                 max_seq_len,
             )
-        generation_capacity_headroom = _get_generation_kv_capacity_headroom(
+        _, generation_capacity_headroom = _get_generation_kv_capacity(
             spec_config, is_draft=is_draft
         )
         (
