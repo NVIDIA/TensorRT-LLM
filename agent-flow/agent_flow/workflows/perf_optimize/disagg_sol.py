@@ -991,7 +991,7 @@ def launch_plan(
                 spec=campaign_spec(
                     base,
                     track=track,
-                    sweep=Path(sweeps[track]),
+                    sweep=sweep,
                     repo=repo,
                     point=point,
                     design=design,
