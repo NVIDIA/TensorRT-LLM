@@ -14,19 +14,19 @@
 """Resolve which post-merge CBTS touch DBs to use.
 
 Candidates are recent builds of `<ARTIFACT_BASE>` with both x86 and SBSA
-coverage tarballs. The newest complete pair wins. The PR diff must apply
-cleanly to that DB's revision; otherwise Tier 2 declines rather than choosing
-an older DB. Revision metadata comes from the forge compare API and needs
-`GITHUB_API_TOKEN`, the anonymous quota being per-IP and exhausted by shared CI
-egress.
+coverage tarballs. The newest complete pair wins. A squashed PR commit must
+cherry-pick cleanly to that DB's revision; when an older DB lacks intervening
+main changes, a cumulative DB-to-head commit is checked instead. Revision
+metadata comes from the forge compare API and needs `GITHUB_API_TOKEN`, the
+anonymous quota being per-IP and exhausted by shared CI egress.
 
 The selected architecture DBs are merged locally through the compact coverage
 schema, producing the one DB consumed by `main.py`.
 
-Two entry points. `--print-selection` prints `{urls, build, commit, lag,
-base_commit, drift, drift_status, patch_apply_status}` and stops. `--prepare
-DIR` goes on to download, unpack, and merge the winner, drop that JSON beside
-it, and print `{path, meta}` — the two paths `main.py` needs.
+Two entry points. `--print-selection` prints the selection metadata and stops.
+`--prepare DIR` goes on to download, unpack, and merge the winner, drop that
+JSON beside it, and print the paths and compatibility-diff metadata used by
+the CI audit.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, NamedTuple, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "coverage_utils"))
 
@@ -59,6 +59,7 @@ ARCH_TARBALL_NAMES = (
 # sqlite at the tar root, and the selection JSON `prepare` drops beside it.
 DB_NAME = "cbts_touchmap.sqlite"
 META_NAME = "cbts_coverage_db.json"
+DIFF_INPUT_NAME = "cbts_coverage_diff.json"
 # Per-build metadata carrying `commit=<sha>`; absent on some builds.
 BUILD_INFO_NAME = "build_info.txt"
 
@@ -66,6 +67,8 @@ BUILD_INFO_NAME = "build_info.txt"
 COVERAGE_BRANCH = "main"
 # Read by `compare_distance`; the anonymous quota is unusable from shared CI egress IPs.
 GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
+# The normal CI checkout's authenticated repository URL, bound by Jenkins.
+COVERAGE_GIT_REPO_ENV = "CBTS_COVERAGE_GIT_REPO"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
@@ -83,6 +86,13 @@ _GIT_TIMEOUT = 120
 _RETRIES = 3
 
 _PatchApplyStatus = Literal["clean", "conflict", "unknown"]
+
+
+class _PatchApplyResult(NamedTuple):
+    status: _PatchApplyStatus
+    diff_base_commit: str
+    changed_files: Optional[list[str]] = None
+    diffs: Optional[dict[str, str]] = None
 
 
 def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
@@ -235,15 +245,34 @@ def _run_git(
         return None
 
 
+def _cumulative_diff(repo: Path, db_commit: str, pr_head: str) -> Optional[dict]:
+    """Build the DB-to-head changed-file payload consumed by Tier 2."""
+    names = _run_git(["diff", "--name-only", "-z", "--find-renames", db_commit, pr_head], cwd=repo)
+    if names is None or names.returncode != 0:
+        return None
+    changed_files = [
+        path for path in names.stdout.decode("utf-8", "surrogateescape").split("\0") if path
+    ]
+    diffs = {}
+    for path in changed_files:
+        diff = _run_git(["diff", "--find-renames", db_commit, pr_head, "--", path], cwd=repo)
+        if diff is None or diff.returncode != 0:
+            return None
+        diffs[path] = diff.stdout.decode("utf-8", "replace")
+    return {"changed_files": changed_files, "diffs": diffs}
+
+
 def _patch_apply_status(
     pr_base_commit: str,
     pr_head: str,
     db_commit: str,
     repo_root: Path = Path("."),
-    upstream_url: str = _GITHUB_GIT_REPO,
-) -> _PatchApplyStatus:
-    """Return clean/conflict/unknown for applying the PR diff to the DB revision."""
+    upstream_url: Optional[str] = None,
+    db_drift_status: str = "",
+) -> _PatchApplyResult:
+    """Check a squashed PR commit against the DB revision."""
     repo_source = repo_root.resolve()
+    main_repo = upstream_url or os.environ.get(COVERAGE_GIT_REPO_ENV) or _GITHUB_GIT_REPO
     checked_out_head = _run_git(["rev-parse", "HEAD"], cwd=repo_source)
     if (
         checked_out_head is None
@@ -251,111 +280,136 @@ def _patch_apply_status(
         or checked_out_head.stdout.decode("ascii", "replace").strip() != pr_head
     ):
         print(f"[artifact] checked-out revision is not PR head {pr_head[:10]}", file=sys.stderr)
-        return "unknown"
+        return _PatchApplyResult("unknown", pr_base_commit)
     with tempfile.TemporaryDirectory(prefix="cbts_patch_check_") as temp_dir:
         temp = Path(temp_dir)
-        git_dir = temp / "repo.git"
-        initialized = _run_git(["init", "--bare", str(git_dir)], cwd=temp)
+        repo = temp / "repo"
+        initialized = _run_git(["init", str(repo)], cwd=temp)
         if initialized is None or initialized.returncode != 0:
             print("[artifact] could not initialize the patch-check repository", file=sys.stderr)
-            return "unknown"
+            return _PatchApplyResult("unknown", pr_base_commit)
 
-        # Fetching into a temporary bare repository leaves the shallow CI checkout and its
-        # index untouched. The checked-out PR head is available locally; both main revisions
-        # are fetched from the public upstream repository.
+        # The PR head is guaranteed to be the checked-out revision. The base and coverage
+        # commits come from the same authenticated internal mirror as normal CI checkouts.
         fetched_head = _run_git(
-            [
-                "--git-dir",
-                str(git_dir),
-                "fetch",
-                "--no-tags",
-                "--depth=1",
-                str(repo_source),
-                "HEAD",
-            ],
-            cwd=temp,
+            ["fetch", "--no-tags", "--depth=1", str(repo_source), "HEAD"], cwd=repo
         )
         if fetched_head is None or fetched_head.returncode != 0:
             print(
                 f"[artifact] could not load PR head {pr_head[:10]} for patch check",
                 file=sys.stderr,
             )
-            return "unknown"
+            return _PatchApplyResult("unknown", pr_base_commit)
 
         revisions = list(dict.fromkeys((pr_base_commit, db_commit)))
         fetched_revisions = _run_git(
-            [
-                "--git-dir",
-                str(git_dir),
-                "fetch",
-                "--no-tags",
-                "--depth=1",
-                upstream_url,
-                *revisions,
-            ],
-            cwd=temp,
+            ["fetch", "--no-tags", "--depth=1", main_repo, *revisions], cwd=repo
         )
         if fetched_revisions is None or fetched_revisions.returncode != 0:
             print(
                 "[artifact] could not load the base/coverage revisions for patch check",
                 file=sys.stderr,
             )
-            return "unknown"
+            return _PatchApplyResult("unknown", pr_base_commit)
 
-        diff = _run_git(
+        checked_out_db = _run_git(["checkout", "--detach", db_commit], cwd=repo)
+        if checked_out_db is None or checked_out_db.returncode != 0:
+            print("[artifact] could not check out the coverage revision", file=sys.stderr)
+            return _PatchApplyResult("unknown", pr_base_commit)
+
+        squashed_pr = _run_git(
             [
-                "--git-dir",
-                str(git_dir),
-                "diff",
-                "--binary",
-                "--full-index",
+                "-c",
+                "user.name=CBTS",
+                "-c",
+                "user.email=cbts@nvidia.com",
+                "commit-tree",
+                f"{pr_head}^{{tree}}",
+                "-p",
                 pr_base_commit,
-                pr_head,
+                "-m",
+                "squashed PR for CBTS compatibility check",
             ],
-            cwd=temp,
+            cwd=repo,
         )
-        if diff is None or diff.returncode != 0:
-            print("[artifact] could not generate the PR diff for patch check", file=sys.stderr)
-            return "unknown"
+        if squashed_pr is None or squashed_pr.returncode != 0:
+            print("[artifact] could not create the squashed PR commit", file=sys.stderr)
+            return _PatchApplyResult("unknown", pr_base_commit)
 
-        index = temp / "index"
-        git_env = os.environ.copy()
-        git_env["GIT_INDEX_FILE"] = str(index)
-        read_tree = _run_git(
-            ["--git-dir", str(git_dir), "read-tree", db_commit], cwd=temp, env=git_env
-        )
-        if read_tree is None or read_tree.returncode != 0:
-            print(
-                "[artifact] could not read the coverage revision for patch check",
-                file=sys.stderr,
-            )
-            return "unknown"
-
-        applied = _run_git(
-            [
-                "--git-dir",
-                str(git_dir),
-                "apply",
-                "--cached",
-                "--3way",
-                "--whitespace=nowarn",
-                "-",
-            ],
-            cwd=temp,
-            input_data=diff.stdout,
-            env=git_env,
-        )
+        pr_commit = squashed_pr.stdout.decode("ascii", "replace").strip()
+        applied = _run_git(["cherry-pick", "--no-commit", pr_commit], cwd=repo)
         if applied is None:
-            return "unknown"
-        return "clean" if applied.returncode == 0 else "conflict"
+            return _PatchApplyResult("unknown", pr_base_commit)
+        if applied.returncode == 0:
+            return _PatchApplyResult("clean", pr_base_commit)
+        if db_drift_status != "ahead":
+            return _PatchApplyResult("conflict", pr_base_commit)
+
+        # An older DB can lack main changes that the PR patch assumes. Retry the full
+        # DB-to-head delta so those prerequisites are included instead of misclassifying
+        # ordinary staleness as a PR conflict.
+        print(
+            f"[artifact] PR diff {pr_base_commit[:10]}..{pr_head[:10]} conflicts with older "
+            f"DB {db_commit[:10]}; retrying cumulative diff {db_commit[:10]}..{pr_head[:10]}",
+            file=sys.stderr,
+        )
+        reset = _run_git(["reset", "--hard", db_commit], cwd=repo)
+        if reset is None or reset.returncode != 0:
+            return _PatchApplyResult("unknown", db_commit)
+        cumulative = _run_git(
+            [
+                "-c",
+                "user.name=CBTS",
+                "-c",
+                "user.email=cbts@nvidia.com",
+                "commit-tree",
+                f"{pr_head}^{{tree}}",
+                "-p",
+                db_commit,
+                "-m",
+                "cumulative diff for CBTS compatibility check",
+            ],
+            cwd=repo,
+        )
+        if cumulative is None or cumulative.returncode != 0:
+            return _PatchApplyResult("unknown", db_commit)
+        cumulative_commit = cumulative.stdout.decode("ascii", "replace").strip()
+        applied = _run_git(["cherry-pick", "--no-commit", cumulative_commit], cwd=repo)
+        if applied is None:
+            return _PatchApplyResult("unknown", db_commit)
+        status: _PatchApplyStatus = "clean" if applied.returncode == 0 else "conflict"
+        if status != "clean":
+            return _PatchApplyResult(status, db_commit)
+        cumulative_diff = _cumulative_diff(repo, db_commit, pr_head)
+        if cumulative_diff is None:
+            return _PatchApplyResult("unknown", db_commit)
+        return _PatchApplyResult(
+            "clean",
+            db_commit,
+            cumulative_diff["changed_files"],
+            cumulative_diff["diffs"],
+        )
 
 
 def _selection_accepts_pr_diff(sel: dict, pr_base_commit: str, pr_head: str) -> bool:
-    sel["patch_apply_status"] = _patch_apply_status(pr_base_commit, pr_head, sel["commit"])
+    patch = _patch_apply_status(
+        pr_base_commit,
+        pr_head,
+        sel["commit"],
+        db_drift_status=sel.get("drift_status") or "",
+    )
+    sel["patch_apply_status"] = patch.status
+    sel["patch_diff_base_commit"] = patch.diff_base_commit
+    sel["patch_diff_head_commit"] = pr_head
+    sel["patch_diff_kind"] = (
+        "cumulative" if patch.diff_base_commit == sel["commit"] != pr_base_commit else "pr"
+    )
+    if patch.changed_files is not None and patch.diffs is not None:
+        sel["_patch_input"] = {"changed_files": patch.changed_files, "diffs": patch.diffs}
     if sel["patch_apply_status"] == "clean":
         return True
     print(
-        f"[artifact] coverage tier declined: PR diff does not apply cleanly to "
+        f"[artifact] coverage tier declined: compatibility diff does not apply cleanly to "
         f"latest DB commit {sel['commit'][:10]} ({sel['patch_apply_status']})",
         file=sys.stderr,
     )
@@ -438,11 +492,20 @@ def describe(sel: dict) -> str:
     else:
         base_distance = f"+{sel['drift']} commit(s)"
     base = (sel.get("base_commit") or "unknown")[:10]
-    return (
+    selection = (
         f"[artifact] selected build {sel.get('build')}, "
         f"DB commit {(sel.get('commit') or 'unknown')[:10]}; topology from DB: "
         f"PR base {base} ({base_distance}), current main tip ({lag})"
     )
+    diff_base = (sel.get("patch_diff_base_commit") or "unknown")[:10]
+    diff_head = (sel.get("patch_diff_head_commit") or "unknown")[:10]
+    if sel.get("patch_diff_kind") == "cumulative":
+        diff_description = (
+            f"cumulative {diff_base}..{diff_head}; differs from GitHub PR diff {base}..{diff_head}"
+        )
+    else:
+        diff_description = f"PR {diff_base}..{diff_head}"
+    return f"{selection}; compatibility diff: {diff_description}"
 
 
 def download(url: str, dest: Path, attempts: int = _RETRIES) -> Optional[Path]:
@@ -524,8 +587,21 @@ def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
         connection.close()
 
     meta = dest / META_NAME
+    patch_input = sel.pop("_patch_input", None)
     meta.write_text(json.dumps(sel))
-    return {"path": str(db), "meta": str(meta)}
+    ready = {
+        "path": str(db),
+        "meta": str(meta),
+        "patch_diff_kind": sel["patch_diff_kind"],
+        "patch_diff_base_commit": sel["patch_diff_base_commit"],
+        "patch_diff_head_commit": sel["patch_diff_head_commit"],
+        "pr_base_commit": pr_base_commit,
+    }
+    if patch_input is not None:
+        diff_input = dest / DIFF_INPUT_NAME
+        diff_input.write_text(json.dumps(patch_input))
+        ready["patch_input"] = str(diff_input)
+    return ready
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -545,8 +621,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--prepare",
         metavar="DIR",
         default=None,
-        help="resolve, download and merge the architecture DBs into DIR, then print "
-        "{path, meta} as JSON",
+        help="resolve, validate, download and merge the architecture DBs into DIR, then "
+        "print paths and compatibility-diff metadata as JSON",
     )
     ap.add_argument(
         "--pr-head",
@@ -594,6 +670,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     if not _selection_accepts_pr_diff(best, pr_base_commit, args.pr_head):
         return 1
+    best.pop("_patch_input", None)
     print(json.dumps(best))
     return 0
 

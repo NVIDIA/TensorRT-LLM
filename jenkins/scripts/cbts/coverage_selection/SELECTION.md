@@ -163,10 +163,12 @@ for b in N .. N-49:                              (_MAX_PROBE)
    GET build_info.txt, parse `commit=`           → sha; skip when absent
    first complete pair with a known sha          → latest coverage DB
    compare <sha>...<PR base>                     → record topology and absolute distance
-fetch PR head, base, and latest DB into a temporary bare repository
-apply `git diff <PR base> <PR head>` to the DB revision with `git apply --3way`
+fetch PR head locally; fetch base and latest DB from the normal CI Git mirror
+create a squashed PR commit with `commit-tree`, parented at the PR base
+cherry-pick it onto the DB revision
    clean                                          → continue
-   conflict / unavailable revision                → decline Tier 2
+   conflict and DB is older than PR base          → retry cumulative DB-to-head commit
+   other conflict / unavailable revision          → decline Tier 2
 ```
 
 Requiring the pair prevents the selector from narrowing only one CPU architecture. Builds are
@@ -186,9 +188,10 @@ mean the revision is no longer on `main` at all (history rewritten).
 
 There is no local-git path for measuring lag. The CI checkout is `depth: 1, noTags: true` with a
 single-SHA refspec (`trtllm_utils.checkoutSpec`), so the coverage revision is not available there.
-The conflict check creates a temporary bare repository, fetches the checked-out PR head locally
-and the public main revisions from GitHub, then uses an isolated index. It never changes the CI
-checkout or its index.
+The conflict check creates a temporary repository and fetches the checked-out PR head locally.
+The base and DB revisions come from `CBTS_COVERAGE_GIT_REPO`, bound to the same authenticated
+`default-llm-repo` internal mirror used by normal CI checkouts. The public GitHub repository is
+only a local-command fallback. The temporary repository never changes the CI checkout or its index.
 
 The compare API answers unless the revision has not reached the public mirror yet (404) or the
 token is missing (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is
@@ -208,21 +211,26 @@ The PR base is `merge_base_commit.sha` from `main...<PR head>`. The latest DB is
 freshness gate and telemetry. `ahead`, `behind`, and `identical` describe valid positions on main;
 diverged and unknown relations decline Tier 2.
 
-The latest DB must accept the complete binary PR diff from base to head via a three-way `git apply`
-with no conflicts. Conflict, fetch failure, or an unconstructable diff declines Tier 2 before the
-large DB artifacts are downloaded. If it passes, `--coverage-max-drift` applies a second fail-closed
+`commit-tree` represents the complete base-to-head PR change as one commit, and `cherry-pick`
+tests that commit against the latest DB without serializing through patch format. If the DB predates
+the PR base, a PR-only cherry-pick can conflict merely because it lacks intervening main changes.
+That case retries a cumulative DB-to-head commit. The audit log calls out this compatibility diff
+because it differs from the GitHub PR diff, and its DB-to-head changed files and per-file diffs
+become the actual Tier 2 input. Other conflicts or unmeasurable checks decline before the large DB
+artifacts are downloaded. If validation passes, `--coverage-max-drift` applies a second fail-closed
 bound: beyond 30 commits Tier 2 declines and the PR runs in full.
 
 
 ### 8.3 What happens with the result
 
 `--prepare DIR` does the whole fetch in one call: resolve the PR base, select the latest complete
-pair, validate the PR diff, stream both tarballs down, unpack their identically named SQLite files
-separately, and union them with `compact_db.merge_databases`. It writes the selection JSON beside
-the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy is left with the two
-things only it can do
-— bind the credential and run `coverage_audit.py` over the result — and any failure anywhere is
-caught and non-fatal: no prepared DB is returned, Tier 2 never runs, and the PR gets a full run.
+pair, validate compatibility, stream both tarballs down, unpack their identically named SQLite
+files separately, and union them with `compact_db.merge_databases`. It writes the selection JSON
+beside the merged SQLite as `cbts_coverage_db.json` and prints the paths plus compatibility-diff
+metadata. For a cumulative fallback, it also writes the corresponding Tier 2 changed-file payload.
+Groovy audits the DB and logs which diff range will drive Tier 2 before running
+`coverage_audit.py` over the result. Any failure anywhere is caught and non-fatal: no prepared DB is
+returned, Tier 2 never runs, and the PR gets a full run.
 
 Those two paths reach `main.py` as `--coverage-db` and `--coverage-db-meta`, so a new selection
 field needs no Groovy change. `main.py` records all of it and **gates on the drift**: past
