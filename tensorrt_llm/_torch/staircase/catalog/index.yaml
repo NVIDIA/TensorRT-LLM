@@ -1,0 +1,200 @@
+# Catalog Index
+#
+# Quick-reference for entry discovery. The path (relative to catalog/) is the
+# unique identifier; the directory encodes the category. Synced manually after
+# catalog changes.
+#
+# The catalog is the complete vocabulary of target modeling code: every call
+# that creates or transforms a tensor must be a catalog entry. Only tensor
+# metadata reads (.shape/.dtype/.device) and Python control flow live outside.
+#
+# AN ENTRY SPANS TWO TREES. The contract (.md) and the wrapper (.py) are here;
+# the GPU test is at
+# tests/unittest/_torch/staircase/<category>/test_staircase_<entry>.py, because
+# that is the tree this repo's CI collects from -- a test inside the package is
+# not picked up by any list. The receipt rule is unchanged in substance and
+# only gains a second directory to look in: a receipt is valid only if it
+# post-dates the last write to *every* file of the entry, contract and wrapper
+# and test alike. Check it mechanically against both paths.
+#
+# The tests are named test_staircase_* rather than test_<entry>: three of them
+# would otherwise collide with an upstream test of the same basename, and more
+# importantly they are not duplicates of those -- upstream covers the modules
+# that wrap these ops, these cover the op itself cell by cell.
+#
+# torch/ entries are hand-added thin mirrors of torch callables — upstream
+# owns their correctness, so they carry no contract doc, no test, and no
+# arch/precision certification (absence = unconstrained by design; real dtype
+# limits, e.g. no float8 arithmetic, are noted in the entry docstring).
+# Entries wrapping trtllm ops carry all three.
+#
+# ── RECEIPT STATUS: all 19 entries certified on sm_103 ────────────────────
+#
+# A receipt says this entry's test passed, on a stated GPU architecture, over
+# files no newer than the run. Both anchors moved at once here -- the
+# migration rewrote every test file, and the targets moved from sm_100 (B200)
+# to sm_103 (GB300) -- so every sm_100 receipt was voided and the whole set
+# was re-run on GB300 under 1.3.0rc26. **All 19 pass**; per-entry counts are
+# in each contract's `receipts:` frontmatter.
+#
+# Getting there surfaced four real differences, none of which was fixed by
+# widening a tolerance:
+#
+#   * thop_attention, mla_rope_generation, mla_rope_append_paged_kv_assign_q
+#     -- op schema drift rc21 -> rc26 (renamed and added parameters). The
+#     wrappers now mirror their schemas argument for argument, so the next
+#     drift fails loudly instead of shifting a positional list.
+#
+#   * mxe4m3_mxe2m1_block_scale_moe_runner -- the FC1 epilogue's MXFP8 block
+#     scale is `floor(log2(amax))-8` on sm_100 and `ceil(log2(amax/448))` on
+#     sm_103, bit-exactly. The reference is now architecture-keyed and each
+#     architecture refutes the other's recipe. See that contract.
+#
+#   * cublas_mm -- torch 2.12 made fp32 matmul default to TF32, so the
+#     *reference* was the imprecise side. The op is bit-identical to a
+#     TF32-disabled torch product. See that contract.
+#
+# The "measured on sm_100" statements throughout the contracts are left
+# exactly as written. They are true records of what was observed on another
+# device, and rewriting them would manufacture GB300 evidence that does not
+# exist. Read them as provenance; the frontmatter is the certification.
+# ──────────────────────────────────────────────────────────────────────────
+#
+# 30 of the source catalog's 43 entries are here — the union of what the two
+# migrated targets call. The 13 left behind (silu_and_mul, attn_custom_op_inplace,
+# create_attn_outputs, create_mla_outputs, load_chunked_kv_cache_for_mla,
+# merge_chunked_attention_for_mla, cute_dsl_bf16_gemm_blackwell,
+# flashinfer_fused_add_rmsnorm_quant, flashinfer_gemma_rmsnorm,
+# flashinfer_gemma_fused_add_rmsnorm, bf16_mxe2m1_block_scale_moe_runner,
+# renorm_moe_routing_op, allreduce) must arrive with their contract AND their
+# receipt when a later target needs them: a wrapper on its own would let that
+# target consume an op with no certification record at all.
+
+entries:
+  # ─── torch (native callables, trtllm-free) ────────────────────
+  - path: torch/embedding.py
+    impl: torch.nn.functional.embedding
+    summary: "Input-embedding lookup: token ids -> rows of the embedding weight"
+
+  - path: torch/concat.py
+    impl: torch.cat
+    summary: "Concatenate a list of tensors along a dim"
+
+  - path: torch/split.py
+    impl: torch.split
+    summary: "Split a tensor along a dim into equal chunks or explicit sizes"
+
+  - path: torch/add.py
+    impl: torch.add
+    summary: "Elementwise add (residual); torch has no float8 arithmetic"
+
+  - path: torch/reshape.py
+    impl: torch.reshape
+    summary: "Reshape (covers view: returns a view when layout allows)"
+
+  - path: torch/empty.py
+    impl: torch.empty
+    summary: "Uninitialized tensor allocation (scratch/output buffers whose sizing the caller owns)"
+
+  - path: torch/expand.py
+    impl: torch.Tensor.expand
+    summary: "Zero-copy broadcast view over singleton dims (stride-0; unsafe to write through)"
+
+  - path: torch/transpose.py
+    impl: torch.transpose
+    summary: "Zero-copy swap of two dims (strided view; presents [tokens, heads, dim] to a head-batched gemm)"
+
+  - path: torch/view_dtype.py
+    impl: torch.Tensor.view
+    summary: "Bitwise dtype reinterpretation of the same bytes (uint8 scale buffer -> float8_e4m3fn view); no conversion, no copy"
+
+  - path: torch/copy_.py
+    impl: torch.Tensor.copy_
+    summary: "In-place elementwise copy into a tensor or view (canonical slice fill; destroys dst contents)"
+
+  - path: torch/pad.py
+    impl: torch.nn.functional.pad
+    summary: "Constant padding of trailing dims (widening an activation to a kernel's operand width)"
+
+  # ─── norm ──────────────────────────────────────────────────────
+  - path: norm/flashinfer_rmsnorm.py
+    impl: torch.ops.trtllm.flashinfer_rmsnorm
+    summary: "RMS normalization over the last dim with elementwise weight scaling"
+
+  - path: norm/flashinfer_fused_add_rmsnorm.py
+    impl: torch.ops.trtllm.flashinfer_fused_add_rmsnorm
+    summary: "In-place fused residual add + RMS norm: residual += x; x = rmsnorm(residual) * weight"
+
+  # ─── activation ────────────────────────────────────────────────
+  - path: activation/flashinfer_silu_and_mul.py
+    impl: torch.ops.trtllm.flashinfer_silu_and_mul
+    summary: "SwiGLU activation: silu(x[..., :d]) * x[..., d:] over a packed gate/up last dim"
+
+  # ─── gemm ──────────────────────────────────────────────────────
+  - path: gemm/cublas_mm.py
+    impl: torch.ops.trtllm.cublas_mm
+    summary: "General matmul via one cuBLASLt call with optional fused bias: [M,K] @ [K,N] col-major (+ bias), fp32 accumulation"
+
+  - path: gemm/bmm_out.py
+    impl: torch.ops.trtllm.bmm_out
+    summary: "Batched matmul into a caller-provided (possibly strided-view) out buffer: [B,M,K] @ [B,K,N] -> [B,M,N], fp32 accumulation"
+
+  - path: gemm/nvfp4_gemm.py
+    impl: torch.ops.trtllm.nvfp4_gemm
+    summary: "NVFP4 x NVFP4 dense GEMM in nn.Linear layout with in-kernel block-scale dequantization: alpha * ([M,K/2] e2m1 + 128x4-swizzled e4m3 scales) @ ([N,K/2] e2m1 + swizzled scales)^T (+ per-column bias) -> fresh [M,N] bf16/fp16/fp32 buffer, fp32 accumulation, backend auto-selected (cutlass/cublaslt/cuda_core/cutedsl)"
+
+  # ─── attention ─────────────────────────────────────────────────
+  - path: attention/fused_qk_norm_rope.py
+    impl: torch.ops.trtllm.fused_qk_norm_rope
+    summary: "In-place fused per-head QK RMS norm + RoPE (neox/interleaved, YaRN, interleaved mRoPE) on a packed bf16 QKV tensor; v heads untouched"
+
+  - path: attention/mla_rope_generation.py
+    impl: torch.ops.trtllm.mla_rope_generation
+    summary: "MLA decode preprocessing: GPT-J RoPE of q_pe + latent [compressed_kv | rope(k_pe)] paged-KV-cache append + decode-FMHA scheduler-buffer fill; bf16 pool writes fused_q's tail, fp8-e4m3 pool writes quant_q_buffer and the two folded bmm scales instead"
+
+  - path: attention/load_paged_kv_cache_for_mla.py
+    impl: torch.ops.trtllm.load_paged_kv_cache_for_mla
+    summary: "Gather each context sequence's full [past + new] MLA latent KV from the paged cache into two new contiguous tensors (compressed_kv [T,C], k_pe [T,R]) for KV-reuse context prefill; an fp8-e4m3 pool is dequantized to bf16/fp16/fp32 by kv_scale_quant_orig"
+
+  - path: attention/mla_rope_append_paged_kv_assign_q.py
+    impl: torch.ops.trtllm.mla_rope_append_paged_kv_assign_q
+    summary: "MLA context-prefill preprocessing: in-place GPT-J RoPE of q_pe (in q) and k_pe (in latent_cache) at each new token's absolute position + [compressed_kv | rope(k_pe)] paged-latent-cache append; an fp8-e4m3 pool quantizes only the appended row, by kv_scale_orig_quant"
+
+  - path: attention/thop_attention.py
+    impl: tensorrt_llm.bindings.internal.thop.attention
+    summary: "Full attention core with fully explicit state (pybind binding, approved exception): paged KV-cache append + causal/padding-masked GQA FMHA over a caller-owned pool (bf16, or fp8-e4m3 with per-tensor kv scales) and explicit length/offset tensors, written into a caller buffer, on either context execution path (use_paged_context_fmha selects packed-QKV context FMHA, or paged-KV context FMHA so a context call may run over a cached prefix — KV-cache reuse and chunked prefill), with optional per-query-head attention sinks (one extra softmax-denominator logit, dropped from the output) and an optional per-call sliding window (attention_window_size keys ending at the query's absolute position; a pure mask — the append stays at absolute positions, so cyclic pool reuse is the caller's page mapping); MLA mode runs context prefill (in-kernel RoPE + latent append), no-append context over explicit K/V (latent_cache=None: cached-KV prefixes and chunked partial passes with softmax-stats output), and generation latent-MQA decode as separate calls over a paged latent pool (bf16 or fp8-e4m3)"
+
+  # ─── moe ───────────────────────────────────────────────────────
+  - path: moe/noaux_tc_op.py
+    impl: torch.ops.trtllm.noaux_tc_op
+    summary: "DeepSeek-V3 style MoE routing (noaux_tc): in-kernel sigmoid of the router logits + per-expert bias correction for selection only + optional group-limited top-k (n_group/topk_group; identity at n_group=1) + combine weights gathered from the unbiased sigmoid, renormalized and scaled by routed_scaling_factor, returning weights in the logits' dtype and int32 expert ids"
+
+  - path: moe/fused_moe.py
+    impl: torch.ops.trtllm.fused_moe
+    summary: "Full MoE layer over pre-routed tokens: expert permutation + grouped FC1 GEMM over stacked [up; gate] expert weights + gated activation (SwiGLU with optional per-expert alpha/beta/limit, or GeGLU) + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, hidden] buffer (bf16/fp16 unquantized path; expert-parallel slot range selected by ep_size/ep_rank)"
+
+  - path: moe/mxe4m3_mxe2m1_block_scale_moe_runner.py
+    impl: torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner
+    summary: "Full MXFP4-weight / MXFP8-activation MoE layer (trtllm-gen W4A8): optional top-k routing over router logits (softmax-then-topk or topk-then-softmax) or caller-supplied top-k ids/weights + grouped FC1 GEMM over pre-shuffled block-scaled [up; gate] expert weights + clamped gated activation + MXFP8 requantization of that activation + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, valid_hidden_size] bf16 buffer (e4m3 hidden states + linear UE8M0 block scales in, expert-parallel window selected by local_expert_offset/local_num_experts)"
+
+  - path: moe/fp4_block_scale_moe_runner.py
+    impl: torch.ops.trtllm.fp4_block_scale_moe_runner
+    summary: "Full NVFP4-weight / NVFP4-activation MoE layer (trtllm-gen W4A4): caller-supplied top-k ids/weights + grouped FC1 GEMM over pre-shuffled block-scaled [up; gate] expert weights + SwiGLU + NVFP4 requantization of that activation + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, hidden] bf16 buffer; the checkpoint's per-tensor global scales enter as three per-expert fp32 scalars, hidden must be a multiple of 256, expert-parallel window selected by local_expert_offset/local_num_experts, do_finalize=False returns the per-slot rows plus their permuted-row map instead of the combine"
+
+  # ─── quantization ──────────────────────────────────────────────
+  - path: quantization/mxfp8_quantize.py
+    impl: torch.ops.trtllm.mxfp8_quantize
+    summary: "Dynamic MXFP8 activation quantization: bf16/fp16 -> e4m3 data (last dim zero-padded up to `alignment`) + one UE8M0 power-of-two scale per 32 contiguous elements, emitted either row-major linear or 128x4 swizzled"
+
+  - path: quantization/fp4_quantize.py
+    impl: torch.ops.trtllm.fp4_quantize
+    summary: "Static-scale NVFP4 activation quantization: bf16/fp16 -> packed e2m1 data (two nibbles per byte, no width padding) + one e4m3 scale per 16 contiguous elements, scale = e4m3(global_scale * blockmax / 6) and data = e2m1(x * global_scale / scale), emitted either row-major linear (trtllm-gen block-scale MoE) or 128x4 swizzled (nvfp4 dense GEMM); MXFP4 mode (32-element blocks, UE8M0 scales) accepted but not certified"
+
+  # ─── comm ──────────────────────────────────────────────────────
+  - path: comm/allgather.py
+    impl: torch.ops.trtllm.allgather
+    summary: "All-gather over a group of MPI-session ranks into a fresh tensor: every rank's rows concatenated along dim 0 in ascending rank order, uniform (sizes=None) or ragged (per-rank row counts in `sizes`, as attention data parallelism produces); a byte-exact move in every dtype, no workspace and no strategy, capturable in a CUDA graph once the group's communicator exists (a captured ragged split is frozen at capture); inside a trtllm serving engine under attention DP the communicator carries the caller's calls only — the runtime synchronizes its ranks with host-side MPI on a different one — and calls pair by position, so ranks that disagree on call order get silently wrong data rather than a hang whenever the mispaired calls move the same number of bytes"
+
+  - path: comm/reducescatter.py
+    impl: torch.ops.trtllm.reducescatter
+    summary: "Summing reduce-scatter over a group of MPI-session ranks into a fresh tensor: every rank's tensor summed elementwise, then split along dim 0 in ascending rank order so each rank keeps its own rows, even (sizes=None) or uneven (per-rank row counts in `sizes`, as attention data parallelism produces); the sum is accumulated in the input dtype in a destination-dependent ring order — deterministic and replay-reproducible, but not the correctly rounded fp32 sum — and float8_e4m3fn is summed as raw bytes rather than as floats; calls pair by position on the communicator whichever `sizes` form they take, and because this one computes, ranks that disagree on call order make every rank wrong nearly everywhere rather than a quarter of the way — silently, and bitwise reproducibly, whenever the mispaired calls move the same number of bytes, hanging only when they do not"

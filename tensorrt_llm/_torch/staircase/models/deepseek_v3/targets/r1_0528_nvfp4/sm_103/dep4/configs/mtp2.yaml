@@ -1,0 +1,69 @@
+# Multi-token prediction, 2 draft tokens per step.
+#
+# This variant crosses the line a config variant normally respects: it does
+# not just move a knob, it selects a **second forward path and a different
+# weight-loading path**. With it, the checkpoint's bf16 MTP module at layer 61
+# stops being a predicted non-load and is loaded (212 keys per rank, ~6.3 GB),
+# the engine raises the KV pool to 62 layers, and every engine step runs the
+# trunk plus `max_draft_len` replays of the MTP layer. Without it the target is
+# the identity assembly the gsm8k record was measured on, bit for bit.
+#
+# decoding_type: MTP + `num_nextn_predict_layers: 1` in the checkpoint config
+# resolves to MTP_EAGLE_ONE_MODEL — one MTP layer, replayed autoregressively
+# `max_draft_len` times. The checkpoint's layer count does not bound this.
+#
+# max_draft_len is spelled out on purpose: left unset on the MTP-Eagle path it
+# resolves to 1, not to anything workload-derived. It also sets the generation
+# call's predicted_tokens_per_seq (= max_draft_len + 1 = 3 here), which the MLA
+# entries certify at 1..4 and which becomes the decode kernel's maxSeqLenQ —
+# one extra JIT compile per rank on first boot.
+#
+# Break-even: two draft steps add ~11% to a decode step's HBM traffic on this
+# checkpoint at dep4, so drafting pays for itself at an acceptance_length of
+# about 1.110 here.
+#
+# **Measured, and dominated — this is not the recommended setting.** A full
+# Pareto sweep of all three draft lengths in one session (perf/data/mtp{1,2,3},
+# GPUs 3-6) puts `max_draft_len: 3` ahead at every one of the nine
+# concurrencies. This file's curve is 1.98x iter1 at con=1 and 1.12x at
+# con=256, against mtp3's 2.29x and 1.16x. Acceptance here is ~2.75 of a 3.0
+# ceiling and barely moves with batch size (2.748 at con=1, 2.754 at con=256).
+# Keep it as the middle of the measured axis; use configs/mtp3.yaml to serve.
+
+# The parallel topology. It is what selects this target at all -- routing
+# derives the target from it -- so every variant carries it and these files
+# are usable as-is: `trtllm-eval --extra_llm_api_options <this file>`.
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: true
+
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 2
+
+# **This variant does not boot at trtllm's default KV-cache sizing.** Measured
+# on this checkpoint at dep4 on a 183.4 GiB B200, with max_draft_len 3:
+#
+#   The MTP module adds 5.87 GiB of declared weights per rank (nvidia-smi read
+#   122,076 MiB after model init), and the engine then sizes the KV pool from
+#   what is free, at
+#   the default free_gpu_memory_fraction 0.9: 38.95 GiB (1,171,200 tokens,
+#   62 layers). Boot then reaches CUDA-graph capture at 182.4 of 183.4 GiB and
+#   livelocks: three of four ranks spin in cudaFree inside the CUDA caching
+#   allocator (release_cached_blocks, reached from a plain empty_cuda in the
+#   *trunk's* MoE runner) while the fourth waits at an MPI_Barrier. No error,
+#   no OOM exception, no progress -- the run has to be killed.
+#
+#   The drafting forward's post-pool transient is simply larger than the ~19.6
+#   GiB the identity config leaves and lives inside. Freeing memory *before*
+#   the pool is sized does not help: chunking the MTP layer's expert call to
+#   2048 rows moved pool sizing by 0.31 GiB (38.64 -> 38.95) and the boot
+#   failed identically, because the pool grows into whatever is freed.
+#
+# 0.75 hands the pool ~32.5 GiB instead, leaving ~28 GiB of headroom. That is
+# still ~975k KV tokens per rank -- an order of magnitude more than any
+# concurrency this target is measured at needs -- so nothing about the
+# workload is constrained by it. It is a boot requirement of the variant, not
+# a tuning choice, and it is the reason these files carry a second key at all.
+kv_cache_config:
+  free_gpu_memory_fraction: 0.75

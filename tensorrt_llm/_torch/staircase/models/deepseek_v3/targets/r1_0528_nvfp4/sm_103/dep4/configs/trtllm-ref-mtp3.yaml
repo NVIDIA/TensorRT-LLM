@@ -1,0 +1,75 @@
+# Stock-trtllm reference line for the MTP variant. NOT a tuning variant.
+#
+# This is `trtllm-ref-boot.yaml` + `mtp3.yaml`, in one file because the perf
+# harness takes a single --config. It exists to answer one question that
+# nothing else can: **is this target's MTP layer computing what the
+# checkpoint says?**
+#
+# Rejection sampling makes that question invisible to every other gate. A
+# miscomputed draft layer still emits the target model's exact distribution —
+# it just has every draft rejected, so the boot gate passes, the accuracy gate passes,
+# and the only thing that moves is speed. The acceptance rate is the sole
+# detector, and a rate is only readable against a reference. That reference is
+# stock in-tree modeling on the same checkpoint, at the same workload and the
+# same speculative_config.
+#
+# Why the boot knobs ride along: stock trtllm cannot boot this checkpoint at
+# dep4 under its own defaults (see trtllm-ref-boot.yaml for the measured
+# ledger), and MTP adds ~5.9 GiB of layer-61 weights per rank on top of that.
+# The knobs change batching capacity, not what the model predicts —
+# **acceptance is a property of the model**, so a reference forced onto
+# different memory knobs is still the right comparison. Only the workload has
+# to match, and it does: bench/perf.py seeds prompts by concurrency value, so
+# both systems see byte-identical requests.
+
+# The parallel topology. It is what selects this target at all -- routing
+# derives the target from it -- so every variant carries it and these files
+# are usable as-is: `trtllm-eval --extra_llm_api_options <this file>`.
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: true
+
+max_num_tokens: 2048
+max_seq_len: 2048
+
+# Must match configs/mtp3.yaml exactly — a reference at a different draft
+# length answers a different question.
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+
+# The staircase side needs 0.75 to boot with MTP at all (configs/mtp3.yaml has
+# the livelock ledger). Stock trtllm carries strictly more memory pressure
+# here, so it starts from the same value rather than from the default.
+kv_cache_config:
+  free_gpu_memory_fraction: 0.75
+
+# ONE MORE THING IS NEEDED AND IT IS NOT A CONFIG KEY.
+#
+# Export `TRTLLM_CAN_USE_DEEP_EP=0` before launching, or this does not boot:
+#
+#   _torch/modules/fused_moe/communication/deep_ep_low_latency.py:238, dispatch
+#       assert hidden_states.dtype == torch.uint8
+#   AssertionError   -- all four ranks, "Failed to initialize executor"
+#
+# Under attention DP + EP the MoE communication factory picks a strategy by
+# priority. Measured here: NVLinkOneSided, NVLinkTwoSided and DeepEP each log
+# `not available: Invalid Argument`, leaving DeepEPLowLatency -- whose dispatch
+# accepts only NVFP4 (uint8-packed) hidden states. The MTP layer is **bf16**,
+# because modelopt excludes `model.layers.61*` from quantization wholesale.
+# TARGET.md's existing `trtllm` curve went through DeepEPLowLatency happily,
+# because without MTP every MoE layer is NVFP4.
+#
+# The variable disables DeepEP and DeepEPLowLatency together and lands on
+# AllGatherReduceScatter, which the selector's own comment calls "always
+# works" -- and which is the strategy this target implements by hand, so it
+# makes the two systems more numerically comparable rather than less.
+#
+# It must be exported **before** the server subprocess is spawned: OpenMPI
+# hands a spawned process the environment as it stood when MPI initialized.
+# bench/perf.py prepares the server's environment and then spawns, so an
+# export in the calling shell reaches every rank.
+#
+# Consequence to state wherever this label is used: its **throughput** is not
+# comparable to the `trtllm` Pareto curve, which carries neither this
+# transport nor this draft length. This config measures acceptance.
