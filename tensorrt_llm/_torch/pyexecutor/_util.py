@@ -52,7 +52,8 @@ from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
-from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
+                           extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
@@ -506,18 +507,24 @@ def _derive_layer_type_attention_windows(
     return resolved
 
 
+def _should_infer_kv_attention_windows(
+    model_config: object,
+    configured_windows: Optional[List[Optional[int]]],
+) -> bool:
+    """Return whether Gemma4 KV storage should infer the model's windows."""
+    return (configured_windows is None and is_gemma4_hybrid(model_config)
+            and getattr(model_config, "sliding_window", None) is not None)
+
+
 def _get_num_pool_groups_for_estimation(
     model_config: object,
     max_seq_len: int,
     fallback_attention_windows: Optional[List[Optional[int]]],
 ) -> int:
-    """Infer the number of V2 KV-cache pools needed during estimation.
+    """Estimate V2 pool groups from KV storage windows and layer metadata.
 
-    Sliding/full-attention hybrids are best distinguished by their effective
-    windows. Hybrid linear-attention models with mixed layer types fall back to
-    their distinct layer types. Unsupported target window metadata must not
-    make estimation fail; in that
-    case preserve the legacy layer-type/window heuristic.
+    Model sliding attention alone does not imply separate storage pools.
+    Preserve distinctions required by hybrid layer types and page sizes.
     """
     num_layers = getattr(model_config, "num_hidden_layers", None)
     layer_types = getattr(model_config, "layer_types", None)
@@ -526,7 +533,9 @@ def _get_num_pool_groups_for_estimation(
     # which can be independently configured from the model's use of sliding-window
     # attention for computation.
     kv_cache_uses_attention_windows = (fallback_attention_windows is not None
-                                       or is_gemma4_hybrid(model_config))
+                                       or _should_infer_kv_attention_windows(
+                                           model_config,
+                                           fallback_attention_windows))
     if kv_cache_uses_attention_windows and isinstance(num_layers,
                                                       int) and num_layers > 0:
         try:
@@ -555,10 +564,15 @@ def _get_num_pool_groups_for_estimation(
     if isinstance(layer_types, (list, tuple)):
         # These tags come from HF pretrained_config.layer_types.
         # As above, sliding-window attention in the model does not imply windowed
-        # KV storage. Without windowed storage, sliding/full attention share a pool type.
+        # KV storage. Without windowed storage, sliding/full attention share a pool
+        # type unless their page sizes differ (Gemma4).
         pool_types = set()
         for layer_type in layer_types:
-            if not kv_cache_uses_attention_windows and layer_type == "sliding_attention":
+            if (not kv_cache_uses_attention_windows
+                    and not is_gemma4_hybrid(model_config) and
+                (_is_sliding_attention_layer(layer_type)
+                 or getattr(layer_type, "name",
+                            str(layer_type)).lower() == "full_attention")):
                 layer_type = "full_attention"
             pool_types.add(layer_type)
         if len(pool_types) > 1:
