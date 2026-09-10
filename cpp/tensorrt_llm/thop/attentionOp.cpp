@@ -1453,9 +1453,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         TLLM_CHECK(request_types[idx] == RequestType::kGENERATION);
     }
 
-    auto const validateVariableWindowTensor = [num_ctx_tokens](torch::Tensor const& tensor, char const* name)
+    auto const validateVariableWindowTensor
+        = [num_ctx_tokens, qDevice = qkv_or_q.device()](torch::Tensor const& tensor, char const* name)
     {
         TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+        TORCH_CHECK(tensor.device() == qDevice, name, " must be on the same device as qkv_or_q (expected ", qDevice,
+            ", got ", tensor.device(), ")");
         TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
         TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Int, name, " must have int32 dtype");
         TORCH_CHECK(tensor.dim() == 1, name, " must be one-dimensional");
@@ -1470,6 +1473,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         TORCH_CHECK(num_contexts > 0, "variable-window attention requires a context phase");
         validateVariableWindowTensor(variable_window_token_starts.value(), "variable_window_token_starts");
         validateVariableWindowTensor(variable_window_token_ends.value(), "variable_window_token_ends");
+        TORCH_CHECK(op->supportsVariableWindow(),
+            "variable-window attention requires a supported context FMHA kernel configuration");
     }
 
     int32_t const max_attention_window_size
