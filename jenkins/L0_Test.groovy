@@ -6899,13 +6899,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-2")
+                            // Match the CUDA the DLFW base image builds the wheel with.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
                         }
-                        // Extra PyTorch CUDA 13.2 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
+                        // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
-                            echo "###### Extra PyTorch CUDA 13.2 install Start ######"
+                            echo "###### Extra CUDA 13 PyTorch install Start ######"
+                            // cu130 is PyTorch's only CUDA 13 channel; it runs on the toolkit above
+                            // through CUDA minor version compatibility.
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
                             // TODO(dlfw-26.08): bump together with requirements.txt's torch/triton pins once
                             // public torch>=2.13.0 and a matching public triton are released.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
