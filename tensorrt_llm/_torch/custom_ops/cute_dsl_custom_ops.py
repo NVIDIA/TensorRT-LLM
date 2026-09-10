@@ -88,8 +88,17 @@ SITU_BETA_DISABLED = -1.0
 
 
 def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
-    """Map the op-boundary sentinel back to ``None`` for the kernel."""
-    return None if situ_beta is None or situ_beta <= 0 else float(situ_beta)
+    """Map the op-boundary sentinel back to ``None`` for the kernel.
+
+    Only the sentinel becomes ``None``. Every other value is forwarded so the
+    kernel's own validation sees it: mapping the whole ``<= 0`` range here
+    would turn ``situ_beta=0.0`` on a SwiGLU layer into "no soft-caps
+    supplied", silently accepting an argument that combination has no meaning
+    for, instead of raising.
+    """
+    if situ_beta is None or situ_beta == SITU_BETA_DISABLED:
+        return None
+    return float(situ_beta)
 
 
 def _get_cute_dsl_swap_ab_candidates(

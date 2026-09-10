@@ -188,13 +188,16 @@ CUDA Graph Support:
 
 class BlockScaledContiguousGatherGroupedGemmKernel:
     """This class implements contiguous grouped matrix multiplication with gather operation and a
-    fused activation (selected via ``activation_type``: SwiGLU or Relu2) for FC1 layer computation.
+    fused activation (selected via ``activation_type``: SwiGLU, Relu2 or SiTU) for FC1 layer
+    computation.
 
     The computation flow:
     1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
     2. Activation (selected via ``activation_type``):
          - ActivationType.Swiglu: C = up * silu(gate), from interleaved acc with granularity=64
          - ActivationType.Relu2:  C = relu(acc)^2
+         - ActivationType.SiTu:   C = situ_gate * situ_up, from the same interleaved acc as
+           Swiglu; requires ``situ_beta`` and ``situ_linear_beta``
        Any other ``ActivationType`` value raises an assertion in ``__init__``.
     3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
@@ -433,9 +436,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     "ActivationType.SiTu requires both situ_beta and "
                     f"situ_linear_beta, got {situ_beta} and {situ_linear_beta}."
                 )
-            if situ_beta <= 0 or situ_linear_beta <= 0:
+            # A chained comparison rather than ``<= 0``: NaN compares false
+            # against every operand, so ``<= 0`` lets it through, and so does
+            # a positive infinity. The epilogue folds ``2/beta`` and
+            # ``2*beta`` at trace time, so either one is baked into the
+            # compiled kernel and returns quietly wrong activations instead of
+            # failing. ``math`` here is the MLIR dialect, not Python's, hence
+            # the bare comparison instead of ``isfinite``.
+            _INF = float("inf")
+            if not (0 < situ_beta < _INF and 0 < situ_linear_beta < _INF):
                 raise ValueError(
-                    "SiTU beta parameters must be positive, got "
+                    "SiTU beta parameters must be finite and positive, got "
                     f"{situ_beta} and {situ_linear_beta}."
                 )
             if self.has_swiglu_limit:
