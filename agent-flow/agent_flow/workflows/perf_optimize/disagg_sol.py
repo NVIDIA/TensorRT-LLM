@@ -815,7 +815,12 @@ DERIVED_SWEEP_NAME = "sweep-at-selected-point.yaml"
 
 
 def derive_sweep_at_point(
-    design_sweep: Path, track: str, point: Mapping[str, Any], *, into: Path
+    design_sweep: Path,
+    track: str,
+    point: Mapping[str, Any],
+    *,
+    into: Path,
+    repo: Path | None = None,
 ) -> Path:
     """Cut the design's sweep down to the one row the campaign will freeze on.
 
@@ -871,6 +876,15 @@ def derive_sweep_at_point(
         config["benchmarks"] = kept_ctx
         config.pop("gpu_overrides", None)
 
+    if repo is not None:
+        # The design measured the image on purpose -- `sweep_design` refuses a
+        # build source there, because choosing an operating point on code no
+        # campaign starts from would pick the point for a different program.
+        # A campaign is the opposite case: it exists to measure its own edits,
+        # and a sweep without a rung would run the image and report every
+        # change as no-gain. So the rung is added here, at the boundary where
+        # the purpose changes, pointing at this campaign's own checkout.
+        config["trtllm_install"] = {"trtllm_repo": str(repo)}
     config["_derived_from"] = {
         "design_sweep": str(design_sweep),
         "selected": {k: point.get(k) for k in ("shape", "concurrency", "ctx_gpus", "max_batch")},

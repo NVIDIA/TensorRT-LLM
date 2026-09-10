@@ -503,7 +503,13 @@ def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[s
     # `frontier build` requires it on every build and refuses to infer
     # one, so a sweep without it produces a campaign that measures fine
     # and cannot be turned into a curve. Cheaper to say so now.
-    if track == GEN_TRACK and sweep_accept_rate(sweep) is None:
+    # Only when a row actually uses speculation. The acceptance length is a
+    # multiplier on the metric, so a wrong one is invisible -- but at mtp 0 it
+    # is 1.0 by definition and there is nothing to measure. The harness draws
+    # the same line: its post-processor exits 1 for a missing rate only when
+    # the sweep has mtp>0 cases. Requiring one here for an mtp0 design sweep
+    # asks for a measurement of a constant.
+    if track == GEN_TRACK and _uses_speculation(sweep) and sweep_accept_rate(sweep) is None:
         errors.append(
             f"{path} sets no 'options.accept_rate'. Every `process frontier` requires it "
             f"and none is inferred: the acceptance length scales both the numerator and "
@@ -545,6 +551,20 @@ def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[s
     except BenchCliError as exc:
         errors.append(f"could not expand {path}: {exc}")
         return None
+
+
+def _uses_speculation(sweep: dict) -> bool:
+    """Whether any row of this sweep runs with a draft length above zero."""
+    for row in sweep.get("gen_configs") or []:
+        if isinstance(row, Mapping):
+            mtp = row.get("gen_mtp_size")
+        elif isinstance(row, (list, tuple)) and len(row) > 7:
+            mtp = row[7]
+        else:
+            continue
+        if isinstance(mtp, int) and not isinstance(mtp, bool) and mtp > 0:
+            return True
+    return False
 
 
 def load_and_validate_task_yaml(
