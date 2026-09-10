@@ -26,7 +26,10 @@ from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
     FlashAttn4Attention,
     _flash_attn_fwd,
 )
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.modules import attention as attention_module
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -331,7 +334,7 @@ class TestFA4PaddedQRaggedK:
         for i, n in enumerate(kv_lens):
             k_padded[i, :n] = k_list[i].transpose(0, 1)
             v_padded[i, :n] = v_list[i].transpose(0, 1)
-        k_ragged, v_ragged, cu_seqlens_kv = Attention.pack_ragged_kv(k_padded, v_padded, kv_lens)
+        k_ragged, v_ragged, cu_seqlens_kv, _ = Attention.pack_ragged_kv(k_padded, v_padded, kv_lens)
 
         out, _ = attn._fwd(
             q_nhd,
@@ -348,20 +351,25 @@ class TestFA4PaddedQRaggedK:
 
 
 class TestPackRaggedKvCache:
-    """Attention._cu_seqlens_kv_cached correctness under repeated/interleaved
-    kv_lens. No FA4/CUDA needed -- pure tensor bookkeeping, runs on CPU."""
+    """Attention._cu_seqlens_kv_and_max correctness under repeated/interleaved
+    kv_lens, cached in a model-scoped metadata_state dict. No FA4/CUDA
+    needed - pure tensor bookkeeping, runs on CPU."""
 
     def setup_method(self):
-        Attention._cu_seqlens_kv_cached.cache_clear()
+        self.metadata_state = {}
 
     def _check(self, k, v, kv_lens):
-        k_ragged, v_ragged, cu = Attention.pack_ragged_kv(k, v, kv_lens)
+        k_ragged, v_ragged, cu, max_seqlen_kv = Attention.pack_ragged_kv(
+            k, v, kv_lens, metadata_state=self.metadata_state
+        )
         expected_cu = [0]
         for n in kv_lens:
             expected_cu.append(expected_cu[-1] + n)
         assert cu.tolist() == expected_cu
+        assert max_seqlen_kv == max(kv_lens)
         assert torch.equal(k_ragged, torch.cat([k[i, :n] for i, n in enumerate(kv_lens)], dim=0))
         assert torch.equal(v_ragged, torch.cat([v[i, :n] for i, n in enumerate(kv_lens)], dim=0))
+        return cu
 
     def test_interleaved_kv_lens_hit_and_miss_both_correct(self):
         device, dtype = "cpu", torch.float32
@@ -370,14 +378,14 @@ class TestPackRaggedKvCache:
         v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
 
         lens_a, lens_b = [50, 14], [10, 30]
-        self._check(k, v, lens_a)  # miss
-        self._check(k, v, lens_b)  # miss
-        self._check(k, v, lens_a)  # hit
-        self._check(k, v, lens_b)  # hit
+        cu_a_miss = self._check(k, v, lens_a)  # miss
+        cu_b_miss = self._check(k, v, lens_b)  # miss
+        cu_a_hit = self._check(k, v, lens_a)  # hit
+        cu_b_hit = self._check(k, v, lens_b)  # hit
 
-        info = Attention._cu_seqlens_kv_cached.cache_info()
-        assert info.misses == 2
-        assert info.hits == 2
+        assert cu_a_hit is cu_a_miss
+        assert cu_b_hit is cu_b_miss
+        assert len(self.metadata_state["varlen_kv_cache"]) == 2
 
     def test_repeated_kv_lens_content_correct_on_new_k_v(self):
         """Same kv_lens (cache hit on cu_seqlens_kv) but different K/V content
@@ -399,6 +407,83 @@ class TestPackRaggedKvCache:
         k = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
         v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
         self._check(k, v, [1, 60])
+
+    def test_no_metadata_state_still_computes_correctly(self):
+        """metadata_state is optional - omitting it (no shared model scope)
+        must still return correct, uncached results every call."""
+        device, dtype = "cpu", torch.float32
+        B, S, H, d_h = 2, 32, 4, 16
+        kv_lens = [7, 3]
+        k = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+        v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+
+        k_ragged, v_ragged, cu, max_seqlen_kv = Attention.pack_ragged_kv(k, v, kv_lens)
+        assert cu.tolist() == [0, 7, 10]
+        assert max_seqlen_kv == 7
+
+
+class TestVarlenKvCacheSharedAcrossModel:
+    """cu_seqlens_kv/max_seqlen_kv prepared once per length layout and reused
+    across layers/denoising steps via shared attention_metadata_state.
+    One DiffusionModelConfig is built once and passed to every layer, matching
+    how WanTransformer3DModel constructs blocks."""
+
+    def _make_layers(self, config, num_layers=3):
+        return [
+            Attention(hidden_size=64, num_attention_heads=4, head_dim=16, config=config)
+            for _ in range(num_layers)
+        ]
+
+    def _make_config(self):
+        return DiffusionModelConfig(
+            attention=AttentionConfig(backend="FA4"),
+            attention_metadata_state=create_attention_metadata_state(),
+        )
+
+    def test_layers_share_one_metadata_state_instance(self):
+        config = self._make_config()
+        layers = self._make_layers(config)
+        assert all(layer._metadata_state is config.attention_metadata_state for layer in layers)
+
+    def test_cu_seqlens_prepared_once_reused_across_layers_and_steps(self):
+        config = self._make_config()
+        layers = self._make_layers(config)
+        kv_lens = [7, 3]
+        device, dtype = "cpu", torch.float32
+        B, S, H, d_h = 2, 32, 4, 16
+
+        cached_cu, cached_max = None, None
+        for _step in range(4):
+            for layer in layers:
+                k = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+                v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+                k_ragged, v_ragged, cu, max_seqlen_kv = Attention.pack_ragged_kv(
+                    k, v, kv_lens, metadata_state=layer._metadata_state
+                )
+                if cached_cu is None:
+                    cached_cu, cached_max = cu, max_seqlen_kv
+                else:
+                    assert cu is cached_cu
+                    assert max_seqlen_kv == cached_max
+                assert torch.equal(
+                    k_ragged, torch.cat([k[i, :n] for i, n in enumerate(kv_lens)], dim=0)
+                )
+
+        assert len(config.attention_metadata_state["varlen_kv_cache"]) == 1
+
+    def test_new_length_layout_gets_its_own_entry(self):
+        config = self._make_config()
+        (layer,) = self._make_layers(config, num_layers=1)
+        device, dtype = "cpu", torch.float32
+        B, S, H, d_h = 2, 32, 4, 16
+        k = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+        v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+
+        Attention.pack_ragged_kv(k, v, [7, 3], metadata_state=layer._metadata_state)
+        Attention.pack_ragged_kv(k, v, [10, 5], metadata_state=layer._metadata_state)
+        Attention.pack_ragged_kv(k, v, [7, 3], metadata_state=layer._metadata_state)
+
+        assert len(config.attention_metadata_state["varlen_kv_cache"]) == 2
 
 
 class TestAttnImplVarlenDispatch:

@@ -1,6 +1,5 @@
-import functools
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -152,6 +151,7 @@ class Attention(nn.Module):
         )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
+        self._metadata_state = attention_metadata_state
 
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
@@ -600,22 +600,42 @@ class Attention(nn.Module):
             return out.flatten(2)
 
     @staticmethod
-    @functools.lru_cache(maxsize=128)
-    def _cu_seqlens_kv_cached(kv_lens: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-        """Depends only on kv_lens (constant across a sampling loop), not K/V content."""
+    def _cu_seqlens_kv_and_max(
+        metadata_state: Optional[Dict[str, Any]],
+        kv_lens: Tuple[int, ...],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int]:
+        """Depends only on kv_lens (constant across layers/denoising steps),
+        not K/V content, so it's cached in the model-scoped metadata_state dict."""
+        cache_key = (kv_lens, device)
+        if metadata_state is not None:
+            cache = metadata_state.setdefault("varlen_kv_cache", {})
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         cu_list = [0]
         for n in kv_lens:
             cu_list.append(cu_list[-1] + n)
-        return torch.tensor(cu_list, dtype=torch.int32, device=device)
+        cu_seqlens_kv = torch.tensor(cu_list, dtype=torch.int32, device=device)
+        max_seqlen_kv = max(kv_lens)
+        result = (cu_seqlens_kv, max_seqlen_kv)
+
+        if metadata_state is not None:
+            cache[cache_key] = result
+        return result
 
     @staticmethod
     def pack_ragged_kv(
-        k: torch.Tensor, v: torch.Tensor, kv_lens: List[int]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_lens: List[int],
+        metadata_state: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Slice each sample's true K/V rows out of padded [B, S, H*D] K/V
-        into [total_kv_tokens, H*D], plus cu_seqlens_kv for _attn_impl_varlen_kv.
-        kv_lens is a plain host-side list; a CUDA tensor would force a sync
-        on .tolist().
+        into [total_kv_tokens, H*D], plus cu_seqlens_kv/max_seqlen_kv for
+        _attn_impl_varlen_kv. kv_lens is a plain host-side list; a CUDA
+        tensor would force a sync on .tolist().
         """
         k_parts, v_parts = [], []
         for i, n in enumerate(kv_lens):
@@ -623,8 +643,10 @@ class Attention(nn.Module):
             v_parts.append(v[i, :n])
         k_ragged = torch.cat(k_parts, dim=0)
         v_ragged = torch.cat(v_parts, dim=0)
-        cu_seqlens_kv = Attention._cu_seqlens_kv_cached(tuple(kv_lens), k.device)
-        return k_ragged, v_ragged, cu_seqlens_kv
+        cu_seqlens_kv, max_seqlen_kv = Attention._cu_seqlens_kv_and_max(
+            metadata_state, tuple(kv_lens), k.device
+        )
+        return k_ragged, v_ragged, cu_seqlens_kv, max_seqlen_kv
 
     def _attn_impl_varlen_kv(
         self,

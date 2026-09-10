@@ -412,7 +412,9 @@ class TestWanBlockVarlenCrossAttn:
             q, k, v = block.attn2.get_qkv(norm_x, encoder_hidden_states_text)
             q, k = block.attn2.apply_qk_norm(q, k)
 
-            k_ragged, v_ragged, cu_seqlens_kv = Attention.pack_ragged_kv(k, v, text_lens.tolist())
+            k_ragged, v_ragged, cu_seqlens_kv, max_seqlen_kv = Attention.pack_ragged_kv(
+                k, v, text_lens.tolist()
+            )
             varlen_out = block.attn2._attn_impl(
                 q,
                 k_ragged,
@@ -420,7 +422,7 @@ class TestWanBlockVarlenCrossAttn:
                 batch_size=B,
                 seq_len=seq_len,
                 cu_seqlens_kv=cu_seqlens_kv,
-                max_seqlen_kv=int(text_lens.max().item()),
+                max_seqlen_kv=max_seqlen_kv,
             )
 
             key_padding_mask = (
