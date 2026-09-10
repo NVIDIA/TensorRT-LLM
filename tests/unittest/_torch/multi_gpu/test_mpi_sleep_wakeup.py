@@ -123,7 +123,10 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
                 "Check pynvml setup or GPU visibility."
             )
 
-        llm._collective_rpc("sleep", (sleep_tags,))
+        llm.release(sleep_tags)
+        status = llm.get_memory_status()
+        assert status.state == "parked"
+        assert status.parked_tags == sleep_tags
 
         mem_sleep = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
@@ -136,7 +139,13 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
                     f"release_with_tag()"
                 )
 
-        llm._collective_rpc("wakeup", (sleep_tags,))
+        llm.resume([ExecutorMemoryType.MODEL_WEIGHTS_MAIN])
+        status = llm.get_memory_status()
+        assert status.state == "parked"
+        assert status.parked_tags == [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+
+        llm.resume()
+        assert llm.get_memory_status().state == "running"
 
         mem_wakeup = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
@@ -184,7 +193,7 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
         generated_before = [o.outputs[0].text for o in outputs_before]
 
         mem_active = _per_device_gpu_memory()
-        llm._collective_rpc("sleep", (sleep_tags,))
+        llm.release(sleep_tags)
         mem_sleep = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
             active_devices = {dev for dev, size in mem_active.items() if size > 0}
@@ -194,7 +203,7 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
                     f"GPU {dev} KV cache memory was not released by sleep()"
                 )
 
-        llm._collective_rpc("wakeup", (sleep_tags,))
+        llm.resume(sleep_tags)
         mem_wakeup = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
             for dev in active_devices:
