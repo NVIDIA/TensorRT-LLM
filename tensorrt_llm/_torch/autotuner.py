@@ -313,11 +313,6 @@ def autotune(tune_mode: bool = True,
     if autotune_enabled:
         logger.info("[Autotuner] Autotuning process starts ...")
 
-    # Fine-grained sync kernels deadlock when profiled, so force them off for the duration via the
-    # C++ override rather than mutating os.environ. TODO: remove once autotuning handles them.
-    if autotune_enabled:
-        torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
-
     try:
         yield
     finally:
@@ -325,7 +320,6 @@ def autotune(tune_mode: bool = True,
         autotuner.skip_dynamic_tuning_buckets = old_skip
         set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
-            torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
             logger.info("[Autotuner] Autotuning process ends")
 
         try:
@@ -1395,8 +1389,7 @@ class AutoTuner:
             )
             logger.debug(
                 f"[Autotuner] Selected: custom_op={custom_op}, runner={runners[best_runner_id]}, "
-                f"tactic={best_tactic}, time={min_time:.3f}ms, fine_grained=OFF (disabled during tuning)"
-            )
+                f"tactic={best_tactic}, time={min_time:.3f}ms")
             # inspect call stack
             # TODO: use named tuple to make it more readable
             self.profiling_cache[cache_key] = (best_runner_id, best_tactic,
