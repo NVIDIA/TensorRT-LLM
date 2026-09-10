@@ -15,7 +15,7 @@ launcher; see ``_rank_job`` for why that is left intact.
 
 import torch
 
-from . import _rank_job
+from tensorrt_llm._torch.staircase.catalog.comm import _rank_job
 
 assert torch.cuda.is_available(), "allgather requires CUDA devices"
 

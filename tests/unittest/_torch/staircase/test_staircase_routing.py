@@ -29,7 +29,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     _is_builtin_model_class,
     get_registered_model_class,
 )
-from ._router_index import (
+from tensorrt_llm._torch.staircase._router_index import (
     STAIRCASE_ENV,
     StaircaseMode,
     staircase_resolve,

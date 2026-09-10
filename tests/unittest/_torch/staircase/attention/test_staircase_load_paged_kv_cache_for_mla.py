@@ -35,12 +35,13 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.staircase.catalog.attention.load_paged_kv_cache_for_mla import (
+    load_paged_kv_cache_for_mla,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-from .load_paged_kv_cache_for_mla import load_paged_kv_cache_for_mla
 
 assert torch.cuda.is_available(), "load_paged_kv_cache_for_mla requires a CUDA device"
 
