@@ -53,7 +53,8 @@ def validate() -> List[str]:
             errors.append(f"SMS schema missing event definition: {event_name}")
             continue
 
-        sms_props = set(events[event_name].get("properties", {}).keys())
+        event_schema = events[event_name]
+        sms_props = set(event_schema.get("properties", {}).keys())
         # Pydantic field aliases are the wire names (camelCase)
         pydantic_aliases = {f.alias or name for name, f in model_cls.model_fields.items()}
 
@@ -69,6 +70,22 @@ def validate() -> List[str]:
             errors.append(
                 f"{event_name}: field '{field}' in Pydantic model "
                 f"{model_cls.__name__} but missing from SMS schema"
+            )
+
+    # GXT convention for telemetry events: every declared property must also
+    # appear in the SMS schema's required array. This is an SMS-internal
+    # invariant, so validate every declared event independently of model_map.
+    for event_name, event_schema in events.items():
+        sms_props = set(event_schema.get("properties", {}).keys())
+        sms_required = set(event_schema.get("required", []))
+
+        for field in sorted(sms_props - sms_required):
+            errors.append(
+                f"{event_name}: field '{field}' in SMS properties but missing from required"
+            )
+        for field in sorted(sms_required - sms_props):
+            errors.append(
+                f"{event_name}: field '{field}' in SMS required but missing from properties"
             )
 
     return errors
