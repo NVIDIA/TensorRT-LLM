@@ -2202,6 +2202,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
                 if (
                     self.max_cuda_graph_batch_size is not None
+                    and self.max_cuda_graph_batch_size > 0
                     and self.is_estimating_kv_cache
                     and all(window is None for window in self.max_attention_window_vec)
                 ):
@@ -2210,7 +2211,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     constraint_batch_size = min(self.max_batch_size, self.max_cuda_graph_batch_size)
                 else:
                     constraint_batch_size = self.max_batch_size
+                constraint_batch_size = max(1, constraint_batch_size)
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
+                # Model one request at max_seq_len plus minimal decode requests
+                # to fill constraint_batch_size.
                 constraints.append(
                     BatchDesc(
                         [
