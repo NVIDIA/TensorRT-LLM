@@ -1073,3 +1073,30 @@ def test_the_two_halves_are_cut_from_different_design_sweeps(tmp_path):
             label="t",
             dry_run=True,
         )
+
+
+def test_a_derived_sweep_is_the_one_the_campaign_is_given(tmp_path):
+    """The resolution and the spec must name the same file.
+
+    Reading the caller's `sweeps` again after deriving one silently hands the
+    campaign a path that was never derived -- and for a track with no sweep of
+    its own, no path at all.
+    """
+    d = _design(tmp_path)
+    _shape_run(d, "bm_tep4", [(1, 4, "False", 0, 0, 214.0, 53.0)])
+    design_sweep = tmp_path / "8k1k_sol_mtp0.yaml"
+    design_sweep.write_text("gen_configs:\n- [1, 1, 4, 64, 64, false, '0.9', 0, 0, '1,32']\n")
+    launches = disagg_sol.launch_plan(
+        {**BASE, FIELD: {**BASE[FIELD], "tracks": ["gen"]}},
+        sweeps={},
+        repos={"gen": tmp_path / "rg"},
+        workspace_root=tmp_path / "wsd",
+        label="t",
+        points={"gen": POINT},
+        design=d,
+        design_sweeps={"gen": design_sweep},
+    )
+    named = Path(launches[0].spec["sol_track"]["sweep"])
+    assert named.name == disagg_sol.DERIVED_SWEEP_NAME
+    assert named.is_file()
+    assert named.parent == launches[0].workspace
