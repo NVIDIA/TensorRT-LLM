@@ -1607,6 +1607,35 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     return op->supportsNvFp4Output();
 }
 
+bool attention_supports_variable_window(c10::ScalarType const dtype, int64_t const num_heads,
+    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
+    int64_t const quant_mode, bool const use_paged_context_fmha)
+{
+    auto op = std::make_shared<AttentionOp>();
+    op->mType = tensorrt_llm::runtime::TorchUtils::dataType(dtype);
+    op->mNumHeads = num_heads;
+    op->mNumKVHeads = num_kv_heads;
+    op->mHeadSize = head_size;
+    op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
+    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mKVCacheQuantMode.hasFp4KvCache();
+    op->mUseKVCache = true;
+    op->mPagedKVCache = true;
+    op->mTokensPerBlock = tokens_per_block.value_or(0);
+    op->mPagedContextFMHA = use_paged_context_fmha;
+    op->mUseVariableWindow = true;
+
+    auto cache_key = op->data();
+    using CacheKey = decltype(cache_key);
+    static std::unordered_map<CacheKey, bool, OpCustomHash<CacheKey>> op_cache;
+    if (auto it = op_cache.find(cache_key); it != op_cache.end())
+    {
+        return it->second;
+    }
+
+    op->initialize();
+    return op_cache.emplace(std::move(cache_key), op->supportsVariableWindow()).first->second;
+}
+
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
     int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache)
 {
@@ -1776,4 +1805,5 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
+    m.def("attention_supports_variable_window", &tensorrt_llm::torch_ext::attention_supports_variable_window);
 }

@@ -2463,6 +2463,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
         fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
         attn_metadata = fake_metadata_type()
+        attn_metadata.num_contexts = 1
         attn_metadata.padded_num_tokens = None
 
         with (
@@ -2479,6 +2480,9 @@ class TestGemma4HFComparison(unittest.TestCase):
                 "get_attention_variable_window",
                 return_value=(starts, ends),
             ) as get_variable_window,
+            unittest.mock.patch.object(
+                model, "_supports_variable_window_attention", return_value=True
+            ),
             unittest.mock.patch.object(model.model, "forward", return_value=output) as text_forward,
             unittest.mock.patch.object(model.logits_processor, "forward", return_value=output),
         ):
@@ -2497,6 +2501,59 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertIsNone(text_forward.call_args.kwargs["local_attention_mask_data"])
         self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_starts"], starts)
         self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_ends"], ends)
+
+    @torch.no_grad()
+    def test_unsupported_variable_window_uses_dense_bidirectional_mask(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        token_type_ids = torch.tensor([0, 1, 1, 0], dtype=torch.long, device="cuda")
+        dense_mask = torch.ones(4, 4, dtype=torch.bool, device="cuda")
+        output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
+        attn_metadata = fake_metadata_type()
+        attn_metadata.num_contexts = 1
+        attn_metadata.padded_num_tokens = None
+
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
+                fake_metadata_type,
+            ),
+            unittest.mock.patch.object(
+                model, "_supports_variable_window_attention", return_value=False
+            ),
+            unittest.mock.patch.object(
+                model, "get_attention_variable_window"
+            ) as get_variable_window,
+            unittest.mock.patch.object(
+                model, "get_attention_mask", return_value=dense_mask
+            ) as get_attention_mask,
+            unittest.mock.patch.object(model.model, "forward", return_value=output) as text_forward,
+            unittest.mock.patch.object(model.logits_processor, "forward", return_value=output),
+        ):
+            actual = model(
+                attn_metadata=attn_metadata,
+                inputs_embeds=output,
+                mm_token_type_ids=token_type_ids,
+            )
+
+        self.assertIs(actual, output)
+        get_variable_window.assert_not_called()
+        get_attention_mask.assert_called_once_with(
+            mm_token_type_ids=token_type_ids,
+            attn_metadata=attn_metadata,
+            effective_sliding_window=config.sliding_window,
+        )
+        self.assertIs(text_forward.call_args.kwargs["local_attention_mask_data"], dense_mask)
+        self.assertIsNone(text_forward.call_args.kwargs["local_variable_window_token_starts"])
+        self.assertIsNone(text_forward.call_args.kwargs["local_variable_window_token_ends"])
 
     @torch.no_grad()
     def test_generation_only_skips_bidirectional_mask_building(self) -> None:

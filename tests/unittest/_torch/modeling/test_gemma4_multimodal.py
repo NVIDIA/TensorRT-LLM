@@ -866,6 +866,48 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         self.assertIsNone(forward_kwargs["mm_token_type_ids"])
         self.assertIsNone(forward_kwargs["ple_input_ids"])
 
+    def test_context_builds_multimodal_token_types_without_prepared_input_ids(self):
+        model = self._make_model()
+        self.assertIsNotNone(model.video_token_ids)
+        raw_input_ids = torch.tensor(
+            [1, model.image_token_ids[0], model.video_token_ids[0]],
+            dtype=torch.int32,
+            device=model.image_token_ids.device,
+        )
+
+        forward_kwargs = model.get_language_model_extra_forward_kwargs(
+            attn_metadata=mock.Mock(num_contexts=1),
+            raw_input_ids=raw_input_ids,
+            position_ids=None,
+            mm_inputs=mock.Mock(input_ids=None),
+        )
+
+        torch.testing.assert_close(
+            forward_kwargs["mm_token_type_ids"],
+            torch.tensor([0, 1, 2], dtype=torch.long, device=raw_input_ids.device),
+        )
+
+    def test_language_model_forward_kwargs_forwards_attention_metadata(self):
+        model = self._make_model()
+        attn_metadata = object()
+        mm_inputs = mock.Mock()
+
+        with mock.patch.object(
+            model, "get_language_model_extra_forward_kwargs", return_value={}
+        ) as extra_kwargs:
+            forward_kwargs = model.get_language_model_forward_kwargs(
+                attn_metadata=attn_metadata,
+                input_ids=None,
+                raw_input_ids=None,
+                position_ids=None,
+                inputs_embeds=None,
+                mm_inputs=mm_inputs,
+                return_context_logits=False,
+            )
+
+        self.assertIs(extra_kwargs.call_args.kwargs["attn_metadata"], attn_metadata)
+        self.assertIs(forward_kwargs["attn_metadata"], attn_metadata)
+
     def test_encoder_cache_reuses_image_embedding_across_requests(self):
         """Persistent cache reuse applies to the shared dense/MoE Gemma4 wrapper."""
         self.assertTrue(issubclass(Gemma4ForConditionalGeneration, MultimodalModelMixin))

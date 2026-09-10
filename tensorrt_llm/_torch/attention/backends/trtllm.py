@@ -1701,6 +1701,23 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_mla_enable,
         )
 
+    def _is_variable_window_kernel_available(
+        self,
+        *,
+        dtype: torch.dtype,
+        tokens_per_block: Optional[int],
+        use_paged_context_fmha: bool,
+    ) -> bool:
+        return torch.ops.trtllm.attention_supports_variable_window(
+            dtype,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            tokens_per_block,
+            self.quant_mode,
+            use_paged_context_fmha,
+        )
+
     def create_output(self, q, *, is_quantize_output: bool,
                       metadata: TrtllmAttentionMetadata,
                       attention_mask: AttentionMask, is_gen_only: bool,
