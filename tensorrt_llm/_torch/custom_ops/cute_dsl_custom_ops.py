@@ -145,6 +145,20 @@ def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
 
 
+#: Sentinel for "this layer is not SiTU". A torch custom op schema cannot carry
+#: ``Optional[float]`` here the way a Python signature can, and 0.0 is not
+#: available as the neutral value: the SiTU epilogue divides by both betas, so
+#: zero is a division by zero rather than a no-op. A negative value is
+#: impossible for a real soft-cap -- ``SiTuActivation`` rejects it at
+#: construction -- which makes it safe to reserve.
+SITU_BETA_DISABLED = -1.0
+
+
+def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
+    """Map the op-boundary sentinel back to ``None`` for the kernel."""
+    return None if situ_beta is None or situ_beta <= 0 else float(situ_beta)
+
+
 def _get_cute_dsl_swap_ab_candidates(
     m: int,
     output_aligned: bool,
@@ -3624,12 +3638,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Initialize the runner.
 
             Args:
-                activation_type: ``ActivationType`` for the fused epilogue. Only
+                activation_type: ``ActivationType`` for the fused epilogue.
                     ``Swiglu`` (gated), ``Relu2`` (non-gated) and ``SiTu``
                     (gated) are supported.
                 swiglu_limit_scalar: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
-                situ_beta: Gate-side SiTU constant; required for ``SiTu`` only.
-                situ_linear_beta: Linear-side SiTU constant; required for ``SiTu`` only.
+                situ_beta: Gate-side SiTU soft-cap. Required for -- and only
+                    valid with -- ``ActivationType.SiTu``.
+                situ_linear_beta: Linear-side SiTU soft-cap, same rule.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -3651,6 +3666,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
+            # Trace-time constants, so they are part of the kernel identity --
+            # see ``unique_id`` and the compile cache key below. Betas that are
+            # not keyed would let a layer silently reuse a kernel compiled for
+            # different soft-caps.
+            self.situ_beta = situ_beta
+            self.situ_linear_beta = situ_linear_beta
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -4054,8 +4075,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         (non-gated) and ``ActivationType.SiTu`` (gated) epilogues; other
         ``ActivationType`` values raise an assertion in the runner.
 
-        ``situ_beta``/``situ_linear_beta`` are only meaningful for
-        ``ActivationType.SiTu``; values <= 0 disable them.
+        ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps.
+        They default to ``SITU_BETA_DISABLED`` rather than ``None`` because the
+        op schema takes plain floats; the runner maps the sentinel back to
+        ``None`` and then rejects a mismatch against ``activation_type``.
         """
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
