@@ -812,7 +812,7 @@ class CUDAGraphRunner:
                 # Omission means every slot reads the dummy seq slot's
                 # permanently-zero delta (model_engine.py's mrope_dummy_seq_slot
                 # fast path). Fill explicitly instead of leaving stale values.
-                logger.warning_once(
+                logger.debug(
                     "replay() got no mrope_delta_read_seq_slots for a "
                     "use_mrope graph; filling the static buffer with the "
                     "dummy seq slot instead of copying real values.",
