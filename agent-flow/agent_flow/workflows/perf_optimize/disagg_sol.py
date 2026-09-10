@@ -722,7 +722,23 @@ def campaign_spec(
         # campaign must be able to say so without reading this module.
         "point_provenance": {
             "design_dir": str(design),
-            "selected": {k: point.get(k) for k in ("shape", "concurrency", "prefer", "ranked_on")},
+            # Both vocabularies, because the two halves are selected on
+            # different axes and a campaign has to be able to state its own
+            # point: a ctx point is (tp_size, max_batch), a gen point is
+            # (shape, concurrency). Recording only one leaves the other half's
+            # provenance describing nothing.
+            "selected": {
+                key: point[key]
+                for key in (
+                    "shape",
+                    "concurrency",
+                    "ctx_gpus",
+                    "max_batch",
+                    "prefer",
+                    "ranked_on",
+                )
+                if key in point
+            },
             "e2e_view_absent": point.get("e2e_view_absent", NO_JOIN),
         },
     }
@@ -917,9 +933,9 @@ def launch_plan(
     repos: Mapping[str, Path],
     workspace_root: Path,
     label: str,
-    point: Mapping[str, Any],
+    points: Mapping[str, Mapping[str, Any]],
     design: Path,
-    design_sweep: Path | None = None,
+    design_sweeps: Mapping[str, Path] | None = None,
 ) -> list[CampaignLaunch]:
     """What this spec would start, in full, before anything starts.
 
@@ -931,14 +947,17 @@ def launch_plan(
     refused here rather than left to the launcher's care.
     """
     wanted = tracks(base)
-    missing = [t for t in wanted if t not in sweeps and design_sweep is None]
+    design_sweeps = dict(design_sweeps or {})
+    missing = [t for t in wanted if t not in sweeps and t not in design_sweeps]
     if missing:
         raise DisaggSolError(
             f"track(s) {missing} have neither a sweep of their own nor a "
-            f"'{DESIGN_KEY}.{DESIGN_SWEEP_KEY}' to cut one from. A campaign has to "
-            f"freeze exactly one row, and which row is not known until the design "
-            f"has been measured -- so either name the design's sweep and let it be "
-            f"derived, or name a sweep that already contains the selected point."
+            f"'{DESIGN_KEY}.{DESIGN_SWEEP_KEY}' entry to cut one from. A campaign "
+            f"has to freeze exactly one row, and which row is not known until the "
+            f"design has been measured -- so either name the design's sweep for "
+            f"that half and let it be derived, or name a sweep that already "
+            f"contains its selected point. The two halves are measured by "
+            f"different sweeps, so `{DESIGN_SWEEP_KEY}` is per track."
         )
     missing = [t for t in wanted if t not in repos]
     if missing:
@@ -957,12 +976,15 @@ def launch_plan(
             )
         seen_repos[str(repo)] = track
         workspace = campaign_workspace(workspace_root, track, label)
+        point = points.get(track) or {}
+        if not point:
+            raise DisaggSolError(f"no selected point for track {track!r}")
         if track in sweeps:
             # A sweep the caller chose: check it, never rewrite it.
             sweep = Path(sweeps[track])
             verify_sweep_matches_point(sweep, track, point)
         else:
-            sweep = derive_sweep_at_point(Path(design_sweep), track, point, into=workspace)
+            sweep = derive_sweep_at_point(Path(design_sweeps[track]), track, point, into=workspace)
         launches.append(
             CampaignLaunch(
                 track=track,
@@ -1072,21 +1094,29 @@ def supervise(
         # No `prefer`: the ctx objective is scalar. See `select_ctx_point`.
         record["ctx_point"] = select_ctx_point(ctx_points(design), incumbent=incumbent)
 
-    point = record.get("gen_point") or record.get("ctx_point") or {}
+    # One point per half. They are different measurements on different
+    # axes -- a ctx point is (tp_size, max_batch), a gen point is (shape,
+    # concurrency) -- so handing one to both halves asks the ctx sweep for a
+    # row described in the generation half's vocabulary.
+    points = {track: record[f"{track}_point"] for track in wanted if f"{track}_point" in record}
     block = _block(base).get(DESIGN_KEY)
     block = block if isinstance(block, Mapping) else {}
-    stated_sweep = block.get(DESIGN_SWEEP_KEY)
-    if stated_sweep and redirect:
-        stated_sweep = rebase_design_sweep(Path(stated_sweep), requested_design, design)
+    stated = block.get(DESIGN_SWEEP_KEY)
+    stated = {GEN_TRACK: stated} if isinstance(stated, str) else dict(stated or {})
+    design_sweeps = {
+        track: rebase_design_sweep(Path(path), requested_design, design)
+        for track, path in stated.items()
+    }
+    record["design_sweeps"] = {k: str(v) for k, v in design_sweeps.items()}
     launches = launch_plan(
         base,
         sweeps=sweeps,
         repos=repos,
         workspace_root=workspace_root,
         label=label,
-        point=point,
+        points=points,
         design=design,
-        design_sweep=Path(stated_sweep) if stated_sweep else None,
+        design_sweeps=design_sweeps,
     )
     record["campaigns"] = [
         {"track": run.track, "workspace": str(run.workspace), "argv": run.argv} for run in launches

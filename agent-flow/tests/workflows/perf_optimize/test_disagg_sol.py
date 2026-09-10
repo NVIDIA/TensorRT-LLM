@@ -266,6 +266,7 @@ BASE = {
     "optimize": {"max_rounds": 3, "approaches": ["code"]},
     "disagg_sol": {"tracks": ["ctx", "gen"], "design": {"prefer": "interactive"}},
 }
+CTX_POINT = {"ctx_gpus": 4, "max_batch": 2, "adp": True}
 POINT = {
     "shape": "tep_4_eplb0_mtp0",
     "concurrency": 1,
@@ -345,7 +346,7 @@ def _plan(tmp_path, repos=None):
         repos=repos or {"ctx": tmp_path / "trtllm-ctx", "gen": tmp_path / "trtllm-gen"},
         workspace_root=tmp_path,
         label="run1",
-        point=POINT,
+        points={"ctx": CTX_POINT, "gen": POINT},
         design=tmp_path / "d",
     )
 
@@ -378,7 +379,7 @@ def test_a_track_with_no_sweep_or_no_checkout_is_refused_by_name(tmp_path):
             repos={"ctx": tmp_path / "a", "gen": tmp_path / "b"},
             workspace_root=tmp_path,
             label="x",
-            point=POINT,
+            points={"ctx": CTX_POINT, "gen": POINT},
             design=tmp_path,
         )
     with pytest.raises(disagg_sol.DisaggSolError, match=r"trtllm_repo_path.*\['gen'\]"):
@@ -388,7 +389,7 @@ def test_a_track_with_no_sweep_or_no_checkout_is_refused_by_name(tmp_path):
             repos={"ctx": tmp_path / "a"},
             workspace_root=tmp_path,
             label="x",
-            point=POINT,
+            points={"ctx": CTX_POINT, "gen": POINT},
             design=tmp_path,
         )
 
@@ -1034,3 +1035,41 @@ def test_a_sweep_pointing_outside_the_design_is_a_deliberate_choice(tmp_path):
     outside = tmp_path / "curated" / "sweep.yaml"
     got = disagg_sol.rebase_design_sweep(outside, tmp_path / "a", tmp_path / "b")
     assert got == outside
+
+
+def test_each_half_is_given_its_own_point_not_the_other_s(tmp_path):
+    """A ctx point is (tp_size, max_batch); a gen point is (shape, concurrency).
+
+    Handing one to both asks the ctx sweep for a row described in the
+    generation half's vocabulary -- observed as "0 benchmark entries matching
+    the selected ctx point tp_size None @ max_batch None".
+    """
+    launches = disagg_sol.launch_plan(
+        BASE,
+        sweeps=_sweeps(tmp_path, gen_tp=4, gen_conc="1"),
+        repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
+        workspace_root=tmp_path / "wsp",
+        label="t",
+        points={"ctx": CTX_POINT, "gen": POINT},
+        design=tmp_path / "d",
+    )
+    by_track = {run.track: run.spec["sol_track"]["point_provenance"] for run in launches}
+    assert by_track["ctx"]["selected"]["ctx_gpus"] == 4
+    assert by_track["ctx"]["selected"]["max_batch"] == 2
+    assert by_track["gen"]["selected"]["shape"] == "tep_4_eplb0_mtp0"
+    assert by_track["gen"]["selected"]["concurrency"] == 1
+
+
+def test_the_two_halves_are_cut_from_different_design_sweeps(tmp_path):
+    """They are measured by different sweeps, so `design_sweep` is per track."""
+    d, spec = _supervisable(tmp_path)
+    spec = {**spec, FIELD: {**spec[FIELD], "tracks": ["ctx", "gen"]}}
+    with pytest.raises(disagg_sol.DisaggSolError, match=r"neither a sweep of their own"):
+        disagg_sol.supervise(
+            spec,
+            sweeps={"gen": _sweeps(tmp_path)["gen"]},  # ctx has neither
+            repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
+            workspace_root=tmp_path / "wsq",
+            label="t",
+            dry_run=True,
+        )
