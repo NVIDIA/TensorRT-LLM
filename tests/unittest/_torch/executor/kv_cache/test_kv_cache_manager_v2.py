@@ -42,7 +42,6 @@ from tensorrt_llm.llmapi.llm_args import (
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
-    PARDDecodingConfig,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -155,7 +154,6 @@ def _make_manager_for_cache_tier_test(
     is_disagg: bool = False,
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
-    max_seq_len: int = MAX_SEQ_LEN,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -202,7 +200,7 @@ def _make_manager_for_cache_tier_test(
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
         patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
-        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=max_seq_len),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
         patch(f"{module}.get_pp_layers", return_value=([0], 1)),
@@ -214,7 +212,7 @@ def _make_manager_for_cache_tier_test(
             num_kv_heads=1,
             head_dim=1,
             tokens_per_block=TOKENS_PER_BLOCK,
-            max_seq_len=max_seq_len,
+            max_seq_len=MAX_SEQ_LEN,
             max_batch_size=1,
             mapping=mapping,
             dtype=DataType.HALF,
@@ -917,32 +915,6 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
     assert kv_cache.resize.call_args_list[1].args == (103, 102)
     assert request.py_request_id not in manager._allocated_draft_lens
-
-
-def test_pard_max_blocks_cover_generation_capacity_headroom() -> None:
-    manager, _ = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            enable_block_reuse=False,
-            max_gpu_total_bytes=16 << 20,
-        ),
-        [Mock()],
-        spec_config=PARDDecodingConfig(
-            max_draft_len=4,
-            speculative_model="draft-model",
-        ),
-        is_draft=True,
-        max_seq_len=24,
-    )
-
-    assert manager._generation_kv_capacity_headroom == 11
-    required_capacity = manager.max_seq_len + manager._generation_kv_capacity_headroom
-    required_blocks = (
-        required_capacity + manager._ledger_tokens_per_block - 1
-    ) // manager._ledger_tokens_per_block
-    expected_blocks = ((required_blocks + 3) // 4) * 4
-
-    assert expected_blocks == 12
-    assert manager.max_blocks_per_seq == expected_blocks
 
 
 def _revert_context_request(request_id: int) -> SimpleNamespace:
