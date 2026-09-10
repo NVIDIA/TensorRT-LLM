@@ -77,7 +77,8 @@ from ..utils import (get_model_extra_attrs,
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig)
-from .engine.cuda_graph import filter_cuda_graph_batch_sizes
+from .engine.cuda_graph import (filter_cuda_graph_batch_sizes,
+                                resolve_cuda_graph_batch_sizes)
 from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
                           make_lora_model_config)
 from .engine.metadata import build_attention_metadata, update_spec_metadata
@@ -90,8 +91,7 @@ from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
                              resolve_runner_type,
                              set_spec_metadata_all_rank_num_tokens,
                              ship_multimodal_indices)
-from .engine.runners.encoder import (EncoderRunner, EncoderRunnerConfig,
-                                     get_encoder_graph_batch_sizes)
+from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig)
 from .engine.runners.interface import ModelRunner, RunnerDeps
@@ -1336,7 +1336,7 @@ class PyTorchModelEngine(ModelEngine):
     def _get_encoder_cuda_graph_batch_sizes(
             self, max_batch_size: int) -> tuple[int, ...]:
         """Use startup settings while encoder scheduling remains in PyExecutor."""
-        return get_encoder_graph_batch_sizes(
+        return resolve_cuda_graph_batch_sizes(
             self._encoder_graph_batch_sizes,
             max_batch_size,
             pad_to_limit=self._encoder_graph_pad_to_limit)

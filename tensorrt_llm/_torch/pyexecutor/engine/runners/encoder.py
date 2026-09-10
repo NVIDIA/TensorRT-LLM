@@ -38,7 +38,13 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, validate_token_e
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..cuda_graph import cuda_graph_capture, cuda_graph_disabled, filter_cuda_graph_batch_sizes
+from ..cuda_graph import (
+    cuda_graph_capture,
+    cuda_graph_disabled,
+    filter_cuda_graph_batch_sizes,
+    filter_cuda_graph_num_tokens,
+    filter_cuda_graph_seq_lens,
+)
 from ..metadata import build_attention_metadata
 from .interface import PreparedInputs, RunnerConfig, RunnerDeps
 
@@ -129,7 +135,7 @@ class EncoderConfigMixin:
             else []
         )
         filtered_num_tokens = (
-            _filter_cuda_graph_num_tokens(
+            filter_cuda_graph_num_tokens(
                 num_tokens,
                 max_num_tokens,
                 enable_padding,
@@ -138,7 +144,7 @@ class EncoderConfigMixin:
             else []
         )
         filtered_seq_lens = (
-            _filter_cuda_graph_seq_lens(
+            filter_cuda_graph_seq_lens(
                 seq_lens,
                 max_seq_len,
                 enable_padding,
@@ -242,70 +248,12 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         )
 
 
-def _filter_cuda_graph_num_tokens(
-    values: list[int],
-    max_num_tokens: int,
-    enable_padding: bool,
-) -> list[int]:
-    result: list[int] = []
-    for index, value in enumerate(values):
-        if value <= max_num_tokens:
-            result.append(value)
-            continue
-        if enable_padding and (index == 0 or result[index - 1] != max_num_tokens):
-            logger.warning(
-                "CUDA graph padding is enabled, but one of the given encoder "
-                f"CUDA graph num_tokens ({value}) is larger than max_num_tokens "
-                f"({max_num_tokens}). We will pad to {max_num_tokens}."
-            )
-            result.append(max_num_tokens)
-        break
-    return result
-
-
-def _filter_cuda_graph_seq_lens(
-    values: list[int],
-    max_seq_len: int,
-    enable_padding: bool,
-) -> list[int]:
-    result: list[int] = []
-    for index, value in enumerate(values):
-        if value <= max_seq_len:
-            result.append(value)
-            continue
-        if enable_padding and (index == 0 or result[index - 1] != max_seq_len):
-            logger.warning(
-                "CUDA graph padding is enabled, but one of the given encoder "
-                f"CUDA graph seq_lens ({value}) is larger than max_seq_len "
-                f"({max_seq_len}). We will pad to {max_seq_len}."
-            )
-            result.append(max_seq_len)
-        break
-    return result
-
-
 @dataclass(frozen=True, kw_only=True)
 class EncoderPreparedInputs(PreparedInputs):
     """Model arguments, original lengths, and graph selected during preparation."""
 
     sequence_lengths: list[int]
     graph_key: EncoderKeyType | None = None
-
-
-def get_encoder_graph_batch_sizes(
-    batch_sizes: tuple[int, ...], max_batch_size: int, *, pad_to_limit: bool
-) -> tuple[int, ...]:
-    """Resolve encoder scheduling targets from immutable startup settings."""
-    bounded_sizes = [size for size in batch_sizes if size <= max_batch_size]
-    # Token padding can target a limit between buckets; feature padding cannot.
-    if (
-        pad_to_limit
-        and any(size > max_batch_size for size in batch_sizes)
-        and max_batch_size > 0
-        and (not bounded_sizes or bounded_sizes[-1] != max_batch_size)
-    ):
-        bounded_sizes.append(max_batch_size)
-    return tuple(bounded_sizes)
 
 
 class EncoderMixin:
@@ -368,6 +316,7 @@ class EncoderMixin:
         self._encoder_graph_batch_sizes = (
             tuple(graph_runner.supported_batch_sizes) if graph_runner.enabled else ()
         )
+        # Token padding can target a limit between buckets; feature padding cannot.
         self._encoder_graph_pad_to_limit = (
             graph_runner.padding_enabled and not graph_runner.feature_mode
         )
