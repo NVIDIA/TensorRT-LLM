@@ -298,17 +298,17 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         }
         else if (mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW)
         {
-            auto const leftWindowReach = runnerParams.slidingWindowSize / 2;
-            auto const rightWindowReach = runnerParams.slidingWindowSize - leftWindowReach - 1;
-            if (std::min(leftWindowReach, rightWindowReach) >= runnerParams.kvSeqLen - 1)
+            // Match legacy FMHA: the window extends this far on both sides of the query, inclusively.
+            auto const windowReach = runnerParams.slidingWindowSize / 2;
+            if (windowReach >= runnerParams.kvSeqLen - 1)
             {
                 tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
             }
             else
             {
                 tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-                tllmRunnerParams.mLeftSlidingWindow = leftWindowReach;
-                tllmRunnerParams.mRightSlidingWindow = rightWindowReach;
+                tllmRunnerParams.mLeftSlidingWindow = windowReach;
+                tllmRunnerParams.mRightSlidingWindow = windowReach;
             }
         }
         else if (usesSlidingWindow)
