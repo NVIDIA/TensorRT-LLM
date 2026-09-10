@@ -17,9 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-pytestmark = pytest.mark.cpu_only
-
-RayGPUWorker = pytest.importorskip("tensorrt_llm.executor.ray.gpu_worker").RayGPUWorker
+from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
 
 
 class _Args:
