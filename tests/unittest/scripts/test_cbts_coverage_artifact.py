@@ -17,11 +17,11 @@
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -32,7 +32,6 @@ from unittest import mock
 _ROOT = Path(__file__).resolve().parents[3]
 _CBTS = _ROOT / "jenkins/scripts/cbts"
 _ARTIFACT_PATH = _CBTS / "coverage_selection/artifact.py"
-_MAIN_PATH = _CBTS / "main.py"
 sys.path.insert(0, str(_CBTS / "coverage_utils"))
 
 from compact_db import write_leaf_database  # noqa: E402
@@ -50,46 +49,57 @@ def _load_artifact() -> ModuleType:
 artifact = _load_artifact()
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+
+
 class CoverageArtifactTest(unittest.TestCase):
-    def test_selects_closest_complete_ancestor_pair(self) -> None:
-        commits = {104: "newer", 102: "older-three", 101: "older-one"}
+    def test_patch_apply_status_detects_clean_and_conflicting_diffs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            _git(repo, "init")
+            _git(repo, "config", "user.email", "cbts@example.com")
+            _git(repo, "config", "user.name", "CBTS Test")
+            source = repo / "source.py"
+            source.write_text("first\nbase\nlast\n")
+            _git(repo, "add", "source.py")
+            _git(repo, "commit", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
 
-        def exists(url: str) -> bool:
-            if "/103/" in url:
-                return url.endswith("cbts_pystart_report_x86_64.tar.gz")
-            return "/100/" not in url
+            _git(repo, "checkout", "-b", "pr")
+            source.write_text("first\npr\nlast\n")
+            _git(repo, "commit", "-am", "pr")
+            head = _git(repo, "rev-parse", "HEAD")
 
-        relations = {
-            "newer": (1, "behind"),
-            "older-three": (3, "ahead"),
-            "older-one": (1, "ahead"),
-        }
-        with (
-            mock.patch.object(artifact, "latest_build_number", return_value=104),
-            mock.patch.object(artifact, "_exists", side_effect=exists),
-            mock.patch.object(
-                artifact, "build_commit", side_effect=lambda build, _base: commits[build]
-            ),
-            mock.patch.object(
-                artifact, "drift", side_effect=lambda commit, _base: relations[commit]
-            ),
-            mock.patch.object(artifact, "compare_distance", return_value=7) as lag,
-        ):
-            selected = artifact.select_tarball(
-                "pr-base", artifact_base="coverage", jenkins_base="jenkins", max_probe=5
+            _git(repo, "checkout", "-b", "db-clean", base)
+            (repo / "other.py").write_text("coverage revision\n")
+            _git(repo, "add", "other.py")
+            _git(repo, "commit", "-m", "non-conflicting db")
+            clean_db = _git(repo, "rev-parse", "HEAD")
+
+            _git(repo, "checkout", "-b", "db-conflict", base)
+            source.write_text("first\ndb\nlast\n")
+            _git(repo, "commit", "-am", "conflicting db")
+            conflicting_db = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "checkout", "pr")
+
+            self.assertEqual(
+                artifact._patch_apply_status(base, head, clean_db, repo, str(repo)), "clean"
             )
-
-        self.assertIsNotNone(selected)
-        assert selected is not None
-        self.assertEqual(selected["build"], 101)
-        self.assertEqual(selected["commit"], "older-one")
-        self.assertEqual(selected["drift"], 1)
-        self.assertEqual(selected["drift_status"], "ahead")
-        self.assertEqual(
-            [url.rsplit("/", 1)[-1] for url in selected["urls"]],
-            list(artifact.ARCH_TARBALL_NAMES),
-        )
-        lag.assert_called_once_with("older-one")
+            self.assertEqual(
+                artifact._patch_apply_status(base, head, conflicting_db, repo, str(repo)),
+                "conflict",
+            )
+            with mock.patch.dict(artifact.os.environ, {artifact.COVERAGE_GIT_REPO_ENV: ""}):
+                self.assertEqual(
+                    artifact._patch_apply_status(base, head, clean_db, repo), "unknown"
+                )
 
     def test_accepts_artifact_collected_at_pr_base(self) -> None:
         with (
@@ -159,6 +169,7 @@ class CoverageArtifactTest(unittest.TestCase):
             with (
                 mock.patch.object(artifact, "merge_base", return_value="pr-base"),
                 mock.patch.object(artifact, "select_tarball", return_value=selection) as select,
+                mock.patch.object(artifact, "_patch_apply_status", return_value="clean") as apply,
                 mock.patch.object(artifact, "download", side_effect=download),
                 mock.patch.object(artifact, "extract", side_effect=extract),
             ):
@@ -167,6 +178,7 @@ class CoverageArtifactTest(unittest.TestCase):
             self.assertIsNotNone(ready)
             assert ready is not None
             select.assert_called_once_with("pr-base")
+            apply.assert_called_once_with("pr-base", "pr-head", "coverage-commit")
             connection = sqlite3.connect(ready["path"])
             try:
                 tests = {
@@ -182,17 +194,6 @@ class CoverageArtifactTest(unittest.TestCase):
                 },
             )
             self.assertEqual(json.loads(Path(ready["meta"]).read_text()), selection)
-
-    def test_freshness_default_is_thirty_commits(self) -> None:
-        tree = ast.parse(_MAIN_PATH.read_text())
-        defaults = {
-            target.id: node.value.value
-            for node in tree.body
-            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        }
-        self.assertEqual(defaults["DEFAULT_COVERAGE_MAX_DRIFT"], 30)
 
 
 if __name__ == "__main__":
