@@ -82,7 +82,7 @@ CROW = 32  # rows per gmem copy sub-tile
 C_THREADS = 384
 P_THREADS = 64  # 2 producer warps: same #cp.async instructions in flight
 PPP = 16  # producer threads per KV page
-M_WARP = 14
+M_WARP = 2
 NTHREADS = 480  # 15 warps => 136 regs/thread, enough to keep all 64
 # per-head weights resident in registers for the scan
 NACC = 3
@@ -874,8 +874,8 @@ def _dsv4_kernel(
     sfb_dst = tb.partition_D(cute.filter_zeros(tSFB))
 
     # ---------------- producer warps 12..15 ----------------
-    if warp_idx >= 12 and warp_idx < M_WARP:
-        lt = tidx - C_THREADS
+    if warp_idx < 2:
+        lt = tidx
         pgt = lt // PPP
         tkt = lt % PPP
         # A TMA issue must be warp uniform, but this kernel's producer geometry
@@ -884,7 +884,7 @@ def _dsv4_kernel(
         # 2*(w-12) and 2*(w-12)+1, i.e. exactly the pages its two half warps
         # would have fetched with cp.async.  The SCALE plane keeps the original
         # 16-lane-per-page decomposition and all 64 per-thread arrivals.
-        pgw = 2 * (warp_idx - 12)
+        pgw = 2 * warp_idx
         jq0 = I32(0)
         if jq0 >= ntl:
             jq0 = I32(0)
@@ -1063,11 +1063,13 @@ def _dsv4_kernel(
                 tcgen05.commit(ab_empty + s)
 
     # ---------------- consumer warps 0..11 ----------------
-    elif warp_idx < 12:
+    elif warp_idx >= 3:
         op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x32, tcgen05.Pack.NONE)
         atom_t2r = cute.make_copy_atom(op, F32)
-        lane = tidx % 128
-        gwg = tidx // 128
+        lane = 32 * (warp_idx % 4) + (tidx % 32)
+        gwg = (warp_idx - 3) // 4
+        ctid = tidx - 96
+        cwarp = warp_idx - 3
         lay32 = cute.make_layout(((TOK, 32), 1, 1), stride=((65536, 1), 0, 0))
         a0 = cute.make_tensor(tmem_ptr, lay32)
         tt = tcgen05.make_tmem_copy(atom_t2r, a0)
@@ -1121,10 +1123,10 @@ def _dsv4_kernel(
                             sSKey,
                             sFine,
                             sCtl,
-                            tidx,
+                            ctid,
                             wl,
                             lmaskw,
-                            warp_idx,
+                            cwarp,
                             crk,
                             L,
                             ndense,
@@ -1140,7 +1142,7 @@ def _dsv4_kernel(
                             sSPos,
                             sSKey,
                             sCtl,
-                            tidx,
+                            ctid,
                             wl,
                             lmaskw,
                             crk,
@@ -1213,7 +1215,7 @@ def _dsv4_kernel(
                     # first line at the last group-0 tile of the dense prefix, then
                     # every LP tiles: a ~1000-cycle detour on any role stalls the
                     # whole pipeline, so it must stay rare.
-                    if warp_idx == 0:
+                    if cwarp == 0:
                         if (i >= (NDENSE - 1 - ((NDENSE - 1) % NACC))) and (
                             ((i - (NDENSE - 1 - ((NDENSE - 1) % NACC))) % LP) == 0
                         ):
@@ -1236,10 +1238,10 @@ def _dsv4_kernel(
                         sSKey,
                         sFine,
                         sCtl,
-                        tidx,
+                        ctid,
                         wl,
                         lmaskw,
-                        warp_idx,
+                        cwarp,
                         crk,
                         L,
                         ndense,
@@ -1254,7 +1256,7 @@ def _dsv4_kernel(
                     sSPos,
                     sSKey,
                     sCtl,
-                    tidx,
+                    ctid,
                     wl,
                     lmaskw,
                     crk,
@@ -1915,11 +1917,11 @@ def _dsv4_kernel(
                 nvt = (ntie + 3) // 4
         sTS = cute.make_tensor(cute.recast_ptr(sCand.iterator, dtype=F32), cute.make_layout(CAP))
         sPG = cute.make_tensor(sTot.iterator, cute.make_layout(TIECAP))
-        if warp_idx >= 12 and warp_idx < M_WARP:
-            lt = tidx - C_THREADS
+        if warp_idx < 2:
+            lt = tidx
             pgt = lt // PPP
             tkt = lt % PPP
-            pgw = 2 * (warp_idx - 12)
+            pgw = 2 * warp_idx
             gBT = cute.make_tensor(bt_ptr + cutlass.Int64(b) * MAXB, cute.make_layout(MAXB))
             for ti in cutlass.range(lt, nvt * 4, P_THREADS, unroll=1):
                 tm = ti
@@ -2004,11 +2006,11 @@ def _dsv4_kernel(
                 with cute.arch.elect_one():
                     tcgen05.commit(acc_full + a)
                     tcgen05.commit(ab_empty + s)
-        elif warp_idx < 12:
+        elif warp_idx >= 3:
             op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x32, tcgen05.Pack.NONE)
             atom_t2r = cute.make_copy_atom(op, F32)
-            lane = tidx % 128
-            gwg = tidx // 128
+            lane = 32 * (warp_idx % 4) + (tidx % 32)
+            gwg = (warp_idx - 3) // 4
             lay32 = cute.make_layout(((TOK, 32), 1, 1), stride=((65536, 1), 0, 0))
             a0 = cute.make_tensor(tmem_ptr, lay32)
             tt = tcgen05.make_tmem_copy(atom_t2r, a0)
