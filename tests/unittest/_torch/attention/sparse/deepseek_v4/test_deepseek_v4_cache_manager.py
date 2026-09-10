@@ -240,7 +240,7 @@ class TestDeepseekV4CacheManager:
             cache_manager.max_blocks_per_seq,
         )
 
-    def test_lazy_hca_summary_valid_lifecycle(self, monkeypatch):
+    def test_hca_summary_valid_aggregated_lifecycle(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_HCA_INCREMENTAL_SUMMARY", "1")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -251,30 +251,58 @@ class TestDeepseekV4CacheManager:
             compressor_dtype=DataType.FLOAT,
         )
         request = self._create_request(41, 64)
-        replacement = None
         valid = torch.empty(1, dtype=torch.bool, device="cpu")
         try:
             assert cache_manager.prepare_context(request)
 
-            # Context keeps raw state. The first generation prepare returns
-            # false and advances the host lifecycle for next time.
+            # Aggregated execution creates the cache in prefill. A context row
+            # must invalidate any summary in that slot and keep raw state for
+            # the first generation step to bootstrap.
+            index = cache_manager.index_mapper.get_index(request.py_request_id)
+            cache_manager._hca_summary_valid[index] = True
             cache_manager.compute_sliding_block_tables([41], 1, valid)
             assert not valid.item()
             cache_manager.compute_sliding_block_tables([41], 0, valid)
             assert not valid.item()
             cache_manager.compute_sliding_block_tables([41], 0, valid)
             assert valid.item()
-
-            cache_manager.free_resources(request)
-            replacement = self._create_request(42, 64)
-            assert cache_manager.prepare_context(replacement)
-            cache_manager.compute_sliding_block_tables([42], 0, valid)
-            assert not valid.item(), "a reused IndexMapper slot must start invalid"
         finally:
-            if replacement is not None and replacement.py_request_id in cache_manager.kv_cache_map:
-                cache_manager.free_resources(replacement)
             if request.py_request_id in cache_manager.kv_cache_map:
                 cache_manager.free_resources(request)
+            cache_manager.shutdown()
+
+    def test_hca_summary_valid_disaggregated_generation_starts_invalid(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_HCA_INCREMENTAL_SUMMARY", "1")
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=256,
+            compress_ratios=[128],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+        old_request = self._create_request(41, 64)
+        new_request = None
+        valid = torch.empty(1, dtype=torch.bool, device="cpu")
+        try:
+            assert cache_manager.prepare_context(old_request)
+            cache_manager.compute_sliding_block_tables([41], 0, valid)
+            cache_manager.compute_sliding_block_tables([41], 0, valid)
+            assert valid.item()
+            cache_manager.free_resources(old_request)
+
+            # A generation worker receives no local context row. Creating the
+            # incoming request must therefore clear the reused sequence slot.
+            new_request = self._create_request(42, 64)
+            new_request.state = LlmRequestState.DISAGG_GENERATION_INIT
+            assert cache_manager.prepare_disagg_gen_init(new_request)
+            cache_manager.compute_sliding_block_tables([42], 0, valid)
+            assert not valid.item()
+        finally:
+            if new_request is not None and new_request.py_request_id in cache_manager.kv_cache_map:
+                cache_manager.free_resources(new_request)
+            if old_request.py_request_id in cache_manager.kv_cache_map:
+                cache_manager.free_resources(old_request)
             cache_manager.shutdown()
 
     def _is_compress_layer(self, compress_ratio: int) -> bool:

@@ -1853,15 +1853,18 @@ def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_po
 
 @pytest.mark.parametrize("head_dim", [128, 512])
 @pytest.mark.parametrize("page_size", [128, 256])
-def test_lazy_incremental_hca_decode_and_rewind(head_dim, page_size):
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_lazy_incremental_hca_decode_and_rewind(head_dim, page_size, input_dtype):
     """The first decode lazily converts raw prefill state and survives a rewind."""
     torch.manual_seed(1234)
     compress_ratio = 128
     prefill_len = 252
     next_n = 4
+    rtol, atol = (2e-3, 5e-3) if input_dtype == torch.bfloat16 else (1e-5, 1e-5)
 
-    prefill_kv = torch.randn(prefill_len, head_dim, device="cuda").bfloat16()
-    prefill_score = torch.randn(prefill_len, head_dim, device="cuda").bfloat16()
+    prefill_kv = torch.randn(prefill_len, head_dim, device="cuda", dtype=input_dtype)
+    prefill_score = torch.randn(prefill_len, head_dim, device="cuda", dtype=input_dtype)
     ape = torch.randn(compress_ratio, head_dim, device="cuda")
     paged_kv, paged_score, block_table, _, _ = create_paged_cache(
         1, prefill_len + next_n, compress_ratio, head_dim, False, page_size
@@ -1870,9 +1873,7 @@ def test_lazy_incremental_hca_decode_and_rewind(head_dim, page_size):
     kv_lens = torch.tensor([prefill_len], device="cuda", dtype=torch.int32)
     start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
     cu_seq_lens, cu_outputs = prepare_prefill_metadata(kv_lens, start_pos, compress_ratio, head_dim)
-    prefill_output = prepare_compress_output(
-        cu_outputs, 1, head_dim, kv_lens.device, torch.bfloat16
-    )
+    prefill_output = prepare_compress_output(cu_outputs, 1, head_dim, kv_lens.device, input_dtype)
     prefill_kernel(
         fuse_kv_score(prefill_kv, prefill_score),
         ape,
@@ -1893,7 +1894,7 @@ def test_lazy_incremental_hca_decode_and_rewind(head_dim, page_size):
 
     first_logits = prefill_score[:compress_ratio].float() + ape
     first_expected = (prefill_kv[:compress_ratio].float() * first_logits.softmax(dim=0)).sum(dim=0)
-    assert torch.allclose(prefill_output[0], first_expected.bfloat16(), rtol=2e-3, atol=5e-3)
+    assert torch.allclose(prefill_output[0], first_expected.to(input_dtype), rtol=rtol, atol=atol)
 
     # Lazy mode leaves prefill state in the original raw representation.
     tail_pos = prefill_len - 1
@@ -1922,10 +1923,10 @@ def test_lazy_incremental_hca_decode_and_rewind(head_dim, page_size):
     # Execute twice from the same committed prefix. The second call represents
     # rejected draft tokens being replaced at the same logical positions.
     for _ in range(2):
-        decode_kv = torch.randn(next_n, head_dim, device="cuda").bfloat16()
-        decode_score = torch.randn(next_n, head_dim, device="cuda").bfloat16()
+        decode_kv = torch.randn(next_n, head_dim, device="cuda", dtype=input_dtype)
+        decode_score = torch.randn(next_n, head_dim, device="cuda", dtype=input_dtype)
         decode_output = prepare_compress_output(
-            decode_cu_outputs, 1, head_dim, kv_lens.device, torch.bfloat16
+            decode_cu_outputs, 1, head_dim, kv_lens.device, input_dtype
         )
         decode_kernel(
             fuse_kv_score(decode_kv, decode_score),
@@ -1950,7 +1951,9 @@ def test_lazy_incremental_hca_decode_and_rewind(head_dim, page_size):
         second_score = torch.cat([prefill_score[compress_ratio:], decode_score], dim=0).float()
         second_logits = second_score + ape
         second_expected = (second_kv * second_logits.softmax(dim=0)).sum(dim=0)
-        assert torch.allclose(decode_output[0], second_expected.bfloat16(), rtol=2e-3, atol=5e-3)
+        assert torch.allclose(
+            decode_output[0], second_expected.to(input_dtype), rtol=rtol, atol=atol
+        )
         summary_valid.fill_(True)
 
 

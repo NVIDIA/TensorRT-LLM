@@ -257,6 +257,10 @@ class Compressor(nn.Module):
                 next_n,
             )
             if use_incremental_hca:
+                # CUDA-graph metadata owns a reserved backing buffer, and the
+                # graph key fixes both counts. Replay updates only the buffer
+                # contents, so this generation view keeps the captured address
+                # and storage offset stable.
                 compressor_args += (
                     metadata.hca_summary_valid_cuda[num_contexts : num_contexts + num_generations],
                 )

@@ -446,6 +446,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             expected_prompt_length=expected_prompt_length,
         )
         if kv_cache is not None and self.incremental_hca_enabled:
+            # A newly assigned IndexMapper slot must never inherit another
+            # request's summary state. This is essential for disaggregated
+            # generation, which has no local context row. In aggregated mode
+            # the cache is created during prefill, and context rows are also
+            # reset in compute_sliding_block_tables() below.
             index = self.index_mapper.get_index(request_id)
             begin = index * self.max_beam_width
             self._hca_summary_valid[begin : begin + self.max_beam_width] = False
