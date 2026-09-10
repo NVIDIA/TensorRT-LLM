@@ -27,6 +27,8 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 
@@ -1125,6 +1127,157 @@ class TestFlashInferAttention(unittest.TestCase):
                                        rtol=0)
 
         kv_cache_manager.shutdown()
+
+    @parameterized.expand([(num_kv_heads, batch_size, fp8_kv)
+                           for num_kv_heads in ([4, 4], [2, 2])
+                           for batch_size in (1, 4)
+                           for fp8_kv in (False, True)])
+    @torch.no_grad()
+    def test_cuda_graph_replay_refreshes_fa2_schedule(self,
+                                                      num_kv_heads: list[int],
+                                                      batch_size: int,
+                                                      fp8_kv: bool) -> None:
+        """Refresh each captured FA2 schedule as request page counts change."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+        torch.manual_seed(0)
+        page_size, max_pages = 32, 256
+        num_heads, head_dim = 8, 128
+        dtype = torch.bfloat16
+        quant_config = QuantConfig(
+            kv_cache_quant_algo=QuantAlgo.FP8) if fp8_kv else None
+        manager = KVCacheManager(
+            KvCacheConfig(max_tokens=2 * batch_size * max_pages * page_size),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=len(num_kv_heads),
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=max_pages * page_size,
+            max_batch_size=2 * batch_size,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=(tensorrt_llm.bindings.DataType.FP8
+                   if fp8_kv else tensorrt_llm.bindings.DataType.BF16),
+        )
+        self.addCleanup(manager.shutdown)
+        manager.add_dummy_requests(list(range(2 * batch_size)),
+                                   [max_pages * page_size] * (2 * batch_size))
+        layers = [
+            FlashInferAttention(layer_idx=i,
+                                num_heads=num_heads,
+                                num_kv_heads=kv_heads,
+                                head_dim=head_dim,
+                                quant_config=quant_config,
+                                flashinfer_backend="fa2")
+            for i, kv_heads in enumerate(num_kv_heads)
+        ]
+        kv_buffers = [manager.get_buffers(layer.layer_idx) for layer in layers]
+        for buffer in kv_buffers:
+            buffer.copy_(torch.randn(buffer.shape, dtype=dtype, device="cuda"))
+        inputs = [
+            tuple(
+                torch.randn(
+                    batch_size, heads * head_dim, dtype=dtype, device="cuda")
+                for heads in [num_heads, kv_heads, kv_heads])
+            for kv_heads in num_kv_heads
+        ]
+
+        # Grow beyond the captured history, not just within a preplanned maximum.
+        initial_length = page_size - 1
+        metadata_args = dict(
+            seq_lens=torch.ones(batch_size, dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[initial_length] * batch_size),
+            max_num_requests=batch_size,
+            max_num_tokens=batch_size,
+            kv_cache_manager=manager,
+            request_ids=list(range(batch_size)),
+        )
+        eager = FlashInferAttentionMetadata(**metadata_args)
+        captured = FlashInferAttentionMetadata(is_cuda_graph=True,
+                                               **metadata_args)
+        eager.prepare()
+        captured.prepare()
+        self.assertIsNone(captured._vswa_layer_to_pool)
+
+        # Pin the backend under test independently of device auto-selection.
+        decode_builder = flashinfer_backend.flashinfer.BatchDecodeWithPagedKVCacheWrapper
+
+        def fa2_decode_wrapper(*args, **kwargs):
+            kwargs["backend"] = "fa2"
+            return decode_builder(*args, **kwargs)
+
+        def run(metadata):
+            # Gemma3 has distinct sliding/global plans with the same head geometry.
+            return [
+                layer.forward(q,
+                              k,
+                              v,
+                              metadata,
+                              attention_window_size=1024
+                              if layer.layer_idx == 0 else None)
+                for layer, (q, k, v) in zip(layers, inputs)
+            ]
+
+        with unittest.mock.patch.object(flashinfer_backend.flashinfer,
+                                        "BatchDecodeWithPagedKVCacheWrapper",
+                                        side_effect=fa2_decode_wrapper):
+            for _ in range(2):
+                run(eager)
+                run(captured)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run(captured)
+        wrappers = captured._plan_params_to_wrappers
+        self.assertEqual(len(wrappers), len(layers))
+        for wrapper in wrappers.values():
+            self.assertEqual(wrapper.decode_wrapper._backend, "fa2")
+        lengths = [page_size * (i + 1) for i in range(batch_size)]
+        transitions = [
+            # Change only page ownership while retaining the captured lengths.
+            (list(range(batch_size,
+                        2 * batch_size)), [initial_length] * batch_size),
+            (list(range(batch_size)), [length - 1 for length in lengths]),
+            (list(range(batch_size)), lengths),
+            (list(range(batch_size)), [length + 1 for length in lengths]),
+            # Same page counts, new ownership: existing page-index updates
+            # must remain correct without rebuilding the FA2 schedule.
+            (list(range(batch_size,
+                        2 * batch_size)), [length + 1 for length in lengths]),
+            (list(range(batch_size)), [page_size * 192] * batch_size),
+        ]
+        for request_ids, cached_lengths in transitions:
+            with self.subTest(request_ids=request_ids, lengths=cached_lengths):
+                for tensors in inputs:
+                    for tensor in tensors:
+                        tensor.normal_()
+                before_kv = [buffer.clone() for buffer in kv_buffers]
+                for metadata in [eager, captured]:
+                    metadata.request_ids = request_ids
+                    metadata.kv_cache_params = KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=cached_lengths)
+                    metadata.prepare()
+                expected = run(eager)
+                expected_kv = [buffer.clone() for buffer in kv_buffers]
+                for buffer, before in zip(kv_buffers, before_kv):
+                    buffer.copy_(before)
+
+                # No Python attention forward or re-capture after prepare().
+                graph.replay()
+                for result, reference in zip(actual, expected):
+                    torch.testing.assert_close(result,
+                                               reference,
+                                               atol=1e-2,
+                                               rtol=0)
+                for buffer, reference in zip(kv_buffers, expected_kv):
+                    torch.testing.assert_close(buffer.view(torch.uint8),
+                                               reference.view(torch.uint8),
+                                               atol=0,
+                                               rtol=0)
 
     def test_ragged_prefill_no_kv_cache_uses_cudnn_plan(self) -> None:
         """Ragged QKV with ``kv_cache_manager=None`` plans via cuDNN (``_plan_ragged_cudnn_no_kv``)."""
