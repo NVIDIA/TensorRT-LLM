@@ -79,6 +79,20 @@ def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
 
 
+#: Sentinel for "this layer is not SiTU". A torch custom op schema cannot carry
+#: ``Optional[float]`` here the way a Python signature can, and 0.0 is not
+#: available as the neutral value: the SiTU epilogue divides by both betas, so
+#: zero is a division by zero rather than a no-op. A negative value is
+#: impossible for a real soft-cap -- ``SiTuActivation`` rejects it at
+#: construction -- which makes it safe to reserve.
+SITU_BETA_DISABLED = -1.0
+
+
+def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
+    """Map the op-boundary sentinel back to ``None`` for the kernel."""
+    return None if situ_beta is None or situ_beta <= 0 else float(situ_beta)
+
+
 def _get_cute_dsl_swap_ab_candidates(
     m: int,
     output_aligned: bool,
@@ -3516,13 +3530,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      scaling_vector_size: int = 16,
                      activation_type: ActivationType = ActivationType.Swiglu,
                      swiglu_limit_scalar: float = float("inf"),
-                     use_expert_counts: bool = False):
+                     use_expert_counts: bool = False,
+                     situ_beta: Optional[float] = None,
+                     situ_linear_beta: Optional[float] = None):
             """Initialize the runner.
 
             Args:
-                activation_type: ``ActivationType`` for the fused epilogue. Only
-                    ``Swiglu`` (gated) and ``Relu2`` (non-gated) are supported.
+                activation_type: ``ActivationType`` for the fused epilogue.
+                    ``Swiglu`` (gated), ``Relu2`` (non-gated) and ``SiTu``
+                    (gated) are supported.
                 swiglu_limit_scalar: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
+                situ_beta: Gate-side SiTU soft-cap. Required for -- and only
+                    valid with -- ``ActivationType.SiTu``.
+                situ_linear_beta: Linear-side SiTU soft-cap, same rule.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -3542,6 +3562,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.use_expert_counts:
                 if self.top_k != 1:
                     raise ValueError("Expert-count scheduling requires top_k=1")
+            # Trace-time constants, so they are part of the kernel identity --
+            # see ``unique_id`` and the compile cache key below. Betas that are
+            # not keyed would let a layer silently reuse a kernel compiled for
+            # different soft-caps.
+            self.situ_beta = situ_beta
+            self.situ_linear_beta = situ_linear_beta
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3564,6 +3590,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.activation_type,
                 self.swiglu_limit_scalar,
                 self.use_expert_counts,
+                self.situ_beta,
+                self.situ_linear_beta,
             )
 
         def get_valid_tactics(
@@ -3826,7 +3854,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          self.activation_type, self.swiglu_limit_scalar,
-                         self.use_expert_counts, self.num_local_experts)
+                         self.use_expert_counts, self.num_local_experts,
+                         self.situ_beta, self.situ_linear_beta)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -3840,6 +3869,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     swiglu_limit=self.swiglu_limit_scalar,
                     use_expert_counts=self.use_expert_counts,
                     num_local_experts=self.num_local_experts,
+                    situ_beta=self.situ_beta,
+                    situ_linear_beta=self.situ_linear_beta,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -3929,12 +3960,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        situ_beta: float = SITU_BETA_DISABLED,
+        situ_linear_beta: float = SITU_BETA_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
-        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
-        (non-gated) epilogues; other ``ActivationType`` values raise an
-        assertion in the runner.
+        Supports ``ActivationType.Swiglu`` (gated), ``ActivationType.Relu2``
+        (non-gated) and ``ActivationType.SiTu`` (gated) epilogues; other
+        ``ActivationType`` values raise an assertion in the runner.
+
+        ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps.
+        They default to ``SITU_BETA_DISABLED`` rather than ``None`` because the
+        op schema takes plain floats; the runner maps the sentinel back to
+        ``None`` and then rejects a mismatch against ``activation_type``.
         """
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
@@ -3960,7 +3998,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             scaling_vector_size,
             activation_type=ActivationType(activation_type),
             swiglu_limit_scalar=swiglu_limit_scalar,
-            use_expert_counts=expert_counts is not None)
+            use_expert_counts=expert_counts is not None,
+            situ_beta=_canonicalize_situ_beta(situ_beta),
+            situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta))
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -3999,6 +4039,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        situ_beta: float = SITU_BETA_DISABLED,
+        situ_linear_beta: float = SITU_BETA_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if expert_counts is not None:
             helper = GroupedGemmInputsHelper(num_experts, top_k,
