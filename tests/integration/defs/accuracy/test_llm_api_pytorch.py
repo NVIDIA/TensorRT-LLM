@@ -2423,8 +2423,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if quant_dtype == "none" and fp8kv:
             pytest.skip("only fp8 and nvfp4 support fp8 kv cache")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=kv_cache_reuse)
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=kv_cache_reuse,
+            # ADP pads an idle rank with a short dummy request. Do not commit
+            # that partial dummy block while exercising prefix reuse.
+            enable_partial_reuse=not kv_cache_reuse,
+        )
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler, )
         if quant_dtype == "fp8" and is_sm_100f():
             pytorch_config["moe_config"] = MoeConfig(backend="DEEPGEMM")
