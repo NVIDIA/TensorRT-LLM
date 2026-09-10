@@ -43,7 +43,8 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
-from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
 from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
@@ -76,6 +77,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (ExecutorRequestQueue,
@@ -1062,8 +1064,43 @@ class PyExecutor:
                     "connector scheduler / worker hooks and are not "
                     "distinguished from real requests.")
 
+            if self.kv_cache_manager is None:
+                raise ValueError(
+                    "KV Cache Connector requires a KV Cache Manager.")
+
+            is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
+                                                KVCacheManagerV2)
+
+            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with speculative "
+                    "decoding on KVCacheManagerV2. Rejected draft tokens "
+                    "shrink a request's page list, and the freed slot goes to "
+                    "whichever request allocates next. The connector is only "
+                    "told about pages appended since the last report, so it "
+                    "would keep addressing a slot another request now owns. "
+                    "Disable speculative decoding to run a connector.")
+
+            scheduler_config = getattr(self.llm_args, 'scheduler_config', None)
+            capacity_scheduler_policy = getattr(scheduler_config,
+                                                'capacity_scheduler_policy',
+                                                None)
+            if (not is_kv_cache_manager_v2
+                    and capacity_scheduler_policy is not None
+                    and capacity_scheduler_policy
+                    != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT):
+                raise NotImplementedError(
+                    "KV Cache Connector on the V1 KV cache manager is only "
+                    "supported with the GUARANTEED_NO_EVICT capacity "
+                    "scheduler policy. A policy that destroys and replays a "
+                    "live request leaves the connector's per-request block "
+                    "delta measured against pages that were freed with it. "
+                    "Set kv_cache_config.use_kv_cache_manager_v2=True, which "
+                    "drops the delta when an allocation dies.")
+
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
-            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+            if not is_kv_cache_manager_v2 and (kv_cache_config is not None and
+                                               kv_cache_config.host_cache_size):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KV cache host "
                     "offloading (KvCacheConfig.host_cache_size). The connector "
@@ -1073,11 +1110,11 @@ class PyExecutor:
                     "streams are not synchronized with the internal "
                     "onboard/offload streams.")
 
-            if self.kv_cache_manager is None:
-                raise ValueError(
-                    "KV Cache Connector requires a KV Cache Manager.")
-
-            if getattr(self.kv_cache_manager, 'is_vswa', False):
+            # VSWA allocates one pool per window size, which a single-tensor
+            # registration cannot describe. `register_kv_cache_layout` can, so
+            # the rejection only applies to the flat-tensor path.
+            if not is_kv_cache_manager_v2 and getattr(self.kv_cache_manager,
+                                                      'is_vswa', False):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with variable "
                     "sliding-window attention (per-layer max_attention_window "
@@ -1093,8 +1130,21 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
-            kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
-            self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
+            if is_kv_cache_manager_v2:
+                # Registered regions are device addresses, so every page has
+                # to stay pinned to GPU for as long as the connector holds
+                # them.
+                self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
+                self._reject_connector_prefix_without_block_reuse(
+                    self.kv_cache_manager)
+                layout = build_kv_cache_layout_v2(self.kv_cache_manager)
+                self.kv_connector_manager.reject_flat_only_scheduler(
+                    len(layout.groups))
+                self.kv_connector_manager.worker.register_kv_cache_layout(
+                    layout)
+            else:
+                kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
+                self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
@@ -1106,6 +1156,66 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+
+    @staticmethod
+    def _reject_connector_prefix_without_block_reuse(kv_cache_manager) -> None:
+        """Reject a connector on KVCacheManagerV2 with block reuse disabled.
+
+        V2 honours a connector-served prefix whatever ``enable_block_reuse``
+        says -- the flag governs the local radix tree, and the connector is a
+        separate source. With reuse off it honours the offer and the restored
+        KV is wrong: prefill is skipped for the served range and generation
+        drifts within a few tokens. Measured on the reference connector with a
+        plain full-attention model, so it is neither VSWA- nor
+        connector-specific.
+
+        Read off the manager rather than ``KvCacheConfig.enable_block_reuse``,
+        which ``create_py_executor`` coerces to False for several unrelated
+        reasons (SM version, KV cache quantization algorithm, hybrid linear
+        models). A user who never touched the flag can still land here, and a
+        config-level check would not see it.
+
+        V1 is deliberately not guarded. It never honours the offer in this
+        configuration -- it asks the connector, then schedules the whole prompt
+        anyway -- so it miscomputes nothing. That it silently discards the
+        connector's work, and reports a negative ``computed_position`` while
+        doing so, is a separate defect tracked in the backlog.
+        """
+        if getattr(kv_cache_manager, "enable_block_reuse", True):
+            return
+        raise NotImplementedError(
+            "KV Cache Connector is not supported on KVCacheManagerV2 with KV "
+            "cache block reuse disabled. The connector's prefix is honoured "
+            "regardless of that setting, and restores incorrect KV without it, "
+            "so the request would silently produce wrong output. Set "
+            "kv_cache_config.enable_block_reuse=True. Note that block reuse is "
+            "also disabled automatically for some quantization and model "
+            "combinations, so this can trigger without the flag being set "
+            "explicitly.")
+
+    @staticmethod
+    def _reject_non_gpu_cache_tiers(kv_cache_manager) -> None:
+        """Reject cache tiers below GPU while a connector runs.
+
+        A registered region is only a valid device address while its page is
+        pinned to GPU, and eviction to another tier reassigns that page's slot.
+        The resolved tier list is read from the manager rather than from
+        ``KvCacheConfig.host_cache_size``, whose default of ``None`` is falsy
+        but still yields a host tier.
+        """
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+        cache_tiers = kv_cache_manager.impl.init_config.cache_tiers
+        extra = [tier for tier in cache_tiers if tier.tier != CacheTier.GPU_MEM]
+        if extra:
+            names = ", ".join(str(tier.tier) for tier in extra)
+            raise NotImplementedError(
+                "KV Cache Connector is not supported with KVCacheManagerV2 "
+                f"cache tiers below GPU (found: {names}). Pages evicted to "
+                "another tier have their GPU slot reassigned, which would "
+                "invalidate the addresses registered with the connector. Set "
+                "KvCacheConfig.host_cache_size=0 and "
+                "KvCacheConfig.disk_cache_size=0 to run GPU-only.")
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
@@ -4772,9 +4882,9 @@ class PyExecutor:
     def _can_pause_for_rebalance(self) -> bool:
         """Gate KV pool rebalance to the cases the hook supports.
 
-        Scope: no in-flight disagg transfer, no beam search, no drafter, not
-        during warmup or shutdown.  Honors the ``enable_kv_pool_rebalance``
-        opt-in flag (default off).
+        Scope: no in-flight disagg transfer, no KV connector, no beam search,
+        no drafter, not during warmup or shutdown.  Honors the
+        ``enable_kv_pool_rebalance`` opt-in flag (default off).
 
         Pipeline parallelism *is* supported, but not in the same shape as the
         other two loops.  ``_executor_loop`` and ``_executor_loop_overlap``
@@ -4799,6 +4909,14 @@ class PyExecutor:
         if not self.enable_kv_pool_rebalance:
             return False
         if self.kv_cache_transceiver is not None:
+            return False
+        if self.kv_connector_manager is not None:
+            # Rebalance suspends every active request and runs a defragmenting
+            # migration, which reassigns slot_id -- the same field a tier
+            # eviction reassigns, and the reason tiers below GPU are rejected
+            # at bring-up. The addresses a connector holds come from
+            # update_state_after_alloc and outlive the iteration, so every
+            # connector run is exposed, synchronous included.
             return False
         if self.is_warmup:
             return False
@@ -7503,8 +7621,8 @@ class PyExecutor:
             # so the connector's per-request state advances exactly as before.
             kv_cache_manager = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
-                kv_cache_manager.publish_connector_scheduler_output(
+            if hasattr(kv_cache_manager, "report_batch_to_connector"):
+                kv_cache_manager.report_batch_to_connector(
                     disagg_gen_init_to_prepare)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
@@ -7838,15 +7956,27 @@ class PyExecutor:
             return
 
         def kv_connector_request_finished(req: LlmRequest):
+            by_layer_group = None
             try:
-                cache_block_ids = self.kv_cache_manager.get_cache_indices(req)
+                # KVCacheManagerV2 has no primary-pool block list, so
+                # `get_cache_indices` raises there. The warning path below
+                # swallows that, leaving `request_finished` uncalled and the
+                # connector never told to save anything.
+                if isinstance(self.kv_cache_manager, KVCacheManagerV2):
+                    by_layer_group = self.kv_cache_manager.get_page_indices_by_layer_group(
+                        req)
+                    cache_block_ids = by_layer_group[0] if len(
+                        by_layer_group) == 1 else []
+                else:
+                    cache_block_ids = self.kv_cache_manager.get_cache_indices(
+                        req)
             except Exception as e:
                 logger.warning(
                     f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
                 )
             else:
                 if self.kv_connector_manager.request_finished(
-                        req, cache_block_ids):
+                        req, cache_block_ids, by_layer_group):
                     self.async_transfer_manager.start_transfer(req)
 
         if not self.disable_overlap_scheduler:

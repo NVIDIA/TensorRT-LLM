@@ -1308,6 +1308,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
         .def(nb::init<std::optional<int>, int>(), nb::arg("window_size"), nb::arg("num_sink_blocks"))
+        // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
+        // connector's view of a life cycle is built by the same code as the allocator's.
+        .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size"), nb::arg("num_sink_tokens"),
+            nb::arg("tokens_per_block"))
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),

@@ -147,7 +147,7 @@ layer group in layer-group ID order.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
-`MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
+`MambaHybridCacheManagerV2` and `max_beam_width=1`. Hybrid
 Mamba models select V2 by default (see
 [Selecting the KV Cache Manager](#selecting-the-kv-cache-manager)); set
 `use_kv_cache_manager_v2` to `false` to select the V1 C++

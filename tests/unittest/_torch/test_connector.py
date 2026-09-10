@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +23,8 @@ import pytest
 
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, KvCacheConnectorManager,
-    KvCacheConnectorSchedulerOutputManager)
+    AsyncRequests, KvCacheConnectorManager, KvCacheConnectorScheduler,
+    KvCacheConnectorSchedulerOutputManager, KvCacheConnectorWorker)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
@@ -177,6 +177,164 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
     run_across_mpi(mpi_pool_executor, test, 2)
 
 
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_query_is_side_effect_free(mpi_pool_executor):
+    """The query and the commit are separable, and the query records nothing.
+
+    KVCacheManagerV2 allocates per context chunk, so an offer can be larger
+    than the pages the scheduler reserved. It therefore commits the amount it
+    honours rather than the amount it was offered, which is only possible if
+    asking is inert: `external_loads` is what tells the connector where its
+    load begins, and a request registered as loading is dropped from the batch.
+    """
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+            scheduler.get_num_new_matched_tokens.return_value = (16, True)
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 42
+        req.is_generation_only_request = False
+        req.py_num_connector_matched_tokens = 0
+
+        assert manager.query_num_new_matched_tokens(req, 32) == (16, True)
+
+        assert manager.new_async_requests.loading_ids == set()
+        assert manager.scheduler_output_manager.external_loads == {}
+        assert req.py_num_connector_matched_tokens == 0
+
+        manager.commit_new_matched_tokens(req, 16, True)
+
+        assert manager.new_async_requests.loading_ids == {42}
+        assert manager.scheduler_output_manager.external_loads == {42: 16}
+        assert req.py_num_connector_matched_tokens == 16
+
+        if mpi_rank() == 0:
+            assert scheduler.get_num_new_matched_tokens.call_count == 1
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_commits_only_what_is_honoured(mpi_pool_executor):
+    """Committing less than the offer is legal and is what gets reported.
+
+    The unconsumed tail is recomputed locally; the connector releases its
+    ownership of the whole request at `request_finished`. V1 relies on the same
+    release -- with block reuse disabled it applies none of an offer it asked
+    for, because `setPrepopulatedPromptLen` is gated on `mEnableBlockReuse`.
+    """
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+            scheduler.get_num_new_matched_tokens.return_value = (128, False)
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 7
+        req.is_generation_only_request = False
+        req.py_num_connector_matched_tokens = 0
+
+        num_tokens, load_async = manager.query_num_new_matched_tokens(req, 0)
+        assert num_tokens == 128
+        manager.commit_new_matched_tokens(req, 32, load_async)
+
+        assert manager.scheduler_output_manager.external_loads == {7: 32}
+        assert req.py_num_connector_matched_tokens == 32
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_scheduler_output_resets_a_destroyed_allocation():
+    """A replayed request must be reported as new, with its whole block list.
+
+    `block_ids` and `tokens` are cumulative deltas, which is right while an
+    allocation lives and wrong the moment one is destroyed. On KVCacheManagerV2
+    a destructive recompute pause does exactly that and the request replays --
+    reachable there and only there, because a connector on V1 must run under
+    GUARANTEED_NO_EVICT, where V1 never pauses. Left stale, the replay lands in
+    `cached_requests` with a delta against pages that no longer exist, and a
+    connector that walks only `new_requests` issues no load.
+    """
+    manager = KvCacheConnectorSchedulerOutputManager()
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0, 1, 2, 3]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    kv_cache_manager.get_priority_by_block_id.return_value = 0
+
+    req = MagicMock()
+    req.request_id = 7
+    req.state = LlmRequestState.CONTEXT_INIT
+    req.get_tokens.return_value = list(range(64))
+    req.context_current_position = 0
+    req.context_remaining_length = 64
+    req.context_chunk_size = 64
+    req.kv_cache_retention_config = None
+    req.cache_salt = None
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+
+    first = manager.build_scheduler_output(batch, AsyncRequests(dict(), dict()),
+                                           kv_cache_manager)
+    assert len(first.new_requests) == 1
+    assert first.new_requests[0].new_block_ids == [0, 1, 2, 3]
+
+    # Without the drop this is a `cached_request` carrying an empty delta.
+    manager.reset_request(req.request_id)
+
+    replay = manager.build_scheduler_output(batch,
+                                            AsyncRequests(dict(), dict()),
+                                            kv_cache_manager)
+    assert len(replay.cached_requests) == 0
+    assert len(replay.new_requests) == 1
+    assert replay.new_requests[0].new_block_ids == [0, 1, 2, 3]
+
+
+def test_scheduler_output_keeps_deltas_while_the_allocation_lives():
+    """The drop is scoped to a destroyed allocation, not to every re-report."""
+    manager = KvCacheConnectorSchedulerOutputManager()
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0, 1, 2, 3]
+    kv_cache_manager.commit_and_get_block_hashes.return_value = []
+    kv_cache_manager.get_priority_by_block_id.return_value = 0
+
+    req = MagicMock()
+    req.request_id = 8
+    req.state = LlmRequestState.CONTEXT_INIT
+    req.get_tokens.return_value = list(range(64))
+    req.context_current_position = 0
+    req.context_remaining_length = 64
+    req.context_chunk_size = 64
+    req.kv_cache_retention_config = None
+    req.cache_salt = None
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [req]
+
+    manager.build_scheduler_output(batch, AsyncRequests(dict(), dict()),
+                                   kv_cache_manager)
+    again = manager.build_scheduler_output(batch, AsyncRequests(dict(), dict()),
+                                           kv_cache_manager)
+
+    assert len(again.new_requests) == 0
+    assert len(again.cached_requests) == 1
+    assert again.cached_requests[0].new_block_ids == []
+
+
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
     """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
     NUM_DRAFT_TOKENS = 3
@@ -252,3 +410,184 @@ def test_scheduler_output_block_hashes_read_through():
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
     for call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
         assert call.args == (req, )
+
+
+class _FlatOnlyScheduler(KvCacheConnectorScheduler):
+    """A connector written against the flat API, as every V1 connector is."""
+
+    def __init__(self):
+        super().__init__(llm_args=None)
+        self.finished = []
+        self.allocs = []
+
+    def build_connector_meta(self, scheduler_output):
+        return None
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        return 0, False
+
+    def request_finished(self, request, cache_block_ids):
+        self.finished.append(list(cache_block_ids))
+        return False
+
+    def update_state_after_alloc(self, request, block_ids):
+        self.allocs.append(list(block_ids))
+
+
+def test_an_empty_group_list_reaches_the_flat_callbacks():
+    """`[]` means the request has no KV cache, not that it has zero layer groups.
+
+    `KVCacheManagerV2.get_page_indices_by_layer_group` returns `[]` for a request
+    its `kv_cache_map` holds no entry for. Dispatched to the per-layer-group
+    form, that reaches the ABC default's refusal, so a connector implementing
+    only the flat API dies with "0 layer groups" instead of being told there is
+    nothing to save.
+    """
+    scheduler = _FlatOnlyScheduler()
+    manager = KvCacheConnectorManager(MagicMock(), scheduler)
+
+    req = MagicMock()
+    req.request_id = 3
+
+    manager.update_state_after_alloc(req, [], [])
+    assert scheduler.allocs == [[]]
+
+    assert manager.request_finished(req, [], []) is False
+    assert scheduler.finished == [[]]
+
+
+def test_a_per_layer_group_connector_needs_no_flat_stubs():
+    """Overriding the grouped form is enough to instantiate.
+
+    The flat methods are the abstract ones and abstractness is tracked per
+    method name, so overriding `request_finished_by_layer_group` does not clear
+    the flag on `request_finished`. Without the stand-in, a VSWA-only connector
+    would carry three dead methods purely to construct -- which is a trap,
+    because the failure is a `TypeError` at bring-up naming methods the
+    connector has no reason to implement.
+    """
+
+    class VswaWorker(KvCacheConnectorWorker):
+
+        def register_kv_cache_layout(self, layout):
+            pass
+
+        def start_load_kv(self, stream):
+            pass
+
+        def wait_for_layer_load(self, layer_idx, stream):
+            pass
+
+        def save_kv_layer(self, layer_idx, stream):
+            pass
+
+        def wait_for_save(self, stream):
+            pass
+
+        def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
+            return [], []
+
+    class VswaScheduler(KvCacheConnectorScheduler):
+
+        def build_connector_meta(self, scheduler_output):
+            return None
+
+        def get_num_new_matched_tokens(self, request, num_computed_tokens):
+            return 0, False
+
+        def request_finished_by_layer_group(self, request,
+                                            cache_block_ids_by_layer_group):
+            return False
+
+        def update_state_after_alloc_by_layer_group(self, request,
+                                                    block_ids_by_layer_group):
+            pass
+
+    worker = VswaWorker(llm_args=None)
+    scheduler = VswaScheduler(llm_args=None)
+
+    # The flat forms are still reachable -- the V1 path calls them -- and say
+    # which form this connector implements rather than reporting nothing.
+    with pytest.raises(NotImplementedError, match="register_kv_cache_layout"):
+        worker.register_kv_caches(None)
+    with pytest.raises(NotImplementedError,
+                       match="request_finished_by_layer_group"):
+        scheduler.request_finished(None, [])
+    with pytest.raises(NotImplementedError,
+                       match="update_state_after_alloc_by_layer_group"):
+        scheduler.update_state_after_alloc(None, [])
+
+
+def test_a_connector_implementing_neither_form_still_fails_at_construction():
+    """The stand-in only fires for a connector that implements the grouped form.
+
+    A connector implementing neither must keep failing where it always has, at
+    construction, naming the method to implement.
+    """
+
+    class NeitherScheduler(KvCacheConnectorScheduler):
+
+        def build_connector_meta(self, scheduler_output):
+            return None
+
+        def get_num_new_matched_tokens(self, request, num_computed_tokens):
+            return 0, False
+
+    with pytest.raises(TypeError, match="request_finished"):
+        NeitherScheduler(llm_args=None)
+
+
+def _grouped_scheduler(*implemented):
+    """A scheduler class overriding exactly the named per-layer-group forms."""
+
+    body = {
+        "build_connector_meta": lambda self, scheduler_output: None,
+        "get_num_new_matched_tokens": lambda self, request, num_computed:
+        (0, False),
+        "request_finished": lambda self, request, cache_block_ids: False,
+        "update_state_after_alloc": lambda self, request, block_ids: None,
+    }
+    body.update({
+        name: lambda self, request, by_group: None
+        for name in implemented
+    })
+    return type("PartialScheduler", (KvCacheConnectorScheduler, ), body)
+
+
+@pytest.mark.parametrize("implemented", [
+    (),
+    ("request_finished_by_layer_group", ),
+    ("update_state_after_alloc_by_layer_group", ),
+])
+def test_a_partial_grouped_scheduler_is_rejected_at_bring_up(implemented):
+    """Mixing the two forms must fail before the model is loaded.
+
+    The two pairs clear their abstract flags independently, so a connector
+    implementing one grouped form and leaving the other flat constructs
+    cleanly. Left to the base defaults it would then raise on the first
+    scheduled request -- after model load, which is what this check buys back.
+    """
+    scheduler = _grouped_scheduler(*implemented)(llm_args=None)
+    manager = KvCacheConnectorManager(MagicMock(), scheduler=scheduler)
+
+    with pytest.raises(NotImplementedError, match="by_layer_group"):
+        manager.reject_flat_only_scheduler(2)
+
+
+def test_a_grouped_scheduler_and_a_single_group_cache_are_accepted():
+    """The two ways to pass: both forms implemented, or only one layer group.
+
+    The single-group arm is the compatibility promise -- every connector
+    written against the V1 manager defines only the flat forms, and must keep
+    starting up.
+    """
+    both = _grouped_scheduler("request_finished_by_layer_group",
+                              "update_state_after_alloc_by_layer_group")
+    KvCacheConnectorManager(
+        MagicMock(),
+        scheduler=both(llm_args=None)).reject_flat_only_scheduler(2)
+
+    flat_only = _grouped_scheduler()
+    KvCacheConnectorManager(
+        MagicMock(),
+        scheduler=flat_only(llm_args=None)).reject_flat_only_scheduler(1)

@@ -808,15 +808,45 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+        # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
+        # not chosen until model loading, so the three manager-dependent
+        # rejections below fire here only when the config names the manager
+        # outright, sparing an explicit config a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats all three against the
+        # manager that was actually built.
+        v2_selection = kv_cache_config.use_kv_cache_manager_v2
+
+        # A policy that destroys and replays a live request leaves the
+        # connector's per-request block delta measured against pages that were
+        # freed with it. Only KVCacheManagerV2 drops that delta on replay.
+        if (scheduler_config.capacity_scheduler_policy
+                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                and v2_selection is False):
             raise NotImplementedError(
-                "KV connector is only supported with guaranteed no evict scheduler policy."
+                "KV connector on the V1 KV cache manager is only supported with the "
+                "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
             )
 
-        max_attention_window = kv_cache_config.max_attention_window
-        if uses_vswa_kv_cache_layout(max_attention_window):
+        # Rejected draft tokens shrink a request's page list, and the freed slot
+        # goes to whichever request allocates next. The connector is only told
+        # about pages appended since the last report, so it would keep
+        # addressing a slot another request now owns.
+        if (spec_config is not None and spec_config.max_draft_len > 0
+                and v2_selection is True):
             raise NotImplementedError(
-                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+                "KV connector is not supported with speculative decoding on the V2 "
+                "KV cache manager. Disable speculative decoding to run a connector."
+            )
+
+        # VSWA allocates one pool per window size, which only
+        # `register_kv_cache_layout` can describe.
+        max_attention_window = kv_cache_config.max_attention_window
+        if (uses_vswa_kv_cache_layout(max_attention_window)
+                and v2_selection is False):
+            raise NotImplementedError(
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
+                "on the V1 KV cache manager. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
         if mapping.enable_attention_dp:
