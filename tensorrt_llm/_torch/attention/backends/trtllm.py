@@ -1837,7 +1837,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     "INT8 KV cache requires FP16 or BF16 attention inputs.")
             if metadata.kv_cache_params is None or not metadata.kv_cache_params.use_cache:
                 raise ValueError("INT8 KV cache requires an active KV cache.")
-            cached_context = any(
+            # Decode-only steps have no context prefixes to inspect. Tensor and
+            # cache guards remain per-call: backend callers may replace them.
+            cached_context = metadata.num_contexts > 0 and any(
                 n > 0 for n in metadata.kv_cache_params.
                 num_cached_tokens_per_seq[:metadata.num_contexts])
             if metadata.is_cross or metadata.enable_helix:

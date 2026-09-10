@@ -2466,6 +2466,10 @@ def _create_kv_cache_manager(
     # Gemma4Attention. No layer_mask exclusion needed here.
 
     if quant_config is not None and quant_config.quant_mode.has_int8_kv_cache():
+        if is_disagg or kv_connector_manager is not None:
+            raise ValueError(
+                "INT8 KV cache does not support disaggregated serving or KV connectors."
+            )
         if is_hybrid_linear(config) or _model_config.is_encoder_decoder:
             raise ValueError(
                 "INT8 KV cache currently supports dense decoder-only models.")

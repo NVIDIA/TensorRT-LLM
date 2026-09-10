@@ -3,6 +3,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 from safetensors.torch import save_file
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -10,9 +11,14 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import DecodeCudaGraphConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def test_int8_kv_checkpoint_generation_with_cuda_graph(tmp_path: Path) -> None:
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+def test_int8_kv_checkpoint_generation_with_cuda_graph(tmp_path: Path, use_v2: bool) -> None:
+    """Explicit INT8 generation is deterministic across eager and CUDA Graph runs."""
     config = LlamaConfig(
         vocab_size=256,
         hidden_size=256,
@@ -41,7 +47,8 @@ def test_int8_kv_checkpoint_generation_with_cuda_graph(tmp_path: Path) -> None:
     del weights, model
 
     results = []
-    for cache_dtype in ("auto", "int8"):
+    resolved_dtypes = []
+    for use_cuda_graph in (False, True):
         with LLM(
             model=tmp_path,
             backend="pytorch",
@@ -51,13 +58,21 @@ def test_int8_kv_checkpoint_generation_with_cuda_graph(tmp_path: Path) -> None:
             max_batch_size=2,
             max_num_tokens=128,
             max_seq_len=256,
-            cuda_graph_config=DecodeCudaGraphConfig(batch_sizes=[1, 2]),
+            cuda_graph_config=DecodeCudaGraphConfig(batch_sizes=[1, 2]) if use_cuda_graph else None,
             enable_chunked_prefill=False,
             disable_overlap_scheduler=True,
             kv_cache_config=KvCacheConfig(
-                dtype=cache_dtype, enable_block_reuse=False, max_tokens=512
+                dtype="int8",
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.001,
+                use_kv_cache_manager_v2=use_v2,
             ),
         ) as llm:
+            resolved_dtypes.append(llm.args.quant_config.kv_cache_quant_algo)
+            assert llm.args.kv_cache_config.dtype == "int8"
+            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 == use_v2
+            assert (llm.args.cuda_graph_config is not None) == use_cuda_graph
+            assert resolved_dtypes[-1] == QuantAlgo.INT8
             outputs = llm.generate(
                 [[1] + list(range(10, 72)), [1] + list(range(100, 130))],
                 SamplingParams(end_id=2, pad_id=0, max_tokens=8, temperature=0, ignore_eos=True),
@@ -65,4 +80,5 @@ def test_int8_kv_checkpoint_generation_with_cuda_graph(tmp_path: Path) -> None:
             ids = [output.outputs[0].token_ids for output in outputs]
             assert len(ids) == 2 and all(len(tokens) == 8 for tokens in ids)
             results.append(ids)
+    assert resolved_dtypes == [QuantAlgo.INT8, QuantAlgo.INT8]
     assert results[0] == results[1]

@@ -15,6 +15,7 @@ l0_a10:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/attention/test_int8_kv_cache.py
+  - unittest/_torch/attention/test_packed_qkv_fmha.py
   - unittest/_torch/test_int8_kv_scales.py
   - unittest/_torch/test_int8_kv_llm.py
   - unittest/_torch/sampler/test_torch_sampler.py

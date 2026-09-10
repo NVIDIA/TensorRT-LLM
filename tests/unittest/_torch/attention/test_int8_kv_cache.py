@@ -27,15 +27,19 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 _PROMPT_LENS = [63, 31]
 _DECODE_STEPS = 3
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
 
 def _quantize(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Native INT8 conversion uses round-to-nearest-even with signed saturation.
+    """Match native signed INT8 rounding and saturation for exact cache assertions."""
     return (x.float() / scale).round().clamp(-128, 127).to(torch.int8)
 
 
 def _metadata(
     case: BackendCase, manager: KVCacheManager, prompt_lens: list[int]
 ) -> TrtllmAttentionMetadata:
+    """Prepare actual cache-manager metadata for a context or decode batch."""
     metadata = TrtllmAttentionMetadata(
         num_contexts=case.num_contexts,
         kv_cache_params=KVCacheParams(
@@ -55,6 +59,7 @@ def _metadata(
 
 
 def _backend(case: BackendCase) -> TrtllmAttention:
+    """Construct the production TRTLLM backend with INT8 KV quantization enabled."""
     return create_attention(
         "TRTLLM",
         layer_idx=0,
@@ -73,6 +78,7 @@ def _forward(
     v: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
+    """Pass packed QKV and explicit reciprocal scales through native attention."""
     forward_args = AttentionForwardArgs(
         attention_mask=PredefinedAttentionMask.CAUSAL,
         kv_scale_orig_quant=scale.reciprocal(),
@@ -118,6 +124,7 @@ def _assert_cache(
     keys: list[torch.Tensor],
     values: list[torch.Tensor],
 ) -> None:
+    """Compare the complete logical K/V cache against expected integer contents."""
     _assert_cache_contains_new_tokens(
         manager,
         0,
@@ -138,6 +145,7 @@ def _assert_cache(
 def test_int8_kv_cache_prefill_and_decode(
     dtype: str, num_kv_heads: int, scale_value: float, use_v2: bool
 ) -> None:
+    """Verify real cache writes, saturation, and reads across a page boundary."""
     case = BackendCase(
         num_heads=4,
         num_kv_heads=num_kv_heads,
@@ -221,15 +229,16 @@ def test_int8_kv_cache_prefill_and_decode(
         manager.shutdown()
 
 
-@pytest.mark.parametrize("paged_context", [False, True])
+@pytest.mark.parametrize("cached_tokens,paged_context", [(7, False), (0, True), (7, True)])
 @torch.inference_mode()
-def test_int8_kv_cache_rejects_cached_context(paged_context: bool) -> None:
+def test_int8_kv_cache_rejects_cached_context(cached_tokens: int, paged_context: bool) -> None:
+    """Cached context must fail with either packed or paged-context metadata."""
     case = BackendCase(
         num_heads=4,
         num_kv_heads=2,
         head_dim=128,
         seq_lens=[2],
-        num_cached_tokens=[7],
+        num_cached_tokens=[cached_tokens],
         num_contexts=1,
         page_size=64,
     )
@@ -251,6 +260,7 @@ def test_int8_kv_cache_rejects_cached_context(paged_context: bool) -> None:
 @torch.inference_mode()
 def test_int8_kv_mixed_prefill_and_decode() -> None:
     # Cached tokens are valid for the decode request in a mixed batch.
+    """Cached decode tokens remain valid beside an uncached context request."""
     case = BackendCase(
         num_heads=4,
         num_kv_heads=2,
@@ -291,9 +301,14 @@ def test_int8_kv_mixed_prefill_and_decode() -> None:
         manager.shutdown()
 
 
-@pytest.mark.parametrize("scale_kind", ["cpu", "float16", "vector"])
+@pytest.mark.parametrize("scale_kind", ["missing", "cpu", "float16", "vector"])
+@pytest.mark.parametrize("scale_field", ["kv_scale_orig_quant", "kv_scale_quant_orig"])
+@pytest.mark.parametrize("after_warmup", [False, True])
 @torch.inference_mode()
-def test_int8_kv_rejects_invalid_scale_tensor(scale_kind: str) -> None:
+def test_int8_kv_rejects_invalid_scale_tensor(
+    scale_kind: str, scale_field: str, after_warmup: bool
+) -> None:
+    """Validate each scale independently, including replacements after warmup."""
     case = BackendCase(
         num_heads=4,
         num_kv_heads=2,
@@ -307,19 +322,81 @@ def test_int8_kv_rejects_invalid_scale_tensor(scale_kind: str) -> None:
     try:
         manager.add_dummy_requests([0], case.token_nums)
         inputs = generate_inputs(case, seed=29)
-        scale = torch.ones(
-            2 if scale_kind == "vector" else 1,
-            dtype=torch.float16 if scale_kind == "float16" else torch.float32,
-            device="cpu" if scale_kind == "cpu" else "cuda",
+        attention = _backend(case)
+        metadata = _metadata(case, manager, case.token_nums)
+        scale = torch.tensor([1 / 32], dtype=torch.float32, device="cuda")
+        forward_args = AttentionForwardArgs(
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            kv_scale_orig_quant=scale.reciprocal(),
+            kv_scale_quant_orig=scale,
         )
-        with pytest.raises(ValueError, match="scalar float32 KV scales"):
-            _forward(
-                _backend(case),
-                _metadata(case, manager, case.token_nums),
-                inputs["q"],
-                inputs["new_k"],
-                inputs["new_v"],
-                scale,
+        qkv = torch.cat((inputs["q"], inputs["new_k"], inputs["new_v"]), dim=-1)
+        if after_warmup:
+            attention.forward(qkv, None, None, metadata, forward_args=forward_args)
+        invalid_scale = (
+            None
+            if scale_kind == "missing"
+            else torch.ones(
+                2 if scale_kind == "vector" else 1,
+                dtype=torch.float16 if scale_kind == "float16" else torch.float32,
+                device="cpu" if scale_kind == "cpu" else "cuda",
             )
+        )
+        setattr(forward_args, scale_field, invalid_scale)
+        with pytest.raises(ValueError, match="scalar float32 KV scales"):
+            attention.forward(qkv, None, None, metadata, forward_args=forward_args)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("invalid", "error"),
+    [
+        ("float32", "FP16 or BF16"),
+        ("missing_cache", "active KV cache"),
+        ("inactive_cache", "active KV cache"),
+        ("cross_attention", "cross-attention"),
+        ("helix", "context parallelism"),
+    ],
+)
+@pytest.mark.parametrize("after_warmup", [False, True])
+@torch.inference_mode()
+def test_int8_kv_rejects_unsupported_forward_inputs(
+    invalid: str, error: str, after_warmup: bool
+) -> None:
+    """Each validation fails in the real backend before native attention runs."""
+    case = BackendCase(
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        seq_lens=[2],
+        num_cached_tokens=[0],
+        num_contexts=1,
+        page_size=64,
+    )
+    manager = _build_kv_cache_manager(case, "TRTLLM", torch.int8)
+    try:
+        manager.add_dummy_requests([0], case.token_nums)
+        metadata = _metadata(case, manager, case.token_nums)
+        inputs = generate_inputs(case, seed=29)
+        q, k, v = inputs["q"], inputs["new_k"], inputs["new_v"]
+        attention = _backend(case)
+        scale = torch.tensor([1 / 32], dtype=torch.float32, device="cuda")
+        if after_warmup:
+            _forward(attention, metadata, q, k, v, scale)
+        if invalid == "float32":
+            q, k, v = q.float(), k.float(), v.float()
+        elif invalid == "missing_cache":
+            metadata.kv_cache_params = None
+        elif invalid == "inactive_cache":
+            metadata.kv_cache_params.use_cache = False
+        elif invalid == "cross_attention":
+            metadata.seq_lens_kv = metadata.seq_lens.clone()
+            assert metadata.is_cross and not metadata.enable_helix
+        else:
+            metadata.enable_helix = True
+            assert not metadata.is_cross
+        with pytest.raises(ValueError, match=error):
+            _forward(attention, metadata, q, k, v, scale)
     finally:
         manager.shutdown()

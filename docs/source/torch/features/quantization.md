@@ -37,6 +37,8 @@ and V scales together. Large differences between the K and V ranges can cause
 substantial accuracy loss with a shared scale. Calibrate for INT8's range,
 including the effect of rotary
 position embeddings on K; FP8 or FP4 scales cannot be reused unchanged.
+`TRTLLM_LOAD_KV_SCALES` must remain enabled (`1`, the default) for INT8;
+disabling calibrated scale loading raises an error.
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -56,7 +58,8 @@ with LLM(
 This path supports full prefill followed by single-token decoding with paged KV
 storage. It does not support cached/chunked prefill, prefix block reuse,
 speculative decoding, MLA, sparse or cross attention, context parallelism,
-hybrid attention/state-space models, or quantized projection weights. These
+hybrid attention/state-space models, disaggregated serving, KV connectors,
+or quantized projection weights. These
 combinations are rejected because they require different kernel paths. Select
 `max_num_tokens` large enough to hold the longest complete prompt when chunked
 prefill is disabled. Validate model quality with representative calibration and
