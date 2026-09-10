@@ -28,9 +28,13 @@ from tensorrt_llm.usage.schemas import SMS_SCHEMA_PATH
 
 
 def validate() -> List[str]:
-    """Check Pydantic model fields match the SMS JSON schema properties.
+    """Validate Pydantic/SMS property names and SMS requiredness parity.
 
-    Returns a list of human-readable error strings (empty = all good).
+    Check model aliases against SMS properties and verify that every SMS
+    event has the same properties and required fields, including events
+    without a registered Pydantic model.
+
+    Return human-readable error strings, or an empty list when all checks pass.
     """
     errors: List[str] = []
 

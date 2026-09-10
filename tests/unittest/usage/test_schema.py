@@ -504,19 +504,6 @@ class TestSchemaCompliance:
         required = sms_schema["definitions"]["events"]["trtllm_heartbeat"]["required"]
         assert required == ["seq"]
 
-    def test_initial_report_required_fields(self):
-        """SMS trtllm_initial_report requires all declared fields."""
-        sms_schema = self._load_sms_schema()
-        required = set(sms_schema["definitions"]["events"]["trtllm_initial_report"]["required"])
-        all_props = set(
-            sms_schema["definitions"]["events"]["trtllm_initial_report"]["properties"].keys()
-        )
-        assert required == all_props, (
-            f"Expected all properties to be required.\n"
-            f"  Missing from required: {all_props - required}\n"
-            f"  Extra in required: {required - all_props}"
-        )
-
     # --- Additional properties enforcement ---
 
     def test_initial_report_no_additional_properties(self):
