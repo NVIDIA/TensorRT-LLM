@@ -666,6 +666,23 @@ def launchReleaseCheck(pipeline, globalVars)
     })
 }
 
+def launchTestListCheck(pipeline, globalVars)
+{
+    def key = "Check Test List"
+    def image = globalVars["LLM_DOCKER_IMAGE"]
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+        stage("[${key}] Run") {
+            echoNodeAndGpuInfo(pipeline, key)
+            sh "git config --global --add safe.directory \"*\""
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+
+            def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
+               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+        }
+    })
+}
+
 def getGitlabMRChangedFile(pipeline, function, filePath="") {
     def result = null
     def pageId = 0
@@ -1914,6 +1931,27 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 launchReleaseCheck(this, globalVars)
             }
         },
+        "Check Test List": {
+            script {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    echo "Skipping Check Test List for the infrastructure dry run."
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping Check Test List (GenPostMergeBuilds mode: builds only)"
+                    return
+                } else if (runMode == "nightly_release") {
+                    echo "Skipping Check Test List for nightly_release."
+                    return
+                } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                    echo "Skipping Check Test List for Docs-only changes."
+                    return
+                } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                    echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                    return
+                }
+                launchTestListCheck(this, globalVars)
+            }
+        },
         "OSS-Compliance-Check": {
             script {
                 stage("[OSS-Compliance-Check] Run") {
@@ -2548,10 +2586,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         echo "Will run job to build ngc containers and running in-pipeline scanning for them"
     }
 
+    def alwaysFailFastStages = ["Release-Check", "Check Test List"] as Set
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
-                value()
+                if (enableFailFast || key in alwaysFailFastStages) {
+                    value()
+                } else {
+                    // Avoid interrupting other stages on failure.
+                    catchError(catchInterruptions: false) {
+                        value()
+                    }
+                }
             }
         }
     }]}
@@ -2635,15 +2681,34 @@ pipeline {
             steps {
                 script {
                     if (isReleaseCheckMode) {
-                        stage("Release-Check") {
-                            script {
-                                if (testFilter[INFRA_DRY_RUN]) {
-                                    echo "Skipping Release-Check for the infrastructure dry run."
-                                } else {
-                                    launchReleaseCheck(this, globalVars)
+                        def releaseCheckStages = [
+                            "Release-Check": {
+                                stage("Release-Check") {
+                                    if (testFilter[INFRA_DRY_RUN]) {
+                                        echo "Skipping Release-Check for the infrastructure dry run."
+                                    } else {
+                                        launchReleaseCheck(this, globalVars)
+                                    }
                                 }
-                            }
-                        }
+                            },
+                            "Check Test List": {
+                                stage("Check Test List") {
+                                    if (testFilter[INFRA_DRY_RUN]) {
+                                        echo "Skipping Check Test List for the infrastructure dry run."
+                                    } else if (runMode == "nightly_release") {
+                                        echo "Skipping Check Test List for nightly_release."
+                                    } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                                        echo "Skipping Check Test List for Docs-only changes."
+                                    } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                                        echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                                    } else {
+                                        launchTestListCheck(this, globalVars)
+                                    }
+                                }
+                            },
+                        ]
+                        releaseCheckStages.failFast = true
+                        parallel releaseCheckStages
                     } else {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
                         // Remove it to workaround the "Argument list too long" error

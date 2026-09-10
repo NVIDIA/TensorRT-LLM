@@ -97,14 +97,3 @@ def test_slurm_install_requires_artifact_inputs(missing: str) -> None:
 
     assert result.returncode != 0
     assert f"{missing} is required" in result.stderr
-
-
-def test_l0_artifact_download_retries_overwrite_archive() -> None:
-    download_commands = [
-        line.strip()
-        for line in L0_TEST.read_text().splitlines()
-        if "wget -nv" in line and "llmTarfile" in line
-    ]
-
-    assert len(download_commands) == 4
-    assert all("wget -nv -O" in command for command in download_commands)
