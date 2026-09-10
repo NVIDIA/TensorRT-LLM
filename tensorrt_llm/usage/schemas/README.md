@@ -256,7 +256,7 @@ exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 | `moe_expert_parallel_size` | MoE expert parallelism degree (None/unset when runtime decides). |
 | `moe_tensor_parallel_size` | MoE tensor parallelism degree (None/unset when runtime decides). |
 | `moe_cluster_parallel_size` | MoE cluster parallelism degree (None/unset when runtime decides). |
-| `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args, and through an explicit allowlist (`pytorch`, `tensorrt`, `_autodeploy`) on the base/TRT args. |
+| `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args. |
 | `dtype` | Model dtype, captured through an explicit allowlist. |
 | `load_format` | Weight load format, captured as a low-cardinality enum/string value. |
 | `quant_config.quant_algo` | Quantization algorithm, captured as a closed `QuantAlgo` enum value (TRT args only). Empty/absent when unquantized. |

@@ -1524,7 +1524,7 @@ class ServerConfig:
         """Generate extra-llm-api-config.yml content."""
         config_data = dict(self.extra_llm_api_config_data)
 
-        # Merge external AutoDeploy config if specified
+        # Merge an external config if specified
         if self.extra_llm_api_config_path:
             config_path = self.extra_llm_api_config_path
             if not os.path.isabs(config_path):

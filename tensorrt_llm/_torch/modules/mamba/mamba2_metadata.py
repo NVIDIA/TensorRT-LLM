@@ -107,7 +107,7 @@ def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
                                    replay_step_width, replay_history_size):
     """Same partition as :func:`_build_replay_work_items_triton`, in ATen ops.
 
-    Keep field order and write-first partitioning in sync with the AutoDeploy
+    Keep field order and write-first partitioning in sync with the
     replay metadata path in shim/interface.py.
     """
     num_decodes = state_indices.shape[0]

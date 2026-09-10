@@ -22,8 +22,6 @@ import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi as public_llmapi
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
-from tensorrt_llm._torch.auto_deploy.llm_args import \
-    LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
     HfCheckpointLoader
@@ -81,13 +79,6 @@ def test_generation_config_mode_defaults_and_validation() -> None:
 
     with pytest.raises(ValidationError, match="generation_config"):
         TorchLlmArgs(model=llama_model_path, generation_config="invalid")
-
-
-@pytest.mark.cpu_only
-def test_generation_config_auto_rejects_autodeploy() -> None:
-    with pytest.raises(ValidationError,
-                       match="AutoDeploy does not support generation_config"):
-        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
 
 
 @pytest.mark.cpu_only
@@ -152,21 +143,6 @@ def test_rank_striped_checkpoint_io_accepts_best_effort_config(
         **kwargs,
     )
     assert args.checkpoint_io_policy == "rank_striped_read_ahead"
-
-
-@pytest.mark.cpu_only
-def test_rank_striped_checkpoint_io_warns_and_preserves_request_for_autodeploy(
-) -> None:
-    with patch.object(llm_args_mod.logger, "warning") as warning:
-        args = AutoDeployLlmArgs(
-            model=llama_model_path,
-            checkpoint_io_policy="rank_striped_read_ahead",
-        )
-    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
-    serialized_args = args.model_dump()
-    assert serialized_args["checkpoint_io_policy"] == "rank_striped_read_ahead"
-    assert any("selected=native" in call.args[0]
-               for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only
@@ -3256,12 +3232,6 @@ class TestPydanticBestPractices:
         ],
         TorchLlmArgs: [
             "checkpoint_loader",  # abstract base class type
-        ],
-        AutoDeployLlmArgs: [
-            "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
-            "model_kwargs",  # typed as Dict[str, Any] for flexibility
-            "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)
-            "tokenizer_kwargs",  # typed as Dict[str, Any] for flexibility
         ],
         UserProvidedDecodingConfig: [
             "drafter",  # abstract base class type

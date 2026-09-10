@@ -4,8 +4,7 @@ description: >
   Onboard a HuggingFace multimodal model (vision/audio/video + text) to the
   TensorRT-LLM PyTorch backend. Use when writing a new
   `tensorrt_llm/_torch/models/modeling_<vlm>.py` plus its input processor and
-  weight mapper, or extending an existing VLM. Not for AutoDeploy — use
-  `ad-model-onboard` for that path.
+  weight mapper, or extending an existing VLM.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -13,7 +12,7 @@ metadata:
 
 # TensorRT-LLM Multimodal Model Onboarding (PyTorch backend)
 
-> **Scope.** PyTorch backend only (`tensorrt_llm/_torch/`) — the default for `LLM(..., backend="pytorch")`, `trtllm-serve`, `trtllm-bench`. **Not** for AutoDeploy (`tensorrt_llm/_torch/auto_deploy/`); use `ad-model-onboard` for that.
+> **Scope.** PyTorch backend only (`tensorrt_llm/_torch/`) — the default for `LLM(..., backend="pytorch")`, `trtllm-serve`, and `trtllm-bench`.
 
 **Output:**
 - `tensorrt_llm/_torch/models/modeling_{name}.py` — wrapper class (multimodal encoder + LLM) decorated with `@register_auto_model`, `@register_vision_encoder`, `@register_input_processor` (and `@support_multimodal_disaggregated` if EPD is supported), plus a `BaseMultimodalInputProcessor` (+ `BaseMultimodalDummyInputsBuilder`) subclass.

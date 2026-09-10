@@ -107,7 +107,7 @@ def ignore_trt_only_args(kwargs: dict, backend: str):
 
     Args:
         kwargs: Dictionary of keyword arguments to be passed to the LLM constructor.
-        backend: The backend type (e.g., "pytorch", "_autodeploy").
+        backend: The backend type.
     """
     trt_only_args = [
         "batching_type",
@@ -139,12 +139,6 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
 
     if runtime_config.backend == 'pytorch':
         llm_cls = PyTorchLLM
-
-    elif runtime_config.backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-        kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
-        llm_cls = AutoDeployLLM
 
     llm = llm_cls(**kwargs)
     return llm

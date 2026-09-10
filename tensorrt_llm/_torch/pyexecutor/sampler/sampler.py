@@ -644,9 +644,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Number of leading rows of the fast-tier buffers the staged batch fills.
         self._fast_num_rows: int = 0
 
-        # AutoDeploy build creates the sampler in inference mode,
-        # which would disallow in-place mutating of new_tokens.
-        # So, we temporarily exit inference mode.
+        # The sampler can be created in inference mode, which disallows
+        # in-place mutation of new_tokens. Temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self._create_store()
             self._request_grouper: _CachingRequestGrouper[Any] = _CachingRequestGrouper(

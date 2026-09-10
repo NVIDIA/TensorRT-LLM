@@ -887,8 +887,8 @@ def test_kimi_disagg_rejects_non_python_transceiver_route(
     """Any K3 disagg route that does not reach the Python NIXL transceiver
     must fail loudly instead of returning a manager the C++ transceiver
     would drive without KDA state transfer (silent wrong results). The
-    'auto_unresolved' case covers paths that skip model-default resolution
-    (e.g. AutoDeploy), where 'auto' falls back to the C++ runtime."""
+    'auto_unresolved' case covers paths that skip model-default resolution,
+    where 'auto' falls back to the C++ runtime."""
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
@@ -1342,7 +1342,7 @@ def test_update_mamba_states_mtp_path():
 
 
 @skip_no_cuda
-def test_update_mamba_states_autodeploy_path():
+def test_update_mamba_states_with_explicit_state_indices():
     mgr = _make_mgr()
     mgr._prepare_mamba_cache_blocks([200, 201, 202])
 

@@ -390,15 +390,10 @@ class BaseLLM:
                     # Propagate to args construction
                     kwargs["orchestrator_type"] = "ray"
 
-            elif backend == '_autodeploy':
-                logger.info("Using LLM with AutoDeploy backend")
-                from .._torch.auto_deploy.llm_args import \
-                    LlmArgs as AutoDeployLlmArgs
-                llm_args_cls = AutoDeployLlmArgs
             else:
                 raise ValueError(
                     f"Unknown backend: {backend!r}. Supported backends are "
-                    "'pytorch' and '_autodeploy'.")
+                    "'pytorch'.")
 
             # check the kwargs and raise ValueError directly
             valid_keys = set(
@@ -930,13 +925,6 @@ class BaseLLM:
         # This branch is applicable for Encode --> Prefill handoff scenario,
         # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
         if is_mm_disagg:
-            if self.args.backend == "_autodeploy":
-                raise ValueError(
-                    "Multimodal disaggregated inference (encode -> prefill "
-                    "embedding handoff) is not supported with the AutoDeploy "
-                    "backend. AutoDeploy runs the multimodal encoder in-prefill "
-                    "on raw inputs and does not consume precomputed multimodal "
-                    "embeddings.")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
@@ -1494,7 +1482,7 @@ class BaseLLM:
             )
 
         # auto enable context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-        if self.args.backend not in ["pytorch", "_autodeploy"]:
+        if self.args.backend != "pytorch":
             if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
                 sampling_params._context_logits_auto_enabled = True
@@ -1569,7 +1557,7 @@ class BaseLLM:
     def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
-        if self.args.backend in ["pytorch", "_autodeploy"]:
+        if self.args.backend == "pytorch":
             # Check prompt length against max_num_tokens to filter illegal requests.
             # Skip check for gen-only requests
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
@@ -1649,9 +1637,8 @@ class BaseLLM:
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
-        if hasattr(self.args, "backend") and self.args.backend in [
-                "pytorch", "_autodeploy"
-        ] and self.args.lora_config is not None:
+        if (hasattr(self.args, "backend") and self.args.backend == "pytorch"
+                and self.args.lora_config is not None):
             num_lora_dirs = len(self.args.lora_config.lora_dir)
             if num_lora_dirs == 1:
                 tokenizer_path = self.args.lora_config.lora_dir[0]

@@ -162,7 +162,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         _llm_args = worker_kwargs.get("llm_args", None)
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
         _backend = None if _llm_args is None else _llm_args.backend
-        self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
+        self._is_pytorch_backend = _backend == "pytorch"
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 

@@ -480,7 +480,6 @@ common-files: &common_files |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
         tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
-        tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py |
         tests/integration/defs/ci_profiler.py |
@@ -1239,7 +1238,6 @@ legacy-files: &legacy_files |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
         tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
-        tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py |
         tests/integration/defs/ci_profiler.py |
@@ -1559,18 +1557,6 @@ repos:
     -   id: trailing-whitespace
         exclude: '(\.(patch|md)|scripts/attribution/data/cas/.*)$'
     -   id: check-toml
-    -   id: mixed-line-ending
-        args: [--fix=lf]
-        files: ".*/auto_deploy/.*"
-    -   id: debug-statements
-        files: ".*/auto_deploy/.*"
-    -   id: check-json
-        files: ".*/auto_deploy/.*"
-        exclude: >
-          (?x)^(
-            .*\.vscode/.*\.json | # vscode files can take comments
-            .*\.devcontainer/.*\.json # devcontainer json files can take comments
-          )$
     -   id: file-contents-sorter
         files: ^tests/integration/test_lists/waives\.txt$
 -   repo: https://github.com/PyCQA/autoflake
@@ -1607,23 +1593,8 @@ repos:
         exclude: *legacy_files
     -   id: ruff-format
         exclude: *legacy_files
--   repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.17
-    hooks:
-    -   id: mdformat
-        additional_dependencies:
-        - mdformat_frontmatter
-        files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
-    -   id: model-registry-check
-        name: Validate AutoDeploy model registry
-        entry: python scripts/check_model_registry.py
-        language: python
-        additional_dependencies:
-        - PyYAML
-        files: ^examples/auto_deploy/model_registry/models\.yaml$
-        pass_filenames: false
     -   id: ruff-legacy
         name: ruff-legacy (baseline-gated lint for legacy files)
         entry: python scripts/legacy_utils.py lint-precommit
@@ -1670,11 +1641,6 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
-    -   id: auto-deploy-import-discipline
-        name: Enforce relative imports inside auto_deploy
-        entry: python scripts/check_auto_deploy_imports.py
-        language: python
-        files: ^tensorrt_llm/_torch/auto_deploy/.*\.py$
     -   id: check-skill-naming-convention
         name: Check Claude Code skill naming convention
         entry: python scripts/check_skill_naming_convention.py

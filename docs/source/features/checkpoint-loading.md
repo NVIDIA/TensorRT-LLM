@@ -121,7 +121,7 @@ The optimized path currently requires identical policy configuration across
 all ranks, the automatically constructed built-in HF loader
 (`checkpoint_loader` must be unset), `load_format: auto`, SafeTensors, and an
 active MPI model-load communicator for distributed jobs. Static incompatibility
-such as MX, AutoDeploy, a custom or explicitly provided loader, a non-automatic
+such as MX, a custom or explicitly provided loader, a non-automatic
 load format, or known partial-model loading selects native I/O before any
 rank-striped communicator or reader setup. An explicit incompatible
 `rank_striped_read_ahead` request emits a warning instead of failing startup;

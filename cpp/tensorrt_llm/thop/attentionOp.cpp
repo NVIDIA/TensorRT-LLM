@@ -957,7 +957,7 @@ public:
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
             }
             // Pass V's actual token stride so the FMHA runner handles both
-            // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
+            // contiguous and non-contiguous V layouts (PyTorch backend
             // kv.split() view) correctly.
             if (v_ptr != nullptr && v.has_value())
             {

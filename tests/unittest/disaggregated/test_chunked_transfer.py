@@ -631,53 +631,6 @@ def test_pipelined_transfer_requires_gen_first_flow():
         PyExecutor._validate_request(executor, request)
 
 
-def test_pipelined_transfer_requires_chunked_prefill_for_auto_deploy():
-    """AutoDeploy reports disabled chunking with the intended validation error."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = MagicMock()
-    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
-    executor.model_engine = SimpleNamespace(_enable_chunked_prefill=False)
-
-    request = MagicMock()
-    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
-    request.py_disaggregated_params = SimpleNamespace(
-        schedule_style=DisaggScheduleStyle.GENERATION_FIRST
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="enable_chunked_prefill is required when enable_pipelined_transfer is set",
-    ):
-        PyExecutor._validate_request(executor, request)
-
-
-def test_pipelined_transfer_accepts_chunked_prefill_for_auto_deploy():
-    """AutoDeploy's chunked-prefill flag satisfies context validation."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = MagicMock()
-    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
-    executor.model_engine = SimpleNamespace(_enable_chunked_prefill=True)
-    executor.dist.pp_size = 1
-    executor.dist.cp_size = 1
-    executor.max_beam_width = 1
-    executor._validate_token_id_range = MagicMock()
-    executor.sampler.validate_request = MagicMock()
-
-    request = MagicMock()
-    request.sampling_config = None
-    request.py_beam_width = 1
-    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
-    request.py_disaggregated_params = SimpleNamespace(
-        schedule_style=DisaggScheduleStyle.GENERATION_FIRST
-    )
-
-    PyExecutor._validate_request(executor, request)
-
-    executor.sampler.validate_request.assert_called_once_with(request)
-
-
 def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
     """Context workers require all layers on one pipeline rank."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor

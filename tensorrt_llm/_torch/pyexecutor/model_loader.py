@@ -433,9 +433,6 @@ def _construct_checkpoint_loader(
             requested_checkpoint_io_policy,
             partial_model_loading,
         )
-    if backend == "_autodeploy":
-        return None
-
     from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
         BaseCheckpointLoader
     from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \

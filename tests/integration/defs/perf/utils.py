@@ -728,7 +728,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
             gpu_idx = gpu_prop.get("index", self._gpu_clock_lock.get_gpu_id())
         # Remove the prefix, which includes the platform info, for network_hash.
         short_test_name = full_test_name.split("::")[-1]
-        # Get device subtype for autodeploy tests
+        # Get the device subtype when available.
         device_subtype = None
         if self._gpu_clock_lock:
             device_subtype = self._gpu_clock_lock.get_device_subtype()
