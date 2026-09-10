@@ -29,4 +29,4 @@ Sparse Attention <visualgen-sparse-attention>
 These articles explain the design choices and benchmark results behind VisualGen optimizations:
 
 - [Scaling video generation across NVL72](../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md) covers multi-GPU parallelism and scaling results.
-- [Quantization and sparse attention for video generation](../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.md) covers GEMM quantization, quantized attention, and Skip Softmax Attention, including performance and visual-quality trade-offs.
+- [Quantization and skipsoftmax attention for video generation](../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.md) covers GEMM quantization, quantized attention, and Skip Softmax Attention, including performance and visual-quality trade-offs.
