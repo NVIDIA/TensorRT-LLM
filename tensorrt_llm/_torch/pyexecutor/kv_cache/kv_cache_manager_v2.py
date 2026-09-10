@@ -1522,6 +1522,21 @@ class KVCacheManagerV2(BaseResourceManager):
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
 
+    def _iter_guard_candidate_buffers(self) -> Iterable[Tuple[int, torch.Tensor]]:
+        """Yield ``(layer_idx, buffer)`` pairs a guard page can be parked on.
+
+        Subclasses whose ``get_buffers`` needs extra arguments (e.g. the
+        DeepSeekV4 override requires an ``attn_type``) or that expose pools
+        unfit to host a guard page override this hook. The base iterates the
+        pipeline-parallel attention layers and skips any pool ``get_buffers``
+        reports as absent.
+        """
+        for layer_idx in self.pp_layers:
+            buffer = self.get_buffers(layer_idx)
+            if buffer is None:
+                continue
+            yield layer_idx, buffer
+
     def _reserve_guard_page(self) -> None:
         """Diagnostic: park masked-out page-table entries on a page nobody owns.
 
@@ -1573,10 +1588,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._guard_page_fill = ""
             return
         unfillable_dtype = False
-        for layer_idx in self.pp_layers:
-            buffer = self.get_buffers(layer_idx)
-            if buffer is None:
-                continue
+        for layer_idx, buffer in self._iter_guard_candidate_buffers():
             pages = self.get_batch_cache_indices([_GUARD_PAGE_REQUEST_ID], layer_idx=layer_idx)[0]
             page = next((int(p) for p in pages if p != BAD_PAGE_INDEX), None)
             if page is None or not 0 <= page < buffer.shape[0]:

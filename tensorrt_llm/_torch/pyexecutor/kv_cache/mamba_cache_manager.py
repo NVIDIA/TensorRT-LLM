@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.sampling_params import SamplingParams
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
-    BlockReusePolicy, KVCacheManagerV2, Role)
+    _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -3934,7 +3934,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return max(1, cache_bytes)
 
     def get_num_free_blocks(self) -> int:
-        assert len(self.kv_cache_map) == 0, (
+        # Mirror the base: the guard page, when enabled, is held by a
+        # permanent reservation made at construction (not by a request), so
+        # exclude reserved ids before asserting the manager is otherwise empty.
+        reserved = set(self.kv_cache_map) & _RESERVED_REQUEST_IDS
+        assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
         attention_pages = []
@@ -3971,19 +3975,29 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return None
         return super().get_buffers(layer_idx, kv_layout)
 
-    def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
+    def _iter_cache_buffers_for_invalid_check(
+            self) -> Iterable[Tuple[int, torch.Tensor]]:
         for global_layer_id, local_layer_id in self.layer_offsets.items():
             if self._is_local_mamba_layer(local_layer_id):
                 continue
             # A layer group is a lifecycle, not a physical memory pool.
             # Differently sized attention buffers can share one lifecycle,
             # so scan every attention layer in this diagnostic path.
-            yield KVCacheManagerV2.get_buffers(self, global_layer_id)
+            yield global_layer_id, KVCacheManagerV2.get_buffers(
+                self, global_layer_id)
 
-        yield from self.all_ssm_states
-        yield from self.all_conv_states
-        yield from self._ple_ngram_contexts.values()
-        yield from self._ple_conv_states.values()
+        # SSM / conv / PLE tensors are not attention layers and hold no guard
+        # page, so yield a sentinel layer id (-1). The base consumer looks the
+        # id up via self._guard_page_by_layer.get(layer_id), which returns None
+        # for an unknown id and correctly skips guard restoration for them.
+        for buffer in self.all_ssm_states:
+            yield -1, buffer
+        for buffer in self.all_conv_states:
+            yield -1, buffer
+        for buffer in self._ple_ngram_contexts.values():
+            yield -1, buffer
+        for buffer in self._ple_conv_states.values():
+            yield -1, buffer
 
     def add_dummy_requests(
         self,
