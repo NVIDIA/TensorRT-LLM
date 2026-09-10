@@ -128,6 +128,15 @@ commands:
         is_flag: true
         flags:
         - "--enable_chunked_prefill"
+      enable_sleep_mode:
+        type: bool
+        default: false
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--enable_sleep_mode"
       enable_visual_gen:
         type: bool
         default: false
