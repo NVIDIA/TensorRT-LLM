@@ -232,6 +232,42 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Single-node experimental adaptation of the NVFP4 DSpark generation
+        # recipe in tests/scripts/perf/disaggregated/
+        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
+        # The blog does not provide a tuned single-node NVFP4 DSpark config.
+        {
+            'patterns': ['deepseek_v4_pro_nvfp4_dspark'],
+            'config': {
+                'attn_backend': 'TRTLLM',
+                'enable_attention_dp': True,
+                'enable_lm_head_tp_in_adp': True,
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 10240,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'tokens_per_block': 128,
+                    'enable_block_reuse': False,
+                },
+                'enable_chunked_prefill': False,
+                'disable_overlap_scheduler': True,
+                'custom_tokenizer': 'deepseek_v4',
+                'speculative_config': {
+                    'decoding_type':
+                    'DSpark',
+                    'max_draft_len':
+                    3,
+                    'block_size':
+                    3,
+                    'speculative_model':
+                    f'{llm_models_root()}/DeepSeek-V4-Pro-nvfp4-DSpark',
+                },
+            }
+        },
         # DeepSeek V4 Pro throughput knobs, from
         # examples/configs/curated/deepseek-v4-pro-throughput.yaml (ADP + EP,
         # small per-rank batch). MTP-1 matches the checkpoint's

@@ -445,6 +445,7 @@ class PerfTestConfig:
         num_gpus: int = 1,
         # only for torch-backend currently
         extra: bool = False,
+        moe_backend: str | None = None,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-cudagraph",
         extra_runtime: str = "trtllm",
@@ -502,6 +503,7 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Extra flag to enable pytorch_model_config reading for TRT backend
         self.extra = extra
+        self.moe_backend = moe_backend
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
         self.extra_runtime = extra_runtime
@@ -636,6 +638,9 @@ class PerfTestConfig:
         if self.extra:
             entries.append("extra")
 
+        if self.moe_backend is not None:
+            entries.append(f"moe:{self.moe_backend}")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -758,6 +763,10 @@ class PerfTestConfig:
             if self.extra:
                 labels.pop(0)
 
+        self.moe_backend = None
+        if labels and labels[0].startswith("moe:"):
+            self.moe_backend = labels.pop(0).removeprefix("moe:")
+
         assert len(
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
@@ -781,6 +790,11 @@ class PerfTestConfig:
         VALID_RUNTIMES = ["serve", "bench"]
         assert self.runtime in VALID_RUNTIMES, \
             f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
+
+        if self.moe_backend is not None:
+            assert self.moe_backend, "moe backend must not be empty!"
+            assert self.backend == "pytorch", \
+                "moe backend overrides require the pytorch backend!"
 
         # Validate plugin mode.
         VALID_MODES = ["plugin", "ootb", "ootb_except_mha"]
@@ -1023,6 +1037,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def _get_model_yaml_config(self) -> dict:
         config = get_model_yaml_config(self._config.to_string(),
                                        lora_dirs=self.lora_dirs)
+        if self._config.moe_backend is not None:
+            config.setdefault('moe_config',
+                              {})['backend'] = self._config.moe_backend
         uses_pytorch_backend = (self._config.runtime == "serve"
                                 or self._config.backend == "pytorch")
         fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
@@ -1238,6 +1255,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 with open(pytorch_config_path, 'w') as f:
                     yaml.dump(config, f, default_flow_style=False)
                 benchmark_cmd += [f"--config={pytorch_config_path}"]
+                # Throughput initializes the dataset tokenizer before loading YAML.
+                if config.get('custom_tokenizer') is not None:
+                    benchmark_cmd += [
+                        f"--custom_tokenizer={config['custom_tokenizer']}"
+                    ]
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
