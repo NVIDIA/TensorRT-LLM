@@ -27,7 +27,8 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--enable-block-reuse]"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--enable-block-reuse]" \
+         "[--moe-backend BACKEND]"
 }
 
 MODEL=""
