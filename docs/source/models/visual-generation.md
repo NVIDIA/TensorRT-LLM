@@ -14,8 +14,8 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.
 - Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), FlashInfer FP16/BF16 dense prefill (`FLASHINFER`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
-- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100), and FlashInfer block-scaled MXFP8/NVFP4 on `FLASHINFER`.
-- Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
+- Quantized attention support: see [VisualGen Quantized Attention](../features/visualgen-quantized-attention.md).
+- Sparse attention support: see [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
 - CPU offloading to reduce peak GPU memory usage.
@@ -277,71 +277,11 @@ By default, `strict=True` raises when adapter tensors cannot be matched, have un
 
 ### Quantized Attention
 
-In addition to linear-layer quantization, VisualGen supports several **attention-level** quantization recipes, which define the Q/K/V data types and scaling granularity used inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
-
-- **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
-- **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
-
-- **FlashInfer block-scaled attention** (`FLASHINFER` backend): Uses FlashInfer's architecture-specific FMHA. On SM100/SM103 (B200/B300), set `qk_dtype` to `mxfp8` or `nvfp4` with `v_dtype: fp8`. On SM120/SM121 (RTX PRO 6000), only dense Q/K/V NVFP4 self-attention is supported, using `qk_dtype: nvfp4` and `v_dtype: nvfp4`; this path requires a sequence length divisible by 128.
-
-Python API for SageAttention:
-
-```python
-from tensorrt_llm import VisualGenArgs
-
-args = VisualGenArgs(
-    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-    attention_config={
-        "backend": "TRTLLM",
-        "quant_attention_config": {
-            "qk_dtype": "int8",
-            "q_block_size": 1,
-            "k_block_size": 16,
-            "v_block_size": 1,
-        },
-    },
-)
-```
-
-Python API for QK16PV8:
-
-```python
-from tensorrt_llm import VisualGenArgs
-
-args = VisualGenArgs(
-    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-    attention_config={
-        "backend": "CUTEDSL",
-        "quant_attention_config": {
-            "qk_dtype": "bf16",
-            "q_block_size": 0,
-            "k_block_size": 0,
-            "v_block_size": 0,
-        },
-    },
-)
-```
-
-Python API for FlashInfer MXFP8 on B200/B300:
-
-```python
-from tensorrt_llm import VisualGenArgs
-
-args = VisualGenArgs(
-    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-    attention_config={
-        "backend": "FLASHINFER",
-        "quant_attention_config": {
-            "qk_dtype": "mxfp8",
-            "v_dtype": "fp8",
-        },
-    },
-)
-```
+In addition to linear-layer quantization, VisualGen exposes multiple backend-specific **quantized-attention** recipes that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and can be enabled independently with any linear layer configuration.  See [VisualGen Quantized Attention](../features/visualgen-quantized-attention.md) for the full recipe table, the V scale-granularity trade-off, and the block-scaled MXFP8 / NVFP4 recipes.
 
 ### CUDA Graphs
 
-VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See [VisualGen CUDA Graphs](../visual-gen/features/cuda-graph.md) for capture scope, graph keys, and sparse-attention phase behavior.
+VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See [VisualGen CUDA Graphs](../features/visualgen-cuda-graph.md) for capture scope, graph keys, and sparse-attention phase behavior.
 
 ### Step Caching
 

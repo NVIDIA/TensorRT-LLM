@@ -45,6 +45,8 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
+from tensorrt_llm.llmapi.utils import \
+    _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -1314,6 +1316,13 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                # Model/KV-cache/transceiver construction can create threads
+                # after configure_cpu_affinity(). Refresh the existing-thread
+                # snapshot immediately before launching executor threads.
+                # Explicit affinity opt-out must remain a true opt-out.
+                if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None,
+                                                                         "1"):
+                    _reapply_current_thread_affinity_to_all_threads()
                 if self.dist.pp_size > 1:
                     self.executed_batch_queue: Queue[BatchStatePP] = Queue(
                         maxsize=self.num_micro_batches)
@@ -7767,6 +7776,8 @@ class PyExecutor:
         """Start async KV sends for finished context-only disagg requests."""
         if not self.kv_cache_transceiver:
             return
+        bridge_enabled = (getattr(self.kv_cache_transceiver,
+                                  "_fp4_mla_bridge_enabled", False) is True)
         # Do not send more chunks after an in-flight cancellation.
         cancel_pending_ids = set(getattr(self, "canceled_req_ids", ()))
         for req in scheduled_requests:
@@ -7796,6 +7807,19 @@ class PyExecutor:
 
                     # Send the monolithic slice or final pipelined chunk.
                     self.kv_cache_transceiver.respond_and_send_async(req)
+
+                    # Bridge validation can safely reject before creating a
+                    # transfer session. Release the matching async-manager
+                    # claim immediately; there is no physical accessor whose
+                    # retirement must be polled.
+                    bridge_rejected = (
+                        bridge_enabled and getattr(req, "state", None)
+                        == LlmRequestState.DISAGG_TRANS_ERROR and
+                        not self.kv_cache_transceiver.has_inflight_transfer(req)
+                    )
+                    if bridge_rejected:
+                        self._end_transfer_and_maybe_terminate(req)
+                        continue
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()

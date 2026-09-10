@@ -124,7 +124,6 @@ class QSAIndexer(nn.Module):
             dtype=config.torch_dtype,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
-            use_custom_cublas_mm=True,
         )
         self.q_layernorm = RMSNorm(
             hidden_size=params.index_head_dim,

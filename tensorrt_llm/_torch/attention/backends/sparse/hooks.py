@@ -119,9 +119,13 @@ class AttentionSparseHooks:
         relative_attention_bias: Optional["torch.Tensor"],
         relative_attention_max_distance: int,
         has_lora: bool,
+        output_gate: Optional["torch.Tensor"],
         **kwargs: object,
     ) -> Optional["torch.Tensor | tuple[torch.Tensor, torch.Tensor]"]:
-        """Return an algorithm-specific forward result, or ``None`` for the default."""
+        """Return an algorithm-specific forward result, or ``None`` for the default.
+
+        A hook that returns a result owns ``output_gate`` and must apply it.
+        """
         return None
 
     def project_output(
