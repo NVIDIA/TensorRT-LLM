@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -123,14 +124,16 @@ def test_validate_models_rejects_same_model_same_yaml_extra_different_config_id(
 
 
 @pytest.mark.parametrize("name", [" model", "model "])
-def test_validate_models_rejects_padded_name(mod, name):
+def test_validate_models_rejects_padded_name(mod: ModuleType, name: str) -> None:
+    """Reject padding on either boundary of a model name."""
     errors = mod.validate_models([{"name": name, "yaml_extra": ["config.yaml"]}])
 
     assert "models[1]: 'name' must not have leading or trailing whitespace." in errors
 
 
 @pytest.mark.parametrize("config_id", [" default", "default "])
-def test_validate_models_rejects_padded_config_id(mod, config_id):
+def test_validate_models_rejects_padded_config_id(mod: ModuleType, config_id: str) -> None:
+    """Reject padding on either boundary of a configuration identifier."""
     errors = mod.validate_models(
         [{"name": "model", "yaml_extra": ["config.yaml"], "config_id": config_id}]
     )
@@ -138,7 +141,8 @@ def test_validate_models_rejects_padded_config_id(mod, config_id):
     assert "models[1]: 'config_id' must not have leading or trailing whitespace." in errors
 
 
-def test_invalid_padded_name_is_excluded_from_duplicate_tracking(mod):
+def test_invalid_padded_name_is_excluded_from_duplicate_tracking(mod: ModuleType) -> None:
+    """Do not register invalid model names in either duplicate index."""
     errors = mod.validate_models(
         [
             {"name": "model ", "yaml_extra": ["config.yaml"]},
@@ -152,7 +156,8 @@ def test_invalid_padded_name_is_excluded_from_duplicate_tracking(mod):
     assert not any("identical yaml_extra" in error for error in errors)
 
 
-def test_invalid_padded_config_id_is_excluded_from_duplicate_tracking(mod):
+def test_invalid_padded_config_id_is_excluded_from_duplicate_tracking(mod: ModuleType) -> None:
+    """Do not register invalid configuration identifiers in either duplicate index."""
     errors = mod.validate_models(
         [
             {
@@ -176,3 +181,35 @@ def test_invalid_padded_config_id_is_excluded_from_duplicate_tracking(mod):
     ) == 1
     assert not any("Duplicate model/config pair" in error for error in errors)
     assert not any("identical yaml_extra" in error for error in errors)
+
+
+@pytest.mark.parametrize("path", [" config.yaml", "config.yaml ", "\tconfig.yaml", "config.yaml\n"])
+def test_validate_models_rejects_padded_yaml_extra(mod: ModuleType, path: str) -> None:
+    """Reject padded configuration paths instead of accepting unresolvable names."""
+    errors = mod.validate_models([{"name": "model", "yaml_extra": [path]}])
+
+    assert errors == [
+        "models[1]: 'yaml_extra' must be a list of non-empty strings "
+        "without leading or trailing whitespace."
+    ]
+
+
+@pytest.mark.parametrize("path", [" config.yaml", "config.yaml "])
+def test_padded_yaml_extra_is_excluded_from_duplicate_tracking(mod: ModuleType, path: str) -> None:
+    """Keep rejected paths out of the identical-configuration index."""
+    errors = mod.validate_models(
+        [
+            {"name": "model", "config_id": config_id, "yaml_extra": [path]}
+            for config_id in ("a", "b")
+        ]
+    )
+
+    assert len(errors) == 2
+    assert all("without leading or trailing whitespace" in error for error in errors)
+    assert not any("identical yaml_extra" in error for error in errors)
+
+
+@pytest.mark.parametrize("paths", [[], ["config.yaml"], ["directory name/config.yaml"]])
+def test_validate_models_preserves_valid_yaml_extra(mod: ModuleType, paths: list[str]) -> None:
+    """Preserve empty lists and paths containing interior spaces."""
+    assert mod.validate_models([{"name": "model", "yaml_extra": paths}]) == []

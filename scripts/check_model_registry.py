@@ -103,10 +103,14 @@ def validate_models(models: typing.Any) -> list[str]:
                 )
 
         yaml_extra = model_entry.get("yaml_extra")
-        if not isinstance(yaml_extra, list) or not all(
-            isinstance(item, str) and item.strip() for item in yaml_extra
-        ):
-            errors.append(f"{entry_label}: 'yaml_extra' must be a list of non-empty strings.")
+        yaml_extra_ok = isinstance(yaml_extra, list) and all(
+            isinstance(item, str) and bool(item) and item == item.strip() for item in yaml_extra
+        )
+        if not yaml_extra_ok:
+            errors.append(
+                f"{entry_label}: 'yaml_extra' must be a list of non-empty strings "
+                "without leading or trailing whitespace."
+            )
 
         config_id = model_entry.get("config_id", DEFAULT_CONFIG_ID)
         config_id_ok = (
@@ -128,9 +132,7 @@ def validate_models(models: typing.Any) -> list[str]:
             continue
 
         seen_model_configs[(name, config_id)].append(index)
-        if isinstance(yaml_extra, list) and all(
-            isinstance(item, str) and item.strip() for item in yaml_extra
-        ):
+        if yaml_extra_ok:
             yaml_signature = tuple(yaml_extra)
             seen_model_yaml_configs[(name, yaml_signature)].append((index, config_id))
 
