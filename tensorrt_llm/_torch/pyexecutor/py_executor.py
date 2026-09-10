@@ -625,6 +625,8 @@ class PyExecutor:
             ResourceManagerType.KV_CACHE_MANAGER)
         self.draft_kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        self.kv_cache_manager_pair = getattr(self.resource_manager,
+                                             "kv_cache_manager_pair", None)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
         self.enable_joint_kv_cache_reuse = (
@@ -3517,12 +3519,9 @@ class PyExecutor:
 
     def _revert_ctx_alloc(self, dropped_context_requests):
         """Revert V2 context KV growth for requests deferred after scheduling."""
+        assert self.kv_cache_manager_pair is not None
         for req in dropped_context_requests:
-            if not self.kv_cache_manager.revert_allocate_context(req):
-                # The cache was dropped and the shared cursor rewound, so drop
-                # the paired draft pool too or it describes abandoned progress.
-                if self.enable_joint_kv_cache_reuse:
-                    self.draft_kv_cache_manager.free_resources(req)
+            self.kv_cache_manager_pair.revert_allocate_context(req)
 
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
