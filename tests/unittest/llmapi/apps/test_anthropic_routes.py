@@ -286,9 +286,10 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False
-    # register_routes() reads this to decide whether to mount the RL
+    # register_routes() reads these to decide whether to mount the optional
     # control endpoints. Building the server with object.__new__ skips
     # __init__, so anything register_routes() touches has to be supplied.
+    standard._enable_runtime_control_endpoints = False
     standard._enable_rl_control_endpoints = False
     standard.register_routes()
 
@@ -373,9 +374,10 @@ def test_batch_routes_are_registered_on_the_standard_server():
         args=SimpleNamespace(return_perf_metrics=False),
     )
     standard.use_harmony = False
-    # register_routes() reads this to decide whether to mount the RL
+    # register_routes() reads these to decide whether to mount the optional
     # control endpoints. Building the server with object.__new__ skips
     # __init__, so anything register_routes() touches has to be supplied.
+    standard._enable_runtime_control_endpoints = False
     standard._enable_rl_control_endpoints = False
     standard.register_routes()
 
