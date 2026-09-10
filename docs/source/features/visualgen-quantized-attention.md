@@ -96,7 +96,7 @@ attention_config:
     v_block_size: 0
 ```
 
-## SageAttention (TRTLLM)
+## SageAttention in the `TRTLLM` backend
 
 **What it does.** SageAttention quantizes all three tensors with fine-grained scales, so both BMM1 and BMM2 run in low precision:
 
