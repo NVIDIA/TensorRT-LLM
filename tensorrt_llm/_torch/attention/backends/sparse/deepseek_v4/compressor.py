@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -108,6 +109,11 @@ class Compressor(nn.Module):
         self.rotate_activation = rotate_activation
         # The C++ scatter does not write FlashInfer's footer-scale layout.
         self.footer_scale_cache = False
+        self.incremental_hca = (
+            compress_ratio == 128
+            and not is_indexer
+            and os.environ.get("TRTLLM_HCA_INCREMENTAL_SUMMARY", "0") == "1"
+        )
 
         # Modules
         self.wkv_gate = Linear(
@@ -225,7 +231,15 @@ class Compressor(nn.Module):
             next_n = metadata.num_gen_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.
-            torch.ops.trtllm.compressor_paged_kv_compress(
+            use_incremental_hca = (
+                self.incremental_hca and metadata.kv_cache_manager.incremental_hca_enabled
+            )
+            compressor_op = (
+                torch.ops.trtllm.compressor_paged_kv_compress_incremental
+                if use_incremental_hca
+                else torch.ops.trtllm.compressor_paged_kv_compress
+            )
+            compressor_args = (
                 kv_score,
                 self.ape,
                 paged_kv_state,
@@ -242,6 +256,11 @@ class Compressor(nn.Module):
                 self.compress_ratio,
                 next_n,
             )
+            if use_incremental_hca:
+                compressor_args += (
+                    metadata.hca_summary_valid_cuda[num_contexts : num_contexts + num_generations],
+                )
+            compressor_op(*compressor_args)
 
         # Scatter to cache with appropriate quantization (all modes fused)
         start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
@@ -402,6 +403,53 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 DeepseekV4AttentionType.COMPRESS.role,
                 PageIndexMode.SHARED,
             )
+
+        self.incremental_hca_enabled = (
+            128 in pp_compress_ratios
+            and self._max_draft_len <= 4
+            # Incremental decode overwrites raw token state with prefix
+            # summaries, so those pages cannot be shared with a new request.
+            and not kv_cache_config.enable_block_reuse
+            and os.environ.get("TRTLLM_HCA_INCREMENTAL_SUMMARY", "0") == "1"
+        )
+        # False means the per-layer paged state still contains raw values;
+        # true means decode prefix summaries have been established.
+        self._hca_summary_valid = (
+            torch.zeros(
+                self.host_kv_cache_block_offsets.shape[1],
+                dtype=torch.bool,
+                pin_memory=prefer_pinned(),
+                device="cpu",
+            )
+            if self.incremental_hca_enabled
+            else None
+        )
+
+    def _create_kv_cache(
+        self,
+        request_id: int,
+        lora_task_id: int | None,
+        input_tokens,
+        *,
+        cache_salt: str | None = None,
+        is_dummy: bool = False,
+        enable_request_stats: bool = False,
+        expected_prompt_length: int | None = None,
+    ):
+        kv_cache = super()._create_kv_cache(
+            request_id,
+            lora_task_id,
+            input_tokens,
+            cache_salt=cache_salt,
+            is_dummy=is_dummy,
+            enable_request_stats=enable_request_stats,
+            expected_prompt_length=expected_prompt_length,
+        )
+        if kv_cache is not None and self.incremental_hca_enabled:
+            index = self.index_mapper.get_index(request_id)
+            begin = index * self.max_beam_width
+            self._hca_summary_valid[begin : begin + self.max_beam_width] = False
+        return kv_cache
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         layer_semantics = self._manager_layer_id_to_layer_attn.get((layer_id, role))
@@ -1266,11 +1314,26 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         self,
         request_ids: List[int],
         num_contexts: int,
+        hca_summary_valid: Optional[torch.Tensor] = None,
     ) -> None:
         """Compute all per-layer sliding-window block tables for this batch."""
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, 1)
         num_tables = copy_idx.size(0)
         self._num_tables = num_tables
+
+        if hca_summary_valid is not None:
+            assert self.incremental_hca_enabled
+            assert self._hca_summary_valid is not None
+            self._hca_summary_valid[copy_idx[:num_contexts]] = False
+            torch.index_select(
+                self._hca_summary_valid,
+                0,
+                copy_idx,
+                out=hca_summary_valid[:num_tables],
+            )
+            # Advance only after gathering so every HCA layer observes the
+            # same validity mask during this iteration.
+            self._hca_summary_valid[copy_idx[num_contexts:]] = True
 
         scratch_descs_by_pool = None
         if self.enable_swa_scratch_reuse and num_contexts > 0:

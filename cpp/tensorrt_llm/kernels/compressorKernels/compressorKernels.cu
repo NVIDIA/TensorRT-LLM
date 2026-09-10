@@ -290,6 +290,220 @@ __device__ __forceinline__ void decodeSoftmaxVec(void const* __restrict__ paged_
     }
 }
 
+// Merge one token into a prefix represented by (logsumexp, normalized weighted value).
+// This two-vector representation fits the existing paged score/KV state pools and is
+// associative. Saving decode prefixes makes rewinding rejected draft tokens equivalent
+// to loading the prefix at the restored sequence position.
+__device__ __forceinline__ void mergeLseValue(
+    float oldLse, float oldValue, float score, float kv, float& newLse, float& newValue)
+{
+    float const delta = oldLse - score;
+    float const expNegAbsDelta = expf(-fabsf(delta));
+    float const invDenom = 1.0F / (1.0F + expNegAbsDelta);
+    float const oldWeight = delta >= 0.0F ? invDenom : expNegAbsDelta * invDenom;
+    newLse = fmaxf(oldLse, score) + log1pf(expNegAbsDelta);
+    newValue = fmaf(oldWeight, oldValue - kv, kv);
+}
+
+// Lazy incremental HCA decode path. Prefill keeps the original raw state layout.
+// On the first decode step for a sequence, the current incomplete CR=128 window is
+// converted once (at most 127 raw tokens). Subsequent steps load the prefix saved at
+// startPos-1 and process only the new tokens.
+template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int NEXT_N>
+__global__ void incrementalHcaDecodeKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
+    void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
+    int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
+    int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp,
+    bool const* __restrict__ summary_valid, int page_size, int max_blocks, int out_elem_bytes)
+{
+    using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    constexpr int ELEM_BYTES_FOR_VEC
+        = (KV_SCORE_ELEM_BYTES > STATE_ELEM_BYTES) ? KV_SCORE_ELEM_BYTES : STATE_ELEM_BYTES;
+    constexpr int MAX_VEC = 16 / ELEM_BYTES_FOR_VEC;
+    constexpr int VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
+    constexpr int NTHRD_BASE = HEAD_DIM / VEC;
+    constexpr int HEAD_BLOCKS = (NTHRD_BASE > 32) ? (NTHRD_BASE / 32) : 1;
+    constexpr int NTHRD_INNER = NTHRD_BASE / HEAD_BLOCKS;
+    constexpr int COMPRESS_RATIO = 128;
+    using KvScoreVecT = typename VecType<VEC * KV_SCORE_ELEM_BYTES>::type;
+    using StateVecT = typename VecType<VEC * STATE_ELEM_BYTES>::type;
+
+    int const tid = threadIdx.x;
+    int const batchIdx = blockIdx.x;
+    int const headBlock = blockIdx.y;
+    int const effectiveTid = headBlock * NTHRD_INNER + tid;
+    int const kvLen = kv_lens[batchIdx];
+    int const startPos = kvLen - NEXT_N;
+    int const inputOffset = cu_seq_lens[batchIdx];
+    int const outputOffset = cu_kv_comp[batchIdx];
+    int64_t const pageStride = static_cast<int64_t>(page_size) * HEAD_DIM;
+
+    auto const* kvScore = reinterpret_cast<KvScoreElemT const*>(kv_score_raw);
+    auto* pagedKv = reinterpret_cast<StateElemT*>(paged_kv_raw);
+    auto* pagedScore = reinterpret_cast<StateElemT*>(paged_score_raw);
+
+    float values[VEC];
+    float lse[VEC];
+    int const startChunkOffset = startPos % COMPRESS_RATIO;
+    if (startChunkOffset != 0)
+    {
+        if (summary_valid[batchIdx])
+        {
+            int const prevTokenIdx = startPos - 1;
+            int const prevLogicalBlock = prevTokenIdx / page_size;
+            int const prevBlockOffset = prevTokenIdx % page_size;
+            int const prevPhysicalKv = block_table_kv[batchIdx * max_blocks + prevLogicalBlock];
+            int const prevPhysicalScore = block_table_score[batchIdx * max_blocks + prevLogicalBlock];
+            int64_t const prevKvBase = static_cast<int64_t>(prevPhysicalKv) * pageStride + prevBlockOffset * HEAD_DIM;
+            int64_t const prevScoreBase
+                = static_cast<int64_t>(prevPhysicalScore) * pageStride + prevBlockOffset * HEAD_DIM;
+            StateVecT const prevValueRaw = reinterpret_cast<StateVecT const*>(&pagedKv[prevKvBase])[effectiveTid];
+            StateVecT const prevLseRaw = reinterpret_cast<StateVecT const*>(&pagedScore[prevScoreBase])[effectiveTid];
+            auto const* prevValues = reinterpret_cast<StateElemT const*>(&prevValueRaw);
+            auto const* prevLse = reinterpret_cast<StateElemT const*>(&prevLseRaw);
+
+#pragma unroll
+            for (int i = 0; i < VEC; ++i)
+            {
+                values[i] = static_cast<float>(prevValues[i]);
+                lse[i] = static_cast<float>(prevLse[i]);
+            }
+        }
+        else
+        {
+            int const chunkStart = startPos - startChunkOffset;
+            float rmax[VEC], rsum[VEC], rwsum[VEC];
+#pragma unroll
+            for (int i = 0; i < VEC; ++i)
+            {
+                rmax[i] = -INFINITY;
+                rsum[i] = 0.0F;
+                rwsum[i] = 0.0F;
+            }
+            for (int tokenIdx = chunkStart; tokenIdx < startPos; ++tokenIdx)
+            {
+                int const logicalBlock = tokenIdx / page_size;
+                int const blockOffset = tokenIdx % page_size;
+                int const physicalKv = block_table_kv[batchIdx * max_blocks + logicalBlock];
+                int const physicalScore = block_table_score[batchIdx * max_blocks + logicalBlock];
+                decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, pageStride, HEAD_DIM,
+                    physicalKv, physicalScore, blockOffset, 0, effectiveTid, rmax, rsum, rwsum);
+            }
+#pragma unroll
+            for (int i = 0; i < VEC; ++i)
+            {
+                values[i] = rwsum[i] / rsum[i];
+                lse[i] = rmax[i] + logf(rsum[i]);
+            }
+
+            // Materialize the conversion endpoint as well. Besides making
+            // the next normal step O(NEXT_N), this preserves correctness if
+            // speculative decoding rewinds all tokens from this launch.
+            StateVecT valueOut;
+            StateVecT lseOut;
+            auto* valueOutElems = reinterpret_cast<StateElemT*>(&valueOut);
+            auto* lseOutElems = reinterpret_cast<StateElemT*>(&lseOut);
+#pragma unroll
+            for (int i = 0; i < VEC; ++i)
+            {
+                valueOutElems[i] = static_cast<StateElemT>(values[i]);
+                lseOutElems[i] = static_cast<StateElemT>(lse[i]);
+            }
+            int const prevTokenIdx = startPos - 1;
+            int const prevLogicalBlock = prevTokenIdx / page_size;
+            int const prevBlockOffset = prevTokenIdx % page_size;
+            int const prevPhysicalKv = block_table_kv[batchIdx * max_blocks + prevLogicalBlock];
+            int const prevPhysicalScore = block_table_score[batchIdx * max_blocks + prevLogicalBlock];
+            int64_t const prevKvBase = static_cast<int64_t>(prevPhysicalKv) * pageStride + prevBlockOffset * HEAD_DIM;
+            int64_t const prevScoreBase
+                = static_cast<int64_t>(prevPhysicalScore) * pageStride + prevBlockOffset * HEAD_DIM;
+            reinterpret_cast<StateVecT*>(&pagedKv[prevKvBase])[effectiveTid] = valueOut;
+            reinterpret_cast<StateVecT*>(&pagedScore[prevScoreBase])[effectiveTid] = lseOut;
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < NEXT_N; ++t)
+    {
+        int const tokenIdx = startPos + t;
+        int const chunkOffset = tokenIdx % COMPRESS_RATIO;
+        int64_t const inputBase = static_cast<int64_t>(inputOffset + t) * 2 * HEAD_DIM;
+
+        KvScoreVecT const kvRaw = reinterpret_cast<KvScoreVecT const*>(&kvScore[inputBase])[effectiveTid];
+        KvScoreVecT const scoreRaw = reinterpret_cast<KvScoreVecT const*>(&kvScore[inputBase + HEAD_DIM])[effectiveTid];
+        auto const* kvElems = reinterpret_cast<KvScoreElemT const*>(&kvRaw);
+        auto const* scoreElems = reinterpret_cast<KvScoreElemT const*>(&scoreRaw);
+
+        if (chunkOffset == 0)
+        {
+#pragma unroll
+            for (int i = 0; i < VEC; ++i)
+            {
+                values[i] = static_cast<float>(kvElems[i]);
+                lse[i] = static_cast<float>(scoreElems[i]) + ape[chunkOffset * HEAD_DIM + effectiveTid * VEC + i];
+            }
+        }
+        else
+        {
+#pragma unroll
+            for (int i = 0; i < VEC; ++i)
+            {
+                float const score
+                    = static_cast<float>(scoreElems[i]) + ape[chunkOffset * HEAD_DIM + effectiveTid * VEC + i];
+                mergeLseValue(lse[i], values[i], score, static_cast<float>(kvElems[i]), lse[i], values[i]);
+            }
+        }
+
+        StateVecT valueOut;
+        StateVecT lseOut;
+        auto* valueOutElems = reinterpret_cast<StateElemT*>(&valueOut);
+        auto* lseOutElems = reinterpret_cast<StateElemT*>(&lseOut);
+#pragma unroll
+        for (int i = 0; i < VEC; ++i)
+        {
+            valueOutElems[i] = static_cast<StateElemT>(values[i]);
+            lseOutElems[i] = static_cast<StateElemT>(lse[i]);
+        }
+
+        int const logicalBlock = tokenIdx / page_size;
+        int const blockOffset = tokenIdx % page_size;
+        int const physicalKv = block_table_kv[batchIdx * max_blocks + logicalBlock];
+        int const physicalScore = block_table_score[batchIdx * max_blocks + logicalBlock];
+        int64_t const kvBase = static_cast<int64_t>(physicalKv) * pageStride + blockOffset * HEAD_DIM;
+        int64_t const scoreBase = static_cast<int64_t>(physicalScore) * pageStride + blockOffset * HEAD_DIM;
+        reinterpret_cast<StateVecT*>(&pagedKv[kvBase])[effectiveTid] = valueOut;
+        reinterpret_cast<StateVecT*>(&pagedScore[scoreBase])[effectiveTid] = lseOut;
+
+        if (chunkOffset == COMPRESS_RATIO - 1)
+        {
+            int const outputIdx = (tokenIdx + 1) / COMPRESS_RATIO - startPos / COMPRESS_RATIO - 1;
+            int64_t const outputBase = static_cast<int64_t>(outputOffset + outputIdx) * HEAD_DIM + effectiveTid * VEC;
+            if (out_elem_bytes == 2)
+            {
+                __nv_bfloat16 packed[VEC];
+#pragma unroll
+                for (int i = 0; i < VEC; ++i)
+                {
+                    packed[i] = __float2bfloat16_rn(values[i]);
+                }
+                using OutVecT = typename VecType<VEC * 2>::type;
+                *reinterpret_cast<OutVecT*>(&reinterpret_cast<__nv_bfloat16*>(output_raw)[outputBase])
+                    = *reinterpret_cast<OutVecT const*>(packed);
+            }
+            else
+            {
+#pragma unroll
+                for (int i = 0; i < VEC; i += 4)
+                {
+                    *reinterpret_cast<float4*>(&reinterpret_cast<float*>(output_raw)[outputBase + i])
+                        = *reinterpret_cast<float4 const*>(&values[i]);
+                }
+            }
+        }
+    }
+}
+
 template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int COMPRESS_RATIO, int NUM_RED_WARPS = 1>
 __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
@@ -681,6 +895,23 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 FOREACH_DECODE_CONFIG(INST_DECODE)
 #undef INST_DECODE
 
+#define INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, NN)                                                                     \
+    template __global__ void incrementalHcaDecodeKernel<HD, KV_EB, 4, NN>(void const*, float const*, void*, void*,     \
+        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, bool const*, int, int,  \
+        int);
+
+#define INST_INCREMENTAL_HCA_DECODE_NN(HD, KV_EB)                                                                      \
+    INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 1)                                                                          \
+    INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 2)                                                                          \
+    INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 3) INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 4)
+
+INST_INCREMENTAL_HCA_DECODE_NN(128, 2)
+INST_INCREMENTAL_HCA_DECODE_NN(128, 4)
+INST_INCREMENTAL_HCA_DECODE_NN(512, 2)
+INST_INCREMENTAL_HCA_DECODE_NN(512, 4)
+#undef INST_INCREMENTAL_HCA_DECODE_NN
+#undef INST_INCREMENTAL_HCA_DECODE
+
 // ============================================================================
 // Decode Launch Wrapper
 //
@@ -761,6 +992,50 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
     TLLM_THROW("pagedKvCompressLaunch: no matching instantiation for HD=%d, kv_eb=%d, state_eb=%d, CR=%d, NRW=%d",
         head_dim, kv_score_elem_bytes, state_elem_bytes, compress_ratio, num_red_warps);
+}
+
+void incrementalHcaCompressLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
+    int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
+    int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, bool const* summary_valid, int batch_size, int page_size,
+    int max_blocks, int head_dim, int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
+    cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(state_elem_bytes == 4, "Incremental HCA compression requires FP32 compressor state");
+    TLLM_CHECK_WITH_INFO(
+        kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4, "Incremental HCA compression requires BF16/FP32 input");
+    TLLM_CHECK_WITH_INFO(next_n >= 1 && next_n <= 4, "Incremental HCA compression requires next_n in [1, 4]");
+
+    constexpr int kStateElemBytes = 4;
+    constexpr int kMaxVec = 16 / kStateElemBytes;
+    int const vec = (head_dim / kMaxVec >= 32) ? kMaxVec : (head_dim / 32);
+    int const threadsBase = head_dim / vec;
+    int const headBlocks = (threadsBase > 32) ? (threadsBase / 32) : 1;
+    int const threads = threadsBase / headBlocks;
+    dim3 const grid(batch_size, headBlocks);
+
+#define TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, NN)                                                                      \
+    if (head_dim == HD && kv_score_elem_bytes == KV_EB && next_n == NN)                                                \
+    {                                                                                                                  \
+        incrementalHcaDecodeKernel<HD, KV_EB, kStateElemBytes, NN><<<grid, threads, 0, stream>>>(kv_score, ape,        \
+            paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,        \
+            summary_valid, page_size, max_blocks, out_elem_bytes);                                                     \
+        return;                                                                                                        \
+    }
+
+#define TRY_LAUNCH_INCREMENTAL_HCA_NN(HD, KV_EB)                                                                       \
+    TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 1)                                                                           \
+    TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 2)                                                                           \
+    TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 3) TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 4)
+
+    TRY_LAUNCH_INCREMENTAL_HCA_NN(128, 2)
+    TRY_LAUNCH_INCREMENTAL_HCA_NN(128, 4)
+    TRY_LAUNCH_INCREMENTAL_HCA_NN(512, 2)
+    TRY_LAUNCH_INCREMENTAL_HCA_NN(512, 4)
+#undef TRY_LAUNCH_INCREMENTAL_HCA_NN
+#undef TRY_LAUNCH_INCREMENTAL_HCA
+
+    TLLM_THROW("Incremental HCA decode: no matching instantiation for HD=%d, kv_eb=%d, next_n=%d", head_dim,
+        kv_score_elem_bytes, next_n);
 }
 
 #undef FOREACH_DECODE_CONFIG

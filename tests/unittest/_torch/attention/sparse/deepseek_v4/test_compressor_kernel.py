@@ -102,6 +102,7 @@ def decode_kernel(
     head_dim: int = None,
     page_size: int = 32,
     next_n: int = 1,
+    incremental_hca_valid: torch.Tensor | None = None,
 ):
     """CUDA decode kernel wrapper with head_dim skip guard."""
     if head_dim not in _CUDA_SUPPORTED_HEAD_DIMS:
@@ -111,7 +112,12 @@ def decode_kernel(
     if block_table_score is None:
         block_table_score = block_table_kv
 
-    torch.ops.trtllm.compressor_paged_kv_compress(
+    compressor_op = (
+        torch.ops.trtllm.compressor_paged_kv_compress_incremental
+        if incremental_hca_valid is not None
+        else torch.ops.trtllm.compressor_paged_kv_compress
+    )
+    compressor_args = (
         kv_score,
         ape,
         paged_kv,
@@ -128,6 +134,9 @@ def decode_kernel(
         compress_ratio,
         next_n,
     )
+    if incremental_hca_valid is not None:
+        compressor_args += (incremental_hca_valid,)
+    compressor_op(*compressor_args)
 
 
 # ============================================================================
@@ -1840,6 +1849,109 @@ def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_po
             f"batch={b} sp={start_pos_val} seqlen={new_seqlen} "
             f"max_diff={(ref_out_b - kernel_out_b).abs().max():.6f}"
         )
+
+
+@pytest.mark.parametrize("head_dim", [128, 512])
+@pytest.mark.parametrize("page_size", [128, 256])
+def test_lazy_incremental_hca_decode_and_rewind(head_dim, page_size):
+    """The first decode lazily converts raw prefill state and survives a rewind."""
+    torch.manual_seed(1234)
+    compress_ratio = 128
+    prefill_len = 252
+    next_n = 4
+
+    prefill_kv = torch.randn(prefill_len, head_dim, device="cuda").bfloat16()
+    prefill_score = torch.randn(prefill_len, head_dim, device="cuda").bfloat16()
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    paged_kv, paged_score, block_table, _, _ = create_paged_cache(
+        1, prefill_len + next_n, compress_ratio, head_dim, False, page_size
+    )
+
+    kv_lens = torch.tensor([prefill_len], device="cuda", dtype=torch.int32)
+    start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
+    cu_seq_lens, cu_outputs = prepare_prefill_metadata(kv_lens, start_pos, compress_ratio, head_dim)
+    prefill_output = prepare_compress_output(
+        cu_outputs, 1, head_dim, kv_lens.device, torch.bfloat16
+    )
+    prefill_kernel(
+        fuse_kv_score(prefill_kv, prefill_score),
+        ape,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_outputs,
+        prefill_output,
+        paged_kv,
+        paged_score,
+        block_table,
+        1,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+    )
+
+    first_logits = prefill_score[:compress_ratio].float() + ape
+    first_expected = (prefill_kv[:compress_ratio].float() * first_logits.softmax(dim=0)).sum(dim=0)
+    assert torch.allclose(prefill_output[0], first_expected.bfloat16(), rtol=2e-3, atol=5e-3)
+
+    # Lazy mode leaves prefill state in the original raw representation.
+    tail_pos = prefill_len - 1
+    tail_physical_block = block_table[0, tail_pos // page_size].item()
+    tail_block_offset = tail_pos % page_size
+    assert torch.allclose(
+        paged_kv[tail_physical_block, tail_block_offset],
+        prefill_kv[-1].float(),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.allclose(
+        paged_score[tail_physical_block, tail_block_offset],
+        prefill_score[-1].float() + ape[(prefill_len - 1) % compress_ratio],
+        rtol=0,
+        atol=0,
+    )
+
+    decode_cu_seq_lens, decode_cu_outputs = prepare_decode_metadata(
+        1, compress_ratio, head_dim, kv_lens.device, next_n
+    )
+    decode_kv_lens = torch.tensor([prefill_len + next_n], device="cuda", dtype=torch.int32)
+    stale_start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
+    summary_valid = torch.zeros(1, device="cuda", dtype=torch.bool)
+
+    # Execute twice from the same committed prefix. The second call represents
+    # rejected draft tokens being replaced at the same logical positions.
+    for _ in range(2):
+        decode_kv = torch.randn(next_n, head_dim, device="cuda").bfloat16()
+        decode_score = torch.randn(next_n, head_dim, device="cuda").bfloat16()
+        decode_output = prepare_compress_output(
+            decode_cu_outputs, 1, head_dim, kv_lens.device, torch.bfloat16
+        )
+        decode_kernel(
+            fuse_kv_score(decode_kv, decode_score),
+            ape,
+            decode_kv_lens,
+            stale_start_pos,
+            decode_cu_seq_lens,
+            decode_cu_outputs,
+            decode_output,
+            paged_kv,
+            paged_score,
+            block_table,
+            block_table,
+            compress_ratio,
+            head_dim,
+            page_size,
+            next_n,
+            incremental_hca_valid=summary_valid,
+        )
+
+        second_kv = torch.cat([prefill_kv[compress_ratio:], decode_kv], dim=0).float()
+        second_score = torch.cat([prefill_score[compress_ratio:], decode_score], dim=0).float()
+        second_logits = second_score + ape
+        second_expected = (second_kv * second_logits.softmax(dim=0)).sum(dim=0)
+        assert torch.allclose(decode_output[0], second_expected.bfloat16(), rtol=2e-3, atol=5e-3)
+        summary_valid.fill_(True)
 
 
 # ============================================================================
