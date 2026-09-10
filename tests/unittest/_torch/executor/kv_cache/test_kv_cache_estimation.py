@@ -654,7 +654,8 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
     assert scratch_size_per_token == expected
 
 
-def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
+@pytest.mark.parametrize("for_budget_split", [False, True])
+def test_v2_dflash_draft_cost_covers_context_and_generation_slots(for_budget_split):
     class FakeDraftModelConfig:
         quant_config = None
         pretrained_config = SimpleNamespace(
@@ -688,6 +689,7 @@ def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
             kv_cache_config=KvCacheConfig(max_attention_window=[512]),
             spec_config=spec_config,
             is_draft=True,
+            for_budget_split=for_budget_split,
         )
     )
 

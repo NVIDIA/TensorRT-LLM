@@ -777,13 +777,18 @@ class KvCacheCreator:
                              pretrained_config.num_hidden_layers)
         return [False] * target_num_layers + [True] * num_draft_layers
 
-    def _get_kv_size_per_token(self,
-                               kv_cache_config: Optional[KvCacheConfig] = None
-                               ) -> CacheCost:
+    def _get_kv_size_per_token(
+        self,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        *,
+        for_budget_split: bool = False,
+    ) -> CacheCost:
         """Aggregate KV cost across target + (optional) draft as a CacheCost.
 
         ``max_batch_size`` and ``kv_cache_config`` are passed unconditionally;
         managers that don't need them ignore via ``**kwargs``.
+        ``for_budget_split`` requests attention byte weights instead of
+        ordinary SWA window-saturation costs, preserving mandatory fixed costs.
         """
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -794,6 +799,7 @@ class KvCacheCreator:
             self._kv_cache_manager_cls,
             model_config,
             kv_cache_config,
+            for_budget_split=for_budget_split,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
@@ -801,9 +807,11 @@ class KvCacheCreator:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
-            total += self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                  draft_model_config,
-                                                  kv_cache_config)
+            total += self._per_manager_cache_cost(
+                draft_kv_cache_manager_cls,
+                draft_model_config,
+                kv_cache_config,
+                for_budget_split=for_budget_split)
         elif use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -826,6 +834,7 @@ class KvCacheCreator:
                     draft_kv_cache_manager_cls,
                     effective_draft_config,
                     draft_kv_cache_config,
+                    for_budget_split=for_budget_split,
                     is_draft=True)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
@@ -834,6 +843,7 @@ class KvCacheCreator:
                     effective_draft_config,
                     draft_kv_cache_config,
                     num_layers=self._get_num_draft_layers(),
+                    for_budget_split=for_budget_split,
                     is_draft=True)
         return total
 
@@ -1687,16 +1697,18 @@ class KvCacheCreator:
         self,
         kv_cache_config: Optional[KvCacheConfig] = None,
     ) -> Optional[tuple[CacheCost, CacheCost]]:
-        """Per-manager KV cache costs for target and draft layers."""
+        """Per-manager costs for budget splitting, including attention weights."""
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
-        total_kv = self._get_kv_size_per_token(target_kv_cache_config)
+        total_kv = self._get_kv_size_per_token(target_kv_cache_config,
+                                               for_budget_split=True)
         use_separate_draft_kv_cache = (
             self._should_create_separate_draft_kv_cache())
         target_kv = self._per_manager_cache_cost(
             self._kv_cache_manager_cls,
             self._model_engine.model.model_config,
             target_kv_cache_config,
+            for_budget_split=True,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
                              intercept=total_kv.intercept - target_kv.intercept)

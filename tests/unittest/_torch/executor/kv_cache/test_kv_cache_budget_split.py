@@ -83,6 +83,64 @@ def _make_creator(
 
 
 class TestSplitGpuBudgetForDraft:
+    @pytest.mark.parametrize("budget_attr", ["max_gpu_total_bytes", "host_cache_size"])
+    @pytest.mark.parametrize("long_window", [32768, 160947], ids=["vswa", "sliding_full"])
+    def test_swa_target_uses_attention_weights(self, budget_attr, long_window) -> None:
+        """Saturated SWA capacity must not reject or duplicate the shared budget."""
+        total_budget = 10 * GB
+        c = _make_creator(max_gpu_total_bytes=total_budget, host_cache_size=total_budget)
+        del c._get_kv_size_per_token  # Exercise the real aggregate estimator.
+        c._kv_cache_config.enable_block_reuse = False
+        c._kv_cache_config.max_attention_window = [128, long_window]
+        c._kv_cache_manager_cls = KVCacheManagerV2
+        c._max_seq_len = 160947
+        c._max_batch_size = 2048
+        c._max_num_tokens = 8192
+        c._mapping = Mock(enable_attention_dp=False, tp_size=2)
+        c._mapping.pp_layers.return_value = list(range(24))
+        c._mapping.is_last_pp_rank.return_value = True
+        c._speculative_config = SimpleNamespace(
+            spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+        )
+        target_model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            quant_config=None,
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=24,
+                hidden_size=2880,
+                num_attention_heads=64,
+                num_key_value_heads=8,
+                head_dim=64,
+            ),
+            get_num_attention_layers=lambda: 24,
+        )
+        draft_model_config = SimpleNamespace(
+            quant_config=None,
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=1,
+                hidden_size=2880,
+                num_attention_heads=64,
+                num_key_value_heads=4,
+                head_dim=64,
+            ),
+        )
+        c._model_engine.model.model_config = target_model_config
+        c._draft_model_engine = None
+        c._get_effective_draft_config = Mock(return_value=draft_model_config)
+        c._get_num_draft_layers = Mock(return_value=1)
+
+        # Capacity estimation keeps its existing window-saturation meaning.
+        assert c._get_kv_size_per_token().intercept > 0
+        target, draft = c._split_kv_cache_budget_for_draft(budget_attr)
+
+        # Target: 24 layers * 1024 B/token; draft: 1 layer * 512 B/token.
+        # Different KV head counts ensure this is byte weighting, not layer counting.
+        assert draft is not None
+        assert getattr(draft, budget_attr) == total_budget // 49
+        assert getattr(target, budget_attr) + getattr(draft, budget_attr) == total_budget
+        assert getattr(c._kv_cache_config, budget_attr) == total_budget
+
+    @pytest.mark.parametrize("for_budget_split", [False, True])
     @pytest.mark.parametrize(
         "mode",
         [
@@ -95,6 +153,7 @@ class TestSplitGpuBudgetForDraft:
         self,
         mocker,
         mode,
+        for_budget_split,
     ) -> None:
         class DraftModelConfig:
             quant_config = None
@@ -154,8 +213,11 @@ class TestSplitGpuBudgetForDraft:
 
         # The draft layer stores 64 bytes/token in a fixed 512-token window.
         # Leaking the target's 16K window would instead count it as 64 bytes/token.
-        cost = creator._get_kv_size_per_token()
-        assert cost == CacheCost(slope=10, intercept=512 * 64)
+        cost = creator._get_kv_size_per_token(for_budget_split=for_budget_split)
+        if for_budget_split and not mode.is_external_drafter():
+            assert cost == CacheCost(slope=10 + 64, intercept=0)
+        else:
+            assert cost == CacheCost(slope=10, intercept=512 * 64)
         assert len(draft_kv_configs) == 1
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]

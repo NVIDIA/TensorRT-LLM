@@ -4178,6 +4178,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_num_tokens: int = 0,
         spec_config=None,
         is_draft: bool = False,
+        for_budget_split: bool = False,
         **kwargs,
     ):
         layer_sizes, attention_windows = _get_static_cache_size_layer_components(
@@ -4187,6 +4188,14 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len=max_seq_len,
             kv_cache_config=kv_cache_config,
         )
+        if for_budget_split and not (
+            is_draft and spec_config is not None and spec_config.spec_dec_mode.is_external_drafter()
+        ):
+            # Ordinary SWA pools grow with admitted tokens: a saturated window
+            # for every max-batch request is not a mandatory reservation. Use
+            # all attention layers as byte weights when dividing the budget.
+            # External drafters retain their per-step capacity reservation.
+            return sum(layer_sizes), 0
         reuse_backoff_enabled = (
             kv_cache_config is not None
             and kv_cache_config.enable_block_reuse
