@@ -141,7 +141,7 @@ attention_config:
     v_block_size: 1
 ```
 
-## MXFP8 / NVFP4 (CUTEDSL / FlashInfer)
+## MXFP8 and NVFP4 in the `CUTEDSL` and `FlashInfer` backends
 
 **What it does.** MXFP8 and NVFP4 quantize Q/K with fixed blocks of 32 and 16 elements, respectively. `q_block_size` and `k_block_size` remain `0` because MXFP8 and NVFP4 follows specialized block-scaling schema which divide into both token dimensions and channel dimensions. V uses FP8 on `CUTEDSL` and FlashInfer SM10X, or NVFP4 on FlashInfer SM12X.
 
