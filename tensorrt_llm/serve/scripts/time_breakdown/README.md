@@ -98,7 +98,7 @@ Client Request
 ┌─────────────────────────────────────────────────────────────────┐
 │  CONTEXT SERVER (Prefill)                                       │
 │                                                                 │
-│  [ctx_server_arrival_time] ─── Context server receives request │
+│  [ctx_server_arrival_time] ─── Context server receives request  │
 │      |                                                          │
 │      v                                                          │
 │  [ctx_arrival_time] ────────── After tokenization               │
@@ -140,7 +140,13 @@ Client Request
 │  [gen_server_arrival_time] ─── Generation server receives req   │
 │      |                                                          │
 │      v                                                          │
-│  [gen_arrival_time] ────────── After KV cache received          │
+│  [gen_arrival_time] ────────── After request parsing + IPC      │
+│      |                                                          │
+│      v                                                          │
+│  [gen_kv_cache_transfer_start] ─ KV cache transfer begins       │
+│      |                                                          │
+│      v                                                          │
+│  [gen_kv_cache_transfer_end] ─── KV cache transfer complete     │
 │      |                                                          │
 │      v                                                          │
 │  [gen_first_scheduled_time] ── Scheduled for decode             │
@@ -264,29 +270,38 @@ For each generation step, the following CPU and GPU times are recorded:
 
 5. **Generation Preprocessing** (`gen_preprocessing`)
    - **Time Period**: `gen_server_arrival_time` → `gen_arrival_time`
-   - **Description**: Python overhead & initialization when generation server receives the request
+   - **Description**: Generation server overhead: request parsing and IPC from the OpenAI server to the LLM executor
 
-6. **Generation Queue** (`gen_queue`)
-   - **Time Period**: `gen_arrival_time` → `gen_first_scheduled_time`
-   - **Description**: Time spent in queue including KV cache transfer
+6. **Generation Queue Wait** (`gen_queue_wait`)
+   - **Time Period**: `gen_arrival_time` → `gen_kv_cache_transfer_start`
+   - **Description**: Time the request waits in the generation executor queue before the KV cache transfer begins
 
-7. **Generation First Token Postprocessing** (`gen_postprocessing`)
+7. **Generation KV Transfer** (`gen_kv_transfer`)
+   - **Time Period**: `gen_kv_cache_transfer_start` → `gen_kv_cache_transfer_end`
+   - **Description**: GPU-to-GPU transfer of the cached key-value tensors from the context server to the generation server
+   - **Note**: Sourced from `kv_cache_transfer_start` / `kv_cache_transfer_end` in the generation server's `timing_metrics`. When those fields are absent, this segment and the two surrounding it all evaluate to zero, and the `gen_arrival_time` → `gen_first_scheduled_time` interval is not attributed to any segment.
+
+8. **Generation Post Transfer** (`gen_post_transfer`)
+   - **Time Period**: `gen_kv_cache_transfer_end` → `gen_first_scheduled_time`
+   - **Description**: Time from KV cache transfer completion to the request being scheduled for generation
+
+9. **Generation First Token Postprocessing** (`gen_postprocessing`)
    - **Time Period**: `gen_first_scheduled_time` → `gen_server_first_token_time`
-   - **Description**: Time to generate and send first token from generation server
+   - **Description**: Time to generate and send the first token from the generation server
 
 ### Disaggregation Server Metrics
 
-8. **Disaggregation Preprocessing** (`disagg_preprocessing`)
-   - **Time Period**: `disagg_server_arrival_time` → `ctx_server_arrival_time`
-   - **Description**: Routing overhead from disagg server to context server
-   - **Includes**: Request routing, load balancing, network transfer
+10. **Disaggregation Preprocessing** (`disagg_preprocessing`)
+    - **Time Period**: `disagg_server_arrival_time` → `ctx_server_arrival_time`
+    - **Description**: Routing overhead from disagg server to context server
+    - **Includes**: Request routing, load balancing, network transfer
 
-9. **Disaggregation Relay** (`disagg_relay`)
-   - **Time Period**: `ctx_server_first_token_time` → `gen_server_arrival_time`
-   - **Description**: Handoff from context server to generation server
-   - **Includes**: Network transfer, KV cache metadata relay via disagg router
+11. **Disaggregation Relay** (`disagg_relay`)
+    - **Time Period**: `ctx_server_first_token_time` → `gen_server_arrival_time`
+    - **Description**: Handoff from context server to generation server
+    - **Includes**: Network transfer, KV cache metadata relay via disagg router
 
-10. **Disaggregation Postprocessing** (`disagg_postprocessing`)
+12. **Disaggregation Postprocessing** (`disagg_postprocessing`)
     - **Time Period**: `gen_server_first_token_time` → `disagg_server_first_token_time`
     - **Description**: Routing overhead from generation server back through disagg server
     - **Includes**: Response aggregation, network transfer to client
