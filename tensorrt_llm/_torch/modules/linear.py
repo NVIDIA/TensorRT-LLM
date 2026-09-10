@@ -35,18 +35,7 @@ from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
-from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
-from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
-
-
-def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
-    """Fast pre-filter: check the global enable flag and M upper bound only."""
-    if not LOW_M_GEMM_ACTIVE:
-        return False
-    if input.ndim < 1:
-        return False
-    k = int(input.shape[-1])
-    return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
+from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
 
 class WeightMode(str, enum.Enum):

@@ -78,7 +78,9 @@ class FallbackFmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del q, k, v, phase
+        del k, v, phase
+        if q is not None and q.dtype == torch.float8_e4m3fn:
+            return False
         return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
             forward_args.update_kv_cache or metadata.is_cross
         )

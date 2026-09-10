@@ -45,6 +45,8 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
+from tensorrt_llm.llmapi.utils import \
+    _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -78,6 +80,7 @@ from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
+from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -472,6 +475,19 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
+        # Opt-in in-graph sampling: let the engine sample inside its forward CUDA
+        # graph. The sampler resolves each batch to a tier and stages the
+        # buffers the in-graph step reads; the engine keys its graph cache on
+        # the tier and calls back at the tail of the forward. Both hooks stay
+        # unregistered (and the engine unchanged) unless the sampler implements
+        # the protocol and the feature is enabled.
+        if (getattr(model_engine, "enable_in_graph_sampling", False)
+                and hasattr(sampler, "resolve_in_graph_sample_type")):
+            model_engine.register_sample_type_resolver(
+                sampler.resolve_in_graph_sample_type,
+                sampler.stage_in_graph_sampling)
+            model_engine.register_sample_in_graph_callable(
+                self._sample_in_graph)
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
@@ -592,20 +608,27 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.draft_kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
+                                            KVCacheManagerV2)
+        self.enable_joint_kv_cache_reuse = (
+            self._is_kv_manager_v2
+            and self.kv_cache_manager.enable_joint_kv_cache_reuse)
         # V2 owns KV allocation, suspend, resume, and context finalization.
         # The executor skips the V1 terminate/pause paths and finalizes V2
         # context resources before transfer or response handling can terminate
         # a request.
-        self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
-                                            KVCacheManagerV2)
         self._prefetched_request_ids: set[int] = set()
-        self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
+        self.enable_kv_cache_events = self.kv_cache_manager is not None and (
+            self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
+                self.kv_cache_manager, "streaming_kv_events_enabled", False))
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse
-            and not isinstance(self.kv_cache_manager, KVCacheManagerV2))
+            and not self._is_kv_manager_v2)
         # Store+pin ctx blocks into the reuse trie at transfer start so the next
         # request reuses them immediately (PP>1 otherwise commits too late and
         # only partially matches). No collective is required for the
@@ -924,6 +947,16 @@ class PyExecutor:
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer, tokens_per_block)
+        if (self.global_rank == 0
+                and self._disagg_transfer_admission_controller.enabled()
+                and self._is_disagg_transfer_window_bypass_eligible()):
+            logger.warning_once(
+                f"[PyExecutor] Bypassing the executor transfer window "
+                f"configured by max_tokens_in_buffer={max_tokens_in_buffer} "
+                "for asynchronous Python generation with KV cache manager "
+                "V2 and pp_size=1; "
+                "scheduler KV cache capacity admission remains active.",
+                key="disagg_transfer_window_bypass")
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -947,6 +980,9 @@ class PyExecutor:
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
         self._fill_admit_cap: int = 0
+        # Optional GPU keepalive for the fill gate (TRTLLM_GPU_KEEPALIVE=1).
+        # Allocates nothing here; its device side is set up at its first tick.
+        self._gpu_keepalive = GpuKeepalive.create_from_env(self.device_id)
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -1280,6 +1316,13 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                # Model/KV-cache/transceiver construction can create threads
+                # after configure_cpu_affinity(). Refresh the existing-thread
+                # snapshot immediately before launching executor threads.
+                # Explicit affinity opt-out must remain a true opt-out.
+                if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None,
+                                                                         "1"):
+                    _reapply_current_thread_affinity_to_all_threads()
                 if self.dist.pp_size > 1:
                     self.executed_batch_queue: Queue[BatchStatePP] = Queue(
                         maxsize=self.num_micro_batches)
@@ -2511,6 +2554,11 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
+        # The loop may exit while the benchmark fill gate is still closed.
+        keepalive = getattr(self, "_gpu_keepalive", None)
+        if keepalive is not None:
+            keepalive.close()
+
         for i in range(self.num_micro_batches):
             try:
                 self.wait_on_pp_send_handles(self.send_handles, i)
@@ -2640,7 +2688,7 @@ class PyExecutor:
                 # other two loops -- the ring has to drain first -- so this
                 # only starts the drain.  Skipped while one is already
                 # pending so the decision is not retaken mid-drain.
-                if (self._uses_kv_manager_v2()
+                if (self._is_kv_manager_v2
                         and self._pp_rebalance_drain_iters is None
                         and self._can_pause_for_rebalance()
                         and self._agreed_need_adjustment()):
@@ -2950,7 +2998,7 @@ class PyExecutor:
 
                 # Stage 3.4: Rebalance the KV pools once the drain started at
                 # the top of some earlier iteration has emptied the ring.
-                if self._uses_kv_manager_v2():
+                if self._is_kv_manager_v2:
                     self._maybe_finish_pp_rebalance()
 
                 if not can_queue and self._pp_ring_is_drained():
@@ -3345,8 +3393,7 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     # Finalize V2 context KV before disagg transfer/response
                     # handling can terminate the request.
-                    self.kv_cache_manager.update_context_resources(
-                        scheduled_requests)
+                    self._update_v2_context_resources(scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3556,6 +3603,15 @@ class PyExecutor:
                 if getattr(req, "py_skip_gen_alloc_revert", False):
                     continue
                 self.kv_cache_manager.revert_allocate_generation(req)
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.revert_allocate_generation(req)
+
+    def _update_v2_context_resources(self, scheduled_batch) -> None:
+        """Commit one context frontier to target and draft caches."""
+        self.kv_cache_manager.update_context_resources(scheduled_batch)
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.update_context_resources(
+                scheduled_batch)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -3594,13 +3650,16 @@ class PyExecutor:
     def _revert_ctx_alloc(self, dropped_context_requests):
         """Revert V2 context KV growth for requests deferred after scheduling."""
         for req in dropped_context_requests:
-            self.kv_cache_manager.revert_allocate_context(req)
+            if not self.kv_cache_manager.revert_allocate_context(req):
+                # The cache was dropped and the shared cursor rewound, so drop
+                # the paired draft pool too or it describes abandoned progress.
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.free_resources(req)
 
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
         """Pre-stage disk blocks to host for upcoming context requests with block reuse."""
-        if not isinstance(getattr(self, "kv_cache_manager", None),
-                          KVCacheManagerV2):
+        if not self._is_kv_manager_v2:
             return
         if not self.kv_cache_manager.enable_block_reuse:
             return
@@ -3673,6 +3732,27 @@ class PyExecutor:
             getattr(kv_cache_manager, "tokens_per_block", None),
         )
 
+    def _is_disagg_transfer_window_bypass_eligible(self) -> bool:
+        """Return whether this runtime may bypass an enabled transfer window."""
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        return (transceiver is not None
+                and transceiver.consumes_transfer_buffer is False
+                and self._uses_async_disagg_gen_transfer()
+                and self.dist.pp_size == 1 and self._is_kv_manager_v2)
+
+    def _disagg_transfer_window_is_active(self) -> bool:
+        """Return whether the executor-level transfer window is active.
+
+        ``max_tokens_in_buffer`` describes the C++ transceiver's physical
+        buffer. The asynchronous Python transceiver does not consume that
+        buffer. With KV cache manager V2 and PP1, its generation requests
+        remain constrained by inline scheduler KV admission without a second
+        executor-level budget. Other configurations retain the window.
+        """
+        return (getattr(self, "kv_cache_transceiver", None) is not None
+                and self._get_disagg_transfer_admission_controller().enabled()
+                and not self._is_disagg_transfer_window_bypass_eligible())
+
     @staticmethod
     def _is_disagg_gen_only_no_context_benchmark() -> bool:
         """Return whether ``gen_only_no_context`` skips KV transfer."""
@@ -3682,13 +3762,6 @@ class PyExecutor:
         """Return whether generation KV transfers can remain in flight."""
         return (not self._is_disagg_gen_only_no_context_benchmark() and
                 os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
-
-    def _uses_kv_manager_v2(self) -> bool:
-        explicit_flag = getattr(self, "_is_kv_manager_v2", None)
-        if explicit_flag is not None:
-            return bool(explicit_flag)
-        return isinstance(getattr(self, "kv_cache_manager", None),
-                          KVCacheManagerV2)
 
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
@@ -3700,8 +3773,8 @@ class PyExecutor:
             return fitting_disagg_gen_init_requests, False
 
         controller = self._get_disagg_transfer_admission_controller()
-        if not (getattr(self, "kv_cache_transceiver", None)
-                and controller.enabled() and fitting_disagg_gen_init_requests):
+        if not (self._disagg_transfer_window_is_active()
+                and fitting_disagg_gen_init_requests):
             return fitting_disagg_gen_init_requests, False
 
         admission_result = controller.select(self.active_requests,
@@ -3725,7 +3798,14 @@ class PyExecutor:
     def _revert_deferred_disagg_gen_init_alloc(
             self, candidates: List[LlmRequest],
             admitted_requests: List[LlmRequest]) -> None:
-        if not (self._uses_kv_manager_v2() and candidates):
+        """Revert Scheduler V2 allocations absent from an admitted request set.
+
+        Scheduler V2 allocates KV while evaluating generation-init requests.
+        This reconciliation is required both after transfer-window admission
+        and when a PP follower's local candidates differ from the canonical
+        schedule propagated by rank 0.
+        """
+        if not (self._is_kv_manager_v2 and candidates):
             return
 
         admitted_request_ids = {
@@ -3770,57 +3850,33 @@ class PyExecutor:
     def _check_disagg_transfer_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
 
-        The poll is non-blocking and rank-symmetric: every rank enters it
-        unconditionally on every disagg iteration, so the consensus performed
-        inside the status call stays aligned without an extra collective here.
-        Ranks with nothing in flight simply reap nothing.
-
-        Generation transfers are deliberately not polled here: the loop head
-        already ran `_check_disagg_gen_transfer_status` this iteration, and any
-        receive started since then by `_prepare_disagg_gen_init` is polled by
-        `_recv_disagg_gen_cache` right after it is issued. A poll here would
-        only repeat the GEN status call and its consensus.
+        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
+        must not enter the context status collective here. A single-rank
+        worker cannot diverge and polls only while a send is in flight.
         """
-        # A synchronous GEN receive is rank-local and blocking. One rank can
-        # still be receiving while another is idle, so entering the context
-        # progress collective here is unsafe. The gen-only-no-context
-        # benchmark skips KV transfer entirely, so its ranks remain aligned
-        # and may safely poll context progress.
-        if (not self._uses_async_disagg_gen_transfer()
-                and not self._is_disagg_gen_only_no_context_benchmark()):
-            # A single-rank CTX worker cannot diverge on a collective. Reap
-            # completed sends while it is idle so their pinned KV blocks can
-            # be reused by the next context requests.
-            if (self._dist_size(self.dist, "world_size") == 1 and
-                    self.async_transfer_manager.has_any_inflight_requests()):
-                self._check_disagg_ctx_cache_transfer_status(0)
+        uses_synchronous_gen_transfer = (
+            not self._uses_async_disagg_gen_transfer()
+            and not self._is_disagg_gen_only_no_context_benchmark())
+        should_poll_synchronous_context_status = (
+            uses_synchronous_gen_transfer
+            and self._dist_size(self.dist, "world_size") == 1
+            and self.async_transfer_manager.has_any_inflight_requests())
+        if (uses_synchronous_gen_transfer
+                and not should_poll_synchronous_context_status):
             return
 
         self._check_disagg_ctx_cache_transfer_status(0)
 
     def _pace_idle_disagg_loop(self) -> None:
-        """Sleep briefly when only a KV transfer completing can make progress.
+        """Sleep briefly when nothing but a KV transfer can make progress.
 
-        Dropping the blocking `atLeastNum=1` wait also dropped the only pacing
-        for the idle-blocked case: `_fetch_and_enqueue_requests` uses a zero
-        timeout while any request is active, so the loop would otherwise re-run
-        the schedule pass and its collectives at full speed until a transfer
-        lands.
-
-        Call this at the end of an iteration that queued nothing, once the pass
-        has drained its ready work. Request updates, KV sends and responses
-        must not be held behind the sleep, and running them first means the
-        pending-transfer check below sees the state they left behind rather
-        than a stale one.
-
-        That check is rank-local. The sleep only paces and never gates a
-        collective, so ranks taking it on different iterations is safe.
+        Call at the end of an iteration that queued nothing, after pending
+        request updates/sends/responses have been handled, so the sleep
+        doesn't hold up work that's already finished.
         """
         if self.kv_cache_transceiver is None:
             return
 
-        # Context sends are tracked by the transfer manager; generation
-        # receives live in the request state, so both directions are covered.
         waiting_on_transfer = (
             self.async_transfer_manager.has_any_inflight_requests()
             or any(req.is_disagg_generation_init_state
@@ -3830,12 +3886,7 @@ class PyExecutor:
             time.sleep(0.001)
 
     def _pp_ring_is_drained(self) -> bool:
-        """Return whether no microbatch is queued or awaiting handling.
-
-        While microbatches are still in flight `fetch_executed_batches` blocks
-        on the response queue, which paces the loop on its own; sleeping on top
-        of that would only delay their relay.
-        """
+        """Return whether no microbatch is queued or awaiting handling."""
         return (self.unhandled_batch_counter == 0
                 and all(batch is None for batch in self.micro_batches))
 
@@ -4154,7 +4205,9 @@ class PyExecutor:
         A short sleep (0.1s) yields the CPU between retries that made no
         transfer progress while keeping the polling interval short enough to
         avoid KV transfer backpressure on the CTX server. Retries that complete
-        a transfer do not sleep.
+        a transfer do not sleep. With ``TRTLLM_GPU_KEEPALIVE=1`` every closed
+        retry also queues a short GPU keepalive chunk, so the GPU does not read
+        idle for the whole wait; the chunks are drained when the gate opens.
 
         Args:
             scheduled_batch: The current scheduled batch.
@@ -4170,13 +4223,19 @@ class PyExecutor:
             can_forward = self._is_benchmark_disagg_fill_complete(
                 scheduled_batch, transfer_made_progress)
             transfer_made_progress = self._benchmark_transfer_progress_global
+            keepalive = getattr(self, "_gpu_keepalive", None)
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
                 self._benchmark_fill_stall_since = None
                 self._benchmark_completed_gen_transfer_ids.clear()
-            elif not transfer_made_progress:
-                time.sleep(0.1)
+                if keepalive is not None:
+                    keepalive.drain()
+            else:
+                if keepalive is not None:
+                    keepalive.tick()
+                if not transfer_made_progress:
+                    time.sleep(0.1)
             if not can_forward:
                 self._fail_if_fill_gate_stalled(transfer_made_progress)
                 return can_forward, True
@@ -4374,9 +4433,7 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     if self._is_kv_manager_v2:
-                        for req in scheduled_batch.generation_requests:
-                            self.kv_cache_manager.revert_allocate_generation(
-                                req)
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -4536,8 +4593,7 @@ class PyExecutor:
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
                         # handling can terminate the request.
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
+                        self._update_v2_context_resources(scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -5199,9 +5255,7 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     if self._is_kv_manager_v2:
-                        for req in scheduled_batch.generation_requests:
-                            self.kv_cache_manager.revert_allocate_generation(
-                                req)
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -5412,8 +5466,7 @@ class PyExecutor:
                     # Only applies to KV cache manager V2 + scheduler V2.
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
+                        self._update_v2_context_resources(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -6990,7 +7043,7 @@ class PyExecutor:
         """Flush generation transfer errors through a TP-uniform path."""
         error_requests = [
             req for req in self._get_disagg_reqs_in_error_state()
-            if req.is_generation_only_request()
+            if req.is_generation_only_request
         ]
         local_needs_flush = bool(error_requests)
 
@@ -7723,6 +7776,8 @@ class PyExecutor:
         """Start async KV sends for finished context-only disagg requests."""
         if not self.kv_cache_transceiver:
             return
+        bridge_enabled = (getattr(self.kv_cache_transceiver,
+                                  "_fp4_mla_bridge_enabled", False) is True)
         # Do not send more chunks after an in-flight cancellation.
         cancel_pending_ids = set(getattr(self, "canceled_req_ids", ()))
         for req in scheduled_requests:
@@ -7739,9 +7794,12 @@ class PyExecutor:
                     # Forward is done for this request — release the
                     # IndexMapper slot so new requests can reuse it.
                     # KV blocks stay allocated for the upcoming transfer.
-                    if hasattr(self.kv_cache_manager, 'release_index_slot'):
-                        self.kv_cache_manager.release_index_slot(
-                            req.py_request_id)
+                    # getattr: executors built by unit tests skip __init__
+                    # and so never get the draft binding.
+                    for mgr in (self.kv_cache_manager,
+                                getattr(self, 'draft_kv_cache_manager', None)):
+                        if hasattr(mgr, 'release_index_slot'):
+                            mgr.release_index_slot(req.py_request_id)
                     # Order matters: start_transfer commits the request's blocks to the reuse
                     # tree and pins them, and must run before respond_and_send_async sends the
                     # final KV slice and (for the Python transceiver) transitions the request toward completion.
@@ -7749,6 +7807,19 @@ class PyExecutor:
 
                     # Send the monolithic slice or final pipelined chunk.
                     self.kv_cache_transceiver.respond_and_send_async(req)
+
+                    # Bridge validation can safely reject before creating a
+                    # transfer session. Release the matching async-manager
+                    # claim immediately; there is no physical accessor whose
+                    # retirement must be polled.
+                    bridge_rejected = (
+                        bridge_enabled and getattr(req, "state", None)
+                        == LlmRequestState.DISAGG_TRANS_ERROR and
+                        not self.kv_cache_transceiver.has_inflight_transfer(req)
+                    )
+                    if bridge_rejected:
+                        self._end_transfer_and_maybe_terminate(req)
+                        continue
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
@@ -8101,6 +8172,18 @@ class PyExecutor:
                 raise NotImplementedError(
                     f'Unsupported cp type {cp_type.name}.')
         self._update_request_states_tp(scheduled_requests)
+
+    def _sample_in_graph(self, model_outputs) -> None:
+        """Sample at the tail of the model's forward graph.
+
+        Invoked by the engine right after the LM head, inside the graph capture
+        region, so the sampling kernels of a graph-capturable tier belong to the
+        forward graph. The tier and its buffers were staged before the forward
+        by stage_in_graph_sampling; a batch that resolved to FULL makes this a
+        no-op and is sampled eagerly by _sample_async instead.
+        """
+        self.sampler.sample_in_graph(model_outputs,
+                                     self.sampler.current_sample_type)
 
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
@@ -8693,7 +8776,7 @@ class PyExecutor:
                     new_active_requests.append(request)
                 continue
 
-            if request.is_generation_only_request() and not request.is_finished:
+            if request.is_generation_only_request and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
@@ -8954,6 +9037,8 @@ class PyExecutor:
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.reset_reuse_state()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,

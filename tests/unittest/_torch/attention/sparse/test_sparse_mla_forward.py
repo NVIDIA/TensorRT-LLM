@@ -60,6 +60,8 @@ from .deepseek_v4.test_compressor_module import \
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 try:
+    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
+
     HAS_FLASH_MLA = True
 except ImportError:
     HAS_FLASH_MLA = False
@@ -178,6 +180,68 @@ UNIFIED_TEST_PARAMS.append(
         DSV4_KV_CACHE_DTYPES[0],
         "deepseek_v4",
         id=f"deepseek_v4-{DSV4_KV_CACHE_DTYPES[0]}-large_mixed_deepseek_v4"))
+
+# FlashMLA sparse MLA kernel contract.
+
+
+@pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
+@pytest.mark.skipif(get_sm_version() < 90,
+                    reason="FlashMLA requires SM90 (Hopper) or later")
+@pytest.mark.parametrize(
+    "seq_len_q,seq_len_kv,topk",
+    [
+        (62, 128, 128),
+        (128, 256, 128),
+        (128, 512, 256),
+    ],
+)
+def test_flash_mla_sparse_fwd(seq_len_q, seq_len_kv, topk):
+    """Validate the direct FlashMLA sparse-forward output contract."""
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    batch_size = 1
+    num_heads_q = 128
+    num_heads_kv = 1
+    head_dim_qk = 576
+    head_dim_v = 512
+
+    q = (torch.randn(batch_size,
+                     seq_len_q,
+                     num_heads_q,
+                     head_dim_qk,
+                     dtype=torch.bfloat16,
+                     device="cuda") / 10.0)
+    q.clamp_(-10, 10)
+    kv = (torch.randn(batch_size,
+                      seq_len_kv,
+                      num_heads_kv,
+                      head_dim_qk,
+                      dtype=torch.bfloat16,
+                      device="cuda") / 10.0)
+    kv.clamp_(-10, 10)
+    indices = torch.randint(0,
+                            seq_len_kv,
+                            (batch_size, seq_len_q, num_heads_kv, topk),
+                            dtype=torch.int32,
+                            device="cuda")
+
+    output, max_logits, lse = flash_mla_sparse_fwd(
+        q.squeeze(0),
+        kv.squeeze(0),
+        indices.squeeze(0),
+        sm_scale=1.0 / math.sqrt(head_dim_qk),
+    )
+
+    assert output.shape == (seq_len_q, num_heads_q, head_dim_v)
+    assert output.dtype == torch.bfloat16
+    assert max_logits.shape == (seq_len_q, num_heads_q)
+    assert max_logits.dtype == torch.float32
+    assert lse.shape == (seq_len_q, num_heads_q)
+    assert lse.dtype == torch.float32
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(max_logits).all()
+    assert torch.isfinite(lse).all()
 
 
 def apply_rotary_emb(x: torch.Tensor,

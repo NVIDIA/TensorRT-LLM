@@ -57,8 +57,16 @@ NEMOTRON_SUPER_MODELS = {
     "nemotron_3_nano_omni_nvfp4_image",
 }
 
+KIMI_K3_MODELS = {"kimi_k3"}
+KIMI_K3_SERVER_ENV = {
+    "KIMI_K3_FP8_WEIGHT_READ": "1",
+    "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
+    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING": "1",
+}
+
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
     "kimi_k2.5_fp4",
+    "kimi_k3",
     "minimax_m3_fp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
@@ -1511,7 +1519,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             server_env = os.environ.copy()
             if self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-            server_timeout = 3600 if self._config.model_name in NEMOTRON_SUPER_MODELS else 600
+            if self._config.model_name in KIMI_K3_MODELS:
+                server_env.update(KIMI_K3_SERVER_ENV)
+            if self._config.model_name in NEMOTRON_SUPER_MODELS:
+                server_timeout = 3600
+            elif self._config.model_name in KIMI_K3_MODELS:
+                server_timeout = 5400
+            else:
+                server_timeout = 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
                                            client_cmds=client_cmds,
                                            data_cmds=data_cmds,

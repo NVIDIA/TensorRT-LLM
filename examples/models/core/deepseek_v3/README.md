@@ -788,10 +788,11 @@ To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following show
 
 **Option 2: PyTorch backend config**
 
-Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `config.yml` consumed by `--config` of `trtllm-serve`, `trtllm-bench` and so on:
+Alternatively, configure FP8 MLA through the PyTorch backend KV-cache dtype. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py` (CLI scalar). Also, you can edit `config.yml` consumed by `--config` of `trtllm-serve`, `trtllm-bench` and so on — use nested `kv_cache_config.dtype` (YAML), not a top-level `kv_cache_dtype` key:
 ```yaml
 # ...
-kv_cache_dtype: fp8
+kv_cache_config:
+  dtype: fp8
 # ...
 ```
 
