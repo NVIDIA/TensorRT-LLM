@@ -230,54 +230,20 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         warmup_sampling.assert_called_once_with()
 
-    def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
-        """Enc-dec encoder warmup is deferred and runs as two passes."""
+    def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self):
         model_engine = object.__new__(PyTorchModelEngine)
-        model_engine.cuda_graph_runner = SimpleNamespace(
-            enabled=True,
-            is_warmup_only=True,
-        )
-        model_engine.model = SimpleNamespace(
-            modules=lambda: [], model_config=SimpleNamespace(is_encoder_decoder=True)
-        )
-        model_engine._torch_compile_piecewise_cuda_graph = False
+        model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
-
-        @contextlib.contextmanager
-        def allow_capture():
-            yield
-
-        runner = SimpleNamespace(
-            enabled=True,
-            is_encoder_decoder=True,
-            is_warmup_only=False,
-            feature_mode=False,
-            allow_capture=allow_capture,
-        )
-        model_engine._runner = object.__new__(EncoderDecoderRunner)
-        model_engine._runner._encoder_cuda_graph_runner = runner
+        model_engine._runner = Mock(spec=EncoderDecoderRunner)
         resource_manager = object()
-        warmup_states = []
 
-        with (
-            patch.object(model_engine, "_capture_generation_cuda_graphs") as generation,
-            patch.object(model_engine, "_capture_mixed_encoder_decoder_cuda_graphs") as mixed,
-            patch.object(
-                model_engine._runner,
-                "_run_encoder_capture_pass",
-                side_effect=lambda *_: warmup_states.append(runner.is_warmup_only),
-            ) as encoder,
-        ):
-            model_engine._run_cuda_graph_warmup(resource_manager)
-            generation.assert_called_once_with(resource_manager)
-            mixed.assert_called_once_with(resource_manager)
-            encoder.assert_not_called()
-            model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)
+        model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)
 
-        assert encoder.call_count == 2
-        assert warmup_states == [True, False]
-        assert not runner.is_warmup_only
+        self.assertEqual(
+            model_engine._runner.method_calls,
+            [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
+        )
 
     def test_empty_cache_fires_immediately_after_autotuner(self):
         """Change 1 placement: empty_cache must be the call right after

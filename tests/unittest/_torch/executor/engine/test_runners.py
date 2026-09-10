@@ -155,13 +155,24 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
     assert resolve_runner_type(_model(is_generation=False), args) is MultimodalEncoderRunner
 
 
-def test_model_engine_initializes_no_kv_cache_runner_by_family() -> None:
+@pytest.mark.parametrize(
+    ("runner_type", "initializer_name"),
+    [
+        (EncoderRunner, "_initialize_encoder_runner"),
+        (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
+        (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
+    ],
+)
+def test_model_engine_initializes_runner_by_family(
+    runner_type: type[Any], initializer_name: str
+) -> None:
     engine = object.__new__(PyTorchModelEngine)
-    expected = Mock(spec=NoKVCacheRunner)
-    engine._initialize_no_kv_cache_runner = Mock(return_value=expected)
+    expected = Mock(spec=runner_type)
+    initializer = Mock(return_value=expected)
+    setattr(engine, initializer_name, initializer)
 
-    assert engine._initialize_runner(NoKVCacheRunner) is expected
-    engine._initialize_no_kv_cache_runner.assert_called_once_with(NoKVCacheRunner)
+    assert engine._initialize_runner(runner_type) is expected
+    initializer.assert_called_once_with(runner_type)
 
 
 def test_model_engine_rejects_unregistered_runner_family() -> None:
@@ -175,7 +186,7 @@ def test_model_engine_rejects_unregistered_runner_family() -> None:
 
 
 def _model_engine_with_runner(
-    runner: Mock,
+    runner: Mock | None,
     *,
     kv_cache_manager: object | None,
 ) -> tuple[PyTorchModelEngine, Mock]:
@@ -200,8 +211,13 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         kv_cache_manager=None,
     )
     batch = ScheduledRequests()
+    model_input = object()
 
-    actual_outputs = engine.forward(batch, resource_manager)
+    actual_outputs = engine.forward(
+        batch,
+        resource_manager,
+        token_type_ids=model_input,
+    )
 
     assert actual_outputs is expected_outputs
     runner.forward.assert_called_once_with(
@@ -210,7 +226,63 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         cuda_graph_lora_manager=None,
         runtime_draft_len=0,
         gather_context_logits=False,
+        token_type_ids=model_input,
     )
+
+
+def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:
+    runner = Mock(spec=EncoderDecoderRunner)
+    hidden_states = object()
+    runner.forward.return_value = {
+        "encoder_hidden_states": hidden_states,
+        "encoder_seq_lens": [2, 3],
+    }
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = SimpleNamespace(
+        model_config=SimpleNamespace(is_encoder_decoder=True),
+    )
+    engine._runner = runner
+    requests = [object(), object()]
+    resource_manager = object()
+
+    outputs = engine.forward_encoder(requests, resource_manager)
+
+    assert outputs == (hidden_states, [2, 3])
+    scheduled_requests = runner.forward.call_args.args[0]
+    assert scheduled_requests.encoder_requests == requests
+    runner.forward.assert_called_once_with(
+        scheduled_requests,
+        resource_manager=resource_manager,
+        cuda_graph_lora_manager=None,
+        runtime_draft_len=0,
+        gather_context_logits=False,
+    )
+
+
+def test_model_engine_legacy_decoder_rejects_runner_model_inputs() -> None:
+    engine, resource_manager = _model_engine_with_runner(
+        None,
+        kv_cache_manager=object(),
+    )
+
+    with pytest.raises(NotImplementedError, match="token_type_ids"):
+        engine.forward(
+            ScheduledRequests(),
+            resource_manager,
+            token_type_ids=object(),
+        )
+
+
+def test_model_engine_releases_runner_owned_graphs() -> None:
+    engine = object.__new__(PyTorchModelEngine)
+    engine._runner = Mock(spec=EncoderRunner)
+    engine._torch_compile_backend = None
+    engine.cuda_graph_runner = None
+    engine.breakable_cuda_graph_runner = None
+
+    engine._release_cuda_graphs()
+
+    engine._runner.release_graph.assert_called_once_with()
 
 
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:
