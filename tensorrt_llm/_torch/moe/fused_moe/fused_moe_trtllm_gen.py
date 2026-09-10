@@ -15,7 +15,7 @@
 
 import os
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Union
+from typing import Dict, FrozenSet, List, Optional, Union
 
 import torch
 from torch import nn
@@ -189,6 +189,18 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         return support
 
     @classmethod
+    def situ_supported_quant_algos(cls) -> FrozenSet[QuantAlgo]:
+        """The quant algos this backend has a fused SiTu FC1 cubin for.
+
+        Public because a model that hands SiTu to this backend has to decide,
+        before construction, whether the handoff can work at all -- and the
+        only alternative to asking is restating the set. Restating it is what
+        broke once already: ``modeling_kimi_linear`` carried its own copy,
+        the NVFP4 cubins landed here, and the copy stayed at MXFP4-only.
+        """
+        return frozenset(cls._SITU_SUPPORTED_QUANT_ALGOS)
+
+    @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """TRTLLM-Gen kernels: the SM100 (Blackwell) family, bfloat16 activations.
 
@@ -325,11 +337,38 @@ class TRTLLMGenFusedMoE(MoEImplBase):
 
         # Eligibility (SM / smart_router / BF16 FlashInfer dep) is owned by
         # ``can_implement``. Keep only the provider selection for the op.
-        self.use_flashinfer = self._check_flashinfer_backend_support()
-        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
-        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
+        self._select_op_provider()
 
         self._weights_created = False
+
+        # Not all models that use this backend define shared experts (e.g. non-DeepSeek
+        # MoEs), so fall back to 0 when the config has no `n_shared_experts`. Retain the
+        # scalar so ``_resolve_fused_shared_expert`` can recompute the fused-expert count
+        # without holding onto the whole pretrained config.
+        self._n_shared_experts = getattr(model_config.pretrained_config,
+                                         "n_shared_experts", 0) or 0
+
+        # ``num_fused_shared_expert`` is derived from the op backend, so resolve it here
+        # for the provider chosen above (recomputed in ``create_weights`` if the provider
+        # is re-resolved once the per-layer quant config is known).
+        self._resolve_fused_shared_expert()
+
+        # create_weights must see the final fused-expert count so the fused shared
+        # slots are allocated when fusion is enabled.
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+        self.layer_idx = layer_idx
+
+    def _resolve_fused_shared_expert(self) -> None:
+        """(Re)compute how many shared experts are folded into the routed-expert
+        grouped GEMM, given the *current* ``self.op_backend``.
+
+        The count depends on the op backend, which ``create_weights`` can switch
+        when it re-resolves the provider for the final per-layer quant config
+        (see ``_select_op_provider``). Recomputing here keeps
+        ``num_fused_shared_expert`` consistent with that provider instead of
+        relying on the value settled at ``__init__`` time.
+        """
         self.num_fused_shared_expert = 0
 
         # Fusing the shared experts into the routed-expert grouped GEMM is opt-in:
@@ -346,28 +385,17 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         # local); gate it out here so EP configs fall back to the unfused path instead
         # of tripping the runtime EP check in the TRTLLM-Gen runner.
         fusion_supported = (
-            fusion_enabled and on_trtllm_backend
-            and model_config.mapping.dp_size == 1
-            and model_config.mapping.moe_ep_size == 1
-            and self.quant_config is not None
+            fusion_enabled and on_trtllm_backend and self.mapping.dp_size == 1
+            and self.mapping.moe_ep_size == 1 and self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_fp8_block_scales())
         if fusion_supported:
-            # Not all models that use this backend define shared experts (e.g. non-DeepSeek
-            # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
-            self.num_fused_shared_expert = getattr(
-                model_config.pretrained_config, "n_shared_experts", 0) or 0
+            self.num_fused_shared_expert = self._n_shared_experts
             if self.num_fused_shared_expert > 0:
                 logger.info_once(
                     f"Shared-expert fusion enabled: folding "
                     f"{self.num_fused_shared_expert} shared expert(s) into the "
                     f"routed-expert grouped GEMM.",
                     key="trtllm_gen_shared_expert_fusion")
-
-        # create_weights must see the final fused-expert count so the fused shared
-        # slots are allocated when fusion is enabled.
-        if not model_config.skip_create_weights_in_init:
-            self.create_weights()
-        self.layer_idx = layer_idx
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
@@ -458,6 +486,24 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         if not (self.use_flashinfer and self._is_unquantized_path()):
             return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+
+    def _select_op_provider(self) -> None:
+        """Pick the op provider (native TRTLLM-Gen or FlashInfer) for the
+        quant config currently installed.
+
+        Called twice: once in ``__init__``, and again from ``create_weights``.
+        The second call is what makes layerwise quantization work. A checkpoint
+        can leave individual MoE layers unquantized while the model-level config
+        says NVFP4; ``ConfigurableMoE.create_weights`` only installs that final
+        per-layer config on the backend just before calling ``create_weights``,
+        so at ``__init__`` time such a layer still looks quantized. Since only
+        FlashInfer implements the BF16 kernels, re-resolving here is what keeps
+        the provider and ``_get_quant_method`` in agreement; otherwise the layer
+        keeps the native provider and dies in ``run_bf16_moe`` at warmup.
+        """
+        self.use_flashinfer = self._check_flashinfer_backend_support()
+        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
+        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
 
     def _check_flashinfer_backend_support(self) -> bool:
         # SiTu is provided by the native TRTLLM-Gen cubin and is not part of
@@ -624,6 +670,15 @@ class TRTLLMGenFusedMoE(MoEImplBase):
     def create_weights(self):
         if self._weights_created:
             return
+
+        # The final per-layer quant config is in place only now (see
+        # ``_select_op_provider``), so re-resolve the provider before the quant
+        # method is chosen from the same config.
+        self._select_op_provider()
+
+        # The provider may have switched above, and the fused-shared-expert count is
+        # derived from it, so recompute it before it is consumed below.
+        self._resolve_fused_shared_expert()
 
         self.quant_method = self._get_quant_method()
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(

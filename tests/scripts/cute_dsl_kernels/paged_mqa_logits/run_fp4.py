@@ -7,7 +7,7 @@ implementation. Intended for local development / sanity checks; not wired into
 CI (matching the convention of other scripts under ``tests/scripts/cute_dsl_kernels/``).
 
 - Helpers (FP4 quant, KV cast, ref) are inlined from
-  tests/unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py.
+  tests/unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py.
 - Schedule metadata is computed in pure Python (mirrors DeepGEMM's
   PagedMQALogitsScheduler), avoiding the deep_gemm C++ binding.
 - Compile + dispatch follows tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
@@ -393,7 +393,7 @@ _CUTLASS_TO_TORCH = {
 
 # Element-wise tolerance keyed by (epi_dtype, output_dtype) — mirrors the
 # unit test's ELEM_TOL table at
-# tests/unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py.
+# tests/unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py.
 _ELEM_TOL = {
     (torch.float32, torch.float32): (5e-5, 1e-5),
     (torch.bfloat16, torch.bfloat16): (1e-2, 1e-2),

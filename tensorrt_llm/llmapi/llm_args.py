@@ -71,6 +71,7 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
+from ..tokenizer import TOKENIZER_ALIASES
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -1081,11 +1082,30 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         default=False,
         description=
         "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
-        "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
-        "threshold search iterations. Currently supported for index_topk ∈ "
-        "{512, 1024, 2048} on Blackwell (SM100+), with compress_ratio ∈ {1, 4} "
-        "(DSv3.2 + DSv4 indexers). Falls back to the production insertion/"
-        "radix Top-K path when prerequisites are not met.")
+        "indexer instead of the exact insertion/radix Top-K path. Currently "
+        "supported for index_topk ∈ {512, 1024, 2048} on Blackwell (SM100+), "
+        "with compress_ratio ∈ {1, 4} (DSv3.2 + DSv4 indexers). Falls back to "
+        "the production insertion/radix Top-K path when prerequisites are not "
+        "met. `use_self_sampling_topk` selects the GVR engine generation.")
+    use_self_sampling_topk: bool = Field(
+        default=True,
+        description=
+        "Select the GVR engine generation when enable_heuristic_topk is set: "
+        "True (default) runs the hint-free self-sampling engine, which derives "
+        "its search bracket from the current row and keeps no cross-step "
+        "state; False runs the temporal-hint engines, which reuse the "
+        "previous decode step's Top-K indices as hints. Ignored when "
+        "enable_heuristic_topk is False.")
+    use_gvr_emission: bool = Field(
+        default=False,
+        description=
+        "Enable the emission-assisted block-skip optimization for the "
+        "temporal-hint GVR engine. When set, the FP4 indexer epilogue emits "
+        "per-block max logits so the GVR Top-K can skip whole blocks. Only "
+        "takes effect with enable_heuristic_topk=True, use_self_sampling_topk="
+        "False, and the FP4 paged-MQA-logits path; ignored otherwise. The "
+        "self-sampling engine derives its bracket from the current row and "
+        "does not use emission.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
@@ -1227,6 +1247,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
@@ -1259,6 +1281,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1346,6 +1370,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
@@ -1371,6 +1397,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1609,12 +1637,12 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
-# Short aliases for built-in custom tokenizers.
-# Maps alias → full import path (module.ClassName).
-TOKENIZER_ALIASES = {
-    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-    'deepseek_v4': 'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
-}
+# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) is
+# imported from `tensorrt_llm.tokenizer`, which is where the built-in custom
+# tokenizers live. It used to be duplicated here, and the copy drifted: it was
+# missing every alias added after it, so `--custom_tokenizer <alias>` failed
+# with "not enough values to unpack" for those while the identical alias worked
+# through `load_custom_tokenizer`.
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
@@ -4027,6 +4055,59 @@ class MambaStateConfig(StrictBaseModel):
         "Requires KV cache manager V2.")
 
 
+class KVEventsConfig(StrictBaseModel):
+    """Configuration for streaming (push-based) KV cache event publishing."""
+
+    enable_kv_cache_events: bool = Field(
+        default=False,
+        description=
+        "Whether to produce and publish KV cache events over the streaming (push) path."
+    )
+    publisher: Optional[Literal["null", "zmq"]] = Field(
+        default=None,
+        description=
+        "Publisher implementation. Defaults to 'zmq' when events are enabled and 'null' otherwise."
+    )
+    endpoint: str = Field(
+        default="tcp://*:5557",
+        min_length=1,
+        description=
+        "Base ZeroMQ endpoint the publisher binds. Each attention-DP rank binds "
+        "base_port+rank, so co-located engines (e.g. disaggregated prefill and "
+        "decode on one host) must use distinct base ports.")
+    replay_endpoint: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=
+        "Optional base ZeroMQ endpoint used to replay KV cache events. Ranks apply "
+        "the same global base_port+rank convention as `endpoint`. Only ranks sharing a "
+        "host contend for a port, so the two base ports must be at least "
+        "ranks-per-host apart or a rank's replay bind collides with another rank's "
+        "publish bind on that host.")
+    buffer_steps: int = Field(
+        default=10_000,
+        gt=0,
+        description="Number of previously published batches retained for replay."
+    )
+    hwm: int = Field(default=100_000,
+                     gt=0,
+                     description="ZeroMQ publisher socket high-water mark. "
+                     "0 means unlimited in ZeroMQ, so it is disallowed here.")
+    max_queue_size: int = Field(
+        default=100_000,
+        gt=0,
+        description="Maximum number of batches queued for background publishing. "
+        "Must be positive; 0 would make the queue unbounded.")
+    topic: str = Field(
+        default="",
+        description="ZeroMQ subscription topic used for KV cache event batches."
+    )
+
+    def model_post_init(self, __context) -> None:
+        if self.publisher is None:
+            self.publisher = "zmq" if self.enable_kv_cache_events else "null"
+
+
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
 
@@ -4131,6 +4212,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The period in milliseconds to gather attention DP events across ranks."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    kv_events_config: Optional[KVEventsConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, "
+        "each rank publishes its own events directly (e.g. over ZeroMQ) instead "
+        "of the buffered event_buffer_max_size gather/poll path.")
     enable_partial_reuse: bool = Field(
         default=True,
         description=
@@ -5254,11 +5343,11 @@ class ModelExpressConfig(StrictBaseModel):
 
     server_query_timeout_s: Optional[NonNegativeInt] = Field(
         default=None,
-        description="Timeout in seconds for upstream MxLiveWeightLoader source "
-        "discovery. When unset, TRT-LLM first probes for existing sources: "
-        "no source uses a short 30-second fallback cap, while an existing "
-        "source uses modelexpress's default wait for long donor loads.",
-        status="prototype")
+        description="Deprecated and ignored. ModelExpress performs one source "
+        "discovery query and falls back to native checkpoint loading when no "
+        "compatible source is immediately available.",
+        status="deprecated",
+        deprecated=True)
 
     preshard_strategy: str = Field(
         default="per_module",
@@ -5639,6 +5728,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "async worker should only be used when confidential compute is active. "
         "This argument is provided to enable it for testing purposes, "
         "irrespective of confidential compute state.",
+        status="prototype")
+
+    enable_in_graph_sampling: bool = Field(
+        default=False,
+        description="Opt-in in-graph sampling: capture part of the "
+        "sampling work into the model's CUDA graph and run it there, instead "
+        "of eagerly after the forward. The sampler itself is unchanged; only "
+        "where its work runs differs. Batches whose sampling cannot be "
+        "captured are unaffected and keep the eager path. This captures an "
+        "additional set of CUDA graphs at startup, which makes warmup "
+        "noticeably slower and costs extra memory, in exchange for lower "
+        "per-step sampling overhead.",
         status="prototype")
 
     enable_speculative_beam_history_d2h: bool = Field(

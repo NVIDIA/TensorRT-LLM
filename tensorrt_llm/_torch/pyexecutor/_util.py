@@ -29,7 +29,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
+    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
     MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
     SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
@@ -57,7 +57,7 @@ from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-                           uses_vswa_kv_cache_layout)
+                           resolve_vocab_size, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -1464,6 +1464,9 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
             disable_overlap_scheduler=self._disable_overlap_scheduler,
+            kv_events_config=None
+            if estimating_kv_cache or model_engine.is_draft_model else
+            self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
@@ -1502,7 +1505,18 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp:
+        if self._speculative_config is None:
+            # No drafter at all, so there is nothing to give a manager to.
+            return False
+        # Narrower than is_external_drafter(): PARD and DRAFT_TARGET_ONE_MODEL
+        # never reach the arena this carve-out exists for.
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        is_standalone_drafter = (spec_dec_mode.is_dflash()
+                                 or spec_dec_mode.is_dspark())
+        if self._mapping.enable_attention_dp and not is_standalone_drafter:
+            # This bail suits MTP, whose draft layers are target-shaped and
+            # appendable to the target pool. A standalone drafter has nothing to
+            # append, so it would be stranded on the private arena instead.
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
@@ -2369,6 +2383,7 @@ def _create_kv_cache_manager(
         is_disagg: bool = False,
         disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
+        kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False) -> KVCacheManager:
     """
     Returns:
@@ -2508,9 +2523,27 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
+        # V2 builds the block-reuse cache key of a multimodal token run from
+        # the vocabulary size. Resolve it here rather than per-branch: the
+        # manager needs it whenever block reuse can meet multimodal input,
+        # whichever branch below builds it, and a branch that omits it leaves
+        # the key generator to be called with None on the first image request.
+        manager_extra_kwargs["vocab_size"] = resolve_vocab_size(config)
+        if (manager_extra_kwargs["vocab_size"] is None
+                and kv_cache_config.enable_block_reuse):
+            logger.warning(
+                "Could not resolve vocab_size from the model config; "
+                "multimodal requests will fail when block reuse is on. "
+                "Disable block reuse to serve them.")
+    elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+        logger.warning(
+            "kv_cache_config.kv_events_config is set but streaming KV event "
+            "publishing requires KV cache manager V2; events will not be "
+            f"published for {kv_cache_manager_cls.__name__}.")
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -2612,7 +2645,6 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
-            vocab_size=config.vocab_size,
             max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
@@ -2896,7 +2928,6 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
-            vocab_size=config.vocab_size,
             max_num_tokens=max_num_tokens,
             model_config=binding_model_config,
             max_beam_width=max_beam_width,

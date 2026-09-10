@@ -742,14 +742,16 @@ class CustomDataset(BenchmarkDataset):
         If the file holds fewer than num_requests lines, the samples are
         oversampled to reach num_requests.
         """
+        if len(self.data) == 0:
+            raise ValueError("No data loaded from --dataset-path")
+
         # Collect all prompts and metadata
         prompts = []
         max_tokens_list = []
         prompt_lengths = []
 
-        for i, entry in enumerate(self.data):
-            if len(prompts) >= num_requests:
-                break
+        for i in range(num_requests):
+            entry = self.data[i % len(self.data)]
             prompt = entry["input"]["messages"][1]["content"]
             max_tokens = entry["input"][
                 "max_tokens"] if output_len is None else output_len

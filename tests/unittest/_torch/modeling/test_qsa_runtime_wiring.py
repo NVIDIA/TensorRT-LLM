@@ -159,6 +159,7 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
         relative_attention_bias=None,
         relative_attention_max_distance=0,
         has_lora=False,
+        output_gate=None,
     )
 
     assert output is None
@@ -322,6 +323,36 @@ def test_qsa_cache_manager_delegates_regular_kv_layout(
     assert calls == [(manager, 7, "HND")]
 
 
+def test_qsa_uses_regular_attention_for_unsupported_head_dim() -> None:
+    """Triton indexes head dims with tl.arange, so non-powers of two go dense."""
+    metadata = object.__new__(QSAAttentionMetadata)
+    metadata._num_tokens = 1
+    metadata.kv_cache_manager = SimpleNamespace(dtype=DataType.BF16)
+    # head_dim comes from the module, not from q: q is still the fused QKV here.
+    attention = SimpleNamespace(head_dim=96, sparse_params=_sparse_params(), layer_idx=0)
+
+    output = QSASparseHooks().forward(
+        attention=attention,
+        q=torch.empty((1, 96 * (4 + 2 + 2))),
+        k=None,
+        v=None,
+        attn_metadata=metadata,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_window_size=None,
+        attention_mask_data=None,
+        mrope_config=None,
+        attention_sinks=None,
+        relative_attention_bias=None,
+        relative_attention_max_distance=0,
+        has_lora=False,
+        output_gate=None,
+        qsa_index_hidden_states=torch.empty((1, 1)),
+        qsa_position_ids=torch.zeros((1,), dtype=torch.int32),
+    )
+
+    assert output is None
+
+
 def test_qsa_uses_regular_attention_for_scale_paged_kv_cache() -> None:
     metadata = object.__new__(QSAAttentionMetadata)
     metadata._num_tokens = 1
@@ -343,6 +374,7 @@ def test_qsa_uses_regular_attention_for_scale_paged_kv_cache() -> None:
         relative_attention_bias=None,
         relative_attention_max_distance=0,
         has_lora=False,
+        output_gate=None,
         qsa_index_hidden_states=torch.empty((1, 1)),
         qsa_position_ids=torch.zeros((1,), dtype=torch.int32),
     )

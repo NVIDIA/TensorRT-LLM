@@ -229,6 +229,13 @@ def assert_acceptance_length(test_key: str, al_value: float) -> None:
         f"(ref_al={ref_str})")
 
 
+def assert_acceptance_length_for_llm(test_key: str, llm) -> None:
+    """Compute, report, and check an LLM's mean acceptance length."""
+    acceptance_length = compute_acceptance_length(llm)
+    print(f"[AL] {test_key} acceptance_length = {acceptance_length:.6f}")
+    assert_acceptance_length(test_key, acceptance_length)
+
+
 class AccuracyTask:
     REFERENCE_DIR = f"{os.path.dirname(__file__)}/references"
 

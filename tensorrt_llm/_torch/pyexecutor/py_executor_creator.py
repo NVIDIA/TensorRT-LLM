@@ -259,7 +259,6 @@ def _load_config_and_create_checkpoint_loader(
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
-        mx_model_name=llm_args.model,
         checkpoint_io_policy=llm_args.checkpoint_io_policy,
         load_format=llm_args.load_format,
         partial_model_loading=llm_args.is_partial_model_loading,
@@ -496,10 +495,12 @@ def create_py_executor(
         if hasattr(spec_config, '_max_batch_size'):
             spec_config._max_batch_size = max_batch_size
 
-        # WAR for https://nvbugs/5807902
-        # Disable separate draft KV cache in disaggregated mode
-        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        if cache_transceiver_config is not None:
+        # WAR for https://nvbugs/5807902 (Eagle3 disagg RMSNorm crash, closed
+        # will-not-fix). Keep the blanket disable; carve out only the standalone
+        # drafters, which it stranded on their private max_seq_len-dense arena.
+        is_standalone_drafter = (spec_config.spec_dec_mode.is_dflash()
+                                 or spec_config.spec_dec_mode.is_dspark())
+        if cache_transceiver_config is not None and not is_standalone_drafter:
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
