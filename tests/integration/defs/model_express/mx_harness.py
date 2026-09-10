@@ -533,7 +533,8 @@ def collect_available_payloads(layout: MxRunLayout) -> dict[str, dict[str, objec
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, ValueError) as error:
+            # `ValueError` covers truncated JSON and undecodable bytes alike.
             print(f"MX E2E timing: ignoring unreadable payload {path}: {error}")
             continue
         if isinstance(payload, dict):
@@ -631,7 +632,9 @@ def collect_available_manifests(manifest_dir: Path) -> dict[ManifestKey, WeightM
     """Best-effort manifests of a run for the timing report.
 
     Unlike `collect_weight_manifests`, this never fails: files that do not
-    follow the manifest naming or do not load are reported and skipped.
+    follow the manifest naming, do not parse, or parse into something that is
+    not a manifest are reported and skipped. This runs from the test's cleanup
+    path, so it must never replace the failure that brought the run down.
     """
     manifests: dict[ManifestKey, WeightManifest] = {}
     if not manifest_dir.is_dir():
@@ -642,7 +645,10 @@ def collect_available_manifests(manifest_dir: Path) -> dict[ManifestKey, WeightM
             continue
         try:
             manifest = load_weight_manifest(path)
-        except (OSError, ValueError, KeyError) as error:
+        except (OSError, TypeError, ValueError, KeyError) as error:
+            # `TypeError`: valid JSON that is not an object (for example `[]`);
+            # `KeyError`: an object without the manifest keys; `ValueError`:
+            # malformed JSON or a stale whole-manifest digest.
             print(f"MX E2E timing: ignoring unreadable manifest {path}: {error}")
             continue
         manifests[(match["family"], match["role"], int(match["rank"]))] = manifest
