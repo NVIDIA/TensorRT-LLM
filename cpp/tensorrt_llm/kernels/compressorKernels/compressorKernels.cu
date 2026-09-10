@@ -1775,6 +1775,8 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
         float residualScale = 0.F;
         if constexpr (hasResidual)
         {
+            // Collect participating lanes before diverging into the RoPE residual groups.
+            uint32_t const residualMask = __ballot_sync(0xFFFFFFFFU, isResidualGroup);
             if (isResidualGroup)
             {
                 float localResidualAmax = 0.F;
@@ -1790,8 +1792,10 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
                 }
 #pragma unroll
                 for (int offset = GROUP_SIZE / 2; offset > 0; offset >>= 1)
+                {
                     localResidualAmax
-                        = fmaxf(localResidualAmax, __shfl_xor_sync(0xFFFFFFFF, localResidualAmax, offset));
+                        = fmaxf(localResidualAmax, __shfl_xor_sync(residualMask, localResidualAmax, offset));
+                }
 
                 __nv_fp8_e4m3 const fp8ResidualScale(
                     fminf(localResidualAmax * nvfp4_global_scale * kFp4MaxInv, 448.0F));
