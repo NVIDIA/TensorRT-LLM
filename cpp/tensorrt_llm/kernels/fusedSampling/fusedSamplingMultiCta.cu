@@ -16,6 +16,7 @@
  */
 
 #include "fusedSamplingKernelsCommon.cuh"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm
 {
@@ -499,6 +500,7 @@ void launchFusedSamplingMultiCta(FusedSamplingParams const& params, cudaStream_t
         smallBatchSplitOutputKernel<T, false><<<statsGrid, statsBlock, 0, stream>>>(params);
         smallBatchSplitFinalizeKernel<T, false><<<rowGrid, finishBlock, 0, stream>>>(params);
     }
+    sync_check_cuda_error(stream);
 }
 
 template void launchFusedSamplingMultiCta<float>(FusedSamplingParams const&, cudaStream_t);
