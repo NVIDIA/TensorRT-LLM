@@ -20,11 +20,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from qualname_map import (
+    PythonChangeAnalysis,
+    analyze_python_changes,
     closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,
 )
-from rules._helpers import iter_diff_post_line_numbers
+from reference_map import RepositoryReferenceIndex
+from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers
 from touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
@@ -50,6 +53,8 @@ class CoverageResult:
     n_untrusted: int = 0
     # functions with no DB rows (new/uninstrumented); bounded per `no_data_policy`
     no_data_funcs: list[str] = field(default_factory=list)
+    # functions with no rows whose statically complete local callers provide the bound
+    caller_bounded_funcs: list[str] = field(default_factory=list)
     # residual file the forge API returned no patch for (binary / rename / oversized); declines
     no_diff_files: list[str] = field(default_factory=list)
 
@@ -72,6 +77,7 @@ class CoverageSelector:
         untrusted_stage_markers: tuple[str, ...] = _UNTRUSTED_STAGE_MARKERS,
         no_data_policy: str = DEFAULT_NO_DATA_POLICY,
         read_source: Callable[[str], str | None] | None = None,
+        external_references: Callable[[str, set[str]], set[str]] | None = None,
     ) -> None:
         self.db = db
         self.repo_root = Path(repo_root)
@@ -83,6 +89,9 @@ class CoverageSelector:
         self._no_data_policy = no_data_policy
         # Defaults to the checkout; callers explaining a past commit inject their own.
         self._read_source = read_source or self._read_head
+        self._external_references = (
+            external_references or RepositoryReferenceIndex(self.repo_root).external_references
+        )
         self._untrusted: set[str] | None = None
 
     def untrusted_tests(self) -> set[str]:
@@ -108,10 +117,11 @@ class CoverageSelector:
 
     def _impacted_tests(
         self, residual_files: list[str], diffs: dict[str, str]
-    ) -> tuple[set[str], list[str], list[str], str | None]:
-        """Return (impacted tests, qualnames with no DB rows, files with no diff, decline reason)."""
+    ) -> tuple[set[str], list[str], list[str], list[str], str | None]:
+        """Return impacted tests, diagnostics, and an optional decline reason."""
         impacted: set[str] = set()
-        no_data: list[str] = []
+        no_data: set[str] = set()
+        caller_bounded: set[str] = set()
         no_diff: list[str] = []
         for path in residual_files:
             cf = canon(path)
@@ -120,32 +130,139 @@ class CoverageSelector:
             if not diff.strip() or source is None:
                 # Patch omitted (binary / renamed / oversized): the changed scope is unknown.
                 no_diff.append(path)
-                return impacted, no_data, no_diff, f"no usable diff: {path}"
+                return (
+                    impacted,
+                    sorted(no_data),
+                    sorted(caller_bounded),
+                    no_diff,
+                    f"no usable diff: {path}",
+                )
             lines = iter_diff_post_line_numbers(diff)
             qualnames, ok = qualnames_for_lines(source, lines)
             if not ok:
-                return impacted, no_data, no_diff, f"unparsable source: {path}"
+                return (
+                    impacted,
+                    sorted(no_data),
+                    sorted(caller_bounded),
+                    no_diff,
+                    f"unparsable source: {path}",
+                )
             if not lines:
                 continue  # comment / blank only: nothing executable changed, so nothing runs
             import_executed = import_executed_qualnames(source)
             closures = closure_attributed_qualnames(source, lines)
+            dependencies = analyze_python_changes(source, lines, iter_diff_deleted_post_lines(diff))
+            import_resolved = False
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
                 if qualname in import_executed:
-                    why = f"import-executed change, no sound bound: {path}::{qualname}"
-                    return impacted, no_data, no_diff, why
+                    if dependencies.unresolved_reason:
+                        why = (
+                            f"import-executed change, no sound bound: {path}::{qualname} "
+                            f"({dependencies.unresolved_reason})"
+                        )
+                        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
+                    if not import_resolved:
+                        external = self._external_references(cf, dependencies.changed_bindings)
+                        if external:
+                            why = (
+                                f"import-executed change has external binding reference(s): "
+                                f"{path}::{', '.join(sorted(external))}"
+                            )
+                            return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
+                        for consumer in sorted(dependencies.import_consumers):
+                            if (
+                                not self.db.tests_touching_func(cf, consumer)
+                                and "." not in consumer
+                                and self._external_references(cf, {consumer})
+                            ):
+                                why = (
+                                    "import-derived consumer has external reference(s): "
+                                    f"{path}::{consumer}"
+                                )
+                                return (
+                                    impacted,
+                                    sorted(no_data),
+                                    sorted(caller_bounded),
+                                    no_diff,
+                                    why,
+                                )
+                            tests, bounded = self._qualname_impact(
+                                cf, consumer, dependencies, allow_caller_bound=True
+                            )
+                            impacted |= tests
+                            if not self.db.tests_touching_func(cf, consumer):
+                                no_data.add(f"{cf}::{consumer}")
+                                if bounded:
+                                    caller_bounded.add(f"{cf}::{consumer}")
+                        import_resolved = True
+                    continue
                 if qualname in closures:
                     tests = self._underrecorded_bound(cf, qualname)
                     if tests is None:
                         why = f"closure change, no wider row set: {path}::{qualname}"
-                        return impacted, no_data, no_diff, why
+                        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
                     impacted |= tests
                     continue
-                tests = self.db.tests_touching_func(cf, qualname)
+                tests, bounded = self._qualname_impact(
+                    cf,
+                    qualname,
+                    dependencies,
+                    allow_caller_bound=qualname in dependencies.import_consumers,
+                )
                 impacted |= tests
-                if not tests:
-                    no_data.append(f"{cf}::{qualname}")
-                    impacted |= self._no_data_fallback(cf)
-        return impacted, no_data, no_diff, None
+                if not self.db.tests_touching_func(cf, qualname):
+                    no_data.add(f"{cf}::{qualname}")
+                    if bounded:
+                        caller_bounded.add(f"{cf}::{qualname}")
+        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, None
+
+    def _qualname_impact(
+        self,
+        cf: str,
+        qualname: str,
+        dependencies: PythonChangeAnalysis,
+        *,
+        allow_caller_bound: bool = False,
+    ) -> tuple[set[str], bool]:
+        """Return a qualname's tests and whether local callers bounded a no-data symbol."""
+        tests = self.db.tests_touching_func(cf, qualname)
+        if tests:
+            return tests, False
+        if allow_caller_bound:
+            caller_tests = self._caller_bound(
+                cf,
+                qualname,
+                dependencies.callers,
+                dependencies.caller_escapes,
+                set(),
+            )
+            if caller_tests is not None:
+                return caller_tests, True
+        return self._no_data_fallback(cf), False
+
+    def _caller_bound(
+        self,
+        cf: str,
+        qualname: str,
+        callers: dict[str, set[str]],
+        caller_escapes: set[str],
+        visiting: set[str],
+    ) -> set[str] | None:
+        """Resolve every local direct-caller branch to a qualname with DB rows."""
+        if qualname in visiting or qualname in caller_escapes or not callers.get(qualname):
+            return None
+        visiting = visiting | {qualname}
+        bound: set[str] = set()
+        for caller in callers[qualname]:
+            tests = self.db.tests_touching_func(cf, caller)
+            if tests:
+                bound |= tests
+                continue
+            transitive = self._caller_bound(cf, caller, callers, caller_escapes, visiting)
+            if transitive is None:
+                return None
+            bound |= transitive
+        return bound or None
 
     def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
         """File row set when it is wider than a closure's enclosing qualname's, else None."""
@@ -180,8 +297,8 @@ class CoverageSelector:
                     ok=False, reason=f"zero-touch residual file (new/uninstrumented): {path}"
                 )
 
-        impacted_tests, no_data_funcs, no_diff_files, decline = self._impacted_tests(
-            residual_files, diffs
+        impacted_tests, no_data_funcs, caller_bounded_funcs, no_diff_files, decline = (
+            self._impacted_tests(residual_files, diffs)
         )
         if decline is not None:
             return CoverageResult(ok=False, reason=decline, no_diff_files=no_diff_files)
@@ -212,4 +329,5 @@ class CoverageSelector:
             skippable=skippable,
             n_untrusted=n_untrusted,
             no_data_funcs=no_data_funcs,
+            caller_bounded_funcs=caller_bounded_funcs,
         )

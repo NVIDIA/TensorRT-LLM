@@ -116,6 +116,25 @@ def iter_diff_post_line_numbers(diff: str) -> set[int]:
     return out
 
 
+def iter_diff_deleted_post_lines(diff: str) -> dict[int, list[str]]:
+    """Return non-comment deleted source lines grouped by post-image anchor."""
+    out: dict[int, list[str]] = {}
+    new_line = 0
+    for line in diff.splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if m is not None:
+            new_line = int(m.group(1))
+            continue
+        if not line or line.startswith(("+++", "---")):
+            continue
+        sign = line[0]
+        if sign == "-":
+            out.setdefault(new_line, []).append(line[1:])
+        elif sign in (" ", "+"):
+            new_line += 1
+    return out
+
+
 def iter_diff_added_post_line_numbers(diff: str) -> set[int]:
     """Post-PR line numbers (1-indexed) touched by `+` lines only.
 

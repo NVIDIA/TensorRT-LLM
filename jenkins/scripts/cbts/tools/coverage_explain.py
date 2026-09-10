@@ -41,8 +41,13 @@ CBTS = THIS.parent.parent
 sys.path.insert(0, str(CBTS))
 sys.path.insert(0, str(CBTS / "coverage_selection"))
 
-from qualname_map import qualnames_for_lines  # noqa: E402
-from rules._helpers import iter_diff_post_line_numbers  # noqa: E402
+from qualname_map import (  # noqa: E402
+    analyze_python_changes,
+    closure_attributed_qualnames,
+    import_executed_qualnames,
+    qualnames_for_lines,
+)
+from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers  # noqa: E402
 from selector import CoverageSelector  # noqa: E402
 from touch_db import TouchDB, canon, stage_family  # noqa: E402
 
@@ -58,6 +63,23 @@ def _src_at(repo: Path, sha: str, path: str) -> str | None:
         ["git", "show", f"{sha}:{path}"], cwd=str(repo), capture_output=True, text=True, check=False
     )
     return r.stdout if r.returncode == 0 else None
+
+
+def _caller_frontier(db: TouchDB, cf: str, qualname: str, callers, visiting=None):
+    """Return row-bearing local callers only when every branch resolves."""
+    visiting = set() if visiting is None else visiting
+    if qualname in visiting or not callers.get(qualname):
+        return None
+    frontier: set[str] = set()
+    for caller in callers[qualname]:
+        if db.tests_touching_func(cf, caller):
+            frontier.add(caller)
+            continue
+        nested = _caller_frontier(db, cf, caller, callers, visiting | {qualname})
+        if nested is None:
+            return None
+        frontier.update(nested)
+    return frontier or None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     impact_funcs: set[tuple[str, str]] = set()
     impact_files: set[str] = set()
     changed_files: set[str] = set()
+    caller_bounded = set(res.caller_bounded_funcs)
     for f in core:
         cf = canon(f)
         changed_files.add(cf)
@@ -105,11 +128,31 @@ def main(argv: list[str] | None = None) -> int:
         if not ok:
             impact_files.add(cf)
             continue
-        for q in qns:
+        dependencies = analyze_python_changes(
+            src, lines, iter_diff_deleted_post_lines(diffs.get(f, ""))
+        )
+        import_executed = import_executed_qualnames(src)
+        closures = closure_attributed_qualnames(src, lines)
+
+        def record_impact(q: str) -> None:
             if db.tests_touching_func(cf, q):
                 impact_funcs.add((cf, q))
-            else:
+                return
+            if f"{cf}::{q}" in caller_bounded:
+                frontier = _caller_frontier(db, cf, q, dependencies.callers)
+                if frontier:
+                    impact_funcs.update((cf, caller) for caller in frontier)
+                    return
+            impact_files.add(cf)
+
+        for q in qns:
+            if q in import_executed:
+                for consumer in dependencies.import_consumers:
+                    record_impact(consumer)
+            elif q in closures:
                 impact_files.add(cf)
+            else:
+                record_impact(q)
     no_data = res.no_data_funcs
 
     print(f"commit {args.sha[:12]} — {len(core)} core file(s), impact set:")
@@ -118,9 +161,14 @@ def main(argv: list[str] | None = None) -> int:
     for cf in sorted(impact_files):
         print(f"  {cf} :: <file-level>")
     if no_data:
-        print(f"  ({len(no_data)} changed function(s) with no DB rows -> file-level fallback)")
+        file_bounded = set(no_data) - caller_bounded
+        print(
+            f"  ({len(no_data)} changed function(s) with no DB rows: "
+            f"{len(caller_bounded)} caller-bounded, {len(file_bounded)} file-level fallback)"
+        )
         for s in sorted(no_data):
-            print(f"    no-data: {s}")
+            bound = "caller-bound" if s in caller_bounded else "file-level"
+            print(f"    no-data ({bound}): {s}")
     if non_core:
         print(
             f"\n  NOTE: {len(non_core)} non-core file(s) in this commit are not evaluated here. "

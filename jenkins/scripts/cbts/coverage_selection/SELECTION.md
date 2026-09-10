@@ -47,12 +47,12 @@ of:
 |---|---|
 | Non-core file | `path` is not a `.py` under `tensorrt_llm/` (checked on the **repo path**, not `canon()`) |
 | File absent from the DB | `file_has_touch_rows(cf)` is false — new or uninstrumented, so "who touches it" is unknown rather than empty |
-| **Import-executed change** | a changed line lands on a module body, a class body, or a signature / decorator line |
+| **Unbounded import-executed change** | a changed line lands on a class body, signature / decorator, or unsupported module statement; the conservative exceptions are below |
 | No usable patch | the forge API omitted the diff (binary / rename / oversized), so the changed scope is unknown |
 | Unparsable source | the AST walk failed, so lines cannot be mapped to qualnames |
 | Closure change with no wider row set | see the next section |
 
-## 4. Why import-executed changes fail closed
+## 4. Bounding low-risk import-executed changes
 
 Import-phase rows are recorded only by the tests that spawn subprocesses (`../coverage_utils/COLLECTION.md`
 §5.2), so a `<module>` or `ClassName` row set is missing the tests served by MPI pool workers. Widening
@@ -61,9 +61,29 @@ that imports the file and never enters any function in it records nothing there 
 from the file set too. Measured on `llmapi/llm_args.py`, the widening goes from 509 holders to 735 while
 about 746 tests import the file — the gap does not close.
 
-Since the missing tests cannot be enumerated from the data, these changes decline outright until the
-producer records the pool workers' import phase. Ordinary function-body changes are unaffected and keep
-precise narrowing.
+Consequently, Tier 2 never uses `<module>` or class-body rows as an impact bound. Most import-executed
+changes still decline. A small AST allowlist can instead translate these low-risk module statements to
+the local functions and methods that consume the changed binding:
+
+- a module binding whose value is a literal container/scalar, including replacement when both
+  the old and new statements are safe assignments to the same names;
+- an annotated literal when `from __future__ import annotations` postpones annotation evaluation;
+- a newly added builtin-module `import` (replacement imports remain unsupported);
+- a newly added plain function declaration with no decorator, default expression, or eagerly evaluated
+  annotation.
+
+The AST layer reports bindings, consumers, and direct local caller edges; it does not infer visibility
+from underscores or any other spelling convention. Before using those facts, the selector checks the
+repository import/reference graph. A binding referenced from another file declines, as does an
+externally referenced no-data consumer whose local callers would otherwise be used as its bound.
+
+The analysis also declines if the binding is consumed by import-executed code. Otherwise its consumers
+are resolved exactly like changed function bodies. If a consumer is new or absent from the DB, Tier 2
+may walk direct, unshadowed local caller edges until every branch reaches a qualname with DB rows. An
+unresolved branch, cycle, or use of the function as a value falls back to the configured no-data policy
+(the whole file by default).
+This is why `_LINUX_EBADHANDLE = 521` can be bounded through `_is_lock_infra_error` and its recorded
+callers without treating all import-time execution as safe or assuming that `_` means private.
 
 ### 4.1 Closures
 
@@ -93,7 +113,10 @@ for each residual file:
   ├ no usable diff / unparsable → decline
   ├ diff has no lines           → contributes nothing (comment / blank only)
   └ for each changed qualname:
-       ├ import-executed → decline
+       ├ supported module binding/declaration
+       │    ├ external reference / import-time consumer → decline
+       │    └ local consumers → rows / local caller bound / no-data fallback
+       ├ other import-executed change          → decline
        ├ closure         → _underrecorded_bound(cf, q)      bound or decline
        ├ has DB rows     → tests_touching_func(cf, q)       precise
        └ no DB rows      → no_data_policy fallback (file by default)
