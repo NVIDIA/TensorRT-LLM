@@ -39,6 +39,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import (TensorParallelMode,
                                                 load_weight_shard)
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
@@ -1562,6 +1563,15 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
 
 class TritonFusedMoE(MoE):
+    """Hopper-only (SM90) Triton MoE backend.
+
+    Deprecated in TensorRT-LLM 1.3 (2026-09). The class remains functional
+    during the 3-month migration period in the project deprecation policy,
+    then it is scheduled for removal. Prefer ``moe_config.backend="CUTLASS"``
+    for a functionally supported replacement on Hopper; performance may
+    differ. Construction logs a one-time warning. See
+    https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy
+    """
 
     capabilities = MoEStaticCapability(supports_expert_bias=True)
 
@@ -1671,6 +1681,16 @@ class TritonFusedMoE(MoE):
         layer_idx: Optional[int] = None,
         activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     ):
+        # One warning per process: gpt-oss constructs one module per layer.
+        logger.warning_once(
+            "TritonFusedMoE (moe_config.backend='TRITON') is deprecated as of "
+            "TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month "
+            "migration period. It remains functional on Hopper (SM90) until "
+            "then. Switch to moe_config.backend='CUTLASS' for a functionally "
+            "supported replacement; performance may differ. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="triton_fused_moe_deprecated",
+        )
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
