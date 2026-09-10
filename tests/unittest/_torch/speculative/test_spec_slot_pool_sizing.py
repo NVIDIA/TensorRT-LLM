@@ -3,10 +3,11 @@
 """Speculative-decoding state that is keyed by live-request identity must be
 sized by the sequence-slot pool, not by max_batch_size.
 
-Under the attention-DP overlap headroom the two differ by 2x
-(``compute_max_num_sequences``): a finished request holds its slot for one more
-iteration while its replacement is already admitted (nvbug-6627795). Two
-distinct families follow from that, and only the first needs the pool size:
+The two differ whenever ``compute_max_num_sequences`` widens the pool: under
+pipeline depth, under disaggregation, and under the attention-DP overlap headroom
+where a finished request holds its slot for one more iteration while its
+replacement is already admitted (nvbug-6627795). Two distinct families follow
+from that, and only the first needs the pool size:
 
 * keyed by ``py_seq_slot`` / a per-request ``SlotManager`` slot -- must span the
   pool. ``SpecMetadata.num_seq_slots`` (draft_probs, full_draft_probs,
@@ -232,8 +233,12 @@ def test_every_resource_manager_branch_forwards_the_slot_pool():
 # ---------------------------------------------------------------------------
 
 
-def _drafter_engine(headroom: bool, seats: int = POOL):
-    """A stub target engine for get_spec_drafter's draft-target branch."""
+def _drafter_engine(seats):
+    """A stub target engine for get_spec_drafter's draft-target branch.
+
+    ``seats=None`` stands for an engine that publishes no pool at all, which is
+    the only case that still falls back to max_batch_size.
+    """
     spec_dec_mode = types.SimpleNamespace(
         is_user_provided=lambda: False,
         is_draft_target=lambda: True,
@@ -248,17 +253,15 @@ def _drafter_engine(headroom: bool, seats: int = POOL):
         max_concurrency=None,
         draft_len_schedule=None,
     )
-    return types.SimpleNamespace(
-        spec_config=spec_config,
-        batch_size=R,
-        max_num_seq_slots=seats,
-        _enable_disagg_adp_overlap_headroom=headroom,
-    )
+    engine = types.SimpleNamespace(spec_config=spec_config, batch_size=R)
+    if seats is not None:
+        engine.max_num_seq_slots = seats
+    return engine
 
 
-def _drafter(headroom: bool, seats: int = POOL):
+def _drafter(seats):
     return get_spec_drafter(
-        _drafter_engine(headroom, seats),
+        _drafter_engine(seats),
         draft_model_engine=object(),
         sampler=object(),
         spec_resource_manager=None,
@@ -266,18 +269,23 @@ def _drafter(headroom: bool, seats: int = POOL):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("headroom,expected_pool", [(True, POOL), (False, R)])
-def test_draft_slot_pool_follows_the_target_seat_pool(headroom, expected_pool):
+@pytest.mark.parametrize("seats,expected_pool", [(POOL, POOL), (R, R), (None, R)])
+def test_draft_slot_pool_follows_the_target_seat_pool(seats, expected_pool):
     """The draft pool is sized by the *target* engine's seat count.
 
     The indices it hands out address buffers sized by that seat count -- the
     sampler shared with PyExecutor, the draft KV cache manager's IndexMapper, and
     spec_resource_manager -- and ``_create_draft_request`` even carries the
     target's ``py_seq_slot`` across as ``target_seq_slot``. Sizing this pool
-    independently is what makes the two disagree. Headroom off keeps
-    max_batch_size, so nothing changes for the other topologies.
+    independently is what makes the two disagree.
+
+    Read from the published pool rather than from the reason it is wide: seats
+    exceed max_batch_size under pipeline depth and under disaggregation as well as
+    under the attention-DP headroom, and this pool cannot tell them apart. An
+    engine whose pool already equals max_batch_size (row 2) is therefore
+    unchanged, which is what keeps aggregated non-ADP deployments untouched.
     """
-    assert _drafter(headroom).draft_seq_slot_manager.slot_manager.max_num_requests == expected_pool
+    assert _drafter(seats).draft_seq_slot_manager.slot_manager.max_num_requests == expected_pool
 
 
 @pytest.mark.cpu_only
@@ -289,11 +297,11 @@ def test_draft_slot_pool_survives_a_full_overlap_turnover():
     cohorts hold draft slots at once. At max_batch_size the (R+1)-th lease raises
     NoFreeSlotsError -- inside the draft loop, mid-iteration.
     """
-    pool = _drafter(True).draft_seq_slot_manager.slot_manager
+    pool = _drafter(POOL).draft_seq_slot_manager.slot_manager
     slots = [pool.add_slot(rid) for rid in range(2 * R)]
     assert len(set(slots)) == 2 * R
 
-    starved = _drafter(False).draft_seq_slot_manager.slot_manager
+    starved = _drafter(R).draft_seq_slot_manager.slot_manager
     for rid in range(R):
         starved.add_slot(rid)
     with pytest.raises(NoFreeSlotsError):
@@ -336,8 +344,8 @@ def test_slot_pool_managers_accept_an_optional_pool_size(manager):
     """The receiving end of the same contract, with ``None`` as the default.
 
     ``None`` -- not ``max_num_requests`` -- has to be the default so that a caller
-    which does not know the pool (PP, no attention DP, overlap disabled) keeps the
-    established sizing without every call site having to restate it.
+    holding an engine that publishes no pool (unit-test stubs, mm-encoder-only
+    engines) keeps the established sizing without every call site restating it.
     """
     param = inspect.signature(manager.__init__).parameters.get("num_seq_slots")
 

@@ -1552,12 +1552,16 @@ def _index_mapper_capacity_for(
     num_reserved_index_slots: int = 1,
     enable_attention_dp: bool = False,
     disable_overlap_scheduler: bool = False,
-) -> tuple[int, int]:
-    """Construct a manager and return (IndexMapper capacity, page-table capacity).
+) -> tuple[int, int, int]:
+    """Construct a manager and return the three sizes it derives.
 
-    The two must agree: ``host_kv_cache_block_offsets`` is indexed by the index the
-    mapper hands out, so a page table sized below the mapper's capacity would be an
-    out-of-bounds write.
+    ``(IndexMapper capacity, page-table capacity, max_admissible_sequences)``.
+
+    The first two must agree: ``host_kv_cache_block_offsets`` is indexed by the
+    index the mapper hands out, so a page table sized below the mapper's capacity
+    would be an out-of-bounds write. The third is the published admission bound
+    that ``validate_seq_slot_pool_covers_admission`` checks the seat pool against
+    at startup, and it is the capacity minus the reserved dummy slots.
     """
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
@@ -1584,7 +1588,7 @@ def _index_mapper_capacity_for(
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor") as page_table,
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
     ):
-        KVCacheManagerV2(
+        manager = KVCacheManagerV2(
             # A quota must be set or __init__ asserts before it sizes anything
             # ("Quota not set. Check kv_cache_config.max_tokens or
             # kv_cache_config.max_gpu_total_bytes"). The value is irrelevant to the
@@ -1618,6 +1622,7 @@ def _index_mapper_capacity_for(
     return (
         index_mapper_cls.call_args.args[0],
         page_table.call_args.args[0],
+        manager.max_admissible_sequences,
     )
 
 
@@ -1665,7 +1670,7 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     reserved: int,
     expected: int,
 ) -> None:
-    capacity, page_table_capacity = _index_mapper_capacity_for(
+    capacity, page_table_capacity, max_admissible_sequences = _index_mapper_capacity_for(
         max_batch_size=max_batch_size,
         pp_size=pp_size,
         is_disagg=is_disagg,
@@ -1675,3 +1680,6 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     )
     assert capacity == expected
     assert page_table_capacity == expected
+    # The published bound excludes the reserved slots, which only ever hold
+    # persistent dummies and are not available to admitted requests.
+    assert max_admissible_sequences == expected - reserved

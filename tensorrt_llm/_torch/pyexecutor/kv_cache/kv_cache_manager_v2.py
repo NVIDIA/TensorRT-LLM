@@ -1531,9 +1531,11 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         max_num_sequences = max_batch_size * mapping.pp_size
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
-        index_mapper_capacity = (
-            max_num_sequences * (2 if needs_extra_index_slots else 1) + num_reserved_index_slots
-        )
+        # Admission bound for real requests, excluding the reserved slots that
+        # only ever hold persistent dummies. Published so the sequence-slot pool
+        # can be checked against it at startup.
+        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_index_slots else 1)
+        index_mapper_capacity = self.max_admissible_sequences + num_reserved_index_slots
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "

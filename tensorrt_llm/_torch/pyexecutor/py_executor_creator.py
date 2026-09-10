@@ -37,8 +37,9 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler,
-                    is_disagg_enabled, is_mla, validate_feature_combination)
+                    compute_max_num_sequences, create_py_executor_instance,
+                    instantiate_sampler, is_disagg_enabled, is_mla,
+                    validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_vswa_kv_cache_layout)
@@ -662,8 +663,12 @@ def create_py_executor(
     resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
-    max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
-                                max_batch_size * getattr(mapping, "pp_size", 1))
+    max_num_seq_slots = getattr(
+        model_engine, "max_num_seq_slots", None) or compute_max_num_sequences(
+            mapping,
+            max_batch_size,
+            llm_args.disable_overlap_scheduler,
+            is_disagg=is_disagg_enabled(cache_transceiver_config))
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64

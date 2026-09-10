@@ -573,20 +573,26 @@ def get_mtp_hidden_size(model_config) -> int:
 
 
 def seat_pool_or_none(model_engine) -> Optional[int]:
-    """The engine's sequence-slot pool size, or None to keep max_batch_size.
+    """The engine's sequence-slot pool size, or None if it publishes none.
 
     Pools keyed by live-request identity must follow the executor's
-    SeqSlotManager pool rather than max_batch_size: the overlap scheduler holds a
-    finished request's slot for one more iteration while its replacement is
-    admitted, so the transient demand exceeds max_batch_size (nvbug-6627795).
-    Buffers indexed by *batch position* deliberately keep max_batch_size -- the
+    SeqSlotManager pool rather than max_batch_size, because ``py_seq_slot`` --
+    the index they are addressed by -- ranges over that whole pool. Buffers
+    indexed by *batch position* deliberately keep max_batch_size: the
     micro-batch scheduler caps every forward at max_batch_size.
 
-    Gated on the same flag ``_set_up_spec_metadata`` reads, so every spec-decoding
-    pool agrees with the metadata about which number it is indexed by.
+    Read unconditionally rather than behind the attention-DP headroom gate.
+    ``max_num_seq_slots`` already exceeds max_batch_size for three independent
+    reasons -- pipeline depth, the attention-DP overlap headroom (nvbug-6627795)
+    and disaggregation -- and the buffers here cannot tell them apart. Gating on
+    one of the three sized them at max_batch_size under the other two while
+    ``_set_up_spec_metadata`` sized the metadata at the full pool, so a
+    high-numbered slot indexed past the end of the allocation.
+
+    Returns None only for engines that publish no pool at all (unit-test stubs,
+    mm-encoder-only engines), which keeps the established
+    ``num_seq_slots or max_num_requests`` fallback in the allocators.
     """
-    if not getattr(model_engine, "_enable_disagg_adp_overlap_headroom", False):
-        return None
     return getattr(model_engine, "max_num_seq_slots", None)
 
 

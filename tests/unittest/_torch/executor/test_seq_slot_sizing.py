@@ -1,25 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Attention-DP seq-slot sizing includes overlap headroom.
+"""Seq-slot pool sizing.
 
-Under the overlap scheduler, requests finished in the previous iteration
-still hold their sequence slots when the next iteration's
-prepare_resources runs, while the capacity scheduler has already dropped
-them from its budget (no_schedule_after_state=GENERATION_TO_COMPLETE) and
-backfilled their seats. Transient slot demand is therefore one extra
-micro-batch worth of slots, regardless of whether speculative decoding is
-enabled. The headroom is selected from runtime topology, not model
-architecture.
+Two independent reasons the pool must exceed max_batch_size, both selected from
+runtime topology rather than model architecture:
 
-Pipeline parallelism is out of scope: the pool is already sized by pp_size
+Attention-DP overlap headroom. Under the overlap scheduler, requests finished in
+the previous iteration still hold their sequence slots when the next iteration's
+prepare_resources runs, while the capacity scheduler has already dropped them
+from its budget (no_schedule_after_state=GENERATION_TO_COMPLETE) and backfilled
+their seats. Transient slot demand is therefore one extra micro-batch worth of
+slots, regardless of whether speculative decoding is enabled. Pipeline
+parallelism is out of scope for this term: the pool is already sized by pp_size
 there, and the ADP router's retiring-request correction is not rank-consistent
 because only the last pipeline stage marks generation requests
 GENERATION_TO_COMPLETE.
 
-compute_max_num_sequences is the single sizing implementation used both
-for the executor's SeqSlotManager pool (create_py_executor_instance) and
-for the sampler state (create_torch_sampler_args); resolve_max_num_sequences
-is how a consumer obtains it without re-deriving it.
+Disaggregated serving. On a generation server the admission bound is
+KVCacheManagerV2's IndexMapper rather than the seat pool, and it is sized at
+twice max_num_sequences. Unlike the headroom above, this holds regardless of
+attention DP, overlap, or PP.
+
+compute_max_num_sequences is the single sizing implementation used both for the
+executor's SeqSlotManager pool (create_py_executor_instance) and for the sampler
+state (create_torch_sampler_args); resolve_max_num_sequences is how a consumer
+obtains it without re-deriving it. Every other slot-indexed buffer follows the
+same number, since py_seq_slot indexes them all.
 """
 
 import inspect
@@ -38,15 +44,14 @@ from tensorrt_llm._torch.pyexecutor._util import (
     should_enable_disagg_adp_overlap_headroom,
     should_enable_non_overlap_adp_forward_intent,
     should_enable_scheduler_aware_adp_dummy,
+    validate_seq_slot_pool_covers_admission,
 )
 from tensorrt_llm.mapping import Mapping
 
 _UCX = SimpleNamespace(backend="UCX")
 
-# (pp_size, enable_overlap_headroom, expected_factor)
-#
-# Disaggregation is absent from this table on purpose -- see
-# test_seat_pool_has_no_disagg_term.
+# (pp_size, enable_overlap_headroom, expected_factor) for an aggregated server.
+# The disaggregated counterpart is DISAGG_SIZING_CASES below.
 SIZING_CASES = [
     # No PP: the headroom buys one extra micro-batch worth of seats.
     (1, False, 1),
@@ -146,22 +151,140 @@ def test_compute_max_num_sequences_scopes_overlap_headroom(
     )
 
 
-def test_seat_pool_has_no_disagg_term():
-    """The disaggregation 2x reaches the seat pool only through the gate.
+# (pp_size, enable_overlap_headroom, expected_factor). The factor is relative to
+# max_batch_size and, for disagg, must cover the IndexMapper's 2x.
+DISAGG_SIZING_CASES = [
+    # Disagg gets the coefficient on topology alone, with no headroom opt-in.
+    (1, False, 2),
+    # The two factors overlap rather than compose, so this stays 2x.
+    (1, True, 2),
+    # PP composes: the IndexMapper is likewise sized pp_size * 2.
+    (2, False, 4),
+    (4, False, 8),
+]
 
-    A request awaiting its KV transfer holds an *index* lease and no seat at all:
-    ``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``
-    requests outright and only seats one once its transmission completes. So the
-    sizing function itself must not carry a disaggregation term -- the single
-    ``enable_overlap_headroom`` flag is the only way in.
 
-    Asserting on the signature rather than on a return value is deliberate: a
-    value test cannot distinguish "the parameter is gone" from "the parameter
-    defaults to False", and it is the parameter's *existence* that invites a
-    caller to propagate the factor.
+@pytest.mark.parametrize("pp_size,enable_overlap_headroom,expected_factor", DISAGG_SIZING_CASES)
+def test_disagg_seats_cover_index_mapper_capacity(
+    pp_size, enable_overlap_headroom, expected_factor
+):
+    max_batch_size = 8
+    mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
+
+    seats = compute_max_num_sequences(
+        mapping,
+        max_batch_size,
+        disable_overlap_scheduler=False,
+        enable_overlap_headroom=enable_overlap_headroom,
+        is_disagg=True,
+    )
+
+    assert seats == max_batch_size * expected_factor
+
+    # Seats must cover every request admission can let through. Mirrors the
+    # expression in KVCacheManagerV2.__init__.
+    index_mapper_capacity = max_batch_size * pp_size * 2
+    assert seats >= index_mapper_capacity
+
+
+@pytest.mark.parametrize("disable_overlap", [False, True])
+def test_disagg_seats_do_not_depend_on_overlap_scheduler(disable_overlap):
+    """The IndexMapper is sized the same either way, so seats must be too.
+
+    Turning the overlap scheduler off removes the terminal-slot race but not the
+    transfer/generate overlap that the 2x coefficient exists for.
     """
-    assert "is_disagg" not in inspect.signature(compute_max_num_sequences).parameters
-    assert "is_disagg" not in inspect.signature(resolve_max_num_sequences).parameters
+    max_batch_size = 8
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+
+    assert (
+        compute_max_num_sequences(mapping, max_batch_size, disable_overlap, is_disagg=True)
+        == max_batch_size * 2
+    )
+
+
+def test_aggregate_sizing_is_unchanged():
+    """Aggregated deployments size the pool at one forward batch."""
+    max_batch_size = 8
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+
+    assert (
+        compute_max_num_sequences(
+            mapping, max_batch_size, disable_overlap_scheduler=False, is_disagg=False
+        )
+        == max_batch_size
+    )
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+@pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize("is_disagg", [False, True])
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_sizing_matches_kv_manager_admission_bound(
+    enable_attention_dp, pp_size, is_disagg, disable_overlap_scheduler
+):
+    """The two coefficients are computed independently; hold them in step.
+
+    KVCacheManagerV2 derives its own admission bound from max_batch_size,
+    pp_size, is_disagg and the attention-DP overlap condition. Assert the two
+    expressions against each other rather than against a literal, so a drift in
+    either one fails here rather than at startup in
+    validate_seq_slot_pool_covers_admission.
+    """
+    max_batch_size = 8
+    mapping = Mapping(
+        world_size=pp_size,
+        tp_size=1,
+        pp_size=pp_size,
+        enable_attention_dp=enable_attention_dp,
+    )
+
+    seats = compute_max_num_sequences(
+        mapping,
+        max_batch_size,
+        disable_overlap_scheduler,
+        enable_overlap_headroom=should_enable_disagg_adp_overlap_headroom(
+            mapping,
+            _UCX if is_disagg else None,
+            disable_overlap_scheduler,
+        ),
+        is_disagg=is_disagg,
+    )
+
+    # Mirrors the coefficient in KVCacheManagerV2.__init__.
+    needs_extra_index_slots = is_disagg or (
+        enable_attention_dp and not disable_overlap_scheduler and pp_size == 1
+    )
+    admission_bound = max_batch_size * pp_size * (2 if needs_extra_index_slots else 1)
+
+    assert seats >= admission_bound
+
+
+def test_validate_seq_slot_pool_accepts_sufficient_pool():
+    validate_seq_slot_pool_covers_admission(16, Mock(max_admissible_sequences=16))
+
+
+def test_validate_seq_slot_pool_rejects_undersized_pool():
+    with pytest.raises(ValueError, match="smaller than the number of"):
+        validate_seq_slot_pool_covers_admission(8, Mock(max_admissible_sequences=16))
+
+
+def test_validate_seq_slot_pool_ignores_managers_without_a_bound():
+    """The V1/C++ manager does not publish one; the check must not fire."""
+    manager = Mock(spec=[])
+    validate_seq_slot_pool_covers_admission(1, manager)
+    validate_seq_slot_pool_covers_admission(1, None)
+
+
+def test_validate_seq_slot_pool_ignores_a_non_integer_bound():
+    """A bare ``Mock`` auto-creates the attribute, so ``is None`` is not enough.
+
+    ``create_py_executor_instance`` is called with a ``Mock()`` cache manager in
+    other modules' tests (e.g. test_dual_pool_kv_cache). Keying the opt-in on
+    ``is None`` would let a ``Mock`` attribute reach the comparison and raise
+    ``TypeError`` from a startup validator.
+    """
+    validate_seq_slot_pool_covers_admission(1, Mock())
 
 
 @pytest.mark.parametrize(
