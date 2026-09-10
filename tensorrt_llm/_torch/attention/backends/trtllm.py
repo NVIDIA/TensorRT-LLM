@@ -71,6 +71,23 @@ def _resolve_skip_correction_threshold(threshold: float,
     return 0.0
 
 
+def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
+                             sm_version: int) -> bool:
+    uses_spcompress = bool(
+        isinstance(sparse_params, SkipSoftmaxParams)
+        and sparse_params.uses_spcompress)
+    if not uses_spcompress:
+        return False
+    if sm_version == 107:
+        return True
+    logger.warning_once(
+        "spcompress is supported only on SM107; "
+        f"disabling it on SM{sm_version}.",
+        key="uses_spcompress_unsupported_sm",
+    )
+    return False
+
+
 @functools.cache
 def generate_spec_decoding_position_offsets(max_num_requests: int,
                                             draft_len: int) -> torch.Tensor:
@@ -1421,6 +1438,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 used by DeepSeek-V4 and DSA on SM120/SM121.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
+            sparse_params (SparseParams): When a ``SkipSoftmaxParams`` with
+                ``uses_spcompress=True`` is passed on SM107, enables 2:4
+                activation-sparsity (spcompress) for the trtllm-gen FMHA
+                context phase.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -1450,6 +1471,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             skip_correction_threshold,
             get_sm_version(),
             is_mla=self.is_mla_enable)
+        self.uses_spcompress = _resolve_uses_spcompress(sparse_params,
+                                                        get_sm_version())
 
         if self.is_mla_enable:
             self.q_lora_rank = self.mla_params.q_lora_rank

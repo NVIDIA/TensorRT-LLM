@@ -1418,6 +1418,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description="Target sparsity for prefill and/or decode phases. "
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
+    uses_spcompress: bool = Field(
+        default=False,
+        description="Whether to enable spcompress (context phase, SM107 only).")
 
     @field_validator("target_sparsity")
     @classmethod
@@ -1498,7 +1501,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             is not None else SkipSoftmaxScheduler.from_target_sparsity(
                 target_sparsity,
                 ckpt_sparse_attention_config=ckpt_sparse_attention_config))
-        return SkipSoftmaxParams(scheduler=scheduler)
+        return SkipSoftmaxParams(scheduler=scheduler,
+                                 uses_spcompress=self.uses_spcompress)
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):

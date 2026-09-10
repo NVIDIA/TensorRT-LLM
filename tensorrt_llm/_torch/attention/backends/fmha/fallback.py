@@ -209,6 +209,7 @@ class FallbackFmha(Fmha):
             attention_chunk_size=attn.attention_chunk_size,
             skip_softmax_stat=attn.skip_softmax_stat,
             skip_correction_threshold=attn.skip_correction_threshold,
+            uses_spcompress=attn.uses_spcompress,
             # --- Sparse runtime parameters ---
             sparse_kv_indices=forward_args.sparse_runtime_params.sparse_kv_indices,
             sparse_kv_offsets=forward_args.sparse_runtime_params.sparse_kv_offsets,

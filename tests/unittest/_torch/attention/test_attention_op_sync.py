@@ -52,7 +52,12 @@ from tensorrt_llm._torch.attention.backends.fmha.fallback import (
     FallbackFmha,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
+from tensorrt_llm._torch.attention.backends.trtllm import (
+    TrtllmAttention,
+    TrtllmAttentionMetadata,
+    _resolve_uses_spcompress,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -687,3 +692,19 @@ def test_fallback_rejects_raw_fp8_input():
     q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
 
     assert not fmha.is_supported(q, None, None, metadata, forward_args)
+
+
+@pytest.mark.parametrize(
+    ("sparse_params", "sm_version", "expected"),
+    (
+        (None, 107, False),
+        (SkipSoftmaxParams(uses_spcompress=False), 107, False),
+        (SkipSoftmaxParams(uses_spcompress=True), 107, True),
+        (SkipSoftmaxParams(uses_spcompress=True), 100, False),
+        (SkipSoftmaxParams(uses_spcompress=True), 103, False),
+    ),
+)
+def test_resolve_uses_spcompress_gates_on_sm107(sparse_params, sm_version, expected):
+    """``uses_spcompress`` only takes effect on SM107, regardless of the
+    knob's value, mirroring the thop-side ``TORCH_CHECK`` gate."""
+    assert _resolve_uses_spcompress(sparse_params, sm_version) is expected

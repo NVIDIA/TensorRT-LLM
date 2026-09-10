@@ -47,7 +47,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..conftest import (check_device_contain, get_device_count,
                         get_mpi_world_size, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
-                        skip_no_mxfp4_swizzle, skip_no_sm120,
+                        skip_no_mxfp4_swizzle, skip_no_rubin, skip_no_sm120,
                         skip_post_blackwell, skip_post_hopper, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
@@ -418,6 +418,29 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
                 **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_no_rubin
+    @parametrize_with_ids("uses_spcompress", [False, True])
+    def test_spcompress_attention(self, uses_spcompress: bool):
+        sparse_attention_config = None
+        if uses_spcompress:
+            sparse_attention_config = SkipSoftmaxAttentionConfig(
+                threshold_scale_factor={
+                    "prefill": 0,
+                    "decode": 0
+                },
+                uses_spcompress=uses_spcompress)
+
+        kv_cache_config = KvCacheConfig(dtype="fp8",
+                                        free_gpu_memory_fraction=0.8)
+
+        with LLM(
+                f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+                attn_backend="TRTLLM",
+                kv_cache_config=kv_cache_config,
+                sparse_attention_config=sparse_attention_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -2235,6 +2258,28 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  speculative_config=mtp_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_no_rubin
+    @parametrize_with_ids("uses_spcompress", [False, True])
+    def test_spcompress_attention(self, uses_spcompress: bool):
+        sparse_attention_config = None
+        if uses_spcompress:
+            sparse_attention_config = SkipSoftmaxAttentionConfig(
+                threshold_scale_factor={
+                    "prefill": 0,
+                    "decode": 0
+                },
+                uses_spcompress=uses_spcompress)
+
+        kv_cache_config = KvCacheConfig(dtype="fp8",
+                                        free_gpu_memory_fraction=0.75)
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                 attn_backend="TRTLLM",
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
