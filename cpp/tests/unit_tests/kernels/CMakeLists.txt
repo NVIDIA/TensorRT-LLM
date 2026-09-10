@@ -206,6 +206,7 @@ add_tllm_gtest(
   FULL_STACK
   LABELS
   "unit;kernels;fmha;full-stack;gpu")
+add_gtest(trtllmGenExportCompatTest trtllmGenExportCompatTest.cpp)
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest
