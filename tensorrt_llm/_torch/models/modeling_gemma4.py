@@ -1611,6 +1611,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             and use_bidir == "vision"
             and is_sm_100f()
             and isinstance(attn_metadata, TrtllmAttentionMetadata)
+            and attn_metadata.num_contexts > 0
         ):
             (
                 local_variable_window_token_starts,
@@ -1620,7 +1621,11 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                 attn_metadata=attn_metadata,
                 effective_sliding_window=self.config.sliding_window,
             )
-        elif mm_token_type_ids is not None and use_bidir == "vision":
+        elif (
+            mm_token_type_ids is not None
+            and use_bidir == "vision"
+            and attn_metadata.num_contexts > 0
+        ):
             local_attention_mask_data = self.get_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,

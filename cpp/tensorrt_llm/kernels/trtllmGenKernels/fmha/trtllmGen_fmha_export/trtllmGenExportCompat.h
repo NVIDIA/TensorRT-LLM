@@ -162,6 +162,8 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "Custom";
   case AttentionMaskType::SlidingWindowCustom:
     return "SlidingWindowCustom";
+  case AttentionMaskType::VariableWindow:
+    return "VariableWindow";
   default:
     return "";
   }

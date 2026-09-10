@@ -726,6 +726,7 @@ class MultimodalModelMixin:
         }
         llm_kwargs.update(
             self.get_language_model_extra_forward_kwargs(
+                attn_metadata=attn_metadata,
                 raw_input_ids=raw_input_ids,
                 position_ids=position_ids,
                 mm_inputs=mm_inputs,
