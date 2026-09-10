@@ -1036,6 +1036,13 @@ _NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL"]
 
 
 def _skip_if_backend_unavailable(moe_backend):
+    """Skip a CUTEDSL parametrization when the CuTe DSL wheel is absent.
+
+    Probed here rather than in a ``pytest.mark.skipif``, because the marker
+    is evaluated at collection time and importing ``cute_dsl_utils`` that
+    early puts the wheel's package directory on ``sys.path`` for every other
+    test file in the session.
+    """
     if moe_backend != "CUTEDSL":
         return
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE

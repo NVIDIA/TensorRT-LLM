@@ -1069,6 +1069,16 @@ class KimiK3MoERuntime(nn.Module):
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
+        """Build the routed experts and the shared expert for one MoE layer.
+
+        ``cfg`` is the raw ``PretrainedConfig`` rather than anything derived:
+        the SiTU soft-caps and the routed-expert geometry are Kimi K3 fields
+        that ``ModelConfig`` does not carry.
+
+        ``aux_stream_dict`` is shared across every layer of the model, so the
+        streams reached through it are borrowed and must not be synchronized
+        or reassigned here.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size

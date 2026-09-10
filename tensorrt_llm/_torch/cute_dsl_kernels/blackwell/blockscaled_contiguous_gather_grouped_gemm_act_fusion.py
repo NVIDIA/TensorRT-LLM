@@ -2752,8 +2752,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             two_lbeta = cutlass.Float32(2.0 * linear_beta)
             neg_lbeta = cutlass.Float32(-linear_beta)
 
-            # sigmoid(x) = rcp(1 + exp2(-x * log2e)), shared by both cores.
             def _sigmoid(p0, p1):
+                """``sigmoid`` on a packed f32x2 pair, as ``rcp(1 + exp2(-x*log2e))``.
+
+                Called three times per element pair -- once for the gate's own
+                sigmoid and once inside each ``tanh`` -- so it is written
+                against the packed intrinsics rather than reused from the
+                scalar helpers, which would unpack and repack every call.
+                """
                 neg = cute.arch.mul_packed_f32x2((p0, p1), neg_log2e_pair)
                 e = (
                     cute.math.exp2(neg[0], fastmath=True),

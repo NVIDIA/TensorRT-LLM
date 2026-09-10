@@ -3430,6 +3430,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
         def unique_id(self):
+            """Identity of the compiled kernel, for the autotuner's cache.
+
+            Every entry here is a trace-time constant folded into the kernel,
+            so two runners that differ in any of them are different kernels
+            and must not share a tuning result. That is why the activation
+            soft-caps appear: ``swiglu_limit_scalar`` and the two SiTU betas
+            are baked in as ``const_expr``, not passed at launch.
+            """
             return (
                 self.num_experts,
                 self.top_k,
@@ -3811,6 +3819,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         situ_beta: float = SITU_BETA_DISABLED,
         situ_linear_beta: float = SITU_BETA_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Meta-device shapes for the FC1 output and its block scales.
+
+        A gated activation halves the N it emits, so the interleaved
+        gate/up pair collapses to one value per output element; the extra
+        ``// 2`` on the tensor itself is NVFP4's two values per byte.
+
+        The activation soft-caps are accepted and ignored: they change what
+        the kernel computes, never the shape it returns, but the fake must
+        still mirror the op's schema exactly.
+        """
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
         is_gated = is_gated_activation(ActivationType(activation_type))
