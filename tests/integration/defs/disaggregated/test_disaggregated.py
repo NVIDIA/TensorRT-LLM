@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import io
 import json
 import os
 import platform
@@ -23,13 +24,16 @@ import shutil
 import subprocess
 import tempfile
 import time
+from base64 import b64encode
 from collections import deque, namedtuple
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional
 
 import aiohttp
 import numpy as np
 import pytest
+import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
@@ -49,6 +53,10 @@ from tensorrt_llm.logger import logger
 
 MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
 MULTIMODAL_IMAGE_MODEL = "Qwen3-VL-2B-Instruct"
+
+MULTIMODAL_IMAGE_PROMPT = "Describe the natural environment in the image."
+
+MMContent = list[dict[str, Any]]
 
 
 @dataclass
@@ -1203,23 +1211,11 @@ def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
     )
 
 
-def _verify_multimodal_image_chat(server_url: str) -> None:
-    """Send one image through the router and require a usable answer.
-
-    The generation worker receives prompt_token_ids in which the context
-    worker already expanded the image placeholders, while the original
-    ``messages`` still carry the image part. A worker that rebuilds
-    multi_modal_data from those messages expands the placeholders a second
-    time and the router returns an error instead of an answer.
-    """
-    image_url = os.path.join(llm_models_root(), "multimodals", "test_data",
-                             "seashore.png")
-    assert os.path.exists(image_url), f"{image_url} does not exist"
-
-    content = [
+def _multimodal_image_content(image_url: str) -> MMContent:
+    return [
         {
             "type": "text",
-            "text": "Describe the natural environment in the image."
+            "text": MULTIMODAL_IMAGE_PROMPT
         },
         {
             "type": "image_url",
@@ -1228,17 +1224,44 @@ def _verify_multimodal_image_chat(server_url: str) -> None:
             }
         },
     ]
+
+
+def _multimodal_embeds_content(embeds: str) -> MMContent:
+    return [
+        {
+            "type": "text",
+            "text": MULTIMODAL_IMAGE_PROMPT
+        },
+        {
+            "type": "image_embeds",
+            "image_embeds": {
+                "data": embeds
+            }
+        },
+    ]
+
+
+def _multimodal_chat_payload(content: MMContent,
+                             max_tokens: Optional[int] = None
+                             ) -> dict[str, Any]:
     payload = {
         "model": MULTIMODAL_IMAGE_MODEL,
         "messages": [{
             "role": "user",
             "content": content
         }],
-        "max_tokens": 32,
         "temperature": 0,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    return payload
 
-    async def run() -> None:
+
+def _post_multimodal_chat(server_url: str, content: MMContent) -> str:
+    """Post one chat request through the router and return its answer."""
+    payload = _multimodal_chat_payload(content, max_tokens=32)
+
+    async def run() -> str:
         timeout = aiohttp.ClientTimeout(total=300)
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{server_url}/v1/chat/completions",
@@ -1249,23 +1272,91 @@ def _verify_multimodal_image_chat(server_url: str) -> None:
                 assert body.get("choices"), body
                 answer = body["choices"][0]["message"]["content"]
                 assert answer and answer.strip(), body
+                return answer
 
-    asyncio.run(run())
+    return asyncio.run(run())
+
+
+def _encode_image_embeds(model_path: str, image_url: str, env: dict) -> str:
+    """Encode one image with a standalone MM encoder and return the payload.
+
+    The returned string is what an ``image_embeds`` chat part carries: the
+    base64 of a ``torch.save`` of the encoder's output tensor.
+
+    Call this before the disagg cluster starts, so the encoder has a device to
+    itself. It inherits the visible devices rather than picking one: the handle
+    is a CUDA IPC handle, and mapping it here only works while the encoder and
+    this process agree on which device ordinal 0 is.
+    """
+    import torch
+
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
+    port = get_free_port()
+    proc = subprocess.Popen([
+        "trtllm-serve", "mm_embedding_serve", model_path, "--host", "localhost",
+        "--port",
+        str(port), "--max_batch_size", "1"
+    ],
+                            env=env)
+    try:
+        assert wait_for_server("localhost", port,
+                               timeout_seconds=600), "MM encoder never bound"
+        payload = _multimodal_chat_payload(_multimodal_image_content(image_url))
+        response = requests.post(f"http://localhost:{port}/v1/chat/completions",
+                                 json=payload,
+                                 timeout=300)
+        assert response.status_code == 200, response.text
+        handle = response.json()["choices"][0]["mm_embedding_handle"]
+        embedding = SharedTensorContainer.from_dict(handle).get_local_view()
+        with io.BytesIO() as buf:
+            torch.save(embedding.cpu(), buf)
+            encoded = b64encode(buf.getvalue()).decode("ascii")
+        del embedding
+        torch.cuda.empty_cache()
+        return encoded
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def _verify_multimodal_image_chat(server_url: str, image_url: str,
+                                  embeds: str) -> None:
+    """Send the same image through the router twice, as both media payloads.
+
+    The generation worker receives prompt_token_ids in which the context
+    worker already expanded the image placeholders, while the original
+    ``messages`` still carry the media part. A worker that rebuilds the media
+    from those messages expands the placeholders a second time and the router
+    returns an error instead of an answer.
+
+    ``image_url`` and ``image_embeds`` reach the generation worker through the
+    same relayed messages, so both legs run.
+    """
+    _post_multimodal_chat(server_url, _multimodal_image_content(image_url))
+    _post_multimodal_chat(server_url, _multimodal_embeds_content(embeds))
 
 
 @pytest.mark.skip_less_device(2)
-@pytest.mark.timeout(900)
+@pytest.mark.timeout(1200)
 def test_disaggregated_multimodal_image(disaggregated_example_root, llm_venv):
     """Disaggregated serving of a chat request that carries an image."""
     model_path = f"{llm_models_root()}/Qwen3/{MULTIMODAL_IMAGE_MODEL}"
+    image_url = os.path.join(llm_models_root(), "multimodals", "test_data",
+                             "seashore.png")
+    assert os.path.exists(image_url), f"{image_url} does not exist"
+    env = llm_venv._new_env.copy()
+    embeds = _encode_image_embeds(model_path, image_url, env)
     run_disaggregated_test(
         disaggregated_example_root,
         "multimodal_image",
         num_iters=0,
-        env=llm_venv._new_env.copy(),
+        env=env,
         model_path=model_path,
         cwd=llm_venv.get_working_directory(),
-        post_client_test=_verify_multimodal_image_chat,
+        post_client_test=partial(_verify_multimodal_image_chat,
+                                 image_url=image_url,
+                                 embeds=embeds),
         server_start_timeout=600,
     )
 

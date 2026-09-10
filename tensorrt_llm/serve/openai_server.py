@@ -2236,10 +2236,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     # The context worker already expanded the media
                     # placeholders into prompt_token_ids and the KV for those
                     # positions arrives over the transceiver, so this worker
-                    # must not re-derive them. Re-attaching the media here
-                    # would send an already-expanded prompt through
-                    # placeholder expansion a second time.
+                    # must not re-derive them. Both payloads have to go:
+                    # _preprocess takes the generation-only path only when
+                    # neither multi_modal_data nor multi_modal_embeddings is
+                    # attached, and either one left on the prompt sends an
+                    # already-expanded prompt through placeholder expansion
+                    # a second time.
                     mm_data = None
+                    mm_embeddings = None
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_embeddings:
