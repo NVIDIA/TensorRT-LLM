@@ -1100,3 +1100,39 @@ def test_a_derived_sweep_is_the_one_the_campaign_is_given(tmp_path):
     assert named.name == disagg_sol.DERIVED_SWEEP_NAME
     assert named.is_file()
     assert named.parent == launches[0].workspace
+
+
+def test_the_derived_sweep_carries_the_campaign_s_own_build_source(tmp_path):
+    """The design measures the image; a campaign measures its own edits.
+
+    `sweep_design` refuses a build source in a design sweep -- choosing an
+    operating point on code no campaign starts from picks it for a different
+    program. A campaign is the opposite case: without a rung it would run the
+    image and report every change as no-gain. The rung is added at the
+    boundary where the purpose changes.
+    """
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _design_sweep(tmp_path),
+        "gen",
+        {"shape": "tep_8_eplb0_mtp0", "concurrency": 64},
+        into=tmp_path / "ws",
+        repo=tmp_path / "trtllm-gen",
+    )
+    got = _yaml.safe_load(out.read_text())
+    assert got["trtllm_install"]["trtllm_repo"].endswith("trtllm-gen")
+    # ...and the design's own sweep still has none
+    assert "trtllm_install" not in _yaml.safe_load(_design_sweep(tmp_path).read_text())
+
+
+def test_a_derivation_without_a_checkout_adds_no_rung(tmp_path):
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _design_sweep(tmp_path),
+        "gen",
+        {"shape": "tep_8_eplb0_mtp0", "concurrency": 64},
+        into=tmp_path / "ws2",
+    )
+    assert "trtllm_install" not in _yaml.safe_load(out.read_text())

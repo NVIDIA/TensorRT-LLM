@@ -759,3 +759,31 @@ def test_the_skills_the_config_repo_ships_are_named_where_they_apply():
     assert "15 %" in gen
     for section in (ctx, gen):
         assert "check-job" in section
+
+
+def test_an_mtp0_sweep_needs_no_measured_accept_rate(tmp_path):
+    """At mtp 0 the acceptance length is 1.0 by definition.
+
+    Requiring a measured one asks for a measurement of a constant. The
+    harness draws the same line: its post-processor exits 1 for a missing
+    rate only when the sweep has mtp>0 cases. A design sweep is mtp0-only, so
+    every campaign cut from one hit this.
+    """
+    sweep = dict(GEN_SWEEP)
+    sweep.pop("accept_rate", None)
+    sweep["gen_configs"] = [[1, 1, 4, 64, 64, False, "0.9", 0, 0, "1,32"]]
+    data = task_schema.load_and_validate_task_yaml(
+        _write_task(tmp_path, {SOL_TRACK_FIELD: _block(tmp_path, sweep=sweep)})
+    )
+    assert data["optimize"]["target_metric"] == "throughput_per_user"
+
+
+def test_a_speculating_sweep_still_needs_one(tmp_path):
+    """Where it is a multiplier, a wrong value is invisible."""
+    sweep = dict(GEN_SWEEP)
+    sweep.pop("accept_rate", None)
+    sweep["gen_configs"] = [[1, 1, 4, 64, 256, False, "0.9", 3, 0, "1,32"]]
+    with pytest.raises(task_schema.TaskSchemaError, match="accept_rate"):
+        task_schema.load_and_validate_task_yaml(
+            _write_task(tmp_path, {SOL_TRACK_FIELD: _block(tmp_path, sweep=sweep)})
+        )
