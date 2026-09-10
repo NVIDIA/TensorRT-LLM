@@ -931,6 +931,15 @@ class TestDisaggTransferAdmissionController:
         assert result.admitted_requests == [request]
         assert result.admitted_transfer_blocks == 3
 
+    def test_revert_ctx_alloc_reverts_target_and_draft(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_manager_pair = Mock()
+        request = _make_disagg_transfer_request(1, 32)
+
+        PyExecutor._revert_ctx_alloc(executor, [request])
+
+        executor.kv_cache_manager_pair.revert_allocate_context.assert_called_once_with(request)
+
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferIdleProgress:
