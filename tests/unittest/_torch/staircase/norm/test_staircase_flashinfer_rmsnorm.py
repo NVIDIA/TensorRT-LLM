@@ -4,7 +4,7 @@
 
 import torch
 
-from .flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.staircase.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 
 assert torch.cuda.is_available(), "flashinfer_rmsnorm requires a CUDA device"
 

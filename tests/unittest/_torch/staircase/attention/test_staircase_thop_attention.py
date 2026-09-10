@@ -174,11 +174,10 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
+from tensorrt_llm._torch.staircase.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-from .thop_attention import thop_attention
 
 assert torch.cuda.is_available(), "thop_attention requires a CUDA device"
 

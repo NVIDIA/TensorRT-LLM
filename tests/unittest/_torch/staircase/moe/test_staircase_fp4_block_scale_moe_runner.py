@@ -5,8 +5,9 @@
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-
-from .fp4_block_scale_moe_runner import fp4_block_scale_moe_runner as moe
+from tensorrt_llm._torch.staircase.catalog.moe.fp4_block_scale_moe_runner import (
+    fp4_block_scale_moe_runner as moe,
+)
 
 assert torch.cuda.is_available(), "fp4_block_scale_moe_runner requires a CUDA device"
 

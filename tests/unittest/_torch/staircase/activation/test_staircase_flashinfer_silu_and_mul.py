@@ -5,7 +5,9 @@
 import torch
 import torch.nn.functional as F
 
-from .flashinfer_silu_and_mul import flashinfer_silu_and_mul
+from tensorrt_llm._torch.staircase.catalog.activation.flashinfer_silu_and_mul import (
+    flashinfer_silu_and_mul,
+)
 
 assert torch.cuda.is_available(), "flashinfer_silu_and_mul requires a CUDA device"
 
