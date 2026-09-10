@@ -967,7 +967,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (coverageDb?.patch_input) {
             coveragePatchInput = new groovy.json.JsonSlurper().parseText(
                 readFile("${LLM_ROOT}/${coverageDb.patch_input}"))
-            changedFiles = (coveragePatchInput.changed_files ?: []).unique()
         }
 
         // Ask Python which file patterns need diffs, fetch them.
@@ -981,13 +980,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         def diffs = [:]
         if (filesNeedingDiff) {
-            def fileChanges = coveragePatchInput?.diffs
-            if (fileChanges == null) {
-                def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-                fileChanges = githubPrApiUrl != null
-                    ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
-                    : getGitlabMRChangedFile(pipeline, "getFileChanges")
-            }
+            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+            def fileChanges = githubPrApiUrl != null
+                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getFileChanges")
+                : getGitlabMRChangedFile(pipeline, "getFileChanges")
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
                 [(filePath): fileChanges[filePath] ?: ""]
@@ -1006,6 +1002,19 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
         if (coverageDb) {
             mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
+        }
+        if (coveragePatchInput) {
+            def coverageDiffs = filesNeedingDiff.collectEntries { filePath ->
+                [(filePath): coveragePatchInput.diffs[filePath] ?: ""]
+            }
+            def coverageInputJson = groovy.json.JsonOutput.toJson([
+                changed_files: changedFiles,
+                diffs: coverageDiffs,
+                post_merge: testFilter[(IS_POST_MERGE)] ?: false,
+            ])
+            def coverageInputPath = "${LLM_ROOT}/cbts_coverage_input.json"
+            writeFile file: coverageInputPath, text: coverageInputJson
+            mainCmd += " --coverage-input cbts_coverage_input.json"
         }
         def output = sh(script: mainCmd, returnStdout: true)
 
@@ -1113,7 +1122,8 @@ def _cbtsCoverageAudit(pipeline)
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
         if (ready.patch_diff_kind == "cumulative") {
-            pipeline.echo("CBTS audit: Tier 2 will use cumulative diff " +
+            pipeline.echo("CBTS audit: Tier 2 will evaluate the current PR files using " +
+                          "cumulative per-file diffs from " +
                           "${ready.patch_diff_base_commit.take(10)}.." +
                           "${ready.patch_diff_head_commit.take(10)}, not the GitHub PR diff " +
                           "${ready.pr_base_commit.take(10)}.." +

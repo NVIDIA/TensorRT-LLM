@@ -215,10 +215,11 @@ diverged and unknown relations decline Tier 2.
 tests that commit against the latest DB without serializing through patch format. If the DB predates
 the PR base, a PR-only cherry-pick can conflict merely because it lacks intervening main changes.
 That case retries a cumulative DB-to-head commit. The audit log calls out this compatibility diff
-because it differs from the GitHub PR diff, and its DB-to-head changed files and per-file diffs
-become the actual Tier 2 input. Other conflicts or unmeasurable checks decline before the large DB
-artifacts are downloaded. If validation passes, `--coverage-max-drift` applies a second fail-closed
-bound: beyond 30 commits Tier 2 declines and the PR runs in full.
+because it differs from the GitHub PR diff. Tier 1 keeps the forge PR payload. Tier 2 keeps the PR's
+changed-file set but uses the corresponding DB-to-head per-file diffs; unrelated files changed only
+between the DB and PR base do not enter either tier. Other conflicts or unmeasurable checks decline
+before the large DB artifacts are downloaded. If validation passes, `--coverage-max-drift` applies
+a second fail-closed bound: beyond 30 commits Tier 2 declines and the PR runs in full.
 
 
 ### 8.3 What happens with the result
@@ -228,7 +229,8 @@ pair, validate compatibility, stream both tarballs down, unpack their identicall
 files separately, and union them with `compact_db.merge_databases`. It writes the selection JSON
 beside the merged SQLite as `cbts_coverage_db.json` and prints the paths plus compatibility-diff
 metadata. For a cumulative fallback, it also writes the corresponding Tier 2 changed-file payload.
-Groovy audits the DB and logs which diff range will drive Tier 2 before running
+Groovy intersects its per-file diffs with the PR changed-file set, passes that as a separate
+`--coverage-input`, and logs which diff range will drive Tier 2 before running
 `coverage_audit.py` over the result. Any failure anywhere is caught and non-fatal: no prepared DB is
 returned, Tier 2 never runs, and the PR gets a full run.
 
