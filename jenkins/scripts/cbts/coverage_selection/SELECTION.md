@@ -167,8 +167,7 @@ fetch PR head locally; fetch base and latest DB from the normal CI Git mirror
 create a squashed PR commit with `commit-tree`, parented at the PR base
 cherry-pick it onto the DB revision
    clean                                          → continue
-   conflict and DB is older than PR base          → retry cumulative DB-to-head commit
-   other conflict / unavailable revision          → decline Tier 2
+   conflict / unavailable revision                → decline Tier 2
 ```
 
 Requiring the pair prevents the selector from narrowing only one CPU architecture. Builds are
@@ -212,14 +211,11 @@ freshness gate and telemetry. `ahead`, `behind`, and `identical` describe valid 
 diverged and unknown relations decline Tier 2.
 
 `commit-tree` represents the complete base-to-head PR change as one commit, and `cherry-pick`
-tests that commit against the latest DB without serializing through patch format. If the DB predates
-the PR base, a PR-only cherry-pick can conflict merely because it lacks intervening main changes.
-That case retries a cumulative DB-to-head commit. The audit log calls out this compatibility diff
-because it differs from the GitHub PR diff. Tier 1 keeps the forge PR payload. Tier 2 keeps the PR's
-changed-file set but uses the corresponding DB-to-head per-file diffs; unrelated files changed only
-between the DB and PR base do not enter either tier. Other conflicts or unmeasurable checks decline
-before the large DB artifacts are downloaded. If validation passes, `--coverage-max-drift` applies
-a second fail-closed bound: beyond 30 commits Tier 2 declines and the PR runs in full.
+tests that commit against the latest DB without serializing through patch format. This check is
+independent of whether the DB is older than, equal to, or newer than the PR base. A conflict or an
+unmeasurable check declines before the large DB artifacts are downloaded. If it passes, Tier 2 uses
+the original forge PR payload. `--coverage-max-drift` applies a second fail-closed bound: beyond 30
+commits Tier 2 declines and the PR runs in full.
 
 
 ### 8.3 What happens with the result
@@ -227,12 +223,10 @@ a second fail-closed bound: beyond 30 commits Tier 2 declines and the PR runs in
 `--prepare DIR` does the whole fetch in one call: resolve the PR base, select the latest complete
 pair, validate compatibility, stream both tarballs down, unpack their identically named SQLite
 files separately, and union them with `compact_db.merge_databases`. It writes the selection JSON
-beside the merged SQLite as `cbts_coverage_db.json` and prints the paths plus compatibility-diff
-metadata. For a cumulative fallback, it also writes the corresponding Tier 2 changed-file payload.
-Groovy intersects its per-file diffs with the PR changed-file set, passes that as a separate
-`--coverage-input`, and logs which diff range will drive Tier 2 before running
-`coverage_audit.py` over the result. Any failure anywhere is caught and non-fatal: no prepared DB is
-returned, Tier 2 never runs, and the PR gets a full run.
+beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
+credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.
+Any failure anywhere is caught and non-fatal: no prepared DB is returned, Tier 2 never runs, and the
+PR gets a full run.
 
 Those two paths reach `main.py` as `--coverage-db` and `--coverage-db-meta`, so a new selection
 field needs no Groovy change. `main.py` records all of it and **gates on the drift**: past

@@ -325,10 +325,8 @@ CBTS defers to the existing filter chain when:
   decorator line), has no usable patch, has unparsable source, or has a closure
   change with no wider row set (see `coverage_selection/SELECTION.md` §3-4)
 - No touch DB artifact could be resolved — Tier 2 never runs
-- Neither the current PR diff nor its permitted older-DB cumulative fallback can be applied to the
-  latest complete coverage DB revision (or the check cannot be completed) — Tier 2 declines before
-  download. When that fallback is used successfully, Tier 1 keeps the PR diff while Tier 2 uses
-  DB-to-PR-head diffs for the PR's files; the audit log warns that these can differ from the PR
+- The current PR diff cannot be applied without conflicts to the latest complete coverage DB
+  revision (or the check cannot be completed) — Tier 2 declines before download
 - The resolved DB sits more than `--coverage-max-drift` commits from the PR's
   base commit, on either side, or an unmeasurable distance from it — Tier 2
   declines (`coverage_freshness` = `stale` / `unknown`)
