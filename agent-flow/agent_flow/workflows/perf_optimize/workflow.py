@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -241,6 +242,7 @@ class PerfOptimizeWorkflow:
         max_rounds_override: int | None = None,
         reuse_analysis: str | Path | None = None,
         sol_methodology: SolMethodology | None = None,
+        parallel_engine_override: str | None = None,
     ) -> None:
         self.workspace = workspace
         self.prompts = prompts or DEFAULT_PROMPTS
@@ -250,6 +252,7 @@ class PerfOptimizeWorkflow:
         # suite included — never pays a live probe.
         self.sol_methodology = sol_methodology or SolMethodology()
         self.max_rounds_override = max_rounds_override
+        self.parallel_engine_override = parallel_engine_override
         self.reuse_analysis = Path(reuse_analysis).expanduser() if reuse_analysis else None
         self.task_path = workspace / "task.yaml"
         self.baseline_dir = workspace / "baseline"
@@ -664,6 +667,17 @@ class PerfOptimizeWorkflow:
                     f"--clean to start fresh with the new budget.[/bold yellow]",
                     log,
                 )
+            if (
+                self.parallel_engine_override is not None
+                and self.parallel_engine_override != self._parallel_engine()
+            ):
+                print_message(
+                    f"[bold yellow]⚠ --parallel-engine {self.parallel_engine_override} "
+                    f"ignored on resume; this workspace is already resolved to "
+                    f"{self._parallel_engine()}. Compare the engines with a second "
+                    f"--workspace, not by re-running this one.[/bold yellow]",
+                    log,
+                )
             if self.reuse_analysis is not None:
                 print_message(
                     f"[bold yellow]⚠ --reuse-analysis {self.reuse_analysis} ignored on "
@@ -679,6 +693,7 @@ class PerfOptimizeWorkflow:
         task_data = load_and_validate_task_yaml(
             task,
             max_rounds_override=self.max_rounds_override,
+            parallel_engine_override=self.parallel_engine_override,
         )
         self.task_path.write_text(dump_task_yaml(task_data), encoding="utf-8")
 
@@ -995,7 +1010,10 @@ class PerfOptimizeWorkflow:
             if entry.get("status") not in ("candidate_ready", "failed")
         ]
         if pending:
-            self._run_item_graph(state, pending, log)
+            if self._parallel_engine() == "threads":
+                self._run_item_threads(state, pending, log)
+            else:
+                self._run_item_graph(state, pending, log)
 
         if not state.batch_completed:
             append_workflow_event(
@@ -1076,6 +1094,43 @@ class PerfOptimizeWorkflow:
             raise RuntimeError(
                 "optimizer/evaluator item nodes did not complete: " + ", ".join(sorted(stalled))
             )
+
+    def _run_item_threads(
+        self,
+        state: WorkflowState,
+        pending: list[dict[str, Any]],
+        log,
+    ) -> None:
+        """Drive one round's pending items through the pre-engine thread pool.
+
+        The ``parallel_engine: threads`` fallback to :meth:`_run_item_graph`.
+        With no scheduler there is no isolation provider either, so each item's
+        worktree is created here, up front, by :meth:`_ensure_item_runtime` —
+        the serial path's call — from the path and branch the ledger already
+        records. Nothing else changes: the item loop and everything downstream
+        of the batch never learn which engine dispatched them.
+        """
+        for entry in pending:
+            self._ensure_item_runtime(state, entry)
+
+        errors: list[BaseException] = []
+        with ThreadPoolExecutor(
+            max_workers=self._max_parallel_items(state),
+            thread_name_prefix="perf-opt-item",
+        ) as executor:
+            futures = [
+                executor.submit(self._run_opt_item, state, dict(entry), log) for entry in pending
+            ]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except BaseException as exc:  # preserve other completed item results
+                    errors.append(exc)
+        if errors:
+            raise RuntimeError(
+                f"{len(errors)} parallel optimization item(s) failed; "
+                f"first error: {type(errors[0]).__name__}: {errors[0]}"
+            ) from errors[0]
 
     def _integrator_verdict_defect(
         self,
@@ -1165,6 +1220,18 @@ class PerfOptimizeWorkflow:
                 if entry["current_item_id"] == item_id:
                     return dict(entry)
         raise RuntimeError(f"item batch has no item {item_id!r}")
+
+    def _parallel_engine(self) -> str:
+        """Which engine runs ``item_execution: parallel`` for this campaign.
+
+        ``dag`` (the default) is the shared ``agent_flow.orchestration``
+        scheduler; ``threads`` is the pre-engine thread pool, kept so a campaign
+        can fall back without giving up parallelism. Read off the resolved
+        ``workspace/task.yaml``, which is written once on the fresh run — so a
+        campaign keeps the engine it started under for its whole life, and a
+        finished workspace still says which one produced its numbers.
+        """
+        return str(self._optimize_block()["parallel_engine"])
 
     def _max_parallel_items(self, state: WorkflowState) -> int:
         """How many item loops may execute at once on the parallel path.

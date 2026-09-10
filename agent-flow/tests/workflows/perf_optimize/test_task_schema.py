@@ -32,6 +32,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
         "max_attempts_per_item": 3,
         "max_items_per_round": 3,
         "item_execution": "parallel",
+        "parallel_engine": "dag",
         "approaches": ["config", "code"],
         "accept_fraction": 0.5,
         "noise_floor_pct": 1.0,
@@ -90,6 +91,21 @@ def test_invalid_item_execution_rejected(tmp_path):
         task_schema.load_and_validate_task_yaml(task)
 
 
+def test_parallel_engine_accepts_dag_and_threads(tmp_path):
+    for value in task_schema.PARALLEL_ENGINES:
+        task = _write_task(tmp_path, {"optimize": {"parallel_engine": value}})
+        data = task_schema.load_and_validate_task_yaml(task)
+        assert data["optimize"]["parallel_engine"] == value
+
+
+def test_invalid_parallel_engine_rejected(tmp_path):
+    # ``parallel`` is the ``item_execution`` value: confusing the two keys is
+    # the likeliest way to get this one wrong.
+    task = _write_task(tmp_path, {"optimize": {"parallel_engine": "parallel"}})
+    with pytest.raises(task_schema.TaskSchemaError, match="optimize.parallel_engine"):
+        task_schema.load_and_validate_task_yaml(task)
+
+
 def test_invalid_approaches_rejected(tmp_path):
     for value in ([], ["yaml-only"], ["config", "config"], "config", ["config", 3]):
         task = _write_task(tmp_path, {"optimize": {"approaches": value}})
@@ -106,6 +122,19 @@ def test_max_rounds_override_wins_over_user_value(tmp_path):
 def test_invalid_max_rounds_override_rejected(tmp_path):
     with pytest.raises(task_schema.TaskSchemaError, match="--max-rounds"):
         task_schema.load_and_validate_task_yaml(_write_task(tmp_path), max_rounds_override=0)
+
+
+def test_parallel_engine_override_wins_over_user_value(tmp_path):
+    task = _write_task(tmp_path, {"optimize": {"parallel_engine": "dag"}})
+    data = task_schema.load_and_validate_task_yaml(task, parallel_engine_override="threads")
+    assert data["optimize"]["parallel_engine"] == "threads"
+
+
+def test_invalid_parallel_engine_override_rejected(tmp_path):
+    with pytest.raises(task_schema.TaskSchemaError, match="--parallel-engine"):
+        task_schema.load_and_validate_task_yaml(
+            _write_task(tmp_path), parallel_engine_override="parallel"
+        )
 
 
 def test_base_validation_still_enforced(tmp_path):

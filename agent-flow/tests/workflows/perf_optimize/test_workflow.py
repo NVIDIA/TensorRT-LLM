@@ -2942,6 +2942,64 @@ def test_max_rounds_override_applies_on_fresh_run(tmp_path, fake_git):
     assert state.max_rounds == 1
 
 
+def test_parallel_engine_override_reaches_the_resolved_workspace_spec(tmp_path, fake_git):
+    """The override survives the trip from constructor arg to campaign record.
+
+    Which is the whole point of putting it in the resolved spec rather than in
+    ``WorkflowState``: two finished campaigns are otherwise indistinguishable
+    without the shell history that launched them.
+    """
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws, parallel_engine_override="threads")
+    _stub_agents(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
+    assert resolved["optimize"]["parallel_engine"] == "threads"
+    assert workflow._parallel_engine() == "threads"
+
+
+def test_parallel_engine_override_is_ignored_on_resume_with_a_warning(tmp_path, fake_git, capsys):
+    """A campaign keeps the engine it started under, and says so if you ask.
+
+    The resolved spec is written once, on the fresh run. Someone comparing the
+    engines would plausibly try re-running the same workspace with the other
+    value, so the flag has to say plainly that this is not how to do it.
+    """
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    ws = tmp_path / "ws"
+    first = Workflow(workspace=ws, parallel_engine_override="threads")
+    _stub_agents(first)
+    try:
+        first.run(str(task))
+    finally:
+        first.close()
+
+    # Reopen the finished campaign asking for the other engine.
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    state.done = False
+    state_module.save_state(ws / state_module.STATE_FILENAME, state)
+    capsys.readouterr()
+
+    resumed = Workflow(workspace=ws, parallel_engine_override="dag")
+    _stub_agents(resumed)
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+
+    out = capsys.readouterr().out
+    assert "--parallel-engine dag" in out
+    assert "ignored on resume" in out
+    # The workspace kept the engine it was resolved with.
+    resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
+    assert resolved["optimize"]["parallel_engine"] == "threads"
+
+
 # ---------------------------------------------------------- real-git end-to-end
 
 
@@ -4748,19 +4806,28 @@ def test_a_batch_row_predating_the_engine_still_derives_its_node_id():
     )
 
 
-def test_a_concurrent_real_git_batch_isolates_every_item(tmp_path):
-    """Three items, real git, real provider, running concurrently.
+@pytest.mark.parametrize("engine", ["dag", "threads"])
+def test_a_concurrent_real_git_batch_isolates_every_item(tmp_path, engine):
+    """Three items, real git, running concurrently — on either engine.
 
-    The pre-engine code created every worktree up front on the orchestrator
-    thread; the provider creates each one inside ``acquire``, which the
-    scheduler calls concurrently. This is the test that says whether that is
-    safe — concurrent ``git worktree add`` against one repository — and that
-    each item really did edit its own checkout rather than a shared one.
+    This is the test that says concurrent ``git worktree add`` against one
+    repository is safe and that each item really edited its own checkout rather
+    than a shared one. Both engines are held to it because the point of keeping
+    ``threads`` is that it is interchangeable; they differ only in *who* creates
+    the worktrees — the provider inside ``acquire`` (``dag``) versus
+    ``_ensure_item_runtime`` up front on the orchestrator thread (``threads``).
     """
     repo = _init_real_repo(tmp_path)
     task = _write_task(
         tmp_path,
-        {"optimize": {"max_rounds": 1, "max_items_per_round": 3, "max_parallel_items": 3}},
+        {
+            "optimize": {
+                "max_rounds": 1,
+                "max_items_per_round": 3,
+                "max_parallel_items": 3,
+                "parallel_engine": engine,
+            }
+        },
     )
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -4802,17 +4869,108 @@ def test_a_concurrent_real_git_batch_isolates_every_item(tmp_path):
         assert roadmap_schema.find_item(roadmap, item_id)["status"] == "accepted"
 
     # The integrated campaign branch carries all three markers — proof the
-    # per-item commits survived release and were cherry-picked, not lost.
+    # per-item commits survived teardown and were cherry-picked, not lost.
     tracked = _real_git(repo, "ls-files")
     for item_id in ("opt-001", "opt-002", "opt-003"):
         assert f"{item_id}.py" in tracked
 
-    # The provider's worktrees and branches are both cleaned up afterwards.
+    # Worktrees and branches are both cleaned up afterwards, on either engine.
     assert not (ws / "worktrees" / "round_1").exists() or not any(
         (ws / "worktrees" / "round_1").iterdir()
     )
     branches = _real_git(repo, "branch", "--list")
     assert "round-1-item_1_opt-001" not in branches
+
+
+def test_the_threads_engine_runs_a_batch_without_the_scheduler(tmp_path, fake_git, monkeypatch):
+    """``parallel_engine: threads`` fans out without building a scheduler.
+
+    A fallback that still runs the engine is not a fallback, so the scheduler is
+    made un-constructible. The round must nonetheless land where the DAG engine
+    lands it: both items accepted through one Integrator verdict.
+    """
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the threads engine must not build a NodeScheduler")
+
+    monkeypatch.setattr(workflow_module, "NodeScheduler", refuse)
+
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"max_items_per_round": 2, "parallel_engine": "threads"}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
+        evaluator_verdicts=[
+            ("APPROVE", "none", 8.4, 108.4),
+            ("APPROVE", "none", 3.0, 111.6),
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace.count("optimizer") == 2
+    assert trace.count("evaluator") == 2
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    for item_id in ("opt-001", "opt-002"):
+        assert roadmap_schema.find_item(roadmap, item_id)["status"] == "accepted"
+    # Via the Integrator, not accepted straight from the items.
+    assert roadmap["current_best"]["source"] == "rounds/round_1/integration/integration.md"
+    # The batch lifecycle is emitted by the shared caller, so it survives the
+    # engine swap — the events a resume and the report both read.
+    events = [
+        entry.get("event")
+        for entry in progress_module.read_progress(workflow.progress_path)["optimization"]
+        if entry.get("agent") == "optimizer_evaluator"
+    ]
+    assert events == ["batch_started", "batch_completed"]
+
+
+def test_the_threads_engine_also_honors_max_parallel_items(tmp_path, fake_git, monkeypatch):
+    """The concurrency cap is a statement about the machine, not about an engine.
+
+    The pre-engine pool was sized to the batch, so a campaign falling back to
+    ``threads`` would otherwise silently lose the ability to say "this node
+    hosts one ``trtllm-serve`` at a time".
+    """
+    real_pool = workflow_module.ThreadPoolExecutor
+    seen: list[int] = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["max_workers"])
+        return real_pool(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "ThreadPoolExecutor", spy)
+
+    task = _write_task(
+        tmp_path,
+        {
+            "optimize": {
+                "max_rounds": 1,
+                "max_items_per_round": 3,
+                "max_parallel_items": 1,
+                "parallel_engine": "threads",
+            }
+        },
+    )
+    workflow = Workflow(workspace=tmp_path / "ws")
+    _stub_agents(
+        workflow,
+        analyzer_items=[
+            [_item("opt-001", gain=10.0), _item("opt-002", gain=8.0), _item("opt-003", gain=5.0)]
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert seen == [1]
 
 
 def test_a_failed_integrator_check_does_not_strand_a_resume(tmp_path, fake_git):
