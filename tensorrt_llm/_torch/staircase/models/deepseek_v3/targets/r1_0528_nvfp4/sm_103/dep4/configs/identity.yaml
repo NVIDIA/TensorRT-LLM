@@ -1,0 +1,21 @@
+# The identity assembly: the target with no variant on top.
+#
+# This is what the gsm8k record in TARGET.md was measured on. It carries only
+# the parallel topology, and the topology is not a tuning knob here -- routing
+# derives this target *from* it, so a run that drops it does not get a
+# differently-tuned staircase, it gets the built-in DeepseekV3 implementation
+# (or, under `TRTLLM_STAIRCASE=require`, an error naming the criterion it
+# missed).
+#
+# Every other file in this directory is this one plus the knobs under
+# experiment, so any of them can be passed directly:
+#
+#   TRTLLM_STAIRCASE=require trtllm-eval --model <ckpt> \
+#     --extra_llm_api_options <this directory>/identity.yaml \
+#     gsm8k --apply_chat_template --fewshot_as_multiturn
+#
+# The switch has to be exported before the ranks start; see
+# `_router_index.STAIRCASE_ENV` for why.
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: true

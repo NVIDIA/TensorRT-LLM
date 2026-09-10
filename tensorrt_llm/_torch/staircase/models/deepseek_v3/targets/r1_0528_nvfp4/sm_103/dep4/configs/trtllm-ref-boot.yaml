@@ -1,0 +1,30 @@
+# Boot-forcing config for the stock-trtllm reference curve ONLY.
+#
+# Stock trtllm (in-tree DeepseekV3 modeling) cannot boot this checkpoint at
+# dep4 on a 178.34 GiB B200 under its own defaults. Measured, per rank:
+#
+#   max_num_tokens 8192 (default): 113.9 GiB is allocated at engine
+#     construction outside the torch allocator, before any weight is
+#     materialized (nvidia-smi 20 MiB -> 116,662 MiB inside one 5 s sample),
+#     and model init then OOMs in init_meta_tensor.
+#   max_num_tokens 2048: weights load (135.85 GiB torch, incl. 1.53 GiB of
+#     CUDA-graph pools), then configure_kv_cache_capacity asks for 7.00 GiB
+#     with 5.61 GiB free. kv_cache_config.free_gpu_memory_fraction does not
+#     move that 7.00 GiB (measured identical at 0.9 and 0.6).
+#
+# max_seq_len is the remaining lever the failure's own memory ledger names:
+# it sets max_blocks_per_seq = max_seq_len / tokens_per_block, 5120 at the
+# checkpoint's 163840 and 64 here, and 2048 is exactly the harness's ISL+OSL.
+#
+# Not a tuning variant for this target: staircase boots at stock defaults, and
+# both knobs measured inert on it (max_seq_len 2048: -0.13% / +0.10%).
+
+# The parallel topology. It is what selects this target at all -- routing
+# derives the target from it -- so every variant carries it and these files
+# are usable as-is: `trtllm-eval --extra_llm_api_options <this file>`.
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: true
+
+max_num_tokens: 2048
+max_seq_len: 2048

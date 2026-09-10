@@ -209,6 +209,14 @@ package_data += [
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
     'usage/schemas/*.json',
+    # Two staircase patterns, both load-bearing. A target's configs/ are
+    # `--extra_llm_api_options` files that TARGET.md's verification commands
+    # pass to trtllm-eval by path, and the claim test asserts TARGET.md sits
+    # beside the modeling.py it vouches for; both read the installed tree. The
+    # contracts, catalog index and docs are read by people in a checkout and
+    # by no code, so they stay out of the wheel.
+    '_torch/staircase/models/**/*.md',
+    '_torch/staircase/models/**/configs/*.yaml',
 ]
 
 

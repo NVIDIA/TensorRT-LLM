@@ -1,6 +1,7 @@
 from typing import Generic, Optional, Type
 
 from ..model_config import ModelConfig
+from ..staircase import staircase_resolve
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
                              get_registered_model_class,
@@ -32,6 +33,14 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             model_arch = model_arch.replace("Eagle3",
                                             "")  # Strip the appended EAGLE3
             model_arch = "EAGLE3" + model_arch
+
+        # Staircase targets are keyed by a synthetic architecture name that no
+        # checkpoint declares -- the same shape as the Eagle3 rewrite above.
+        # Returns None unless `staircase` is on and a target claims this exact
+        # (checkpoint, GPU arch, parallel topology), so the default path is
+        # byte-for-byte unchanged.
+        if (staircase_arch := staircase_resolve(config)) is not None:
+            model_arch = staircase_arch
 
         return get_registered_model_class(model_arch)
 
