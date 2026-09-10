@@ -507,15 +507,6 @@ def _derive_layer_type_attention_windows(
     return resolved
 
 
-def _should_infer_kv_attention_windows(
-    model_config: object,
-    configured_windows: Optional[List[Optional[int]]],
-) -> bool:
-    """Return whether Gemma4 KV storage should infer the model's windows."""
-    return (configured_windows is None and is_gemma4_hybrid(model_config)
-            and getattr(model_config, "sliding_window", None) is not None)
-
-
 def _get_num_pool_groups_for_estimation(
     model_config: object,
     max_seq_len: int,
@@ -526,33 +517,22 @@ def _get_num_pool_groups_for_estimation(
     Model sliding attention alone does not imply separate storage pools.
     Preserve distinctions required by hybrid layer types and page sizes.
     """
-    num_layers = getattr(model_config, "num_hidden_layers", None)
+    if (fallback_attention_windows is not None
+            and not is_hybrid_linear(model_config)):
+        normalized_windows = _normalize_attention_windows(
+            fallback_attention_windows, max_seq_len)
+        return 1 if normalized_windows is None else len(set(normalized_windows))
+
     layer_types = getattr(model_config, "layer_types", None)
     attention_windows = None
-    # Check whether KV storage uses attention windows (KvCacheConfig.max_attention_window),
+    if fallback_attention_windows is None:
+        attention_windows = _derive_layer_type_attention_windows(
+            model_config, max_seq_len)
+    # Check whether KV storage uses configured or inferred attention windows,
     # which can be independently configured from the model's use of sliding-window
     # attention for computation.
     kv_cache_uses_attention_windows = (fallback_attention_windows is not None
-                                       or _should_infer_kv_attention_windows(
-                                           model_config,
-                                           fallback_attention_windows))
-    if kv_cache_uses_attention_windows and isinstance(num_layers,
-                                                      int) and num_layers > 0:
-        try:
-            inferred_windows = [
-                get_layer_attention_window(model_config, layer_idx)
-                for layer_idx in range(num_layers)
-            ]
-        except (NotImplementedError, ValueError) as error:
-            logger.warning(
-                "Unable to infer target attention windows for KV-cache "
-                f"estimation ({error}); falling back to layer metadata.")
-        else:
-            if any(window is not None for window in inferred_windows):
-                attention_windows = [
-                    max_seq_len if window is None else window
-                    for window in inferred_windows
-                ]
+                                       or attention_windows is not None)
 
     if attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
@@ -1726,6 +1706,8 @@ class KvCacheCreator:
         sparse_attn_config = effective_draft_config.sparse_attention_config
         return _create_kv_cache_manager(
             model_engine=None,
+            max_cuda_graph_batch_size=self._model_engine.
+            _max_cuda_graph_batch_size,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=draft_kv_config,
@@ -2445,7 +2427,8 @@ def _create_kv_cache_manager(
         is_disagg: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
-        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
+        joint_kv_cache_reuse: bool = False,
+        max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2598,7 +2581,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
             model_engine._max_cuda_graph_batch_size
-            if model_engine is not None else None)
+            if model_engine is not None else max_cuda_graph_batch_size)
         # V2 builds the block-reuse cache key of a multimodal token run from
         # the vocabulary size. Resolve it here rather than per-branch: the
         # manager needs it whenever block reuse can meet multimodal input,
