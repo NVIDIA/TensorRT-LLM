@@ -994,8 +994,13 @@ def supervise(
     prefer = preference(base)
     wanted = tracks(base)
 
+    # Resolved BEFORE the designer is considered, not after. A design costs
+    # about an order of magnitude more than the campaigns it enables, so
+    # paying for one that already exists next door is the expensive half of
+    # this mistake -- and the reason the agent resumed a neighbour in the
+    # first place was to avoid exactly that.
+    design, redirect = resolve_design_dir(design, wanted)
     unready = [t for t in wanted if not established(design, t)]
-    redirect: str | None = None
     if unready and designer is not None:
         # The design is normally an input -- it is reused across campaigns and
         # costs an order of magnitude more than any of them. But "an input"
@@ -1008,10 +1013,11 @@ def supervise(
                 model_dir=Path(design).parent.name, design_dir=design, tracks=unready
             )
         )
-        # Where the design landed is read back, not assumed: the agent
-        # resumes from a state file, and an existing design beside the
-        # requested one is the thing it should resume.
-        design, redirect = resolve_design_dir(design, wanted)
+        # ...and read back again after it runs, because the agent resumes
+        # from a state file and may have established the design somewhere
+        # other than where it was sent.
+        design, after = resolve_design_dir(design, wanted)
+        redirect = after or redirect
         unready = [t for t in wanted if not established(design, t)]
     if unready:
         what = {

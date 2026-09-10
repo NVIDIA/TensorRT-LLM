@@ -971,3 +971,37 @@ def test_the_redirection_travels_in_the_run_record(tmp_path):
     )
     assert record["design_dir"].endswith("sweep_design")
     assert "design_dir_redirected" in record
+
+
+def test_a_design_that_already_exists_is_not_paid_for_again(tmp_path):
+    """The resolution happens before the designer is considered.
+
+    A design costs about an order of magnitude more than the campaigns it
+    enables, so running one that already exists next door is the expensive
+    half of this mistake -- and avoiding exactly that is why the agent
+    resumed a neighbour to begin with.
+    """
+    model = tmp_path / "model"
+    _established_at(model, "sweep_design")
+    requested = model / "sweep_design2"
+    requested.mkdir()
+    spec = {
+        "checkpoint_path": "/ckpt",
+        FIELD: {
+            "tracks": ["gen"],
+            "design": {"design_dir": str(requested), "prefer": "interactive"},
+        },
+    }
+    ran: list[str] = []
+    record = disagg_sol.supervise(
+        spec,
+        sweeps={"gen": _sweeps(tmp_path)["gen"]},
+        repos={"gen": tmp_path / "rg"},
+        workspace_root=tmp_path / "wsn",
+        label="t",
+        dry_run=True,
+        designer=lambda instruction: ran.append(instruction),
+    )
+    assert ran == []  # the designer was never started
+    assert record["design_dir"].endswith("sweep_design")
+    assert "design_dir_redirected" in record
