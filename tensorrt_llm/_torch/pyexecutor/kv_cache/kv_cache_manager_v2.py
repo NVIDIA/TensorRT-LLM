@@ -1369,26 +1369,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         self._pool_layer_ids_by_role.setdefault(
                             (pool_id, buffer_id.role), buffer_id.layer_id
                         )
-        # A lifecycle group can contain different page sizes in separate
-        # physical pools (e.g. Gemma's heterogeneous head dimensions). Those
-        # layers cannot share a pool pointer or page-index scale. Use the
-        # per-layer conversion path, also required for SWA scratch slots,
-        # while keeping the underlying lifecycle grouping unchanged.
-        self._use_per_layer_page_tables = self.enable_swa_scratch_reuse or any(
-            len(
-                {
-                    self.impl.get_page_stride(layer_id, self._get_pool_roles(pool_id)[0])
-                    for layer_id in layer_ids
-                }
-            )
-            > 1
-            for pool_id, layer_ids in enumerate(self.impl.layer_grouping)
-        )
-        if self._use_per_layer_page_tables:
-            self.num_attention_op_pools = self.num_local_layers
-        else:
-            self.num_attention_op_pools = self.num_pools
-
         num_layers = len(config.layers)
         self.layer_to_pool_mapping_dict: dict[int, int] = {
             layer_id: self.impl.get_layer_group_id(layer_id)
@@ -1636,6 +1616,28 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache_pool_pointers, kv_cache_pool_mapping
 
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        # Keep role-dependent checks in this default page-table initializer:
+        # custom layouts such as DeepSeek V4 override it with their own roles.
+        # A lifecycle group can contain different page sizes in separate
+        # physical pools (e.g. Gemma's heterogeneous head dimensions). Those
+        # layers cannot share a pool pointer or page-index scale. Use the
+        # per-layer conversion path, also required for SWA scratch slots,
+        # while keeping the underlying lifecycle grouping unchanged.
+        self._use_per_layer_page_tables = self.enable_swa_scratch_reuse or any(
+            len(
+                {
+                    self.impl.get_page_stride(layer_id, self._get_pool_roles(pool_id)[0])
+                    for layer_id in layer_ids
+                }
+            )
+            > 1
+            for pool_id, layer_ids in enumerate(self.impl.layer_grouping)
+        )
+        if self._use_per_layer_page_tables:
+            self.num_attention_op_pools = self.num_local_layers
+        else:
+            self.num_attention_op_pools = self.num_pools
+
         self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
