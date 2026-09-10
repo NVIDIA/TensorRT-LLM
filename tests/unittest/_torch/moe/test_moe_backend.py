@@ -14,6 +14,7 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
+import dataclasses
 import importlib
 import itertools
 import logging
@@ -84,6 +85,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
+    _reject_unsupported_activation,
     build_moe_deployment,
     impl_class_for,
     resolve_moe_impl,
@@ -2535,6 +2537,30 @@ def test_nvfp4_fc1_row_alignment_gate(
     else:
         # Other gates may still turn the layer down; this one must not.
         assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
+
+
+@pytest.mark.parametrize(
+    "backend_cls",
+    [CutlassFusedMoE, CuteDslFusedMoE],
+    ids=["cutlass", "cutedsl"],
+)
+def test_situ_survives_resolution_not_just_construction(backend_cls):
+    """A SiTU layer must be admitted by the *resolver*, not only build.
+
+    Every other SiTU test constructs a backend directly and so never consults
+    ``activation_support``. Resolution does, and it reads the **class**
+    attribute, because it judges candidates before any instance exists. A
+    backend that declared its alpha/beta shape per instance instead passed
+    every unit test and then resolved away to CUTLASS on real hardware with
+    "kernels take no activation alpha, which this layer's SiTu supplies" --
+    silently, because Kimi K3 permits degradation for this backend.
+    """
+    problem = dataclasses.replace(
+        _nvfp4_problem(2048, "SiTu"),
+        activation_constants=frozenset({"alpha", "beta"}),
+    )
+    rejection = _reject_unsupported_activation(backend_cls, problem)
+    assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
 
 
 def test_unresolvable_layer_error_carries_rejection_details():

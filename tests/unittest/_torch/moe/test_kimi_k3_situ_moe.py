@@ -591,6 +591,41 @@ def test_kimi_k3_routed_config_logs_megamoe_capacity_override(monkeypatch):
     )
 
 
+def test_kimi_k3_allow_list_matches_what_the_backends_declare():
+    """The K3 allow-list must be exactly the backends that execute SiTU.
+
+    Asserting agreement with each backend's own ``activation_support``
+    rather than against a literal list: a hand-maintained second copy of a
+    capability set is the defect this module already exists to catch, and
+    it is how CUTEDSL stayed shut after its kernels grew the epilogue.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import MegaMoECuteDsl
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm import MegaMoEDeepGemm
+    from tensorrt_llm._torch.utils import ActivationType
+
+    declares_situ = {
+        "CUTLASS": CutlassFusedMoE,
+        "TRTLLM": TRTLLMGenFusedMoE,
+        "CUTEDSL": CuteDslFusedMoE,
+        "MEGAMOE_CUTEDSL": MegaMoECuteDsl,
+        "MEGAMOE_DEEPGEMM": MegaMoEDeepGemm,
+    }
+    for name, cls in declares_situ.items():
+        assert ActivationType.SiTu in cls.activation_support.kinds, (
+            f"{name} lost SiTU from activation_support; the K3 allow-list "
+            "still offers it, so a layer would resolve here and then fail."
+        )
+        model_config = ModelConfig(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            moe_backend=name,
+        )
+        # Must not raise: this is the gate that kept CUTEDSL out.
+        KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+
 def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -990,6 +1025,23 @@ nvfp4_moe_supported = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() < 100,
     reason="NVFP4 Cutlass MoE requires Blackwell (SM100+)",
 )
+
+
+#: The FP4 backends that serve SiTU. CUTEDSL additionally needs the CuTe DSL
+#: wheel, which is checked inside the test rather than in a ``skipif``:
+#: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
+#: directory to ``sys.path``, and this repository fails the whole pytest
+#: session when a test file does that at collection time.
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL"]
+
+
+def _skip_if_backend_unavailable(moe_backend):
+    if moe_backend != "CUTEDSL":
+        return
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
 
 
 def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
@@ -1493,7 +1545,7 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+@pytest.mark.parametrize("moe_backend", _NVFP4_SITU_BACKENDS)
 def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
@@ -1505,16 +1557,23 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     wrong in exactly the way the GSM8K collapse showed, while every
     shape-and-buffer check stayed green.
 
-    Run for both FP4 backends: CUTLASS resolves SiTU through the activation
-    enum, TRTLLM-Gen through a distinct fused-cubin family
-    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``). A silent fallback is a different
-    failure on each, and this comparison is tolerance-free, so it catches
-    both -- including the degenerate all-zero FC1 output, which scores 0
-    against both references and so fails the assertion below.
+    Run for every FP4 backend, because each reaches SiTU by a different
+    mechanism and so fails differently: CUTLASS resolves it through the
+    activation enum, TRTLLM-Gen through a distinct fused-cubin family
+    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``), and CuteDSL through soft-caps
+    folded into a JIT-compiled epilogue at trace time. The CuteDSL case is
+    the one this test exists for: its betas travel as trace-time scalars
+    keyed into the kernel cache, so dropping them does not raise -- it
+    compiles a SwiGLU kernel and returns plausible numbers. An internal
+    branch shipped exactly that defect on a sibling backend for weeks.
+
+    The comparison is tolerance-free, so it also catches the degenerate
+    all-zero FC1 output, which scores 0 against both references.
 
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
     """
+    _skip_if_backend_unavailable(moe_backend)
     num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
     gate = _make_test_gate(num_experts=num_experts)
 
