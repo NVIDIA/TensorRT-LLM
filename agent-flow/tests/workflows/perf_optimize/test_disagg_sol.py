@@ -1136,3 +1136,30 @@ def test_a_derivation_without_a_checkout_adds_no_rung(tmp_path):
         into=tmp_path / "ws2",
     )
     assert "trtllm_install" not in _yaml.safe_load(out.read_text())
+
+
+def test_the_plan_gives_the_derivation_the_campaign_s_checkout(tmp_path):
+    """End to end through launch_plan, not just the derivation in isolation.
+
+    The rung reached `derive_sweep_at_point`'s signature and not its call
+    site, so the unit test passed while every real campaign was refused for
+    having no build source.
+    """
+    import yaml as _yaml
+
+    d = _design(tmp_path)
+    _shape_run(d, "bm_tep4", [(1, 4, "False", 0, 0, 214.0, 53.0)])
+    design_sweep = tmp_path / "8k1k_sol_mtp0.yaml"
+    design_sweep.write_text("gen_configs:\n- [1, 1, 4, 64, 64, false, '0.9', 0, 0, '1,32']\n")
+    launches = disagg_sol.launch_plan(
+        {**BASE, FIELD: {**BASE[FIELD], "tracks": ["gen"]}},
+        sweeps={},
+        repos={"gen": tmp_path / "trtllm-gen"},
+        workspace_root=tmp_path / "wsk",
+        label="t",
+        points={"gen": POINT},
+        design=d,
+        design_sweeps={"gen": design_sweep},
+    )
+    got = _yaml.safe_load(Path(launches[0].spec["sol_track"]["sweep"]).read_text())
+    assert got["trtllm_install"]["trtllm_repo"].endswith("trtllm-gen")
