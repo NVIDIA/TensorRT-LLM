@@ -58,6 +58,7 @@ class RpcWorkerMixin:
         self._postproc_input_queues = None
         self._postproc_collector = None
         self._postproc_collector_thread = None
+        self._postproc_collector_stop = Event()
         self._postproc_futures = []
 
     def init_postproc_workers(self) -> None:
@@ -86,6 +87,7 @@ class RpcWorkerMixin:
 
         num = self.postproc_config.num_postprocess_workers
         assert num > 0
+        self._postproc_collector_stop.clear()
 
         self._postproc_input_queues = [
             IpcQueue(is_server=True, name=f"rpc_worker_postproc_input_{i}") for i in range(num)
@@ -102,17 +104,43 @@ class RpcWorkerMixin:
         # which deadlocks inside a Ray actor (verified empirically).
         self._postproc_pool = ProcessPoolExecutor(max_workers=num)
 
-        def _on_postproc_worker_done(fut) -> None:
-            # ProcessPoolExecutor stores task exceptions on the Future and
-            # never raises them in the parent. A postproc child that dies
-            # outside per-request handling would otherwise fail silently and
-            # leave its requests pending forever; surface the exception on the
-            # worker's background-error path so the next response turns into
-            # an ErrorResponse for the client.
-            exc = fut.exception()
-            if exc is not None and not self.shutdown_event.is_set():
-                logger.error(f"PostprocWorker process died: {exc}")
-                self._error_queue.put(exc)
+        from .utils import ErrorResponse
+
+        def _make_on_postproc_worker_done(shard: int):
+            def _on_postproc_worker_done(fut) -> None:
+                # ProcessPoolExecutor stores task exceptions on the Future and
+                # never raises them in the parent; a postproc child that dies
+                # outside per-request handling would otherwise fail silently.
+                if fut.cancelled():
+                    # pool.shutdown(wait=False) cancels never-started submits;
+                    # fut.exception() would raise CancelledError here.
+                    return
+                exc = fut.exception()
+                if exc is None or self.shutdown_event.is_set():
+                    return
+                logger.error(f"PostprocWorker process {shard} died: {exc}")
+                # Requests are sharded to postproc workers by
+                # client_id % num (see _send_rsp_to_postproc); the engine
+                # produces no further responses for records already handed to
+                # the dead child, so fail this shard's pending requests
+                # explicitly instead of poisoning an unrelated next response.
+                errors = [
+                    ErrorResponse(client_id, f"PostprocWorker process died: {exc}", -1)
+                    for client_id in list(self._results.keys())
+                    if client_id % num == shard
+                ]
+                if errors:
+                    for err in errors:
+                        self._pop_result(err.client_id)
+                    # fetch_responses drains _response_queue list-wise.
+                    self._response_queue.put(errors)
+                else:
+                    # No in-flight request on this shard: park the failure on
+                    # the background-error path so a later submission surfaces
+                    # it instead of hanging on the dead child.
+                    self._error_queue.put(exc)
+
+            return _on_postproc_worker_done
 
         for i in range(num):
             fut = self._postproc_pool.submit(
@@ -123,11 +151,18 @@ class RpcWorkerMixin:
                 PostprocWorker.default_record_creator,
                 self.postproc_config.post_processor_hook,
             )
-            fut.add_done_callback(_on_postproc_worker_done)
+            fut.add_done_callback(_make_on_postproc_worker_done(i))
             self._postproc_futures.append(fut)
 
         def _collect_postproc_outputs() -> None:
-            while not self.shutdown_event.is_set():
+            # IpcQueue.get() has no timeout, so poll the underlying socket
+            # (the same pattern as IpcQueue.drain) to keep the loop observing
+            # the stop events; a live PostprocWorker also forwards a None
+            # sentinel on shutdown, either wakes the loop.
+            self._postproc_collector.setup_lazily()
+            while not (self.shutdown_event.is_set() or self._postproc_collector_stop.is_set()):
+                if not self._postproc_collector.socket.poll(timeout=1000):
+                    continue
                 batch = self._postproc_collector.get()
                 if batch is None:
                     break
@@ -152,28 +187,11 @@ class RpcWorkerMixin:
             self._postproc_pool.shutdown(wait=False)
             self._postproc_pool = None
         if self._postproc_collector_thread is not None:
-            # A live PostprocWorker forwards the None sentinel to its push
-            # pipes (PostprocWorker._batched_put), which unblocks the
-            # collector's get(). If every child already died, nobody forwards
-            # it, so nudge the collector's PULL socket directly.
+            # The collector loop polls with a 1s timeout and re-checks this
+            # event, so it self-terminates even if every child died without
+            # forwarding the None sentinel.
+            self._postproc_collector_stop.set()
             self._postproc_collector_thread.join(timeout=5)
-            if self._postproc_collector_thread.is_alive():
-                import zmq
-
-                from .ipc import IpcQueue
-
-                try:
-                    nudge = IpcQueue(
-                        self._postproc_collector.address,
-                        is_server=False,
-                        socket_type=zmq.PUSH,
-                        name="rpc_worker_postproc_collector_nudge",
-                    )
-                    nudge.put(None)
-                    nudge.close()
-                except Exception:
-                    pass
-                self._postproc_collector_thread.join(timeout=5)
             self._postproc_collector_thread = None
         if self._postproc_input_queues:
             for q in self._postproc_input_queues:

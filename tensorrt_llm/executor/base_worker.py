@@ -1442,7 +1442,11 @@ class AwaitResponseHelper:
             []
             for _ in range(self.worker.postproc_config.num_postprocess_workers)
         ] if self.enable_postprocprocess_parallel else None
-        rsp_batch = [] if not self.enable_postprocprocess_parallel else None
+        # Always allocate: even with postproc parallelism on, ErrorResponse
+        # records bypass the postproc lane (see _send_rsp) and must be batched
+        # here — consumers of result_queue under RPC/Ray expect lists, and a
+        # bare ErrorResponse (a NamedTuple) would be splatted by extend().
+        rsp_batch = []
 
         for response in responses:
 
@@ -1627,7 +1631,10 @@ def _send_rsp(
     # (see RpcWorkerMixin.init_postproc_workers). ErrorResponse records are
     # exempt when a direct route exists: PostprocWorker reads input.rsp.result,
     # which they lack, so they ride the result queue instead (the proxy demux
-    # already terminates on them).
+    # already terminates on them). Note the direct route can overtake earlier
+    # responses of the same client still queued for postproc; the proxy pops
+    # the record on the error, so a trailing Output may log a benign
+    # "unknown client_id" warning.
     _error_with_direct_route = (isinstance(response, ErrorResponse)
                                 and (worker.frontend_result_queues is not None
                                      or worker.result_queue is not None))
