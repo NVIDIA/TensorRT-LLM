@@ -30,9 +30,9 @@ The following tasks are currently supported:
 
 \* Rouge is an informal evaluation metric for code completion.
 
-For LLM API supported tasks, the core evaluation logics (i.e., evaluators) are implemented in the [`tensorrt_llm.evaluate`](../../../../tensorrt_llm/evaluate) module. They are also shared with the CLI tool [`trtllm-eval`](../../../../examples/trtllm-eval). CLI flow tasks typically require calling a standalone script like [`summarize.py`](../../../../examples/summarize.py).
+For LLM API supported tasks, the core evaluation logics (i.e., evaluators) are implemented in the [`tensorrt_llm.evaluate`](../../../../tensorrt_llm/evaluate) module. They are also shared with the CLI tool [`trtllm-eval`](../../../../examples/trtllm-eval). CLI flow tasks typically require calling a standalone script like [`summarize.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/summarize.py).
 
-New accuracy tests are strongly recommended to be added to this test suite, in particular, in the LLM API style (i.e., [test_llm_api.py](./test_llm_api.py) and [test_llm_api_pytorch.py](./test_llm_api_pytorch.py)). There are some legacy accuracy tests outside this test suite (e.g., the tests in [examples](../examples) folder), but they are not recommended anymore.
+New accuracy tests are strongly recommended to be added to this test suite, in particular, in the LLM API style (i.e., [test_llm_api_pytorch.py](./test_llm_api_pytorch.py)). There are some legacy accuracy tests outside this test suite (e.g., the tests in [examples](../examples) folder), but they are not recommended anymore.
 
 
 ## Background: Why This Test Suite?
@@ -138,7 +138,7 @@ If all the evaluated accuracies are equal to or higher than the corresponding th
 
 ### Add New Test Cases with Existing Tasks
 
-We suggest supporting the model with LLM API, and then add tests to [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has the test class defined as:
+We suggest supporting the model with LLM API, and then add tests to [test_llm_api_pytorch.py](./test_llm_api_pytorch.py). Typically, a test class is responsible for a model (corresponding to a unique Hugging Face model ID); it contains several test methods for different features (e.g., quantizations, parallelisms). For example, in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) the model [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) has the test class defined as:
 
 ```python
 class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
@@ -267,7 +267,7 @@ The remaining fields of the task class should be straightforward:
 
 Please see `AccuracyTask.evaluate` in [accuracy_core.py](./accuracy_core.py) for how `EVALUATOR_CLS` and `EVALUATOR_KWARGS` are used.
 
-The new task class is all set. Use it in [test_llm_api.py](./test_llm_api.py) or [test_llm_api_pytorch.py](./test_llm_api_pytorch.py).
+The new task class is all set. Use it in [test_llm_api_pytorch.py](./test_llm_api_pytorch.py).
 
 
 ## Hypothesis Testing Methodology
