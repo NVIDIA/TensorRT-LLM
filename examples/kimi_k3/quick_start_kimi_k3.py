@@ -26,6 +26,12 @@ SAMPLES = [
 
 
 def parse_arguments() -> argparse.Namespace:
+    """CLI for the single-node-per-rank Kimi K3 smoke run.
+
+    The defaults describe a DEP16 deployment: ``--tp-size`` sets tensor and
+    expert parallelism together, since Kimi K3 runs attention-DP with
+    expert-parallel MoE and the two sizes are the same number.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model",
@@ -55,6 +61,12 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Generate the four sample prompts and report whether each hit.
+
+    Prints the expected substring check per prompt rather than asserting, so
+    a run that loads and generates but answers wrongly is visible in the log
+    instead of collapsing into a single non-zero exit.
+    """
     args = parse_arguments()
     llm_kwargs = dict(
         model=args.model,
