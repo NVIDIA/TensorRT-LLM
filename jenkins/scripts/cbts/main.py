@@ -396,6 +396,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         "rest is recorded. Absent or unreadable declines the tier.",
     )
     parser.add_argument(
+        "--coverage-input",
+        default=None,
+        help="Optional INPUT_JSON used only by the coverage tier. Tier 1 always uses the "
+        "positional PR input.",
+    )
+    parser.add_argument(
         "--coverage-max-drift",
         type=int,
         default=DEFAULT_COVERAGE_MAX_DRIFT,
@@ -472,9 +478,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         if not note:  # the gate passed; a note here means it did not
             try:
+                coverage_pr = pr
+                if args.coverage_input:
+                    coverage_diff_input = _load_pr_inputs(Path(args.coverage_input))
+                    coverage_pr = PRInputs(
+                        changed_files=pr.changed_files,
+                        diffs=coverage_diff_input.diffs,
+                        post_merge=pr.post_merge,
+                    )
                 db = open_db(args.coverage_db)
                 tier, note = apply_coverage_tier(
-                    pr,
+                    coverage_pr,
                     selector.pairs,
                     selector.handled,
                     stages,
