@@ -105,6 +105,7 @@ endif()
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_gtest(trtllmGenExportCompatTest trtllmGenExportCompatTest.cpp)
 
 set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
     nvfp4ColdPageKernelsTest.cpp

@@ -458,6 +458,11 @@ public:
         return mEnableContextFMHA && mEnableXQA && !needsUlyssesPostprocess;
     }
 
+    [[nodiscard]] bool supportsVariableWindow() const
+    {
+        return mUseVariableWindow && mEnableContextFMHA;
+    }
+
     [[nodiscard]] int32_t* multiBlockSemaphores() const
     {
         return mMultiBlockSemaphores.get();

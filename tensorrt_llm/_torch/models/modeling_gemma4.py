@@ -1583,6 +1583,16 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             resource_manager=resource_manager,
         )
 
+    def _supports_variable_window_attention(self, attn_metadata: TrtllmAttentionMetadata) -> bool:
+        sliding_layer = next((layer for layer in self.model.layers if layer.is_sliding), None)
+        if sliding_layer is None:
+            return False
+        return sliding_layer.self_attn.attn._is_variable_window_kernel_available(
+            dtype=self.config.torch_dtype,
+            tokens_per_block=attn_metadata.tokens_per_block,
+            use_paged_context_fmha=attn_metadata.use_paged_context_fmha,
+        )
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1612,6 +1622,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             and is_sm_100f()
             and isinstance(attn_metadata, TrtllmAttentionMetadata)
             and attn_metadata.num_contexts > 0
+            and self._supports_variable_window_attention(attn_metadata)
         ):
             (
                 local_variable_window_token_starts,
