@@ -54,10 +54,11 @@ from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
-                           get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-                           resolve_vocab_size, uses_vswa_kv_cache_layout)
+                           get_layer_attention_window, has_fp4_kv_cache,
+                           is_gemma4_hybrid, is_hybrid_linear, is_kimi_linear,
+                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_qwen4_exp, resolve_vocab_size,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -147,8 +148,7 @@ def get_kv_cache_manager_cls(
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
     quant_config = getattr(model_config, "quant_config", None)
-    if (is_mla(config) and quant_config is not None
-            and quant_config.quant_mode.has_fp4_kv_cache()):
+    if is_mla(config) and has_fp4_kv_cache(quant_config):
         if kv_cache_config.use_kv_cache_manager_v2 is False:
             raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
         if model_config.attn_backend != "TRTLLM":
@@ -754,8 +754,7 @@ class KvCacheCreator:
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
                 quant_config = getattr(model_config, "quant_config", None)
-                if (is_mla(config) and quant_config is not None
-                        and quant_config.quant_mode.has_fp4_kv_cache()):
+                if is_mla(config) and has_fp4_kv_cache(quant_config):
                     raise NotImplementedError(
                         "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
                         f"not yet supported with {incompat_str}. Disable these "

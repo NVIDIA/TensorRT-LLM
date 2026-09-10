@@ -51,9 +51,9 @@ from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, is_mla, resolve_hf_torch_dtype,
-                           resolve_ssm_cache_dtype, supports_fp4_mla_attention,
-                           uses_fp4_mla_attention)
+from .config_utils import (has_fp4_kv_cache, is_hybrid_linear, is_mla,
+                           resolve_hf_torch_dtype, resolve_ssm_cache_dtype,
+                           supports_fp4_mla_attention, uses_fp4_mla_attention)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -208,7 +208,7 @@ def validate_fp4_mla_config(model_config: ModelConfig,
                             llm_args: TorchLlmArgs) -> None:
     """Validate FP4 MLA before model construction and KV-cache allocation."""
     if not (is_mla(model_config.pretrained_config)
-            and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
+            and has_fp4_kv_cache(model_config.quant_config)):
         return
     if not supports_fp4_mla_attention(model_config):
         raise ValueError(
