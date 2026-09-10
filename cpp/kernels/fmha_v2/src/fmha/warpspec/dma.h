@@ -620,7 +620,7 @@ struct DMA
                                                                                                                        \
     int v_barrier_id;                                                                                                  \
     void* v_barrier_ptr;                                                                                               \
-    typename Kernel_traits::Element_data_type* v_smem;                                                                 \
+    typename Kernel_traits::Element_data_type_o* v_smem;                                                               \
                                                                                                                        \
     if constexpr (DMA_GROUP_TRANSPOSE_V)                                                                               \
     {                                                                                                                  \

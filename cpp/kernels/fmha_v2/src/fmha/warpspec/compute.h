@@ -214,35 +214,63 @@ struct Compute
         SAGE_BLOCK_SIZE_Q = Kernel_traits::SAGE_BLOCK_SIZE_Q
     };
 
-    // sanitize 0 to -1, avoid DIV BY ZERO below
     enum
     {
-        SAGE_BLOCK_SIZE_K = Kernel_traits::SAGE_BLOCK_SIZE_K > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_K : -1
+        SAGE_BLOCK_SIZE_K = Kernel_traits::SAGE_BLOCK_SIZE_K
     };
 
     enum
     {
-        SAGE_BLOCK_SIZE_V = Kernel_traits::SAGE_BLOCK_SIZE_V > 0 ? Kernel_traits::SAGE_BLOCK_SIZE_V : -1
+        SAGE_BLOCK_SIZE_V = Kernel_traits::SAGE_BLOCK_SIZE_V
     };
 
-    // BLOCK_SIZE_Q should be multiply of STEP_Q (usually 64) so that q scale can be fused into scale_bmm1
-    static_assert(SAGE_BLOCK_SIZE_Q < 0 || SAGE_BLOCK_SIZE_Q % STEP_Q == 0);
-    static_assert(SAGE_BLOCK_SIZE_K < 0 || SAGE_BLOCK_SIZE_K % 8 == 0);  // 8 = columns of a gmma CORE
-    static_assert(SAGE_BLOCK_SIZE_V < 0 || SAGE_BLOCK_SIZE_V % 32 == 0); // 32 = K dimension of a qgmma
-
-    // SAGE_BLOCKS_PER_STEP_X is used to declare scale buffer like `float scales_k[SAGE_BLOCKS_PER_STEP_K];`
-    // if SAGE_BLOCKS_PER_STEP_X == 0, you will get `zero-sized variable is not allowed in device code`
-    // error from nvcc, so the minimal value have to be 1. But don't worry, unused local variables will
-    // be optimized out by compiler.
+    // SageAttention groups tokens the way the BMM1 fragment distributes them across threads, so a
+    // thread never needs more than one scale per axis. Q: the 2 rows a thread owns (quad_row and
+    // quad_row + 8, strided). K: one of the SAGE_K_CHUNKS sub-fragments of a thread's key columns.
     enum
     {
-        SAGE_BLOCKS_PER_STEP_K = std::max(STEP_KV / SAGE_BLOCK_SIZE_K, 1)
+        SAGE_Q_TOKENS_PER_SCALE = 2
     };
 
     enum
     {
-        SAGE_BLOCKS_PER_STEP_V = std::max(STEP_KV / SAGE_BLOCK_SIZE_V, 1)
+        SAGE_K_TOKENS_PER_SCALE = STEP_KV / (4 * Kernel_traits::SAGE_K_CHUNKS)
     };
+
+    enum
+    {
+        SAGE_Q_SCALES_PER_TILE = STEP_Q / SAGE_Q_TOKENS_PER_SCALE
+    };
+
+    enum
+    {
+        SAGE_K_SCALES_PER_TILE = 4 * Kernel_traits::SAGE_K_CHUNKS
+    };
+
+    // The scale buffers are laid out as (H, scales for the whole batch) rather than
+    // (B, H, max_nblock): the caller sizes its workspace when only the batch size and the total
+    // token count are known, not max_seqlen. A sequence's scales begin at a base derived from its
+    // cu_seqlens entry, and each sequence reserves one spare tile so that the scales of a partial
+    // final tile -- which the kernel indexes in full -- cannot run into the next sequence.
+    enum
+    {
+        SAGE_Q_SLOTS_PER_SEQ = SAGE_Q_SCALES_PER_TILE
+    };
+
+    // K reserves 4 more so its base can be rounded up to a multiple of 4, which keeps the float4
+    // scale load aligned. Rounding up costs at most 3, and one spare tile plus 4 covers that.
+    enum
+    {
+        SAGE_K_SLOTS_PER_SEQ = SAGE_K_SCALES_PER_TILE + 4
+    };
+
+    static_assert(SAGE_K_SLOTS_PER_SEQ % 4 == 0, "the K scale base must stay 16B-aligned");
+    static_assert(SAGE_BLOCK_SIZE_Q <= 0 || SAGE_BLOCK_SIZE_Q == SAGE_Q_TOKENS_PER_SCALE,
+        "sage block_q must be 2: Q is quantized per thread (2 strided rows)");
+    static_assert(SAGE_BLOCK_SIZE_K <= 0 || SAGE_BLOCK_SIZE_K == SAGE_K_TOKENS_PER_SCALE,
+        "sage block_k must be 16: K is quantized per thread sub-fragment");
+    static_assert(SAGE_BLOCK_SIZE_V <= 0 || Kernel_traits::SAGE_V_PER_CHANNEL,
+        "V is quantized along the channel axis; sage block_v must be 1 or 0");
 
 #define K_TILE_WAIT()                                                                                                  \
     int ready_k = cbr_k.peek();                                                                                        \
@@ -262,7 +290,7 @@ struct Compute
         actual_kv_seqlen, alibi_head_scale,                                                                            \
         USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)                           \
                         : (q_step_idx * STEP_Q + head_info.q_tile_offset),                                             \
-        kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor,                                             \
+        kv_step_idx * STEP_KV, sage_scale_base_kv, cbr, cbr_v, mutex_accessor,                                         \
         &shared->skip_softmax_votes[kv_step_idx & 1][warpgroup_id], kv_step_idx == kv_idx_end - 1);
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -389,11 +417,21 @@ struct Compute
             // Calculate the alibi head_scaling_factor.
             float alibi_head_scale
                 = APPLY_ALIBI ? get_alibi_head_scaling_factor<AlibiParams>(head_info.bidh, params.alibi_params) : 0.f;
-            // pre-compute the row of the scale for reuse
-            int sage_scale_row;
+            // pre-compute where this (sequence, head) pair's scales start, for reuse below. Q is
+            // quantized per query head, K per key/value head: in MQA/GQA several query heads share
+            // one KV head. max_nblock is the per-head stride of the whole batch's scales.
+            int sage_scale_base = 0;
+            int sage_scale_base_kv = 0;
             if constexpr (Kernel_traits::SAGE_ATTENTION)
             {
-                sage_scale_row = head_info.bidb * params.h + head_info.bidh;
+                int const bidb = head_info.bidb;
+                sage_scale_base = head_info.bidh * params.sage.q.max_nblock
+                    + params.cu_q_seqlens[bidb] / SAGE_Q_TOKENS_PER_SCALE + bidb * SAGE_Q_SLOTS_PER_SEQ;
+                // Round the dense part up so the base is a multiple of 4; SAGE_K_SLOTS_PER_SEQ is
+                // one too, so every sequence's base stays 16B-aligned.
+                int const k_dense = params.cu_kv_seqlens[bidb] / SAGE_K_TOKENS_PER_SCALE;
+                sage_scale_base_kv = (head_info.bidh / params.h_q_per_kv) * params.sage.k.max_nblock
+                    + ((k_dense + 3) & ~3) + bidb * SAGE_K_SLOTS_PER_SEQ;
             }
 
             // BMM2 epilogue
@@ -415,7 +453,12 @@ struct Compute
                     // to avoid frequent `__ldg`. But experiment shows that the current one is faster.
                     // A bit counterintuitive.
                     auto const scale_bmm1 = params.scale_bmm1_d ? __ldg(params.scale_bmm1_d) : params.scale_bmm1;
-                    int const idx = sage_scale_row * params.sage.q.max_nblock + q_offset / SAGE_BLOCK_SIZE_Q;
+                    // One scale per thread: it covers exactly the two rows this thread owns. All
+                    // four lanes of a quad share quad_row and therefore read the same scale, which
+                    // keeps the row-max shuffle reduction consistent. Derived from tidx because
+                    // quad_row_ is only initialised for causal/sliding kernels.
+                    int const q_pair = (tidx / 32) * 8 + (tidx % 32) / 4;
+                    int const idx = sage_scale_base + (q_offset / STEP_Q) * SAGE_Q_SCALES_PER_TILE + q_pair;
                     *(float*) (&softmax.scale_bmm1_)
                         = reinterpret_cast<float const&>(scale_bmm1) * __ldg(&params.sage.q.scales[idx]);
                 }
@@ -520,6 +563,51 @@ struct Compute
                 }
                 if (valid_run)
                 {
+                    // The per-channel V scale is constant along the BMM2 reduction dimension, so it never has
+                    // to interrupt the QGMMA pipeline: it is applied once here, per output column. The
+                    // accumulator N index is permuted relative to the head dimension; the column mapping below
+                    // mirrors Gmem_tile_o_qgmma_fp32_16bits::store().
+                    if constexpr (Kernel_traits::SAGE_V_PER_CHANNEL)
+                    {
+                        // Layout is (H_kv, D): the amax is reduced over every token of every sequence, so
+                        // unlike the Q/K scales it carries no batch dimension.
+                        float const* v_scales_ch
+                            = params.sage.v.scales + (size_t) (head_info.bidh / params.h_q_per_kv) * params.dv;
+                        int const lane_quad = tidx % 4;
+#pragma unroll
+                        for (int mma_ni = 0; mma_ni < Mma_tile_o::MMAS_N; mma_ni++)
+                        {
+                            // Each even/odd core pair covers 4 consecutive output columns starting at col_base,
+                            // so the scales come in as one 16B load. The (ni, ei) -> column order is exactly
+                            // the (x, y, z, w) order of store().
+#pragma unroll
+                            for (int ni = 0; ni < Mma_tile_o::CORES_N; ni += 2)
+                            {
+                                int const col_base = mma_ni * Mma_tile_o::CORES_N * 8 + ni * 8 + lane_quad * 4;
+                                float4 scale4 = {1.f, 1.f, 1.f, 1.f};
+                                if (col_base + 4 <= params.dv)
+                                {
+                                    scale4 = __ldg(reinterpret_cast<float4 const*>(v_scales_ch + col_base));
+                                }
+                                float const scale_ch[2][2] = {{scale4.x, scale4.z}, {scale4.y, scale4.w}};
+#pragma unroll
+                                for (int nj = 0; nj < 2; nj++)
+                                {
+#pragma unroll
+                                    for (int ei = 0; ei < 2; ei++)
+                                    {
+#pragma unroll
+                                        for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
+                                        {
+                                            ctile_o.acc_[0][mma_ni].elt(
+                                                2 * (ni + nj) * Mma_tile_o::CORES_M + 2 * mi + ei)
+                                                *= scale_ch[nj][ei];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Final step's update.
                     tile_o_epilogue.scale(ctile_o, p_max, p_sum);
                     // Store o_tile to gmem.
@@ -554,8 +642,9 @@ struct Compute
     inline __device__ void compute_single_tile(Params params, Compute_tile_p& ctile_p, Softmax& softmax,
         Compute_tile_o& ctile_o, float (&p_max)[Mma_tile_p::CORES_M], float (&p_sum)[Mma_tile_p::CORES_M],
         int const tidx, int const actual_kv_seqlen, float const alibi_head_scale, int const row_offset,
-        int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr, Circular_buffer_kv_reader& cbr_v,
-        OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote, bool complete = false)
+        int const col_offset, int const sage_scale_base_kv, Circular_buffer_q_reader& cbr,
+        Circular_buffer_kv_reader& cbr_v, OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote,
+        bool complete = false)
     {
 
         // Skip-softmax vote initialization
@@ -565,27 +654,36 @@ struct Compute
             *skip_softmax_vote = 1;
         }
 // load the scales of K/V from global memory
-#define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                                                        \
-    if constexpr (block_size > 0)                                                                                      \
+// Load this thread's K scales for one STEP_KV tile. They are stored swizzled as
+// [tile][quad_col][chunk], so the SAGE_K_CHUNKS scales a thread needs are contiguous and come in as
+// a single 128-bit access.
+#define LOAD_SCALES_K(dst)                                                                                             \
+    if constexpr (SAGE_BLOCK_SIZE_K > 0)                                                                               \
     {                                                                                                                  \
-        const int _start = col_offset / block_size;                                                                    \
-        const float* _src = params.sage.which.scales + sage_scale_row * params.sage.which.max_nblock + _start;         \
-        const int _end = params.sage.which.max_nblock - _start;                                                        \
-        _Pragma("unroll") for (int _i = 0; _i < blocks_per_step; _i++)                                                 \
+        const float* _src = params.sage.k.scales + sage_scale_base_kv                                                  \
+            + (col_offset / STEP_KV) * SAGE_K_SCALES_PER_TILE + (tidx % 4) * Kernel_traits::SAGE_K_CHUNKS;             \
+        if constexpr (Kernel_traits::SAGE_K_CHUNKS == 4)                                                               \
         {                                                                                                              \
-            dst[_i] = _i < _end ? _src[_i] : 1.0f;                                                                     \
+            const float4 _s4 = __ldg(reinterpret_cast<const float4*>(_src));                                           \
+            dst[0] = _s4.x;                                                                                            \
+            dst[1] = _s4.y;                                                                                            \
+            dst[2] = _s4.z;                                                                                            \
+            dst[3] = _s4.w;                                                                                            \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            _Pragma("unroll") for (int _g = 0; _g < Kernel_traits::SAGE_K_CHUNKS; _g++)                                \
+            {                                                                                                          \
+                dst[_g] = __ldg(_src + _g);                                                                            \
+            }                                                                                                          \
         }                                                                                                              \
     }
-
-#define LOAD_SCALES_K(scales) LOAD_SCALES_KV(scales, k, SAGE_BLOCKS_PER_STEP_K, SAGE_BLOCK_SIZE_K)
-
-#define LOAD_SCALES_V(scales) LOAD_SCALES_KV(scales, v, SAGE_BLOCKS_PER_STEP_V, SAGE_BLOCK_SIZE_V)
 
         // Load the needed packed masks.
         softmax.load_packed_mask(row_offset, col_offset);
 
         // experiments show that here is the best place to load scales of K
-        float scales_k[SAGE_BLOCKS_PER_STEP_K];
+        float scales_k[Kernel_traits::SAGE_K_CHUNKS];
         LOAD_SCALES_K(scales_k)
 
         // Wait until another warpgroup has already executed HGMMA.
@@ -650,18 +748,29 @@ struct Compute
 
         // Unpack the elements from bmm1 output to floats.
         softmax.unpack(ctile_p);
-        // apply the scales of K before softmax
+        // apply the scales of K before softmax. A chunk is exactly the set of keys sharing one K
+        // scale, i.e. one of the SAGE_K_CHUNKS sub-fragments of this thread's key columns.
+        //
+        // NOTE: the shipped cubin folds this into the exp2f of the softmax instead, which costs a
+        // few multiplies per tile rather than one per element. This tree only has to agree on the
+        // ABI, the thread shape and the shared-memory budget, so it takes the simple route.
         if constexpr (SAGE_BLOCK_SIZE_K > 0)
         {
+            constexpr int ELTS_PER_CHUNK = Mma_tile_p::CORES_N * 2 / Kernel_traits::SAGE_K_CHUNKS;
+            static_assert(
+                Mma_tile_p::CORES_N * 2 % Kernel_traits::SAGE_K_CHUNKS == 0, "chunk must divide the fragment");
 #pragma unroll
-            for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++)
+            for (int g = 0; g < Kernel_traits::SAGE_K_CHUNKS; g++)
             {
-                float const scale_k = scales_k[SAGE_BLOCKS_PER_STEP_K * ni / Mma_tile_p::CORES_N];
+                float const scale_k = scales_k[g];
 #pragma unroll
-                for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+                for (int j = 0; j < ELTS_PER_CHUNK; j++)
                 {
-                    softmax.elt_[mi][2 * ni] *= scale_k;
-                    softmax.elt_[mi][2 * ni + 1] *= scale_k;
+#pragma unroll
+                    for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
+                    {
+                        softmax.elt_[mi][g * ELTS_PER_CHUNK + j] *= scale_k;
+                    }
                 }
             }
         }
@@ -696,10 +805,6 @@ struct Compute
             return;
         }
 
-        // experiments show that here is the best place to load scales of V
-        float scales_v[SAGE_BLOCKS_PER_STEP_V];
-        LOAD_SCALES_V(scales_v)
-
         // Update flash attention scales and pack it for BMM2
         softmax.pack<IS_FIRST_COL>(ctile_o, frag_p);
 
@@ -718,42 +823,6 @@ struct Compute
 
         warpgroup_arrive();
 
-        float last_scale_v;
-
-// Apply the scale of V to partial result.
-// Note 2 points:
-// 1. Because the matrix V is quantized along the inner dimension, it is necessary to interrupt
-//   the MMA workflow after processing each BLOCKS_SIZE_V rows of V and scale the intermediate
-//   results once. For example, STEP_KV=256, qgmma.K=32, then 256/32=8 MMAs are needs,
-//   so mma_ki = [0,1,2, ..., 7]. If the BLOCK_SIZE_V=64, then after each 2 qgmmas we should scale
-//   ctile_o.
-// 2. The ctile_o is all zero at the beginning. if we directly apply the scale of V after each 2
-//   qgmmas, let's see what happens:
-//     ctile_o = [0]
-//     ctile_o = (ctile_o + P0 x V0) * s0 = P0 x V0 * s0
-//     ctile_o = (ctile_o + P1 x V1) * s1 = P0 x V0 * s0 * s1 + P1 x V1 * s1
-//     ctile_o = (ctile_o + P2 x V2) * s2 = P0 x V0 * s0 * s1 * s2 + P1 x V1 * s1 * s2 + P2 x V2 * s2
-//     ...
-//   As you see, the actual scale of a V block is the cumulative product of the scales of all
-//   later blocks. To solve this, we have to preprocess the scale s[i] of block[i] to s[i]/s[i+1],
-//   and the final block uses the actual scale.
-// But to fetch the next scale in next STEP leads to bad performance. So we apply s[i-1]/s[i] to
-// current partial result BEFORE each V block.
-#define APPLY_SCALE_V(mma_ki)                                                                                          \
-    if constexpr (SAGE_BLOCK_SIZE_V > 0)                                                                               \
-    {                                                                                                                  \
-        if (mma_ki % (Mma_tile_o::MMAS_K / SAGE_BLOCKS_PER_STEP_V) == 0)                                               \
-        {                                                                                                              \
-            float _scale_v = scales_v[SAGE_BLOCKS_PER_STEP_V * mma_ki / Mma_tile_o::MMAS_K];                           \
-            if (mma_ki != 0)                                                                                           \
-            {                                                                                                          \
-                warpgroup_commit();                                                                                    \
-                warpgroup_wait<0>();                                                                                   \
-            }                                                                                                          \
-            last_scale_v = _scale_v;                                                                                   \
-        }                                                                                                              \
-    }
-
 // BMM2 (S * V).
 #pragma unroll
         for (int kbi = 0; kbi < BMM2_MMAS_K_GROUPS - 1; kbi++)
@@ -762,7 +831,6 @@ struct Compute
             for (int ki = 0; ki < BMM2_MMAS_K_PER_GROUP; ++ki)
             {
                 int const mma_ki = kbi * BMM2_MMAS_K_PER_GROUP + ki;
-                APPLY_SCALE_V(mma_ki)
                 ctile_o.fill_frag_a(frag_p[mma_ki]);
                 ctile_o.compute(ki, false, ki == BMM2_MMAS_K_PER_GROUP - 1);
             }
@@ -773,12 +841,10 @@ struct Compute
         for (int ki = 0; ki < BMM2_MMAS_K_PER_GROUP - 1; ++ki)
         {
             int const mma_ki = (BMM2_MMAS_K_GROUPS - 1) * BMM2_MMAS_K_PER_GROUP + ki;
-            APPLY_SCALE_V(mma_ki)
             ctile_o.fill_frag_a(frag_p[mma_ki]);
             ctile_o.compute(ki);
         }
 
-        APPLY_SCALE_V((Mma_tile_o::MMAS_K - 1))
         ctile_o.fill_frag_a(frag_p[Mma_tile_o::MMAS_K - 1]);
         ctile_o.compute(Mma_tile_o::MMAS_K - 1, true, true);
 

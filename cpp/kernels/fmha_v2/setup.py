@@ -2233,6 +2233,7 @@ def selected_mask_types(kspec):
 
 
 def get_kernel_code(kspec, kname, lname):
+
     min_cuda_version = 0  # no restriction
 
     # The architecture that determines the instruction.
@@ -3333,7 +3334,11 @@ def use_cubin_header(sm,
                      dtype,
                      output_dtype=None,
                      enable_skip_softmax=False,
-                     attention_mask_type=None):
+                     attention_mask_type=None,
+                     sage_block_sizes=None):
+    # SageAttention is warp-specialized + TMA only.
+    if sage_block_sizes:
+        return True
     if enable_skip_softmax:
         return False
     if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
@@ -3355,7 +3360,7 @@ def get_cubin_header(kernel_traits, specs_names):
             if '_bidirectional_sliding_window' in kname else None
         if generate_cu_trtllm and not use_cubin_header(
                 kspec.sm, kspec.head_size, kspec.dtype, kspec.output_dtype,
-                kspec.enable_skip_softmax, mask_type):
+                kspec.enable_skip_softmax, mask_type, kspec.sage_block_sizes):
             continue
         name = fname.replace('.', '_')
         # No `extern "C"` -- the build-time INCBIN aggregator
@@ -3429,8 +3434,10 @@ def get_cubin_header(kernel_traits, specs_names):
             toks.pop(-5)
             toks.pop(-4)
             toks.pop(-3)
+            has_sage = True
         else:
             sage_block_sizes = (0, 0, 0)
+            has_sage = False
         head_size = toks[-3]
         if 'x' in head_size:
             (head_size, head_size_v) = head_size.split('x')
@@ -3467,6 +3474,12 @@ def get_cubin_header(kernel_traits, specs_names):
             is_fp32_accu = 'true'
         if output_prec is None:
             output_prec = prec
+
+        # SageAttention runs int8 Q/K with an e4m3 PV. The metadata carries a single input data
+        # type, so record the composite one: it still selects the kernel, and it tells a reader
+        # this is not a plain fp8 kernel.
+        if has_sage:
+            prec = 'KV_INT8_E4M3'
 
         is_il = pythonBoolean2cpp['_il' in kname]
         attention_mask_type = AttentionMaskType.PADDING
@@ -3535,7 +3548,7 @@ def get_cubin_header(kernel_traits, specs_names):
                     if use_cubin_header(int(sm), int(head_size), prec.lower(),
                                         output_prec.lower(),
                                         enable_skip_softmax,
-                                        attention_mask_type):
+                                        attention_mask_type, has_sage):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
@@ -3558,7 +3571,8 @@ def get_cubin_header(kernel_traits, specs_names):
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
 '''.format(**locals()) if use_cubin_header(
                     int(sm), int(head_size), prec.lower(), output_prec.lower(),
-                    enable_skip_softmax, attention_mask_type) else '''\
+                    enable_skip_softmax, attention_mask_type,
+                    has_sage) else '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
@@ -3848,6 +3862,8 @@ constexpr int32_t kSM_120 = 120;
 constexpr int32_t kSM_121 = 121;
 
 // FIXME: These are duplicated declarations, we should remove them in the future.
+// The enumerator order has to match kernels/multiHeadAttentionCommon.h, since both describe the
+// same values in one binary.
 enum Data_type
 {{
     DATA_TYPE_BOOL,
@@ -3859,7 +3875,11 @@ enum Data_type
     DATA_TYPE_BF16,
     DATA_TYPE_E2M1,
     DATA_TYPE_E4M3,
-    DATA_TYPE_E5M2
+    DATA_TYPE_E5M2,
+    // Composite kv data types
+    DATA_TYPE_KV_FP16_E4M3,
+    DATA_TYPE_KV_BF16_E4M3,
+    DATA_TYPE_KV_INT8_E4M3
 }};
 
 struct FusedMultiHeadAttentionKernelMetaInfoV2
@@ -3964,6 +3984,10 @@ def generate_files(specs_names):
 
     kfiles = []
     valid_specs_names = []
+
+    # SageAttention ships as pre-built cubins, so its specs contribute only the cubin extern
+    # declarations and the metadata row emitted by get_cubin_header, and are threaded straight to
+    # it alongside the generated kernels.
 
     for kspec, fname, lname, kname in specs_names:
         code = get_kernel_code(kspec, kname, lname)
@@ -6711,12 +6735,13 @@ def enumerate_kernels():
             output_dtype="bf16",
             enable_skip_softmax=enable_skip_softmax)
 
-    # For now SageAttention only needs BF16
-    # block_size_q should be divisible by 64
-    # block_size_k should be divisible by 8
-    # block_size_v should be divisible by 32
-    for sage_block_sizes in [(64, 64, 64), (64, 64, 128), (64, 64, 256),
-                             (64, 128, 64), (64, 128, 128), (64, 128, 256)]:
+    # SM90 SageAttention scales the tokens a single thread owns, so exactly one combination is
+    # supported. All three entries are block sizes, each counted along the axis quantization runs
+    # over:
+    #   block_q = 2   the 2 query rows a thread owns (strided: rows r and r + 8)
+    #   block_k = 16  the 16 keys of one of a thread's four sub-fragments (strided)
+    #   block_v = 1   one channel, since V is quantized along the channel axis
+    for sage_block_sizes in [(2, 16, 1)]:
         enumerate_qgmma_flash_warpspec_kernels(
             specs,
             sm=90,
@@ -6747,17 +6772,6 @@ def enumerate_kernels():
                                      dtype='e4m3_fp32',
                                      head_sizes=[192, 576],
                                      output_dtype="bf16")
-        # Sage Attention on Ada only supports block_size = (64, 32, 32)
-        enumerate_qmma_flash_kernels(specs,
-                                     sm=89,
-                                     dtype='e4m3_fp32',
-                                     sage_block_sizes=(64, 32, 32),
-                                     output_dtype="bf16")
-        enumerate_qmma_flash_kernels(specs,
-                                     sm=89,
-                                     dtype='e4m3_fp32',
-                                     sage_block_sizes=(64, 32, 32),
-                                     output_dtype="fp16")
 
     enumerate_imma_kernels(specs, sm=89)
     enumerate_hmma_kernels(specs, sm=89, dtype='fp16')
@@ -6939,27 +6953,19 @@ def enumerate_kernels():
                   and ((kspec.warp_specialization == True and kspec.alibi == False)   # sm90
                     or (kspec.warp_specialization == False and kspec.tiled == True))  # non-sm90
                   and kspec.enable_attn_logit_softcapping == False)
-                  # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
+                  # SageAttention (warp_spec, separate Q/K/V, padding mask). SageAttention
+                  # quantizes Q, K and V separately, so separate Q/K/V is the layout it is exported
+                  # for; the head sizes listed are the ones we ship a cubin for.
                   or (kspec.sm            == 90
-                  and kspec.head_size     in [80, 128]
+                  and kspec.head_size     in [128]
                   and kspec.version       == 2
-                  and kspec.sage_block_sizes in [(64, 64, 256)]
+                  and kspec.sage_block_sizes in [(2, 16, 1)]
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.warp_specialization == True
-                  and kspec.input_layout == InputLayout.PACKED_QKV
+                  and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
                   and kspec.alibi == False
-                  and kspec.enable_attn_logit_softcapping == False)
-                  # SageAttention on Ada (head_size in (80, 128), packed QKV, padding mask)
-                  or (kspec.sm            == 89
-                  and kspec.head_size     in [80, 128]
-                  and kspec.sage_block_sizes in [(64, 32, 32)]
-                  and kspec.output_dtype in ['fp16', 'bf16']
-                  and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.warp_specialization == False
-                  and kspec.input_layout == InputLayout.PACKED_QKV))
+                  and kspec.enable_attn_logit_softcapping == False))
                   # only generate head_size = 128/256 for attn_logit_softcapping operation.
                   and (kspec.head_size == 128 or kspec.head_size == 256 or not kspec.enable_attn_logit_softcapping)]
     # yapf: enable
