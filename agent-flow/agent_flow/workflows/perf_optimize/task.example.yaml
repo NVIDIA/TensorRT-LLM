@@ -114,6 +114,11 @@ profile:
 #   max_items_per_round: 3      # maximum roadmap items selected per round
 #   item_execution: parallel    # parallel: isolated workers then Integrator;
 #                               # serial: one worker at a time, accepted directly
+#   parallel_engine: dag        # which engine runs `item_execution: parallel`.
+#                               # dag (default): the shared orchestration DAG
+#                               # scheduler. threads: the pre-engine thread
+#                               # pool, kept as a fallback — same batch, same
+#                               # Integrator, no scheduler. Ignored by serial
 #   max_parallel_items: 3       # how many of those items may run AT ONCE
 #                               # (parallel mode only; defaults to
 #                               # max_items_per_round). Each concurrent item

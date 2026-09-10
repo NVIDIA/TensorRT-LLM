@@ -145,6 +145,15 @@ than inventing values:
   `trtllm-serve` and benchmark, so on a single node without a
   `slurm-environment` block tell the user to set it to `1` — otherwise the
   concurrent servers contend for the same GPUs and port.
+  `optimize.parallel_engine` picks that engine: `dag` (default, the scheduler)
+  or `threads` (the pre-engine thread pool). Both run the same batch, the same
+  Integrator, and honor `max_parallel_items`; they differ only in when
+  worktrees are freed and how a crashed item surfaces. Do not raise it
+  unprompted — it is for a user who suspects the scheduler itself or wants to
+  compare the two. If they do want a comparison, tell them to point two
+  `--workspace` directories at one task.yaml and vary only
+  `--parallel-engine`: the flag is fresh-run only, so re-running one workspace
+  with the other value will not switch engines.
   Two things worth telling the user when sizing a run:
   - **Rounds are not equally expensive.** A round pays for a profile
     after an accept, after a reverted code attempt may have changed
