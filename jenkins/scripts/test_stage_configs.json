@@ -7,7 +7,15 @@
     "Fields: name, arch (\"x86\"|\"SBSA\"), slurm (K8s dispatch if false), platform, testDB, splits,",
     "and optionally gpuCount, nodeCount, runWithSbatch, useClusterDurations (slurm only),",
     "modelExpressSidecar (K8s only). Each field applies identically to every generated shard",
-    "\"<name>-<k>\" for k in 1..splits."
+    "\"<name>-<k>\" for k in 1..splits.",
+    "\"splits\" is a fallback, not always authoritative: for a stage family whose (testDB,",
+    "pre/post-merge phase) isn't shared by any sibling family, both consumers above instead",
+    "size \"<name>-<k>\" dynamically from tests/integration/defs/.test_durations (~2h/shard,",
+    "see computeDynamicSplitCounts in L0_Test.groovy / _dynamic_split_counts in",
+    "test_to_stage_mapping.py). The hardcoded value here is only used when duration data is",
+    "unavailable, or when the family shares its (testDB, phase) with siblings distinguished by",
+    "stage-name-based filtering (e.g. \"-GptOss-\", \"-Ray-\") that can't be replicated from",
+    "config data alone."
   ],
   "configs": [
     {
