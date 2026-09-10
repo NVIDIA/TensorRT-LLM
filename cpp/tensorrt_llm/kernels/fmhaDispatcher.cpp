@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 
+#include <algorithm>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
@@ -342,16 +344,17 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         }
         else if (mFixedParams.attentionMaskType == ContextAttentionMaskType::BIDIRECTIONAL_SLIDING_WINDOW)
         {
-            auto const windowReach = runnerParams.slidingWindowSize / 2;
-            if (windowReach >= runnerParams.kvSeqLen - 1)
+            auto const leftWindowReach = runnerParams.slidingWindowSize / 2;
+            auto const rightWindowReach = runnerParams.slidingWindowSize - leftWindowReach - 1;
+            if (std::min(leftWindowReach, rightWindowReach) >= runnerParams.kvSeqLen - 1)
             {
                 tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
             }
             else
             {
                 tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-                tllmRunnerParams.mLeftSlidingWindow = windowReach;
-                tllmRunnerParams.mRightSlidingWindow = windowReach;
+                tllmRunnerParams.mLeftSlidingWindow = leftWindowReach;
+                tllmRunnerParams.mRightSlidingWindow = rightWindowReach;
             }
         }
         else if (usesSlidingWindow)
