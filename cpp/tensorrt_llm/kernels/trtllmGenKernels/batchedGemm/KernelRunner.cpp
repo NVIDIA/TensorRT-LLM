@@ -110,21 +110,7 @@ static inline bool skipQuirks(BatchedGemmConfig const& config)
     bool const hang_schedS_tmaOob_tileN64
         = options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt && options.mTileN == 64;
 
-    // MxFp8Fp6Fp4 (MxE4m3 activation) 2x-mmaK (mmaK=64) SM107a kernels hang when FC1 and FC2 both dispatch to
-    // this kernel family back to back on the same stream (confirmed with CUDA_LAUNCH_BLOCKING=1 that FC1
-    // completes and FC2's launch never returns; a forced cudaStreamSynchronize between the two GEMMs does not
-    // help, ruling out a host-side memory-ordering race). This affects both fine-grained and plain SM107a
-    // FC1/FC2 tile pairs: a fine-grained pair (FC1 t128x8x512u2 splitK2, FC2 t128x8x256u2) hangs, and so does
-    // at least one plain pair (FC1/FC2 both t128x8x256, no splitK, persistent-drain scheduler); trtllm-gen's
-    // standalone BatchedGemm harness ran the splitK2 pair clean for 2000 replays without fine-grained sync, so
-    // this is not simply "fine-grained sync is unsafe" -- multiple SM107a tile/scheduler variants in this
-    // dtype/mmaK family are affected in ways not yet isolated to a single option. Either GEMM alone, paired
-    // with the other on SM100f, runs fine, as do the NVFP4 (mmaK=128) and BF16-cast (mmaK=16) SM107a pairs.
-    // Disable the whole family until the kernel-side issue is root-caused in trtllm-gen.
-    bool const hang_mxfp8_mmaK64_sm107a
-        = config.mSm == tg::CudaArch::Sm107a && options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 && options.mMmaK == 64;
-
-    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64 || hang_mxfp8_mmaK64_sm107a;
+    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64;
 }
 
 void setProblemDimensions(BatchedGemmData& gemmData, bool transposeMmaOutput, int32_t m, int32_t n, int32_t k,
