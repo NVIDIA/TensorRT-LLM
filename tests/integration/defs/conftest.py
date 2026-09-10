@@ -1741,8 +1741,7 @@ def pytest_configure(config):
             dump_hang_traceback=periodic_hang_traceback,
         )
 
-        # Configure and register the reporter
-        reporter.pytest_configure(config)
+        # Registration replays the historic pytest_configure hook.
         config.pluginmanager.register(reporter, 'periodic_junit')
 
         print_info("PeriodicJUnitXML reporter registered")

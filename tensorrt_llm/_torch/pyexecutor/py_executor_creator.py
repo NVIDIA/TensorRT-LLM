@@ -46,6 +46,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
@@ -1050,13 +1051,14 @@ def create_py_executor(
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
-        return _create_py_executor_impl(
-            llm_args=llm_args,
-            checkpoint_dir=checkpoint_dir,
-            tokenizer=tokenizer,
-            profiling_stage_data=profiling_stage_data,
-            resource_governor_queue=resource_governor_queue,
-        )
+        with monitor_executor_initialization():
+            return _create_py_executor_impl(
+                llm_args=llm_args,
+                checkpoint_dir=checkpoint_dir,
+                tokenizer=tokenizer,
+                profiling_stage_data=profiling_stage_data,
+                resource_governor_queue=resource_governor_queue,
+            )
     except BaseException:
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
