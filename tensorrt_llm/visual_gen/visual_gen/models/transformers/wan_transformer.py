@@ -16,6 +16,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import types
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -36,10 +38,43 @@ from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.layers.attention import ditAttnProcessor
 from visual_gen.layers.linear import ditLinear
 from visual_gen.models.transformers.base_transformer import ditBaseTransformer
+from visual_gen.ops import wan_fused
 from visual_gen.utils import dit_sp_gather, dit_sp_split
 from visual_gen.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+WAN_OPTIMIZATIONS = os.environ.get("VISUAL_GEN_WAN_OPTIMIZATIONS", "0") == "1"
+WAN_PACKED_QKV = WAN_OPTIMIZATIONS and os.environ.get(
+    "VISUAL_GEN_WAN_PACKED_QKV", "1"
+) == "1"
+WAN_FUSED_GELU_QUANT = WAN_OPTIMIZATIONS and os.environ.get(
+    "VISUAL_GEN_WAN_FUSED_GELU_QUANT", "1"
+) == "1"
+_WAN_QK_NORM_ROPE_OP = (
+    torch.ops.fused_wan_qk_norm_rope.fused_wan_qk_norm_rope
+    if WAN_PACKED_QKV
+    else None
+)
+def _wan_fused_ffn_forward(self, hidden_states, *args, **kwargs):
+    """Preserve FeedForward parameters while replacing its inference forward."""
+    if (
+        not self.training
+        and len(self.net) == 3
+        and hasattr(self.net[0], "proj")
+        and getattr(self.net[1], "p", None) == 0.0
+        and hasattr(self.net[2], "get_linear_type")
+        and self.net[2].get_linear_type() == "te-fp8-per-tensor"
+        and hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+    ):
+        projected = self.net[0].proj(hidden_states)
+        _, fp8_activation = wan_fused.approximate_gelu_fp8(projected)
+        return self.net[2](fp8_activation)
+    for module in self.net:
+        hidden_states = module(hidden_states)
+    return hidden_states
 
 
 class ditWanAttnProcessor(ditAttnProcessor):
@@ -64,14 +99,46 @@ class ditWanAttnProcessor(ditAttnProcessor):
 
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
+        packed_qk_norm_rope = (
+            WAN_PACKED_QKV
+            and encoder_hidden_states is None
+            and rotary_emb is not None
+            and getattr(attn, "fused_projections", False)
+            and hasattr(attn, "to_qkv")
+            and query.dtype == torch.bfloat16
+            and key.dtype == torch.bfloat16
+            and attn.norm_q.weight.dtype == torch.bfloat16
+            and attn.norm_k.weight.dtype == torch.bfloat16
+            and query.shape[-1] == key.shape[-1] == value.shape[-1]
+        )
+
+        if packed_qk_norm_rope:
+            # _get_qkv_projections returns views of the fused [Q|K|V] linear
+            # output. Update Q/K in place so all three tensors retain one
+            # B,S,3,H,D storage allocation. Transformer Engine detects this as
+            # bsh3d and skips its per-attention CatArrayBatchedCopy.
+            query, key = _WAN_QK_NORM_ROPE_OP(
+                query,
+                key,
+                attn.heads,
+                attn.heads,
+                query.shape[-1] // attn.heads,
+                attn.norm_q.eps,
+                attn.norm_q.weight,
+                attn.norm_k.weight,
+                rotary_emb[0],
+                rotary_emb[1],
+                False,
+            )
+        else:
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
 
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
-        if rotary_emb is not None:
+        if rotary_emb is not None and not packed_qk_norm_rope:
 
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
@@ -202,6 +269,10 @@ class ditWanTransformer3DModel(WanTransformer3DModel, ditBaseTransformer):
             for attr in attrs[:-1]:
                 parent = getattr(parent, attr)
             setattr(parent, attrs[-1], linear)
+
+        if WAN_FUSED_GELU_QUANT:
+            for block in self.blocks:
+                block.ffn.forward = types.MethodType(_wan_fused_ffn_forward, block.ffn)
 
     def _teacache_modulated_inp(self, timestep_proj: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
         if not TeaCacheConfig.enable_teacache():
