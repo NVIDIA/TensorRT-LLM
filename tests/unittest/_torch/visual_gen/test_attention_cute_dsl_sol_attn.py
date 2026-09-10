@@ -16,10 +16,11 @@
 dense_layers/disabled_until_timestep guards.
 
 Mirrors test_attention_cute_dsl_vsa.py's structure and scope for its sibling
-sparse-attention algorithm. GPU kernel-vs-dense numerical equivalence (the
-analogue of VSA's test_cute_kernel_matches_dense_at_full_topk) is not yet
-covered here -- see the TODO on test_cute_kernel_matches_dense_placeholder
-below for what it needs and why it's deferred, not just missing.
+sparse-attention algorithm. GPU kernel-vs-dense numerical equivalence is
+covered by test_cute_kernel_matches_dense_on_a_single_block: Sol-Attn's
+routing is score-derived, so no tau provably forces dense routing the way
+VSA's full-top-k does, but a single KV block makes sparsity structurally
+impossible and gives the same guarantee.
 """
 
 from types import SimpleNamespace
@@ -381,17 +382,33 @@ def _backend_mod():
     return sol_attn_backend
 
 
+def _fake_cuda_q(shape, dtype=torch.bfloat16):
+    """A tensor-like that reports `is_cuda=True` without needing a GPU.
+
+    `sol_attn_ineligible_reason` checks `is_cuda` first and returns early, so a
+    CPU tensor can never reach the rank, head_dim, or dtype branches. These
+    stubs pass that first gate so each later reason is actually exercised; the
+    architecture check comes after them and is not reached.
+    """
+    return SimpleNamespace(is_cuda=True, ndim=len(shape), shape=shape, dtype=dtype)
+
+
 @pytest.mark.parametrize(
     "make,expect",
     [
         (lambda: torch.randn(1, 4, 2, 128), "not a CUDA tensor"),
-        (lambda: torch.randn(1, 4, 2, 64), "not a CUDA tensor"),
-        (lambda: torch.randn(1, 4, 128), "not a CUDA tensor"),
+        (lambda: _fake_cuda_q((1, 4, 128)), "must be 4-D"),
+        (lambda: _fake_cuda_q((1, 4, 2, 64)), "head_dim must be 128"),
+        (lambda: _fake_cuda_q((1, 4, 2, 128), dtype=torch.float16), "dtype must be bfloat16"),
     ],
-    ids=["cpu-ok-shape", "cpu-wrong-head-dim", "cpu-wrong-rank"],
+    ids=["cpu-tensor", "wrong-rank", "wrong-head-dim", "wrong-dtype"],
 )
 def test_ineligible_reason_is_reported(make, expect):
-    """Ineligibility must name a reason, never fail silently."""
+    """Ineligibility must name the specific reason, never fail silently.
+
+    Each case is built to fail exactly one check, in the order the function
+    applies them, so the id names the branch that actually fires.
+    """
     reason = _backend_mod().sol_attn_ineligible_reason(make())
     assert reason is not None and expect in reason
     assert not _backend_mod().sol_attn_supported(make())
