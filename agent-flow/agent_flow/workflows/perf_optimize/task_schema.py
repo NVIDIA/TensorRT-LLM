@@ -105,11 +105,11 @@ OPTIMIZE_DEFAULTS: dict[str, Any] = {
     # both serial and parallel execution modes.
     "max_items_per_round": 3,
     "item_execution": "parallel",
-    # Which engine drives ``item_execution: parallel``. ``dag`` is the shared
-    # ``agent_flow.orchestration`` scheduler; ``threads`` is the pre-engine
-    # thread pool, kept as a fallback so a campaign can opt out of the engine
-    # without opting out of parallelism. Ignored by ``item_execution: serial``.
-    "parallel_engine": "dag",
+    # Which engine drives ``item_execution: parallel``. ``threads`` is this
+    # workflow's own thread pool and stays the default; ``dag`` opts into the
+    # shared ``agent_flow.orchestration`` scheduler, which is the same batch
+    # under a general engine. Ignored by ``item_execution: serial``.
+    "parallel_engine": "threads",
     # Which roadmap ``approach`` values the run may plan/apply. Restrict
     # to ["code"] to forbid tuning-YAML knob changes (code-only campaign)
     # or to ["config"] to leave the TRT-LLM checkout untouched.
@@ -121,7 +121,7 @@ OPTIMIZE_DEFAULTS: dict[str, Any] = {
 
 ITEM_EXECUTIONS = ("serial", "parallel")
 
-PARALLEL_ENGINES = ("dag", "threads")
+PARALLEL_ENGINES = ("threads", "dag")
 
 ACCURACY_DEFAULTS: dict[str, Any] = {
     "max_drop_pct": 1.0,
