@@ -3,16 +3,18 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Sleep and Wakeup (Prototype)
+# Runtime Memory Checkpointing (Prototype)
 
 TensorRT-LLM can temporarily release selected GPU allocations while keeping an
-LLM instance alive. This supports GPU time-sharing between inference and
-training workloads, such as reinforcement learning and agentic workflows.
+LLM runtime process alive. This enables a different GPU workload to run while
+the inference runtime is parked.
 
-Sleep can preserve allocation contents in host memory and release their GPU
-physical memory. Wakeup allocates GPU physical memory again, maps it at the same
-virtual addresses, and restores the saved contents. The virtual addresses
-remain reserved while the instance sleeps.
+Release can preserve allocation contents in host memory and free their GPU
+physical memory. Resume allocates GPU physical memory again, maps it at the
+same virtual addresses, and restores the saved contents. The virtual addresses
+remain reserved while the runtime is parked. This is an in-process memory
+checkpoint: it is not written to disk and does not survive process termination
+or support restart in a different process.
 
 ```{warning}
 Sleep and wakeup are prototype APIs and are subject to change. They are
@@ -21,48 +23,82 @@ available only with the PyTorch backend. AutoDeploy is not supported.
 
 ## Python API
 
-The public API is asynchronous and is provided by `AsyncLLM`. Enable it with
-`SleepConfig`, then call `release()` and `resume()` with the memory tags to
-operate on.
+Enable runtime memory checkpointing with `SleepConfig`. Both synchronous
+`LLM` and asynchronous `AsyncLLM` expose `release()`, `resume()`, and
+`get_memory_status()`.
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import ExecutorMemoryType, SleepConfig
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    sleep_config=SleepConfig(),
+)
+llm.release()
+try:
+    # The selected GPU physical memory is available to another workload.
+    ...
+finally:
+    llm.resume()
+```
+
+With no tags, `release()` selects every usable `ExecutorMemoryType` and
+`resume()` restores every tag still parked. You can release or restore a
+specific subset:
+
+```python
+tags = [
+    ExecutorMemoryType.MODEL_ENGINE_MAIN,
+    ExecutorMemoryType.MODEL_WEIGHTS_MAIN,
+]
+llm.release(tags)
+llm.resume([ExecutorMemoryType.MODEL_WEIGHTS_MAIN])
+
+status = llm.get_memory_status()
+assert status.state == "parked"
+assert status.parked_tags == [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+
+llm.resume()  # Restore the remaining parked tag and reopen request admission.
+```
+
+Tags can be enum members or their string values. TensorRT-LLM normalizes them,
+removes duplicates while retaining their first-seen order, and rejects an
+explicitly empty list. The two `_no_capture_init_*` enum values are
+initialization-only markers and cannot be selected.
+
+The asynchronous API has the same arguments and results:
 
 ```python
 from tensorrt_llm import AsyncLLM
-from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+from tensorrt_llm.llmapi import SleepConfig
 
-sleep_tags = [
-    ExecutorMemoryType.MODEL_ENGINE_MAIN.value,
-    ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value,
-]
-
-async with AsyncLLM(
-    model="meta-llama/Llama-3.1-8B-Instruct",
-    sleep_config=SleepConfig(),
-) as llm:
-    # Block new requests, abort requests in flight, and wait for idle workers.
-    await llm.pause_generation()
-
-    await llm.release(sleep_tags)
-    try:
-        # The selected GPU physical memory is available to other workloads.
-        ...
-    finally:
-        await llm.resume(sleep_tags)
-        await llm.resume_generation()
+async with AsyncLLM(model="meta-llama/Llama-3.1-8B-Instruct",
+                    sleep_config=SleepConfig()) as llm:
+    await llm.release()
+    status = await llm.get_memory_status()
+    await llm.resume()
 ```
 
-`AsyncLLM` uses the Ray orchestrator. `release()` and `resume()` complete after
-the operation completes on every worker. Use the same tags for both calls and
-do not submit requests between them.
+`release()` first closes request admission and drains work already in flight.
+Generation remains rejected until all parked tags have been restored. The
+synchronous MPI/local and asynchronous Ray paths use the same admission states:
 
-Calling `pause_generation()` first is recommended when another task can submit
-requests concurrently. It blocks the `AsyncLLM` frontend, aborts requests in
-flight, and drains the workers. Sleep also enters a worker control action to
-ensure the engines are idle before allocations change.
+| State | Meaning |
+| --- | --- |
+| `running` | Requests are admitted and no tags are parked |
+| `parking` | Admission is closed and release is in progress |
+| `parked` | At least one tag remains released |
+| `waking` | A restore is in progress |
+| `failed` | A memory operation might have partially mutated runtime state |
 
-The PyTorch workers also coordinate sleep and wakeup across tensor-parallel and
-pipeline-parallel MPI ranks. `LLM` does not currently expose public synchronous
-`release()` and `resume()` methods; do not rely on its private collective-RPC
-interface.
+Distributed status replies must agree. A disagreement is reported as a runtime
+failure instead of choosing one worker's view.
+
+Retries are idempotent. Releasing tags that are already parked or resuming tags
+that are already active succeeds without repeating a memory operation.
+Releasing additional tags while already parked is rejected; resume the runtime
+first. New operations are also rejected during transitional and failed states.
 
 ## Memory tags
 
@@ -142,42 +178,112 @@ GMS loading. GMS mappings and sessions have a separate lifecycle.
 
 ## Failure and lifecycle behavior
 
-- Invalid tag strings raise `ValueError`.
-- Sleep and wakeup require `sleep_config`.
+- Invalid or explicitly empty tag lists raise `ValueError`.
+- Release and resume require `sleep_config`.
 - Calls synchronize CUDA work before changing mappings and before returning.
 - Distributed operations coordinate all ranks. An error after ranks begin
   changing memory can put the worker in a terminal failed state because a
   partially changed distributed state cannot be safely reconciled.
+- A host-memory backup is usable only by the same live runtime process.
 - Put `resume()` in a `finally` block if the LLM must remain usable when the
   caller's intervening work fails.
 
 ## Control-plane HTTP endpoints
 
-`OpenAIServer` can optionally register authenticated reinforcement-learning
-control endpoints when its generator is an `AsyncLLM`:
+`trtllm-serve` can expose authenticated runtime-control routes for the
+PyTorch HTTP text-generation server. The feature is opt-in and requires the
+secret to come from the environment:
+
+```bash
+export TRTLLM_RUNTIME_CONTROL_API_KEY='replace-with-a-long-random-secret'
+trtllm-serve meta-llama/Llama-3.1-8B-Instruct --enable_sleep_mode
+```
+
+If the YAML configuration has no `sleep_config`, the command creates a default
+`SleepConfig`. An explicitly configured `sleep_config` is preserved. Sleep
+mode is rejected for AutoDeploy and gRPC.
+
+The enabled routes are:
 
 ```text
 POST /release_memory
 POST /resume_memory
+GET  /memory_status
 ```
 
-Both accept:
+The POST body is optional. An omitted body or `{}` selects the defaults
+described in the Python API. To select specific resources, send
+`{"tags":["model","model_weights"]}`.
+
+Every request must include `x-trtllm-runtime-control-auth` containing
+`sha256=<hex digest>`, where the digest is HMAC-SHA256 of the exact transmitted
+body. Sign an empty byte string for a GET or a body-less POST. This Python
+example signs and sends matching bytes:
+
+```python
+import hashlib
+import hmac
+import json
+import os
+
+import requests
+
+key = os.environ["TRTLLM_RUNTIME_CONTROL_API_KEY"].encode()
+
+
+def auth(body: bytes) -> dict[str, str]:
+    digest = hmac.new(key, body, hashlib.sha256).hexdigest()
+    return {"x-trtllm-runtime-control-auth": f"sha256={digest}"}
+
+
+body = json.dumps(
+    {"tags": ["model", "model_weights"]},
+    separators=(",", ":"),
+).encode()
+response = requests.post(
+    "http://localhost:8000/release_memory",
+    data=body,
+    headers={"content-type": "application/json", **auth(body)},
+)
+response.raise_for_status()
+
+status = requests.get(
+    "http://localhost:8000/memory_status",
+    headers=auth(b""),
+)
+print(status.json())
+
+resume_body = json.dumps({"tags": ["model_weights"]},
+                         separators=(",", ":")).encode()
+requests.post(
+    "http://localhost:8000/resume_memory",
+    data=resume_body,
+    headers={"content-type": "application/json", **auth(resume_body)},
+).raise_for_status()
+```
+
+A status response has this shape:
 
 ```json
 {
-  "tags": ["model", "model_weights"]
+  "state": "parked",
+  "parked_tags": ["model"]
 }
 ```
 
-They return `{"status": "success"}` after all workers complete. The routes are
-disabled by default. A custom `OpenAIServer` integration must set
-`enable_rl_control_endpoints=True`, provide `rl_control_api_key`, and place an
-HMAC-SHA256 signature of the exact request body in the
-`x-trtllm-rl-control-auth` header. The standard `trtllm-serve` command does not
-currently expose these server settings.
+Successful POST requests return `{"status":"success"}`. Invalid tags return
+HTTP 400, conflicting transitions return 409, authentication failures return
+401, and unexpected worker failures return 500.
 
-The caller must stop generation traffic before releasing memory and resume
-traffic only after memory is restored.
+Treat the control key as an administrative secret and expose these routes only
+to a trusted control plane. Coordinate traffic draining before release when
+clients can race with the operation, and wait for `running` before resuming
+normal traffic. Host memory must remain available until restore completes.
+
+The older `enable_rl_control_endpoints`, `x-trtllm-rl-control-auth`, and
+`/update_weights` surface remains as a deprecated compatibility path for
+custom `AsyncLLM` integrations. It cannot be enabled together with generic
+runtime control, and `--enable_sleep_mode` never exposes `/update_weights`.
 
 ## Implementation overview
 
@@ -189,7 +295,10 @@ addresses, and restores or initializes contents according to `SleepConfig`.
 
 Principal implementation locations are:
 
-- Python API: `tensorrt_llm/_torch/async_llm.py`
+- Synchronous API: `tensorrt_llm/llmapi/llm.py`
+- Asynchronous API: `tensorrt_llm/_torch/async_llm.py`
+- Serving and authentication: `tensorrt_llm/serve/openai_server.py` and
+  `tensorrt_llm/serve/runtime_control_auth.py`
 - Workers: `tensorrt_llm/executor/base_worker.py` and
   `tensorrt_llm/executor/ray/gpu_worker.py`
 - Allocation tagging: `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py`
