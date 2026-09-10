@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/compressorKernels/compressorKernels.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <limits>
 #include <torch/extension.h>
 
 namespace tk = tensorrt_llm::kernels::compressor;
@@ -30,7 +31,7 @@ void compressorPagedKvCompressIncrementalOp(torch::Tensor kvScore, torch::Tensor
     int64_t headDim, int64_t compressRatio, int64_t nextN)
 {
     constexpr int64_t kMinNextN = 1;
-    constexpr int64_t kMaxNextN = 4;
+    constexpr int64_t kMaxNextN = std::numeric_limits<int>::max();
     TORCH_CHECK(nextN >= kMinNextN && nextN <= kMaxNextN, "nextN must be in [", kMinNextN, ", ", kMaxNextN,
         "] before conversion to int, got ", nextN);
     TORCH_CHECK(compressRatio == 128, "incremental HCA compression requires compressRatio == 128");

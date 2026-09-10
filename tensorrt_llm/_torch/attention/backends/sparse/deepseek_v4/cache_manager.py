@@ -406,7 +406,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         self.incremental_hca_enabled = (
             128 in pp_compress_ratios
-            and self._max_draft_len <= 4
             # Incremental prefill/decode stores endpoint summaries instead of
             # raw token state, so those pages cannot be shared with a request
             # that expects the legacy raw layout.

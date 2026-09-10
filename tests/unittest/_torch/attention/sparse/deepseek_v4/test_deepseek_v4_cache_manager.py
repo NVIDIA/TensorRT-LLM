@@ -1753,6 +1753,29 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
+    def test_incremental_hca_supports_full_mtp_width(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_HCA_INCREMENTAL_SUMMARY", "1")
+        spec_config = SimpleNamespace(
+            max_draft_len=7,
+            max_total_draft_tokens=7,
+            spec_dec_mode=SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL,
+        )
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[128],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            spec_config=spec_config,
+        )
+
+        try:
+            assert cache_manager._max_draft_len + 1 == 8
+            assert cache_manager.incremental_hca_enabled
+        finally:
+            cache_manager.shutdown()
+
     def test_draft_cache_manager_disables_swa_scratch_reuse(self):
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,

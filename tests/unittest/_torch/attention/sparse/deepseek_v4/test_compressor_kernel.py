@@ -1858,7 +1858,19 @@ def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_po
 @pytest.mark.parametrize("head_dim", [128, 512])
 @pytest.mark.parametrize("page_size", [128, 256])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("prefill_len,next_n", [(255, 1), (252, 4)])
+@pytest.mark.parametrize(
+    "prefill_len,next_n",
+    [
+        pytest.param(255, 1, id="next1"),
+        pytest.param(254, 2, id="next2"),
+        pytest.param(253, 3, id="next3"),
+        pytest.param(252, 4, id="next4"),
+        pytest.param(251, 5, id="next5"),
+        pytest.param(250, 6, id="next6"),
+        pytest.param(249, 7, id="next7"),
+        pytest.param(248, 8, id="next8"),
+    ],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_eager_incremental_hca_prefill_decode_and_rewind(
     head_dim, page_size, input_dtype, prefill_len, next_n
@@ -1969,6 +1981,83 @@ def test_eager_incremental_hca_prefill_decode_and_rewind(
         assert torch.allclose(
             decode_output[0], second_expected.to(input_dtype), rtol=rtol, atol=atol
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_incremental_hca_decode_runtime_next_n_crosses_multiple_windows():
+    """Runtime next_n is not limited to a fixed MTP width or one CR boundary."""
+    torch.manual_seed(5678)
+    compress_ratio = 128
+    head_dim = 512
+    page_size = 128
+    prefill_len = compress_ratio - 1
+    next_n = compress_ratio + 1
+    total_len = prefill_len + next_n
+
+    kv = torch.randn(total_len, head_dim, device="cuda")
+    score = torch.randn(total_len, head_dim, device="cuda")
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    paged_kv, paged_score, block_table, _, _ = create_paged_cache(
+        1, total_len, compress_ratio, head_dim, False, page_size
+    )
+
+    prefill_kv_lens = torch.tensor([prefill_len], device="cuda", dtype=torch.int32)
+    prefill_start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
+    prefill_cu_seq_lens = torch.tensor([0, prefill_len], device="cuda", dtype=torch.int32)
+    prefill_cu_outputs = torch.zeros(2, device="cuda", dtype=torch.int32)
+    prefill_kernel(
+        fuse_kv_score(kv[:prefill_len], score[:prefill_len]),
+        ape,
+        prefill_kv_lens,
+        prefill_start_pos,
+        prefill_cu_seq_lens,
+        prefill_cu_outputs,
+        torch.empty(0, head_dim, device="cuda"),
+        paged_kv,
+        paged_score,
+        block_table,
+        0,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        incremental_hca=True,
+    )
+
+    decode_cu_seq_lens, decode_cu_outputs = prepare_decode_metadata(
+        1, compress_ratio, head_dim, kv.device, next_n
+    )
+    decode_output = torch.empty(2, head_dim, device="cuda")
+    decode_kernel(
+        fuse_kv_score(kv[prefill_len:], score[prefill_len:]),
+        ape,
+        torch.tensor([total_len], device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        decode_cu_seq_lens,
+        decode_cu_outputs,
+        decode_output,
+        paged_kv,
+        paged_score,
+        block_table,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        next_n,
+        incremental_hca=True,
+    )
+
+    logits = score + ape[torch.arange(total_len, device="cuda") % compress_ratio]
+    expected = torch.stack(
+        [
+            (
+                kv[start : start + compress_ratio]
+                * logits[start : start + compress_ratio].softmax(dim=0)
+            ).sum(dim=0)
+            for start in (0, compress_ratio)
+        ]
+    )
+    torch.testing.assert_close(decode_output, expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("head_dim", [128, 512])

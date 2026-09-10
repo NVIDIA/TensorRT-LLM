@@ -313,12 +313,12 @@ __device__ __forceinline__ void mergeLseValue(
 // Incremental HCA decode path. Prefill stores the current CR=128 tail as an
 // associative summary at its final token. Decode extends that summary and saves
 // every new prefix so speculative decoding can rewind to any accepted token.
-template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int NEXT_N>
+template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES>
 __global__ void incrementalHcaDecodeKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
-    int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks,
-    int out_elem_bytes)
+    int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp, int next_n, int page_size,
+    int max_blocks, int out_elem_bytes)
 {
     using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
@@ -338,7 +338,7 @@ __global__ void incrementalHcaDecodeKernel(void const* __restrict__ kv_score_raw
     int const headBlock = blockIdx.y;
     int const effectiveTid = headBlock * NTHRD_INNER + tid;
     int const kvLen = kv_lens[batchIdx];
-    int const startPos = kvLen - NEXT_N;
+    int const startPos = kvLen - next_n;
     int const inputOffset = cu_seq_lens[batchIdx];
     int const outputOffset = cu_kv_comp[batchIdx];
     int64_t const pageStride = static_cast<int64_t>(page_size) * HEAD_DIM;
@@ -372,8 +372,7 @@ __global__ void incrementalHcaDecodeKernel(void const* __restrict__ kv_score_raw
         }
     }
 
-#pragma unroll
-    for (int t = 0; t < NEXT_N; ++t)
+    for (int t = 0; t < next_n; ++t)
     {
         int const tokenIdx = startPos + t;
         int const chunkOffset = tokenIdx % COMPRESS_RATIO;
@@ -844,20 +843,14 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 FOREACH_DECODE_CONFIG(INST_DECODE)
 #undef INST_DECODE
 
-#define INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, NN)                                                                     \
-    template __global__ void incrementalHcaDecodeKernel<HD, KV_EB, 4, NN>(void const*, float const*, void*, void*,     \
-        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int);
+#define INST_INCREMENTAL_HCA_DECODE(HD, KV_EB)                                                                         \
+    template __global__ void incrementalHcaDecodeKernel<HD, KV_EB, 4>(void const*, float const*, void*, void*,         \
+        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int, int);
 
-#define INST_INCREMENTAL_HCA_DECODE_NN(HD, KV_EB)                                                                      \
-    INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 1)                                                                          \
-    INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 2)                                                                          \
-    INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 3) INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 4)
-
-INST_INCREMENTAL_HCA_DECODE_NN(128, 2)
-INST_INCREMENTAL_HCA_DECODE_NN(128, 4)
-INST_INCREMENTAL_HCA_DECODE_NN(512, 2)
-INST_INCREMENTAL_HCA_DECODE_NN(512, 4)
-#undef INST_INCREMENTAL_HCA_DECODE_NN
+INST_INCREMENTAL_HCA_DECODE(128, 2)
+INST_INCREMENTAL_HCA_DECODE(128, 4)
+INST_INCREMENTAL_HCA_DECODE(512, 2)
+INST_INCREMENTAL_HCA_DECODE(512, 4)
 #undef INST_INCREMENTAL_HCA_DECODE
 
 // ============================================================================
@@ -950,7 +943,7 @@ void incrementalHcaCompressLaunch(void const* kv_score, float const* ape, void* 
     TLLM_CHECK_WITH_INFO(state_elem_bytes == 4, "Incremental HCA compression requires FP32 compressor state");
     TLLM_CHECK_WITH_INFO(
         kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4, "Incremental HCA compression requires BF16/FP32 input");
-    TLLM_CHECK_WITH_INFO(next_n >= 1 && next_n <= 4, "Incremental HCA compression requires next_n in [1, 4]");
+    TLLM_CHECK_WITH_INFO(next_n >= 1, "Incremental HCA compression requires next_n >= 1, got %d", next_n);
 
     constexpr int kStateElemBytes = 4;
     constexpr int kMaxVec = 16 / kStateElemBytes;
@@ -960,29 +953,22 @@ void incrementalHcaCompressLaunch(void const* kv_score, float const* ape, void* 
     int const threads = threadsBase / headBlocks;
     dim3 const grid(batch_size, headBlocks);
 
-#define TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, NN)                                                                      \
-    if (head_dim == HD && kv_score_elem_bytes == KV_EB && next_n == NN)                                                \
+#define TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB)                                                                          \
+    if (head_dim == HD && kv_score_elem_bytes == KV_EB)                                                                \
     {                                                                                                                  \
-        incrementalHcaDecodeKernel<HD, KV_EB, kStateElemBytes, NN><<<grid, threads, 0, stream>>>(kv_score, ape,        \
-            paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,        \
+        incrementalHcaDecodeKernel<HD, KV_EB, kStateElemBytes><<<grid, threads, 0, stream>>>(kv_score, ape, paged_kv,  \
+            paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp, next_n,          \
             page_size, max_blocks, out_elem_bytes);                                                                    \
         return;                                                                                                        \
     }
 
-#define TRY_LAUNCH_INCREMENTAL_HCA_NN(HD, KV_EB)                                                                       \
-    TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 1)                                                                           \
-    TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 2)                                                                           \
-    TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 3) TRY_LAUNCH_INCREMENTAL_HCA(HD, KV_EB, 4)
-
-    TRY_LAUNCH_INCREMENTAL_HCA_NN(128, 2)
-    TRY_LAUNCH_INCREMENTAL_HCA_NN(128, 4)
-    TRY_LAUNCH_INCREMENTAL_HCA_NN(512, 2)
-    TRY_LAUNCH_INCREMENTAL_HCA_NN(512, 4)
-#undef TRY_LAUNCH_INCREMENTAL_HCA_NN
+    TRY_LAUNCH_INCREMENTAL_HCA(128, 2)
+    TRY_LAUNCH_INCREMENTAL_HCA(128, 4)
+    TRY_LAUNCH_INCREMENTAL_HCA(512, 2)
+    TRY_LAUNCH_INCREMENTAL_HCA(512, 4)
 #undef TRY_LAUNCH_INCREMENTAL_HCA
 
-    TLLM_THROW("Incremental HCA decode: no matching instantiation for HD=%d, kv_eb=%d, next_n=%d", head_dim,
-        kv_score_elem_bytes, next_n);
+    TLLM_THROW("Incremental HCA decode: no matching instantiation for HD=%d, kv_eb=%d", head_dim, kv_score_elem_bytes);
 }
 
 #undef FOREACH_DECODE_CONFIG
