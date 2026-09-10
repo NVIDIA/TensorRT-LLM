@@ -1040,7 +1040,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # never re-enters context admission, so PEFT ownership
                 # must be re-registered explicitly. Idempotent and a
                 # no-op for non-LoRA requests.
-                peft_cache_manager.add_request_peft(req, True)
+                peft_cache_manager.add_request_peft(req)
             return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
 
         # Self-eviction: suspend this gen request to free its

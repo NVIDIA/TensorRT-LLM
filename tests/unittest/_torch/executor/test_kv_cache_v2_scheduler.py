@@ -1229,7 +1229,7 @@ class TestPeftSuspendResume:
         peft.mark_request_done.assert_called_once_with(req_a, pause=True)
 
     def test_resume_reregisters_peft_ownership_once(self) -> None:
-        """A resumes after a prior suspension: add_request_peft(A, True)
+        """A resumes after a prior suspension: add_request_peft(A)
         must fire exactly once before A is returned as scheduled, and must
         not fire again on later steady-state iterations while A stays
         active."""
@@ -1242,7 +1242,7 @@ class TestPeftSuspendResume:
         out = sched.schedule_request([req_a], set())
 
         assert ids(out.generation_requests) == [0]
-        peft.add_request_peft.assert_called_once_with(req_a, True)
+        peft.add_request_peft.assert_called_once_with(req_a)
         peft.mark_request_done.assert_not_called()
 
         # Steady state: the cache is active on later iterations (as the real
@@ -1251,7 +1251,7 @@ class TestPeftSuspendResume:
         out2 = sched.schedule_request([req_a], set())
 
         assert ids(out2.generation_requests) == [0]
-        peft.add_request_peft.assert_called_once_with(req_a, True)  # still just once
+        peft.add_request_peft.assert_called_once_with(req_a)  # still just once
 
     def test_suspend_without_peft_manager_does_not_crash(self) -> None:
         """No LoRA config at all (peft_cache_manager=None): self-eviction
