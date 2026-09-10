@@ -15,9 +15,11 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_encoder_decoder_kv_cache_config,
     validate_fp4_mla_config,
 )
+from tensorrt_llm._utils import QuantModeWrapper
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.mode import QuantMode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -152,6 +154,7 @@ def _mock_sm107(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "nvfp4"])
 @pytest.mark.parametrize("chunked_prefill", [False, True])
+@pytest.mark.parametrize("quant_mode_representation", ["wrapper", "enum", "int"])
 @pytest.mark.parametrize(
     "mla,backend,sparse,hybrid,expected",
     [
@@ -166,6 +169,7 @@ def test_validate_and_set_kv_cache_quant_resolves_nvfp4_on_sm107(
     monkeypatch: pytest.MonkeyPatch,
     kv_cache_dtype: str,
     chunked_prefill: bool,
+    quant_mode_representation: str,
     mla: bool,
     backend: str,
     sparse: bool,
@@ -187,6 +191,12 @@ def test_validate_and_set_kv_cache_quant_resolves_nvfp4_on_sm107(
     validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
     assert model_config.quant_config.kv_cache_quant_algo == expected
     assert model_config.quant_config_dict["layer"].kv_cache_quant_algo == expected
+    quant_mode = QuantMode.from_quant_algo(kv_cache_quant_algo=expected)
+    if quant_mode_representation == "wrapper":
+        quant_mode = QuantModeWrapper([quant_mode])
+    elif quant_mode_representation == "int":
+        quant_mode = int(quant_mode)
+    monkeypatch.setattr(model_config.quant_config, "quant_mode", quant_mode)
     assert uses_fp4_mla_attention(model_config) == (expected == QuantAlgo.NVFP4)
     llm_args = types.SimpleNamespace(
         enable_chunked_prefill=chunked_prefill,
