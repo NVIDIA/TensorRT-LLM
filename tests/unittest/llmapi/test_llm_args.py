@@ -3646,6 +3646,19 @@ sparse_attention_config:
             "decode": 0.3,
         }
 
+    def test_uses_spcompress_defaults_false(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+        assert config.uses_spcompress is False
+        sparse_params = config.to_sparse_params()
+        assert sparse_params.uses_spcompress is False
+
+    def test_uses_spcompress_plumbs_to_sparse_params(self):
+        config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0,
+                                            uses_spcompress=True)
+        assert config.uses_spcompress is True
+        sparse_params = config.to_sparse_params()
+        assert sparse_params.uses_spcompress is True
+
     @pytest.mark.parametrize("target_sparsity", [-0.1, 1.1])
     def test_target_sparsity_scalar_must_be_in_unit_interval(
             self, target_sparsity):
