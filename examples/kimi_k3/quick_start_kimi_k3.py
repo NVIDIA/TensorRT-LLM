@@ -10,7 +10,7 @@ Example:
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MambaStateConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MambaStateConfig, MoeConfig
 
 SAMPLES = [
     ("The capital of France is", "Paris"),
@@ -45,12 +45,18 @@ def parse_arguments() -> argparse.Namespace:
         "manager with KDA recurrent-state snapshots; prefix-cache hits "
         "skip recomputing shared prompt prefixes).",
     )
+    parser.add_argument(
+        "--moe-backend",
+        default=None,
+        help="Force moe_config.backend (e.g. CUTEDSL). Default leaves AUTO, "
+        "which Kimi K3 resolves to TRTLLM.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_arguments()
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model,
         tensor_parallel_size=args.tp_size,
         enable_attention_dp=True,
@@ -72,6 +78,9 @@ def main() -> None:
             else MambaStateConfig(),
         ),
     )
+    if args.moe_backend:
+        llm_kwargs["moe_config"] = MoeConfig(backend=args.moe_backend)
+    llm = LLM(**llm_kwargs)
 
     sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
     prompts = [prompt for prompt, _ in SAMPLES]
