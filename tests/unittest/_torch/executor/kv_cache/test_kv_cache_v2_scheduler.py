@@ -257,6 +257,7 @@ def make_scheduler(
         if no_schedule_after_state is not None:
             kwargs["no_schedule_after_state"] = no_schedule_after_state
         if draft_kv_cache_manager is not None:
+            draft_kv_cache_manager.is_draft = True
             kwargs["draft_kv_cache_manager"] = draft_kv_cache_manager
         if cross_kv_cache_manager is not None:
             kwargs["cross_kv_cache_manager"] = cross_kv_cache_manager

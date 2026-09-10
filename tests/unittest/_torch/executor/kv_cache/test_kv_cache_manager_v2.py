@@ -1072,6 +1072,7 @@ def test_context_revert_drops_unshrinkable_cache_and_rewinds_progress() -> None:
     # request part-way through its prompt, so the cache cannot be shrunk back.
     kv_cache = Mock(is_active=True, capacity=128, history_length=256)
     manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
     manager.tokens_per_block = 64
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager.free_resources = Mock()
@@ -1093,6 +1094,7 @@ def test_context_revert_shrinks_in_place_when_history_fits() -> None:
     kv_cache = Mock(is_active=True, capacity=128, history_length=32)
     kv_cache.resize.return_value = True
     manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
     manager.tokens_per_block = 64
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager.free_resources = Mock()
