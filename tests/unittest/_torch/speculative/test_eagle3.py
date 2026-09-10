@@ -375,7 +375,7 @@ def test_eagle3_one_model_capture_uses_real_token_count() -> None:
 @skip_num_gpus_less_than(1)
 def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
     invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
-    spec_config = MTPDecodingConfig(max_draft_len=3, mtp_eagle_one_model=True)
+    spec_config = MTPDecodingConfig(max_draft_len=3)
     spec_metadata = Eagle3OneModelSpecMetadata(
         max_num_requests=2,
         max_draft_len=3,
@@ -693,7 +693,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         # Llama 3 does not support one model eagle.
-        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
@@ -770,7 +769,6 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=eagle3_one_model,
     )
 
     with LLM(
@@ -981,7 +979,6 @@ def test_deepseek_mla_eagle3():
 
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=use_one_model,
                                            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -1079,7 +1076,6 @@ def test_multi_eagle3(use_one_model: bool):
 
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=use_one_model,
                                            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -1137,7 +1133,6 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
     spec_config_kwargs = dict(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        eagle3_one_model=True,
         use_rejection_sampling=True,
     )
     if use_dynamic_tree:
@@ -1194,7 +1189,6 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
         max_seq_len=8192,
     )
     spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
-                                    mtp_eagle_one_model=True,
                                     use_dynamic_tree=True,
                                     dynamic_tree_max_topK=10,
                                     max_total_draft_tokens=31)
@@ -1284,7 +1278,6 @@ def test_eagle3_lora(use_cuda_graph: bool):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
@@ -1341,7 +1334,6 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        eagle3_one_model=True,
         use_dynamic_tree=True,
         dynamic_tree_max_topK=dynamic_tree_max_topK,
         max_total_draft_tokens=max_total_draft_tokens,

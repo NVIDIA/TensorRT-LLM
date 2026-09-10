@@ -1998,13 +1998,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[bool]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.eagle3_one_model"
-    },
-    {
-      "allowed_values": [],
       "annotation": "Optional[List[List[int]]]",
       "converter": "",
       "kind": "value",
@@ -2118,13 +2111,6 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.max_total_draft_tokens"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.mtp_eagle_one_model"
     },
     {
       "allowed_values": [],

@@ -2325,12 +2325,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
-    eagle3_one_model: Optional[bool] = Field(
-        default=True,
-        description=
-        "Retained for backward compatibility; the one-model implementation "
-        "(draft as submodule) is the only supported path. Setting False is "
-        "rejected: the two-model path has been removed.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2356,39 +2350,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
                     )
         return v
 
-    @field_validator("eagle3_one_model")
-    @classmethod
-    def _reject_two_model_eagle3(cls, value: Optional[bool]) -> Optional[bool]:
-        # A field validator rather than a check inside the model validator: it
-        # also runs on assignment when the model is configured for it, so
-        # `config.eagle3_one_model = False` after construction cannot leave a
-        # value that telemetry reports but the runtime ignores.
-        if value is False:
-            raise ValueError(
-                "eagle3_one_model=False is no longer supported: the two-model "
-                "Eagle3 path has been removed. Omit the field or set it to "
-                "True.")
-        return value
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        # `validate_assignment` cannot be enabled on this model: the model
-        # validators below assign to `self`, and re-running validation on every
-        # assignment recurses without bound. Guard just the retired field so a
-        # post-construction `config.eagle3_one_model = False` fails loud instead
-        # of leaving a value telemetry reports but the runtime ignores.
-        if name == "eagle3_one_model" and value is False:
-            raise ValueError(
-                "eagle3_one_model=False is no longer supported: the two-model "
-                "Eagle3 path has been removed. Omit the field or set it to "
-                "True.")
-        super().__setattr__(name, value)
-
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        # None kept its historical meaning: fall through to the one-model path.
-        self.eagle3_one_model = True
         self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
@@ -2787,34 +2752,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "Force vanilla MTP mode (sequential MTP layers). When False, uses EAGLE-style MTP for single-layer checkpoints."
     )
-    mtp_eagle_one_model: bool = Field(
-        default=True,
-        description=
-        "Retained for backward compatibility; when using EAGLE-style MTP the "
-        "one-model implementation (drafter as submodule) is the only supported "
-        "path. Setting False is rejected: the two-model path has been "
-        "removed.")
-
-    @field_validator("mtp_eagle_one_model")
-    @classmethod
-    def _reject_two_model_mtp(cls, value: bool) -> bool:
-        if value is False:
-            raise ValueError(
-                "mtp_eagle_one_model=False is no longer supported: the "
-                "two-model MTP path has been removed. Omit the field or set "
-                "it to True.")
-        return value
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        # See EagleDecodingConfig.__setattr__ for why this is a guard rather
-        # than `validate_assignment`.
-        if name == "mtp_eagle_one_model" and value is False:
-            raise ValueError(
-                "mtp_eagle_one_model=False is no longer supported: the "
-                "two-model MTP path has been removed. Omit the field or set "
-                "it to True.")
-        super().__setattr__(name, value)
-
     use_dynamic_tree: bool = Field(
         default=False,
         description=

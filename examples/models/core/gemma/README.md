@@ -59,7 +59,6 @@ cat > gemma4_mtp.yaml <<'EOF'
 speculative_config:
   decoding_type: MTP
   max_draft_len: 3
-  mtp_eagle_one_model: true
   speculative_model: google/gemma-4-E4B-it-assistant
 kv_cache_config:
   enable_block_reuse: false

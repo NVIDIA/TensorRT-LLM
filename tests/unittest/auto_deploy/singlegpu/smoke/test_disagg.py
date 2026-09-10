@@ -273,7 +273,6 @@ def test_autodeploy_disaggregated_eagle3_smoke():
     speculative_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle3_model_config["args"]["model"],
-        eagle3_one_model=True,
         eagle3_layers_to_capture={0, 1, 2},
     )
     speculative_model_kwargs = {

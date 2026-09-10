@@ -199,8 +199,7 @@ def _run_multinode_accuracy(model_path,
     spec_config = None
     if draft_model_path is not None:
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
-                                           speculative_model=draft_model_path,
-                                           eagle3_one_model=True)
+                                           speculative_model=draft_model_path)
 
     with LLM(model_path,
              tensor_parallel_size=tp_size,
@@ -508,7 +507,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=max_draft_len,
             max_draft_len=max_draft_len,
             use_mtp_vanilla=False,
-            mtp_eagle_one_model=True,
             draft_len_schedule=draft_len_schedule,
         )
         with LLM(self.MODEL_PATH,
@@ -3545,7 +3543,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=eagle_model_dir,
-            eagle3_one_model=eagle3_one_model,
             max_concurrency=max_concurrency,
             draft_len_schedule=draft_len_schedule)
 
@@ -3687,7 +3684,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         spec_config_kwargs = dict(
             max_draft_len=4,
             speculative_model=f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3",
-            eagle3_one_model=True,
         )
         if use_dynamic_tree:
             spec_config_kwargs.update(
@@ -4099,8 +4095,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
                 speculative_model=
-                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
-                eagle3_one_model=True)
+                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/")
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
@@ -4147,8 +4142,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
             spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
                 speculative_model=
-                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
-                eagle3_one_model=True)
+                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/")
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
@@ -4955,8 +4949,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5029,8 +5022,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5091,8 +5083,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5145,8 +5136,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5212,8 +5202,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 5
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
         check_acceptance_length = one_model and moe_backend == "CUTLASS"
         stats_args = (dict(max_stats_len=-1, enable_iter_perf_stats=True)
                       if check_acceptance_length else {})
@@ -5723,7 +5712,6 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         )
 
         with LLM(self.MODEL_PATH,
@@ -6597,7 +6585,6 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True,
                 eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/",
@@ -6649,7 +6636,6 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True,
                 eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
@@ -6880,8 +6866,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         external-comm dispatch path with scheduler-precomputed routing.
         """
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
-                                       mtp_eagle_one_model=True)
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         with LLM(model_path,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
@@ -6980,7 +6965,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             )
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         )
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
@@ -7065,7 +7049,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         # This test uses MTP with max_draft_len=3 and one_model mode.
         mtp_config = MTPDecodingConfig(
             max_draft_len=3,
-            mtp_eagle_one_model=True,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
@@ -7103,7 +7086,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             max_draft_len=max_draft_len,
-            mtp_eagle_one_model=True,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
@@ -7169,7 +7151,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=max_draft_len,
-            mtp_eagle_one_model=True,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
@@ -7234,7 +7215,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
@@ -7421,7 +7401,6 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                                      use_mtp):
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         )
         max_batch_size = 4 if attention_dp else 32
         with LLM(
@@ -7503,7 +7482,6 @@ class TestLlama4SpeculativeDecoding(LlmapiAccuracyTestHarness):
             max_draft_len=4,
             speculative_model=(
                 f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"),
-            eagle3_one_model=True,
         )
         if use_dynamic_tree:
             spec_config_kwargs.update(

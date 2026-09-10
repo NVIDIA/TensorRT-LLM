@@ -156,7 +156,6 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             speculative_config=MTPDecodingConfig(
                 max_draft_len=3,
-                mtp_eagle_one_model=True,
                 speculative_model=self.MTP_MODEL_PATH,
             ),
             max_stats_len=-1,

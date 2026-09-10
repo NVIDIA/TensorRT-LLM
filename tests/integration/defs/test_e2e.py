@@ -1818,7 +1818,6 @@ def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=True,
     )
     with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
         results_spec = llm_spec.generate([prompt], sampling_params)
