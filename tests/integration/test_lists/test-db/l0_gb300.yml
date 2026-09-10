@@ -24,3 +24,12 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
+  # Staircase catalog: the certification matrix for each op a staircase target
+  # calls, plus the two consistency tests that guard the routing tables against
+  # the targets they name. Deliberately NOT a duplicate of the upstream tests
+  # for the same ops -- those cover the modules that wrap them, these cover the
+  # op itself cell by cell -- which is why every file is named test_staircase_*.
+  # These entries are the receipts: the catalog's certification is per GPU
+  # architecture, and this list is the sm_103 one. comm/ is excluded here and
+  # carried by l0_gb300_multi_gpus.yml, since those two need 4 ranks.
+  - unittest/_torch/staircase --ignore=unittest/_torch/staircase/comm

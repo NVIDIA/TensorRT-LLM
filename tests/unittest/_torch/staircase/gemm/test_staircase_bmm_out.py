@@ -4,7 +4,7 @@
 
 import torch
 
-from .bmm_out import bmm_out
+from tensorrt_llm._torch.staircase.catalog.gemm.bmm_out import bmm_out
 
 assert torch.cuda.is_available(), "bmm_out requires a CUDA device"
 

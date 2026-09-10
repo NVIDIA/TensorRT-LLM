@@ -15,7 +15,7 @@ cannot be a normal test, because the job that runs it never reports).
 
 import torch
 
-from . import _rank_job
+from tensorrt_llm._torch.staircase.catalog.comm import _rank_job
 
 assert torch.cuda.is_available(), "reducescatter requires CUDA devices"
 

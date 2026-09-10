@@ -4,7 +4,7 @@
 
 import torch
 
-from .noaux_tc_op import noaux_tc_op
+from tensorrt_llm._torch.staircase.catalog.moe.noaux_tc_op import noaux_tc_op
 
 assert torch.cuda.is_available(), "noaux_tc_op requires a CUDA device"
 

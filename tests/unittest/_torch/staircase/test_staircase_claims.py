@@ -7,6 +7,10 @@ this runs anywhere, including a CI machine with no GPU and no built
 extensions. That is deliberate: the failure mode being guarded against is a
 rename or a move, and those are visible without executing anything.
 
+The paths it walks are the *package's*, resolved from the imported module
+rather than from this file, because the tests live under tests/ and the tree
+they guard lives under tensorrt_llm/.
+
 What is *not* guarded here is whether a target is correct; that is what its
 gate records are for.
 """
@@ -18,9 +22,12 @@ from pathlib import Path
 
 import pytest
 
-from ._router_index import STAIRCASE_ROUTERS, routing_module
+import tensorrt_llm._torch.staircase as _staircase
+from tensorrt_llm._torch.staircase._router_index import STAIRCASE_ROUTERS, routing_module
 
-_ROOT = Path(__file__).resolve().parent
+# The package, not this file: these paths address the tree under test, and this
+# test lives in tests/ while that tree lives in tensorrt_llm/.
+_ROOT = Path(_staircase.__file__).resolve().parent
 _ARCHS = sorted(STAIRCASE_ROUTERS)
 
 
@@ -137,13 +144,23 @@ def test_no_routing_module_reads_an_unplumbed_dimension(arch):
     )
 
 
-def test_every_target_ships_the_four_products():
-    """modeling.py, weights.py, smoke.py and TARGET.md travel together."""
+def test_every_target_ships_the_three_products():
+    """modeling.py, weights.py and TARGET.md travel together.
+
+    The forward, the weights it expects, and the record of what that pair was
+    measured to do. A target missing the third is one nobody can check.
+
+    There used to be a fourth, a per-target ``smoke.py``. In-tree there is no
+    reason to carry a bespoke keyword-assert CLI: the same boot-and-generate
+    check is ``examples/llm-api/quickstart_advanced.py``, and the accuracy
+    gates are ``trtllm-eval`` and ``accuracy/test_staircase.py`` -- which,
+    unlike a module that nothing ever ran, CI actually runs.
+    """
     for arch in _ARCHS:
         routing = routing_module(arch)
         for name, dotted in routing.TARGET_MODULES.items():
             target_dir = _module_path(dotted).parent
-            for product in ("modeling.py", "weights.py", "smoke.py", "TARGET.md"):
+            for product in ("modeling.py", "weights.py", "TARGET.md"):
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
 

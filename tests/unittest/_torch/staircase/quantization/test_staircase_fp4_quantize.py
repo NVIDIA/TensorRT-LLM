@@ -6,8 +6,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-
-from .fp4_quantize import fp4_quantize
+from tensorrt_llm._torch.staircase.catalog.quantization.fp4_quantize import fp4_quantize
 
 assert torch.cuda.is_available(), "fp4_quantize requires a CUDA device"
 

@@ -6,7 +6,7 @@ import contextlib
 
 import torch
 
-from .cublas_mm import cublas_mm
+from tensorrt_llm._torch.staircase.catalog.gemm.cublas_mm import cublas_mm
 
 assert torch.cuda.is_available(), "cublas_mm requires a CUDA device"
 
