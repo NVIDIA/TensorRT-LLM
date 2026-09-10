@@ -6024,6 +6024,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             )
 
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
+        if v2_kv_cache:
+            # This test imposes a 32K KV-cache window on full-attention layers,
+            # far larger than GPT-OSS's native 128-token sliding window.
+            # V2 budgets max_batch_size requests with fully occupied windows.
+            # With the default 2048, this test-only 32K window causes OOM.
+            # Limit test concurrency rather than change V2's allocation policy.
+            pytorch_config["max_batch_size"] = 64
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto",
                                         enable_block_reuse=True,
