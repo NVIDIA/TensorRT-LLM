@@ -600,6 +600,7 @@ def test_generate_with_detokenization_stop_words_streaming(model_path):
                                      streaming=True):
         if output.outputs[0].finish_reason == 'stop':
             assert output.outputs[0].stop_reason == "How"
+            assert output.outputs[0].text == "Hello there!"
             found_stop = True
             break
         elif output.outputs[0].finish_reason == 'length':
