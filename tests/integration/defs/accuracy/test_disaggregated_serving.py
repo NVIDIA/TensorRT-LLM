@@ -2108,7 +2108,13 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
                 "speculative_model": model_path,
             },
             # Acceptance length is read back off this worker's /metrics.
-            # -1 keeps the server's stats buffer unbounded; the 1000-iteration
+            # Without return_perf_metrics the server never builds its tee
+            # buffer (openai_server.py gates it on the Prometheus collector),
+            # so /metrics drains the engine's iteration-stats queue directly
+            # and nothing is dropped. iter_stats_max_iterations is therefore
+            # inert here, and is set defensively: it becomes load-bearing the
+            # moment anything turns the collector on -- e.g.
+            # launch_disaggregated_llm(enable_perf=True) -- where the 1000
             # default would silently drop the start of a full GSM8K run.
             "enable_iter_perf_stats": True,
             "iter_stats_max_iterations": -1,
@@ -2148,6 +2154,16 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             # rejected every step and only costs speed. Gate on acceptance
             # length too, or this test covers everything except the feature
             # it exists to exercise.
+            #
+            # The baseline in references/acceptance_length.yaml is the mean of
+            # 4 runs of this exact configuration (4.024/4.075/4.084/4.112).
+            # Across 13 runs total -- also spanning max_batch_size 64 and an
+            # FP8 KV variant -- AL stayed within 4.019-4.112 (sd 0.032), so
+            # min_al 3.8701 sits ~6 sd below the mean and 3.8% below the
+            # lowest value ever observed. Recorded here because
+            # acceptance_length.yaml cannot hold comments: the
+            # TRTLLM_POPULATE_ACCEPTANCE_LENGTH path rewrites it through
+            # yaml.safe_dump, which drops them.
             acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
             print(f"[AL] test_gsm8k_1p1d_dep4 "
                   f"acceptance_length = {acceptance_length:.3f}")
