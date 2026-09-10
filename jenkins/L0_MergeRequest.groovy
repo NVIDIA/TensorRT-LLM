@@ -796,7 +796,13 @@ def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", fileP
     )
     def changedFiles = nameStatus.readLines().collect { line ->
         def fields = line.split('\t', -1)
-        [status: fields[0], paths: fields.drop(1).findAll { it }]
+        def paths = []
+        for (int index = 1; index < fields.length; index++) {
+            if (fields[index]) {
+                paths.add(fields[index])
+            }
+        }
+        [status: fields[0], paths: paths]
     }
     if (function == "getChangedFileList") {
         return changedFiles.collectMany { changedFile ->
