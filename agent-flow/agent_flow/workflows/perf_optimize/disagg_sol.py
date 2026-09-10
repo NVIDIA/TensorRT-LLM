@@ -578,6 +578,76 @@ def established(directory: Path, track: str = GEN_TRACK) -> bool:
     return bool(sorted(root.rglob(GEN_ONLY_CSV)))
 
 
+#: Why a design may be somewhere other than where it was asked for, and what
+#: is done about it.
+#:
+#: The design agent is given a directory and told to resume from its
+#: ``state.json``. When the named directory does not exist and a sibling one
+#: does — carrying a state file whose recorded scope matches the instruction —
+#: resuming that sibling is the right engineering call: it saved roughly
+#: twenty node-hours of re-probing on the run this was written after. Refusing
+#: it would forbid a correct decision.
+#:
+#: But the supervisor checks the directory it *asked* for, so the correct
+#: decision surfaced as "the design was never established" and the run
+#: stopped. Following the agent silently would be worse: every later artefact
+#: would cite a design directory the spec never named.
+#:
+#: So it is followed and recorded. The redirection travels in the run record
+#: and in every campaign's provenance, for the same reason the missing
+#: end-to-end view does: a reader must not have to already know.
+DESIGN_REDIRECTED = (
+    "the design agent was given {requested} and established the design in {actual} "
+    "instead. That is legitimate -- a design is resumed from its state.json, and "
+    "resuming an existing one avoids re-measuring what it already measured -- but "
+    "it means every artefact below was selected from a directory this spec did not "
+    "name. Point the spec at {actual} to make the next run's request and result "
+    "agree."
+)
+
+
+def resolve_design_dir(requested: Path, wanted: Sequence[str]) -> tuple[Path, str | None]:
+    """Where the design actually is, and a note if that is not where it was asked.
+
+    Looked for among the requested directory's siblings, which is where an
+    agent resuming an existing design would find one: the model directory
+    holds ``sweep_design`` and whatever variants a spec has named. The search
+    is deliberately narrow -- one level, and only directories that both carry
+    a ``state.json`` and are established for every wanted track -- because a
+    supervisor that hunts the filesystem for something that looks like a
+    design will eventually find one that is not.
+
+    Ambiguity is refused rather than resolved. Two established designs beside
+    each other is a question about which measurement the campaigns should
+    freeze on, and this is not the layer that answers it.
+    """
+    requested = Path(requested)
+    if all(established(requested, track) for track in wanted):
+        return requested, None
+
+    parent = requested.parent
+    if not parent.is_dir():
+        return requested, None
+    found = [
+        candidate
+        for candidate in sorted(parent.iterdir())
+        if candidate.is_dir()
+        and candidate != requested
+        and (candidate / DESIGN_STATE).is_file()
+        and all(established(candidate, track) for track in wanted)
+    ]
+    if not found:
+        return requested, None
+    if len(found) > 1:
+        raise DisaggSolError(
+            f"{requested} is not established, and {len(found)} sibling directories "
+            f"are: {[str(f) for f in found]}. Which measurement the campaigns "
+            f"freeze on is not something this layer may pick -- name one in "
+            f"'{DISAGG_SOL_FIELD}.{DESIGN_KEY}.{DESIGN_DIR_KEY}'."
+        )
+    return found[0], DESIGN_REDIRECTED.format(requested=requested, actual=found[0])
+
+
 def campaign_workspace(root: Path, track: str, label: str) -> Path:
     """Each half gets its own, and the name says which half it is.
 
@@ -925,6 +995,7 @@ def supervise(
     wanted = tracks(base)
 
     unready = [t for t in wanted if not established(design, t)]
+    redirect: str | None = None
     if unready and designer is not None:
         # The design is normally an input -- it is reused across campaigns and
         # costs an order of magnitude more than any of them. But "an input"
@@ -937,6 +1008,10 @@ def supervise(
                 model_dir=Path(design).parent.name, design_dir=design, tracks=unready
             )
         )
+        # Where the design landed is read back, not assumed: the agent
+        # resumes from a state file, and an existing design beside the
+        # requested one is the thing it should resume.
+        design, redirect = resolve_design_dir(design, wanted)
         unready = [t for t in wanted if not established(design, t)]
     if unready:
         what = {
@@ -954,6 +1029,7 @@ def supervise(
 
     record: dict[str, Any] = {
         "design_dir": str(design),
+        **({"design_dir_redirected": redirect} if redirect else {}),
         "design_state": design_state(design).get("phase"),
         "tracks": wanted,
         "label": label,
