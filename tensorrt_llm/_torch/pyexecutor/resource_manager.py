@@ -1905,24 +1905,17 @@ class KVCacheManager(BaseResourceManager):
         result = self.impl.get_primary_pool_data(layer_offset)
 
         pool = self.get_pool_for_layer(layer_offset)
-        layer_dtype = pool.dtype if pool else self.dtype
         layer_head_dim = pool.head_dim if pool else self.head_dim
 
         assert kv_layout in ["NHD",
                              "HND"], f"Unsupported kv_layout: {kv_layout}"
-
-        element_per_container = 1
-        if layer_dtype == DataType.NVFP4:
-            element_per_container = 2
-        effective_head_dim = layer_head_dim // element_per_container
-
         if kv_layout == "NHD":
             return result.reshape(
                 result.shape[0],
                 self.kv_factor,
                 self.tokens_per_block,
                 self.num_kv_heads_per_layer[layer_offset],
-                effective_head_dim,
+                layer_head_dim,
             )
         else:
             return result.reshape(
@@ -1930,7 +1923,7 @@ class KVCacheManager(BaseResourceManager):
                 self.kv_factor,
                 self.num_kv_heads_per_layer[layer_offset],
                 self.tokens_per_block,
-                effective_head_dim,
+                layer_head_dim,
             )
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
