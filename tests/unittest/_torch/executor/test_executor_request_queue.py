@@ -220,6 +220,27 @@ def test_post_mutation_failure_permanently_closes_admission(executor_queue):
         executor_queue.enqueue_request(Mock())
 
 
+def test_memory_status_snapshot_tracks_partial_restore(executor_queue):
+    assert executor_queue.get_memory_status() == (
+        RequestAdmissionState.RUNNING,
+        frozenset(),
+    )
+
+    executor_queue.begin_sleep_transition(["model", "kv_cache"])
+    executor_queue.complete_sleep_transition()
+    assert executor_queue.get_memory_status() == (
+        RequestAdmissionState.PARKED,
+        frozenset({"model", "kv_cache"}),
+    )
+
+    executor_queue.begin_wakeup_transition(["kv_cache"])
+    executor_queue.complete_wakeup_transition()
+    assert executor_queue.get_memory_status() == (
+        RequestAdmissionState.PARKED,
+        frozenset({"model"}),
+    )
+
+
 @pytest.mark.parametrize(
     "rank,active,expected",
     [
