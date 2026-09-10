@@ -50,7 +50,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 See `examples/visual_gen/configs/`:
 
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
-- `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
+- `cosmos3-super-4gpu.yaml` — 4 GPU, tensor parallel + Ulysses + parallel VAE
 - `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
