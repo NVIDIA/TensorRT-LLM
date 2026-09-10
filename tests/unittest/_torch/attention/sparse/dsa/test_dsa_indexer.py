@@ -234,7 +234,7 @@ def test_use_gvr_prescore_threads_to_params(use_gvr_prescore):
     additionally requires use_gvr_emission (temporal-hint path, FP4, paged-MQA)."""
     sparse_config = DeepSeekV4SparseAttentionConfig(
         compress_ratios=[1, 4, 128],
-        index_head_dim=96,
+        index_head_dim=128,
         index_topk=512,
         indexer_k_dtype="fp4",
         enable_heuristic_topk=True,
