@@ -1,0 +1,190 @@
+# Accuracy reference scores, keyed by Hugging Face repo name; target_ckpt
+# joins an entry to the <checkpoint> segment of a target's identity path,
+# models/<family>/targets/<checkpoint>/<gpu arch>/<parallel>/.
+#
+# Gate: measured accuracy >= score - tol, one-sided, enforced by
+# trtllm-eval --check_accuracy. tol is 5.0 everywhere — a reference score
+# drifts a few points across checkpoint variants, harnesses and
+# quantizations, while an assembly catastrophe sits 20+ points away
+# (random = 25 on MMLU).
+#
+# source, preferred first:
+#   `trtllm`      — TensorRT-LLM's accuracy suite
+#                   (tests/integration/defs/accuracy/). Best source: the
+#                   harness we delegate to, and the test that produced the
+#                   score also states its protocol (see `eval`). A
+#                   checkpoint lists one entry per quantization — take the
+#                   one this target matches, not the first line.
+#   `model-card`  — the checkpoint's published number.
+#   `trtllm-eval` — measured here, e.g. stock trtllm on the same
+#                   checkpoint when nothing is published.
+# After a target's first passing run, write its measured score back and
+# set source to `trtllm-eval`; tol stays 5.0. Skip the write-back when the
+# target was accepted with a protocol caveat (no passing value exists), or
+# when the anchor is already this repo's own stock-trtllm measurement —
+# replacing that with the target's number makes the gate self-referential.
+#
+# `eval` (optional) — the protocol, so our number and the anchor measure
+# the same thing. Absent = trtllm-eval defaults: 5-shot completion MMLU
+# scored on the first generated token. That fits a base model; an instruct
+# model without its chat template, or a reasoning model with no room to
+# reason, scores far below its ability and the gate then reads as an
+# assembly defect. Copy the protocol from the test that gave the score.
+#
+#   eval:
+#     task: gsm8k          # trtllm-eval subcommand; default mmlu
+#     args:                # passed through by name to that subcommand
+#       apply_chat_template: true
+#       fewshot_as_multiturn: true
+#       max_output_length: 8192
+#
+# args pass through by name: any option the subcommand accepts (booleans
+# become flags, mappings are JSON-encoded).
+#
+# `scores_filter` is a sibling of `args`, not one of them: it names which
+# lm-eval filter the gate reads (e.g. `exact_match,flexible-extract`).
+# trtllm-eval exposes no CLI flag for it — it is a keyword of the
+# evaluator's evaluate() — so a caller has to bind it before delegating.
+# Set it whenever the anchor's protocol names one. Unset, the evaluator
+# averages every metric the task reports, which mixes filters measuring
+# different things and, on a task whose result dict carries a string
+# alias, raises instead of returning a score. A reasoning model needs it:
+# its answer never arrives in the strict `#### N` form, so the strict
+# filter scores it near the floor while flexible extraction reads what it
+# actually answered.
+#
+# ── THE SCORES BELOW ARE ANCHORS, NOT GATE RECORDS ────────────────────────
+#
+# Every `score` here that says `source: trtllm-eval` was written back from a
+# passing run on **sm_100 (B200)**, through a standalone harness that did not
+# survive the move in-tree. The migrated targets are sm_103 (GB300) and have
+# no passing run yet. These values are still the right bar to gate against —
+# an accuracy anchor is a property of the checkpoint and the protocol, not of
+# the GPU — but no target in this tree has cleared one. See each TARGET.md.
+#
+# The replacement invocation is trtllm-eval directly, with the protocol below
+# spelled out on the command line and `TRTLLM_STAIRCASE=require` exported, so
+# that a configuration which does not match a target fails loudly instead of
+# quietly measuring the built-in implementation.
+# ──────────────────────────────────────────────────────────────────────────
+
+# TensorRT-LLM's accuracy suite, references/gsm8k.yaml key
+# `openai/gpt-oss-120b`, read at commit 1662a877f374ee944d1907e8efa735d35ff2abf6
+# whose tensorrt_llm/version.py is 1.3.0rc21 — the pin exactly. The
+# quantization-keyed twin `GPT-OSS/120B-MXFP4` carries the same 90.3,
+# including its `quant_algo: W4A16_MXFP4` row, which is this checkpoint's
+# quantization. The suite has no MMLU entry for gpt-oss at all and gates
+# the family on GSM8K only: the model reasons before it answers, and
+# 5-shot completion MMLU scored on the first generated token measures
+# none of that.
+# Protocol copied from TestGPTOSS (test_llm_api_pytorch.py), whose
+# MODEL_PATH is this exact checkpoint: chat template, few-shot as
+# multiturn, MAX_OUTPUT_LEN patched to 8192, and flexible answer
+# extraction. Stock trtllm measured here under precisely that protocol
+# scored 90.22 (strict-match, for contrast: 28.13) — the anchor
+# reproduces on this machine, so it was gated against directly rather
+# than through a stock-trtllm proxy.
+#
+# The score below is the target's own first passing measurement, 90.5989
+# over the full 1319 questions, which replaces the 90.3 it was gated
+# against. Measured twice by separate invocations of `bench/accuracy.py`
+# — the assembler's gating run and an independent orchestrator re-run —
+# reproducing bit-identically, down to the non-gated strict-match filter
+# (25.4738). Read the +0.30 over the external anchor and the +0.38 over
+# the stock-trtllm number as agreement, not as an improvement: the same
+# build measured 90.22 through a differently-invoked driver, so
+# differences of this size on this benchmark are not results.
+#
+# That measurement is of the assembly's W4A16 MoE forward. The perf
+# campaign then shipped the W4A8 (MXFP8-activation) member of the same
+# kernel family, which gates at 89.1585 — also bit-identical across two
+# invocations, so the 1.44-point drop is the recipe's price and not
+# sampling. The anchor is deliberately left at the higher W4A16 value:
+# lowering it would only loosen the gate, and 90.5989 remains a real
+# measurement of this checkpoint through this harness. Open thread for
+# whoever revisits: stock trtllm runs the same W4A8 recipe and measured
+# 90.2199 here, so our W4A8 sits 1.06 below it — larger than this gate's
+# 0.38-point cross-driver spread.
+openai/gpt-oss-120b:
+  target_ckpt: gpt-oss-120b
+  score: 90.5989
+  n_samples: 1319
+  source: trtllm-eval
+  tol: 5.0
+  eval:
+    task: gsm8k
+    scores_filter: exact_match,flexible-extract
+    args:
+      apply_chat_template: true
+      fewshot_as_multiturn: true
+      max_output_length: 8192
+
+# TensorRT-LLM's accuracy suite, references/gsm8k.yaml key
+# `deepseek-ai/DeepSeek-R1-0528`, the `quant_algo: NVFP4` +
+# `kv_cache_quant_algo: FP8` row = 94.24, read at commit
+# 1662a877f374ee944d1907e8efa735d35ff2abf6 whose tensorrt_llm/version.py
+# is 1.3.0rc21 — the pin exactly. That row is the checkpoint's exact
+# quantization pair: this target's hf_quant_config.json declares
+# `quant_algo: NVFP4` with `kv_cache_quant_algo: FP8`, so it is the row
+# to take rather than the block's first line by position (they coincide
+# here).
+#
+# Why GSM8K and not MMLU. references/mmlu.yaml does carry a
+# `deepseek-ai/DeepSeek-R1-0528` block, but it holds **only
+# FP8_BLOCK_SCALES rows — there is no NVFP4 row at all**, so this
+# checkpoint's quantization has no MMLU anchor to be gated against. GSM8K
+# is also the right task on its own terms: R1-0528 is a reasoning model,
+# and 5-shot completion MMLU scored on the first generated token measures
+# none of that.
+#
+# Protocol: the consuming test is TestModelRegistryAccuracy's
+# `test_autodeploy_from_registry` (test_llm_api_autodeploy.py), whose
+# `nvidia/DeepSeek-R1-0528-NVFP4-v2` parameter is aliased onto this key
+# and whose task list is `[GSM8K]`. It passes `evaluate_kwargs = {}` for
+# every non-MMLU task, so the measurement is accuracy_core.GSM8K's
+# defaults — full 1319 questions, random_seed 0, **no chat template**, no
+# fewshot-as-multiturn, max_input_length 4096, max_output_length 256.
+# trtllm-eval's `gsm8k` subcommand defaults to exactly those, so no
+# `args` block is needed. Being a reasoning model does not change that:
+# under plain few-shot completion the model continues the exemplars'
+# form rather than opening a think block, which is what makes 94.24
+# reachable inside 256 output tokens.
+#
+# `scores_filter` is this repo's one deliberate deviation, for the reason
+# the file header gives — the suite leaves it None and averages every
+# metric, which this harness cannot do. Same choice as the gpt-oss-120b
+# and DeepSeek-V3-Lite entries. Report both filters on the first run.
+#
+# CAVEAT, and the reason this entry is worth re-reading at write-back
+# time: the anchor was measured on a **different NVFP4 export of the same
+# base model**. The test's `nvidia/DeepSeek-R1-0528-NVFP4-v2` resolves
+# (tests/test_common/llm_data.py:44) to
+# `DeepSeek-R1/DeepSeek-R1-0528-FP4-v2`, while this target is built from
+# `DeepSeek-R1/DeepSeek-R1-0528-FP4` — the v1 export, which sits beside
+# it on disk. Both declare NVFP4 + FP8 KV, but their modelopt
+# `exclude_modules` lists differ substantially (63 entries here against
+# 246 in v2), so they are not the same weights. tol 5.0 is what absorbs
+# an export-revision difference of this kind; a measured score a point or
+# two off 94.24 is not evidence of an assembly defect.
+#
+# WRITE-BACK. The score below is the target's own first passing
+# measurement, 94.9962 over the full 1319 questions, replacing the 94.24 it
+# was gated against. `strict-match` on the same run was 94.6171; the 0.38
+# between the filters is 5 questions, so under few-shot completion this
+# checkpoint mostly answers in the strict `#### N` form and flexible
+# extraction finds a few more.
+#
+# Read the +0.76 over the external anchor as agreement, not as an
+# improvement. One filter's stderr alone is +-0.60, and the anchor was
+# measured on the other export — the caveat above is exactly why a
+# difference of this size carries no information. Nothing in the target's
+# record rests on it.
+deepseek-ai/DeepSeek-R1-0528:
+  target_ckpt: deepseek-r1-0528-nvfp4
+  score: 94.9962
+  n_samples: 1319
+  source: trtllm-eval
+  tol: 5.0
+  eval:
+    task: gsm8k
+    scores_filter: exact_match,flexible-extract
