@@ -785,6 +785,47 @@ def test_fmha_cache_keeps_combined_selections_immutable() -> None:
     assert len(events) == num_events_after_misses
 
 
+@pytest.mark.parametrize("variable_window_first", [False, True])
+def test_fmha_cache_separates_variable_window_selections(variable_window_first: bool) -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    variable_window_fmha = FakeFmha(
+        attn,
+        "variable-window",
+        events,
+        support_predicate=lambda args: args.variable_window_token_starts is not None,
+    )
+    regular_fmha = FakeFmha(
+        attn,
+        "regular",
+        events,
+        support_predicate=lambda args: args.variable_window_token_starts is None,
+    )
+    manager.fmha_libs = [variable_window_fmha, regular_fmha]
+    metadata = _make_metadata(num_contexts=1, num_generations=0, num_ctx_tokens=1)
+    regular_args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
+    bounds = torch.zeros(1, dtype=torch.int32)
+    variable_window_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        variable_window_token_starts=bounds,
+        variable_window_token_ends=bounds,
+    )
+    requests = (
+        (variable_window_args, variable_window_fmha),
+        (regular_args, regular_fmha),
+    )
+    if not variable_window_first:
+        requests = tuple(reversed(requests))
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        for forward_args, expected_fmha in requests:
+            selected = manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args)
+            assert selected is expected_fmha
+
+    assert len(manager._cache) == 2
+    assert {key.has_variable_window for key in manager._cache} == {False, True}
+
+
 def test_fmha_cache_is_bypassed_while_autotuning() -> None:
     cases = (
         (False, AttentionInputType.mixed, 1, 1, 1, 2),

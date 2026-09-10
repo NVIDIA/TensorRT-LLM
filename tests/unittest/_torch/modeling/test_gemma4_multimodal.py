@@ -852,6 +852,20 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             self.assertEqual(text_model_config.attn_backend, backend)
             self.assertEqual(vision_model_config.attn_backend, "TRTLLM")
 
+    def test_generation_only_omits_multimodal_token_types(self):
+        model = self._make_model()
+        raw_input_ids = torch.tensor([1, model.image_token_ids[0]], dtype=torch.int32)
+
+        forward_kwargs = model.get_language_model_extra_forward_kwargs(
+            attn_metadata=mock.Mock(num_contexts=0),
+            raw_input_ids=raw_input_ids,
+            position_ids=None,
+            mm_inputs=mock.Mock(input_ids=None),
+        )
+
+        self.assertIsNone(forward_kwargs["mm_token_type_ids"])
+        self.assertIsNone(forward_kwargs["ple_input_ids"])
+
     def test_encoder_cache_reuses_image_embedding_across_requests(self):
         """Persistent cache reuse applies to the shared dense/MoE Gemma4 wrapper."""
         self.assertTrue(issubclass(Gemma4ForConditionalGeneration, MultimodalModelMixin))

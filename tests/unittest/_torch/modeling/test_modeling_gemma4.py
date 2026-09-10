@@ -2499,6 +2499,49 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_ends"], ends)
 
     @torch.no_grad()
+    def test_generation_only_skips_bidirectional_mask_building(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+        output = torch.zeros(1, config.hidden_size, dtype=config.torch_dtype, device="cuda")
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
+
+        for sm_version in (100, 103):
+            with self.subTest(sm_version=sm_version):
+                attn_metadata = fake_metadata_type()
+                attn_metadata.num_contexts = 0
+                attn_metadata.padded_num_tokens = None
+                with (
+                    unittest.mock.patch(
+                        "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                        side_effect=lambda: 100 <= sm_version < 110,
+                    ),
+                    unittest.mock.patch(
+                        "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
+                        fake_metadata_type,
+                    ),
+                    unittest.mock.patch.object(
+                        model, "get_attention_variable_window"
+                    ) as get_window,
+                    unittest.mock.patch.object(model, "get_attention_mask") as get_mask,
+                    unittest.mock.patch.object(model.model, "forward", return_value=output),
+                    unittest.mock.patch.object(
+                        model.logits_processor, "forward", return_value=output
+                    ),
+                ):
+                    actual = model(
+                        attn_metadata=attn_metadata,
+                        inputs_embeds=output,
+                        mm_token_type_ids=torch.zeros(1, dtype=torch.long, device="cuda"),
+                    )
+
+                self.assertIs(actual, output)
+                get_window.assert_not_called()
+                get_mask.assert_not_called()
+
+    @torch.no_grad()
     def test_bidirectional_mask_only_applies_to_sliding_layers(self):
         """Full-attention layers retain the standard causal mask."""
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
