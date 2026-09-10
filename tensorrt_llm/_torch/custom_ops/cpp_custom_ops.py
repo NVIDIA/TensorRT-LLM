@@ -15,6 +15,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
+    """Register the meta ("fake") kernels for the trtllm C++ custom ops.
+
+    Each entry mirrors one op's output shapes and dtypes without touching data,
+    which is what torch.compile and export need to trace through the op.
+    """
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
@@ -1266,7 +1271,10 @@ def _register_fake():
           cp_rank,
           cp_size,
           zero_kv_mask=None):
-        # Returns outputs with same shapes as inputs
+        """Exchanged tensors keep the shape and dtype of their inputs.
+
+        zero_kv_mask only changes the values the sender writes, never a shape.
+        """
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
 

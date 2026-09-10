@@ -36,6 +36,13 @@ struct HelixFieldInfo
     int stride;       // Stride between rows in bytes
 };
 
+//! Arguments for one Helix CP all-to-all: what to send, where to receive, and
+//! which peers participate.
+//!
+//! Two fields per direction, matching the pair the Helix combine needs: field 0
+//! is the partial attention output, field 1 the per-row (max, sum) softmax
+//! stats. An "entry" is one unit of exchange per peer rank, so a rank sends
+//! entryCount entries to each of the cpSize peers.
 struct HelixAllToAllParams
 {
     HelixFieldInfo sendFields[2];
