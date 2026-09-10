@@ -892,6 +892,12 @@ class KVCacheManager:
     @property
     def pool_group_descs(self) -> TypedIndexList[PoolGroupIndex, PoolGroupDesc]:
         storage = self._storage
+        gpu_storage = storage._levels[GPU_LEVEL].storage
+        # base_address below is the address of slot 0, which lives in locality
+        # domain 0, so the slot count has to describe that same domain.
+        use_primary_locality_domain = (
+            isinstance(gpu_storage, GpuCacheLevelStorage) and gpu_storage.num_locality_domains > 1
+        )
 
         def get_pool_group_desc(pg_idx: PoolGroupIndex) -> PoolGroupDesc:
             slot_size_list = storage.slot_size(pg_idx)
@@ -905,7 +911,9 @@ class KVCacheManager:
             )
             return PoolGroupDesc(
                 pool_group_index=pg_idx,
-                num_slots=storage.num_slots(pg_idx),
+                num_slots=storage.num_slots(pg_idx, locality_domain_id=0)
+                if use_primary_locality_domain
+                else storage.num_slots(pg_idx),
                 slot_desc=storage._slot_desc_list[pg_idx],
                 pools=pools,
             )
