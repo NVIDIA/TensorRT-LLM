@@ -1,7 +1,7 @@
 schema_version: 1
 vendors:
   flashinfer-prims-ts:
-    url: https://github.com/rosong11/flashinfer.git
+    url: https://github.com/yuxianq/flashinfer.git
     branch: trtllm-prims-ts-dev
     commit: bad2bdb15aac3553934e7a7a164dcb2ca4fda7f1
     source: flashinfer/attention/prims_ts
