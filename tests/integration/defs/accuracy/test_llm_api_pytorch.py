@@ -4094,8 +4094,8 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
-                speculative_model=
-                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/")
+                speculative_model=f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/"
+            )
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
@@ -4141,8 +4141,8 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
-                speculative_model=
-                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/")
+                speculative_model=f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/"
+            )
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
@@ -5710,9 +5710,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
 
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
 
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
@@ -6963,9 +6961,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             pytest.skip(
                 f"Device count {get_device_count()} is less than required {gpu_needed}"
             )
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
@@ -7047,9 +7043,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_8gpus_mtp(self):
         # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
         # This test uses MTP with max_draft_len=3 and one_model mode.
-        mtp_config = MTPDecodingConfig(
-            max_draft_len=3,
-        )
+        mtp_config = MTPDecodingConfig(max_draft_len=3, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
@@ -7084,9 +7078,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     def test_nvfp4_4gpu_mtp_ar(self):
         max_draft_len = 7
-        mtp_config = MTPDecodingConfig(
-            max_draft_len=max_draft_len,
-        )
+        mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
@@ -7149,9 +7141,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpu_mtp_ar_custom_op(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         max_draft_len = 7
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=max_draft_len,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
@@ -7213,9 +7203,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_8gpus_mtp_custom_op(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
@@ -7399,9 +7387,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      periodic_snapshot_interval, attention_dp,
                                      use_mtp):
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
         max_batch_size = 4 if attention_dp else 32
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",

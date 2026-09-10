@@ -890,7 +890,6 @@ def test_deepseek_mla_eagle3():
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
     enable_block_reuse = False
-    use_one_model = True
     enable_chunked_prefill = False
 
     # Eagle3 one model works with overlap scheduler and block reuse.
@@ -1242,7 +1241,6 @@ def test_eagle3_lora(use_cuda_graph: bool):
     """
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = True
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
