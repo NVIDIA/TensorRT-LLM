@@ -170,7 +170,12 @@ __global__ void smallBatchSplitOutputKernel(FusedSamplingParams params)
         }
         reinterpret_cast<float4*>(rowProbs)[v] = out;
     }
-    int const tailBegin = begin > vecEnd * 4 ? begin : vecEnd * 4;
+    // Clamp against prologueEnd rather than begin: a slice narrower than one float4
+    // leaves vecBegin > vecEnd, and a tail starting at vecEnd * 4 would then re-walk
+    // indices the prologue already covered and double-count localProbMass. The static
+    // assert on kSmallBatchSplitMinVocab makes that unreachable, but the tail should
+    // not depend on it.
+    int const tailBegin = vecEnd * 4 > prologueEnd ? vecEnd * 4 : prologueEnd;
     for (int i = tailBegin + tid; i < splitEnd; i += blockDim.x)
     {
         float const p = weightOf(rowLogits, i, rp.tempInv, rowStats.max) * scale;
@@ -449,10 +454,17 @@ __global__ void smallBatchSplitFinalizeKernel(FusedSamplingParams params)
             localProbMass += rowProbs[i];
         }
         float base = 0.0f;
-        BlockScanF(temp.scanF).ExclusiveSum(localProbMass, base);
+        float splitTotal = 0.0f;
+        BlockScanF(temp.scanF).ExclusiveSum(localProbMass, base, splitTotal);
         __syncthreads();
 
-        float const target = sTarget;
+        // sTarget was carved out of sMass[chosenSplit] -- a float4 tree reduction over
+        // kSmallBatchSplitBlock threads plus a serial head sum -- while this scan re-sums
+        // the same range with a kWideBlock scalar stride. Those are structurally different
+        // reduction trees, so they disagree by more than the ulp-level rounding the argmax
+        // fallback is calibrated for; a residual past the re-summed total would leave every
+        // interval test below false and silently demote the row to argmax.
+        float const target = fminf(sTarget, nextafterf(splitTotal, -FLT_MAX));
         if (target >= base && target < base + localProbMass)
         {
             float running = base;

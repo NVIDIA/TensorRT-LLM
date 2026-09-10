@@ -134,7 +134,12 @@ __device__ inline RowParams loadRowParams(FusedSamplingParams const& p, int row)
     float const temperature = p.temperatures != nullptr ? p.temperatures[row] : 1.0f;
     r.tempInv = 1.0f / (temperature + kTempEpsilon);
 
-    r.minP = p.minPs != nullptr ? p.minPs[row] : 0.0f;
+    // min_p is a fraction of the row maximum, so a value above 1 keeps nothing: keptMass
+    // would be 0 and the renormalized row would come back all-inf instead of raising.
+    // SamplingParams already enforces [0, 1], but these ops are publicly registered and
+    // the unit tests call them directly. Clamp here rather than on the host, where a value
+    // check would need a D2H sync that is illegal under CUDA graph capture.
+    r.minP = fminf(fmaxf(p.minPs != nullptr ? p.minPs[row] : 0.0f, 0.0f), 1.0f);
     r.topP = p.topPs != nullptr ? p.topPs[row] : 1.0f;
     r.topK = p.topKs != nullptr ? p.topKs[row] : 0;
 
@@ -189,6 +194,9 @@ constexpr int kSplitHistogramOffset = kSmallBatchWorkspaceFloats;
 constexpr int kSplitHistogramStride = 2 * kRadixBuckets;
 static_assert(sizeof(OnlineSoftmax) % sizeof(float) == 0);
 static_assert(kSplitHistogramOffset + kSmallBatchSplits * kSplitHistogramStride <= kSmallBatchSplitMinVocab);
+// Every multi-CTA split must extend past the scratch header, or the vectorized prologue and
+// tail in smallBatchSplitOutputKernel can overlap on a sub-float4 slice.
+static_assert(kSmallBatchSplitMinVocab / kSmallBatchSplits > kSmallBatchWorkspaceFloats);
 
 //! Merge two partial online-softmax states by rebasing the smaller max onto the larger.
 //! Associative and commutative, so a block reduce over it is order-independent -- which is
@@ -1002,7 +1010,10 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
         keptMass = sKeptMass;
     }
     // A degenerate row (every weight filtered away by a pathological threshold) would
-    // divide by zero; fall back to the unfiltered mass rather than emit NaNs.
+    // divide by zero; fall back to sTotalMass rather than emit NaNs. For a min-p row that
+    // is the min-p-*filtered* mass, overwritten in the pass above, not the unfiltered one.
+    // Unreachable for valid input: the __fmul_rn discipline makes w == 1.0 exact at the
+    // argmax and minP is clamped to <= 1, so keptMass >= 1.0.
     if (!(keptMass > 0.0f))
     {
         keptMass = sTotalMass;

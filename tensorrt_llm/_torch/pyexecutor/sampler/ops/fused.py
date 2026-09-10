@@ -33,6 +33,11 @@ per combination -- and what lets ``min_p`` be added without doubling the mode sp
 
 Disable sentinels, matching ``SpecMetadata._scan_one_model_sampling``: ``top_k`` outside
 ``(0, vocab_size)`` (including ``INT32_MAX``), ``top_p >= 1``, ``min_p <= 0``.
+
+Unlike the flashinfer ops, none of these carries ``@torch.compiler.disable``, and the
+absence is deliberate rather than an omission: each is a single C++ custom op with a
+registered fake kernel (:mod:`tensorrt_llm._torch.custom_ops.cpp_custom_ops`), so it
+traces cleanly and has no python chain to break the graph on.
 """
 
 from typing import Optional
