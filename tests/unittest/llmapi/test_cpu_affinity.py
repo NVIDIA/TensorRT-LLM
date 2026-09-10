@@ -117,6 +117,22 @@ def test_partial_binding_keeps_owned_mask_for_retry(affinity, monkeypatch):
     assert bindings == [[0, 1], [0, 1]]
 
 
+def test_proper_subset_readback_remains_owned_for_retry(affinity, monkeypatch):
+    current, bindings = affinity
+
+    def subset_bind(cpus):
+        bindings.append(list(cpus))
+        current[:] = [0]
+        return 1, 3
+
+    monkeypatch.setattr(utils, "_set_affinity_all_threads", subset_bind)
+    utils.configure_cpu_affinity(0)
+    utils.configure_cpu_affinity(0)
+    assert current == [0]
+    assert bindings == [[0, 1], [0, 1]]
+    utils.logger.warning.assert_not_called()
+
+
 _REAL_CONFIGURE_PROBE = """
 import os
 import threading
@@ -162,7 +178,10 @@ finally:
 """
 
 
-@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="Linux only")
+@pytest.mark.skipif(
+    not hasattr(os, "sched_setaffinity") or not os.path.isdir("/proc/self/task"),
+    reason="Linux procfs affinity only",
+)
 def test_repeated_configuration_preserves_real_thread_masks():
     import subprocess
     import sys
