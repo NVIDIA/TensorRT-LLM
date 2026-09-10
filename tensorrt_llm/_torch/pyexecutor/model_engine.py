@@ -39,6 +39,8 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 
 # isort: split
+from itertools import accumulate
+
 from tensorrt_llm.llmapi.llm_args import validate_token_encoder_bucket_config
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
@@ -110,8 +112,6 @@ from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
                                      warmup_sampling_module)
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
-from itertools import accumulate
-
 from .trace_log_utils import log_mem_snapshot
 
 
@@ -5464,7 +5464,8 @@ class PyTorchModelEngine(ModelEngine):
         # the fork-join attention kernel requires per-domain contiguous input
         # slices. We rewrite the underlying chunking and last-chunk lists in
         # place so ``scheduled_batch.context_requests`` sees the sorted order.
-        _locality_domain_reorder = _locality_domain_forkjoin_enabled(kv_cache_manager)
+        _locality_domain_reorder = _locality_domain_forkjoin_enabled(
+            kv_cache_manager)
         # Skip the ctx reorder under chunked prefill: fork-join ctx attention already
         # falls back to the single-kernel path for MLA chunked-prefill ctx, so
         # per-domain contiguity is not needed, and reordering there was observed to
@@ -5477,8 +5478,9 @@ class PyTorchModelEngine(ModelEngine):
         _ctx_requests = scheduled_requests.context_requests
         if _locality_domain_reorder_ctx:
             n_ctx = len(_ctx_requests)
-            _ctx_perm = sorted(range(n_ctx),
-                               key=lambda i: _ctx_requests[i].py_locality_domain_id)
+            _ctx_perm = sorted(
+                range(n_ctx),
+                key=lambda i: _ctx_requests[i].py_locality_domain_id)
             _ctx_requests = [_ctx_requests[i] for i in _ctx_perm]
             # context_requests is a computed property -- reorder the underlying
             # lists so downstream sees the sorted order.
@@ -5672,18 +5674,21 @@ class PyTorchModelEngine(ModelEngine):
         _all_gen_reqs = list(scheduled_requests.generation_requests)
         _gen_dispatch_locality_domain: dict[int, int] = {}
         if _locality_domain_reorder and _all_gen_reqs:
-            _all_gen_perm = sorted(range(len(_all_gen_reqs)),
-                                   key=lambda i: _all_gen_reqs[i].py_locality_domain_id)
+            _all_gen_perm = sorted(
+                range(len(_all_gen_reqs)),
+                key=lambda i: _all_gen_reqs[i].py_locality_domain_id)
             _all_gen_reqs = [_all_gen_reqs[i] for i in _all_gen_perm]
             scheduled_requests.generation_requests = _all_gen_reqs
             if scheduled_requests.num_context_requests == 0:
                 num_locality_domains_local = kv_cache_manager.num_locality_domains
                 assert num_locality_domains_local == 2, (
                     "balanced generation locality domain dispatch currently supports "
-                    "num_locality_domains == 2; got {}".format(num_locality_domains_local))
+                    "num_locality_domains == 2; got {}".format(
+                        num_locality_domains_local))
                 half = (len(_all_gen_reqs) + 1) // 2
                 for idx, req in enumerate(_all_gen_reqs):
-                    _gen_dispatch_locality_domain[req.py_request_id] = 0 if idx < half else 1
+                    _gen_dispatch_locality_domain[
+                        req.py_request_id] = 0 if idx < half else 1
 
         for request in scheduled_requests.generation_requests:
             is_promoted_context = (request.py_request_id
@@ -6509,8 +6514,8 @@ class PyTorchModelEngine(ModelEngine):
 
             gen_sequence_lengths = sequence_lengths[num_ctx_requests:]
             for i, request in enumerate(_all_gen_reqs):
-                u = _gen_dispatch_locality_domain.get(request.py_request_id,
-                                                      request.py_locality_domain_id)
+                u = _gen_dispatch_locality_domain.get(
+                    request.py_request_id, request.py_locality_domain_id)
                 per_locality_domain_gen_reqs[u] += 1
                 per_locality_domain_gen_tokens[u] += gen_sequence_lengths[i]
 
