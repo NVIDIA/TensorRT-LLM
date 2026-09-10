@@ -44,7 +44,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (MultimodalConfig, SleepConfig,
+                                          TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -628,7 +629,9 @@ def launch_server(
         num_media_load_workers: int = 8,
         multi_frontend_enabled: bool = True,
         internal_disagg_auth_key: Optional[str] = None,
-        report_addr: Optional[str] = None):
+        report_addr: Optional[str] = None,
+        enable_runtime_control_endpoints: bool = False,
+        runtime_control_api_key: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -728,7 +731,10 @@ def launch_server(
                 allow_request_chat_template=allow_request_chat_template,
                 input_processor_workers=num_input_processor_workers,
                 media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
+                internal_disagg_auth_key=internal_disagg_auth_key,
+                enable_runtime_control_endpoints=
+                enable_runtime_control_endpoints,
+                runtime_control_api_key=runtime_control_api_key)
             _apply_fastapi_middlewares(server.app, middleware)
 
             # Optionally disable GC (default: not disabled)
@@ -1293,6 +1299,13 @@ def launch_visual_gen_server(
     "launcher read the kernel-assigned port back instead of reserving one up "
     "front.",
     status="prototype")
+@stability_option(
+    "--enable_sleep_mode",
+    is_flag=True,
+    default=False,
+    help=
+    "Enable runtime-memory checkpointing and authenticated HTTP control endpoints.",
+    status="prototype")
 def serve(
     model: str,
     tokenizer: Optional[str],
@@ -1345,12 +1358,25 @@ def serve(
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
     report_addr: Optional[str],
+    enable_sleep_mode: bool,
 ) -> None:
     """Running an OpenAI API compatible server
 
     MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
+    if enable_sleep_mode and backend != "pytorch":
+        raise click.UsageError(
+            "--enable_sleep_mode is only supported by the PyTorch backend.")
+    if enable_sleep_mode and grpc:
+        raise click.UsageError(
+            "--enable_sleep_mode is only supported by the HTTP server.")
+    runtime_control_api_key = None
+    if enable_sleep_mode:
+        runtime_control_api_key = os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY")
+        if not runtime_control_api_key:
+            raise click.UsageError(
+                "--enable_sleep_mode requires TRTLLM_RUNTIME_CONTROL_API_KEY.")
 
     if backend == "_autodeploy":
         logger.warning(
@@ -1467,6 +1493,8 @@ def serve(
             llm_args_extra_dict, "internal_request_auth_key")
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
+        if enable_sleep_mode and llm_args.get("sleep_config") is None:
+            llm_args["sleep_config"] = SleepConfig()
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
@@ -1582,7 +1610,9 @@ def serve(
                 num_input_processor_workers=num_input_processor_workers,
                 num_media_load_workers=num_media_load_workers,
                 internal_disagg_auth_key=internal_disagg_auth_key,
-                report_addr=report_addr)
+                report_addr=report_addr,
+                enable_runtime_control_endpoints=enable_sleep_mode,
+                runtime_control_api_key=runtime_control_api_key)
 
     def _serve_visual_gen():
         from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -1598,6 +1628,10 @@ def serve(
 
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
+    if enable_sleep_mode and is_visual_gen:
+        raise click.UsageError(
+            "--enable_sleep_mode is only supported by the HTTP "
+            "text-generation server.")
     # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
     # than leaving a launcher waiting forever on a file nobody writes.
     if report_addr and (grpc or is_visual_gen):

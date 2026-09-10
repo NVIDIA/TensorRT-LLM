@@ -163,6 +163,7 @@ l0_cpu:
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_report_addr.py
+  - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_utils.py
