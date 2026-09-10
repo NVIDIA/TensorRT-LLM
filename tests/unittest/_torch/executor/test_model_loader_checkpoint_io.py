@@ -16,6 +16,7 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckp
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
+    _checkpoint_startup_metadata,
     _construct_checkpoint_loader,
     _open_checkpoint_weight_session,
     _timed_checkpoint_weight_session,
@@ -23,6 +24,19 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_checkpoint_startup_metadata_describes_actual_loader() -> None:
+    checkpoint_loader = HfCheckpointLoader()
+
+    metadata = _checkpoint_startup_metadata(checkpoint_loader, "auto")
+
+    assert metadata == {
+        "checkpoint_loader_kind": "HfCheckpointLoader",
+        "checkpoint_weight_loader_kind": "HfWeightLoader",
+        "checkpoint_source_kind": "HF",
+        "load_format": "auto",
+    }
 
 
 @pytest.mark.parametrize("loader_cls", [MistralCheckpointLoader, MXCheckpointLoader])
