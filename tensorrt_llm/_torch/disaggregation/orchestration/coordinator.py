@@ -207,6 +207,7 @@ class DisaggTransferCoordinator:
         """Start async KV sends for finished context-only requests."""
         # Do not send more chunks after an in-flight cancellation.
         cancel_pending_ids = set(self._registry.canceled_request_ids())
+        bridge_enabled = getattr(self._transceiver, "_fp4_mla_bridge_enabled", False) is True
         for req in requests:
             if not req.is_context_only_request or req.is_finished_due_to_cancellation:
                 continue
@@ -230,6 +231,16 @@ class DisaggTransferCoordinator:
                 # the request toward completion.
                 self._transfers.start_transfer(req)
                 self._transceiver.respond_and_send_async(req)
+                # Bridge validation can reject before a transfer session exists.
+                # Release the claim right away: there is no physical accessor
+                # whose retirement the reap could poll.
+                if (
+                    bridge_enabled
+                    and req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                    and not self._transceiver.has_inflight_transfer(req)
+                ):
+                    self.release_transfer(req)
+                    continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
                     req.py_kv_transfer_start_time = time.monotonic()
             elif (

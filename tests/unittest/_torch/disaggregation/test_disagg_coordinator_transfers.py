@@ -172,6 +172,34 @@ def test_send_releases_the_index_slot_on_the_target_and_draft_kv_managers() -> N
     assert h.in_transfer(req)
 
 
+@pytest.mark.parametrize(
+    ("bridge_enabled", "has_inflight", "releases_claim"),
+    [(True, False, True), (True, True, False), (False, False, False)],
+)
+def test_bridge_rejection_releases_the_claim_only_without_a_physical_owner(
+    bridge_enabled: bool, has_inflight: bool, releases_claim: bool
+) -> None:
+    """The FP4 MLA bridge may reject a send before any transfer session exists.
+    Only then is there no physical accessor for the reap to poll, so the claim
+    is released on the spot; a rejection with a live session, or a failure
+    without the bridge, stays claimed until the reap and the error path."""
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    h.transceiver._fp4_mla_bridge_enabled = bridge_enabled
+    h.transceiver.has_inflight_transfer = lambda _req: has_inflight
+    h.transceiver.respond_and_send_async = lambda req: setattr(
+        req, "state", LlmRequestState.DISAGG_TRANS_ERROR
+    )
+    req = _Request(1)
+    h.active.append(req)
+
+    h.send(req)
+
+    assert h.in_transfer(req) is not releases_claim
+    assert (req.py_kv_transfer_start_time is None) is releases_claim
+    assert h.active == [req]
+    assert h.effects.terminated == []
+
+
 def test_send_skips_requests_that_must_not_send() -> None:
     """Cancelled, unfinished, user-cancel-pending and retired-session requests
     all stay out of the transfer manager and never reach the transceiver."""
