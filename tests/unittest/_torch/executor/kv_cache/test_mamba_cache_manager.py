@@ -69,6 +69,7 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.llm_utils import (
     _resolve_kv_cache_manager_v2_auto,
     _resolve_transceiver_runtime_auto,
+    apply_model_defaults_to_llm_args,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -786,6 +787,24 @@ def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
         _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+def test_qwen3_hybrid_default_batch_size_fits_live_recurrent_state():
+    """A hybrid default must keep the fixed recurrent state affordable.
+
+    Every resident sequence owns one fixed-size GDN state slot, so
+    ``_minimum_live_gpu_quota`` scales with ``max_batch_size`` alone. At the
+    generic default that floor exceeds the whole KV budget of an 80 GB card and
+    ``_build_cache_config`` rejects the run, so the family pins a smaller
+    default. (An explicit user value still wins the deep-merge; that is
+    ``apply_model_defaults_to_llm_args`` behaviour, covered in
+    ``test_llm_args.py::TestPyTorchBackendModelDefaults``.)
+    """
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
+
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+    apply_model_defaults_to_llm_args(llm_args, Qwen3NextForCausalLM.get_model_defaults(llm_args))
+    assert llm_args.max_batch_size < TorchLlmArgs.model_fields["max_batch_size"].default
 
 
 @pytest.mark.parametrize(

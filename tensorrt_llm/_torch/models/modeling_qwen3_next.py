@@ -1069,8 +1069,23 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Disable block reuse until a snapshot policy is configured."""
-        return {"kv_cache_config": {"enable_block_reuse": False}}
+        """Disable block reuse until a snapshot policy is configured, and cap
+        the resident-sequence count to a value a hybrid model can afford.
+
+        Every resident sequence owns one GDN conv+SSM state slot whose size is
+        fixed by the model geometry and independent of sequence length (~25 MiB
+        per slot for Qwen3.5-4B), so the generic ``max_batch_size`` default of
+        2048 reserves ~50 GiB of recurrent state before a single attention page
+        exists. That makes an out-of-the-box ``LLM(model=...)`` unloadable on
+        anything below an ~80 GB card. 256 is the concurrency the curated
+        Qwen3.5 serving config builds CUDA graphs for.
+        """
+        return {
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            },
+            "max_batch_size": 256,
+        }
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,

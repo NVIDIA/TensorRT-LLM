@@ -3895,8 +3895,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if minimum_live_quota > gpu_quota:
             raise ValueError(
                 "The V2 Mamba GPU cache quota is too small for live recurrent "
-                f"states and attention pages: got {gpu_quota} bytes, need at "
-                f"least {minimum_live_quota} bytes.")
+                f"states and attention pages: got {gpu_quota / GB:.2f} GiB, "
+                f"need at least {minimum_live_quota / GB:.2f} GiB for "
+                f"{self._max_resident_sequences()} resident sequences plus "
+                f"{self._num_reserved_dummy_slots} reserved slot(s). Each "
+                "resident sequence holds one fixed-size recurrent state, so "
+                "reduce max_batch_size, or raise free_gpu_memory_fraction / "
+                "max_gpu_total_bytes.")
         # _build_base_config already constructed every attention layer,
         # including dtype-specific scale and subclass-provided side buffers.
         # Preserve those configs and replace only the local Mamba layers.
