@@ -113,7 +113,7 @@ Currently `AutoQuantize` supports only `effective_bits` as the performance const
 
 #### 1. Quantize a model with ModelOpt
 
-Refer to [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/llm_autodeploy/README.md) for generating quantized model checkpoint.
+Refer to [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer/blob/0.39.0/examples/llm_autodeploy/README.md) for generating quantized model checkpoint.
 
 #### 2. Deploy the quantized model with AutoDeploy
 
