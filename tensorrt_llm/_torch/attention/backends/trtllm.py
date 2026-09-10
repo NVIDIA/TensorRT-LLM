@@ -50,6 +50,7 @@ from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
+_VARIABLE_WINDOW_SUPPORTED_SMS = frozenset((100, 103))
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -1730,6 +1731,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         tokens_per_block: Optional[int],
         use_paged_context_fmha: bool,
     ) -> bool:
+        if get_sm_version() not in _VARIABLE_WINDOW_SUPPORTED_SMS:
+            return False
         return torch.ops.trtllm.attention_supports_variable_window(
             dtype,
             self.num_heads,
