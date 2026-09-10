@@ -112,7 +112,9 @@ function configure_flashinfer_workspace {
     # processes from concurrent jobs cannot share FlashInfer's default workspace.
     if { [ "$tllm_mpi_size" -le 1 ] && [ -z "$PMI_RANK" ] && [ -z "$PMI_ID" ]; } || \
         [ "${TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS:-1}" = "0" ]; then
-        [ -n "$TRTLLM_CACHE_DIR" ] && export FLASHINFER_WORKSPACE_BASE="$workspace_root"
+        if [ -n "$TRTLLM_CACHE_DIR" ]; then
+            export FLASHINFER_WORKSPACE_BASE="$workspace_root"
+        fi
         return
     fi
 
