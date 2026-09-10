@@ -5324,21 +5324,26 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # to host when a competing request needs the slots, and on resume are
         # onboarded with their host page-index buffers RECONNECTED
         kv_cache_config = KvCacheConfig(
-            # Sized so the four concurrent requests contend: each alone fits, but
-            # the pool cannot hold all four at their decode peak, so the scheduler
-            # must preempt (ACTIVE->SUSPENDED, pages LOCKED->HELD) and resume.
+            # Sized so the twelve concurrent requests contend: each alone fits,
+            # but the pool cannot hold all twelve at their decode peak, so the
+            # scheduler must preempt (ACTIVE->SUSPENDED, pages LOCKED->HELD) and
+            # resume.
             #
             # NOTE: max_tokens is NOT the resulting pool size. The V2 manager
             # converts it to a byte quota and then inflates it by
             # 1 / max_util_for_resume -- see the _get_quota_from_max_tokens call
             # in tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and the
             # note in _util.py::_configure_helix_kv_cache_capacity. With 0.7
-            # below, the pool is sized for roughly 512/0.7 tokens. GPT-OSS is
-            # also a SWA model, so the token->byte rate is not uniform across
-            # layers. Whether any given pair of requests can co-reside is
-            # therefore NOT derivable from this knob -- read `pool_tokens` in the
-            # [I-10 sizing] diagnostic below instead.
-            max_tokens=512,
+            # below, the pool is sized for roughly 400/0.7 tokens. GPT-OSS is a
+            # VSWA model: half its layers slide (window 128) and half are full
+            # attention, so the token->byte rate is far from uniform and the pool
+            # holds several times more tokens than a full-attention model would
+            # for the same byte quota. That is exactly why twelve concurrent
+            # requests (not the historical four) are needed to overflow it.
+            # Whether any given set of requests can co-reside is therefore NOT
+            # derivable from this knob -- read `pool_tokens` in the [I-10 sizing]
+            # diagnostic below instead.
+            max_tokens=400,
             free_gpu_memory_fraction=0.5,
             # Refuse resume() once the hot tier is above this utilization, so a
             # suspended request genuinely defers before being recalled (V2-only).
@@ -5351,7 +5356,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
                   kv_cache_config=kv_cache_config,
-                  max_batch_size=8,
+                  max_batch_size=12,
                   max_seq_len=1024,
                   disable_overlap_scheduler=True,
                   enable_iter_perf_stats=True,
@@ -5360,7 +5365,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # Several distinct long prompts. Each alone fits the pool; together they
         # cannot all stay resident at their decode peak, which is what forces
         # suspend/resume. The contention comes from context + 128 decode across
-        # four requests plus the max_util_for_resume gate -- not from two bare
+        # twelve requests plus the max_util_for_resume gate -- not from two bare
         # contexts failing to co-reside (see the sizing note above).
         base = (
             "In large language model inference, the key-value cache stores the "
@@ -5370,10 +5375,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # context -- i.e. in the first KV pages, exactly the ones that go
         # LOCKED->HELD on suspend and are reconnected on resume. Recalling it
         # after a round trip is the KV-integrity signal (assertion (3) below).
-        # The needles also keep the four prompts genuinely distinct: a bare
+        # The needles also keep the twelve prompts genuinely distinct: a bare
         # "Alpha:"/"Beta:" prefix is ignored by the model, which made two
         # contended completions come back byte-identical.
-        needles = ("BANANA", "TRUMPET", "GLACIER", "VIOLIN")
+        needles = ("BANANA", "TRUMPET", "GLACIER", "VIOLIN", "COMPASS",
+                   "ORCHID", "LANTERN", "PYRAMID", "WALRUS", "MAGNET", "CACTUS",
+                   "HELMET")
         prompts = [
             f"Remember this code word: {n}. {base * 8}"
             f"Question: what was the code word? Answer in one word."
@@ -5443,23 +5450,26 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   f"ctx_lens={ctx_lens} decode={sampling.max_tokens} "
                   f"peak_per_request={peak_per_request} "
                   f"concurrent_peak={concurrent_peak}")
-            # Workload precondition: the pool cannot hold all four requests at
+            # Workload precondition: the pool cannot hold all twelve requests at
             # their decode peak, which is what forces the scheduler to preempt.
             # Checked against the *measured* pool, never against max_tokens --
             # the manager inflates that knob by 1 / max_util_for_resume, so a
             # config-derived bound is wrong by ~1.43x (see the sizing note on
-            # kv_cache_config). Observed on B200/H100 at 1588 vs 736, a ~2.2x
-            # margin; the deliberately weaker two-request form (794 vs 736) is
-            # only ~8% and too tight to gate CI on. Failing here means the
-            # workload stopped being contended, NOT that the KV path broke.
+            # kv_cache_config). Under VSWA the pool holds far more tokens per
+            # byte than a full-attention model, so it takes twelve requests to
+            # overflow it: observed on B200 at concurrent_peak ~4764 vs
+            # pool_tokens ~3328, a ~1.4x margin that reliably suspends/resumes a
+            # couple of in-flight requests. Failing here means the workload
+            # stopped being contended, NOT that the KV path broke.
             assert concurrent_peak > pool_tokens, (
                 f"workload precondition failed: the pool ({pool_tokens} tokens) "
                 f"can hold all {len(prompts)} requests at their decode peak "
                 f"({concurrent_peak} tokens), so nothing forces preemption -- "
                 f"retune max_tokens / prompt length; this is not a KV-path "
                 f"failure")
-            # Contended: all prompts in flight against a ~1-request pool, so the
-            # scheduler must suspend/resume (and may offload/onboard) to serve them.
+            # Contended: all prompts in flight against a pool too small to hold
+            # them all, so the scheduler must suspend/resume (and may
+            # offload/onboard) to serve them.
             # Bounded wait: a V2 scheduler deadlock (all requests suspended, none
             # resumable) would otherwise hang the test until the CI stage timeout,
             # with no diagnostics. TimeoutError here IS the deadlock signal.
