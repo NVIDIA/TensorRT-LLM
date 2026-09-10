@@ -1943,7 +1943,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_cuda_graph_warmup_reserves_one_generation_token(self):
+    def test_cuda_graph_warmup_request_split(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         resource_manager = Mock()
         resource_manager.get_resource_manager.side_effect = (
@@ -1965,9 +1965,18 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                                        max_seq_len=512)
 
         self.assertEqual(
+            kv_cache_manager.add_dummy_requests.call_args_list[0].args[0],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            kv_cache_manager.add_dummy_requests.call_args_list[1].
+            kwargs["request_ids"],
+            [3],
+        )
+        self.assertEqual(
             kv_cache_manager.add_dummy_requests.call_args_list[1].
             kwargs["token_nums"],
-            [99],
+            [100],
         )
         kv_cache_manager.shutdown()
 
