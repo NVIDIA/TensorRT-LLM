@@ -506,6 +506,127 @@ def test_generate_with_stop_words():
 
 @force_ampere
 @pytest.mark.part0
+@pytest.mark.parametrize("model_path", [
+    get_model_path(qwen3_tokenizer_model_name),
+])
+def test_generate_with_detokenization_stop_words(model_path):
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=global_kvcache_config,
+    )
+
+    # Format the prompt using chat template
+    messages = [{
+        "role": "user",
+        "content": "Say exactly: Hello there! How can I help"
+    }]
+
+    formatted_prompt = llm.tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False)
+
+    detokenization_prompts = [formatted_prompt]
+
+    # Test case 1: Stop word "How" should be detected after detokenization.
+    # Use an exact text match (rather than llm_check_output's fuzzy
+    # similarity check) to confirm the stop string is actually stripped from
+    # the output, not merely close enough to pass a SequenceMatcher ratio.
+    outputs = llm.generate(detokenization_prompts,
+                           sampling_params=SamplingParams(stop="How",
+                                                          max_tokens=10))
+    out = outputs[0].outputs[0]
+    assert out.finish_reason == 'stop'
+    assert out.stop_reason == "How"
+    assert out.text == "Hello there!", \
+        f"Stop string 'How' must not be retained in output text, got: {out.text!r}"
+
+    # Test case 2: Stop word "there" should be detected after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello"],
+                     sampling_params=SamplingParams(stop="there",
+                                                    max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["there"])
+
+    # Test case 3: Stop word that should not be found after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello there! How can I help"],
+                     sampling_params=SamplingParams(stop="XYZ", max_tokens=10),
+                     finish_reasons=['length'],
+                     stop_reasons=[None])
+
+    # Test case 4: Multiple stop words, one should be found after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello"],
+                     sampling_params=SamplingParams(stop=["XYZ", "there"],
+                                                    max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["there"])
+
+
+@force_ampere
+@pytest.mark.part0
+@pytest.mark.parametrize("model_path", [
+    get_model_path(qwen3_tokenizer_model_name),
+])
+def test_generate_with_detokenization_stop_words_streaming(model_path):
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=global_kvcache_config,
+    )
+
+    # Format the prompt using chat template
+    messages = [{
+        "role": "user",
+        "content": "Say exactly: Hello there! How can I help"
+    }]
+
+    formatted_prompt = llm.tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False)
+
+    sampling_params = SamplingParams(stop="How", max_tokens=10)
+
+    # NOTE: without tracking `found_stop` and asserting on it after the loop,
+    # this test can silently pass if generate_async yields no outputs at all
+    # or never reaches a terminal finish_reason.
+    found_stop = False
+    for output in llm.generate_async(formatted_prompt,
+                                     sampling_params=sampling_params,
+                                     streaming=True):
+        if output.outputs[0].finish_reason == 'stop':
+            assert output.outputs[0].stop_reason == "How"
+            found_stop = True
+            break
+        elif output.outputs[0].finish_reason == 'length':
+            assert False, f"Expected to find stop word 'How' but reached max_tokens. Generated: {output.outputs[0].text}"
+        elif output.outputs[0].finish_reason not in (None, ''):
+            assert False, f"Unexpected finish_reason: {output.outputs[0].finish_reason}"
+
+    assert found_stop, "Expected to observe finish_reason='stop' with stop_reason='How', but no such output was produced"
+
+    # Test case: unmatched stop string should not trigger early stopping
+    sampling_params_no_match = SamplingParams(stop="XYZ", max_tokens=10)
+    found_length = False
+    for output in llm.generate_async(formatted_prompt,
+                                     sampling_params=sampling_params_no_match,
+                                     streaming=True):
+        if output.outputs[0].finish_reason == 'length':
+            assert output.outputs[0].stop_reason is None
+            found_length = True
+            break
+        elif output.outputs[0].finish_reason not in (None, ''):
+            assert False, f"Unexpected finish_reason: {output.outputs[0].finish_reason}"
+
+    assert found_length, "Expected to observe finish_reason='length' with stop_reason=None, but no such output was produced"
+
+
+@force_ampere
+@pytest.mark.part0
 def test_generate_with_bad_words():
     llm = LLM(
         model=llama_model_path,
