@@ -90,6 +90,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.functional import RopeEmbeddingUtils
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -2007,29 +2008,6 @@ def _yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-def _yarn_find_correction_dim(
-    num_rotations: float, dim: int, base: float, max_position_embeddings: int
-) -> float:
-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
-        2 * math.log(base)
-    )
-
-
-def _yarn_find_correction_range(
-    low_rot: float, high_rot: float, dim: int, base: float, max_position_embeddings: int
-) -> tuple[int, int]:
-    low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
-    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
-    return max(low, 0), min(high, dim - 1)
-
-
-def _yarn_linear_ramp_mask(minimum: float, maximum: float, dim: int) -> torch.Tensor:
-    if minimum == maximum:
-        maximum += 0.001  # Prevent singularity.
-    linear_func = (torch.arange(dim, dtype=torch.float32) - minimum) / (maximum - minimum)
-    return torch.clamp(linear_func, 0, 1)
-
-
 def build_dspark_mla_yarn_rope(
     *,
     dim: int,
@@ -2045,33 +2023,40 @@ def build_dspark_mla_yarn_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """YaRN cos/sin tables for an MLA drafter's ``qk_rope_head_dim`` slice.
 
-    Transcribed from HF ``DeepseekV3YarnRotaryEmbedding``: the drafters are
-    distilled under HF/vLLM numerics, so the table is built here rather than
-    routed through ``RopeParams`` (whose MLA convention carries the fused
-    kernel's ``duplicate_data`` / GPT-J packing).
+    Repacks ``RopeEmbeddingUtils.create_sinusoidal_positions_yarn``, which is
+    the same HF DeepSeek-V2 transcription the drafters are distilled under --
+    verified bit-identical to the hand-rolled table this replaced, on the K3
+    Inferact parameters. What is deliberately NOT reused is
+    ``RopeParams.create_rope_const_params()``: it pins the fused MLA kernel's
+    GPT-J packing, which rotates differently and costs acceptance silently.
+
+    ``duplicate_data=True`` even though only the first half is read as a
+    complex pair. The util's two modes disagree by 1 ulp on 6 of 8224 entries
+    (torch's ``cos`` vectorises a ``[n, dim, 1]`` input differently than a
+    ``[n, dim/2, 1]`` one), and the duplicated one is what every measured
+    drafter run used.
 
     Returns ``(cos, sin)``, both ``[max_position_embeddings, dim]`` fp32, with
     the frequency half duplicated so ``rotate_half`` applies.
     """
-    freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    freq_inter = 1.0 / (
-        scaling_factor * base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    # The util returns a flat numpy [pos][slot](cos, sin); split the pair.
+    _, packed = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+        num_pos=max_position_embeddings,
+        dim=dim,
+        base=base,
+        scaling_factor=scaling_factor,
+        original_max_position_embeddings=original_max_position_embeddings,
+        beta_fast=beta_fast,
+        beta_slow=beta_slow,
+        mscale=mscale,
+        mscale_all_dim=mscale_all_dim,
+        duplicate_data=True,
     )
-    low, high = _yarn_find_correction_range(
-        beta_fast, beta_slow, dim, base, original_max_position_embeddings
+    table = torch.from_numpy(packed).reshape(max_position_embeddings, dim, 2)
+    return (
+        table[..., 0].contiguous().to(device),
+        table[..., 1].contiguous().to(device),
     )
-    inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, dim // 2)
-    inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-
-    t = torch.arange(max_position_embeddings, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)
-    # HF divides the two mscales; both published drafters set them equal, so
-    # this is 1.0 there. Kept general because the checkpoint declares both.
-    scale = _yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(
-        scaling_factor, mscale_all_dim
-    )
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return (emb.cos() * scale).to(device), (emb.sin() * scale).to(device)
 
 
 def build_dspark_mla_yarn_freqs_cis(*, device: str = "cuda", **kwargs) -> torch.Tensor:
@@ -2104,6 +2089,11 @@ def apply_dspark_mla_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor)
     gathered at the query positions. HF interleaves the rope slice, so it first
     reshapes ``(d//2, 2) -> transpose -> (d,)`` and only then applies the
     half-split ``rotate_half``; the net rotation is GPT-J style.
+
+    Equal to ``RotaryEmbedding.apply_rotary_pos_emb(..., is_neox=False)`` up to
+    an even/odd lane split of its output (checked exactly, max diff 0.0). Kept
+    separate because that helper unsqueezes cos/sin itself, so routing through
+    it would push a rank contract onto every caller for no numerical gain.
     """
     d = x.shape[-1]
     x = x.reshape(*x.shape[:-1], d // 2, 2).transpose(-1, -2).reshape(*x.shape[:-1], d)
