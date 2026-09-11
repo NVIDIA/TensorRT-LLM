@@ -2122,9 +2122,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 q_len_per_req=plan_params.q_len_per_req,
                 disable_split_kv=False,
             )
-            # Every captured FA2 decode schedule depends on page counts.
-            if (self.is_cuda_graph and self.num_contexts == 0
-                    and decode_wrapper._backend == 'fa2'):
+            # Every captured FA2 decode schedule depends on page counts. The
+            # wrapper is created with backend="auto" off Hopper, and
+            # flashinfer only resolves that to "fa2" on the tensor-core plan
+            # path; the plain decode plan leaves it as "auto".
+            if (self.is_cuda_graph
+                    and decode_wrapper._backend in ('fa2', 'auto')):
                 wrappers.fa2_plan_num_blocks = tuple(
                     self.num_blocks[self.num_contexts:])
             self._publish_decode_wrapper_kv_lens(decode_wrapper)

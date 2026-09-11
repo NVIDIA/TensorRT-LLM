@@ -1202,13 +1202,6 @@ class TestFlashInferAttention(unittest.TestCase):
         captured.prepare()
         self.assertIsNone(captured._vswa_layer_to_pool)
 
-        # Pin the backend under test independently of device auto-selection.
-        decode_builder = flashinfer_backend.flashinfer.BatchDecodeWithPagedKVCacheWrapper
-
-        def fa2_decode_wrapper(*args, **kwargs):
-            kwargs["backend"] = "fa2"
-            return decode_builder(*args, **kwargs)
-
         def run(metadata):
             # Gemma3 has distinct sliding/global plans with the same head geometry.
             return [
@@ -1221,20 +1214,25 @@ class TestFlashInferAttention(unittest.TestCase):
                 for layer, (q, k, v) in zip(layers, inputs)
             ]
 
-        with unittest.mock.patch.object(flashinfer_backend.flashinfer,
-                                        "BatchDecodeWithPagedKVCacheWrapper",
-                                        side_effect=fa2_decode_wrapper):
-            for _ in range(2):
-                run(eager)
-                run(captured)
+        # Use the production backend selection: "fa2" on Hopper, "auto"
+        # elsewhere. The plain (non-tensor-core) decode plan keeps "auto".
+        for _ in range(2):
+            run(eager)
+            run(captured)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             actual = run(captured)
         wrappers = captured._plan_params_to_wrappers
         self.assertEqual(len(wrappers), len(layers))
+        # 8 query heads: [4, 4] BF16 uses the plain FA2 decode kernel, while
+        # [2, 2] (GQA ratio 4) and FP8 KV use the tensor-core plan path.
+        expects_tensor_cores = fp8_kv or num_kv_heads[0] == 2
         for wrapper in wrappers.values():
-            self.assertEqual(wrapper.decode_wrapper._backend, "fa2")
+            self.assertIn(wrapper.decode_wrapper._backend, ("fa2", "auto"))
+            self.assertEqual(wrapper.decode_wrapper.use_tensor_cores,
+                             expects_tensor_cores)
+            self.assertIsNotNone(wrapper.fa2_plan_num_blocks)
         lengths = [page_size * (i + 1) for i in range(batch_size)]
         transitions = [
             # Change only page ownership while retaining the captured lengths.
