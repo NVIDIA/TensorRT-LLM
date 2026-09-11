@@ -909,7 +909,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe._mm_encoder_item_scheduling_enabled = False
     exe._pending_recompute_pause_ids = set()
 
-    # Rebalance state.  _uses_kv_manager_v2() reads the explicit flag first.
+    # Rebalance state uses the executor's global KV manager gate.
     exe._is_kv_manager_v2 = True
     exe._pp_rebalance_drain_iters = None
     exe.pp_multi_stream_sample = False
@@ -929,6 +929,9 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe.resource_manager = MagicMock()
     exe.wait_on_pp_send_handles = MagicMock()
     exe.kv_cache_transceiver = None
+    # Empty: the loop's idle recompute-pause progress hook must find nothing
+    # pending, so it never reaches the PP termination handler.
+    exe._pending_recompute_pause_ids = set()
 
     # Loop termination: the loop breaks when should_stop_processing goes true,
     # which is a property over these three.

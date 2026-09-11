@@ -57,6 +57,7 @@ def test_native_halo_conv_emits_local_output_without_strip(
 def test_unsafe_geometry_disables_local_output() -> None:
     """Assert fast-path selection only, not support for this stride-2 geometry."""
     conv = WanCausalConv3d(4, 4, 3, stride=(1, 1, 2), padding=1).float()
+    conv.supports_residual_fusion = True
     halo = WanCausalConvHalo(
         conv,
         chunk_dim=4,
@@ -66,3 +67,44 @@ def test_unsafe_geometry_disables_local_output() -> None:
     )
 
     assert halo._local_output_spatial_padding is None
+    assert not halo.supports_residual_fusion
+
+
+def test_local_output_halo_delegates_residual_fusion(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _ResidualConv(WanCausalConv3d):
+        supports_residual_fusion = True
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            cache_x: torch.Tensor | None = None,
+            *,
+            spatial_padding: tuple[int, int] | None = None,
+            residual: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            del cache_x
+            assert spatial_padding == (1, 0)
+            assert residual is not None
+            assert x.shape[-1] == residual.shape[-1] + 2
+            return residual
+
+    conv = _ResidualConv(4, 4, 3, padding=1).float()
+    halo = WanCausalConvHalo(
+        conv,
+        chunk_dim=4,
+        adj_groups=[mock.Mock(spec=torch.distributed.ProcessGroup)],
+        rank=0,
+        world_size=2,
+    )
+    x = torch.randn(1, 4, 3, 8, 8)
+    residual = torch.randn_like(x)
+    monkeypatch.setattr(
+        halo,
+        "_exchange_halos",
+        lambda tensor: torch.nn.functional.pad(tensor, (1, 1)),
+    )
+
+    output = halo(x, residual=residual)
+
+    assert halo.supports_residual_fusion
+    torch.testing.assert_close(output, residual)

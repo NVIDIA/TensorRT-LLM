@@ -134,6 +134,36 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     return spec_config._allow_separate_draft_kv_cache
 
 
+def draft_prompt_lookahead(spec_config) -> Optional[int]:
+    """Prompt tokens past position ``i`` that a one-model draft consumes at ``i``:
+    Eagle reads the shift-by-1 input ids, vanilla MTP chains ``D`` layers.
+
+    Read by the context-chunk tail token (``_prepare_context_input_ids``) and by a
+    separate draft pool's ``reuse_match_backoff``. ``None`` = span not established.
+    """
+    if spec_config is None:
+        return None
+    spec_mode = spec_config.spec_dec_mode
+    if not spec_mode.use_one_engine():
+        # Two-model drafting runs the draft as its own engine over its own
+        # request view, so nothing here is shifted against the target prompt.
+        return None
+    if spec_mode.is_mtp_vanilla():
+        # Known limitation: an internal chunk lacks target_hidden[i + k], so reuse
+        # can attach draft KV an unchunked prefill would not produce. Acceptance only.
+        return spec_config.max_draft_len
+    if spec_mode.is_eagle_one_model():
+        return 1
+    if spec_mode.is_pard():
+        # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
+        # its draft state at i is a function of tokens [0, i] like the target's.
+        return 0
+    # Unestablished elsewhere: DraftTargetOneModel likely shifts by 1 but is
+    # unvalidated; DFlash/DSpark build context draft K/V from projected target
+    # hidden states into worker-owned buffers, which block reuse cannot restore.
+    return None
+
+
 def prepare_attn_metadata_for_draft_replay(attn_metadata,
                                            draft_kv_cache_manager):
     """
@@ -301,6 +331,10 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
+    def is_eagle_one_model(self):
+        """Whether MTP-Eagle or EAGLE3 uses the unified one-model worker."""
+        return self.is_mtp_eagle_one_model() or self.is_eagle3_one_model()
 
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
@@ -1035,6 +1069,25 @@ class SpecMetadata:
                              device=self.draft_probs.device)
         self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
         self.draft_probs[slots, :draft_len, 0] = 1.0
+
+    def dp_num_tokens(self) -> int:
+        """Return the attention-DP token count for the current batch.
+
+        Some modes publish a count that differs from the scheduled
+        ``num_tokens`` (the draft-verification positions are excluded). Both
+        consumers read it from here so they cannot drift apart:
+        ``prepare()``, which rewrites ``self.num_tokens`` into this shape, and
+        the attention-DP allgather in ``model_engine``, which runs *before*
+        ``prepare()``. The allgathered value is what overrides
+        ``attn_metadata.all_rank_num_tokens`` on the step-0 draft forward,
+        which is why each mode's convention is load-bearing.
+
+        Contract: reads ``self.num_tokens`` and ``self.num_generations``, so
+        both must already be set for this batch, and it must be called before
+        ``prepare()`` rewrites ``num_tokens`` -- it is not idempotent for the
+        modes that subtract. The base metadata keeps the count as-is.
+        """
+        return self.num_tokens
 
     def prepare(self):
         """
@@ -2676,7 +2729,8 @@ class SpecWorkerBase(nn.Module, ABC):
     ):
         """
         Prepare context input IDs for draft model forward.
-        Shifts input IDs left by 1 and places the first accepted token at gather positions.
+        Shifts input IDs left by 1 (``draft_prompt_lookahead == 1``), leaving one
+        hole per request at the chunk's last position.
 
         Args:
             input_ids: Original input IDs tensor

@@ -376,6 +376,9 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
         ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32
+        generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
+        if generation_state_indices is None:
+            generation_state_indices = state_indices[num_prefills:]
 
         cores: List[torch.Tensor] = []
         if num_prefills > 0:
@@ -399,13 +402,11 @@ class KimiKDALinearAttention(nn.Module):
                     hidden_states[num_ctx_tokens:num_tokens],
                     conv_pool,
                     ssm_pool,
-                    state_indices[num_prefills:],
+                    generation_state_indices,
                     mamba_metadata,
                     layer_cache,
                     ssm_state_indices=(
-                        mamba_metadata.state_indices[num_prefills:batch_size]
-                        if self._use_indexed_ssm_pool
-                        else None
+                        generation_state_indices if self._use_indexed_ssm_pool else None
                     ),
                     output=output[num_ctx_tokens:num_tokens] if output is not None else None,
                 )
@@ -427,7 +428,7 @@ class KimiKDALinearAttention(nn.Module):
                     layer_cache,
                     conv_pool,
                     ssm_pool,
-                    state_indices[num_prefills:],
+                    generation_state_indices,
                     output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
                 )
                 if output is None:

@@ -1236,7 +1236,7 @@ class VilaModel(PreTrainedModel):
         self.llm.to(device=device, dtype=self.model_dtype)
 
         # Surface the in-vocab media token IDs (image, video, ...) to the
-        # model engine's ``_prepare_multimodal_indices``. ``init_llm`` populates
+        # ``runners.prepare_multimodal_indices``. ``init_llm`` populates
         # ``self.tokenizer.media_token_ids`` as ``{name: id}``.
         media_ids = list(self.tokenizer.media_token_ids.values())
         self._mm_token_ids = torch.tensor(media_ids, dtype=torch.int32)

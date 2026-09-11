@@ -20,7 +20,6 @@
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_vector.h>
 #include <nanobind/stl/chrono.h>
-#include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
@@ -50,12 +49,13 @@
 #include "tensorrt_llm/nanobind/testing/kvCacheManagerTestUtilBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
+#include "tensorrt_llm/nanobind/visual_gen/coordinatorWatchdog.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
@@ -134,6 +134,13 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
+
+    mInternal.def("start_coordinator_watchdog", &tensorrt_llm::nanobind::visual_gen::startCoordinatorWatchdog,
+        nb::arg("coordinator_pid"), "Terminate this process when its coordinator exits.");
+    mInternalTesting.def("start_coordinator_watchdog_with_pidfd_error",
+        &tensorrt_llm::nanobind::visual_gen::testing::startCoordinatorWatchdogWithPidfdError,
+        nb::arg("coordinator_pid"), nb::arg("pidfd_error_code"),
+        "Test coordinator supervision when pidfd_open returns an error.");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
@@ -388,33 +395,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     // That decoder is gone and LlmRequest now holds an executor::SamplingConfig directly, so
     // the name is kept as an alias to avoid breaking `from tensorrt_llm.bindings import SamplingConfig`.
     m.attr("SamplingConfig") = mExecutor.attr("SamplingConfig");
-
-    nb::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
-        .def(nb::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
-                 tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
-            nb::arg("name"), nb::arg("version"), nb::arg("precision"), nb::arg("tensor_parallelism"),
-            nb::arg("pipeline_parallelism"), nb::arg("context_parallelism"), nb::arg("gpus_per_node"),
-            nb::arg("model_config"), nb::arg("runtime_defaults") = nb::none())
-        .def_static("parse", nb::overload_cast<std::string const&>(&tr::GptJsonConfig::parse), nb::arg("json"))
-        .def_static(
-            "parse_file", nb::overload_cast<std::filesystem::path const&>(&tr::GptJsonConfig::parse), nb::arg("path"))
-        .def_prop_ro("model_config", &tr::GptJsonConfig::getModelConfig)
-        .def_prop_ro("name", &tr::GptJsonConfig::getName)
-        .def_prop_ro("version", &tr::GptJsonConfig::getVersion)
-        .def_prop_ro("precision", &tr::GptJsonConfig::getPrecision)
-        .def_prop_ro("tensor_parallelism", &tr::GptJsonConfig::getTensorParallelism)
-        .def_prop_ro("pipeline_parallelism", &tr::GptJsonConfig::getPipelineParallelism)
-        .def_prop_ro("context_parallelism", &tr::GptJsonConfig::getContextParallelism)
-        .def_prop_ro("gpus_per_node", &tr::GptJsonConfig::getGpusPerNode)
-        .def_prop_ro("world_size", &tr::GptJsonConfig::getWorldSize)
-        .def_prop_ro("runtime_defaults", &tr::GptJsonConfig::getRuntimeDefaults)
-        .def("engine_filename",
-            nb::overload_cast<tr::WorldConfig const&, std::string const&>(
-                &tr::GptJsonConfig::engineFilename, nb::const_),
-            nb::arg("world_config"), nb::arg("model"))
-        .def("engine_filename",
-            nb::overload_cast<tr::WorldConfig const&>(&tr::GptJsonConfig::engineFilename, nb::const_),
-            nb::arg("world_config"));
 
     nb::enum_<tb::LlmRequestState>(m, "LlmRequestState")
         .value("UNKNOWN", tb::LlmRequestState::kUNKNOWN)

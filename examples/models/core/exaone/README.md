@@ -394,7 +394,7 @@ Once all servers are running, you can send requests to `http://localhost:8000/v1
 
 ## TRT flow
 
-The next section describes how to convert weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use LLaMA's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE models and then build the model with `trtllm-build`.
+The next section describes how to convert weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use LLaMA's [convert_checkpoint.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/llama/convert_checkpoint.py) for EXAONE models and then build the model with `trtllm-build`.
 
 ### Convert checkpoint and build TensorRT engine(s)
 
@@ -534,7 +534,7 @@ trtllm-build \
 
 
 ### Run Engine
-Test your engine with the [run.py](../../../run.py) script:
+Test your engine with the [run.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/run.py) script:
 
 ```bash
 python3 ../../../run.py \
@@ -558,7 +558,7 @@ python ../../../summarize.py \
     --engine_dir trt_engines/exaone/fp16/1-gpu
 ```
 
-For more examples regarding EXAONE-3.0 & EXAONE-Deep's TRT flow, see [`examples/models/core/llama/README.md`](../llama/README.md)
+For more examples regarding EXAONE-3.0 & EXAONE-Deep's TRT flow, see [`examples/models/core/llama/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/llama/README.md)
 
 
 
