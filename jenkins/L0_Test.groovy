@@ -2970,6 +2970,66 @@ String getTestReuseStagePattern(String stageName) {
     return "${stageNamePrefix}-[0-9]+(-cbts)?"
 }
 
+def failMaintenanceStage(String stageName, String reason) {
+    GlobalState.maintenanceSkips.add(stageName)
+    echo "Skip - Resource maintenance is in progress. No test agent was launched."
+    echo "Skip reason: ${reason}"
+    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+        error "Stage '${stageName}' was not executed because of resource maintenance."
+    }
+}
+
+def warnUnmatchedMaintenancePatterns(Collection stageNames, List patterns) {
+    (patterns ?: []).findAll { pattern ->
+        !stageNames.any { stageName ->
+            stageMatchesPattern(stageName.toString(), pattern.toString())
+        }
+    }.each { pattern ->
+        echo "WARNING: Maintenance pattern '${pattern}' matched no selected stage in this job."
+    }
+}
+
+def escapeMaintenanceHtml(def value) {
+    return value.toString()
+        .replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+        .replace("'", '&#39;')
+        .replace('"', '&quot;')
+}
+
+def appendMaintenanceSummary(Map globalVars) {
+    try {
+        if (!GlobalState.maintenanceSkips) {
+            return
+        }
+
+        def parents = globalVars[ACTION_INFO]?.get('parents') ?: []
+        if (parents.size() < 2) {
+            echo "WARNING: No parent job found to append the maintenance summary."
+            return
+        }
+
+        def parentJob = parents[-2]
+        def buildLabel = "${escapeMaintenanceHtml(env.JOB_NAME)} #${escapeMaintenanceHtml(env.BUILD_NUMBER)}"
+        def buildUrl = escapeMaintenanceHtml(env.BUILD_URL)
+        def stages = GlobalState.maintenanceSkips.collect { stageName ->
+            "<b>${escapeMaintenanceHtml(stageName)}</b>"
+        }.unique().join('<br/>')
+        def reason = escapeMaintenanceHtml(globalVars[MAINTENANCE_ENTRIES].reason)
+        def summary = "<span data-maintenance-warning='true'>" +
+            "<b>Resource maintenance in <a href='${buildUrl}'>${buildLabel}</a>:</b> ${reason}<br/>" +
+            "<b>Affected stages:</b><br/>${stages}</span><br/>"
+        trtllm_utils.appendBuildDescription(
+            this, parentJob['name'], parentJob['build_number'], summary)
+        echo "Appended maintenance summary to parent build ${parentJob['name']} #${parentJob['build_number']}."
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "WARNING: Failed to append maintenance summary: ${e.toString()}"
+    }
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -3063,6 +3123,8 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3070,12 +3132,14 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
 ]
 
 class GlobalState {
     static def uploadResultStageNames = []
     static def stageAttemptEstimateMs = [:]
     static def stageAttemptEstimateDetails = [:]
+    static def maintenanceSkips = []
 
     // HOST_NODE_NAME to starting port section map
     // This map maintains the next available starting port for each host node
@@ -7063,6 +7127,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     echo "Check the passed GitLab bot testFilter parameters."
     def keysStr = parallelJobsFiltered.keySet().join(",\n")
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
+    def maintenanceConfig = globalVars[MAINTENANCE_ENTRIES] ?: [reason: "", patterns: []]
+    def maintenancePatterns = maintenanceConfig.patterns ?: []
+    warnUnmatchedMaintenancePatterns(
+        parallelJobsFiltered.keySet(), maintenancePatterns)
 
     // Per-stage execution scope for infra-scoped fail-fast (runBranchesWithInfraDefer).
     // A stage carrying opts.slurmDispatcher runs its work through a SLURM dispatcher
@@ -7078,6 +7146,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key in testFilter[REUSE_STAGE_LIST]) {
                 stage("Skip - Reused") {
                     echo "Skip - Passed in the previous pipelines."
+                }
+            } else if (stageMatchesAnyPattern(key, maintenancePatterns)) {
+                stage("Skip - Maintenance") {
+                    failMaintenanceStage(key, maintenanceConfig.reason)
                 }
             } else if (values instanceof List) {
                 // parallelJobs entries are either [podSpec, runner] or
@@ -7158,12 +7230,22 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     testConfigs = testConfigs.findAll { key, config ->
         return config.image != null
     }
+    def maintenanceConfig = globalVars[MAINTENANCE_ENTRIES] ?: [reason: "", patterns: []]
+    def maintenancePatterns = maintenanceConfig.patterns ?: []
+    warnUnmatchedMaintenancePatterns(
+        testConfigs.values()*.name, maintenancePatterns)
 
     echo "Filtered test configs with images:"
     println testConfigs
 
     def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
-        if (values.wheelInstalled) {
+        if (stageMatchesAnyPattern(values.name, maintenancePatterns)) {
+            stage(values.name) {
+                stage("Skip - Maintenance") {
+                    failMaintenanceStage(values.name, maintenanceConfig.reason)
+                }
+            }
+        } else if (values.wheelInstalled) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
@@ -7342,6 +7424,7 @@ pipeline {
                         } catch (Exception sweepErr) {
                             echo "[SLURM-FINALIZER] post-build sweep error: ${sweepErr}"
                         }
+                        appendMaintenanceSummary(globalVars)
                     }
                 }
             }
