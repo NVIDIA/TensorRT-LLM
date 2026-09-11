@@ -11,11 +11,9 @@ import transformers
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.quantization.mode import QuantMode
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
 def resolve_cache_transceiver_config(
@@ -326,20 +324,11 @@ def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
             and not is_hybrid_linear(model_config.pretrained_config))
 
 
-def has_fp4_kv_cache(quant_config: Optional["QuantConfig"]) -> bool:
-    """Check resolved KV quantization for integer modes and Python wrappers."""
-    if quant_config is None:
-        return False
-    quant_mode = quant_config.quant_mode
-    if isinstance(quant_mode, int):
-        quant_mode = QuantMode(quant_mode)
-    return quant_mode.has_fp4_kv_cache()
-
-
 def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
     """Use the resolved quantization, never the requested cache dtype."""
     quant_config = getattr(model_config, "quant_config", None)
-    return (has_fp4_kv_cache(quant_config)
+    return (quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
             and supports_fp4_mla_attention(model_config))
 
 
