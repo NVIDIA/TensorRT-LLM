@@ -176,10 +176,13 @@ class DefaultInputProcessor(InputProcessor):
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
         # Only when the tokenizer would be called exactly as the cache calls it.
+        # Same outer NVTX range as the plain path, so A/B traces aggregate by
+        # name; the nested range marks which path was taken.
         if (self._prefix_token_cache is not None
                 and not sampling_params.add_special_tokens
                 and sampling_params.truncate_prompt_tokens is None):
-            with nvtx_range_debug("tokenize prompt (prefix cache)"):
+            with nvtx_range_debug("tokenize prompt"), nvtx_range_debug(
+                    "prefix cache"):
                 return self._prefix_token_cache.encode(self.tokenizer,
                                                        inputs["prompt"]), None
         kwargs = {}
