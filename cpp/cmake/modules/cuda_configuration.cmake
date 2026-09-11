@@ -379,7 +379,7 @@ function(setup_cuda_architectures)
 
   # Compatibility low bounds: Always compile kernels for these architectures. 86
   # is enabled to avoid perf regression when using 80 kernels.
-  set(ARCHITECTURES_COMPATIBILITY_BASE 80 86 90 100 120)
+  set(ARCHITECTURES_COMPATIBILITY_BASE 80 86 90 100 107 120)
   # Exclude Tegra architectures
   set(ARCHITECTURES_NO_COMPATIBILITY 87 101)
 
