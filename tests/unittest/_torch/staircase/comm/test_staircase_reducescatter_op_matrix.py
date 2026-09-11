@@ -13,6 +13,7 @@ certifies the one call-order divergence that wedges instead of lying (it
 cannot be a normal test, because the job that runs it never reports).
 """
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.staircase.catalog.comm import _rank_job
@@ -20,5 +21,10 @@ from tensorrt_llm._torch.staircase.catalog.comm import _rank_job
 assert torch.cuda.is_available(), "reducescatter requires CUDA devices"
 
 
+# Each case starts its own 4-rank mpirun over every visible device. Under
+# xdist several workers would fight for the same GPUs, so this must run
+# alone -- the same reason the other collective entry in this repo
+# (_torch/thop/serial/test_moe_alltoall.py) carries the marker.
+@pytest.mark.no_xdist
 def test_reducescatter_op_matrix() -> None:
     _rank_job.run("reducescatter")
