@@ -120,19 +120,29 @@ def get_multi_processor_count_for_device(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def get_multi_ctas_kv_counter_size(
-    device: torch.device, num_heads: int, max_num_sequences: int
+def get_multi_ctas_kv_counter_size_for_sm_count(
+    num_heads: int, max_num_sequences: int, multi_processor_count: int
 ) -> int:
     """Bytes needed by the trtllm-gen multi-CTA KV counter semaphores.
 
     Sized by flashinfer, which owns the kernels that address this buffer, so the two
-    cannot drift.
+    cannot drift. Callers that already track an SM count -- DFlash and the MiniMax-M3
+    dense decode path -- use this directly; the FMHA libs go through the device-based
+    wrapper below.
     """
+    return get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        max_num_sequences, num_heads, multi_processor_count
+    )
+
+
+def get_multi_ctas_kv_counter_size(
+    device: torch.device, num_heads: int, max_num_sequences: int
+) -> int:
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    return get_trtllm_gen_multi_ctas_kv_counter_bytes(
-        max_num_sequences, num_heads, get_multi_processor_count_for_device(device_index)
+    return get_multi_ctas_kv_counter_size_for_sm_count(
+        num_heads, max_num_sequences, get_multi_processor_count_for_device(device_index)
     )
 
 

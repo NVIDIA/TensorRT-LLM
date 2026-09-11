@@ -782,17 +782,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             )
         )
 
-    def get_fp8_context_fmha(
-        self,
-        q: torch.Tensor,
-        output: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        is_gen_only: bool,
-    ) -> bool:
-        del q, metadata, is_gen_only
-        return self._use_fp8_context_fmha(output, forward_args.attention_input_type)
-
     def prepare_workspace(
         self,
         params: FmhaParams,
@@ -907,6 +896,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         rope_params = params.rope_params
         bmm1_scale_static = self._get_bmm1_scale(params.head_size, params.q_scaling)
         attention_chunk_size = self._get_attention_chunk_size(params.attention_chunk_size)
+        fp8_context_fmha = self._use_fp8_context_fmha(fwd.output, fwd.attention_input_type)
         (
             q_processed,
             kv_pool,
@@ -956,7 +946,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale_static,  # bmm1_scale
             1.0,  # bmm2_scale
             attention_chunk_size,  # attention_chunk_size
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             params.use_paged_context_fmha,  # paged_context_fmha
             params.is_mla_enable,  # is_mla_enable
             self._multi_processor_count,  # multi_processor_count
@@ -970,7 +960,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         has_fp4_kv = QuantMode(params.quant_mode).has_fp4_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or params.fp8_context_fmha:
+        if has_fp4_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * params.num_heads * params.head_size]
@@ -978,9 +968,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(params.num_tokens, params.num_heads, params.head_size)
             )
         ctx_bmm1_scale = bmm1_scale_static
-        if params.fp8_context_fmha and bmm1_scale is not None:
+        if fp8_context_fmha and bmm1_scale is not None:
             ctx_bmm1_scale = bmm1_scale.narrow(0, 0, 1)
-        ctx_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
+        ctx_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
         causal = (
             False
             if params.is_cross
@@ -1046,7 +1036,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             rope_params.max_positions,  # rotary_embedding_max_positions
             params.position_embedding_type,  # position_embedding_type
             bmm1_scale_static,  # bmm1_scale
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             params.use_paged_context_fmha,  # paged_context_fmha
             params.is_mla_enable,  # is_mla_enable
             attention_chunk_size,  # attention_chunk_size
@@ -1061,6 +1051,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         rope_params = params.rope_params
         bmm1_scale_static = self._get_bmm1_scale(params.head_size, params.q_scaling)
         attention_chunk_size = self._get_attention_chunk_size(params.attention_chunk_size)
+        fp8_context_fmha = self._use_fp8_context_fmha(fwd.output, fwd.attention_input_type)
         # Use the phase-local sequence count. Cross-attention CUDA graphs can pad
         # active rows beyond ``num_requests * beam_width``.
         batch_beam = params.num_seqs
@@ -1113,7 +1104,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.position_embedding_type,  # position_embedding_type
             bmm1_scale_static,  # bmm1_scale
             1.0,  # bmm2_scale
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             params.predicted_tokens_per_seq,  # predicted_tokens_per_seq
             attention_chunk_size,  # attention_chunk_size
             self._multi_processor_count,  # multi_processor_count
@@ -1130,7 +1121,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         has_fp4_kv = QuantMode(params.quant_mode).has_fp4_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or params.fp8_context_fmha:
+        if has_fp4_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * params.num_heads * params.head_size]
@@ -1138,9 +1129,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(params.num_tokens, params.num_heads, params.head_size)
             )
         gen_bmm1_scale = (
-            bmm1_scale if params.fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
+            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
-        gen_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
+        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,

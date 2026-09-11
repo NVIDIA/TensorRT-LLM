@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.quantization.mode import QuantMode
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True, frozen=True)
 class StaticAttentionConfig:
     """The attention-layer configuration used to build native kernel runners."""
 
@@ -149,7 +149,7 @@ class StaticAttentionConfig:
             use_kv_cache=use_kv_cache,
             paged_context_fmha=params.paged_context_fmha,
             position_embedding_type=params.position_embedding_type,
-            mask_type=params.mask_type,
+            mask_type=params.fwd.mask_type,
             q_scaling=params.q_scaling,
             rotary_embedding_dim=rotary_embedding_dim,
             attn_logit_softcapping_scale=params.attn_logit_softcapping_scale,
@@ -221,7 +221,6 @@ class FmhaParams:
     rope_params: RopeParams = None
     kv_pool: Optional[torch.Tensor] = None
     use_paged_context_fmha: bool = cpp_metadata(default=False)
-    fp8_context_fmha: bool = cpp_metadata(default=False)
     kv_factor: int = cpp_metadata(default=1)
     total_num_blocks: int = cpp_metadata(default=0)
     seq_offset: int = cpp_metadata(default=0)
@@ -452,7 +451,6 @@ def _populate_nested_thop_params(target: Any, source: FmhaParams) -> None:
     # Derived values: computed here rather than declared, so they have no field of
     # their own on either side.
     target.mask_type = forward_args.mask_type
-    target.beam_width = 1 if source.is_cross else source.beam_width
 
 
 class FmhaPhase(str, Enum):

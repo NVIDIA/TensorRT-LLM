@@ -73,16 +73,14 @@ def get_dflash_trtllm_gen_ops() -> DFlashTrtllmGenOps:
 
     import flashinfer
 
-    from ..attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_multi_ctas_kv_counter_size,
-        _get_workspace_size,
-    )
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import _get_workspace_size
+    from ..attention.backends.fmha.utils import get_multi_ctas_kv_counter_size_for_sm_count
 
     return DFlashTrtllmGenOps(
         append_paged_kv_cache=flashinfer.page.append_paged_kv_cache,
         batch_context_with_kv_cache=flashinfer.prefill.trtllm_batch_context_with_kv_cache,
         batch_decode_with_kv_cache=flashinfer.decode.trtllm_batch_decode_with_kv_cache,
-        get_multi_ctas_kv_counter_size=_get_multi_ctas_kv_counter_size,
+        get_multi_ctas_kv_counter_size=get_multi_ctas_kv_counter_size_for_sm_count,
         get_workspace_size=_get_workspace_size,
     )
 

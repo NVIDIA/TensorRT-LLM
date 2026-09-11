@@ -84,6 +84,8 @@ def make_fake_metadata(**overrides: object) -> SimpleNamespace:
         trtllm_gen_jit_warmup=False,
     )
     defaults.update(overrides)
+    if "effective_beam_width" not in overrides:
+        defaults["effective_beam_width"] = 1 if defaults["is_cross"] else defaults["beam_width"]
     return SimpleNamespace(**defaults)
 
 

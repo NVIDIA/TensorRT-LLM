@@ -1495,29 +1495,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: FmhaManager
-        # Owns this layer's native attention op. Built on first use rather than here:
+        # Owns this layer's native attention ops. Built on first use rather than here:
         # `__init__` can run under a meta device or before CUDA is ready, while
-        # initializing the op creates a cuBLAS handle and the FMHA kernel runners.
-        self._attention_op: Optional[thop.AttentionOp] = None
+        # initializing an op creates a cuBLAS handle and the FMHA kernel runners.
+        # A layer may legitimately use multiple static configurations, for example
+        # FULL and CAUSAL masks during chunked prefill.
+        self._attention_ops: dict[StaticAttentionConfig, thop.AttentionOp] = {}
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
     def attention_op(self, params: "FmhaParams") -> "thop.AttentionOp":
-        """This layer's native attention op, built on first use.
-
-        The op derives its head counts, parallel layout and MLA flags from the shape
-        below, which is fixed for a layer, so one op serves all of its calls;
-        `update_quant_config` and `release` cover the two moments that stops being
-        true. The shape is read off the first call's parameters rather than off this
-        object because the KV cache manager, not the layer, owns `tokens_per_block`.
-        """
-        if self._attention_op is None:
-            config = StaticAttentionConfig.from_params(
-                params,
-                skip_correction_threshold=self.skip_correction_threshold,
-            )
-            self._attention_op = thop.AttentionOp(config.to_thop_config())
-        return self._attention_op
+        """Return the native attention op for this call's static configuration."""
+        config = StaticAttentionConfig.from_params(
+            params,
+            skip_correction_threshold=self.skip_correction_threshold,
+        )
+        op = self._attention_ops.get(config)
+        if op is None:
+            op = thop.AttentionOp(config.to_thop_config())
+            self._attention_ops[config] = op
+        return op
 
     def release(self) -> None:
         """Drop the native op and the CUDA resources it owns.
@@ -1526,7 +1523,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kernel runners, and (for context parallelism) an NCCL communicator, none of
         which should be destroyed at interpreter exit, after CUDA has gone away.
         """
-        self._attention_op = None
+        self._attention_ops.clear()
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
