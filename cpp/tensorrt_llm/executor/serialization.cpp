@@ -824,8 +824,6 @@ size_t Serialization::serializedSize(ContextPhaseParams const& contextPhaseParam
 // Request
 Request Serialization::deserializeRequest(std::istream& is)
 {
-    // Serialization of Request with logitsPostProcessor is currently not supported.
-    // Dynamic logitsPostProcessor only supported with replicate=false or no tensor parallelism.
     auto inputTokenIds = su::deserialize<VecTokens>(is);
     auto maxNewTokens = su::deserialize<SizeType32>(is);
     auto streaming = su::deserialize<bool>(is);
@@ -842,7 +840,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto mRopeConfig = su::deserialize<std::optional<MropeConfig>>(is);
     auto loraConfig = su::deserialize<std::optional<LoraConfig>>(is);
     auto kvCacheRetentionConfig = su::deserialize<std::optional<KvCacheRetentionConfig>>(is);
-    auto logitsPostProcessorName = su::deserialize<std::optional<std::string>>(is);
     auto encoderInputTokenIds = su::deserialize<std::optional<VecTokens>>(is);
     auto clientId = su::deserialize<std::optional<IdType>>(is);
     auto returnAllGeneratedTokens = su::deserialize<bool>(is);
@@ -863,10 +860,10 @@ Request Serialization::deserializeRequest(std::istream& is)
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
-        std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::nullopt,
-        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
-        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
+        std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(encoderInputTokenIds), clientId,
+        returnAllGeneratedTokens, priority, requestType, std::move(contextPhaseParams), std::move(encoderInputFeatures),
+        encoderOutputLength, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId,
+        std::move(cacheSalt));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)

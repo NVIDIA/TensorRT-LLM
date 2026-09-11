@@ -571,15 +571,14 @@ void initRequestBindings(nb::module_& m)
             self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPositionIds(),
             self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getPromptTuningConfig(),
             self.getMultimodalInput(), self.getMultimodalEmbedding(), self.getMropeConfig(), self.getLoraConfig(),
-            self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(), self.getLogitsPostProcessor(),
-            self.getEncoderInputTokenIds(), self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(),
-            self.getRequestType(), self.getContextPhaseParams(), self.getEncoderInputFeatures(),
-            self.getEncoderOutputLength(), self.getGuidedDecodingParams(), self.getDisaggRequestId(),
-            self.getCacheSalt());
+            self.getKvCacheRetentionConfig(), self.getEncoderInputTokenIds(), self.getClientId(),
+            self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
+            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getGuidedDecodingParams(),
+            self.getDisaggRequestId(), self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 29)
+        if (state.size() != 27)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -605,14 +604,12 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::MultimodalInput>>(state[11]), nb::cast<std::optional<Tensor>>(state[12]),
             nb::cast<std::optional<tle::MropeConfig>>(state[13]), nb::cast<std::optional<tle::LoraConfig>>(state[14]),
             nb::cast<std::optional<tle::KvCacheRetentionConfig>>(state[15]),
-            nb::cast<std::optional<std::string>>(state[16]),
-            nb::cast<std::optional<tle::LogitsPostProcessor>>(state[17]), nb::cast<std::optional<VecTokens>>(state[18]),
-            nb::cast<std::optional<IdType>>(state[19]), nb::cast<bool>(state[20]),
-            nb::cast<tle::PriorityType>(state[21]), nb::cast<tle::RequestType>(state[22]),
-            nb::cast<std::optional<tle::ContextPhaseParams>>(state[23]),
-            nb::cast<std::optional<tle::Tensor>>(state[24]), nb::cast<std::optional<SizeType32>>(state[25]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[26]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[27]), nb::cast<std::optional<std::string>>(state[28]));
+            nb::cast<std::optional<VecTokens>>(state[16]), nb::cast<std::optional<IdType>>(state[17]),
+            nb::cast<bool>(state[18]), nb::cast<tle::PriorityType>(state[19]), nb::cast<tle::RequestType>(state[20]),
+            nb::cast<std::optional<tle::ContextPhaseParams>>(state[21]),
+            nb::cast<std::optional<tle::Tensor>>(state[22]), nb::cast<std::optional<SizeType32>>(state[23]),
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[24]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[25]), nb::cast<std::optional<std::string>>(state[26]));
     };
 
     // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
@@ -650,8 +647,6 @@ void initRequestBindings(nb::module_& m)
                 std::optional<tle::MultimodalInput> multimodal_input, std::optional<tle::Tensor> multimodal_embedding,
                 std::optional<tle::MropeConfig> mrope_config, std::optional<tle::LoraConfig> lora_config,
                 std::optional<tle::KvCacheRetentionConfig> kv_cache_retention_config,
-                std::optional<std::string> logits_post_processor_name,
-                std::optional<tle::LogitsPostProcessor> logits_post_processor,
                 std::optional<tle::VecTokens> encoder_input_token_ids, std::optional<tle::IdType> client_id,
                 bool return_all_generated_tokens, tle::PriorityType priority, tle::RequestType type,
                 std::optional<tle::ContextPhaseParams> context_phase_params,
@@ -665,8 +660,7 @@ void initRequestBindings(nb::module_& m)
                     output_config, end_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
                     std::move(embedding_bias), std::move(prompt_tuning_config), std::move(multimodal_input),
                     std::move(multimodal_embedding), std::move(mrope_config), std::move(lora_config),
-                    std::move(kv_cache_retention_config), std::move(logits_post_processor_name),
-                    std::move(logits_post_processor), std::move(encoder_input_token_ids), client_id,
+                    std::move(kv_cache_retention_config), std::move(encoder_input_token_ids), client_id,
                     return_all_generated_tokens, priority, type, std::move(context_phase_params),
                     std::move(encoder_input_features), encoder_output_length, std::move(guided_decoding_params),
                     language_adapter_uid, allotted_time_ms, disagg_request_id, std::move(cache_salt));
@@ -689,8 +683,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("mrope_config") = nb::none(),
         nb::arg("lora_config") = nb::none(),
         nb::arg("kv_cache_retention_config") = nb::none(),
-        nb::arg("logits_post_processor_name") = nb::none(),
-        nb::arg("logits_post_processor") = nb::none(),
         nb::arg("encoder_input_token_ids") = nb::none(),
         nb::arg("client_id") = nb::none(),
         nb::arg("return_all_generated_tokens") = false,
@@ -724,10 +716,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig)
         .def_prop_rw("kv_cache_retention_config", &tle::Request::getKvCacheRetentionConfig,
             &tle::Request::setKvCacheRetentionConfig)
-        .def_prop_rw("logits_post_processor_name", &tle::Request::getLogitsPostProcessorName,
-            &tle::Request::setLogitsPostProcessorName)
-        .def_prop_rw(
-            "logits_post_processor", &tle::Request::getLogitsPostProcessor, &tle::Request::setLogitsPostProcessor)
         .def_prop_rw(
             "encoder_input_token_ids", &tle::Request::getEncoderInputTokenIds, &tle::Request::setEncoderInputTokenIds)
         .def_prop_rw("client_id", &tle::Request::getClientId, &tle::Request::setClientId)
@@ -745,7 +733,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
-    request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
 
     nb::class_<tle::SpeculativeDecodingFastLogitsInfo>(m, "SpeculativeDecodingFastLogitsInfo")
         .def(nb::init<>())

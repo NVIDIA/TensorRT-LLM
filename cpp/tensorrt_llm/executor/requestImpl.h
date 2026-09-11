@@ -54,7 +54,6 @@ public:
         std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
         std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
         std::optional<LoraConfig> loraConfig, std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
-        std::optional<std::string> logitsPostProcessorName, std::optional<LogitsPostProcessor> logitsPostProcessor,
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
         PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
@@ -77,8 +76,6 @@ public:
         , mMropeConfig(std::move(mRopeConfig))
         , mLoraConfig(std::move(loraConfig))
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        , mLogitsPostProcessorName(std::move(logitsPostProcessorName))
-        , mLogitsPostProcessor(std::move(logitsPostProcessor))
         , mEncoderInputTokenIds(std::move(encoderInputTokenIds))
         , mClientId(clientId)
         , mReturnAllGeneratedTokens(returnAllGeneratedTokens)
@@ -104,17 +101,11 @@ public:
 
     void serialize(std::ostream& ostream) const
     {
-        // Dynamic logitsPostProcessor is only supported with replicate=false or no tensor parallelism.
-        TLLM_CHECK_WITH_INFO(!mLogitsPostProcessor.has_value(),
-            "Serialization of Request with logitsPostProcessor is currently not supported.");
         visitMembers([&ostream](auto const& member) { serialize_utils::serialize(member, ostream); });
     }
 
     [[nodiscard]] size_t serializedSize() const
     {
-        // Dynamic logitsPostProcessor is only supported with replicate=false or no tensor parallelism.
-        TLLM_CHECK_WITH_INFO(!mLogitsPostProcessor.has_value(),
-            "Serialization of Request with logitsPostProcessor is currently not supported.");
         size_t totalSize = 0;
         visitMembers([&totalSize](auto const& member) { totalSize += serialize_utils::serializedSize(member); });
         return totalSize;
@@ -203,16 +194,6 @@ public:
     [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const
     {
         return mKvCacheRetentionConfig;
-    }
-
-    [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const
-    {
-        return mLogitsPostProcessorName;
-    }
-
-    std::optional<LogitsPostProcessor> getLogitsPostProcessor() const
-    {
-        return mLogitsPostProcessor;
     }
 
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const
@@ -350,16 +331,6 @@ public:
         mKvCacheRetentionConfig = kvCacheRetentionConfig;
     }
 
-    void setLogitsPostProcessorName(std::string const& logitsPostProcessorName)
-    {
-        mLogitsPostProcessorName = logitsPostProcessorName;
-    }
-
-    void setLogitsPostProcessor(std::optional<LogitsPostProcessor> const& logitsPostProcessor)
-    {
-        mLogitsPostProcessor = logitsPostProcessor;
-    }
-
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds)
     {
         mEncoderInputTokenIds = encoderInputTokenIds;
@@ -431,11 +402,6 @@ private:
         TLLM_CHECK(!mInputTokenIds.empty());
         TLLM_CHECK(mMaxNewTokens > 0);
 
-        if (mLogitsPostProcessorName.has_value() && mLogitsPostProcessor.has_value())
-        {
-            TLLM_THROW("Only one of 'logitsPostProcessorName' and 'logitsPostProcessor' can be specified.");
-        }
-
         if (mGuidedDecodingParams.has_value() && mSamplingConfig.getBeamWidth() > 1)
         {
             TLLM_THROW("Guided decoding does not support with beam search.");
@@ -470,7 +436,6 @@ private:
         lambda(mMropeConfig);
         lambda(mLoraConfig);
         lambda(mKvCacheRetentionConfig);
-        lambda(mLogitsPostProcessorName);
         lambda(mEncoderInputTokenIds);
         lambda(mClientId);
         lambda(mReturnAllGeneratedTokens);
@@ -502,8 +467,6 @@ private:
     std::optional<MropeConfig> mMropeConfig;
     std::optional<LoraConfig> mLoraConfig;
     std::optional<KvCacheRetentionConfig> mKvCacheRetentionConfig;
-    std::optional<std::string> mLogitsPostProcessorName;
-    std::optional<LogitsPostProcessor> mLogitsPostProcessor;
     std::optional<VecTokens> mEncoderInputTokenIds;
     std::optional<IdType> mClientId;
     bool mReturnAllGeneratedTokens;

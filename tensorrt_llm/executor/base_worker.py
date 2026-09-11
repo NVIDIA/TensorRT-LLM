@@ -491,12 +491,6 @@ class BaseWorker(GenerationExecutor):
                 # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
                 multimodal_embedding=None,
                 mrope_config=None,
-                logits_post_processor_name=(
-                    tllm.Request.BATCHED_POST_PROCESSOR_NAME
-                    if request.sampling_params.apply_batched_logits_processor
-                    else None),
-                logits_post_processor=None if self._is_pytorch_backend else
-                request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 encoder_input_token_ids=request.encoder_input_token_ids,

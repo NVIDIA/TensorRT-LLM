@@ -155,9 +155,9 @@ TEST(RequestTest, serializeDeserialize)
         std::make_optional<std::vector<SizeType32>>({0, 1, 2, 3}), std::list<VecTokens>{{1, 2, 3}, {2, 3, 4}},
         std::nullopt, std::nullopt, PromptTuningConfig(embeddingTable, VecTokenExtraIds({1, 2, 3, 4})), std::nullopt,
         std::nullopt, std::nullopt, std::nullopt,
-        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 1, 10)}, 10), "Processor",
-        std::nullopt, std::nullopt, 1234, false, 0.5, RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt,
-        std::nullopt, std::nullopt, GuidedDecodingParams(GuidedDecodingParams::GuideType::kREGEX, "\\d+"));
+        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 1, 10)}, 10), std::nullopt, 1234,
+        false, 0.5, RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, std::nullopt, std::nullopt,
+        GuidedDecodingParams(GuidedDecodingParams::GuideType::kREGEX, "\\d+"));
 
     auto serializedSize = Serialization::serializedSize(request);
     std::ostringstream os;
@@ -174,9 +174,6 @@ TEST(RequestTest, serializeDeserialize)
     EXPECT_EQ(newRequest.getEndId(), request.getEndId());
     EXPECT_EQ(newRequest.getPositionIds(), request.getPositionIds());
     EXPECT_EQ(newRequest.getBadWords(), request.getBadWords());
-    EXPECT_TRUE(request.getLogitsPostProcessorName().has_value());
-    EXPECT_TRUE(newRequest.getLogitsPostProcessorName().has_value());
-    EXPECT_EQ(newRequest.getLogitsPostProcessorName().value(), request.getLogitsPostProcessorName().value());
     EXPECT_EQ(newRequest.getClientId(), request.getClientId());
     EXPECT_EQ(newRequest.getReturnAllGeneratedTokens(), request.getReturnAllGeneratedTokens());
     EXPECT_EQ(newRequest.getPriority(), request.getPriority());
