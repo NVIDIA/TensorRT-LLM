@@ -4,13 +4,13 @@
 
 In multi-turn agentic serving, each turn's prompt is usually the previous turn's
 prompt plus a small delta, yet the frontend re-tokenizes the whole prompt on
-every turn. On a GLM-5.2 disaggregated context server with ~38k-token prompts,
-tokenization accounted for 47.4% of context-server wall-clock at
-43.7 ms/request.
+every turn. With long prompts, this can make tokenization a significant share
+of the time a context server spends per request.
 
 The prefix-tokenization cache remembers the token ids of recent prompts. When a
 new prompt extends a cached one, it tokenizes only the tail and splices it onto
-the cached ids, bringing tokenization to 5.49 ms/request in the same setup.
+the cached ids, so the cost of a turn scales with the delta rather than the
+whole prompt.
 
 Tokenizing a tail in isolation is not generally identical to tokenizing the
 whole prompt, because BPE merges can straddle the split. The cache therefore
