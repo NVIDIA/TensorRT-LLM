@@ -321,9 +321,12 @@ CBTS defers to the existing filter chain when:
   YAML edit)
 - Combined scope is `None` (incompatible mix)
 - Tier 2 declines: a residual file is not core Python, is absent from the
-  touch DB, has an import-executed change (module / class body, signature or
-  decorator line), has no usable patch, has unparsable source, or has a closure
-  change with no wider row set (see `coverage_selection/SELECTION.md` §3-4)
+  touch DB, has an unbounded import-executed change (class body, signature,
+  decorator, or unsupported module statement), has no usable patch, has
+  unparsable source, or has a closure change with no wider row set. A small AST
+  allowlist maps literal bindings, newly added builtin imports, and plain
+  declarations to consumers/callers after a repository reference check (see
+  `coverage_selection/SELECTION.md` §3-4).
 - No touch DB artifact could be resolved — Tier 2 never runs
 - The resolved DB sits more than `--coverage-max-drift` commits from the PR's
   base commit, on either side, or an unmeasurable distance from it — Tier 2
