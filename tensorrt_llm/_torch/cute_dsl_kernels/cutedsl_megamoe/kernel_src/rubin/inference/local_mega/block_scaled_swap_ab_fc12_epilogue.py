@@ -66,6 +66,13 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.combine_format = problem_desc["combine_format"]
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
+        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
+        self.swiglu_beta = problem_desc.get("swiglu_beta")
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
+        if self.swiglu_alpha is not None:
+            self.swiglu_alpha = float(self.swiglu_alpha)
+            self.swiglu_beta = float(self.swiglu_beta)
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]

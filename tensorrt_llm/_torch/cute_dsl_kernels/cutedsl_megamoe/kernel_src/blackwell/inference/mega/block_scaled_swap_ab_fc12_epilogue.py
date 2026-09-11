@@ -1067,6 +1067,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
             "combine_format": CombineFormat,
             "gate_up_clamp": Optional[float],
+            "swiglu_alpha": OptionalRequirement(Optional[float]),
+            "swiglu_beta": OptionalRequirement(Optional[float]),
             # SiTU (Kimi K3) selects a different gated-activation core; optional so
             # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
             "situ_beta": OptionalRequirement(Optional[float]),
@@ -1113,6 +1115,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             raise ValueError(
                 "SiTU does not support gate_up_clamp; the two activation variants are exclusive."
             )
+        if problem_desc.get("swiglu_alpha") is not None:
+            raise ValueError("SiTU does not support SwiGLUBias constants.")
         return float(beta), float(linear_beta)
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1124,6 +1128,13 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.combine_format = problem_desc["combine_format"]
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
+        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
+        self.swiglu_beta = problem_desc.get("swiglu_beta")
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
+        if self.swiglu_alpha is not None:
+            self.swiglu_alpha = float(self.swiglu_alpha)
+            self.swiglu_beta = float(self.swiglu_beta)
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
@@ -1963,7 +1974,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         #        gate = min(gate, +limit)           (upper bound only)
         #        up   = clamp(up, -limit, +limit)   (symmetric)
         #   3. gated activation, either SwiGLU or SiTU (mutually exclusive; SiTU has no clamp):
-        #        SwiGLU: out = up * gate * sigmoid(gate)
+        #        SwiGLU: out = (up + swiglu_beta) * gate * sigmoid(swiglu_alpha * gate)
+        #                Standard SwiGLU uses swiglu_alpha=1 and swiglu_beta=0.
         #        SiTU:   out = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
         #                sigmoid(x) = rcp(1 + exp2(-x * log2e))
         #
@@ -1975,8 +1987,15 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         out = cute.make_rmem_tensor((n,), cutlass.Float32)
         log2_e = 1.4426950408889634
 
-        neg_log2e_pair = (cutlass.Float32(-log2_e), cutlass.Float32(-log2_e))
+        activation_alpha = 1.0 if self.swiglu_alpha is None else self.swiglu_alpha
+        neg_activation_alpha_log2e = -activation_alpha * log2_e
+        neg_log2e_pair = (
+            cutlass.Float32(neg_activation_alpha_log2e),
+            cutlass.Float32(neg_activation_alpha_log2e),
+        )
         one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+        if cutlass.const_expr(self.swiglu_beta is not None):
+            beta_pair = (cutlass.Float32(self.swiglu_beta), cutlass.Float32(self.swiglu_beta))
         if cutlass.const_expr(self.gate_up_clamp is not None):
             limit = cutlass.Float32(self.gate_up_clamp)
 
@@ -2052,7 +2071,9 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             sigmoid_pair = _sigmoid(g0, g1)
 
             if cutlass.const_expr(self.situ_beta is None):
-                # SwiGLU: out = up * gate * sigmoid(gate)
+                # The SwiGLUBias offset follows the up clamp.
+                if cutlass.const_expr(self.swiglu_beta is not None):
+                    u0, u1 = cute.arch.add_packed_f32x2((u0, u1), beta_pair)
                 ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
                 out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
             else:

@@ -70,6 +70,8 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             "a_major_mode": OperandMajorMode,
             "b_major_mode": OperandMajorMode,
             "gate_up_clamp": Optional[float],
+            "swiglu_alpha": OptionalRequirement(Optional[float]),
+            "swiglu_beta": OptionalRequirement(Optional[float]),
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
             "topk": int,
@@ -113,6 +115,8 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
         self.b_major_mode = problem_desc["b_major_mode"]
         self.combine_format = CombineFormat.parse("bf16")
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
+        self.swiglu_alpha = problem_desc.get("swiglu_alpha")
+        self.swiglu_beta = problem_desc.get("swiglu_beta")
         self.situ_beta = problem_desc.get("situ_beta")
         self.situ_linear_beta = problem_desc.get("situ_linear_beta")
         self.topk = problem_desc["topk"]
@@ -426,6 +430,7 @@ class BlockScaledSwapAbLocalMegaMoeKernel(KernelClass):
             f"fc1epiflag{self.fc1_epi_flag_batch}_clusters{self.launch_cluster_count}_"
             f"routingflag{self.routing_flag_batch}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
+            f"swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}_"
             # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"

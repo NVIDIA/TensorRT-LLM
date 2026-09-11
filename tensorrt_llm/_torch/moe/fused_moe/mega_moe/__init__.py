@@ -22,10 +22,10 @@ Two backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
   call sites that predate the identity.
   ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the DG-native weight tensors,
   scale conversion, and DeepGEMM weight transform.
-* :class:`MegaMoECuteDsl` — CuteDSL ``Sm100MegaMoEKernel`` fused dispatch +
-  FC1 + activation + FC2 + combine kernel for NVFP4 weights. The kernel and
+* :class:`MegaMoECuteDsl` — architecture-dispatched CuteDSL fused dispatch +
+  FC1 + activation + FC2 + combine kernels for NVFP4 weights. The kernel and
   helper sources are ported into
-  ``tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4``;
+  ``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``;
   ``NVFP4MegaMoECuteDslMethod`` owns the NVFP4 weight tensors, MegaMoE-format
   derived buffers, and per-expert scale tensors consumed by the kernel ABI.
 """
