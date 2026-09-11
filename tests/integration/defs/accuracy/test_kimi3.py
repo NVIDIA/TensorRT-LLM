@@ -34,6 +34,7 @@ from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import (
     GSM8K,
     ForceTokenLogitsProcessor,
+    GPQADiamond,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length_for_llm,
     assert_guided_decoding_regex,
@@ -56,12 +57,45 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # schedule these tests on B300; that exclusion is enforced by QA's
     # platform selection, not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
-    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa", "dspark"])
-    def test_w4a16_mxfp4(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize(
+        "mode,task_cls,max_seq_len,sampling_params",
+        [
+            *[
+                pytest.param(
+                    mode,
+                    GSM8K,
+                    8192,
+                    None,
+                    id=mode,
+                )
+                for mode in ("baseline", "reuse", "sa", "dspark")
+            ],
+            pytest.param(
+                "baseline",
+                GPQADiamond,
+                GPQADiamond.MAX_INPUT_LEN + 32_768,
+                SamplingParams(
+                    max_tokens=32_768,
+                    truncate_prompt_tokens=GPQADiamond.MAX_INPUT_LEN,
+                ),
+                id="gpqa",
+            ),
+        ],
+    )
+    def test_w4a16_mxfp4(
+        self,
+        mode: str,
+        task_cls: type[GSM8K] | type[GPQADiamond],
+        max_seq_len: int,
+        sampling_params: SamplingParams | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Verify Kimi K3 accuracy and its key model-feature matrix entries.
 
-        The three modes retain the existing full-GSM8K coverage. The baseline
-        mode also exercises attention DP, the overlap scheduler, CUDA graphs,
+        The four existing modes retain full-GSM8K coverage. The GPQA case
+        evaluates GPQA Diamond with a 32,768-token output budget and expected
+        accuracy of 90.404%, using the baseline mode. The baseline mode also
+        exercises attention DP, the overlap scheduler, CUDA graphs,
         chunked prefill, Torch sampling, a logits processor, and guided
         decoding. The reuse mode requires an observed hybrid-cache hit. The SA
         and DSpark modes also guard acceptance length for the two speculative
@@ -85,7 +119,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_attention_dp=True,
             max_batch_size=32,
             max_num_tokens=8192,
-            max_seq_len=8192,
+            max_seq_len=max_seq_len,
             trust_remote_code=True,
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
@@ -105,7 +139,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             # snapshot boundaries; without a snapshot cadence, block reuse
             # silently never engages.
             kv_cache_kwargs["mamba_state_config"] = MambaStateConfig(periodic_snapshot_interval=256)
-        else:
+        elif mode in ("sa", "dspark"):
             llm_kwargs.update(
                 max_batch_size=8,
                 disable_overlap_scheduler=True,
@@ -146,8 +180,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             elif mode == "reuse":
                 self._assert_kv_cache_reuse(llm)
 
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task = task_cls(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
             if mode in ("sa", "dspark"):
                 assert_acceptance_length_for_llm(
                     f"TestKimiK3::test_w4a16_mxfp4[{mode}]",
