@@ -479,6 +479,14 @@ def test_collect_llm_api_config_caps_sequences_recursively_and_flags_truncation(
     assert len(config["outer"]) == cap
     assert meta["sequence_truncated"] is True
 
+    exact = list(range(cap))
+    exact_outer = [[0, 1] for _ in range(cap)]
+    config, meta = _loads_payloads(
+        _SequenceConfig(flat=exact, inner=[exact], outer=exact_outer)
+    )
+    assert config == {"flat": exact, "inner": [exact], "outer": exact_outer}
+    assert meta["sequence_truncated"] is False
+
     config, meta = _loads_payloads(
         _SequenceConfig(flat=[1, 2, 3], inner=[[1], [2]], outer=[[0, 1]])
     )
