@@ -18,5 +18,4 @@
 add_subdirectory(fmha)
 add_subdirectory(gemm)
 add_subdirectory(batchedGemm)
-add_subdirectory(blockScaleMoe)
 add_subdirectory(gemmGatedAct)

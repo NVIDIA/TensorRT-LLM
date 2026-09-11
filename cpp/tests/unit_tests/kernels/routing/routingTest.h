@@ -18,7 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
+#include "tensorrt_llm/kernels/moe/trtllmGen/runner.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"

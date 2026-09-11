@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/routing/RoutingCustomSelection.h"
+#include "tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingCustomSelection.h"
 #include "tests/unit_tests/kernels/routing/routingTest.h"
 
 #include <vector>
