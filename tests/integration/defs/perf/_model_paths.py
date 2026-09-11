@@ -71,6 +71,7 @@ MODEL_PATH_DICT = {
     "qwen3.8_flash_next_fp4_mtp": "Inferact-Qwen3.8-Flash-Next-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
+    "deepseek_v4_pro_base_fp8": "DeepSeek-V4-Pro-Base",
     "deepseek_v4_flash": "DeepSeek-V4-Flash",
     "deepseek_v4_flash_base_fp8": "DeepSeek-V4-Flash-Base",
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
