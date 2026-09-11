@@ -204,12 +204,19 @@ def apply_coverage_tier(
     if cov.no_data_funcs:
         shown = ", ".join(cov.no_data_funcs[:3])
         more = f" (+{len(cov.no_data_funcs) - 3})" if len(cov.no_data_funcs) > 3 else ""
+        caller_bounded = set(cov.caller_bounded_funcs)
+        fallback_count = len(set(cov.no_data_funcs) - caller_bounded)
         bound = {
             "file": "bounded to each file's whole test set",
             "importers": "bounded via importers",
             "ignore": "NOT bounded",
         }[no_data_policy]
-        nd = f"; new/uncovered function(s), {bound}: {shown}{more}"
+        bounds: list[str] = []
+        if caller_bounded:
+            bounds.append(f"{len(caller_bounded)} bounded via local callers")
+        if fallback_count:
+            bounds.append(f"{fallback_count} {bound}")
+        nd = f"; new/uncovered function(s), {', '.join(bounds)}: {shown}{more}"
 
     known = db.known_by_family()
     untrusted = selector.untrusted_families()
@@ -253,6 +260,11 @@ def apply_coverage_tier(
             "no_data_policy": no_data_policy,
             "no_diff_files": len(cov.no_diff_files),
             **({"no_data_funcs": list(cov.no_data_funcs)} if cov.no_data_funcs else {}),
+            **(
+                {"caller_bounded_funcs": list(cov.caller_bounded_funcs)}
+                if cov.caller_bounded_funcs
+                else {}
+            ),
         },
     )
     return result, result.reason

@@ -59,6 +59,7 @@ from rules.tests_def_rule import (  # noqa: E402
     _yaml_top_keys_from_deletions,
 )
 from rules.tests_def_rule import TestsDefRule as CbtsTestsDefRule  # noqa: E402
+from selector import CoverageSelector  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -566,6 +567,111 @@ def test_function_alias_marks_caller_graph_incomplete() -> None:
     assert analysis.binding_consumers == {"helper"}
     assert analysis.callers == {}
     assert analysis.callable_escapes == {"helper"}
+
+
+class _FakeDB:
+    def __init__(self) -> None:
+        self.rows = {
+            "helper": set(),
+            "caller": {"A10-PyTorch-1/test_caller"},
+        }
+
+    def file_has_touch_rows(self, _path: str) -> bool:
+        return True
+
+    def tests_touching_func(self, _path: str, qualname: str) -> set[str]:
+        return set(self.rows.get(qualname, set()))
+
+    def tests_touching_file(self, _path: str) -> set[str]:
+        return {
+            "A10-PyTorch-1/test_caller",
+            "A10-PyTorch-1/test_unrelated",
+        }
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+
+    def untrusted_tests(self, *_args) -> set[str]:
+        return set()
+
+
+def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 521\n\ndef helper():\n    return VALUE\n\ndef caller():\n    return helper()\n"
+    )
+    diff = "@@ -0,0 +1 @@\n+VALUE = 521\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+    assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
+    assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+def test_selector_declines_when_changed_binding_has_external_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 521\n\ndef helper():\n    return VALUE\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, names: names & {"VALUE"},
+    )
+
+    result = selector.decide([path], {path: "@@ -0,0 +1 @@\n+VALUE = 521\n"})
+
+    assert not result.ok
+    assert "external binding reference(s)" in result.reason
+
+
+def test_selector_uses_file_fallback_when_consumer_escapes() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 521\n\n"
+        "def helper():\n"
+        "    return VALUE\n\n"
+        "def caller():\n"
+        "    alias = helper\n"
+        "    return alias()\n"
+    )
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -0,0 +1 @@\n+VALUE = 521\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+    assert result.caller_bounded_funcs == []
+
+
+def test_ordinary_no_data_function_change_keeps_file_fallback() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "def helper():\n    return 2\n\ndef caller():\n    return helper()\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -2 +2 @@\n-    return 1\n+    return 2\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+    assert result.caller_bounded_funcs == []
 
 
 @pytest.fixture()
