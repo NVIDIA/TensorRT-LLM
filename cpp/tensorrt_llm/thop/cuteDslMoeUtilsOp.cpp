@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/moe/cuteDsl/moeUtils.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
+#include "tensorrt_llm/kernels/moe/trtllmGen/runner.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <cuda_fp4.h>

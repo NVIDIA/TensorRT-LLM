@@ -19,6 +19,7 @@
 # everything else here (communication/, loadBalance/, routing/, utils/) compiles
 # into kernels_src, exactly as it did before the move.
 add_subdirectory(cuteDsl) # cute_dsl_src
+add_subdirectory(trtllmGen) # trtllm_gen_fp8_block_scale_moe{,_routing}
 # cutlass/: moe_gemm_src and its per-arch OBJECT libraries are defined in
 # ../cutlass_kernels/CMakeLists.txt, next to the CUTLASS instantiation generator
 # they depend on.
