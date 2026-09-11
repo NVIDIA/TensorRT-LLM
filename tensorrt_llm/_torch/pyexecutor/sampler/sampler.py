@@ -84,6 +84,7 @@ from .sampler_features import (
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
+    meet_stop_token_criteria,
     scatter_new_tokens,
 )
 from .sampler_strategy import (
@@ -1739,7 +1740,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or request.max_beam_num_tokens >= self.max_seq_len
             ):
                 request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
-            elif request.py_stop_words_list and new_token in request.py_stop_words_list[0]:
+            elif meet_stop_token_criteria(request, new_token, DEFAULT_BEAM_IDX):
                 request.finish_by(FinishReason.STOP_WORDS, DEFAULT_BEAM_IDX)
             request.py_num_accepted_draft_tokens = 0
             request.py_rewind_len = 0
