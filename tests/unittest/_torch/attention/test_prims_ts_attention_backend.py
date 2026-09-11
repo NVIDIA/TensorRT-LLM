@@ -15,6 +15,9 @@
 
 import functools
 import inspect
+import math
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -342,6 +345,193 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     )
 
     run_case(case)
+
+
+@pytest.mark.parametrize("num_heads", [6, 12, 96])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+def test_prims_ts_fp8_mla_preprocessing(
+    monkeypatch: pytest.MonkeyPatch, num_heads: int, use_kv_cache_manager_v2: bool
+) -> None:
+    from test_attention_mla import RopeConfig, _run_test_for_backend
+
+    from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+    # Context remains on the regular backend; every decode must select PrimTS.
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts,fallback")
+    original_run = PrimsTSFmha.run_mla_generation
+    calls = []
+
+    def run_and_capture(fmha: PrimsTSFmha, params: FmhaParams) -> None:
+        assert params.qkv_input.dtype == torch.bfloat16
+        assert params.fwd.quant_q_buffer.dtype == torch.uint8
+        original_run(fmha, params)
+        eager = params.context_buf.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            original_run(fmha, params)
+        params.context_buf.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(params.context_buf, eager, atol=0, rtol=0)
+        calls.append(params.attn.local_layer_idx)
+
+    monkeypatch.setattr(PrimsTSFmha, "run_mla_generation", run_and_capture)
+    _run_test_for_backend(
+        backend_name="TRTLLM",
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        num_layers=2,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        rope_config=RopeConfig(
+            num_attention_heads=num_heads,
+            max_position_embeddings=4096,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 40.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 4096,
+                "type": "yarn",
+            },
+        ),
+        kv_cache_tokens_per_block=32,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        context_sequence_lengths=[129, 191],
+        generation_seq_len_q=1,
+        num_generation_steps=2,
+        v2_kv_cache=use_kv_cache_manager_v2,
+    )
+    assert calls == [0, 1, 0, 1]
+
+
+@pytest.mark.parametrize("num_heads", [6, 12, 96])
+@pytest.mark.parametrize("batch_size", [2, 65])
+def test_prims_ts_fp8_mla_scales_and_graph_replay(
+    monkeypatch: pytest.MonkeyPatch, num_heads: int, batch_size: int
+) -> None:
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts as prims_ts_module
+    from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm.quantization.mode import QuantMode
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    attn = Mock(
+        is_mla_enable=True,
+        num_heads=num_heads,
+        num_kv_heads=1,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        head_dim=576,
+        v_head_dim=128,
+        local_layer_idx=0,
+        quant_mode=QuantMode.FP8_KV_CACHE,
+        q_scaling=1.0,
+    )
+    fmha = PrimsTSFmha(attn)
+    query = torch.randn(batch_size, num_heads, 576, device=device).to(torch.float8_e4m3fn)
+    kv_cache = torch.randn(batch_size * 2, 1, 32, 576, device=device).to(torch.float8_e4m3fn)
+    block_tables = torch.zeros((batch_size, 2, 4), dtype=torch.int32, device=device)
+    block_tables[:, 0, :2] = torch.arange(batch_size * 2, device=device).view(batch_size, 2)
+    seq_lens = torch.full((batch_size,), 33, dtype=torch.int32, device=device)
+    output = torch.empty((batch_size, num_heads * 512), dtype=torch.bfloat16, device=device)
+    # Deliberately use different, non-unit scales. BMM1[1] is log2-scaled and
+    # must not be passed to PrimTS; BMM2 must scale V independently of QK.
+    bmm1_scale, bmm2_scale = 0.025, 1.75
+    fwd = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        attention_window_size=128,
+        output=output,
+        quant_q_buffer=query.view(torch.uint8),
+        mla_bmm1_scale=torch.tensor([bmm1_scale, bmm1_scale * math.log2(math.e)], device=device),
+        mla_bmm2_scale=torch.tensor([bmm2_scale], device=device),
+    )
+    metadata = SimpleNamespace(
+        host_kv_cache_pool_pointers=None,
+        host_kv_cache_pool_mapping=None,
+        kv_cache_block_offsets=block_tables,
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_generations=batch_size,
+        tokens_per_block=32,
+    )
+    # Pool ownership/indexing is covered by the real v1/v2 preprocessing test.
+    monkeypatch.setattr(
+        prims_ts_module.thop,
+        "build_trtllm_gen_kv_cache_metadata",
+        lambda *args: (kv_cache, block_tables, None),
+    )
+    # Poison the BF16 input: the adapter must consume the preprocessing bytes.
+    q = torch.full((batch_size, num_heads * 576), float("nan"), dtype=torch.bfloat16, device=device)
+    workspace = torch.empty(0, dtype=torch.uint8, device=device)
+    fmha.prepare_workspace(q, None, None, metadata, fwd, workspace)
+    params = FmhaParams(
+        attn=attn,
+        meta=metadata,
+        fwd=fwd,
+        workspace=workspace,
+        qkv_input=q,
+        context_buf=output,
+        sequence_lengths=seq_lens,
+        input_seq_length=1,
+        num_tokens=batch_size,
+        batch_size=batch_size,
+        num_requests=batch_size,
+        tokens_per_block=32,
+        kv_factor=1,
+        total_num_blocks=batch_size * 2,
+    )
+
+    def check_output() -> None:
+        pages = kv_cache[:, 0].float()[block_tables[:, 0, :2].long()].reshape(batch_size, 64, 576)
+        scores = torch.einsum("bhd,bkd->bhk", query.float(), pages) * bmm1_scale
+        invalid = torch.arange(64, device=device)[None, :] >= seq_lens[:, None]
+        scores.masked_fill_(invalid[:, None, :], float("-inf"))
+        ideal = torch.einsum("bhk,bkd->bhd", scores.softmax(-1), pages[..., :512]) * bmm2_scale
+        # This case fits one KV tile. FP8 MLA rounds the unnormalized P tile
+        # (scaled to E4M3's maximum 448) before PV, but keeps its sum in FP32.
+        # Model that intermediate rounding for the elementwise comparison.
+        probabilities = (scores - scores.amax(dim=-1, keepdim=True)).exp() * 448.0
+        rounded_p = probabilities.to(torch.float8_e4m3fn).float()
+        expected = (
+            torch.einsum("bhk,bkd->bhd", rounded_p, pages[..., :512])
+            / probabilities.sum(dim=-1, keepdim=True)
+            * bmm2_scale
+        )
+        torch.testing.assert_close(
+            output, expected.reshape_as(output).to(output.dtype), atol=2e-2, rtol=2e-2
+        )
+        # Also bound aggregate error against full-precision attention so the
+        # low-precision oracle does not hide a large numerical regression.
+        relative_error = (output.float().view_as(ideal) - ideal).norm() / ideal.norm()
+        assert relative_error.item() < 0.04
+
+    fmha.run_mla_generation(params)
+    check_output()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fmha.run_mla_generation(params)
+    # New query bytes and page-table/length contents must be read on replay.
+    query.view(torch.uint8).copy_(query.view(torch.uint8).flip(0))
+    block_tables[:, 0, :2].copy_(block_tables[:, 0, :2].flip(0))
+    seq_lens.add_(7)
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    check_output()
 
 
 def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
