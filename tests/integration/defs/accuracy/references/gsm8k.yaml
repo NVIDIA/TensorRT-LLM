@@ -498,16 +498,6 @@ nvidia/Nemotron-3.5-Lightning:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 84.42
-MiniMaxAI/MiniMax-M2:
-  - accuracy: 89.045
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 93.75
-  - quant_algo: FP8_BLOCK_SCALES
-    extra_acc_spec: tp_attn
-    accuracy: 92.0
-MiniMaxAI/MiniMax-M2.5:
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 93.75
 # MiniMax-M3 text decoder (block-sparse MoE) GSM8K, full 1319-sample split.
 # Thresholds tracked per checkpoint / quantization scheme.
 MiniMaxAI/MiniMax-M3:
