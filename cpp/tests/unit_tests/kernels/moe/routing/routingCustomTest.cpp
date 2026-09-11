@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingCustomSelection.h"
-#include "tests/unit_tests/kernels/routing/routingTest.h"
+#include "tests/unit_tests/kernels/moe/routing/routingTest.h"
 
 #include <vector>
 

@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "tests/unit_tests/kernels/routing/routingTest.h"
+#include "tests/unit_tests/kernels/moe/routing/routingTest.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tensorrt_llm::tests::kernels::routing

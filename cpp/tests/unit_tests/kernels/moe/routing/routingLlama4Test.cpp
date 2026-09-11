@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tests/unit_tests/kernels/routing/routingTest.h"
+#include "tests/unit_tests/kernels/moe/routing/routingTest.h"
 
 namespace tk = tensorrt_llm::kernels;
 namespace btg = batchedGemm::trtllm::gen;
