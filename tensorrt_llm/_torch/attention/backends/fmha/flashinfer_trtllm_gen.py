@@ -392,17 +392,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
-        if (
-            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
-            and not cls.supports_skip_correction
-        ):
-            logger.debug(
-                "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-correction is "
-                "enabled and unsupported."
-            )
-            return False
-
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -537,7 +527,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],

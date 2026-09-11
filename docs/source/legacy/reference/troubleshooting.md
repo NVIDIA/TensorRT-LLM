@@ -18,7 +18,7 @@ Solution: try running build script with `--clean`, or try running `rm -r build c
 
 ## Debug on Unit Tests
 
-Here is an example to print the values of the MLP output tensor in a unit test ([full example](../../../../tests/unittest/others/test_debugging_api.py)).
+Here is an example to print the values of the MLP output tensor in a unit test ([full example](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tests/unittest/others/test_debugging_api.py)).
 
 1. Register the intermediate tensors as the network outputs with `register_network_output` API.
 
