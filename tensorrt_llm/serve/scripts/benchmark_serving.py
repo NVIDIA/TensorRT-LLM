@@ -1110,24 +1110,22 @@ def main(args: argparse.Namespace):
             print("No time data found; skipping time breakdown report.")
             return
 
-        # These "Time Breakdown ..." lines are the machine-readable output of the
-        # breakdown -- the perf-sanity harness scrapes them out of this process's
-        # stdout the same way it scrapes "Mean TTFT (ms)" -- whereas the JSONL, the
-        # JSON and the HTML diagram are human aids that need a writable path. Print
-        # first so that none of them failing can cost us the measurement:
-        # output_stem is relative to the current directory unless --result-dir was
-        # given.
+        # Deliberately not printed as scrapeable "Time Breakdown ..." lines. The
+        # perf-sanity harness aggregates the same spans itself from the worker
+        # JSONLs, and a second producer of those lines is worse than none: this
+        # view is built from the client's copy of the file only, drops spans whose
+        # events overlapped (see compute_statistics), and models neither the
+        # per-step nor the per-chunk spans. Printing it made the harness's
+        # "no breakdown lines were parsed" check pass on the fallback, hiding the
+        # aggregation failure the check exists to surface. Written as an artifact
+        # instead, for whoever passed --save-request-time-breakdown by hand.
         span_stats = analyzer.compute_statistics(timing_data)
-        for span in sorted(span_stats):
-            for stat in ("mean", "median", "p75", "p99"):
-                print(f"Time Breakdown {span} {stat} (ms): "
-                      f"{span_stats[span][stat]:.4f}")
 
-        # Printing first is only half of it: an unwritable output_stem would otherwise
-        # raise out of main() and make the client exit non-zero, which the harness
-        # reads as a failed benchmark even though the lines above already carried the
-        # whole measurement. Report and continue. span_stats is passed in so the
-        # reduction is not run a second time over every request.
+        # Each artifact is written independently: an unwritable output_stem would
+        # otherwise raise out of main() and make the client exit non-zero, which the
+        # harness reads as a failed benchmark. output_stem is relative to the current
+        # directory unless --result-dir was given. Report and continue. span_stats is
+        # passed in so the reduction is not run a second time over every request.
         perf_filename = f"{output_stem}.jsonl"
         try:
             with open(perf_filename, "w", encoding="utf-8") as outfile:

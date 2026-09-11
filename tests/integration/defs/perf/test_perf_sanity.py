@@ -2092,10 +2092,10 @@ class ClientConfig:
         if self.trust_remote_code:
             benchmark_cmd.append("--trust-remote-code")
         if self.save_request_time_breakdown:
-            # Makes the client read the servers' per-request JSONLs after the
-            # measured window and print one "Time Breakdown <span> <stat> (ms):"
-            # line per aggregate, which parse_metrics_from_output scrapes back
-            # out of this command's stdout.
+            # Makes the servers write their per-request JSONLs to this directory.
+            # The client emits only artifacts from them; the "Time Breakdown
+            # <span> <stat> (ms):" lines parse_metrics_from_output scrapes are
+            # produced solely by append_time_breakdown_metrics below.
             benchmark_cmd.append("--save-request-time-breakdown")
             benchmark_cmd.append(self.save_request_time_breakdown)
         return benchmark_cmd
@@ -3967,16 +3967,13 @@ class PerfSanityTestConfig:
                 tb_match = TIME_BREAKDOWN_METRIC_LOG_QUERY.search(line)
                 if tb_match:
                     span, stat, value = tb_match.groups()
-                    # Last match wins, unlike every other metric here. Two
-                    # producers write these lines: benchmark_serving prints the
-                    # lifecycle spans it can derive from the client's copy of the
-                    # server-written file, and append_time_breakdown_metrics
-                    # then appends the full set aggregated from the worker files.
-                    # The two agree on the spans they share, but taking the
-                    # appended set wholesale keeps every uploaded field from a
-                    # single computation, so the spans still tile TTFT exactly on
-                    # the dashboard. If that aggregation did not run, the
-                    # client-derived lines remain as the fallback.
+                    # append_time_breakdown_metrics is the sole producer of these
+                    # lines, so every uploaded field comes from one computation and
+                    # the spans tile TTFT exactly on the dashboard. Nothing else may
+                    # print them: a second producer would satisfy the
+                    # "parsed no 'Time Breakdown ...' lines" check in
+                    # check_test_failure and hide an aggregation failure behind a
+                    # partial, differently-computed set of spans.
                     metrics[time_breakdown_metric_name(span, stat)] = float(value)
                     continue
                 for metric_type, regex in all_queries.items():

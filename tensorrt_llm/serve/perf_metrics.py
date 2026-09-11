@@ -570,14 +570,10 @@ def _jsonl_perf_metrics(phase_record: Dict[str, Any]) -> PerfMetrics:
     # and never reaches a header-derived record -- which zeroed the KV-transfer
     # span for every disaggregated request.
     #
-    # Falsy, not `is None`: a request that never transferred KV reaches here with
-    # 0.0, not None, because the aggregated path reads these off a default-
-    # initialised C++ duration (`timing_metrics.kv_cache_transfer_start
-    # .total_seconds()` in executor/result.py). Testing only for None would write
-    # `kv_cache_transfer_start: 0.0` into the JSONL where the key used to be
-    # absent, and a consumer checking presence rather than truthiness would read a
-    # zero-width transfer as a real measurement. A populated timestamp is a
-    # steady-clock reading, so it is never 0.
+    # Falsy rather than `is None` only for belt-and-braces: both producers already
+    # yield None for an absent timestamp (_as_seconds maps <= 0 to None, and the
+    # header path emits a field only when the header carried it), and a populated
+    # timestamp is a steady-clock reading, so it is never 0.
     for name in ("kv_cache_transfer_start", "kv_cache_transfer_end"):
         if not timing_metrics.get(name):
             timing_metrics.pop(name, None)

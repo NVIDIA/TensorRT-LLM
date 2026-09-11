@@ -105,6 +105,12 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
+  # test_request_metrics.py as a whole is not registered on any list, so only the
+  # two cases added with the KV-transfer fix are selected here. Registering the
+  # file would also enable a dozen pre-existing cases that have never run in CI,
+  # which belongs in its own change.
+  - unittest/llmapi/apps/test_request_metrics.py::test_header_derived_record_keeps_kv_transfer_without_kv_cache_size
+  - unittest/llmapi/apps/test_request_metrics.py::test_unpopulated_kv_transfer_timestamps_stay_absent
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
   - unittest/llmapi/apps/test_responses_streaming_events.py

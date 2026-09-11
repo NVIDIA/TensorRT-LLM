@@ -2184,13 +2184,16 @@ class RequestTimeBreakdown:
         timestamp is missing, so 0 means "not measured", not "took no time".
         Reporting it as 0.0 would silently fabricate a data point.
 
-        Negative durations are kept. Only exactly-zero is the "not measured"
-        sentinel; a negative value is a real measurement of two events that
-        overlapped, which is normal for ``step_preprocessing`` when the overlap
-        scheduler is on (step N is prepared before step N-1's token is emitted).
-        Dropping those requests would bias the surviving mean towards the
-        non-overlapped tail -- worst of all silently, since the span would still
-        be reported with a plausible-looking positive value.
+        This is a *coarse* view, and deliberately so. ``calculate_duration`` also
+        returns 0 when ``start_time > end_time``, so a span whose two events
+        genuinely overlapped is indistinguishable here from one that was never
+        measured, and both are dropped -- which biases the surviving mean of such a
+        span towards its non-overlapped tail. Overlap is real for per-step spans
+        under the overlap scheduler, so anything needing an unbiased mean should
+        use the perf-sanity aggregator
+        (``tests/integration/defs/perf/time_breakdown_metrics.py``), which keeps
+        signed spans and covers per-step and per-chunk detail this config does not
+        model at all.
         """
         stats: Dict[str, Dict[str, float]] = {}
         for metric in self.config.metrics:
