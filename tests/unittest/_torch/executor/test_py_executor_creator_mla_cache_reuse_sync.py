@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
@@ -126,6 +127,7 @@ class _DummyModelEngine:
         *,
         attn_runtime_features,
         kv_cache_quant_algo,
+        attn_backend="TRTLLM",
         sparse_algorithm=None,
         enable_flash_mla=False,
         max_seq_len=128,
@@ -135,6 +137,7 @@ class _DummyModelEngine:
         Args:
             attn_runtime_features: AttentionRuntimeFeatures instance.
             kv_cache_quant_algo: Quantization algorithm for KV cache.
+            attn_backend: Attention backend selected for the model.
             sparse_algorithm: Optional sparse-attention algorithm name.
             enable_flash_mla: Whether to emulate the FlashMLA block-size override.
             max_seq_len: Effective sequence length reported by the model engine.
@@ -148,10 +151,16 @@ class _DummyModelEngine:
         self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
+                attn_backend=attn_backend,
+                sparse_attention_config=self.sparse_attention_config,
                 enable_flash_mla=enable_flash_mla,
                 is_generation=True,
-                pretrained_config=SimpleNamespace(),
-                quant_config=SimpleNamespace(kv_cache_quant_algo=kv_cache_quant_algo),
+                pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+                quant_config=QuantConfig(
+                    kv_cache_quant_algo=(
+                        None if kv_cache_quant_algo == QuantAlgo.NO_QUANT else kv_cache_quant_algo
+                    )
+                ),
             ),
             vocab_size_padded=32000,
         )
@@ -303,6 +312,7 @@ def _run_create_py_executor(
         return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
+            attn_backend=attn_backend,
             sparse_algorithm=sparse_algorithm,
             enable_flash_mla=enable_flash_mla,
             max_seq_len=model_max_seq_len,
