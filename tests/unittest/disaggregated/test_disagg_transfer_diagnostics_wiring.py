@@ -324,7 +324,6 @@ def test_gen_timeout_start_and_observation_share_request_identity(
         "tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic",
         lambda: 10.0,
     )
-    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: 10.2)
     monkeypatch.setattr(
         coordinator_module,
         "is_disagg_inflight_cancel_enabled",
@@ -332,6 +331,9 @@ def test_gen_timeout_start_and_observation_share_request_identity(
     )
 
     executor._recv_disagg_gen_cache([request])
+    # py_executor and coordinator import the same time module, so advance the
+    # shared clock only after the receive path records its start timestamp.
+    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: 10.2)
     coordinator.check_transfer_timeouts()
 
     assert request.py_kv_transfer_start_time == 10.0
@@ -1339,7 +1341,7 @@ def test_native_writer_result_precedes_local_destination_completion(
     receiver._sessions = {}
     receiver._sessions_lock = threading.Lock()
     receiver._pre_cancelled_rids = set()
-    receiver._shutdown = True
+    receiver._shutdown = False
     receiver._bounce = Mock()
     receiver._bounce.is_bounced.return_value = False
     receiver._registrar = SimpleNamespace(
