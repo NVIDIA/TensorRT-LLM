@@ -1464,14 +1464,10 @@ def test_gen_first_ready_timestamp_survives_until_sender_session_setup(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("diagnostics_enabled", "expected_transfer_bytes"),
-    [(False, 0), (True, 0x180)],
-)
-def test_kv_result_reports_bytes_without_enabling_perf_timer(
+@pytest.mark.parametrize("diagnostics_enabled", [False, True])
+def test_kv_result_size_is_diagnostics_independent_without_perf_timer(
     monkeypatch: pytest.MonkeyPatch,
     diagnostics_enabled: bool,
-    expected_transfer_bytes: int,
 ) -> None:
     rid = 108
     peer_rank = 2
@@ -1532,7 +1528,7 @@ def test_kv_result_reports_bytes_without_enabling_perf_timer(
     sender._deliver_kv_to_agent(write_meta)
 
     result = transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])
-    assert result[5] == expected_transfer_bytes
+    assert result[5] == 0
 
 
 @pytest.mark.cpu_only

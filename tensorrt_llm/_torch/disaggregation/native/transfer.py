@@ -1257,11 +1257,7 @@ class Sender(SenderBase):
             if send_slot_id is not None and agent_result == AgentResult.SUCCESS
             else None
         )
-        transfer_size = (
-            timer.get_transfer_size(write_meta.peer_rank)
-            if timer
-            else diagnostic_transfer_bytes or 0
-        )
+        transfer_size = timer.get_transfer_size(write_meta.peer_rank) if timer else 0
         result_msg = _make_kv_result_msg(
             self._instance_rank,
             write_meta.unique_rid,
