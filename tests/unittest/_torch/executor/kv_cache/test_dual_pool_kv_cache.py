@@ -30,7 +30,10 @@ from transformers import PretrainedConfig
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
@@ -715,6 +718,10 @@ class TestKVCacheV2SchedulerCrossParam:
         mgr.tokens_per_block = tokens_per_block
         mgr._has_cp_helix = False
         mgr.enable_joint_kv_cache_reuse = False
+        # Instance attributes of the real manager, so a spec'd Mock does not
+        # auto-create them; the scheduler reads both in __init__.
+        mgr.enable_block_reuse = False
+        mgr.block_reuse_policy = BlockReusePolicy.PER_REQUEST
         return mgr
 
     def test_default_cross_is_none(self):

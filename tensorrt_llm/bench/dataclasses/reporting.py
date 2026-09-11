@@ -284,8 +284,11 @@ class ReportUtility:
                 metric_name = f"{prefix}.{name}" if prefix else name
                 if isinstance(value, dict):
                     lines.append(format_metrics(value, metric_name))
-                else:
+                elif isinstance(value,
+                                (int, float)) and not isinstance(value, bool):
                     lines.append(f"{metric_name}: {value:.4f}\n")
+                else:
+                    lines.append(f"{metric_name}: {value}\n")
             return "".join(lines)
 
         metric_lines = format_metrics(startup_metrics)

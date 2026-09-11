@@ -815,12 +815,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         alpha_scale_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             32 * 1,  # alpha_scale_load_warp_id threads
-            32 * 1,
         )
         alpha_scale_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             32 * len(self.epilog_warp_id),  # epilogue warps
-            32 * len(self.epilog_warp_id),
         )
         alpha_scale_pipeline = pipeline.PipelineCpAsync.create(
             barrier_storage=storage.alpha_scale_load_mbar_ptr.data_ptr(),

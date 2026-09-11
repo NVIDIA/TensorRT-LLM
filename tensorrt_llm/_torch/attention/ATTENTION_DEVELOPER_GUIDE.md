@@ -353,6 +353,21 @@ request checks. For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
+`Fmha` owns both entry points. Libraries declare shared capabilities through
+class attributes, such as `supports_skip_correction`, and override only
+`_is_available()` and `_is_supported()` for implementation-specific checks.
+`is_available()` rejects unsupported static capabilities before calling
+`_is_available()`. `is_supported()` provides the same boundary for shared
+request capability checks and delegates all inputs, including `phase`, to
+`_is_supported()`. Both hooks default to `True` when no additional restriction
+is needed. Parent-hook delegation must use `super()._is_available()` or
+`super()._is_supported()` to avoid re-entering the public wrapper.
+
+Availability requirements must be finalized before manager construction and
+remain invariant for its lifetime. Request-varying capability requirements
+must be represented in `FmhaManager._make_cache_key`, because a cache hit
+reuses the selected library without rechecking support.
+
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.

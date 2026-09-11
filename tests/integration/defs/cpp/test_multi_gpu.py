@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os as _os
 import pathlib as _pl
 import platform
@@ -8,16 +23,6 @@ import pytest
 from defs.conftest import skip_no_nvls
 
 
-# Helper filter for disagg google tests
-def get_model_test_filter_prefix(model: str) -> str:
-    if model == "llama":
-        return "Llama"
-    elif model == "gpt":
-        return "Gpt"
-    else:
-        raise ValueError(f"Unsupported model: {model}")
-
-
 class KVCacheType(Enum):
     NONE = auto()
     MPI = auto()
@@ -26,7 +31,7 @@ class KVCacheType(Enum):
     MOONCAKE = auto()
 
 
-def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
+def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE):
     env = {**_os.environ}
 
     match kv_cache_type:
@@ -43,9 +48,6 @@ def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
             pass
         case _:
             raise ValueError(f"Unsupported KVCacheType: {kv_cache_type}")
-
-    if llama_multi_gpu:
-        env["RUN_LLAMA_MULTI_GPU"] = "true"
 
     return env
 
@@ -91,8 +93,8 @@ def run_gemm_allreduce_tests(build_dir, nprocs, timeout=300):
 
 
 def run_cache_transceiver_tests(build_dir: _pl.Path,
-                                nprocs=2,
-                                kv_cache_type=KVCacheType.MPI,
+                                nprocs,
+                                kv_cache_type,
                                 timeout=600):
 
     tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"

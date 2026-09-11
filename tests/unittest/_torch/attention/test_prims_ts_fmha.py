@@ -86,6 +86,7 @@ class _Attention:
         self.v_head_dim = 128 if is_mla else None
         self.predicted_tokens_per_seq = 1
         self.sparse_params = None
+        self.skip_correction_threshold = 0.0
         self.position_embedding_type = 0
         self.quant_mode = 0
         self.q_scaling = 1.0

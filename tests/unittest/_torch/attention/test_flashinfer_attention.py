@@ -185,7 +185,7 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         manager.get_batch_cache_indices.assert_called_once_with([99])
 
-    def test_decode_plan_cache_key_reuses_single_token_batches(self):
+    def test_decode_query_width_is_part_of_plan_params(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
@@ -270,19 +270,16 @@ class TestFlashInferAttention(unittest.TestCase):
             )
 
         self.assertEqual(single_token_plan.q_len_per_req, 1)
-        self.assertEqual(single_token_plan.num_generations, 0)
         self.assertEqual(larger_single_token_plan.q_len_per_req, 1)
-        self.assertEqual(larger_single_token_plan.num_generations, 0)
         self.assertEqual(single_token_plan, larger_single_token_plan)
-        self.assertEqual(full_page_single_token_plan.num_generations, 2)
-        self.assertNotEqual(single_token_plan, full_page_single_token_plan)
-        self.assertEqual(shared_draft_single_token_plan.num_generations, 2)
-        self.assertNotEqual(single_token_plan, shared_draft_single_token_plan)
+        self.assertEqual(single_token_plan, full_page_single_token_plan)
+        self.assertEqual(single_token_plan, shared_draft_single_token_plan)
         self.assertEqual(multi_token_plan.q_len_per_req, 6)
         self.assertNotEqual(single_token_plan, multi_token_plan)
-        self.assertEqual(multi_token_plan.num_generations, 2)
-        self.assertEqual(larger_batch_plan.num_generations, 3)
-        self.assertNotEqual(multi_token_plan, larger_batch_plan)
+        # The live generation batch size deliberately does not key the cache. Eager metadata
+        # replans every wrapper on each prepare() and sizes their block tables by
+        # max_num_requests, so keying on it would allocate a fresh wrapper per batch size seen.
+        self.assertEqual(multi_token_plan, larger_batch_plan)
 
         metadata.seq_lens = torch.tensor([6, 5], dtype=torch.int32)
         with self.assertRaisesRegex(ValueError, "uniform query length"):
@@ -295,6 +292,41 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
+
+    def test_cuda_graph_metadata_owns_a_private_plan_cache(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=4,
+            max_num_tokens=16,
+        )
+        plan_params = PlanParams(
+            num_heads=32,
+            num_kv_heads=4,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            attention_mask_type=AttentionMaskType.causal,
+        )
+        eager_wrappers = FlashInferWrappers(is_planned=True)
+        metadata._plan_params_to_wrappers[plan_params] = eager_wrappers
+
+        graph_metadata = metadata.create_cuda_graph_metadata(2)
+
+        # Wrappers belong to a metadata instance, and the runner builds one metadata per captured
+        # batch size. That partitioning -- not the cache key -- is what keeps a graph wrapper from
+        # being reused across batch sizes, so PlanParams need not carry the generation batch size.
+        self.assertTrue(graph_metadata.is_cuda_graph)
+        self.assertIsNot(graph_metadata._plan_params_to_wrappers,
+                         metadata._plan_params_to_wrappers)
+        self.assertEqual(graph_metadata._plan_params_to_wrappers, {})
+        self.assertIs(metadata._plan_params_to_wrappers[plan_params],
+                      eager_wrappers)
 
     def test_generation_page_table_keeps_logical_positions(self):
         if not torch.cuda.is_available():

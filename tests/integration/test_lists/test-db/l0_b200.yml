@@ -33,12 +33,6 @@ l0_b200:
   # ------------- PyTorch tests ---------------
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=True-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_nvfp4_dflash
@@ -283,6 +277,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
+  - unittest/_torch/visual_gen/test_attention_cudnn.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
@@ -389,6 +384,11 @@ l0_b200:
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint); ~13 min, too heavy for pre_merge. Mirrors l0_gb300_multi_gpus.
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
+  # Keep new full-corpus EAGLE-3 baselines in post_merge until repeated green
+  # runs establish stable references.
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_1gpu[cutlass-one_model] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_eagle3_accuracy[linear] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_eagle3_accuracy[dynamic] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
@@ -423,7 +423,6 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_branch_snapshot[enable_branch_snapshot=True]
   - accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
