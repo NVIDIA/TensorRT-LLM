@@ -229,20 +229,14 @@ def _logic_vsa_ulysses_real_model(
 
     _log(rank, f"[{label}] building ref_model (world_size=1)")
     ref_config = _make_vsa_model_config(pretrained_dict)
-    try:
-        ref_model = WanTransformer3DModel(ref_config).to(device).to(dtype)
-    except (ImportError, ValueError, NotImplementedError) as e:
-        pytest.skip(f"[{label}] VSA ref model unavailable: {e}")
+    ref_model = WanTransformer3DModel(ref_config).to(device).to(dtype)
     _log(rank, f"[{label}] ref_model created")
 
     _log(rank, f"[{label}] building dist_model (ul={ulysses_size} cfg={cfg_size})")
     dist_config = _make_vsa_model_config(
         pretrained_dict, ulysses_size=ulysses_size, cfg_size=cfg_size
     )
-    try:
-        dist_model = WanTransformer3DModel(dist_config).to(device).to(dtype)
-    except (ImportError, ValueError, NotImplementedError) as e:
-        pytest.skip(f"[{label}] VSA parallel model unavailable: {e}")
+    dist_model = WanTransformer3DModel(dist_config).to(device).to(dtype)
     _log(rank, f"[{label}] dist_model created")
 
     _log(rank, f"[{label}] loading checkpoint weights")

@@ -21,7 +21,6 @@ Run:
     pytest tests/unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py -v -s
 """
 
-import importlib
 import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
@@ -426,7 +425,6 @@ class TestWan22I2VBatchGeneration:
 
 @pytest.mark.integration
 @pytest.mark.wan_i2v
-@pytest.mark.skipif(importlib.util.find_spec("cache_dit") is None, reason="cache_dit not installed")
 class TestWan22I2VCombinedOptimizations:
     """FP8 + CacheDiT + TRTLLM attention combined on Wan 2.2 I2V (480x832)."""
 

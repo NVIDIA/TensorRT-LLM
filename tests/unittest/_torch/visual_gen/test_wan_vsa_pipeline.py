@@ -59,12 +59,12 @@ COS_SIM_THRESHOLD = 0.95
 # ============================================================================
 
 
-def _load_vsa_pipeline(checkpoint_path: str, vsa_sparsity: float = 0.0):
+def _load_vsa_pipeline(checkpoint_subdir: str, vsa_sparsity: float = 0.0):
     """Load TRTLLM WanPipeline with CUTEDSL + VSA backend."""
     if not _cute_dsl_available:
         pytest.skip(f"CUTEDSL not available (requires Blackwell GPU): {_cute_dsl_import_error}")
     args = VisualGenArgs(
-        model=checkpoint_path,
+        model=get_checkpoint(checkpoint_subdir),
         attention_config=AttentionConfig(
             backend="CUTEDSL",
             sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=vsa_sparsity),
@@ -109,7 +109,7 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _assert_vsa_matches_dense(
-    checkpoint_path: str,
+    checkpoint_subdir: str,
     height: int,
     width: int,
     num_frames: int,
@@ -134,14 +134,14 @@ def _assert_vsa_matches_dense(
     )
 
     # --- CuTe-DSL path ---
-    vsa_pipe = _load_vsa_pipeline(checkpoint_path, vsa_sparsity=vsa_sparsity)
+    vsa_pipe = _load_vsa_pipeline(checkpoint_subdir, vsa_sparsity=vsa_sparsity)
     vsa_video = _capture_trtllm_video(vsa_pipe, **common_kwargs)
     del vsa_pipe
     gc.collect()
     torch.cuda.empty_cache()
 
     # --- SDPA fallback reference (same VSA formulation, fine attn via SDPA) ---
-    sdpa_pipe = _load_vsa_pipeline(checkpoint_path, vsa_sparsity=vsa_sparsity)
+    sdpa_pipe = _load_vsa_pipeline(checkpoint_subdir, vsa_sparsity=vsa_sparsity)
     with patch.object(_vsa_module, "is_cute_supported", return_value=False):
         sdpa_video = _capture_trtllm_video(sdpa_pipe, **common_kwargs)
     del sdpa_pipe
@@ -179,7 +179,7 @@ class TestWanVsa14B_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_vsa_matches_dense(
-            checkpoint_path=get_checkpoint(WAN21_VSA_SUBDIR),
+            checkpoint_subdir=WAN21_VSA_SUBDIR,
             height=720,
             width=1280,
             num_frames=9,
@@ -195,7 +195,7 @@ class TestWanVsaSparse:
     """VSA at sparsity=0.9: config propagates, output is correctly shaped and finite."""
 
     def test_sparse_vsa(self):
-        pipeline = _load_vsa_pipeline(get_checkpoint(WAN21_VSA_SUBDIR), vsa_sparsity=0.9)
+        pipeline = _load_vsa_pipeline(WAN21_VSA_SUBDIR, vsa_sparsity=0.9)
         try:
             attn_cfg = pipeline.pipeline_config.primary_model_config.attention
             assert attn_cfg.backend == "CUTEDSL"

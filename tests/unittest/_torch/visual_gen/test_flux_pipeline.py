@@ -124,18 +124,6 @@ def _find_first_quantizable_linear(transformer):
     return None, None
 
 
-@pytest.fixture
-def flux1_checkpoint_exists():
-    """FLUX.1 checkpoint gate; the path is resolved (and staging enforced) at import."""
-    return True
-
-
-@pytest.fixture
-def flux2_checkpoint_exists():
-    """FLUX.2 checkpoint gate; the path is resolved (and staging enforced) at import."""
-    return True
-
-
 # =============================================================================
 # Pipeline Loading Tests
 # =============================================================================
@@ -145,7 +133,7 @@ class TestFluxPipelineLoading:
     """Integration tests for FLUX pipeline loading."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_load_flux1_pipeline_basic(self, flux1_checkpoint_exists):
+    def test_load_flux1_pipeline_basic(self):
         """Test loading FLUX.1 pipeline."""
         args = VisualGenArgs(
             model=_flux1_path(),
@@ -163,7 +151,7 @@ class TestFluxPipelineLoading:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_load_flux2_pipeline_basic(self, flux2_checkpoint_exists):
+    def test_load_flux2_pipeline_basic(self):
         """Test loading FLUX.2 pipeline."""
         args = VisualGenArgs(
             model=_flux2_path(),
@@ -181,7 +169,7 @@ class TestFluxPipelineLoading:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
-    def test_load_flux1_with_attention_backend(self, flux1_checkpoint_exists, backend: str):
+    def test_load_flux1_with_attention_backend(self, backend: str):
         """Test loading FLUX.1 with different attention backends."""
         args = VisualGenArgs(
             model=_flux1_path(),
@@ -207,7 +195,7 @@ class TestFluxQuantization:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_load_flux1_with_quantization(self, flux1_checkpoint_exists, quant_algo: str):
+    def test_load_flux1_with_quantization(self, quant_algo: str):
         """Test loading FLUX.1 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
             model=_flux1_path(),
@@ -256,7 +244,7 @@ class TestFluxQuantization:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_load_flux2_with_quantization(self, flux2_checkpoint_exists, quant_algo: str):
+    def test_load_flux2_with_quantization(self, quant_algo: str):
         """Test loading FLUX.2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
             model=_flux2_path(),
@@ -313,7 +301,7 @@ class TestFluxFP8NumericalCorrectness:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_fp8_vs_bf16_single_layer(self, flux1_checkpoint_exists, quant_algo: str):
+    def test_fp8_vs_bf16_single_layer(self, quant_algo: str):
         """Test FP8 vs BF16 numerical accuracy on a single Linear layer.
 
         Pattern (matching Wan test_fp8_vs_bf16_numerical_correctness):
@@ -396,7 +384,7 @@ class TestFluxFP8NumericalCorrectness:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
-    def test_fp8_vs_bf16_full_transformer_e2e(self, flux1_checkpoint_exists, quant_algo: str):
+    def test_fp8_vs_bf16_full_transformer_e2e(self, quant_algo: str):
         """End-to-end test: Compare full FLUX.1 transformer FP8 vs BF16 output.
 
         Runs the entire transformer (19 dual + 38 single blocks) and compares outputs.
@@ -507,7 +495,7 @@ class TestFluxFP8Memory:
     """Test FP8 memory reduction for FLUX models."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fp8_vs_bf16_memory_comparison(self, flux1_checkpoint_exists):
+    def test_fp8_vs_bf16_memory_comparison(self):
         """Test FP8 uses ~2x less memory than BF16 (matching Wan test)."""
 
         def get_module_memory_gb(module):
@@ -573,7 +561,7 @@ class TestFluxAttentionBackend:
     """Test VANILLA vs TRTLLM attention backend numerical correctness."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_attention_backend_comparison(self, flux1_checkpoint_exists):
+    def test_attention_backend_comparison(self):
         """Test that VANILLA and TRTLLM backends produce similar outputs.
 
         FLUX uses joint self-attention (same seq_len for Q and KV), so both
@@ -668,7 +656,7 @@ class TestFluxE2E:
     """End-to-end pipeline tests: full generation compared to HuggingFace reference."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_flux1_e2e_vs_hf(self, flux1_checkpoint_exists):
+    def test_flux1_e2e_vs_hf(self):
         """Full FLUX.1 pipeline (all components) generates image matching HF reference."""
         from diffusers import FluxPipeline as HFFluxPipeline
 
@@ -718,7 +706,7 @@ class TestFluxE2E:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_flux2_e2e_vs_hf(self, flux2_checkpoint_exists):
+    def test_flux2_e2e_vs_hf(self):
         """Full FLUX.2 pipeline (all components) generates image matching HF reference."""
         from diffusers import Flux2Pipeline as HFFlux2Pipeline
 
@@ -769,7 +757,7 @@ class TestFluxE2E:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_flux2_reference_image_e2e_vs_hf(self, flux2_checkpoint_exists):
+    def test_flux2_reference_image_e2e_vs_hf(self):
         """FLUX.2 reference-image generation matches the diffusers pipeline."""
         from diffusers import Flux2Pipeline as HFFlux2Pipeline
 
@@ -1086,7 +1074,7 @@ class TestFluxParallelism:
         torch.cuda.is_available() and torch.cuda.device_count() < 2,
         reason="Ulysses parallel test requires at least 2 GPUs",
     )
-    def test_ulysses_2gpu_correctness(self, flux1_checkpoint_exists):
+    def test_ulysses_2gpu_correctness(self):
         """Test Ulysses (ulysses_size=2) correctness against single-GPU baseline.
 
         Similar pattern to WAN's test_cfg_2gpu_correctness:
@@ -1267,7 +1255,7 @@ class TestFluxCombinedOptimizations:
         torch.cuda.is_available() and torch.cuda.device_count() < 2,
         reason="Combined optimization test requires at least 2 GPUs",
     )
-    def test_all_optimizations_combined(self, flux1_checkpoint_exists):
+    def test_all_optimizations_combined(self):
         """Test FP8 + TeaCache + TRTLLM attention + Ulysses=2 combined correctness.
 
         Validates that all optimizations work together correctly.

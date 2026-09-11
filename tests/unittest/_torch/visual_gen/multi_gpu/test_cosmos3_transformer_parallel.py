@@ -38,7 +38,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
 # LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
-# attn2d tests skip cleanly when the kernels are not built (e.g. non-Blackwell CI).
+# attn2d tests fail loudly when the kernels are missing on their Blackwell runner —
+# a build/dependency problem, not a reason to skip.
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
@@ -846,14 +847,16 @@ class TestCosmos3TransformerParallel:
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_cfg_ulysses_vs_single_gpu)
 
     def test_attn2d_2x1_vs_single_gpu(self):
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_attn2d_2x1_ulysses2_vs_single_gpu(self):
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_attn2d_ulysses_vs_single_gpu)
 
 

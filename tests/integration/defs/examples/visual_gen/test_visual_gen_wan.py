@@ -70,10 +70,10 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _run_reusable_video_lpips_eval,
     _run_single_device_feature_generator,
     _save_lpips_video_mp4,
-    _skip_if_missing,
     _validate_single_feature_config,
     _visual_gen_output_path,
 )
+from test_common.llm_data import get_checkpoint
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
@@ -331,8 +331,7 @@ def test_fastwan_lpips_against_golden(request, tmp_path, fastwan_video_path):
 def _generate_wan_feature_video(case, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
-    model_path = _lpips_model_path(case.checkpoint_subdir)
-    _skip_if_missing(model_path, f"{case.checkpoint_subdir} checkpoint", is_dir=True)
+    model_path = get_checkpoint(case.checkpoint_subdir)
     _disable_inductor_compile_worker_quiesce()
     pipeline = None
     with (

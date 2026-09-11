@@ -4,14 +4,14 @@
 """Tests for Cache-DiT in visual generation.
 
 Wan 2.2 step-split logic is covered with small CPU-side tests. Wan, FLUX, and LTX-2
-integration tests run on GPU only when cache_dit is installed and CUDA is available; the
-checkpoints they need are resolved under LLM_MODELS_ROOT and fail loudly when unavailable.
+integration tests run on GPU when CUDA is available; cache-dit is a required dependency
+(requirements.txt), so a missing install fails loudly rather than skipping. The checkpoints
+they need are resolved under LLM_MODELS_ROOT and fail loudly when unavailable.
 """
 
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import logging
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,13 +25,6 @@ from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import split_wan22_
 # ---------------------------------------------------------------------------
 # Integration prerequisites
 # ---------------------------------------------------------------------------
-
-_CACHE_DIT_SPEC = importlib.util.find_spec("cache_dit")
-
-requires_cache_dit = pytest.mark.skipif(
-    _CACHE_DIT_SPEC is None,
-    reason="optional dependency cache-dit not installed (pip install cache-dit)",
-)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -174,7 +167,6 @@ class TestSplitWan22InferenceSteps:
 # ---------------------------------------------------------------------------
 
 
-@requires_cache_dit
 @requires_cuda
 class TestCacheDiTRealPipelineForward:
     """Wan, FLUX.1, and LTX-2 use the CI llm-models tree when checkpoints are present.
@@ -446,7 +438,6 @@ class _IdentityBlock(torch.nn.Module):
         return hidden_states, encoder_hidden_states
 
 
-@requires_cache_dit
 class TestFluxEnablerCompiledBlockCheckFlags:
     """enable_cache_dit_for_flux must disable cache_dit's inspect-based
     forward-pattern checks exactly when blocks are torch.compile wrappers.
@@ -505,7 +496,6 @@ class TestFluxEnablerCompiledBlockCheckFlags:
 # ---------------------------------------------------------------------------
 
 
-@requires_cache_dit
 class TestCacheDiTEnablerRegistry:
     def test_enabler_keys_name_registered_pipeline_classes(self):
         """Every CUSTOM_CACHE_DIT_ENABLERS key must name a real registered

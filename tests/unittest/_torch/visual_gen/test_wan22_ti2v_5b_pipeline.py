@@ -410,7 +410,6 @@ class TestWan22TI2V5BBatchGeneration:
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 @pytest.mark.wan_i2v
-@pytest.mark.skipif(importlib.util.find_spec("cache_dit") is None, reason="cache_dit not installed")
 class TestWan22TI2V5BCombinedOptimizations:
     """FP8 + CacheDiT + TRTLLM attention combined on Wan 2.2 TI2V-5B (704x1280)."""
 

@@ -25,11 +25,11 @@ SKIP_HEAVY_COMPONENTS = [
 
 
 @pytest.fixture
-def checkpoint_path():
+def checkpoint_path() -> str:
     return get_checkpoint("Wan2.1-T2V-1.3B-Diffusers")
 
 
-def test_meta_init_mode_creates_meta_tensors(checkpoint_path):
+def test_meta_init_mode_creates_meta_tensors(checkpoint_path) -> None:
     """Test that MetaInitMode creates tensors on meta device (no GPU memory)."""
     from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
@@ -461,7 +461,7 @@ def test_reject_invalid_vae_dynamic_quantization_modes(raw, message):
         DiffusionPipelineConfig.load_vae_conv_quant_config(raw)
 
 
-def test_load_wan_pipeline_basic(checkpoint_path):
+def test_load_wan_pipeline_basic(checkpoint_path) -> None:
     """Test basic loading without quantization using VisualGenArgs."""
     from tensorrt_llm._torch.visual_gen import PipelineLoader
     from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -487,7 +487,7 @@ def test_load_wan_pipeline_basic(checkpoint_path):
     assert param.dtype in [torch.float32, torch.bfloat16, torch.float16]
 
 
-def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_path):
+def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_path) -> None:
     """Test loading with FP8 dynamic quantization using VisualGenArgs.
 
     Verifies the dynamic quantization flow:
@@ -530,7 +530,7 @@ def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_path):
     assert found_fp8_linear, "No FP8 Linear modules found in transformer"
 
 
-def test_load_wan_pipeline_with_fp8_rowwise(checkpoint_path):
+def test_load_wan_pipeline_with_fp8_rowwise(checkpoint_path) -> None:
     """Test loading with FP8 row-wise (per-channel-per-token) dynamic quantization.
 
     Verifies:
@@ -575,7 +575,7 @@ def test_load_wan_pipeline_with_fp8_rowwise(checkpoint_path):
     assert found_fp8_linear, "No FP8 Linear modules found in transformer"
 
 
-def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_path):
+def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_path) -> None:
     """Test loading with FP8 blockwise quantization using VisualGenArgs."""
     from tensorrt_llm._torch.modules.linear import Linear
     from tensorrt_llm._torch.visual_gen import PipelineLoader
@@ -671,7 +671,7 @@ def test_visual_gen_args_to_quant_config():
     assert dwq is True
 
 
-def test_load_without_quant_config_no_fp8(checkpoint_path):
+def test_load_without_quant_config_no_fp8(checkpoint_path) -> None:
     """Test that loading without quant_config does NOT produce FP8 weights."""
     from tensorrt_llm._torch.modules.linear import Linear
     from tensorrt_llm._torch.visual_gen import PipelineLoader
@@ -747,7 +747,7 @@ def _get_cuda_peak_memory_gb():
     return torch.cuda.max_memory_allocated() / 1024**3
 
 
-def test_fp8_vs_bf16_memory_comparison(checkpoint_path):
+def test_fp8_vs_bf16_memory_comparison(checkpoint_path) -> None:
     """Test FP8 dynamic quant uses ~2x less memory than BF16, including peak memory.
 
     This test verifies that dynamic quantization doesn't create unnecessary

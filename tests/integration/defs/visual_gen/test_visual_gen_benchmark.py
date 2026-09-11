@@ -31,8 +31,8 @@ from typing import List, Optional
 import pytest
 import requests
 import yaml
+from test_common.llm_data import get_checkpoint
 
-from defs import conftest
 from tensorrt_llm._utils import get_free_port
 
 # ---------------------------------------------------------------------------
@@ -42,15 +42,9 @@ from tensorrt_llm._utils import get_free_port
 _WAN_T2V_MODEL = "Wan2.1-T2V-1.3B-Diffusers"
 
 
-def _wan_t2v_path() -> Path:
-    """Resolve the Wan T2V model path."""
-    root = Path(conftest.llm_models_root())
-    model_path = root / _WAN_T2V_MODEL
-    if not model_path.is_dir():
-        raise FileNotFoundError(
-            f"Wan T2V model not found: {model_path} (stage {_WAN_T2V_MODEL} under LLM_MODELS_ROOT)"
-        )
-    return model_path
+def _wan_t2v_path() -> str:
+    """Resolve the Wan T2V model path, failing loudly if it is not staged."""
+    return get_checkpoint(_WAN_T2V_MODEL)
 
 
 # Common small-scale generation params for fast CI

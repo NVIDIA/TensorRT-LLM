@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from test_common.llm_data import get_checkpoint, llm_models_root
+from test_common.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
@@ -50,16 +50,11 @@ SKIP_COMPONENTS = [
 ]
 
 
-_LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
-
 _LTX2_BF16_SUBDIR = "LTX-2/ltx-2-19b-dev.safetensors"
 _LTX2_FP8_SUBDIR = "LTX-2/ltx-2-19b-dev-fp8.safetensors"
 _LTX2_GEMMA3_SUBDIR = "gemma/gemma-3-12b-it"
 _LTX2_UPSAMPLER_SUBDIR = "LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
 _LTX2_LORA_SUBDIR = "LTX-2/ltx-2-19b-distilled-lora-384.safetensors"
-
-CHECKPOINT_PATH_BF16 = os.path.join(_LTX2_BASE, "ltx-2-19b-dev.safetensors")
-CHECKPOINT_PATH_FP8 = os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors")
 
 
 def _ltx2_pipeline_config(**overrides):
@@ -191,7 +186,7 @@ class TestLTX2Quantization:
     def test_load_with_quantization(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
         """Test loading LTX2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_bf16_checkpoint_exists,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
             pipeline_config=_ltx2_pipeline_config(),
         )
@@ -247,7 +242,7 @@ class TestLTX2FP8NumericalCorrectness:
         """
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
         args_bf16 = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_bf16_checkpoint_exists,
             pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load(
@@ -256,7 +251,7 @@ class TestLTX2FP8NumericalCorrectness:
 
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
         args_fp8 = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_bf16_checkpoint_exists,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
             pipeline_config=_ltx2_pipeline_config(),
         )
@@ -324,7 +319,7 @@ class TestLTX2FP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_bf16 = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_bf16_checkpoint_exists,
             pipeline_config=_ltx2_pipeline_config(),
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load(
@@ -340,7 +335,7 @@ class TestLTX2FP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_fp8 = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_bf16_checkpoint_exists,
             quant_config={"quant_algo": "FP8", "dynamic": True},
             pipeline_config=_ltx2_pipeline_config(),
         )
@@ -377,7 +372,7 @@ class TestLTX2AttentionBackend:
         """
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
         args_baseline = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_bf16_checkpoint_exists,
             attention_config=AttentionConfig(backend="VANILLA"),
             pipeline_config=_ltx2_pipeline_config(),
         )
@@ -404,7 +399,7 @@ class TestLTX2AttentionBackend:
 
         print("[Attention Backend Test] Loading TRTLLM transformer...")
         args_trtllm = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_bf16_checkpoint_exists,
             attention_config=AttentionConfig(backend="TRTLLM"),
             pipeline_config=_ltx2_pipeline_config(),
         )
@@ -1155,17 +1150,15 @@ class TestTwoStageFP4Helpers:
 # Two-Stage Pipeline Loading Tests (requires checkpoints)
 # ============================================================================
 
-UPSAMPLER_PATH = os.path.join(_LTX2_BASE, "ltx-2-spatial-upscaler-x2-1.0.safetensors")
-LORA_PATH = os.path.join(_LTX2_BASE, "ltx-2-19b-distilled-lora-384.safetensors")
-
 
 @pytest.fixture
 def ltx2_two_stage_assets_exist():
     """Resolve all two-stage assets (checkpoint + upsampler + LoRA), failing loudly if missing."""
-    get_checkpoint(_LTX2_BF16_SUBDIR)
-    get_checkpoint(_LTX2_UPSAMPLER_SUBDIR)
-    get_checkpoint(_LTX2_LORA_SUBDIR)
-    return True
+    return SimpleNamespace(
+        checkpoint=get_checkpoint(_LTX2_BF16_SUBDIR),
+        upsampler=get_checkpoint(_LTX2_UPSAMPLER_SUBDIR),
+        lora=get_checkpoint(_LTX2_LORA_SUBDIR),
+    )
 
 
 class TestLTX2TwoStageLoRAHelpers:
@@ -1587,10 +1580,10 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_two_stage_assets_exist.checkpoint,
             pipeline_config=_ltx2_pipeline_config(
-                spatial_upsampler_path=UPSAMPLER_PATH,
-                distilled_lora_path=LORA_PATH,
+                spatial_upsampler_path=ltx2_two_stage_assets_exist.upsampler,
+                distilled_lora_path=ltx2_two_stage_assets_exist.lora,
             ),
         )
 
@@ -1620,10 +1613,10 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_two_stage_assets_exist.checkpoint,
             pipeline_config=_ltx2_pipeline_config(
-                spatial_upsampler_path=UPSAMPLER_PATH,
-                distilled_lora_path=LORA_PATH,
+                spatial_upsampler_path=ltx2_two_stage_assets_exist.upsampler,
+                distilled_lora_path=ltx2_two_stage_assets_exist.lora,
             ),
         )
 
@@ -1666,10 +1659,10 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            model=CHECKPOINT_PATH_BF16,
+            model=ltx2_two_stage_assets_exist.checkpoint,
             pipeline_config=_ltx2_pipeline_config(
-                spatial_upsampler_path=UPSAMPLER_PATH,
-                distilled_lora_path=LORA_PATH,
+                spatial_upsampler_path=ltx2_two_stage_assets_exist.upsampler,
+                distilled_lora_path=ltx2_two_stage_assets_exist.lora,
             ),
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )

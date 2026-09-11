@@ -265,10 +265,7 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
 
     torch.manual_seed(SEED_WEIGHTS)
     dist_config = _make_model_config(pretrained_cfg, backend="FA4", **parallel_cfg_kwargs)
-    try:
-        dist_model = Flux2Transformer2DModel(dist_config).to(device).to(dtype)
-    except (ImportError, ValueError, NotImplementedError) as e:
-        pytest.skip(f"[{label}] Parallel backend unavailable: {e}")
+    dist_model = Flux2Transformer2DModel(dist_config).to(device).to(dtype)
     dist_model.load_state_dict(ref_state)
 
     torch.manual_seed(SEED_INPUT)
@@ -322,9 +319,10 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
 @pytest.mark.integration
 @pytest.mark.flux2
 class TestFlux2TransformerParallel:
-    def _skip_if_unavailable(self):
-        if not _flash_attn4_available:
-            pytest.skip("FlashAttn4 JIT kernels not available")
+    def _require_flash_attn4(self) -> None:
+        assert _flash_attn4_available, (
+            "FlashAttn4 JIT kernels not available; expected on the Blackwell CI runner"
+        )
 
     @pytest.mark.parametrize(
         "label,parallel_cfg_kwargs",
@@ -332,7 +330,7 @@ class TestFlux2TransformerParallel:
         ids=[name for name, _ in _FLUX2_8GPU_PARALLEL_COMBINATIONS],
     )
     def test_parallel_all_combinations_vs_single_gpu_8gpu(self, label, parallel_cfg_kwargs):
-        self._skip_if_unavailable()
+        self._require_flash_attn4()
         run_test_in_distributed(
             world_size=8,
             test_fn=_logic_flux2_transformer_parallel_vs_single_gpu,
