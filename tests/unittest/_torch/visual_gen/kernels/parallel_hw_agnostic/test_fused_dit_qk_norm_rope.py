@@ -470,8 +470,9 @@ def test_per_head_v_unchanged(head_dim):
 # ============================================================================
 # Full-dim norm tests (LTX-2 / WAN packed FUSE_QKV)
 # weight is [num_heads*head_dim] (full-dim per-token norm), no dual-stream,
-# cos/sin can be [num_tokens, num_heads*head_dim] (per-head) or
-# broadcast [num_tokens/B, num_heads*head_dim] (kernel modulo over B).
+# cos/sin can be [num_tokens, head_dim] (shared across heads),
+# [num_tokens, num_heads*head_dim] (per-head), or either layout broadcast
+# over batches (kernel modulo over B).
 # ============================================================================
 
 
@@ -490,7 +491,8 @@ def torch_ref_full_dim(
     """Reference: full-dim RMSNorm (weight shape [num_heads*head_dim]) on Q and K
     of a packed qkv tensor [N, 3*num_heads*head_dim], then rope; V untouched.
 
-    cos/sin shape: [num_tokens, num_heads*head_dim] (per-head, full-dim layout).
+    cos/sin shape: [num_tokens, head_dim] (shared across heads) or
+    [num_tokens, num_heads*head_dim] (per-head, full-dim layout).
     """
     num_tokens = qkv.shape[0]
     hidden = num_heads * head_dim
@@ -506,8 +508,12 @@ def torch_ref_full_dim(
     var_k = k.pow(2).mean(-1, keepdim=True)
     k = k * torch.rsqrt(var_k + eps) * k_weight.float()
 
-    cos_3d = cos_emb.float().view(num_tokens, num_heads, head_dim)
-    sin_3d = sin_emb.float().view(num_tokens, num_heads, head_dim)
+    if cos_emb.numel() == num_tokens * head_dim:
+        cos_3d = cos_emb.float().view(num_tokens, 1, head_dim).expand(-1, num_heads, -1)
+        sin_3d = sin_emb.float().view(num_tokens, 1, head_dim).expand(-1, num_heads, -1)
+    else:
+        cos_3d = cos_emb.float().view(num_tokens, num_heads, head_dim)
+        sin_3d = sin_emb.float().view(num_tokens, num_heads, head_dim)
     q_4d = q.view(num_tokens, num_heads, head_dim)
     k_4d = k.view(num_tokens, num_heads, head_dim)
     if interleave:
@@ -554,6 +560,96 @@ def _make_per_head_cos_full_dim(num_tokens, num_heads, head_dim, device, dtype=t
     cos_2d = cos.reshape(num_tokens, num_heads * head_dim).contiguous().to(dtype)
     sin_2d = sin.reshape(num_tokens, num_heads * head_dim).contiguous().to(dtype)
     return cos_2d, sin_2d
+
+
+@pytest.mark.parametrize("cos_dtype", [torch.float32, torch.bfloat16], ids=["fp32cos", "bf16cos"])
+def test_full_dim_norm_wan_shared_interleaved(cos_dtype):
+    """WAN-14B: 40-head full-dim norm with one interleaved RoPE vector shared by all heads."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    num_tokens, num_heads, head_dim = 4, 40, 128
+    hidden = num_heads * head_dim
+    qkv = torch.randn(num_tokens, 3 * hidden, dtype=torch.bfloat16, device=device) * 0.5
+    qkv_copy = qkv.clone()
+    q_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    freqs = torch.randn(num_tokens, head_dim // 2, dtype=torch.float32, device=device)
+    freqs = freqs.repeat_interleave(2, dim=-1)
+    cos = freqs.cos().to(cos_dtype)
+    sin = freqs.sin().to(cos_dtype)
+
+    _call_fused_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        None,
+        None,
+        cos,
+        sin,
+        -1,
+        interleave=True,
+    )
+    ref = torch_ref_full_dim(
+        qkv_copy,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        interleave=True,
+    )
+    torch.testing.assert_close(qkv, ref, rtol=2e-2, atol=5e-3)
+
+
+def test_full_dim_norm_rejects_oversized_dynamic_smem():
+    """An unsupported dynamic-SMEM request must fail before attempting the fused launch."""
+    device = "cuda"
+    head_dim = 128
+    smem_limit = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    num_heads = next(
+        (
+            heads
+            for heads in range(2, 65)
+            if 4 * heads * head_dim * torch.bfloat16.itemsize
+            + 4 * heads * head_dim * torch.float32.itemsize
+            + 64
+            > smem_limit
+        ),
+        None,
+    )
+    if num_heads is None:
+        pytest.skip("All supported full-dim shapes fit this device's opt-in shared-memory limit")
+
+    hidden = num_heads * head_dim
+    qkv = torch.randn(1, 3 * hidden, dtype=torch.bfloat16, device=device)
+    q_weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
+    k_weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
+    cos, sin = _make_per_head_cos_full_dim(1, num_heads, head_dim, device)
+
+    with pytest.raises(RuntimeError, match="dynamic shared memory"):
+        _call_fused_kernel(
+            qkv,
+            num_heads,
+            num_heads,
+            num_heads,
+            head_dim,
+            1e-6,
+            q_weight,
+            k_weight,
+            None,
+            None,
+            cos,
+            sin,
+            -1,
+            interleave=False,
+        )
 
 
 @pytest.mark.parametrize("cos_dtype", [torch.float32, torch.bfloat16], ids=["fp32cos", "bf16cos"])
