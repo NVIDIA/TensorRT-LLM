@@ -398,8 +398,7 @@ def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
 def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path, monkeypatch):
     reference_path = tmp_path / "ltx2_trtllm_backend_generated.mp4"
     generated_path = tmp_path / "ltx2_cuda_graph_trtllm_backend_generated.mp4"
-    # Compare the same NVFP4, attention, and compilation configuration. The BF16
-    # golden has different numerics; fixed-golden accuracy is covered separately.
+    # Compare the same NVFP4, attention, and compilation configuration.
     # Reuse the reference worker's tuning decisions so only graph capture differs.
     autotuner_cache_path = tmp_path / "ltx2_autotuner_cache.json"
     monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_PATH", str(autotuner_cache_path))
@@ -429,6 +428,28 @@ def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path, mon
         "ltx2_cuda_graph_trtllm_backend_generated.mp4",
     )
     _assert_lpips_below_threshold(score, LTX2_CUDA_GRAPH_LPIPS_THRESHOLD)
+
+    golden_path = _golden_media_path(
+        tmp_path,
+        "ltx2_trtllm_backend_lpips_golden_video.mp4",
+        "LTX-2 NVFP4 TRTLLM backend LPIPS golden video",
+    )
+    golden_score = _run_lpips_eval(
+        tmp_path,
+        "ltx2_trtllm_backend_golden",
+        "video",
+        LTX2_T2V_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        golden_score,
+        LTX2_LPIPS_THRESHOLD,
+        generated_path,
+        "ltx2_cuda_graph_trtllm_backend_generated.mp4",
+    )
+    _assert_lpips_below_threshold(golden_score, LTX2_LPIPS_THRESHOLD)
 
 
 @pytest.fixture(scope="session")
