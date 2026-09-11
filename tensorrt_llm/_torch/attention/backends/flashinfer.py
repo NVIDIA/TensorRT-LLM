@@ -230,19 +230,6 @@ class MLAPlanParams:
     sm_scale: Optional[float] = None
 
 
-def _records_fa2_plan(is_cuda_graph: bool, decode_backend: str) -> bool:
-    """Whether a decode plan must record the page tuple it was planned for.
-
-    Graph replay never re-enters forward_impl, so the split-KV schedule
-    (request/kv-tile indices, kv_chunk_size) that plan() computed is what
-    every replay runs. Recording the tuple lets prepare() re-plan through
-    _refresh_fa2_cuda_graph_plans() whenever the generation page counts
-    change. trtllm-gen is excluded because it keeps its own per-step
-    block-table/kv_lens refresh in prepare().
-    """
-    return is_cuda_graph and decode_backend != 'trtllm-gen'
-
-
 @dataclass(kw_only=True)
 class FlashInferWrappers:
     is_planned: bool
@@ -2125,12 +2112,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 q_len_per_req=plan_params.q_len_per_req,
                 disable_split_kv=False,
             )
-            # Without this, multi-wrapper (variable sliding window) metadata
-            # deferred the re-plan to forward_impl and replayed the
-            # capture-time plan (one max_seq_len dummy in generation slot 0,
-            # one-token dummies elsewhere), so slots >= 1 attended only their
-            # first kv_chunk_size tokens.
-            if _records_fa2_plan(self.is_cuda_graph, decode_wrapper._backend):
+            # Graph replay reuses the split-KV schedule plan() computed, so
+            # record the page tuple this decode plan was built for; prepare()
+            # re-plans through _refresh_fa2_cuda_graph_plans() when the
+            # generation page counts change. trtllm-gen is excluded because it
+            # does its own per-step block-table/kv_lens refresh in prepare().
+            if self.is_cuda_graph and decode_wrapper._backend != 'trtllm-gen':
                 wrappers.fa2_plan_num_blocks = tuple(
                     self.num_blocks[self.num_contexts:])
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
