@@ -4274,6 +4274,10 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._request_stats_enabled_ids.clear()
+        # Drop the outstanding plans before the manager shuts down: discarding a handle applies
+        # its plan, which mutates manager state.
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()
         self.impl.shutdown()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
@@ -4282,8 +4286,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # on a closed manager, so there is no teardown-time None race.
         if isinstance(self.event_manager, StreamingKVCacheEventManager):
             self.event_manager.shutdown()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
