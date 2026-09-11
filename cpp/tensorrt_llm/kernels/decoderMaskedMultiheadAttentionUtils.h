@@ -3358,7 +3358,7 @@ inline __device__ void convert_from_fp8(uint16_t* v, const __nv_fp8_e4m3 u)
 
 inline __device__ void convert_from_fp8(uint32_t* v, const fp8_2_t u)
 {
-    half2 h = half2(u);
+    half2 h = static_cast<half2>(u);
     v[0] = reinterpret_cast<uint32_t&>(h);
 }
 
@@ -3448,7 +3448,7 @@ inline __device__ void convert_from_fp8(float2* v, const fp8_2_t u)
 
 inline __device__ void convert_from_fp8(float4* v, const fp8_4_t u)
 {
-    v[0] = float4(u);
+    v[0] = static_cast<float4>(u);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
