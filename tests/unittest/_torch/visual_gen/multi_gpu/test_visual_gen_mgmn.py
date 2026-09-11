@@ -29,6 +29,8 @@ from tensorrt_llm._torch.visual_gen.launch import LaunchMode, run_diffusion_work
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.visual_gen import VisualGen
 
+pytestmark = pytest.mark.cpu_only
+
 _ENV_VARS = [
     "TLLM_SPAWN_PROXY_PROCESS",
     "tllm_mpi_size",
@@ -65,16 +67,6 @@ def _isolated_env():
 # =============================================================================
 
 
-class _FakeLocalComm:
-    """Result of COMM_WORLD.Split_type(COMM_TYPE_SHARED) for one rank."""
-
-    def __init__(self, local_rank):
-        self._local_rank = local_rank
-
-    def Get_rank(self):
-        return self._local_rank
-
-
 class _FakeComm:
     """COMM_WORLD stand-in for one simulated rank.
 
@@ -84,11 +76,10 @@ class _FakeComm:
     recorded value, discarding their own input.
     """
 
-    def __init__(self, rank, size, names, local_rank, wire):
+    def __init__(self, rank, size, names, wire):
         self._rank = rank
         self._size = size
         self._names = names
-        self._local_rank = local_rank
         self._wire = wire
         self.bcast_calls = 0
 
@@ -98,10 +89,12 @@ class _FakeComm:
     def Get_size(self):
         return self._size
 
-    def Split_type(self, split_type):
-        return _FakeLocalComm(self._local_rank)
-
     def allgather(self, value):
+        # This one allgather decides both the node id and the local rank, so a
+        # wrong contribution here would silently mis-assign GPUs.
+        assert value == self._names[self._rank], (
+            f"rank {self._rank} allgathered {value!r}, expected its processor name"
+        )
         return list(self._names)
 
     def bcast(self, value, root=0):
@@ -117,7 +110,6 @@ class _FakeComm:
 def _fake_mpi4py(comm):
     mpi = types.SimpleNamespace(
         COMM_WORLD=comm,
-        COMM_TYPE_SHARED=object(),
         Get_processor_name=lambda: comm._names[comm._rank],
     )
     module = types.ModuleType("mpi4py")
@@ -129,9 +121,9 @@ REQ_ADDR = "tcp://10.0.0.1:5555"
 RESP_ADDR = "tcp://10.0.0.1:5556"
 
 
-def _run_mgmn_rank(rank, world_size, names, local_rank, wire, worker_mock, task_world_size=None):
+def _run_mgmn_rank(rank, world_size, names, wire, worker_mock, task_world_size=None):
     """Run run_diffusion_worker_mgmn as one simulated rank with mocked mpi4py."""
-    comm = _FakeComm(rank, world_size, names, local_rank, wire)
+    comm = _FakeComm(rank, world_size, names, wire)
     with (
         patch.dict(sys.modules, {"mpi4py": _fake_mpi4py(comm)}),
         patch.object(executor_mod, "run_diffusion_worker", worker_mock),
@@ -309,7 +301,7 @@ class TestMgmnWorkerFanout:
         calls = []
         for rank in range(world):
             worker = MagicMock()
-            _run_mgmn_rank(rank, world, names, local_rank=rank, wire=wire, worker_mock=worker)
+            _run_mgmn_rank(rank, world, names, wire=wire, worker_mock=worker)
             calls.append(worker.call_args.kwargs)
 
         rank0 = calls[0]
@@ -327,14 +319,23 @@ class TestMgmnWorkerFanout:
             assert kwargs["world_size"] == world
             assert kwargs["disable_mpi_env"] is False
 
-    def test_local_rank_from_shared_comm_split(self):
-        # Pre-populated wire stands in for rank 0's earlier broadcasts.
-        wire = {0: "node0", 1: 29500}
-        worker = MagicMock()
-
-        _run_mgmn_rank(2, 4, ["a", "a", "b", "b"], local_rank=7, wire=wire, worker_mock=worker)
-
-        assert worker.call_args.kwargs["local_rank"] == 7
+    @pytest.mark.parametrize(
+        "names, expected_local_ranks",
+        [
+            (["a", "a", "b", "b"], [0, 1, 0, 1]),
+            (["a", "b", "a", "b"], [0, 0, 1, 1]),
+            (["a", "a", "a", "b"], [0, 1, 2, 0]),
+        ],
+        ids=["contiguous", "interleaved", "uneven"],
+    )
+    def test_local_rank_is_position_among_ranks_sharing_a_node(self, names, expected_local_ranks):
+        # Same allgather that decides GROUP_RANK decides the GPU each rank takes,
+        # so the two cannot disagree about which ranks share a node.
+        wire = {}
+        for rank in range(4):
+            worker = MagicMock()
+            _run_mgmn_rank(rank, 4, names, wire=wire, worker_mock=worker)
+            assert worker.call_args.kwargs["local_rank"] == expected_local_ranks[rank]
 
     def test_group_rank_from_interleaved_processor_names(self):
         # First-occurrence ordering of unique names: nodeB -> 0, nodeA -> 1,
@@ -345,14 +346,12 @@ class TestMgmnWorkerFanout:
         for rank in range(4):
             worker = MagicMock()
             os.environ["GROUP_RANK"] = "stale"  # must be overwritten per rank
-            _run_mgmn_rank(rank, 4, names, local_rank=rank // 2, wire=wire, worker_mock=worker)
+            _run_mgmn_rank(rank, 4, names, wire=wire, worker_mock=worker)
             assert os.environ["GROUP_RANK"] == expected_host_ids[rank]
 
     def test_world_size_mismatch_raises(self):
         with pytest.raises(RuntimeError, match="does not match"):
-            _run_mgmn_rank(
-                0, 4, ["a"] * 4, local_rank=0, wire={}, worker_mock=MagicMock(), task_world_size=8
-            )
+            _run_mgmn_rank(0, 4, ["a"] * 4, wire={}, worker_mock=MagicMock(), task_world_size=8)
 
 
 # =============================================================================
@@ -387,7 +386,7 @@ class TestEnvHygiene:
     def test_mgmn_task_pops_tllm_disable_mpi_at_entry(self):
         os.environ["TLLM_DISABLE_MPI"] = "1"  # leaked from user env / prior task
 
-        _run_mgmn_rank(0, 2, ["a", "a"], local_rank=0, wire={}, worker_mock=MagicMock())
+        _run_mgmn_rank(0, 2, ["a", "a"], wire={}, worker_mock=MagicMock())
 
         assert "TLLM_DISABLE_MPI" not in os.environ
 
@@ -539,9 +538,7 @@ class TestMgmnRendezvous:
         addrs, ports, comms = [], [], []
         for rank in range(world):
             worker = MagicMock()
-            comm = _run_mgmn_rank(
-                rank, world, names, local_rank=rank % 2, wire=wire, worker_mock=worker
-            )
+            comm = _run_mgmn_rank(rank, world, names, wire=wire, worker_mock=worker)
             comms.append(comm)
             addrs.append(worker.call_args.kwargs["master_addr"])
             ports.append(worker.call_args.kwargs["master_port"])
@@ -558,7 +555,7 @@ class TestMgmnRendezvous:
         worker = MagicMock()
         wire = {}
 
-        _run_mgmn_rank(0, 2, ["a", "a"], local_rank=0, wire=wire, worker_mock=worker)
+        _run_mgmn_rank(0, 2, ["a", "a"], wire=wire, worker_mock=worker)
 
         assert worker.call_args.kwargs["master_addr"] == "override-host"
         assert worker.call_args.kwargs["master_port"] == 12345
@@ -569,15 +566,17 @@ class TestMgmnRendezvous:
         # Rank 0 runs without MASTER_* env and resolves its own rendezvous.
         wire = {}
         worker0 = MagicMock()
-        _run_mgmn_rank(0, 2, ["a", "a"], local_rank=0, wire=wire, worker_mock=worker0)
+        _run_mgmn_rank(0, 2, ["a", "a"], wire=wire, worker_mock=worker0)
         root_addr = worker0.call_args.kwargs["master_addr"]
         root_port = worker0.call_args.kwargs["master_port"]
 
         # Rank 1 has conflicting env; the broadcast value must win.
         os.environ["MASTER_ADDR"] = "wrong-host"
-        os.environ["MASTER_PORT"] = "1"
+        # Malformed on purpose: a valid number would still pass if a non-root
+        # rank parsed its own env before discarding it. int() would raise here.
+        os.environ["MASTER_PORT"] = "not-a-port"
         worker1 = MagicMock()
-        comm1 = _run_mgmn_rank(1, 2, ["a", "a"], local_rank=1, wire=wire, worker_mock=worker1)
+        comm1 = _run_mgmn_rank(1, 2, ["a", "a"], wire=wire, worker_mock=worker1)
 
         assert worker1.call_args.kwargs["master_addr"] == root_addr
         assert worker1.call_args.kwargs["master_port"] == root_port
@@ -646,7 +645,6 @@ class TestMgmnPgTimeout:
                 0,
                 1,
                 ["a"],
-                local_rank=0,
                 wire={},
                 worker_mock=executor_mod.run_diffusion_worker,
             )

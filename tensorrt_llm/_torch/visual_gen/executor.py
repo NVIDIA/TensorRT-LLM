@@ -637,6 +637,14 @@ def run_diffusion_worker(
             logger.error(f"VisualGen worker could not supervise its coordinator: {e}")
             raise
 
+    executor = None
+    # This function writes the rendezvous and rank into the process environment.
+    # An MGMN worker's process outlives the run, so the next one would otherwise
+    # read this run's address and its already-bound port.
+    saved_env = {
+        name: os.environ.get(name)
+        for name in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK")
+    }
     try:
         # Set log level before any other work so loading logs are visible
         logger.set_level(log_level)
@@ -690,14 +698,29 @@ def run_diffusion_worker(
             in_client_process=in_client_process,
         )
         executor.serve_forever()
-        if executor.pipeline is not None:
-            executor.pipeline.cleanup()
-        dist.destroy_process_group()
 
     except Exception as e:
         logger.error(f"Worker failed: {e}")
         traceback.print_exc()
         raise
+    finally:
+        # MGMN workers run in persistent MPI rank processes, so a pipeline or
+        # process group left behind outlives the run and corrupts the next one.
+        if executor is not None and executor.pipeline is not None:
+            try:
+                executor.pipeline.cleanup()
+            except Exception as e:
+                logger.warning(f"Worker pipeline cleanup failed: {e}")
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                logger.warning(f"Worker process-group teardown failed: {e}")
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 class DiffusionRemoteClient:

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch.multiprocessing as mp
 
+from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.utils import create_mpi_comm_session, get_spawn_proxy_process_env
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 from tensorrt_llm.logger import logger
@@ -54,9 +55,9 @@ _get_mp_context = mp.get_context
 _get_process_id = os.getpid
 
 # Default ``torch.distributed`` process-group timeout (seconds) for MGMN
-# workers. Paired with TORCH_NCCL_ASYNC_ERROR_HANDLING it bounds how long a
-# surviving rank blocks in a collective whose peers died, while staying
-# generous enough for slow model-load barriers. Overridable per run via
+# workers: how long the NCCL watchdog lets a collective run before aborting the
+# communicator, after which the next collective raises and the death reaches the
+# client. Generous enough for slow model-load barriers. Overridable per run via
 # TLLM_VG_MGMN_PG_TIMEOUT_SEC.
 MGMN_PG_TIMEOUT_SEC = 1800
 
@@ -95,9 +96,7 @@ class LaunchPlan:
 
 
 def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+    return get_free_port()
 
 
 def get_ip_address() -> str:
@@ -395,16 +394,17 @@ def run_diffusion_worker_mgmn(
             f"parallel_config.n_workers ({world_size}). Launch exactly "
             f"n_workers MPI ranks under trtllm-llmapi-launch."
         )
-    local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
-    local_rank = local_comm.Get_rank()
-
-    # Deterministic, launcher-agnostic node id consumed by
-    # mapping._get_host_id via GROUP_RANK: the first-occurrence index of this
-    # rank's processor name among the unique names. Identical on every rank
-    # because the allgather result is.
+    # Deterministic, launcher-agnostic node grouping. One allgather of the
+    # processor names decides both values, so the GPU a rank takes and the node
+    # it is grouped into cannot disagree. Identical on every rank because the
+    # allgather result is.
     names = comm.allgather(MPI.Get_processor_name())
+    # Node id consumed by mapping._get_host_id via GROUP_RANK: the
+    # first-occurrence index of this rank's processor name among the unique
+    # names.
     host_id = sorted(set(names), key=names.index).index(names[rank])
     os.environ["GROUP_RANK"] = str(host_id)
+    local_rank = [r for r, name in enumerate(names) if name == names[rank]].index(rank)
 
     # torch rendezvous: rank-0-authoritative, agreed over an UNCONDITIONAL
     # bcast. Every rank participates regardless of its own env, so a
@@ -417,10 +417,14 @@ def run_diffusion_worker_mgmn(
     root_port = (int(os.environ.get("MASTER_PORT") or find_free_port())) if rank == 0 else None
     master_port = comm.bcast(root_port, root=0)
 
-    # Surviving ranks must not block forever in collectives whose peers died:
-    # abort NCCL collectives on async errors, paired with the bounded
-    # process-group timeout passed below.
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    # CleanUpOnly: abort the communicator on an async NCCL error and leave the
+    # process running, so the worker survives to raise and the leader can
+    # forward a RemoteWorkerDeath. Every other value of this variable, including
+    # torch's own default, tears the process down instead, which under MPI takes
+    # the whole job with it and the client learns nothing. Process-wide for the
+    # life of the launcher process, so the first run's value is the one that
+    # sticks.
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "2")
     pg_timeout = timedelta(
         seconds=int(os.environ.get("TLLM_VG_MGMN_PG_TIMEOUT_SEC", str(MGMN_PG_TIMEOUT_SEC)))
     )

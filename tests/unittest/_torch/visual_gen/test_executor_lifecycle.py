@@ -56,6 +56,9 @@ def _install_spawn_workers(client, processes, spawner=None):
     """
     if spawner is None:
         spawner = launch_module._WorkerProcessSpawner(processes)
+        # The spawner is never started here, so shutdown would otherwise wait
+        # out the full spawn timeout for a batch that is already in place.
+        spawner._spawn_complete.set()
     client._workers = launch_module._SpawnWorkers(processes, spawner)
     return spawner
 
