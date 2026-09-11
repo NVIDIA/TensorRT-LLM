@@ -6908,9 +6908,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // cu130 is PyTorch's only CUDA 13 channel; it runs on the toolkit above
                             // through CUDA minor version compatibility.
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // TODO(dlfw-26.08): bump together with requirements.txt's torch/triton pins once
-                            // public torch>=2.13.0 and a matching public triton are released.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            // This must stay equal to what requirements.txt resolves to from the public
+                            // index, which is the highest public torch its ceiling admits: the wheel under
+                            // test is linked against that libtorch, and a mismatch fails the import with an
+                            // undefined c10 symbol rather than anything that names a version.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
