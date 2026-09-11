@@ -22,6 +22,7 @@ from .quantization_for_cold_page import ColdPageQuantizationCompression
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 _ScalePair = tuple[float, float]
 _LayerScales = dict[str, _ScalePair]
@@ -187,6 +188,138 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         super().__init__(config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
 
+    def _build_deepseek_v4_layer_layouts(
+        self,
+        cache_config: object,
+        *,
+        attention_layers: Sequence["AttentionLayerConfig"],
+        pp_layers: Sequence[int],
+        runtime_type: int,
+        is_draft: bool,
+    ) -> dict[int, _Nvfp4LayerLayout | None]:
+        """Build layouts for DeepSeek-V4 lifecycles; None selects lossless fallback."""
+
+        roles_by_layer: dict[int, set[str]] = {}
+        for layer in attention_layers:
+            layer_id = int(layer.layer_id)
+            buffer_roles = {str(buffer.role) for buffer in layer.buffers}
+            deepseek_v4_roles = {
+                role for role in buffer_roles if role.startswith(_DEEPSEEK_V4_PREFIX)
+            }
+            if deepseek_v4_roles:
+                if deepseek_v4_roles != buffer_roles or not buffer_roles <= _DEEPSEEK_V4_ROLES:
+                    raise NotImplementedError(
+                        f"Unsupported DeepSeek-V4 cold-page roles: {sorted(buffer_roles)}"
+                    )
+                roles_by_layer[layer_id] = buffer_roles
+
+        has_csa_cache = any(roles == _DEEPSEEK_V4_CSA_ROLES for roles in roles_by_layer.values())
+        model_layers: dict[int, int] = {}
+        if has_csa_cache:
+            model_layer = None
+            num_model_layers = 0
+            for layer in attention_layers:
+                layer_id = int(layer.layer_id)
+                roles = roles_by_layer.get(layer_id)
+                if roles is None:
+                    continue
+                if _DEEPSEEK_V4_SWA in roles:
+                    if num_model_layers == len(pp_layers):
+                        raise ValueError(
+                            "DeepSeek-V4 KVCM layout has more model-layer anchors than pp_layers"
+                        )
+                    model_layer = int(pp_layers[num_model_layers])
+                    num_model_layers += 1
+                elif model_layer is None:
+                    raise ValueError(
+                        "DeepSeek-V4 KVCM layout must begin each model layer with an SWA Page"
+                    )
+                model_layers[layer_id] = model_layer
+            if num_model_layers != len(pp_layers):
+                raise ValueError(
+                    "DeepSeek-V4 KVCM layout and pp_layers have different model-layer counts"
+                )
+
+        layouts: dict[int, _Nvfp4LayerLayout | None] = {}
+        for layer in attention_layers:
+            layer_id = int(layer.layer_id)
+            buffer_roles = roles_by_layer.get(layer_id)
+            if buffer_roles is None:
+                continue
+            if buffer_roles != _DEEPSEEK_V4_CSA_ROLES:
+                layout = None
+                if has_csa_cache and buffer_roles == _DEEPSEEK_V4_HCA_ROLES:
+                    layout = _Nvfp4LayerLayout(
+                        layer_id=layer_id,
+                        num_kv_heads=0,
+                        tokens_per_page=0,
+                        head_dim=0,
+                        raw_row_stride_elements=0,
+                        buffers=tuple(
+                            _Nvfp4BufferLayout(role=str(buffer.role)) for buffer in layer.buffers
+                        ),
+                    )
+                layouts[layer_id] = layout
+                continue
+
+            tokens_per_page = int(cache_config.tokens_per_block)
+            if tokens_per_page % 4 != 0:
+                raise ValueError(
+                    "DeepSeek-V4 CSA Page geometry must divide tokens_per_block by 4"
+                )
+            tokens_per_page //= 4
+
+            element_bytes = 1 if runtime_type == 2 else 2
+            raw_bytes = tokens_per_page * _DEEPSEEK_V4_ROW_STRIDE * element_bytes
+            configured_bytes = next(
+                int(buffer.size)
+                for buffer in layer.buffers
+                if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
+            )
+            footer_bytes = tokens_per_page * _DEEPSEEK_V4_FOOTER_SCALE_ROW_BYTES
+            if runtime_type == 2 and configured_bytes == footer_bytes:
+                raise NotImplementedError(
+                    "NVFP4 cold-page compression does not support DeepSeek-V4 "
+                    "fp8_ds_mla footer-scale Pages"
+                )
+            if configured_bytes != raw_bytes:
+                raise ValueError(
+                    f"DeepSeek-V4 {_DEEPSEEK_V4_COMPRESS} buffer has "
+                    f"{configured_bytes} bytes; expected {raw_bytes} for an ordinary runtime Page"
+                )
+
+            scale = _IDENTITY_NVFP4_SCALE
+            if not is_draft:
+                model_scales = self._model_scales.get(model_layers[layer_id])
+                if model_scales:
+                    if "k" not in model_scales:
+                        raise ValueError(
+                            "DeepSeek-V4 NVFP4 cold pages require a K scale when "
+                            "model-layer scale metadata is present"
+                        )
+                    scale = model_scales["k"]
+
+            layouts[layer_id] = _Nvfp4LayerLayout(
+                layer_id=layer_id,
+                num_kv_heads=1,
+                tokens_per_page=tokens_per_page,
+                head_dim=_DEEPSEEK_V4_NOPE_DIM,
+                raw_row_stride_elements=_DEEPSEEK_V4_ROW_STRIDE,
+                buffers=tuple(
+                    _Nvfp4BufferLayout(
+                        role=str(buffer.role),
+                        scales=(
+                            _Nvfp4Scales(*scale)
+                            if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
+                            else None
+                        ),
+                    )
+                    for buffer in layer.buffers
+                ),
+            )
+
+        return layouts
+
     def build_codec_state(
         self,
         cache_config: object,
@@ -213,132 +346,24 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 f"Attention KV, not {runtime_dtype}"
             )
 
-        deepseek_v4_roles_by_layer: dict[int, set[str]] = {}
-        for layer in attention_layers:
-            layer_id = int(layer.layer_id)
-            buffer_roles = {str(buffer.role) for buffer in layer.buffers}
-            deepseek_v4_roles = {
-                role for role in buffer_roles if role.startswith(_DEEPSEEK_V4_PREFIX)
-            }
-            if deepseek_v4_roles:
-                if deepseek_v4_roles != buffer_roles or not buffer_roles <= _DEEPSEEK_V4_ROLES:
-                    raise NotImplementedError(
-                        f"Unsupported DeepSeek-V4 cold-page roles: {sorted(buffer_roles)}"
-                    )
-                deepseek_v4_roles_by_layer[layer_id] = buffer_roles
-
-        has_csa_cache = any(
-            roles == _DEEPSEEK_V4_CSA_ROLES for roles in deepseek_v4_roles_by_layer.values()
+        deepseek_v4_layouts = self._build_deepseek_v4_layer_layouts(
+            cache_config,
+            attention_layers=attention_layers,
+            pp_layers=pp_layers,
+            runtime_type=runtime_type if runtime_type is not None else 0,
+            is_draft=is_draft,
         )
-        deepseek_v4_model_layers: dict[int, int] = {}
-        if has_csa_cache:
-            model_layer = None
-            num_model_layers = 0
-            for layer in attention_layers:
-                layer_id = int(layer.layer_id)
-                roles = deepseek_v4_roles_by_layer.get(layer_id)
-                if roles is None:
-                    continue
-                if _DEEPSEEK_V4_SWA in roles:
-                    if num_model_layers == len(pp_layers):
-                        raise ValueError(
-                            "DeepSeek-V4 KVCM layout has more model-layer anchors than pp_layers"
-                        )
-                    model_layer = int(pp_layers[num_model_layers])
-                    num_model_layers += 1
-                elif model_layer is None:
-                    raise ValueError(
-                        "DeepSeek-V4 KVCM layout must begin each model layer with an SWA Page"
-                    )
-                deepseek_v4_model_layers[layer_id] = model_layer
-            if num_model_layers != len(pp_layers):
-                raise ValueError(
-                    "DeepSeek-V4 KVCM layout and pp_layers have different model-layer counts"
-                )
 
         layer_layouts = []
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
-            buffer_roles = {str(buffer.role) for buffer in layer.buffers}
-            if layer_id in deepseek_v4_roles_by_layer:
-                is_csa_cache = buffer_roles == _DEEPSEEK_V4_CSA_ROLES
-                if not is_csa_cache:
-                    if has_csa_cache and buffer_roles == _DEEPSEEK_V4_HCA_ROLES:
-                        layer_layouts.append(
-                            _Nvfp4LayerLayout(
-                                layer_id=layer_id,
-                                num_kv_heads=0,
-                                tokens_per_page=0,
-                                head_dim=0,
-                                raw_row_stride_elements=0,
-                                buffers=tuple(
-                                    _Nvfp4BufferLayout(role=str(buffer.role))
-                                    for buffer in layer.buffers
-                                ),
-                            )
-                        )
-                    continue
-
-                tokens_per_page = int(cache_config.tokens_per_block)
-                if tokens_per_page % 4 != 0:
-                    raise ValueError(
-                        "DeepSeek-V4 CSA Page geometry must divide tokens_per_block by 4"
-                    )
-                tokens_per_page //= 4
-
-                element_bytes = 1 if runtime_type == 2 else 2
-                raw_bytes = tokens_per_page * _DEEPSEEK_V4_ROW_STRIDE * element_bytes
-                configured_bytes = next(
-                    int(buffer.size)
-                    for buffer in layer.buffers
-                    if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
-                )
-                footer_bytes = tokens_per_page * _DEEPSEEK_V4_FOOTER_SCALE_ROW_BYTES
-                if runtime_type == 2 and configured_bytes == footer_bytes:
-                    raise NotImplementedError(
-                        "NVFP4 cold-page compression does not support DeepSeek-V4 "
-                        "fp8_ds_mla footer-scale Pages"
-                    )
-                if configured_bytes != raw_bytes:
-                    raise ValueError(
-                        f"DeepSeek-V4 {_DEEPSEEK_V4_COMPRESS} buffer has "
-                        f"{configured_bytes} bytes; expected {raw_bytes} for an "
-                        "ordinary runtime Page"
-                    )
-
-                scale = _IDENTITY_NVFP4_SCALE
-                if not is_draft:
-                    model_scales = self._model_scales.get(deepseek_v4_model_layers[layer_id])
-                    if model_scales:
-                        if "k" not in model_scales:
-                            raise ValueError(
-                                "DeepSeek-V4 NVFP4 cold pages require a K scale when "
-                                "model-layer scale metadata is present"
-                            )
-                        scale = model_scales["k"]
-
-                layer_layouts.append(
-                    _Nvfp4LayerLayout(
-                        layer_id=layer_id,
-                        num_kv_heads=1,
-                        tokens_per_page=tokens_per_page,
-                        head_dim=_DEEPSEEK_V4_NOPE_DIM,
-                        raw_row_stride_elements=_DEEPSEEK_V4_ROW_STRIDE,
-                        buffers=tuple(
-                            _Nvfp4BufferLayout(
-                                role=str(buffer.role),
-                                scales=(
-                                    _Nvfp4Scales(*scale)
-                                    if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
-                                    else None
-                                ),
-                            )
-                            for buffer in layer.buffers
-                        ),
-                    )
-                )
+            if layer_id in deepseek_v4_layouts:
+                layout = deepseek_v4_layouts[layer_id]
+                if layout is not None:
+                    layer_layouts.append(layout)
                 continue
 
+            buffer_roles = {str(buffer.role) for buffer in layer.buffers}
             if "key" not in buffer_roles:
                 raise NotImplementedError(
                     "NVFP4 cold-page compression requires an Attention key buffer"

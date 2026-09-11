@@ -123,8 +123,7 @@ struct Nvfp4ColdPageBuffer
     Nvfp4ColdPageKernelParams params;
 };
 
-// Private KVCM Page-index view; its matching layout is asserted here and at the
-// callback boundary.
+// Private KVCM Page-index view; its matching layout is asserted here and at the callback boundary.
 struct alignas(8) PageIndexPairView
 {
     std::int32_t dst;
@@ -137,8 +136,7 @@ static_assert(offsetof(PageIndexPairView, dst) == 0);
 static_assert(offsetof(PageIndexPairView, src) == 4);
 static_assert(std::is_trivially_copyable_v<PageIndexPairView>);
 
-// Keep every CTA iteration and shared-memory tile on complete 16-value scale
-// groups.
+// Keep every CTA iteration and shared-memory tile on complete 16-value scale groups.
 static_assert(kElementsPerScaleGroup % kElementsPerHalfGroup == 0,
     "An NVFP4 scale group must contain a whole number of half-groups");
 static_assert(kHalfGroupsPerScaleGroup == 2U, "NVFP4 stores one scale for two eight-value half-groups");
@@ -240,8 +238,7 @@ __host__ __device__ constexpr std::uint32_t scaleBytesForHalfGroups(std::uint32_
     return halfGroupCount / kHalfGroupsPerScaleGroup;
 }
 
-// Align packed shared staging to uint4; this padding is not stored in the cold
-// record.
+// Align packed shared staging to uint4; this padding is not stored in the cold record.
 __host__ __device__ constexpr std::uint32_t packedStageBytesForHalfGroups(std::uint32_t halfGroupCount)
 {
     return (packedBytesForHalfGroups(halfGroupCount) + sizeof(uint4) - 1U) / sizeof(uint4) * sizeof(uint4);
@@ -407,7 +404,7 @@ template <typename T>
 __device__ void copyLosslessSuffixToCold(
     std::uint8_t const* raw, std::uint8_t* coldLosslessSuffix, Nvfp4ColdPageKernelParams const& params)
 {
-    if (blockIdx.x != 0U || params.losslessSuffixBytesPerRow == 0)
+    if (blockIdx.x != 0U)
     {
         return;
     }
@@ -423,7 +420,7 @@ template <typename T>
 __device__ void restoreLosslessSuffixFromCold(
     std::uint8_t const* coldLosslessSuffix, std::uint8_t* raw, Nvfp4ColdPageKernelParams const& params)
 {
-    if (blockIdx.x != 0U || params.losslessSuffixBytesPerRow == 0)
+    if (blockIdx.x != 0U)
     {
         return;
     }
@@ -678,7 +675,10 @@ __global__ void offloadFrom16BitTiledKernel(
             scaleBytesForHalfGroups(halfGroups));
         __syncthreads();
     }
-    copyLosslessSuffixToCold<T>(task.raw, task.coldLosslessSuffix, params);
+    if (params.losslessSuffixBytesPerRow != 0)
+    {
+        copyLosslessSuffixToCold<T>(task.raw, task.coldLosslessSuffix, params);
+    }
     clearColdPadding(task, buffer);
 #endif
 }
@@ -758,7 +758,10 @@ __global__ void offloadFromFp8TiledKernel(
             scaleBytesForHalfGroups(halfGroups));
         __syncthreads();
     }
-    copyLosslessSuffixToCold<__nv_fp8_e4m3>(task.raw, task.coldLosslessSuffix, params);
+    if (params.losslessSuffixBytesPerRow != 0)
+    {
+        copyLosslessSuffixToCold<__nv_fp8_e4m3>(task.raw, task.coldLosslessSuffix, params);
+    }
     clearColdPadding(task, buffer);
 #endif
 }
@@ -899,7 +902,10 @@ __global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLau
         // Finish consumers before reusing shared memory.
         __syncthreads();
     }
-    restoreLosslessSuffixFromCold<T>(task.coldLosslessSuffix, task.raw, params);
+    if (params.losslessSuffixBytesPerRow != 0)
+    {
+        restoreLosslessSuffixFromCold<T>(task.coldLosslessSuffix, task.raw, params);
+    }
 #endif
 }
 
