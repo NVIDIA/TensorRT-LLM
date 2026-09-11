@@ -77,8 +77,10 @@ enum IntegerField : std::uint32_t
     kTokensPerPage,        // Number of token or compressed-entry rows per KV head in one
                            // Page.
     kHeadDim,              // Number of leading elements in each row encoded as NVFP4.
-    kRawRowStrideElements, // Element stride between hot rows; elements after
-                           // kHeadDim stay lossless.
+    kRawRowStrideElements, // Element stride between rows in the hot Page.
+    // Trailing bytes preserved after each row's NVFP4 prefix; zero when the
+    // whole row is quantized.
+    kLosslessSuffixBytesPerRow,
 };
 
 enum ScaleField : std::uint32_t
@@ -95,6 +97,7 @@ struct Nvfp4ColdPageKernelParams
     std::int32_t tokensPerPage;
     std::int32_t headDim;
     std::int32_t rawRowStrideElements;
+    std::int32_t losslessSuffixBytesPerRow;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -103,9 +106,8 @@ struct Nvfp4ColdPageKernelParams
 
 enum class Nvfp4ColdPageTransform : std::int32_t
 {
-    kNvfp4 = 0,
-    kLosslessCopy = 1,
-    kNvfp4WithLosslessSuffix = 2,
+    kNvfp4 = 0,        // Quantize the row prefix and preserve any declared suffix.
+    kLosslessCopy = 1, // Copy the entire buffer byte-for-byte.
 };
 
 struct Nvfp4ColdPageBuffer
@@ -193,8 +195,8 @@ __device__ Nvfp4ColdPageBuffer loadBuffer(std::uint32_t index, Nvfp4ColdPageWide
         static_cast<std::size_t>(w[kRawBytes]), static_cast<std::size_t>(w[kColdDataOffset]),
         static_cast<std::size_t>(w[kColdScaleOffset]), static_cast<std::size_t>(w[kColdPaddingOffset]),
         static_cast<std::uint32_t>(i[kColdPaddingBytes]), static_cast<Nvfp4ColdPageTransform>(i[kTransform]),
-        {i[kNumKvHeads], i[kTokensPerPage], i[kHeadDim], i[kRawRowStrideElements], s[kNvfp4ScaleOrigQuant],
-            s[kNvfp4ScaleQuantOrig], s[kFp8ScaleOrigQuant], s[kFp8ScaleQuantOrig]}};
+        {i[kNumKvHeads], i[kTokensPerPage], i[kHeadDim], i[kRawRowStrideElements], i[kLosslessSuffixBytesPerRow],
+            s[kNvfp4ScaleOrigQuant], s[kNvfp4ScaleQuantOrig], s[kFp8ScaleOrigQuant], s[kFp8ScaleQuantOrig]}};
 }
 
 // A prefix-quantized buffer stores its lossless row suffix immediately after
@@ -264,6 +266,8 @@ template <std::uint32_t kElementsPerGroup>
 __host__ __device__ constexpr std::uint32_t rawGroupElementOffset(
     Nvfp4ColdPageKernelParams const& params, std::uint32_t group)
 {
+    // Most models store fully quantized, contiguous rows. Keep that common path
+    // free of integer division and modulo.
     if (params.rawRowStrideElements == params.headDim)
     {
         return group * kElementsPerGroup;
@@ -403,7 +407,7 @@ template <typename T>
 __device__ void copyLosslessSuffixToCold(
     std::uint8_t const* raw, std::uint8_t* coldLosslessSuffix, Nvfp4ColdPageKernelParams const& params)
 {
-    if (blockIdx.x != 0U)
+    if (blockIdx.x != 0U || params.losslessSuffixBytesPerRow == 0)
     {
         return;
     }
@@ -411,15 +415,15 @@ __device__ void copyLosslessSuffixToCold(
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
     std::size_t const prefixBytes = static_cast<std::size_t>(params.headDim) * sizeof(T);
-    std::size_t const suffixBytes = rawRowBytes - prefixBytes;
-    copyStridedRows(raw, rawRowBytes, prefixBytes, coldLosslessSuffix, suffixBytes, 0, rows, suffixBytes);
+    std::size_t const suffixBytesPerRow = static_cast<std::size_t>(params.losslessSuffixBytesPerRow);
+    copyStridedRows(raw, rawRowBytes, prefixBytes, coldLosslessSuffix, suffixBytesPerRow, 0, rows, suffixBytesPerRow);
 }
 
 template <typename T>
 __device__ void restoreLosslessSuffixFromCold(
     std::uint8_t const* coldLosslessSuffix, std::uint8_t* raw, Nvfp4ColdPageKernelParams const& params)
 {
-    if (blockIdx.x != 0U)
+    if (blockIdx.x != 0U || params.losslessSuffixBytesPerRow == 0)
     {
         return;
     }
@@ -427,8 +431,8 @@ __device__ void restoreLosslessSuffixFromCold(
         = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
     std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
     std::size_t const prefixBytes = static_cast<std::size_t>(params.headDim) * sizeof(T);
-    std::size_t const suffixBytes = rawRowBytes - prefixBytes;
-    copyStridedRows(coldLosslessSuffix, suffixBytes, 0, raw, rawRowBytes, prefixBytes, rows, suffixBytes);
+    std::size_t const suffixBytesPerRow = static_cast<std::size_t>(params.losslessSuffixBytesPerRow);
+    copyStridedRows(coldLosslessSuffix, suffixBytesPerRow, 0, raw, rawRowBytes, prefixBytes, rows, suffixBytesPerRow);
 }
 
 __device__ __forceinline__ uint4 collectTwoFp8Words(std::uint64_t first, std::uint64_t second)
@@ -674,10 +678,7 @@ __global__ void offloadFrom16BitTiledKernel(
             scaleBytesForHalfGroups(halfGroups));
         __syncthreads();
     }
-    if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4WithLosslessSuffix)
-    {
-        copyLosslessSuffixToCold<T>(task.raw, task.coldLosslessSuffix, params);
-    }
+    copyLosslessSuffixToCold<T>(task.raw, task.coldLosslessSuffix, params);
     clearColdPadding(task, buffer);
 #endif
 }
@@ -757,10 +758,7 @@ __global__ void offloadFromFp8TiledKernel(
             scaleBytesForHalfGroups(halfGroups));
         __syncthreads();
     }
-    if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4WithLosslessSuffix)
-    {
-        copyLosslessSuffixToCold<__nv_fp8_e4m3>(task.raw, task.coldLosslessSuffix, params);
-    }
+    copyLosslessSuffixToCold<__nv_fp8_e4m3>(task.raw, task.coldLosslessSuffix, params);
     clearColdPadding(task, buffer);
 #endif
 }
@@ -901,10 +899,7 @@ __global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLau
         // Finish consumers before reusing shared memory.
         __syncthreads();
     }
-    if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4WithLosslessSuffix)
-    {
-        restoreLosslessSuffixFromCold<T>(task.coldLosslessSuffix, task.raw, params);
-    }
+    restoreLosslessSuffixFromCold<T>(task.coldLosslessSuffix, task.raw, params);
 #endif
 }
 

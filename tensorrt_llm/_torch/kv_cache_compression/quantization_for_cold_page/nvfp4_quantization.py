@@ -38,11 +38,10 @@ _ELEMENTS_PER_HALF_GROUP = 8
 _MAX_HALF_GROUPS_PER_TILE = 2048
 _MAX_BUFFERS_PER_LAUNCH = 256
 _WIDE_FIELDS = 6
-_INTEGER_FIELDS = 6
+_INTEGER_FIELDS = 7
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
-_NVFP4_WITH_LOSSLESS_SUFFIX_TRANSFORM = 2
 
 _DEEPSEEK_V4_PREFIX = "deepseek_v4_"
 _DEEPSEEK_V4_SWA = f"{_DEEPSEEK_V4_PREFIX}swa"
@@ -419,12 +418,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             compressed_count = sum(buffer.scales is not None for buffer in layout.buffers)
             packed_bytes = elements // _ELEMENTS_PER_BYTE
             scale_bytes = elements // _ELEMENTS_PER_SCALE
-            suffix_bytes = (
-                layout.num_kv_heads
-                * layout.tokens_per_page
-                * (layout.raw_row_stride_elements - layout.head_dim)
-                * element_bytes
-            )
+            suffix_bytes_per_row = (
+                layout.raw_row_stride_elements - layout.head_dim
+            ) * element_bytes
+            suffix_bytes = layout.num_kv_heads * layout.tokens_per_page * suffix_bytes_per_row
             layer_start = cold_page_bytes
             scale_start = layer_start + compressed_count * packed_bytes
             scale_and_suffix_bytes = scale_bytes + suffix_bytes
@@ -459,12 +456,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     scale_offset = 0
                     cursor += raw_bytes
 
-                if not is_compressed:
-                    transform = _LOSSLESS_TRANSFORM
-                elif suffix_bytes:
-                    transform = _NVFP4_WITH_LOSSLESS_SUFFIX_TRANSFORM
-                else:
-                    transform = _NVFP4_TRANSFORM
+                transform = _NVFP4_TRANSFORM if is_compressed else _LOSSLESS_TRANSFORM
 
                 wide_rows.append(
                     [
@@ -484,6 +476,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         layout.tokens_per_page if is_compressed else 0,
                         layout.head_dim if is_compressed else 0,
                         layout.raw_row_stride_elements if is_compressed else 0,
+                        suffix_bytes_per_row if is_compressed else 0,
                     ]
                 )
                 buffer_scales = buffer.scales if is_compressed else _Nvfp4Scales(1.0, 1.0)

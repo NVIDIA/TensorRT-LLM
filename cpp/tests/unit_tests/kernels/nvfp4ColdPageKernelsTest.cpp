@@ -54,6 +54,7 @@ struct Nvfp4ColdPageKernelParams
     std::int32_t tokensPerPage;
     std::int32_t headDim;
     std::int32_t rawRowStrideElements;
+    std::int32_t losslessSuffixBytesPerRow;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -64,7 +65,6 @@ enum class Nvfp4ColdPageTransform : std::int32_t
 {
     kNvfp4 = 0,
     kLosslessCopy = 1,
-    kNvfp4WithLosslessSuffix = 2,
 };
 
 struct Nvfp4ColdPageTestBuffer
@@ -107,7 +107,7 @@ Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPag
                 static_cast<std::int64_t>(buffer.coldScaleOffset), static_cast<std::int64_t>(buffer.coldPaddingOffset)};
         metadata.integers[index] = {static_cast<std::int32_t>(buffer.coldPaddingBytes),
             static_cast<std::int32_t>(buffer.transform), buffer.params.numKvHeads, buffer.params.tokensPerPage,
-            buffer.params.headDim, buffer.params.rawRowStrideElements};
+            buffer.params.headDim, buffer.params.rawRowStrideElements, buffer.params.losslessSuffixBytesPerRow};
         metadata.scales[index] = {buffer.params.nvfp4ScaleOrigQuant, buffer.params.nvfp4ScaleQuantOrig,
             buffer.params.fp8ScaleOrigQuant, buffer.params.fp8ScaleQuantOrig};
         if (buffer.transform != Nvfp4ColdPageTransform::kLosslessCopy)
@@ -980,6 +980,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
     std::size_t const ropeElements = kDeepseekV4RowElements - geometry.headDim;
     auto params = makeParams(geometry);
     params.rawRowStrideElements = kDeepseekV4RowElements;
+    params.losslessSuffixBytesPerRow = static_cast<std::int32_t>(ropeElements * rawElementBytes(kind));
     params.nvfp4ScaleOrigQuant = nvfp4ScaleOrigQuant;
     params.nvfp4ScaleQuantOrig = nvfp4ScaleQuantOrig;
     params.fp8ScaleOrigQuant = 1.0F;
@@ -1015,9 +1016,8 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
 
     auto const makeMetadata = [&](DeviceRegion const& raw)
     {
-        std::vector<Nvfp4ColdPageTestBuffer> const buffers{
-            {reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes, rawPageBytes, 0U, packed, payloadBytes,
-                paddingBytes, Nvfp4ColdPageTransform::kNvfp4WithLosslessSuffix, params}};
+        std::vector<Nvfp4ColdPageTestBuffer> const buffers{{reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes,
+            rawPageBytes, 0U, packed, payloadBytes, paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params}};
         return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
     };
     auto const inputMetadata = makeMetadata(rawInput);
@@ -1088,6 +1088,7 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
     std::size_t constexpr numPages = variantsPerCount * kDeepseekV4ValidTokenCounts.size();
     auto params = makeParams(kDeepseekV4NopeGeometry);
     params.rawRowStrideElements = kDeepseekV4RowElements;
+    params.losslessSuffixBytesPerRow = static_cast<std::int32_t>(ropeElements * rawElementBytes(kind));
     params.fp8ScaleOrigQuant = 1.0F;
     params.fp8ScaleQuantOrig = 1.0F;
     std::size_t const elementBytes = rawElementBytes(kind);
@@ -1117,9 +1118,9 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
     auto const makeMetadata = [&](DeviceRegion const& raw)
     {
         std::size_t const payloadBytes = packed + scales + suffix;
-        std::vector<Nvfp4ColdPageTestBuffer> const buffers{{reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes,
-            rawPageBytes, 0U, packed, payloadBytes, static_cast<std::uint32_t>(coldPageBytes - payloadBytes),
-            Nvfp4ColdPageTransform::kNvfp4WithLosslessSuffix, params}};
+        std::vector<Nvfp4ColdPageTestBuffer> const buffers{
+            {reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes, rawPageBytes, 0U, packed, payloadBytes,
+                static_cast<std::uint32_t>(coldPageBytes - payloadBytes), Nvfp4ColdPageTransform::kNvfp4, params}};
         return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
     };
     auto const inputMetadata = makeMetadata(rawInput);
