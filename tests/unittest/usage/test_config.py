@@ -83,7 +83,7 @@ class TestTelemetryConfigLocation:
 class TestBackwardCompatibility:
     """Verify types are still importable from llm_args for backward compat."""
 
-    def test_telemetry_types_preserve_legacy_imports(self):
+    def test_telemetry_types_preserve_legacy_imports(self) -> None:
         from tensorrt_llm.llmapi.llm_args import TelemetryConfig as LegacyTelemetryConfig
         from tensorrt_llm.llmapi.llm_args import UsageContext as LegacyUsageContext
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
