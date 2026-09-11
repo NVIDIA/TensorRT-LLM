@@ -44,9 +44,8 @@ from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
-                        log_attention_failure_context,
                         merge_attention_forward_args)
-from .page_table_check import check_page_table
+from .utils import check_page_table, log_attention_failure_context
 
 # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
 # check would force a CUDA context at import time.

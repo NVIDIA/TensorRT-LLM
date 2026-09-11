@@ -26,12 +26,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends import interface
+from tensorrt_llm._torch.attention.backends import utils
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     PredefinedAttentionMask,
-    log_attention_failure_context,
 )
+from tensorrt_llm._torch.attention.backends.utils import log_attention_failure_context
 
 
 class _CapturingLogger:
@@ -68,7 +68,7 @@ def _fake_metadata(**overrides):
 
 def test_failure_context_reports_shapes_and_window(monkeypatch) -> None:
     capturing_logger = _CapturingLogger()
-    monkeypatch.setattr(interface, "logger", capturing_logger)
+    monkeypatch.setattr(utils, "logger", capturing_logger)
 
     log_attention_failure_context(
         "TrtllmAttention", 3, _fake_metadata(), 2048, RuntimeError("CUBLAS_STATUS_EXECUTION_FAILED")
