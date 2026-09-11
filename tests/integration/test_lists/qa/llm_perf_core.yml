@@ -106,7 +106,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_35b_a3b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:8000,1000-con:256] #max_throughput
     #qwen3.5_122b_a10b (MoE BF16 234G, 4-GPU)
   - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:128,128-ep:4-tp:4-gpus:4]
-  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:500,2000-ep:4-tp:4-gpus:4]
+  - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-kv_frac:0.8-input_output_len:500,2000-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:2000,500-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:8000,1000-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[qwen3.5_122b_a10b-bench-pytorch-bfloat16-input_output_len:1000,2000-ep:4-tp:4-gpus:4]

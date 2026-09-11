@@ -248,6 +248,16 @@ public:
 
     PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
+
+    // Whether a pool group must reserve headroom for sequences to grow.
+    //
+    // The headroom keeps free slots available so that already-admitted requests can grow during the current and
+    // next batch steps; without it a sequence would hit a growth failure almost immediately after being admitted.
+    // Life cycles sharing a pool group draw from the same free slots, so a group needs the reserve exactly when
+    // any of its life cycles lacks a constant per-sequence state size. A pure SSM pool group is one slot per
+    // sequence forever and may therefore use all of its physical slots.
+    bool poolGroupNeedsHeadroomForGrowth(PoolGroupIndex pgIdx) const;
+
     PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
 
