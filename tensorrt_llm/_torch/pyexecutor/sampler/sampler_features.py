@@ -49,6 +49,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..llm_request import LlmRequest
+from .embedding_bias import try_apply_cached_embedding_bias
 from .sampler_common import DEFAULT_BEAM_IDX
 
 if sys.version_info[:2] >= (3, 12):
@@ -462,6 +463,8 @@ def apply_embedding_bias(
     logits: torch.Tensor,
     requests: list[LlmRequest],
     request_steps: torch.Tensor,
+    *,
+    request_beams: torch.Tensor | None = None,
 ) -> None:
     """Apply embedding bias (aka logit bias) to logits.
 
@@ -470,6 +473,9 @@ def apply_embedding_bias(
 
     Modifies logits in-place.
     """
+    if try_apply_cached_embedding_bias(logits, requests, request_steps, request_beams):
+        return
+
     # NB: Unfortunately, Torch provides no combination of torch.index_select (similar to
     #     torch.Tensor.gather -- allows one-to-many mapping) and addition, analogous to how
     #     torch.Tensor.scatter_add_ (and its variant torch.Tensor.index_add_ -- allows

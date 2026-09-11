@@ -1535,6 +1535,8 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        for request in self.active_requests:
+            request._py_embedding_bias_cache = None
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -8095,6 +8097,9 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        # Device bias records sampling-stream uses before raw-pointer kernels run,
+        # so releasing request ownership cannot recycle in-flight storage.
+        request._py_embedding_bias_cache = None
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
