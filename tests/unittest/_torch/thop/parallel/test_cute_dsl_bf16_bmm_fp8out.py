@@ -12,13 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for ``trtllm::cute_dsl_bf16_bmm_fp8out_blackwell``.
-
-BF16 x BF16 batched GEMM (FP32 accumulate) whose epilogue stores FP8 E4M3 at
-unit scale, possibly into a strided column slice of a wider buffer. It replaces
-the bf16 absorb bmm + standalone quantizeCopyInputToFp8Kernel pair on the
-GLM 5.2 / DSv3.2 MLA context path (MLA.forward_absorption_context), writing the
-nope columns of the FP8 Q buffer directly.
+"""Unit tests for ``trtllm::cute_dsl_bf16_bmm_fp8out_blackwell`` (BF16 x BF16 bmm,
+FP32 accumulate, FP8 E4M3 store at unit scale, optionally into a column slice).
 
 Reference: torch.bmm in fp32 -> .to(float8_e4m3fn). Tensor-core accumulation
 order differs from torch's, so values sitting on an FP8 rounding boundary can
@@ -34,9 +29,8 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import is_sm_100f
 
 skip_unless_available = pytest.mark.skipif(
-    not is_sm_100f() or not IS_CUTLASS_DSL_AVAILABLE
-    or not hasattr(torch.ops.trtllm, "cute_dsl_bf16_bmm_fp8out_blackwell"),
-    reason="Requires SM100 family, CuTe DSL and the cute_dsl_bf16_bmm_fp8out_blackwell op",
+    not is_sm_100f() or not IS_CUTLASS_DSL_AVAILABLE,
+    reason="Requires the SM100 family and CuTe DSL",
 )
 
 
@@ -75,8 +69,9 @@ def test_bf16_bmm_fp8out_contiguous(batch, m, n, k):
 
 
 @skip_unless_available
+@pytest.mark.parametrize("use_tvm_ffi", [True, False])
 @pytest.mark.parametrize("num_tokens", [64, 1000, 8192])
-def test_bf16_bmm_fp8out_mla_absorb_column_slice(num_tokens):
+def test_bf16_bmm_fp8out_mla_absorb_column_slice(num_tokens, use_tvm_ffi):
     """The production call: q_nope [tokens, H, 192] (transposed view of the
     q_b_proj output) x W_UK^T [H, 512, 192] written into columns 0..511 of the
     FP8 Q buffer [tokens, H, 576]; columns 512..575 (the RoPE segment the RoPE
@@ -88,13 +83,14 @@ def test_bf16_bmm_fp8out_mla_absorb_column_slice(num_tokens):
     q_nope = q[..., :nope]  # [tokens, H, 192], row-strided view
     w_uk_t = torch.randn(heads, lora, nope, dtype=torch.bfloat16, device=device) * (4.0 / nope**0.5)
     quant_q = torch.empty(num_tokens, heads, lora + rope, dtype=torch.float8_e4m3fn, device=device)
-    sentinel = torch.full_like(quant_q[..., lora:], 3.0).to(torch.float8_e4m3fn)
+    sentinel = torch.full_like(quant_q[..., lora:], 3.0)
     quant_q[..., lora:] = sentinel
 
     torch.ops.trtllm.cute_dsl_bf16_bmm_fp8out_blackwell(
         q_nope.transpose(0, 1),  # [H, tokens, 192], K contiguous
         w_uk_t,  # [H, 512, 192]
         quant_q[..., :lora].transpose(0, 1),  # [H, tokens, 512], N contiguous, row stride 576
+        use_tvm_ffi=use_tvm_ffi,
     )
     torch.cuda.synchronize()
     ref = _ref_fp8(q_nope.transpose(0, 1).contiguous(), w_uk_t)  # [H, tokens, 512]
