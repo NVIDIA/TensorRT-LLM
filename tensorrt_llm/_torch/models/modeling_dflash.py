@@ -464,18 +464,15 @@ class DFlashForCausalLM(nn.Module):
         The truth is the constructed module tree, not a hand-kept list that
         rots as the backbone changes.
 
-        Checked at module granularity. For a PLAIN module that is the hole the
-        flag cannot close: the loader skips one whose subtree filters to
-        nothing (modeling_utils.py `if module_weights:`) whatever the flag
-        says. For a FUSED module `allow_partial_loading=False` would catch it
-        (linear.py asserts all three shards) -- but the flag has to stay True
-        for the target-shared modules, so the check covers that case here
-        instead, and requires every component rather than any.
+        Module granularity. A PLAIN module is the hole `allow_partial_loading`
+        cannot close -- the loader skips one whose subtree filters to nothing
+        (modeling_utils.py `if module_weights:`) whatever the flag says. A FUSED
+        module `allow_partial_loading=False` would catch (linear.py asserts all
+        three shards), but the flag must stay True for the target-shared
+        modules, so this requires every component rather than any.
 
-        Missing parameters INSIDE a present component stay tolerated: a
-        checkpoint with all three weights but only `q_proj.bias` takes the same
-        per-shard copy and leaves the rest at `torch.empty`. Module-granular
-        checking cannot see that and does not pretend to.
+        Missing parameters INSIDE a present component stay tolerated: all three
+        weights but only `q_proj.bias` leaves the rest at `torch.empty`.
         """
         provided = set(weights)
 

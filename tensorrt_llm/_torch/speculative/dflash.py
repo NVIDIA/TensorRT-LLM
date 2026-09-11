@@ -85,23 +85,17 @@ def dflash_allocated_ctx_limit(
 ) -> torch.Tensor:
     """Context length a request may advertise, given the pages it holds.
 
-    Leaves ``block_size`` positions of room on purpose. The MLA path writes the
-    block's own latents at ``ctx_len .. ctx_len + block_size``, so stopping at
-    exactly the allocation puts the first of them on the first UNallocated page
-    -- whose block-table entry ``_refresh_ctx_block_tables`` clamped from a
-    negative placeholder to 0, i.e. another request's block. That is a silent
-    cross-request write, not an out-of-range fault, so the room has to be left
-    here rather than caught downstream.
+    Leaves ``block_size`` positions of room: the MLA path writes the block's own
+    latents at ``ctx_len .. ctx_len + block_size``, so stopping at exactly the
+    allocation puts the first of them on an unallocated page, whose table entry
+    ``_refresh_ctx_block_tables`` clamped to 0 -- another request's block. A
+    silent cross-request write, not a fault.
 
-    How tight this is depends on the V2 backend, and only one of the two keeps
-    the information. ``copyBatchBlockOffsetsToDeviceKernel``
-    (kvCacheManagerV2Utils.cu) writes ``0`` for ``BAD_PAGE_INDEX``, so under the
-    default ``cpp`` backend every row counts full and this degenerates to the
-    block-table-width bound upstream already applied -- correct, just not
-    per-request. The ``python`` backend propagates ``BAD_PAGE_INDEX`` through
-    ``_copy_swa_block_offsets_with_scratch``, and there the bound is real.
-    Sized from the counts either way so the tight case needs no second code
-    path; do not read a per-request guarantee into it on ``cpp``.
+    Per-request only on the ``python`` V2 backend, which propagates
+    ``BAD_PAGE_INDEX``. The default ``cpp`` one maps it to 0
+    (kvCacheManagerV2Utils.cu), every row counts full, and this degenerates to
+    the block-table-width bound upstream already applied. Do not read a
+    per-request guarantee into it there.
     """
     return (block_counts * page_size - block_size).clamp(min=0)
 
@@ -637,14 +631,10 @@ class DFlashWorker(SpecWorkerBase):
         hd = draft_model._head_dim
         kv_factor = getattr(draft_model, "_kv_factor", 2)
         capacity = self._max_ctx + self._compute_block_size
-        # The one number a drafter that builds an absolute-position table needs,
-        # published from the only place that knows it: _max_ctx comes from
-        # attn_metadata.max_seq_len, the engine's value, which
+        # Published before any drafter table is built, so a drafter may read it
+        # instead of its config cap. _max_ctx is attn_metadata.max_seq_len, which
         # py_executor_creator raises past model_config.max_seq_len and never
-        # writes back. Tables are built lazily on first forward and this runs
-        # before any of them, so a drafter may read it in place of its
-        # config-derived cap. _compute_block_size, not _resolved_block_size:
-        # the block decode's j runs over the slots the forward computes.
+        # writes back. _compute_block_size: the block decode's j runs over it.
         draft_model._runtime_position_ceiling = dflash_position_ceiling(
             self._max_ctx, self._compute_block_size, self.max_draft_len
         )
@@ -1414,14 +1404,10 @@ class DFlashWorker(SpecWorkerBase):
 
             num_ctx_per_req_t = self._ctx_len[slots]
             if self._ctx_block_tables is not None:
-                # ctx_len tracks the target sequence, but the write above clamps
-                # columns to what the manager allocated for this request, so a
-                # context that outruns its allocation has its tail written on
-                # top of the last valid slot. Reading past the allocation would
-                # then attend either that clobbered value or -- for pages the
-                # block table left clamped to 0 -- another request's data.
-                # Truncating the advertised length keeps the two consistent:
-                # the drafter attends a short context instead of a wrong one.
+                # The write above clamps columns to the request's allocation, so
+                # a context that outruns it has its tail written over the last
+                # valid slot. Truncate what is advertised to match, or the read
+                # attends that clobbered value -- or another request's page.
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )

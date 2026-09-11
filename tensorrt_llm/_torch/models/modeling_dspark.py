@@ -1990,15 +1990,11 @@ class DSv4DSparkForCausalLM(nn.Module):
 # ----------------------------------------------------------------------------
 # MLA-shaped standalone drafter backbone (Inferact/Kimi-K3-DSpark).
 #
-# A weight container, not a servable model: ``DFlashForCausalLM`` builds this
-# through the registry only to own the drafter's modules, then runs its own
-# hand-written block decode over them (see ``MLADSparkForCausalLM``). Nothing
-# here registers with the attention backend or the KV cache manager, so the
-# layers deliberately have no working ``forward``.
-#
-# Not a ``DeepseekV3`` reuse: that model carries MoE branches, a fused
-# ``qkv_a_proj`` switch, quantization and KV-manager registration, none of
-# which this bf16 five-layer drafter has.
+# A weight container, not a servable model: nothing here registers with the
+# attention backend or the KV cache manager, so the layers have no working
+# ``forward``. ``MLADSparkForCausalLM`` runs its own block decode over them.
+# Not a ``DeepseekV3`` subclass -- that carries MoE, a fused ``qkv_a_proj``
+# switch, quantization and KV-manager registration, none of which apply.
 # ----------------------------------------------------------------------------
 
 
@@ -2023,18 +2019,14 @@ def build_dspark_mla_yarn_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """YaRN cos/sin tables for an MLA drafter's ``qk_rope_head_dim`` slice.
 
-    Repacks ``RopeEmbeddingUtils.create_sinusoidal_positions_yarn``, which is
-    the same HF DeepSeek-V2 transcription the drafters are distilled under --
-    verified bit-identical to the hand-rolled table this replaced, on the K3
-    Inferact parameters. What is deliberately NOT reused is
-    ``RopeParams.create_rope_const_params()``: it pins the fused MLA kernel's
-    GPT-J packing, which rotates differently and costs acceptance silently.
+    Repacks ``RopeEmbeddingUtils.create_sinusoidal_positions_yarn``, the same HF
+    DeepSeek-V2 transcription the drafters are distilled under. NOT reused:
+    ``RopeParams.create_rope_const_params()`` pins the fused MLA kernel's GPT-J
+    packing and hard-codes ``device='cuda'``.
 
-    ``duplicate_data=True`` even though only the first half is read as a
-    complex pair. The util's two modes disagree by 1 ulp on 6 of 8224 entries
-    (torch's ``cos`` vectorises a ``[n, dim, 1]`` input differently than a
-    ``[n, dim/2, 1]`` one), and the duplicated one is what every measured
-    drafter run used.
+    ``duplicate_data=True`` though only the first half is read as a complex
+    pair: the util's two modes disagree by 1 ulp on 6 of 8224 entries, and the
+    duplicated one is what every measured drafter run used.
 
     Returns ``(cos, sin)``, both ``[max_position_embeddings, dim]`` fp32, with
     the frequency half duplicated so ``rotate_half`` applies.
@@ -2066,16 +2058,11 @@ def build_dspark_mla_yarn_freqs_cis(*, device: str = "cuda", **kwargs) -> torch.
     fused ``cute_dsl_dspark_rmsnorm_rope`` kernel consumes, where the last dim of
     the rotated slice is read as (re, im) pairs.
 
-    HF DeepSeek instead de-interleaves and then rotates halves. The two produce
-    the *same values in a different order*: with even/odd the pair members,
-    HF writes ``even*cos - odd*sin`` to lane i and ``odd*cos + even*sin`` to lane
-    i + dim/2, while this one writes them to lanes 2i and 2i+1. That permutation
-    of the rope slice cancels inside ``q_rope . k_rope``, so the drafter is free
-    to use either -- but every producer of a rope slice must use the SAME one.
-    Mixing them changes the scores silently and only shows up as lower AL.
-
-    ``mscale`` rides in the modulus rather than the phase, exactly as the
-    cos/sin builder folds it into the table.
+    HF DeepSeek de-interleaves and rotates halves instead, writing the same
+    values to lanes i and i + dim/2 rather than 2i and 2i+1. That permutation
+    cancels inside ``q_rope . k_rope``, so either convention works -- but every
+    producer of a rope slice must use the SAME one, and mixing them only shows
+    up as lower AL. ``mscale`` rides in the modulus, not the phase.
     """
     cos, sin = build_dspark_mla_yarn_rope(device=device, **kwargs)
     half = cos.shape[-1] // 2
@@ -2329,22 +2316,16 @@ _MLA_DECODE_WORKSPACE_BYTES = 256 * 1024 * 1024
 class _MLABlockFixup(NamedTuple):
     """Layer-invariant state for the MLA block-decode fixup.
 
-    The block's own latents are written into the pool at ``ctx_len + j`` first.
-    Those slots belong to this request -- the draft KV manager adds
-    ``max(draft_len, max_total_draft_tokens)`` tokens to every generation
-    request each step (resource_manager.py:1060) -- and the accepted tokens
-    overwrite them next step, so the write is transient rather than a claim on
-    the cache. It is what the GQA drafter's TRTLLM backend already does
-    (modeling_dflash.py append_paged_kv_cache).
+    The block's own latents are written into the pool at ``ctx_len + j``. Those
+    slots belong to this request -- the draft KV manager adds
+    ``max(draft_len, max_total_draft_tokens)`` tokens to every generation request
+    each step (resource_manager.py:1060) -- and the accepted tokens overwrite
+    them next step, so the write is transient. Same thing the GQA drafter's
+    TRTLLM backend does (modeling_dflash.py append_paged_kv_cache).
 
-    With ``seq_lens = ctx_len + block_size`` the kernel's in-block causality
-    then leaves query j seeing block keys 0..j, so all that is left to fix up is
-    the block's strict upper triangle -- ``blk_kv`` itself, already in hand. The
-    earlier form kept the pool read-only and paid for it twice: a gather of the
-    hidden context tail, and a 15-key rather than 8-key fixup.
-
-    Every field depends only on ctx_len, the page table and the block geometry,
-    so it is built once per forward rather than once per layer.
+    In-block causality then leaves query j seeing block keys 0..j, so only the
+    strict upper triangle needs fixing up. Every field depends on ctx_len, the
+    page table and the block geometry alone, so it is built once per forward.
     """
 
     pages: torch.Tensor  # [B, block] page holding each block position
@@ -2579,12 +2560,10 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     """DSpark drafter on an MLA-shaped backbone, from a standalone checkpoint.
 
-    The sibling ``modeling_dspark``'s GQA class could not be: DFlash's block
-    decode splits a fused ``qkv_proj`` by (num_heads, num_kv_heads, head_dim)
-    and fuses per-head K/V across layers, and MLA has neither. What it keeps is
-    the DFlash *contract* -- dual-source KV (context from the projected target
-    hidden, block from the draft hidden), non-causal block attention, one
-    precomputed context cache -- and the DSpark head set on top.
+    Separate from the GQA class because DFlash's block decode splits a fused
+    ``qkv_proj`` by (num_heads, num_kv_heads, head_dim) and fuses per-head K/V
+    across layers, neither of which MLA has. It keeps the DFlash contract --
+    dual-source KV, non-causal block attention, one precomputed context cache.
 
     The cache stores one ``kv_lora_rank + qk_rope_head_dim`` latent per token
     per layer and no V, which is the point: 5 x 576 x 2B = 5760 B/token/rank
@@ -2722,18 +2701,12 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         full visibility). Its LSE is base 2 (also measured: exact against
         ``log2(sum exp)``, 1.84 off against the natural log).
 
-        The block's own latents go into the pool first, at ``ctx_len + j`` --
-        slots the draft KV manager already reserves for this request each step
+        The block's own latents go into the pool first, at ``ctx_len + j``
         (see _MLABlockFixup). With ``seq_lens = ctx_len + block_size`` the kernel
-        then covers context AND block, and in-block causality leaves only the
-        block's strict upper triangle: 8 keys, no context-tail gather. Those are
-        attended eagerly against ``blk_kv``, already in hand, and merged by
-        log-sum-exp.
-
-        Writing into the pool is safe because dflash.py bounds the advertised
-        context at ``allocated - block_size``; without that the first block
-        position lands on the first unallocated page, whose table entry was
-        clamped to physical block 0 -- another request's.
+        covers context AND block, and in-block causality leaves only the block's
+        strict upper triangle -- 8 keys, attended eagerly against ``blk_kv`` and
+        merged by log-sum-exp. The room those writes need is reserved by
+        ``dflash_allocated_ctx_limit``.
 
         Returns the latent-space output ``[B, block, heads, kv_lora_rank]``.
         """

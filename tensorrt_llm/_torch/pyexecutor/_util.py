@@ -1569,25 +1569,19 @@ class KvCacheCreator:
         private arena, which OOMs at long context), so the pool dtype must
         follow the drafter, not the target.
 
-        Every consumer that reasons about draft KV bytes must go through here.
-        Construction and the target/draft budget split reading different dtypes
-        is not cosmetic: the split then charges the draft fp8 bytes for a pool
-        allocated bf16, so the draft manager receives exactly HALF the tokens
-        the target gets. Because the capacity scheduler admits on the target
-        pool alone, the draft pool cannot backpressure -- it can only raise
-        "Draft KV cache context resize failed" out of
-        ``KVCacheManagerV2._prepare_draft_resources``, which is fatal to every
-        rank, as soon as resident context passes ~50% of target utilization.
+        Every consumer of draft KV bytes must go through here. If the budget
+        split and the allocation read different dtypes, the split charges fp8
+        bytes for a bf16 pool and the draft manager gets HALF the target's
+        tokens. The capacity scheduler admits on the target pool alone, so the
+        draft pool cannot backpressure -- past ~50% target utilization it raises
+        "Draft KV cache context resize failed", fatal to every rank.
         """
         effective_draft_config = self._get_effective_draft_config()
         # Narrower than is_external_drafter(), matching
-        # _should_create_separate_draft_kv_cache: PARD and
-        # DRAFT_TARGET_ONE_MODEL reach here too, via
-        # should_use_separate_draft_kv_cache, and their draft checkpoints can
-        # carry a genuine fp8 KV algo of their own -- with dtype="auto",
-        # validate_and_set_kv_cache_quant returns early and keeps it. Dropping
-        # that would allocate bf16 while their attention modules, built from
-        # the un-neutralized config, still read and write fp8.
+        # _should_create_separate_draft_kv_cache. PARD and DRAFT_TARGET_ONE_MODEL
+        # reach here too and can carry a genuine fp8 KV algo of their own, which
+        # dtype="auto" keeps; dropping it would allocate bf16 under attention
+        # modules that still read and write fp8.
         spec_dec_mode = self._speculative_config.spec_dec_mode
         if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
