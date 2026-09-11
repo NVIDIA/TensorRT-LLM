@@ -30,14 +30,14 @@ def test_begin_weight_update_releases_capture_and_prepares_modules() -> None:
     model_engine = SimpleNamespace(
         model=model,
         model_loader=MagicMock(),
-        release_piecewise_cuda_graphs_for_refit=MagicMock(),
+        unwrap_compiled_model_for_refit=MagicMock(),
     )
     extension = WorkerExtension.__new__(WorkerExtension)
     extension.engine = SimpleNamespace(model_engine=model_engine)
 
     extension.begin_weight_update()
 
-    model_engine.release_piecewise_cuda_graphs_for_refit.assert_called_once_with()
+    model_engine.unwrap_compiled_model_for_refit.assert_called_once_with()
     model_engine.model_loader.begin_update_weights.assert_called_once_with()
     model.layer.pre_reload_weights.assert_called_once_with()
 
@@ -45,7 +45,7 @@ def test_begin_weight_update_releases_capture_and_prepares_modules() -> None:
 def test_finish_weight_update_invalidates_cache_and_recaptures() -> None:
     resource_manager = object()
     model_engine = SimpleNamespace(
-        recapture_piecewise_cuda_graphs_after_refit=MagicMock(),
+        restore_compiled_model_after_refit=MagicMock(),
     )
     engine = SimpleNamespace(
         model_engine=model_engine,
@@ -60,7 +60,7 @@ def test_finish_weight_update_invalidates_cache_and_recaptures() -> None:
 
     engine.reset_prefix_cache.assert_called_once_with()
     synchronize.assert_called_once_with()
-    model_engine.recapture_piecewise_cuda_graphs_after_refit.assert_called_once_with(
+    model_engine.restore_compiled_model_after_refit.assert_called_once_with(
         resource_manager
     )
 
