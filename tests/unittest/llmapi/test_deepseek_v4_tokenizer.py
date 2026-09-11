@@ -353,6 +353,74 @@ def test_deepseek_v4_chat_template_uses_v4_tool_prompt_from_request_tools():
     assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
 
 
+def test_deepseek_v4_chat_template_keeps_system_prompt_before_request_tools():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "system",
+                "content": "SYSTEM_PROMPT_HERE",
+            },
+            {
+                "role": "user",
+                "content": "Weather?",
+            },
+        ],
+        tools=tools,
+        tokenize=False,
+    )
+
+    # The reference encoding renders the system content, then the tool block.
+    assert prompt.startswith("<｜begin▁of▁sentence｜>SYSTEM_PROMPT_HERE\n\n## Tools")
+    assert prompt.count("SYSTEM_PROMPT_HERE") == 1
+    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_chat_template_inserts_system_message_for_tools_without_system():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "developer",
+                "content": "DEV",
+            },
+            {
+                "role": "user",
+                "content": "Weather?",
+            },
+        ],
+        tools=tools,
+        tokenize=False,
+    )
+
+    # No leading system message, so the synthetic one is still inserted and the
+    # developer turn keeps rendering after the tool block, as before.
+    assert prompt.startswith("<｜begin▁of▁sentence｜>\n\n## Tools")
+    assert prompt.endswith("<｜User｜>DEV<｜User｜>Weather?<｜Assistant｜></think>")
+
+
 def test_deepseek_v4_chat_template_renders_tool_call_history():
     tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
     messages = [
