@@ -51,7 +51,10 @@ feature you turned on.
   `add_special_tokens=True` and is not accelerated.
 - A prompt that extends a cached entry replaces that entry, so a conversation
   costs one entry regardless of how many turns it has. Lookup is bucketed by a
-  hash of the first `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` characters.
+  hash of the first `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` characters, and each
+  entry keeps a short probe of its last characters so that conversations
+  sharing a long system preamble are told apart without comparing the
+  preamble. The candidate scan runs outside the cache lock.
 - An unexpected exception inside the cache disables it, with a warning, and the
   request is tokenized normally. A cache problem never fails a request.
 - The cache logs its configuration at startup and, every 1000 cache-eligible
