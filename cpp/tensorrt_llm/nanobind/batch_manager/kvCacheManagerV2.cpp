@@ -255,6 +255,33 @@ static std::pair<std::vector<kv::TokenIdExt>, bool> castTokenIterable(nb::handle
     return {std::move(vec), knownNoDigest};
 }
 
+// A content name is 32 raw bytes. Converted by hand like every binding here:
+// Digest and the strong index types have no caster, so naming one in a signature
+// yields an entry that answers hasattr and raises TypeError on every use.
+static std::vector<kv::BlockKey> castBlockKeys(nb::sequence const& keys)
+{
+    std::vector<kv::BlockKey> out;
+    for (auto item : keys)
+    {
+        // Asked before casting: nb::cast_error has no translator here, so a str
+        // or an int would surface as RuntimeError where the other backend
+        // raises ValueError -- the same name refused two different ways.
+        if (!nb::isinstance<nb::bytes>(item))
+        {
+            throw std::invalid_argument("a block key must be bytes");
+        }
+        auto b = nb::cast<nb::bytes>(item);
+        if (nb::len(b) != kv::kDIGEST_LEN)
+        {
+            throw std::invalid_argument("a block key must be exactly kDIGEST_LEN bytes");
+        }
+        kv::BlockKey key;
+        std::memcpy(key.data(), b.c_str(), kv::kDIGEST_LEN);
+        out.push_back(key);
+    }
+    return out;
+}
+
 // Zero-copy-friendly token ingestion. Invokes fn(TokenSpan, knownNoDigest) with a non-owning
 // view of the tokens; fn must consume it synchronously (it may release the GIL — the backing
 // buffer must outlive the call).
@@ -1849,6 +1876,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         { return std::make_unique<TestPaddingColdPageCodec>(std::move(coldPageBytesByLayer)); },
         nb::arg("cold_page_bytes_by_layer"));
 
+    // The pools at a level below the hot one, which pool_group_descs does not
+    // reach. Only the hot base address is worth committing to -- a host pool is
+    // resized through mremap and can move -- so this stays experimental.
+    mIntrospection.def(
+        "pool_group_descs_at",
+        // A plain int, like every other level-taking binding here: the strong
+        // index has no caster, so naming it would yield an entry that exists,
+        // answers hasattr, and raises TypeError on every call.
+        [](kv::KvCacheManager const& manager, int level) -> nb::object
+        {
+            auto descs = manager.poolGroupDescsAt(kv::CacheLevel{level});
+            if (!descs.has_value())
+            {
+                // Not memory at this level -- a disk (fd, offset) -- or no such
+                // level in this build.
+                return nb::none();
+            }
+            return nb::cast(descs->raw());
+        },
+        nb::arg("manager"), nb::arg("level"));
+
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
     mIntrospection.def(
         "make_test_block",
@@ -2269,6 +2317,38 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
+        // Content-named lookup: the two questions a peer serving a chain it was
+        // asked for by content actually has. The match never crosses out --
+        // what is needed is a level and a length.
+        .def(
+            "servable_chain",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::sequence const& keys,
+                std::vector<int> const& lifeCycles) -> nb::object
+            {
+                auto const blockKeys = castBlockKeys(keys);
+                std::vector<kv::LifeCycleId> lcIds;
+                lcIds.reserve(lifeCycles.size());
+                for (auto lc : lifeCycles)
+                {
+                    lcIds.emplace_back(lc);
+                }
+                std::optional<std::pair<kv::CacheLevel, int>> found;
+                {
+                    nb::gil_scoped_release release;
+                    found = self->servableChain(blockKeys, lcIds);
+                }
+                if (!found.has_value())
+                {
+                    return nb::none();
+                }
+                return nb::make_tuple(found->first.value(), found->second);
+            },
+            nb::arg("keys"), nb::arg("life_cycles"))
+        .def(
+            "create_kv_cache_from_keys",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::sequence const& keys, std::optional<kv::RequestIdType> id)
+            { return self->createKvCacheFromKeys(castBlockKeys(keys), id); },
+            nb::arg("keys"), nb::arg("id") = std::nullopt)
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
             nb::arg("data_role"), nb::arg("index_mode") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))

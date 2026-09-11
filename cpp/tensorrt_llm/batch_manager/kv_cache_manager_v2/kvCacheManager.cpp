@@ -209,6 +209,112 @@ int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, boo
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
+BlockRadixTree::ReuseMatch KvCacheManager::matchReuseByKeys(std::vector<BlockKey> const& keys) const
+{
+    return mRadixTree->matchKeys(keys);
+}
+
+namespace
+{
+// numTokens counts every matched link as a whole block, so it cannot be the
+// test: a link naming a block that holds fewer tokens still passes it. The
+// blocks are asked instead, which is what a holder built from them will read.
+bool isWholeBlockChain(BlockRadixTree::ReuseMatch const& match, int tokensPerBlock)
+{
+    if (match.numTokens != match.blocks.size().value() * tokensPerBlock)
+    {
+        return false;
+    }
+    return std::all_of(match.blocks.begin(), match.blocks.end(),
+        [tokensPerBlock](auto const* block) { return static_cast<int>(block->tokens.size()) == tokensPerBlock; });
+}
+} // namespace
+
+std::optional<std::pair<CacheLevel, int>> KvCacheManager::servableChain(
+    std::vector<BlockKey> const& keys, std::vector<LifeCycleId> const& lifeCycles) const
+{
+    // getPage indexes a TypedVec unchecked, so an id arriving from Python is an
+    // out-of-bounds read in a release build. Refused rather than answered as a
+    // miss: the caller named a life cycle this manager does not have.
+    auto const numLifeCycles = this->lifeCycles().size();
+    for (auto const lcId : lifeCycles)
+    {
+        if (lcId < LifeCycleId{0} || !(lcId < numLifeCycles))
+        {
+            throw std::invalid_argument("servableChain: life cycle id out of range");
+        }
+    }
+    auto const match = matchReuseByKeys(keys);
+    // All-or-nothing has no way to serve a fraction of a block, and the peer
+    // would read the untouched tail as if it were content.
+    if (!isWholeBlockChain(match, tokensPerBlock()))
+    {
+        return std::nullopt;
+    }
+    auto const level = uniformCacheLevel(match, lifeCycles);
+    if (!level.has_value())
+    {
+        return std::nullopt;
+    }
+    return std::make_pair(*level, match.numTokens);
+}
+
+std::optional<CacheLevel> KvCacheManager::uniformCacheLevel(
+    BlockRadixTree::ReuseMatch const& match, std::vector<LifeCycleId> const& lifeCycles) const
+{
+    if (match.blocks.empty())
+    {
+        return std::nullopt;
+    }
+    std::optional<CacheLevel> seen;
+    for (auto const* block : match.blocks)
+    {
+        for (auto const lcId : lifeCycles)
+        {
+            auto const* page = block->getPage(lcId);
+            if (page == nullptr)
+            {
+                return std::nullopt; // A life cycle this worker reads is uncovered.
+            }
+            if (!seen.has_value())
+            {
+                seen = page->cacheLevel;
+            }
+            else if (*seen != page->cacheLevel)
+            {
+                return std::nullopt; // The chain straddles two levels.
+            }
+        }
+    }
+    return seen;
+}
+
+std::shared_ptr<KvCache> KvCacheManager::createKvCacheFromKeys(
+    std::vector<BlockKey> const& keys, std::optional<RequestIdType> id)
+{
+    // An empty chain names nothing, so there is no honest prompt length to
+    // state, and the two backends would have stated it differently. Refused
+    // with invalid_argument, which nanobind renders as the other's ValueError.
+    if (keys.empty())
+    {
+        throw std::invalid_argument("createKvCacheFromKeys: an empty key chain names no blocks");
+    }
+    // Neither may be left blank: a null priority callback is called on any
+    // commit path, and textOnly must follow the manager rather than be forced.
+    auto priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };
+    auto const expectedPromptLength = static_cast<int>((keys.size() - 1) * static_cast<size_t>(tokensPerBlock()));
+    auto const match = matchReuseByKeys(keys);
+    // The scope below is the default one, not the chain's -- a key is a digest
+    // and does not invert. Refusing anything but whole blocks is what keeps
+    // close() from committing a remainder under that wrong root.
+    if (!isWholeBlockChain(match, tokensPerBlock()))
+    {
+        throw std::invalid_argument("createKvCacheFromKeys: the chain does not name whole blocks");
+    }
+    return std::make_shared<KvCache>(
+        *this, ReuseScope{}, match, std::move(id), std::move(priorityCb), expectedPromptLength, std::nullopt, false);
+}
+
 // ---- Memory pool queries --------------------------------------------------
 
 MemAddress KvCacheManager::getMemPoolBaseAddress(
@@ -351,6 +457,39 @@ std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<B
 
 TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
 {
+    // The hot level is memory by construction, so this never comes back empty.
+    // A call rather than a second copy of the walk: two would drift.
+    return poolGroupDescsAt(kHotLevel).value();
+}
+
+std::optional<TypedVec<PoolGroupIndex, PoolGroupDesc>> KvCacheManager::poolGroupDescsAt(CacheLevel level) const
+{
+    // A level this build does not have is not memory either. Both ends, because
+    // CacheLevel is signed and the binding takes a plain int: a negative one
+    // clears an upper-bound test and indexes mLevels past its front.
+    if (level < kHotLevel || !(level < mStorage->numCacheLevels()))
+    {
+        return std::nullopt;
+    }
+    // A caller addresses this tier as "the same groups, one level down", which a
+    // level shaped differently cannot be. Refused rather than approximated: the
+    // arithmetic does not fail on a mismatch, it lands on an unrelated pool.
+    auto const& hot = mStorage->mLevels[kHotLevel];
+    auto const& tier = mStorage->mLevels[level];
+    if (tier.numPoolGroups() != hot.numPoolGroups())
+    {
+        return std::nullopt;
+    }
+    // Group count and byte sizes agreeing is not the layout agreeing: a cold
+    // level regroups life cycles by encoded page size, so a reader addressing
+    // it as the hot layout can land on a pool belonging to another life cycle.
+    for (LifeCycleId lcId{0}; lcId < mLifeCycles.size(); ++lcId)
+    {
+        if (mStorage->getPoolGroupIndex(level, lcId) != mStorage->getPoolGroupIndex(kHotLevel, lcId))
+        {
+            return std::nullopt;
+        }
+    }
     auto const& slotDescList = mStorage->slotDescList();
     TypedVec<PoolGroupIndex, PoolGroupDesc> result;
     result.reserve(slotDescList.size());
@@ -358,17 +497,40 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
         auto const& slotDesc = slotDescList.at(pgIdx);
-        auto slotSizeList = mStorage->slotSize(pgIdx);
+        // The level's own slot sizes, not the hot level's: a cold slot can be
+        // the whole hot group concatenated, so they are neither the same count
+        // nor the same bytes.
+        auto const slotSizeList = tier.storage->slotSize(pgIdx);
+        auto const hotSizeList = hot.storage->slotSize(pgIdx);
+        // Same count *and* same bytes: a cold-page codec can repack one pool to
+        // one pool at a quarter the size, and a reader addressing that as the hot
+        // layout walks past the page it asked for. No peer check catches this.
+        if (slotSizeList.size() != hotSizeList.size())
+        {
+            return std::nullopt;
+        }
+        for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
+        {
+            if (slotSizeList.at(poolIdx) != hotSizeList.at(poolIdx))
+            {
+                return std::nullopt;
+            }
+        }
 
         TypedVec<PoolIndex, PoolDesc> pools;
         pools.reserve(slotSizeList.size());
         for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
         {
-            pools.push_back(
-                PoolDesc{poolIdx, mStorage->getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx)});
+            auto const address = mStorage->slotAddress(level, pgIdx, SlotId{0}, poolIdx);
+            auto const* base = std::get_if<MemAddress>(&address);
+            if (base == nullptr)
+            {
+                return std::nullopt; // Not memory at this level -- a disk (fd, offset).
+            }
+            pools.push_back(PoolDesc{poolIdx, *base, slotSizeList.at(poolIdx)});
         }
 
-        result.push_back(PoolGroupDesc{pgIdx, mStorage->numSlots(pgIdx, kHotLevel), slotDesc, std::move(pools)});
+        result.push_back(PoolGroupDesc{pgIdx, mStorage->numSlots(pgIdx, level), slotDesc, std::move(pools)});
     }
 
     return result;

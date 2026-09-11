@@ -420,10 +420,18 @@ public:
         mPendingRootErases.push_back(key);
     }
 
+    // match() for a chain named by content: `keys` is what sequenceToBlockchainKeys
+    // yields minus any partial tail, since a partial block is never committed.
+    // Prunes via match()'s own call, so servability is asked one way.
+    ReuseMatch matchKeys(std::vector<BlockKey> const& keys) const;
+
 private:
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     std::vector<MatchResult> matchTokenPath(
         ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
+    // The walk matchKeys drives. Tokens only ever reach the tree to be hashed
+    // into keys, so a caller holding the keys already drives it directly.
+    std::vector<MatchResult> matchKeyPath(std::vector<BlockchainKeyStep> const& steps) const;
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
     // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).

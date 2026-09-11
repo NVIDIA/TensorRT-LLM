@@ -767,6 +767,75 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 
 } // anonymous namespace
 
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchKeyPath(std::vector<BlockchainKeyStep> const& steps) const
+{
+    drainPendingRootErases();
+
+    std::vector<MatchResult> results;
+    if (steps.empty())
+    {
+        return results;
+    }
+    auto rootIt = mRoots.find(steps.front().key);
+    if (rootIt == mRoots.end())
+    {
+        return results;
+    }
+    RootBlock const& root = *rootIt->second;
+    std::unordered_map<BlockKey, SharedPtr<Block>> const* currentNext = &root.next;
+    for (size_t i = 1; i < steps.size(); ++i)
+    {
+        auto blockIt = currentNext->find(steps[i].key);
+        if (blockIt == currentNext->end())
+        {
+            break;
+        }
+        Block* block = blockIt->second.get();
+        results.push_back({block, static_cast<int>(steps[i].tokens.length())});
+        currentNext = &block->next;
+    }
+    return results;
+}
+
+BlockRadixTree::ReuseMatch BlockRadixTree::matchKeys(std::vector<BlockKey> const& keys) const
+{
+    ReuseMatch result{};
+    if (keys.empty())
+    {
+        return result;
+    }
+    // Root first (empty token range), then one whole block per key. Partial
+    // match is not offered: it works by scanning tokens, and a key chain has none.
+    std::vector<BlockchainKeyStep> steps;
+    steps.reserve(keys.size());
+    steps.push_back({keys.front(), HalfOpenRange<size_t>{size_t{0}, size_t{0}}});
+    for (size_t i = 1; i < keys.size(); ++i)
+    {
+        size_t const beg = (i - 1) * static_cast<size_t>(mTokensPerBlock);
+        steps.push_back({keys[i], HalfOpenRange<size_t>{beg, beg + static_cast<size_t>(mTokensPerBlock)}});
+    }
+
+    auto rawMatched = matchKeyPath(steps);
+    int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
+    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    std::optional<int> numReusableTokensBeforeHybridPruning;
+    if (ssmLcId.has_value())
+    {
+        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+    }
+    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
+    result.numLookupTokens = static_cast<int>((keys.size() - 1) * static_cast<size_t>(mTokensPerBlock));
+    result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
+    result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
+    result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
+    for (auto const& match : matched)
+    {
+        result.blocks.push_back(match.block);
+    }
+    return result;
+}
+
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {

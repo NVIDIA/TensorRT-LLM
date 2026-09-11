@@ -144,6 +144,23 @@ public:
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
+    // ---- Content-named lookup ----------------------------------------------
+
+    // Reads only; holds nothing. The result is volatile, exactly as matchReuse's is.
+    BlockRadixTree::ReuseMatch matchReuseByKeys(std::vector<BlockKey> const& keys) const;
+
+    // Where a content-named chain sits and how much of it is real. Topology
+    // only -- readiness is the reader's, from the pages' events. lifeCycles
+    // narrows and never widens: the match is pruned by every one there is.
+    std::optional<std::pair<CacheLevel, int>> servableChain(
+        std::vector<BlockKey> const& keys, std::vector<LifeCycleId> const& lifeCycles) const;
+
+    // A cache holding a content-named chain, for reading it out to a peer.
+    // Holds against dropping, NOT against migration: a page evicted downward
+    // hands its slot back, so an address taken from it can name other data.
+    std::shared_ptr<KvCache> createKvCacheFromKeys(
+        std::vector<BlockKey> const& keys, std::optional<RequestIdType> id = std::nullopt);
+
     // ---- Memory pool queries -----------------------------------------------
 
     // Base address of the memory pool. When indexMode is PER_LAYER, returns pool group base
@@ -165,6 +182,11 @@ public:
     std::vector<AggregatedPageDesc> getAggregatedPages(std::vector<BufferId> const& buffers) const;
 
     TypedVec<PoolGroupIndex, PoolGroupDesc> poolGroupDescs() const;
+
+    // poolGroupDescs at another cache level. slotDesc stays the hot one: a level
+    // answers only for its own base addresses and slot count. Nullopt when it
+    // cannot -- a disk level addresses by (fd, offset), which is not a pointer.
+    std::optional<TypedVec<PoolGroupIndex, PoolGroupDesc>> poolGroupDescsAt(CacheLevel level) const;
 
     // ---- Query / info ------------------------------------------------------
 
@@ -318,6 +340,11 @@ public:
     friend class KvCacheIntrospection;
 
 private:
+    // The level half of servableChain. Private because it indexes life cycles
+    // unchecked -- servableChain validates them before calling it.
+    std::optional<CacheLevel> uniformCacheLevel(
+        BlockRadixTree::ReuseMatch const& match, std::vector<LifeCycleId> const& lifeCycles) const;
+
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.
     void _checkNoLivingKvCaches(char const* api) const;
