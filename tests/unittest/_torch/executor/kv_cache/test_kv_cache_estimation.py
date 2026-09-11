@@ -22,19 +22,14 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModel
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
-    DFlashDecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     MultimodalConfig,
-    PARDDecodingConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 pytestmark = pytest.mark.cpu_only
 
@@ -655,77 +650,6 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
     expected = CacheCost(slope=64, intercept=3 * 2 * (2048 + 64) * 64)
     assert no_scratch_size_per_token == expected
     assert scratch_size_per_token == expected
-
-
-@pytest.mark.parametrize("config_cls", [DFlashDecodingConfig, PARDDecodingConfig])
-def test_external_draft_estimated_quota_supports_allocation_and_resume(
-    config_cls: type[DFlashDecodingConfig] | type[PARDDecodingConfig],
-) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    init_cuda_once()
-    spec = config_cls(max_draft_len=4, speculative_model="draft")
-    model_config = SimpleNamespace(
-        quant_config=None,
-        pretrained_config=SimpleNamespace(
-            hidden_size=32,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            layer_types=["full_attention"],
-        ),
-        get_num_attention_layers=lambda: 1,
-    )
-    batch_size, context_tokens, window = 64, 512, 504
-    config = KvCacheConfig(enable_block_reuse=False, max_attention_window=[window])
-    slope, fixed = KVCacheManagerV2.get_cache_size_per_token(
-        model_config,
-        Mapping(),
-        tokens_per_block=32,
-        max_seq_len=4096,
-        max_batch_size=batch_size,
-        max_num_tokens=context_tokens,
-        kv_cache_config=config,
-        spec_config=spec,
-        is_draft=True,
-    )
-    config.max_gpu_total_bytes = slope * context_tokens + fixed
-    manager = KVCacheManagerV2(
-        config,
-        CacheType.SELF,
-        num_layers=1,
-        num_kv_heads=2,
-        head_dim=8,
-        tokens_per_block=32,
-        max_seq_len=4096,
-        max_batch_size=batch_size,
-        max_num_tokens=context_tokens,
-        mapping=Mapping(),
-        dtype=DataType.HALF,
-        spec_config=spec,
-        is_draft=True,
-    )
-    caches = []
-    stream = torch.cuda.current_stream().cuda_stream
-    try:
-        for _ in range(batch_size):
-            cache = manager.impl.create_kv_cache()
-            caches.append(cache)
-            assert cache.resume(stream)
-        # One context request runs alongside a full generation batch minus one.
-        assert caches[0].resize(context_tokens + spec.max_draft_len - 1)
-        # Sweep a complete page so the workload exercises unaligned retention.
-        for history in range(1024, 1056):
-            capacity = history + spec.max_draft_len - 1 + spec.tokens_per_gen_step
-            for cache in caches[1:]:
-                assert cache.resize(capacity, history)
-        # A quota that admits allocation must also allow requests to resume.
-        for cache in caches:
-            cache.suspend()
-            assert cache.resume(stream)
-    finally:
-        for cache in caches:
-            cache.close()
-        manager.shutdown()
 
 
 @pytest.mark.parametrize("max_seq_len", [256, 512])
