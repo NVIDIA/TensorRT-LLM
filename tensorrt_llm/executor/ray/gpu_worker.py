@@ -280,17 +280,32 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        tags = self._prepare_sleep_tags(tags)
+        if not tags:
+            return
+
+        logger.info(f"Sleep: {tags}")
+        self.engine.begin_sleep_transition(tags)
+        mutation_started = False
         try:
-            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
-            logger.info(f"Sleep: {tags}")
             torch.cuda.synchronize()
+            mutation_started = True
             release_with_tag(*tags)
             torch.cuda.synchronize()
             gc.collect()
             torch.cuda.empty_cache()
-        except Exception as e:
-            logger.error(f"Encountered an error in sleep: {e}")
-            raise e
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_sleep_transition()
+            logger.exception("Encountered an error in sleep")
+            raise
+        try:
+            self.engine.complete_sleep_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     @control_action_decorator
     def wakeup(self, wakeup_tags: List[str]):
@@ -301,15 +316,30 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        tags = self._prepare_wakeup_tags(tags)
+        if not tags:
+            return
+
+        logger.info(f"Wakeup: {tags}")
+        self.engine.begin_wakeup_transition(tags)
+        mutation_started = False
         try:
-            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
-            logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
+            mutation_started = True
             materialize_with_tag(*tags)
             torch.cuda.synchronize()
-        except Exception as e:
-            logger.error(f"Encountered an error in wakeup")
-            raise e
+        except Exception:
+            if mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_wakeup_transition()
+            logger.exception("Encountered an error in wakeup")
+            raise
+        try:
+            self.engine.complete_wakeup_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def start(self):
         pass

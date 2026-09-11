@@ -58,7 +58,8 @@ from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
+                       TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
+                       RuntimeMemoryStatus, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
@@ -68,6 +69,11 @@ from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
+
+_RUNTIME_MEMORY_TYPES = tuple(
+    memory_type for memory_type in ExecutorMemoryType
+    if memory_type not in (ExecutorMemoryType.INIT_KV_CACHE,
+                           ExecutorMemoryType.INIT_EXTRA_RESOURCES))
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -1888,6 +1894,109 @@ class _TorchLLM(BaseLLM):
             raise ValueError(
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
+
+    def _check_runtime_memory_enabled(self) -> None:
+        if self.args.sleep_config is None:
+            raise ValueError(
+                "Runtime memory checkpointing is not enabled. Set sleep_config "
+                "when constructing the LLM.")
+
+    @staticmethod
+    def _normalize_runtime_memory_tags(
+        tags: Sequence[ExecutorMemoryType | str] | None,
+        *,
+        default_tags: Sequence[ExecutorMemoryType],
+    ) -> list[ExecutorMemoryType]:
+        if tags is None:
+            return list(default_tags)
+        if not tags:
+            raise ValueError("Runtime memory tags must not be empty.")
+
+        normalized = []
+        seen = set()
+        for tag in tags:
+            try:
+                memory_type = (tag if isinstance(tag, ExecutorMemoryType) else
+                               ExecutorMemoryType(tag))
+            except (TypeError, ValueError) as error:
+                valid = ", ".join(item.value for item in _RUNTIME_MEMORY_TYPES)
+                raise ValueError(
+                    f"Invalid runtime memory tag {tag!r}. Expected one of: {valid}"
+                ) from error
+            if memory_type in (ExecutorMemoryType.INIT_KV_CACHE,
+                               ExecutorMemoryType.INIT_EXTRA_RESOURCES):
+                raise ValueError(
+                    f"Runtime memory tag {memory_type.value!r} is an "
+                    "initialization-only tag and cannot be released.")
+            if memory_type not in seen:
+                normalized.append(memory_type)
+                seen.add(memory_type)
+        return normalized
+
+    @set_api_status("prototype")
+    def get_memory_status(self) -> RuntimeMemoryStatus:
+        """Return the authoritative runtime-memory checkpoint status.
+
+        Returns:
+            tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus: The reconciled
+            state reported by the runtime workers.
+        """
+        self._check_runtime_memory_enabled()
+        replies = self._collective_rpc("get_memory_status")
+        statuses = [
+            RuntimeMemoryStatus.model_validate(reply) for reply in replies
+        ]
+        if not statuses:
+            raise RuntimeError("No worker returned runtime-memory status.")
+        expected = statuses[0]
+        if any(status != expected for status in statuses[1:]):
+            raise RuntimeError(
+                "Runtime-memory state diverged across workers: "
+                f"{[status.model_dump(mode='json') for status in statuses]}")
+        return expected
+
+    @set_api_status("prototype")
+    def release(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
+        """Checkpoint and release selected GPU runtime memory.
+
+        Args:
+            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):
+                Memory types to release. When omitted, release every
+                sleep-managed runtime memory type.
+
+        Returns:
+            None: The call returns after all selected memory has been released.
+        """
+        self._check_runtime_memory_enabled()
+        normalized = self._normalize_runtime_memory_tags(
+            tags, default_tags=_RUNTIME_MEMORY_TYPES)
+        self._collective_rpc("sleep", ([tag.value for tag in normalized], ))
+
+    @set_api_status("prototype")
+    def resume(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
+        """Restore selected GPU runtime memory.
+
+        Args:
+            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):
+                Memory types to restore. When omitted, restore every currently
+                parked memory type.
+
+        Returns:
+            None: The call returns after all selected memory has been restored.
+        """
+        self._check_runtime_memory_enabled()
+        default_tags = self.get_memory_status().parked_tags
+        normalized = self._normalize_runtime_memory_tags(
+            tags, default_tags=default_tags)
+        if normalized:
+            self._collective_rpc("wakeup",
+                                 ([tag.value for tag in normalized], ))
 
     def _reject_token_encoder_config_without_buckets(self) -> None:
         """Reject a bucket-less token-encoder config before weights load.

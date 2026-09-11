@@ -127,9 +127,12 @@ l0_cpu:
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
+  - unittest/llmapi/test_runtime_control.py
+  - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_report_addr.py
+  - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
   - unittest/llmapi/test_tokenizer_aliases.py
   - unittest/llmapi/test_utils.py

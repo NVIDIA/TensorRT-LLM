@@ -1,14 +1,19 @@
+#!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from collections.abc import Sequence
 from typing import Any, List, Optional
 
 from ..llmapi.llm import LLM
-from ..llmapi.llm_args import RayPlacementConfig
+from ..llmapi.llm_args import ExecutorMemoryType, RayPlacementConfig, RuntimeMemoryStatus
 
 
 class AsyncLLM(LLM):
-    """AsyncLLM is a subclass of LLM that supports asynchronous setup, release and
-    resume operations that are necessary for RL or agentic scenarios.
+    """LLM runtime with asynchronous setup, generation, and memory control.
 
-    Currently, RL APIs are only supported with Ray orchestrator.
+    AsyncLLM uses the Ray orchestrator. Weight-update methods remain available
+    for compatibility with existing reinforcement-learning integrations.
     """
 
     def __init__(
@@ -46,21 +51,56 @@ class AsyncLLM(LLM):
             self._async_initialized = True
         return self
 
-    async def release(self, tags: list[str]):
+    async def get_memory_status(self) -> RuntimeMemoryStatus:
+        """Return the authoritative runtime-memory checkpoint status."""
+        self._check_runtime_memory_enabled()
+        replies = await self.collective_rpc("get_memory_status")
+        statuses = [RuntimeMemoryStatus.model_validate(reply) for reply in replies]
+        if not statuses:
+            raise RuntimeError("No worker returned runtime-memory status.")
+        expected = statuses[0]
+        if any(status != expected for status in statuses[1:]):
+            raise RuntimeError(
+                "Runtime-memory state diverged across workers: "
+                f"{[status.model_dump(mode='json') for status in statuses]}"
+            )
+        return expected
+
+    async def release(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
         """Release the GPU memory used by the LLM asynchronously.
 
         Args:
-            tags: List of memory tag strings to release (e.g., ["model", "kv_cache"]).
+            tags: Memory types to release. When omitted, release every
+                sleep-managed runtime memory type.
         """
-        await self.collective_rpc("sleep", args=(tags,))
+        self._check_runtime_memory_enabled()
+        default_tags = [
+            memory_type
+            for memory_type in ExecutorMemoryType
+            if memory_type
+            not in (ExecutorMemoryType.INIT_KV_CACHE, ExecutorMemoryType.INIT_EXTRA_RESOURCES)
+        ]
+        normalized = self._normalize_runtime_memory_tags(tags, default_tags=default_tags)
+        await self.collective_rpc("sleep", args=([tag.value for tag in normalized],))
 
-    async def resume(self, tags: list[str]):
+    async def resume(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
         """Resume the GPU memory used by the LLM asynchronously.
 
         Args:
-            tags: List of memory tag strings to resume (e.g., ["model", "kv_cache"]).
+            tags: Memory types to restore. When omitted, restore every
+                currently parked memory type.
         """
-        await self.collective_rpc("wakeup", args=(tags,))
+        self._check_runtime_memory_enabled()
+        default_tags = (await self.get_memory_status()).parked_tags
+        normalized = self._normalize_runtime_memory_tags(tags, default_tags=default_tags)
+        if normalized:
+            await self.collective_rpc("wakeup", args=([tag.value for tag in normalized],))
 
     async def update_weights(self, weights: dict[str, str]):
         """Update the weights of the LLM asynchronously.

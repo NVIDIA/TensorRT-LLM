@@ -159,6 +159,11 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             self.admission_state = RequestAdmissionState.FAILED
 
+    def get_memory_status(self) -> tuple[RequestAdmissionState, frozenset[str]]:
+        """Return an atomic snapshot of admission state and parked tags."""
+        with self.enqueue_lock:
+            return self.admission_state, self._parked_tags
+
     def get_admission_state(self) -> RequestAdmissionState:
         with self.enqueue_lock:
             return self.admission_state
