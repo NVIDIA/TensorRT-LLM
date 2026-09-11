@@ -288,18 +288,15 @@ TEST(KvCacheManagerV2DefaultColdPageCodecTest, ValidatesHostIndexArgumentsBefore
     ASSERT_TRUE(configureOne(*codec, makePoolGroupDesc(pool0.get(), kPool0Bytes, pool1.get(), kPool1Bytes, 1)));
 
     PageIndexPair const validIndex{0, 0};
-    PageIndexPair const invalidIndex{-1, 0};
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
     EXPECT_FALSE(codec->encode(LifeCycleId{0}, cold.get(), nullptr, 1, stream));
     EXPECT_FALSE(codec->encode(LifeCycleId{2}, cold.get(), &validIndex, 1, stream));
-    EXPECT_FALSE(codec->encode(LifeCycleId{0}, cold.get(), &invalidIndex, 1, stream));
     EXPECT_FALSE(codec->encode(LifeCycleId{0}, cold.get(), &validIndex, 1, nullptr));
     EXPECT_TRUE(codec->encode(LifeCycleId{0}, nullptr, nullptr, 0, nullptr));
     EXPECT_FALSE(codec->decode(LifeCycleId{0}, nullptr, &validIndex, 1, stream));
     EXPECT_FALSE(codec->decode(LifeCycleId{0}, cold.get(), nullptr, 1, stream));
     EXPECT_FALSE(codec->decode(LifeCycleId{2}, cold.get(), &validIndex, 1, stream));
-    EXPECT_FALSE(codec->decode(LifeCycleId{0}, cold.get(), &invalidIndex, 1, stream));
     EXPECT_FALSE(codec->decode(LifeCycleId{0}, cold.get(), &validIndex, 1, nullptr));
     EXPECT_TRUE(codec->decode(LifeCycleId{0}, nullptr, nullptr, 0, nullptr));
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);

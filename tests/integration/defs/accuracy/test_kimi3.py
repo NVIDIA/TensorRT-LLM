@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-
 import pytest
 
 from tensorrt_llm import LLM
@@ -31,7 +29,6 @@ from tensorrt_llm.llmapi import (
     SchedulingParams,
 )
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import (
@@ -39,6 +36,7 @@ from .accuracy_core import (
     ForceTokenLogitsProcessor,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
     assert_kv_cache_reuse_for_llm,
 )
 
@@ -145,7 +143,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             if mode == "baseline":
                 self._assert_attention_dp(llm)
                 self._assert_logits_processor(llm)
-                self._assert_guided_decoding(llm)
+                assert_guided_decoding_regex(llm)
             elif mode == "reuse":
                 # Sequential requests on the idle default router are assigned
                 # to the same ADP rank, so explicit rank pinning is unnecessary.
@@ -260,22 +258,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         assert isinstance(outputs, list)
         assert len(outputs) == 1
         assert outputs[0].outputs[0].token_ids == [forced_token_id] * output_length
-
-    @staticmethod
-    def _assert_guided_decoding(llm: LLM) -> None:
-        prompt_token_ids = llm.tokenizer.encode("Return exactly two decimal digits:")
-        outputs = llm.generate(
-            [prompt_token_ids],
-            sampling_params=SamplingParams(
-                max_tokens=8,
-                guided_decoding=GuidedDecodingParams(regex=r"[0-9]{2}"),
-            ),
-            use_tqdm=False,
-        )
-
-        assert isinstance(outputs, list)
-        assert len(outputs) == 1
-        assert re.fullmatch(r"[0-9]{2}", outputs[0].outputs[0].text)
 
 
 @pytest.mark.timeout(3600)

@@ -12,6 +12,8 @@ from dataclasses import replace
 from importlib import import_module
 from typing import TYPE_CHECKING, Optional
 
+from .skip_softmax import SkipSoftmaxParams
+
 if TYPE_CHECKING:
     import torch
 
@@ -119,9 +121,13 @@ class AttentionSparseHooks:
         relative_attention_bias: Optional["torch.Tensor"],
         relative_attention_max_distance: int,
         has_lora: bool,
+        output_gate: Optional["torch.Tensor"],
         **kwargs: object,
     ) -> Optional["torch.Tensor | tuple[torch.Tensor, torch.Tensor]"]:
-        """Return an algorithm-specific forward result, or ``None`` for the default."""
+        """Return an algorithm-specific forward result, or ``None`` for the default.
+
+        A hook that returns a result owns ``output_gate`` and must apply it.
+        """
         return None
 
     def project_output(
@@ -220,26 +226,36 @@ def prepare_sparse_runtime_params(
     backend: "TrtllmAttention",
     q: "torch.Tensor",
     k: Optional["torch.Tensor"],
+    v: Optional["torch.Tensor"],
     metadata: "AttentionMetadata",
     forward_args: "AttentionForwardArgs",
 ) -> "SparseRuntimeParams":
-    """Run backend prediction hooks and update attention-op parameters."""
-    runtime_params = forward_args.sparse_runtime_params
-    if backend.sparse_params is None:
-        return runtime_params
+    """Predict all sparse inputs for one attention call.
 
+    Runs the ``sparse_kv_predict``, ``sparse_attn_predict`` and
+    ``block_sparse_attn_predict`` hooks once each and returns a new
+    ``SparseRuntimeParams`` built from ``forward_args.sparse_runtime_params``
+    plus the hook results. Fields a backend writes into that carrier outside
+    the hooks, such as an auxiliary pool pointer, are carried over. SkipSoftmax
+    backends receive their threshold schedule last.
+    """
     kv_indices, kv_offsets = backend.sparse_kv_predict(q, k, metadata, forward_args)
     attn_indices, attn_offsets = backend.sparse_attn_predict(q, k, metadata, forward_args)
-    block_size = (
-        backend.sparse_params.indices_block_size
-        if attn_indices is not None or attn_offsets is not None
-        else runtime_params.sparse_attn_indices_block_size
-    )
-    return replace(
-        runtime_params,
+    block_sparse_inputs = backend.block_sparse_attn_predict(q, k, v, metadata, forward_args)
+    has_attn_indices = attn_indices is not None or attn_offsets is not None
+    sparse_params = backend.sparse_params
+    runtime_params = replace(
+        forward_args.sparse_runtime_params,
         sparse_kv_indices=kv_indices,
         sparse_kv_offsets=kv_offsets,
         sparse_attn_indices=attn_indices,
         sparse_attn_offsets=attn_offsets,
-        sparse_attn_indices_block_size=block_size,
+        sparse_attn_indices_block_size=sparse_params.indices_block_size if has_attn_indices else 0,
+        block_sparse_inputs=block_sparse_inputs,
     )
+    if isinstance(sparse_params, SkipSoftmaxParams):
+        runtime_params = sparse_params.scheduler.get_runtime_params(
+            runtime_params=runtime_params,
+            timestep=forward_args.timestep,
+        )
+    return runtime_params

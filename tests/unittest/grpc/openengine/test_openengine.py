@@ -23,6 +23,7 @@ environment can exercise lives in ``tests/unittest/grpc/test_grpc_optional.py``.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,16 +57,32 @@ def test_format_bind_address_brackets_ipv6() -> None:
     assert _format_bind_address("[::1]", 8000) == "[::1]:8000"
 
 
-def test_openengine_server_serves_the_stub_contract() -> None:
+def test_openengine_server_serves_the_control_contract() -> None:
     """The server binds, attaches Control, answers, and shuts down cleanly.
 
-    The servicer is the generated base, so UNIMPLEMENTED is its contract;
-    what this exercises is TRT-LLM's own lifecycle around it -- port-zero
-    resolution, startup, reachability, and graceful stop.
+    Exercises TRT-LLM's lifecycle around the servicer -- port-zero resolution,
+    startup, reachability, graceful stop -- and that Control is wired in and
+    answering rather than falling through to the generated base.
     """
+    llm = SimpleNamespace(
+        args=SimpleNamespace(
+            max_seq_len=2048,
+            max_batch_size=8,
+            max_num_tokens=2048,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            context_parallel_size=1,
+            guided_decoding_backend=None,
+            reasoning_parser=None,
+            kv_cache_config=SimpleNamespace(tokens_per_block=32),
+        ),
+        llm_id="test-instance",
+        tokenizer=object(),
+        _check_health=lambda: True,
+    )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer(host="127.0.0.1", port=0)
+        server = OpenEngineServer(host="127.0.0.1", port=0, llm=llm, model="test-model")
         # port=0 must be replaced by the kernel-assigned port, or nothing
         # downstream (including this test's channel) can reach the server.
         assert server.port != 0
@@ -74,11 +91,24 @@ def test_openengine_server_serves_the_stub_contract() -> None:
         channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
         try:
             control = openengine_pb2_grpc.ControlStub(channel)
-            with pytest.raises(grpc.aio.AioRpcError) as error:
-                await control.GetServerInfo(server_pb2.GetServerInfoRequest(), timeout=5)
-            assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
+            info = await control.GetServerInfo(server_pb2.GetServerInfoRequest(), timeout=5)
+            assert info.engine_name == "tensorrt_llm"
         finally:
             await channel.close()
             await server.stop(grace=0)
 
     asyncio.run(exercise_server())
+
+
+def test_is_loopback_classifies_bind_hosts() -> None:
+    """The listener is unauthenticated, so a non-loopback bind must be flagged."""
+    from tensorrt_llm.grpc.openengine.server import _is_loopback
+
+    assert _is_loopback("127.0.0.1")
+    assert _is_loopback("::1")
+    assert _is_loopback("[::1]")
+    assert _is_loopback("localhost")
+    assert not _is_loopback("0.0.0.0")
+    assert not _is_loopback("10.0.0.7")
+    # An unresolvable name is not assumed safe.
+    assert not _is_loopback("some-host")
