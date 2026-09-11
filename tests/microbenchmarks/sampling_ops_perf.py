@@ -242,7 +242,7 @@ def available_impls() -> dict[str, Impl]:
             impl = _flashinfer_impl(mode)
             impls[impl.name] = impl
 
-    from tensorrt_llm._torch.pyexecutor.sampler.ops import fused
+    from tensorrt_llm._torch.pyexecutor.sampler.ops import custom as fused
 
     def call(shape: str, inp: Inputs) -> Callable[[], Any]:
         args = (inp.logits, inp.temperatures, inp.top_ks, inp.top_ps, inp.min_ps)

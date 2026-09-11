@@ -44,8 +44,8 @@ if IS_FLASHINFER_AVAILABLE:
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 from ..pyexecutor.sampler import penalties as penalty_ops
+from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
-from ..pyexecutor.sampler.ops import fused as fused_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 

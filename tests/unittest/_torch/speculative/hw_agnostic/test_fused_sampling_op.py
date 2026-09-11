@@ -28,8 +28,8 @@ behavior is checked by support, determinism and distribution instead.
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.sampler.ops import custom as fused
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as fi
-from tensorrt_llm._torch.pyexecutor.sampler.ops import fused
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
 
 DISABLE_TOPK = torch.iinfo(torch.int32).max
