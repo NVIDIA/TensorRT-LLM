@@ -36,13 +36,13 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _NestedConfig(StrictBaseModel):
-    marked: int = 7
-    unmarked: int = Field(default=11)
+    safe_plain_int: int = 7
+    safe_field_int: int = Field(default=11)
 
 
 class _ExampleConfig(StrictBaseModel):
-    safe_marked: int = 3
-    safe_unmarked: int = Field(default=5)
+    safe_plain_int: int = 3
+    safe_field_int: int = Field(default=5)
     private_path: str = "/customer/private/model"
     mode: Literal["auto", "slow"] = "auto"
     nested: _NestedConfig = Field(default_factory=_NestedConfig)
@@ -60,10 +60,10 @@ def test_collect_llm_api_config_uses_type_driven_autoenroll_and_safety_vetoes():
 
     assert config == {
         "mode": "auto",
-        "nested.marked": 7,
-        "nested.unmarked": 11,
-        "safe_marked": 3,
-        "safe_unmarked": 5,
+        "nested.safe_field_int": 11,
+        "nested.safe_plain_int": 7,
+        "safe_field_int": 5,
+        "safe_plain_int": 3,
     }
     assert "private_path" not in config  # bare str, no allowlist -> not capturable
     assert "unsafe_union" not in config  # Union[str,Path], no allowlist -> not capturable
