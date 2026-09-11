@@ -33,7 +33,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
 
@@ -83,7 +83,6 @@ class _TrtllmPlanner:
         # and pool_pointers already encodes the layer offset via kv_cache.data_ptr()
         self.host_pool_mapping: Optional[torch.Tensor] = None  # [1, 2] int32 pinned
         # thop-specific host metadata NOT available from SequenceInfo
-        self.host_request_types: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         self.host_total_kv_lens: Optional[torch.Tensor] = None  # [2] int64 pinned
         # thop variant of input_pos_host and seq_len_host
         # keeping a separate copy here since we sometimes have to overwrite the original values
@@ -157,9 +156,6 @@ class _TrtllmPlanner:
         )
         self.host_total_kv_lens = torch.zeros(
             2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.host_request_types = torch.zeros(
-            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self._max_batch = max_batch
         self._max_blocks_per_seq = max_blocks_per_seq
@@ -266,8 +262,6 @@ class _TrtllmPlanner:
         by SequenceInfo to avoid a host-to-device copy here.
         """
         num_seq = num_prefill + num_extend + num_decode
-        self.host_request_types[:num_prefill].fill_(0)
-        self.host_request_types[num_prefill:num_seq].fill_(1)
 
         # Batch counts for thop.attention
         self.num_contexts = num_prefill
@@ -300,10 +294,7 @@ class _TrtllmPlanner:
         (``switch_to_generate_``), so values set during host-prepare (``plan_host()``) can go
         stale by the time draft-loop attention layers read them.
         """
-        num_seq = batch_info.get_total_num_sequences()
         num_prefill = batch_info.get_num_sequences()[0]
-        self.host_request_types[:num_prefill].fill_(0)
-        self.host_request_types[num_prefill:num_seq].fill_(1)
         self.num_contexts = num_prefill
         self.num_ctx_tokens = batch_info.get_num_tokens()[0]
 
@@ -472,14 +463,14 @@ def prepare_trtllm_metadata_host(
     prompt_lens_host: torch.Tensor,
     prompt_lens: torch.Tensor,
 ) -> None:
-    """Fill thop-specific HOST metadata (pinned tensors for thop.attention).
+    """Fill TRT-LLM attention HOST metadata.
 
     Runs OUTSIDE the CUDA graph before every forward (including replays).
     Handles host_total_kv_lens, host_past_kv_lengths, and host_context_lengths.
     Also performs one-time spec-dec tensor initialization when ``BatchInfo``
     advertises that this run is speculative.
 
-    host_request_types is filled separately by prepare_trtllm_metadata (device custom op) at
+    Batch counts are refreshed separately by prepare_trtllm_metadata (device custom op) at
     the top of every captured graph, so that Eagle's mid-forward batch_info mutation is
     reflected before each graph's attention kernels read it.
     """
@@ -696,11 +687,9 @@ def trtllm_mha_with_cache(
         output = torch.zeros(
             total_padded_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device
         )
-    # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
     context_lengths = _GlobalTrtllmPlanner.context_lengths_gpu[:num_seq]
 
-    host_request_types = _GlobalTrtllmPlanner.host_request_types[:num_seq]
     host_total_kv_lens = _GlobalTrtllmPlanner.host_total_kv_lens
 
     # Pool mapping (shared, always zeros since layer offset is in pool_pointers)
@@ -714,103 +703,43 @@ def trtllm_mha_with_cache(
         scratch[0, :num_seq, :, :] = kv_cache_block_offsets[0, :num_seq, :, :]
         kv_cache_block_offsets = scratch
 
-    thop.attention(
-        qkv_fused,  # q (actually fused QKV)
-        None,  # k (None when using fused QKV)
-        None,  # v (None when using fused QKV)
-        output[:num_tokens],  # output
-        None,  # output_sf (NVFP4)
-        _GlobalTrtllmPlanner.workspace,  # workspace (module-level, like flashinfer)
-        sequence_length,  # sequence_length
-        _GlobalTrtllmPlanner.host_past_kv_lengths[:num_seq],  # host_past_key_value_lengths
-        host_total_kv_lens,  # host_total_kv_lens
-        context_lengths,  # context_lengths
-        _GlobalTrtllmPlanner.host_context_lengths[:num_seq],  # host_context_lengths
-        host_request_types,  # host_request_types
-        None,  # max_context_q_len_override
-        kv_cache_block_offsets,  # kv_cache_block_offsets
-        host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
-        host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
-        None,  # cache_indirection (beam search)
-        kv_scale_oq,  # kv_scale_orig_quant
-        kv_scale_qo,  # kv_scale_quant_orig
-        out_scale,  # out_scale
-        None,  # rotary_inv_freq
-        rotary_cos_sin,  # rotary_cos_sin
-        None,  # latent_cache (MLA)
-        None,  # q_pe (MLA)
-        None,  # block_ids_per_seq
-        attention_sinks,  # attention_sinks (per-head learnable scalar, e.g. GPT-OSS)
-        True,  # is_fused_qkv
-        True,  # update_kv_cache
-        1,  # predicted_tokens_per_seq (always 1 except for MLA kernel)
-        0,  # local_layer_idx (always 0; pool_pointers already encodes the layer offset)
-        num_heads,  # num_heads
-        num_kv_heads,  # num_kv_heads
-        head_dim,  # head_size
-        tokens_per_block,  # tokens_per_block
-        max_num_requests,  # max_num_requests
-        max_context_length,  # max_context_length
-        max_seq_len,  # max_seq_len
-        attention_window_size,  # attention_window_size
-        1,  # beam_width
-        int(AttentionMaskType.causal),  # mask_type
-        quant_mode,  # quant_mode
-        scale * math.sqrt(head_dim) if scale is not None else 1.0,  # q_scaling
-        position_embedding_type,  # position_embedding_type
-        rotary_embedding_dim,  # rope_dim
-        10000.0,  # rope_base
-        0,  # rope_scale_type
-        1.0,  # rope_scale
-        1.0,  # rope_short_m_scale
-        1.0,  # rope_long_m_scale
-        max_context_length,  # rope_max_positions
-        max_context_length,  # rope_original_max_positions
-        True,  # use_paged_context_fmha
-        0,  # attention_input_type
-        False,  # is_mla_enable
-        max_num_requests,  # chunked_prefill_buffer_batch_size
-        None,  # q_lora_rank (MLA)
-        None,  # kv_lora_rank (MLA)
-        None,  # qk_nope_head_dim (MLA)
-        None,  # qk_rope_head_dim (MLA)
-        None,  # v_head_dim (MLA)
-        None,  # rope_append
-        None,  # mrope_rotary_cos_sin
-        None,  # mrope_position_deltas
-        None,  # helix_position_offsets
-        None,  # helix_is_inactive_rank
-        None,  # attention_chunk_size
-        None,  # softmax_stats_tensor
-        _GlobalTrtllmPlanner.is_spec_decoding_enabled,  # is_spec_decoding_enabled
-        _GlobalTrtllmPlanner.use_spec_decoding,  # use_spec_decoding
-        False,  # is_spec_dec_tree (always False for AutoDeploy linear Eagle chains)
+    FallbackFmha.run_auto_deploy_mha(
+        qkv_fused,
+        output,
+        _GlobalTrtllmPlanner.workspace,
+        sequence_length,
+        _GlobalTrtllmPlanner.host_past_kv_lengths[:num_seq],
+        host_total_kv_lens,
+        context_lengths,
+        _GlobalTrtllmPlanner.host_context_lengths[:num_seq],
+        kv_cache_block_offsets,
+        host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping,
+        kv_scale_oq,
+        kv_scale_qo,
+        out_scale,
+        rotary_cos_sin,
+        attention_sinks,
         _GlobalTrtllmPlanner.spec_decoding_generation_lengths,
         _GlobalTrtllmPlanner.spec_decoding_position_offsets,
         _GlobalTrtllmPlanner.spec_decoding_packed_mask,
-        None,  # spec_decoding_bl_tree_mask_offset (None for AutoDeploy linear Eagle chains)
-        None,  # spec_decoding_bl_tree_mask
-        None,  # spec_bl_tree_first_sparse_mask_offset_kv
-        None,  # sparse_kv_indices
-        None,  # sparse_kv_offsets
-        None,  # sparse_attn_indices
-        None,  # sparse_attn_offsets
-        1,  # sparse_attn_indices_block_size
-        0,  # num_sparse_topk
-        None,  # sparse_attn_kv_lens
-        None,  # skip_softmax_threshold_scale_factor_prefill
-        None,  # skip_softmax_threshold_scale_factor_decode
-        None,  # skip_softmax_stat
-        None,  # cu_q_seqlens
-        None,  # cu_kv_seqlens
-        None,  # fmha_scheduler_counter
-        None,  # mla_bmm1_scale
-        None,  # mla_bmm2_scale
-        None,  # quant_q_buffer
-        None,  # flash_mla_tile_scheduler_metadata
-        None,  # flash_mla_num_splits
-        num_contexts=_GlobalTrtllmPlanner.num_contexts,
-        num_ctx_tokens=_GlobalTrtllmPlanner.num_ctx_tokens,
+        _GlobalTrtllmPlanner.num_contexts,
+        _GlobalTrtllmPlanner.num_ctx_tokens,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        tokens_per_block,
+        max_num_requests,
+        max_context_length,
+        max_seq_len,
+        attention_window_size,
+        AttentionMaskType.causal,
+        quant_mode,
+        scale * math.sqrt(head_dim) if scale is not None else 1.0,
+        position_embedding_type,
+        rotary_embedding_dim,
+        _GlobalTrtllmPlanner.is_spec_decoding_enabled,
+        _GlobalTrtllmPlanner.use_spec_decoding,
     )
 
     if out is not None:

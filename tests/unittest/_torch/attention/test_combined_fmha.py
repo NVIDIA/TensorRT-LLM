@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention, FakePhasedFmha
+from fmha_test_utils import FakeAttention, FakePhasedFmha, make_fake_metadata
 
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.fmha.triton_custom_mask import Trito
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    CustomAttentionMask,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
@@ -53,7 +54,7 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
     )
     combined_fmha = CombinedFmha(attn)
     combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
-    metadata = SimpleNamespace(
+    metadata = make_fake_metadata(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),
         num_contexts=2,
@@ -85,6 +86,111 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         ("run", "generation", FmhaPhase.GENERATION, 4, 4, 2),
     ]
     assert metadata.effective_workspace.numel() == 8
+
+
+def test_phased_fmha_preserves_packed_nvfp4_output() -> None:
+    events: list[tuple] = []
+    attn = FakeAttention()
+    fmha = FakePhasedFmha(
+        attn,
+        {FmhaPhase.GENERATION},
+        "generation",
+        events,
+    )
+    metadata = make_fake_metadata(
+        effective_workspace=torch.empty(0, dtype=torch.uint8),
+        kv_cache_block_offsets=object(),
+        num_generations=1,
+        kv_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([1], dtype=torch.int32),
+    )
+    output = torch.empty((1, 2), dtype=torch.uint8)
+
+    fmha.forward(
+        torch.empty((1, 4)),
+        None,
+        None,
+        metadata,
+        AttentionForwardArgs(
+            output=output,
+            attention_input_type=AttentionInputType.generation_only,
+        ),
+    )
+
+    assert events[-1] == ("run", "generation", FmhaPhase.GENERATION, 1, 1, 1)
+
+
+def test_phased_fmha_does_not_lower_custom_mask_before_delegation() -> None:
+    events: list[tuple] = []
+    attn = FakeAttention()
+    fmha = FakePhasedFmha(
+        attn,
+        {FmhaPhase.CONTEXT},
+        "context",
+        events,
+    )
+    metadata = make_fake_metadata(
+        effective_workspace=torch.empty(0, dtype=torch.uint8),
+        kv_cache_block_offsets=object(),
+        num_contexts=1,
+        num_ctx_tokens=1,
+        kv_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([1], dtype=torch.int32),
+    )
+
+    fmha.forward(
+        torch.empty((1, 4)),
+        None,
+        None,
+        metadata,
+        AttentionForwardArgs(
+            output=torch.empty((1, 4)),
+            attention_input_type=AttentionInputType.context_only,
+            attention_mask=CustomAttentionMask.CUSTOM,
+            attention_mask_data=torch.ones((1, 1), dtype=torch.bool),
+        ),
+    )
+
+    assert events[-1] == ("run", "context", FmhaPhase.CONTEXT, 1, 1, 1)
+
+
+def test_cross_attention_uses_effective_beam_width() -> None:
+    events: list[tuple] = []
+    attn = FakeAttention()
+    fmha = FakePhasedFmha(
+        attn,
+        {FmhaPhase.GENERATION},
+        "generation",
+        events,
+    )
+    metadata = make_fake_metadata(
+        effective_workspace=torch.empty(0, dtype=torch.uint8),
+        kv_cache_block_offsets=object(),
+        num_generations=2,
+        beam_width=2,
+        is_cross=True,
+        kv_lens_cuda_runtime=torch.tensor([1, 1], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([1, 1], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([1, 1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([1, 1], dtype=torch.int32),
+    )
+
+    fmha.forward(
+        torch.empty((2, 4)),
+        None,
+        None,
+        metadata,
+        AttentionForwardArgs(
+            output=torch.empty((2, 4)),
+            attention_input_type=AttentionInputType.generation_only,
+        ),
+    )
+
+    assert events[-1] == ("run", "generation", FmhaPhase.GENERATION, 2, 2, 2)
 
 
 def test_combined_fmha_uses_flattened_v2_page_bound() -> None:

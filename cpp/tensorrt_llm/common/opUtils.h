@@ -75,35 +75,6 @@ inline cudaDataType_t trtToCublasDtype(tensorrt_llm::DataType type)
     }
 }
 
-// Like std::unique_ptr, but does not prevent generation of default copy constructor when used as class members.
-// The copy constructor produces nullptr. So the plugin default copy constructor will not really copy this, and
-// your clone() implementation is responsible for initializing such data members.
-// With this we can simplify clone() implementation when there are many data members including at least one unique_ptr.
-template <typename T, typename Del = std::default_delete<T>>
-class UniqPtrWNullCopy : public std::unique_ptr<T, Del>
-{
-public:
-    using std::unique_ptr<T, Del>::unique_ptr;
-
-    // for compatibility with std::make_unique
-    explicit UniqPtrWNullCopy(std::unique_ptr<T, Del>&& src)
-        : std::unique_ptr<T, Del>::unique_ptr{std::move(src)}
-    {
-    }
-
-    // copy constructor produces nullptr
-    UniqPtrWNullCopy(UniqPtrWNullCopy const&)
-        : std::unique_ptr<T, Del>::unique_ptr{}
-    {
-    }
-
-    // copy assignment copies nothing
-    UniqPtrWNullCopy& operator=(UniqPtrWNullCopy const&)
-    {
-        return *this;
-    }
-};
-
 namespace
 {
 

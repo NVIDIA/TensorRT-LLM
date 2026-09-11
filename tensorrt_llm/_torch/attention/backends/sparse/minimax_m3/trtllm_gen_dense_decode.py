@@ -37,12 +37,16 @@ def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> i
     run, while computing it reaches C++ through a deferred import and a
     device-properties query on every dense layer of every step.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_multi_ctas_kv_counter_size,
+    from tensorrt_llm._torch.attention.backends.fmha.utils import (
+        get_multi_ctas_kv_counter_size_for_sm_count,
     )
 
     multi_processor_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return int(_get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
+    return int(
+        get_multi_ctas_kv_counter_size_for_sm_count(
+            num_heads, max_num_requests, multi_processor_count
+        )
+    )
 
 
 def _counter_buffer(
