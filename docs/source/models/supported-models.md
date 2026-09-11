@@ -71,6 +71,9 @@ The following is a table of supported models for the PyTorch backend:
 ## Model-Feature Support Matrix (Key Models)
 
 Note: Support for other models may vary. Features marked "N/A" are not applicable to the model architecture.
+This matrix covers language-only requests, including the text-decoder path of multimodal architectures. The multimodal
+matrix below independently covers requests with actual image, video, or audio input, so a feature can have different
+statuses for the same architecture in the two matrices.
 
 | Model Architecture/Feature       | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | Speculative Decoding [^18] | Torch Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding |
 | -------------------------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | -------------------------- | ------------- | -------------- | ------------------------ | --------------------- | --------------- |
@@ -114,8 +117,10 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^20]: Logits post-processor coverage for `Qwen4ExpForCausalLM` is a proxy test through the text core of a `Qwen4ExpForConditionalGeneration` checkpoint; no checkpoint declaring the exact text-only architecture was available.
 [^21]: Logits post processors are not supported by the AutoDeploy `ADEngine` used for `Glm4MoeLiteForCausalLM`.
 [^22]: Logits post-processor support for `Gemma4ForConditionalGeneration` was validated on the real `nvidia-Gemma-4-26B-A4B-NVFP4` checkpoint using the native PyTorch backend on one B200 with an FP8 KV cache and block and partial reuse disabled.
-[^23]: Logits post-processor coverage for `Gemma4UnifiedForConditionalGeneration` uses a representative dummy-weight end-to-end test with supported attention head dimensions because the available real unified checkpoint encounters an attention limitation.
+[^23]: Logits post-processor support for `Gemma4UnifiedForConditionalGeneration` was validated on the real `gemma-4-12B-it` checkpoint using an image input on one B200; the processor forced four generated tokens to token ID 22.
 [^24]: Overlap scheduler, CUDA graph, and attention data parallelism coverage for the Gemma 4 architectures uses representative dummy-weight end-to-end tests with supported attention head dimensions.
+[^25]: Multimodal logits post-processor support for `Step3p7ForConditionalGeneration` and `MiniMaxM3SparseForConditionalGeneration` was validated on real FP8 and NVFP4 checkpoints, respectively, using image input on four B200 GPUs with TP4/EP4; each processor forced four generated tokens to token ID 22.
+[^26]: Multimodal KV cache reuse for `Llama4ForConditionalGeneration` was tested on the real `Llama-4-Maverick-17B-128E-Instruct-FP8` checkpoint using image input on four B200 GPUs with TP4/EP4. An otherwise identical baseline with block reuse disabled generated successfully; enabling block reuse failed with a multimodal token-count mismatch (0 image tokens for 720 image embeddings).
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -137,16 +142,19 @@ complete encoder input must fit in the iteration token budget.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
+Entries in this matrix require a request with at least one listed non-language modality; language-only test evidence is
+not used to mark a feature as supported here.
+
 | Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality  |
 | ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | -------------- | --------------------- | ------------------------- | --------- |
 | `Exaone4_5_ForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
 | `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | N/A            | Yes                   | No                        | L + I     |
 | `Gemma4ForConditionalGeneration`     | Yes [^24]          | Yes        | Yes             | Yes           | No             | Yes [^22]             | No                        | L + I + V + A [^9] |
-| `Gemma4UnifiedForConditionalGeneration` | Yes [^24]          | Yes [^24] | Untested        | Yes           | No             | Untested              | No                        | L + I + A |
+| `Gemma4UnifiedForConditionalGeneration` | Yes [^24]          | Yes [^24] | Untested        | Yes           | No             | Yes [^23]             | No                        | L + I + A |
 | `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes            | Yes                   | No                        | L + I     |
 | `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I + V |
 | `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I     |
-| `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I     |
+| `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | No [^26]       | Yes                   | No                        | L + I     |
 | `MiniCPMV4_6ForConditionalGeneration` [^14] | Yes               | Untested   | Untested        | Yes           | Untested       | Untested              | No                        | L + I + V |
 | `Mistral3ForConditionalGeneration`   | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I     |
 | `NemotronH_Nano_VL_V2`               | Yes               | Yes        | Yes             | Yes           | N/A            | Yes                   | Yes                       | L + I + V + A [^10] |
@@ -155,8 +163,8 @@ complete encoder input must fit in the iteration token budget.
 | `Qwen2_5_VLForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
 | `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
 | `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
-| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested       | Untested              | Untested                  | L + I     |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Untested                  | L + I + V |
+| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested       | Yes [^25]             | Untested                  | L + I     |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | No             | Yes [^25]             | Untested                  | L + I + V |
 | `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | L + I + V |
 | `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
