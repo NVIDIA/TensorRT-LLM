@@ -1,8 +1,12 @@
+---
+orphan: true
+---
+
 # Speculative Sampling
 
 - [About Speculative Sampling](#about-speculative-sampling)
-- [Performance Improvements](#Performance-improvements)
-- [Draft-Target-Model](#Draft-Target-Model)
+- [Performance Improvements](#performance-improvements)
+- [Draft-Target-Model](#draft-target-model)
 - [NGram](#ngram)
 - [Medusa](#medusa)
   - [Medusa Tree](#medusa-tree)

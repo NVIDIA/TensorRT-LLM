@@ -342,6 +342,8 @@ To configure the nested level arguments like ``moe_config.backend``, the yaml fi
    moe_config:
        backend: CUTLASS
 
+.. _syntax:
+
 Syntax
 ------
 

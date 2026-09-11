@@ -217,7 +217,7 @@ enable_attention_dp: true
 ```
 
 The following is a list of common performance switches.
-#### `kv_cache_config`
+### `kv_cache_config`
 
 &emsp;**Description**: A section for configuring the Key-Value (KV) cache.
 
@@ -227,7 +227,7 @@ The following is a list of common performance switches.
 
 &emsp;&emsp;**Default**: auto (uses the data type specified in the model checkpoint).
 
-#### `cuda_graph_config`
+### `cuda_graph_config`
 
 &emsp;**Description**: A section for configuring CUDA graphs to optimize performance.
 
@@ -247,7 +247,7 @@ The following is a list of common performance switches.
 
 &emsp;&emsp;**Default**: None
 
-#### `moe_config`
+### `moe_config`
 
 &emsp;**Description**: Configuration for Mixture-of-Experts (MoE) models.
 
@@ -257,7 +257,7 @@ The following is a list of common performance switches.
 
 &emsp;&emsp;**Default**: CUTLASS
 
-#### `attention_backend`
+### `attention_backend`
 
 &emsp;**Description**: The backend to use for attention calculations.
 
