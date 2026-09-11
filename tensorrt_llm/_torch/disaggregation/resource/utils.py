@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Set
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from .page import (
     AttentionLayerGroup,
@@ -23,6 +23,7 @@ from .page import (
     KVCachePageTable,
     LayerGroup,
     MambaLayerGroup,
+    MapperKind,
     PhysicalPool,
     PoolView,
 )
@@ -154,6 +155,50 @@ def get_global_layer_ids(layer_group: AttentionLayerGroup) -> List[int]:
     Ordered global layer IDs for *layer_group*
     """
     return [ll.global_layer_id for ll in layer_group.local_layers]
+
+
+def get_hosted_global_layer_ids(page_table: KVCachePageTable, kind: CacheKind) -> Set[int]:
+    """Global layer IDs hosted by the layer groups of *kind* in *page_table*."""
+    return {
+        gid for lg in page_table.layer_groups if lg.kind == kind for gid in get_global_layer_ids(lg)
+    }
+
+
+def get_replicated_role_layers(
+    page_table: KVCachePageTable, kind: CacheKind
+) -> Set[Tuple[FrozenSet[str], int]]:
+    """``(pool_role, global_layer_id)`` pairs of every REPLICATED view of *kind*."""
+    return {
+        (pool_view.pool_role, global_layer_id)
+        for layer_group in page_table.layer_groups
+        if layer_group.kind == kind
+        for pool_view in layer_group.pool_views
+        if pool_view.mapper_kind == MapperKind.REPLICATED
+        for global_layer_id in get_pool_view_global_layer_ids(pool_view, layer_group)
+    }
+
+
+def find_replicated_role_mismatch(
+    self_page_table: Optional[KVCachePageTable],
+    peer_page_table: Optional[KVCachePageTable],
+    kind: CacheKind,
+) -> List[Tuple[List[str], int]]:
+    """Replicated roles that only one side declares on a layer both sides host.
+
+    Pool matching drops a view with no counterpart silently, so a role the peer
+    never declares would leave the receiver holding zeroed state instead of
+    raising. Returns a sorted list of ``(sorted_role_names, global_layer_id)``;
+    empty when the two sides agree or either page table is missing.
+    """
+    if self_page_table is None or peer_page_table is None:
+        return []
+    shared = get_hosted_global_layer_ids(self_page_table, kind) & get_hosted_global_layer_ids(
+        peer_page_table, kind
+    )
+    differing = get_replicated_role_layers(self_page_table, kind) ^ get_replicated_role_layers(
+        peer_page_table, kind
+    )
+    return sorted((sorted(role), gid) for role, gid in differing if gid in shared)
 
 
 def get_layer_group_num_layers(layer_group: AttentionLayerGroup) -> int:

@@ -61,15 +61,12 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     get_non_empty_aux_indices,
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
 )
-from tensorrt_llm._torch.disaggregation.native.peer import (
-    PeerOverlap,
-    PeerRegistrar,
-    ReplicatedPolicy,
-)
+from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
@@ -2838,7 +2835,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
-                ReplicatedPolicy.validate_peer_compatible(
+                AttentionPolicy.validate_peer_compatible(
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )

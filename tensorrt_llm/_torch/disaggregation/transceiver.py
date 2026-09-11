@@ -488,9 +488,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for pv in lg.pool_views:
                 pool = get_physical_pool(pt, lg_id, pv.pool_idx)
                 if lg.kind == CacheKind.STATE:
-                    # STATE: n=1 (one slot), but transfer covers all layers.
+                    # STATE: n=1 (one slot), but transfer covers all layers of
+                    # the view. The physical slot may hold several roles, so
+                    # size by the view's per-layer bytes, not the pool's slot.
                     num_layers = get_pool_view_num_layers(pv)
-                    total += num_layers * pool.slot_bytes
+                    total += num_layers * pv.bytes_per_layer
                 else:
                     # Attention: n blocks, each slot covers all layers.
                     total += n * pool.slot_bytes

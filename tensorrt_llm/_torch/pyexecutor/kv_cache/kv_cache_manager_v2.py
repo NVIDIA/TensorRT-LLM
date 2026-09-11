@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import (
@@ -2341,6 +2341,17 @@ class KVCacheManagerV2(BaseResourceManager):
         backend's configuration.
         """
         return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
+
+    def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Resharding geometry for roles whose mapper kind needs it.
+
+        SECTIONED roles declare ``section_bytes``; INDEXED roles whose head
+        count is not derivable from the attention topology declare
+        ``bytes_per_head``. Attention K/V and replicated roles need none, so
+        the base manager declares nothing. The page-table builder copies the
+        layout onto the role's ``PoolView``.
+        """
+        return {}
 
     @property
     def blocks_in_primary_pool(self) -> int:
