@@ -1,16 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pickle
+import sys
 from types import SimpleNamespace
 
+import cloudpickle
 import pytest
 import torch
+from mpi4py import MPI
 
 import tensorrt_llm as tllm
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(
+    cloudpickle.dumps,
+    cloudpickle.loads,
+    pickle.HIGHEST_PROTOCOL,
+)
 
 _SM_VERSION = get_sm_version() if torch.cuda.is_available() else 0
 
