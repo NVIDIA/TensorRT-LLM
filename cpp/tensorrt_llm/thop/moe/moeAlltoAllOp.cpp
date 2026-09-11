@@ -19,7 +19,7 @@
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftManager.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include "tensorrt_llm/thop/moeAlltoAllMeta.h"
+#include "tensorrt_llm/thop/moe/moeAlltoAllMeta.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <atomic>

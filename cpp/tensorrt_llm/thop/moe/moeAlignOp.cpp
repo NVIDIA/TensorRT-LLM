@@ -16,7 +16,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/utils/moeAlignKernels.h"
-#include "thUtils.h"
+#include "tensorrt_llm/thop/thUtils.h"
 #include <torch/extension.h>
 
 namespace tk = tensorrt_llm::kernels;
