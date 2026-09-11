@@ -377,6 +377,111 @@ def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
         )
 
 
+def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
+    """Replicated context excludes text and generated-sequence padding."""
+    batch = 2
+    generated_len = 5
+    generated_padded_len = 6
+    seq_per_rank = generated_padded_len // world_size
+    context_len = 4
+    context_lengths = [1, context_len] if unequal_lengths else [context_len] * batch
+    num_heads = world_size * 2
+    head_dim = 16
+    device = torch.device("cpu")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    v_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    context_k = torch.randn(batch, context_len, num_heads, head_dim, device=device)
+    context_v = torch.randn(batch, context_len, num_heads, head_dim, device=device)
+
+    start = rank * seq_per_rank
+    end = start + seq_per_rank
+    q_shard = q_full[:, start:end].contiguous()
+    k_shard = k_full[:, start:end].contiguous()
+    v_shard = v_full[:, start:end].contiguous()
+
+    class _RecordingVanillaAttention(VanillaAttention):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.kv_seq_lens = []
+
+        def forward(self, q, k, v, *, key_padding_mask=None, **kwargs):
+            assert key_padding_mask is None
+            self.kv_seq_lens.append(k.shape[2])
+            return super().forward(q, k, v, key_padding_mask=key_padding_mask, **kwargs)
+
+    inner = _RecordingVanillaAttention(
+        num_heads=num_heads // world_size,
+        head_dim=head_dim,
+    )
+    attention = UlyssesAttention(inner_backend=inner, process_group=None)
+    output = attention(
+        q_shard,
+        k_shard,
+        v_shard,
+        attention_mask=PredefinedAttentionMask.FULL,
+        replicated_k=context_k,
+        replicated_v=context_v,
+        replicated_k_lengths=(
+            torch.tensor(context_lengths, dtype=torch.int32) if unequal_lengths else None
+        ),
+        global_generated_seq_len=generated_len,
+    )
+    expected_kv_seq_lens = (
+        [generated_len + length for length in context_lengths]
+        if unequal_lengths
+        else [generated_len + context_len]
+    )
+    assert inner.kv_seq_lens == expected_kv_seq_lens
+
+    reference = []
+    for batch_idx, text_len in enumerate(context_lengths):
+        k_valid = torch.cat(
+            [
+                k_full[batch_idx : batch_idx + 1, :generated_len],
+                context_k[batch_idx : batch_idx + 1, :text_len],
+            ],
+            dim=1,
+        )
+        v_valid = torch.cat(
+            [
+                v_full[batch_idx : batch_idx + 1, :generated_len],
+                context_v[batch_idx : batch_idx + 1, :text_len],
+            ],
+            dim=1,
+        )
+        reference.append(
+            F.scaled_dot_product_attention(
+                q_full[batch_idx : batch_idx + 1, :generated_len].transpose(1, 2),
+                k_valid.transpose(1, 2),
+                v_valid.transpose(1, 2),
+                scale=1.0 / math.sqrt(head_dim),
+                dropout_p=0.0,
+            ).transpose(1, 2)
+        )
+    reference = torch.cat(reference, dim=0)
+
+    valid_in_shard = max(0, min(end, generated_len) - start)
+    if valid_in_shard > 0:
+        torch.testing.assert_close(
+            output[:, :valid_in_shard],
+            reference[:, start : start + valid_in_shard],
+            rtol=1e-4,
+            atol=1e-4,
+            msg=f"Rank {rank}: replicated K/V padding changed Ulysses attention output",
+        )
+
+
+def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
+    _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths=True)
+
+
+def _logic_ulysses_replicated_kv_equal_lengths(rank, world_size):
+    _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths=False)
+
+
 def _logic_ulysses_invalid_heads(rank, world_size):
     """Invalid head count (not divisible by world_size) cannot be sharded."""
     assert rank >= 0 and rank < world_size
