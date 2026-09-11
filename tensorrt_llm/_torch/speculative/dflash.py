@@ -80,6 +80,22 @@ def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -
     return int(max_ctx) + max(int(block_size), int(max_draft_len) + 1)
 
 
+def dflash_allocated_ctx_limit(
+    block_counts: torch.Tensor, page_size: int, block_size: int
+) -> torch.Tensor:
+    """Context length a request may advertise, given the pages it holds.
+
+    Leaves ``block_size`` positions of room on purpose. The MLA path writes the
+    block's own latents at ``ctx_len .. ctx_len + block_size``, so stopping at
+    exactly the allocation puts the first of them on the first UNallocated page
+    -- whose block-table entry ``_refresh_ctx_block_tables`` clamped from a
+    negative placeholder to 0, i.e. another request's block. That is a silent
+    cross-request write, not an out-of-range fault, so the room has to be left
+    here rather than caught downstream.
+    """
+    return (block_counts * page_size - block_size).clamp(min=0)
+
+
 @dataclass
 class DFlashSpecMetadata(SpecMetadata):
     """Metadata for DFlash speculative decoding.
@@ -271,6 +287,9 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_page_table = None
         self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
         self._ctx_block_indptr = None
+        # Pages the manager has actually handed this request, per batch row.
+        # Recovered from the negative placeholders before _refresh clamps them.
+        self._ctx_block_counts = None
         self._ctx_pool_idx = 0
         self._ctx_block_divisor = 1  # encoded offset -> raw pool block index
         self._ctx_kv_indptr = None
@@ -469,6 +488,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_indptr = torch.arange(
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
+        self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         logger.info(
             f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}, "
             f"pool_idx={self._ctx_pool_idx}, divisor={self._ctx_block_divisor}, "
@@ -499,6 +519,10 @@ class DFlashWorker(SpecWorkerBase):
         # clone(): .to() is a no-op for an int64 source, and the in-place ops
         # below would then edit attn_metadata's own tensor.
         encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
+        # Count the placeholders BEFORE the clamp below erases them. Unlike the
+        # private arena, whose slots each owned a fixed page range, a write past
+        # a request's allocation lands in whatever block 0 belongs to.
+        self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
         decoded = encoded.clamp_(min=0).div_(self._ctx_block_divisor, rounding_mode="floor")
         self._ctx_block_tables[:num_seqs].copy_(decoded.to(torch.int32))
         return True
@@ -531,6 +555,7 @@ class DFlashWorker(SpecWorkerBase):
         # pass falling back to the arena still rebinds once the real pool lands.
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
+        self._ctx_block_counts = None
         max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
@@ -858,6 +883,14 @@ class DFlashWorker(SpecWorkerBase):
         # signals a fresh start → replace instead of append.
         offset = 0
         num_contexts = attn_metadata.num_contexts
+        # A context write addresses pages through row i of the block table, so
+        # it has to fit that row's allocation as well as the arena's length.
+        # One sync for the whole loop, which already pays one per request.
+        ctx_alloc = (
+            (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+            if self._ctx_block_tables is not None
+            else None
+        )
         for i in range(num_contexts):
             req_id = spec_metadata.request_ids[i]
             slen = int(attn_metadata._seq_lens[i])
@@ -874,13 +907,14 @@ class DFlashWorker(SpecWorkerBase):
 
             slot = self._req_to_slot[req_id]
             cur = int(self._ctx_len[slot].item())
-            if cur + slen > self._max_ctx:
+            cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
+            if cur + slen > cap:
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
                 # forward would take every other in-flight request with it.
                 logger.warning(
                     f"DFlash: ctx overflow on slot {slot} "
-                    f"({cur} + {slen} > {self._max_ctx}); skipping its context "
+                    f"({cur} + {slen} > {cap}); skipping its context "
                     "store, so this request drafts nothing."
                 )
                 self._req_to_slot.pop(req_id, None)
@@ -975,17 +1009,9 @@ class DFlashWorker(SpecWorkerBase):
         )
         spec_metadata._dflash_worker = self
         # Before any store: prefill and decode both address pages through it.
-        refreshed = self._refresh_ctx_block_tables(attn_metadata, batch_size)
-        if self._ctx_block_tables is not None and not refreshed:
-            # False is normal only while no paged pool is bound (the private
-            # arena addresses slots directly). Once one IS bound, the counts
-            # drive the advertised context length, so a missed refresh leaves
-            # them at zero and every drafter attends an empty context -- no
-            # error, just acceptance quietly collapsing.
-            raise RuntimeError(
-                "DFlash: draft block tables are bound to a paged pool but this "
-                "iteration's attn_metadata carried no draft_kv_cache_block_offsets."
-            )
+        # Returning False here means an empty batch -- the missing-offsets case
+        # raises inside, with the metadata type in the message.
+        self._refresh_ctx_block_tables(attn_metadata, batch_size)
 
         # Save context lengths so both warmup and a failed forward can roll
         # back the in-place _ctx_len updates made during drafting.
@@ -1329,11 +1355,13 @@ class DFlashWorker(SpecWorkerBase):
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
                 if self._ctx_block_tables is not None:
-                    # Bound by the table width. A per-request bound is not
-                    # recoverable here: V2 writes 0 for BAD_PAGE_INDEX and V1
-                    # leaves the tail stale, so a placeholder reads as block 0.
-                    ctx_capacity = self._ctx_block_tables.size(1) * self._ctx_page_size
-                    col_idx = col_idx.clamp(max=ctx_capacity - 1)
+                    # Bound by what the manager allocated for THIS request, not
+                    # by the table width: the masked entries below are still
+                    # written (fixed-size, for graph safety), and every page
+                    # past the allocation is a placeholder that _refresh clamped
+                    # to 0 -- i.e. another request's block.
+                    gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
+                    col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
                 else:
                     col_idx = col_idx.clamp(max=self._max_ctx - 1)
 
@@ -1387,16 +1415,8 @@ class DFlashWorker(SpecWorkerBase):
                 # block table left clamped to 0 -- another request's data.
                 # Truncating the advertised length keeps the two consistent:
                 # the drafter attends a short context instead of a wrong one.
-                #
-                # Leave the block room too. The MLA path writes its own latents
-                # at ctx_len..ctx_len+block_size (_build_mla_block_fixup), so
-                # stopping at `allocated` puts the first block position on the
-                # first UNallocated page -- whose block-table entry _refresh
-                # clamped from its negative placeholder to 0, i.e. another
-                # request's block. That is a silent cross-request write, not an
-                # out-of-range fault.
-                allocated = (self._ctx_block_counts * self._ctx_page_size - block_size).clamp_(
-                    min=0
+                allocated = dflash_allocated_ctx_limit(
+                    self._ctx_block_counts, self._ctx_page_size, block_size
                 )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
             noise_embedding = noise_embed_2d

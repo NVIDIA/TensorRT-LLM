@@ -1173,26 +1173,34 @@ def test_mla_dspark_rope_conventions_agree_on_scores():
 def test_mla_block_fixup_stays_inside_the_allocation():
     """A context that fills its allocation must still leave the block room.
 
-    dflash.py truncates ctx_len to what the draft KV manager allocated, but the
-    MLA path then writes the block's own latents at ctx_len..ctx_len+block_size.
-    Stopping at exactly `allocated` puts the first block position on the first
-    unallocated page, whose block-table entry _refresh_ctx_block_tables clamped
-    from a negative placeholder to 0 -- another request's block. Silent
-    cross-request corruption, not a fault, so only an explicit bound catches it.
+    The bound comes from dflash.py, so it is called here rather than restated:
+    a test that computed `allocated - block_size` itself would still pass
+    against a production path truncating to `allocated`. The MLA writes the
+    block's own latents at ctx_len..ctx_len+block_size, so that regression puts
+    the first of them on the first unallocated page, whose block-table entry
+    _refresh_ctx_block_tables clamped from a negative placeholder to 0 --
+    another request's block. Silent cross-request corruption, not a fault.
     """
     from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+    from tensorrt_llm._torch.speculative.dflash import dflash_allocated_ctx_limit
 
     page_size, block_size, allocated_pages = 8, 3, 2
     allocated = allocated_pages * page_size
     # Entries past the allocation are the clamped placeholders: physical 0.
     page_tables = torch.tensor([[41, 42, 0, 0]])
-    ctx_len = torch.tensor([max(allocated - block_size, 0)])
 
+    ctx_len = dflash_allocated_ctx_limit(torch.tensor([allocated_pages]), page_size, block_size)
     fixup = _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size)
 
-    allocated_ids = page_tables[0, :allocated_pages].tolist()
-    assert set(fixup.pages.flatten().tolist()) <= set(allocated_ids)
+    # Exactly the last allocated page, not merely a subset of the allocation:
+    # `<= {41, 42}` also passes for a block that landed a page early.
+    assert set(fixup.pages.flatten().tolist()) == {42}
     assert int(fixup.seq_lens_i32[0]) <= allocated
+
+    # Negative control: the value the production path yields if the block room
+    # is dropped. It must reach the unallocated page, or this bound is untested.
+    overrun = _build_mla_block_fixup(torch.tensor([allocated]), page_tables, block_size, page_size)
+    assert 0 in overrun.pages.flatten().tolist()
 
 
 def test_mla_rope_table_follows_runtime_max_seq_len():
