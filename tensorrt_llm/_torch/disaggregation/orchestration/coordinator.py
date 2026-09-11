@@ -163,22 +163,25 @@ class DisaggTransferCoordinator:
                     f"kv_transfer_timeout_ms={timeout_ms}ms"
                 )
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                    disagg_diagnostics.emit_event(
-                        "transfer_timeout_observed",
-                        side="ctx" if kind == "context" else "gen",
-                        request_id=get_unique_rid(req),
-                        local_request_id=req.py_request_id,
-                        rank=self._dist.rank,
-                        elapsed_ms=elapsed_ms,
-                        timeout_ms=timeout_ms,
-                        timeout_owner="pyexecutor",
-                        timer_start_monotonic_ns=int(req.py_kv_transfer_start_time * 1_000_000_000),
-                        state=req.state.name,
-                        cancellation_requested=cancel_enabled,
-                        tp_rank=self._dist.tp_rank,
-                        pp_rank=self._dist.pp_rank,
-                        cp_rank=self._dist.cp_rank,
-                    )
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "transfer_timeout_observed",
+                            side="ctx" if kind == "context" else "gen",
+                            request_id=get_unique_rid(req),
+                            local_request_id=req.py_request_id,
+                            rank=self._dist.rank,
+                            elapsed_ms=elapsed_ms,
+                            timeout_ms=timeout_ms,
+                            timeout_owner="pyexecutor",
+                            timer_start_monotonic_ns=int(
+                                req.py_kv_transfer_start_time * 1_000_000_000
+                            ),
+                            state=req.state.name,
+                            cancellation_requested=cancel_enabled,
+                            tp_rank=self._dist.tp_rank,
+                            pp_rank=self._dist.pp_rank,
+                            cp_rank=self._dist.cp_rank,
+                        )
                 req.py_kv_transfer_timed_out = True
 
         # Context requests start their clock on the last chunk, which is also
@@ -247,20 +250,22 @@ class DisaggTransferCoordinator:
                 # the request toward completion.
                 self._transfers.start_transfer(req)
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                    disagg_diagnostics.emit_event(
-                        "ctx_send_ready",
-                        side="ctx",
-                        request_id=get_unique_rid(req),
-                        local_request_id=req.py_request_id,
-                        rank=self._dist.rank,
-                        prompt_tokens=req.prompt_len,
-                        state=req.state.name,
-                        source_kv_request_owned=True,
-                        source_kv_reuse_pinned=self._transfers.should_store_blocks,
-                        tp_rank=self._dist.tp_rank,
-                        pp_rank=self._dist.pp_rank,
-                        cp_rank=self._dist.cp_rank,
-                    )
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "ctx_send_ready",
+                            side="ctx",
+                            request_id=get_unique_rid(req),
+                            local_request_id=req.py_request_id,
+                            rank=self._dist.rank,
+                            prompt_tokens=req.prompt_len,
+                            state=req.state.name,
+                            source_kv_request_owned=True,
+                            source_kv_reuse_pinned=self._transfers.should_store_blocks,
+                            timeout_expected=self._transceiver.kv_transfer_timeout_ms is not None,
+                            tp_rank=self._dist.tp_rank,
+                            pp_rank=self._dist.pp_rank,
+                            cp_rank=self._dist.cp_rank,
+                        )
                 self._transceiver.respond_and_send_async(req)
                 # Bridge validation can reject before a transfer session exists.
                 # Release the claim right away: there is no physical accessor
@@ -271,25 +276,43 @@ class DisaggTransferCoordinator:
                     and not self._transceiver.has_inflight_transfer(req)
                 ):
                     self.release_transfer(req)
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_event(
+                                "ctx_transfer_settled",
+                                side="ctx",
+                                request_id=get_unique_rid(req),
+                                local_request_id=req.py_request_id,
+                                rank=self._dist.rank,
+                                instance=getattr(self._transceiver, "_instance_name", None),
+                                outcome="failed",
+                                session_status=None,
+                                resources_drained=True,
+                                tp_rank=self._dist.tp_rank,
+                                pp_rank=self._dist.pp_rank,
+                                cp_rank=self._dist.cp_rank,
+                                dp_rank=getattr(self._dist, "dp_rank", None),
+                            )
                     continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
                     timeout_start = time.monotonic()
                     req.py_kv_transfer_start_time = timeout_start
                     if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                        disagg_diagnostics.emit_event(
-                            "transfer_timeout_started",
-                            side="ctx",
-                            request_id=get_unique_rid(req),
-                            local_request_id=req.py_request_id,
-                            rank=self._dist.rank,
-                            timeout_ms=self._transceiver.kv_transfer_timeout_ms,
-                            timeout_owner="pyexecutor",
-                            timer_start_monotonic_ns=int(timeout_start * 1_000_000_000),
-                            state=req.state.name,
-                            tp_rank=self._dist.tp_rank,
-                            pp_rank=self._dist.pp_rank,
-                            cp_rank=self._dist.cp_rank,
-                        )
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_event(
+                                "transfer_timeout_started",
+                                side="ctx",
+                                request_id=get_unique_rid(req),
+                                local_request_id=req.py_request_id,
+                                rank=self._dist.rank,
+                                timeout_ms=self._transceiver.kv_transfer_timeout_ms,
+                                timeout_owner="pyexecutor",
+                                timer_start_monotonic_ns=int(timeout_start * 1_000_000_000),
+                                state=req.state.name,
+                                tp_rank=self._dist.tp_rank,
+                                pp_rank=self._dist.pp_rank,
+                                cp_rank=self._dist.cp_rank,
+                            )
             elif (
                 self._transceiver.pipeline_transfer_enabled
                 and req.state != LlmRequestState.GENERATION_COMPLETE
@@ -498,24 +521,25 @@ class DisaggTransferCoordinator:
             elapsed_ms = (current_time - request.py_kv_transfer_start_time) * 1000
             if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                    disagg_diagnostics.emit_event(
-                        "transfer_timeout_observed",
-                        side="gen",
-                        request_id=get_unique_rid(request),
-                        local_request_id=request.py_request_id,
-                        rank=self._dist.rank,
-                        elapsed_ms=elapsed_ms,
-                        timeout_ms=timeout_ms,
-                        timeout_owner="pyexecutor",
-                        timer_start_monotonic_ns=int(
-                            request.py_kv_transfer_start_time * 1_000_000_000
-                        ),
-                        state=request.state.name,
-                        cancellation_requested=True,
-                        tp_rank=self._dist.tp_rank,
-                        pp_rank=self._dist.pp_rank,
-                        cp_rank=self._dist.cp_rank,
-                    )
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "transfer_timeout_observed",
+                            side="gen",
+                            request_id=get_unique_rid(request),
+                            local_request_id=request.py_request_id,
+                            rank=self._dist.rank,
+                            elapsed_ms=elapsed_ms,
+                            timeout_ms=timeout_ms,
+                            timeout_owner="pyexecutor",
+                            timer_start_monotonic_ns=int(
+                                request.py_kv_transfer_start_time * 1_000_000_000
+                            ),
+                            state=request.state.name,
+                            cancellation_requested=True,
+                            tp_rank=self._dist.tp_rank,
+                            pp_rank=self._dist.pp_rank,
+                            cp_rank=self._dist.cp_rank,
+                        )
                 logger.warning(
                     f"Requesting cancellation for generation request "
                     f"{request.py_request_id} due to KV cache transfer timeout"
