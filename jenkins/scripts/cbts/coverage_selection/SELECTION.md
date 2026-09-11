@@ -21,7 +21,8 @@ Tier 2 only ever looks at the **residual**: the files no Tier 1 rule claimed.
 
 ## 2. The qualname concepts
 
-Precision comes down to which qualname a changed line lands on. `qualname_map`'s attribution:
+Precision comes down to which qualname a changed line lands on. The shared
+`python_change_analysis` module's attribution:
 
 | Changed line sits in | Attributed to | Note |
 |---|---|---|

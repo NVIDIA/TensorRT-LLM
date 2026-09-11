@@ -92,10 +92,11 @@ jenkins/scripts/cbts/
 │   ├── openengine_rule.py
 │   └── out_of_scope_rule.py
 ├── coverage_tier.py       Tier 2 entry: applies the selector to the test-db YAMLs, classifies every candidate entry
+├── python_change_analysis.py  shared AST scopes, bindings, and local dependencies
+├── repository_reference.py   shared repository import and binding-reference index
 ├── coverage_selection/
 │   ├── SELECTION.md       how a decision is made: qualname concepts, decline gates, narrowing
 │   ├── selector.py        CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
-│   ├── qualname_map.py    changed lines → co_qualname, plus the import-time and closure classifications
 │   ├── touch_db.py        read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
 │   └── artifact.py        resolve and merge the x86/SBSA post-merge touch DBs
 ├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
