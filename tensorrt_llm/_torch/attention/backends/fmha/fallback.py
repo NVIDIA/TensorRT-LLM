@@ -57,6 +57,7 @@ class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
 
     supports_skip_correction = True
+    supports_workspace_reclamation = True
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -106,6 +107,7 @@ class FallbackFmha(Fmha):
             output=forward_args.output,
             output_sf=forward_args.output_sf,
             workspace_=metadata.effective_workspace,
+            workspace_required_bytes=metadata.workspace_required_bytes,
             # --- Per-step batch state (TrtllmAttentionMetadata) ---
             sequence_length=metadata.kv_lens_cuda_runtime,
             host_past_key_value_lengths=metadata.kv_lens_runtime,

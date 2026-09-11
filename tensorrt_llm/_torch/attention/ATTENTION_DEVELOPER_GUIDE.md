@@ -545,3 +545,29 @@ Key test files:
 - Do not treat KV-cache semantics as a small implementation detail.
 - Do not bypass MLA's context dispatcher for chunked or cached-KV cases.
 - Do not duplicate RoPE handling before checking the fused path.
+
+## 8. Experimental Eager Scratch Reclamation
+
+Enable with `TRTLLM_EAGER_WORKSPACE_SHRINK=1` before engine construction
+(default: off). Successful warmup freezes the minimum eager capacity.
+
+- Native sizing reports the maximum required bytes across one model forward
+  into a CPU scalar, without GPU synchronization. Three underfilled forwards
+  trigger replacement with `max(warmup floor, window maximum requirement)`.
+  Growth, exact-capacity demand, or failure resets the counter; no report
+  leaves it unchanged.
+- Drop the old Tensor before replacement: `resize_` alone retains storage.
+  Memory returns to PyTorch's allocator, not necessarily the driver; stream
+  ordering may delay reuse. This does not prevent peak OOM and can add
+  allocation overhead with alternating large/small requests.
+- CUDA graph storage is untouched. Speculative decoding, CP, encoder-decoder,
+  sparse, compiled, breakable-graph, and multi-stream modes are excluded;
+  changing the serving stream disables reclamation.
+- Only fallback FMHA opts in. Any other eager FMHA use, including warmup,
+  disables reclamation for that metadata. Opting in requires pure scratch
+  with no cross-forward state and complete requirement reporting.
+
+Tests: policy, ownership branches, and engine wiring run on CPU (CUDA calls
+are mocked). Only allocator/async-lifetime and native FMHA tests need a GPU;
+prefer one available lower-cost supported card. Native FMHA requires SM80+
+and matching rebuilt bindings, not specifically H100/H200.

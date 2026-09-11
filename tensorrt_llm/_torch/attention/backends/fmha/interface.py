@@ -41,6 +41,7 @@ class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
     supports_skip_correction: ClassVar[bool] = False
+    supports_workspace_reclamation: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
