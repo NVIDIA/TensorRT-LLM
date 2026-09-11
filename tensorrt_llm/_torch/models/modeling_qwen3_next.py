@@ -536,9 +536,13 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         # It is also genuinely unreachable here: _eager_fusion_enabled() returns
         # False under attention DP, so PRE/POST_MOE_FUSION are False and the only
         # call sites (inside `if self.fusion_config.POST_MOE_FUSION`) never run.
-        # Same guard modeling_qwen3_moe.py already uses.
+        # Gate on the fusion flag itself: it already excludes attention DP and
+        # pipeline-parallel layers, and also skips the workspace when eager
+        # fusion is disabled (TRTLLM_QWEN3_EAGER_FUSION_DISABLED=1). Forward
+        # only ever clears the flag (spec-metadata layer capture), never sets
+        # it, so the construction-time value is a superset of runtime use.
         self.moe_allreduce = None
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+        if self.fusion_config.POST_MOE_FUSION and self.mapping.tp_size > 1:
             self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
@@ -721,9 +725,13 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         # It is also genuinely unreachable here: _eager_fusion_enabled() returns
         # False under attention DP, so PRE/POST_MOE_FUSION are False and the only
         # call sites (inside `if self.fusion_config.POST_MOE_FUSION`) never run.
-        # Same guard modeling_qwen3_moe.py already uses.
+        # Gate on the fusion flag itself: it already excludes attention DP and
+        # pipeline-parallel layers, and also skips the workspace when eager
+        # fusion is disabled (TRTLLM_QWEN3_EAGER_FUSION_DISABLED=1). Forward
+        # only ever clears the flag (spec-metadata layer capture), never sets
+        # it, so the construction-time value is a superset of runtime use.
         self.moe_allreduce = None
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+        if self.fusion_config.POST_MOE_FUSION and self.mapping.tp_size > 1:
             self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(

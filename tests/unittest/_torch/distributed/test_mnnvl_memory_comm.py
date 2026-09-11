@@ -31,10 +31,8 @@ import pytest
 import torch
 
 from tensorrt_llm import _mnnvl_utils
-from tensorrt_llm._mnnvl_utils import (HelixCpMnnvlMemory, MnnvlMemory,
-                                       ProcessGroupComm)
-from tensorrt_llm._torch.models.modeling_utils import (MetaInitException,
-                                                       MetaInitMode)
+from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory, ProcessGroupComm
+from tensorrt_llm._torch.models.modeling_utils import MetaInitException, MetaInitMode
 
 
 class _FakeProcessGroup:
@@ -48,6 +46,8 @@ class _FakeMapping:
     """Just enough of Mapping for the communicator helpers."""
 
     def __init__(self, tp_group_pg=None, cp_group_pg=None):
+        self.world_size = 4
+        self.pp_size = 1
         self.tp_size = 4
         self.tp_rank = 1
         self.pp_rank = 0
@@ -55,18 +55,22 @@ class _FakeMapping:
         self.cp_rank = 0
         self.moe_tp_size = 1
         self.moe_tp_rank = 0
+        self.moe_ep_size = 1
+        self.moe_cluster_size = 1
         self.tp_group_pg = tp_group_pg
         self.cp_group_pg = cp_group_pg
 
 
 @pytest.fixture(autouse=True)
 def _reset_cached_comms():
-    """get_comm() memoizes into class state; keep tests independent."""
-    MnnvlMemory.comm = None
-    HelixCpMnnvlMemory.comm = None
+    """get_comm() memoizes comm + layout signature; keep tests independent."""
+    for cls in (MnnvlMemory, HelixCpMnnvlMemory):
+        cls.comm = None
+        cls.comm_signature = None
     yield
-    MnnvlMemory.comm = None
-    HelixCpMnnvlMemory.comm = None
+    for cls in (MnnvlMemory, HelixCpMnnvlMemory):
+        cls.comm = None
+        cls.comm_signature = None
 
 
 @pytest.fixture
@@ -96,8 +100,7 @@ def test_get_comm_uses_tp_process_group_under_ray(ray_mode, monkeypatch):
     assert comm._pg is pg
 
 
-def test_helix_cp_get_comm_uses_cp_process_group_under_ray(
-        ray_mode, monkeypatch):
+def test_helix_cp_get_comm_uses_cp_process_group_under_ray(ray_mode, monkeypatch):
     _forbid_mpi(monkeypatch)
     pg = _FakeProcessGroup("cp")
 
@@ -109,7 +112,7 @@ def test_helix_cp_get_comm_uses_cp_process_group_under_ray(
 
 def test_get_comm_rejects_missing_process_group(ray_mode, monkeypatch):
     _forbid_mpi(monkeypatch)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="ProcessGroup not initialised"):
         MnnvlMemory.get_comm(_FakeMapping(tp_group_pg=None))
 
 
@@ -118,7 +121,6 @@ def test_get_comm_still_splits_mpi_comm_under_mpi(mpi_mode, monkeypatch):
     recorded = {}
 
     class _FakeMpiComm:
-
         def Split(self, color, key):
             recorded["color"] = color
             recorded["key"] = key
@@ -147,10 +149,10 @@ def test_get_comm_is_cached(ray_mode, monkeypatch):
 
 def test_process_group_comm_delegates_size_and_rank(monkeypatch):
     pg = _FakeProcessGroup()
-    monkeypatch.setattr(torch.distributed, "get_world_size",
-                        lambda group=None: 4 if group is pg else -1)
-    monkeypatch.setattr(torch.distributed, "get_rank",
-                        lambda group=None: 2 if group is pg else -1)
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group=None: 4 if group is pg else -1
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 2 if group is pg else -1)
 
     comm = ProcessGroupComm(pg)
 
@@ -160,20 +162,16 @@ def test_process_group_comm_delegates_size_and_rank(monkeypatch):
 
 def test_process_group_comm_allgather_returns_one_entry_per_rank(monkeypatch):
     pg = _FakeProcessGroup()
-    monkeypatch.setattr(torch.distributed, "get_world_size",
-                        lambda group=None: 3)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 3)
 
     def _fake_all_gather_object(out_list, obj, group=None):
         assert group is pg
         for i in range(len(out_list)):
             out_list[i] = (i, obj)
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object",
-                        _fake_all_gather_object)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", _fake_all_gather_object)
 
-    assert ProcessGroupComm(pg).allgather("handle") == [(0, "handle"),
-                                                        (1, "handle"),
-                                                        (2, "handle")]
+    assert ProcessGroupComm(pg).allgather("handle") == [(0, "handle"), (1, "handle"), (2, "handle")]
 
 
 def test_process_group_comm_allgather_survives_meta_init_mode(monkeypatch):
@@ -187,8 +185,7 @@ def test_process_group_comm_allgather_survives_meta_init_mode(monkeypatch):
     "Meta tensor used in unsupported function".
     """
     pg = _FakeProcessGroup()
-    monkeypatch.setattr(torch.distributed, "get_world_size",
-                        lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
 
     def _all_gather_object_like_torch(out_list, obj, group=None):
         # Mirror _object_to_tensor: allocate, then set_ from a storage. Under an
@@ -198,8 +195,7 @@ def test_process_group_comm_allgather_survives_meta_init_mode(monkeypatch):
         for i in range(len(out_list)):
             out_list[i] = obj
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object",
-                        _all_gather_object_like_torch)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", _all_gather_object_like_torch)
 
     comm = ProcessGroupComm(pg)
 
@@ -223,17 +219,14 @@ def test_process_group_comm_barrier_uses_cpu_backend(monkeypatch):
     waited = []
 
     class _Work:
-
         def wait(self):
             waited.append(True)
 
     class _Backend:
-
         def barrier(self):
             return _Work()
 
     class _Pg:
-
         def __init__(self):
             self.requested_devices = []
 
