@@ -88,7 +88,7 @@ class PrimsTSFmha(PhasedFmha):
         self._decode_workspace_required_bytes = 0
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         sm = get_sm_version()
         if sm not in (100, 103):
             logger.debug(f"PrimTS FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
@@ -145,7 +145,7 @@ class PrimsTSFmha(PhasedFmha):
         )
         return [name for name in required_ops if not hasattr(thop, name)]
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],

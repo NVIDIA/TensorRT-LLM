@@ -1524,7 +1524,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             self.mm_encoder = Llama4VisionEncoder(full_model_config)
 
         # Surface the in-vocab image placeholder to the model engine's
-        # ``_prepare_multimodal_indices`` so it selects the ``torch.isin``
+        # ``runners.prepare_multimodal_indices`` so it selects the ``torch.isin``
         # predicate. Read from ``full_model_config`` (the top-level Llama4Config
         # holds ``image_token_index``; the text-only swapped config above does
         # not).
