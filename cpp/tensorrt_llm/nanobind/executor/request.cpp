@@ -568,7 +568,7 @@ void initRequestBindings(nb::module_& m)
         auto inputTokenIdsBytes = nb::bytes(
             reinterpret_cast<char const*>(inputTokenIds.data()), inputTokenIds.size() * sizeof(VecTokens::value_type));
         return nb::make_tuple(std::move(inputTokenIdsBytes), self.getMaxTokens(), self.getStreaming(),
-            self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
+            self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPositionIds(),
             self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getPromptTuningConfig(),
             self.getMultimodalInput(), self.getMultimodalEmbedding(), self.getMropeConfig(), self.getLoraConfig(),
             self.getLookaheadConfig(), self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(),
@@ -580,7 +580,7 @@ void initRequestBindings(nb::module_& m)
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 33)
+        if (state.size() != 32)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -599,24 +599,23 @@ void initRequestBindings(nb::module_& m)
         }
         new (&self) tle::Request(std::move(inputTokenIds), nb::cast<SizeType32>(state[1]), nb::cast<bool>(state[2]),
             nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
-            nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<SizeType32>>(state[6]),
-            nb::cast<std::optional<std::vector<SizeType32>>>(state[7]),
-            nb::cast<std::optional<std::list<VecTokens>>>(state[8]),
-            nb::cast<std::optional<std::list<VecTokens>>>(state[9]), nb::cast<std::optional<Tensor>>(state[10]),
-            nb::cast<std::optional<tle::PromptTuningConfig>>(state[11]),
-            nb::cast<std::optional<tle::MultimodalInput>>(state[12]), nb::cast<std::optional<Tensor>>(state[13]),
-            nb::cast<std::optional<tle::MropeConfig>>(state[14]), nb::cast<std::optional<tle::LoraConfig>>(state[15]),
-            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[16]),
-            nb::cast<std::optional<tle::KvCacheRetentionConfig>>(state[17]),
-            nb::cast<std::optional<std::string>>(state[18]),
-            nb::cast<std::optional<tle::LogitsPostProcessor>>(state[19]), nb::cast<std::optional<VecTokens>>(state[20]),
-            nb::cast<std::optional<IdType>>(state[21]), nb::cast<bool>(state[22]),
-            nb::cast<tle::PriorityType>(state[23]), nb::cast<tle::RequestType>(state[24]),
-            nb::cast<std::optional<tle::ContextPhaseParams>>(state[25]),
-            nb::cast<std::optional<tle::Tensor>>(state[26]), nb::cast<std::optional<SizeType32>>(state[27]),
-            nb::cast<std::optional<tle::Tensor>>(state[28]), nb::cast<std::optional<tle::Tensor>>(state[29]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[30]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[31]), nb::cast<std::optional<std::string>>(state[32]));
+            nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<std::vector<SizeType32>>>(state[6]),
+            nb::cast<std::optional<std::list<VecTokens>>>(state[7]),
+            nb::cast<std::optional<std::list<VecTokens>>>(state[8]), nb::cast<std::optional<Tensor>>(state[9]),
+            nb::cast<std::optional<tle::PromptTuningConfig>>(state[10]),
+            nb::cast<std::optional<tle::MultimodalInput>>(state[11]), nb::cast<std::optional<Tensor>>(state[12]),
+            nb::cast<std::optional<tle::MropeConfig>>(state[13]), nb::cast<std::optional<tle::LoraConfig>>(state[14]),
+            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[15]),
+            nb::cast<std::optional<tle::KvCacheRetentionConfig>>(state[16]),
+            nb::cast<std::optional<std::string>>(state[17]),
+            nb::cast<std::optional<tle::LogitsPostProcessor>>(state[18]), nb::cast<std::optional<VecTokens>>(state[19]),
+            nb::cast<std::optional<IdType>>(state[20]), nb::cast<bool>(state[21]),
+            nb::cast<tle::PriorityType>(state[22]), nb::cast<tle::RequestType>(state[23]),
+            nb::cast<std::optional<tle::ContextPhaseParams>>(state[24]),
+            nb::cast<std::optional<tle::Tensor>>(state[25]), nb::cast<std::optional<SizeType32>>(state[26]),
+            nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<tle::Tensor>>(state[28]),
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[29]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[30]), nb::cast<std::optional<std::string>>(state[31]));
     };
 
     // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
@@ -648,9 +647,9 @@ void initRequestBindings(nb::module_& m)
                 nb::handle input_token_ids, // list[int] or int32 ndarray
                 tle::SizeType32 max_tokens, bool streaming, tle::SamplingConfig const& sampling_config,
                 tle::OutputConfig const& output_config, std::optional<tle::SizeType32> const& end_id,
-                std::optional<tle::SizeType32> const& pad_id, std::optional<std::vector<SizeType32>> position_ids,
-                std::optional<std::list<tle::VecTokens>> bad_words, std::optional<std::list<tle::VecTokens>> stop_words,
-                std::optional<tle::Tensor> embedding_bias, std::optional<tle::PromptTuningConfig> prompt_tuning_config,
+                std::optional<std::vector<SizeType32>> position_ids, std::optional<std::list<tle::VecTokens>> bad_words,
+                std::optional<std::list<tle::VecTokens>> stop_words, std::optional<tle::Tensor> embedding_bias,
+                std::optional<tle::PromptTuningConfig> prompt_tuning_config,
                 std::optional<tle::MultimodalInput> multimodal_input, std::optional<tle::Tensor> multimodal_embedding,
                 std::optional<tle::MropeConfig> mrope_config, std::optional<tle::LoraConfig> lora_config,
                 std::optional<tle::LookaheadDecodingConfig> lookahead_config,
@@ -668,7 +667,7 @@ void initRequestBindings(nb::module_& m)
                 std::optional<std::string> cache_salt)
             {
                 new (self) tle::Request(toVecTokens(input_token_ids), max_tokens, streaming, sampling_config,
-                    output_config, end_id, pad_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
+                    output_config, end_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
                     std::move(embedding_bias), std::move(prompt_tuning_config), std::move(multimodal_input),
                     std::move(multimodal_embedding), std::move(mrope_config), std::move(lora_config),
                     std::move(lookahead_config), std::move(kv_cache_retention_config),
@@ -687,7 +686,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("sampling_config") = tle::SamplingConfig(),
         nb::arg("output_config") = tle::OutputConfig(),
         nb::arg("end_id") = nb::none(),
-        nb::arg("pad_id") = nb::none(),
         nb::arg("position_ids") = nb::none(),
         nb::arg("bad_words") = nb::none(),
         nb::arg("stop_words") = nb::none(),
@@ -724,7 +722,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("sampling_config", &tle::Request::getSamplingConfig, &tle::Request::setSamplingConfig)
         .def_prop_rw("output_config", &tle::Request::getOutputConfig, &tle::Request::setOutputConfig)
         .def_prop_rw("end_id", &tle::Request::getEndId, &tle::Request::setEndId)
-        .def_prop_rw("pad_id", &tle::Request::getPadId, &tle::Request::setPadId)
         .def_prop_rw("position_ids", &tle::Request::getPositionIds, &tle::Request::setPositionIds)
         .def_prop_rw("bad_words", &tle::Request::getBadWords, &tle::Request::setBadWords)
         .def_prop_rw("stop_words", &tle::Request::getStopWords, &tle::Request::setStopWords)

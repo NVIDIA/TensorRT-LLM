@@ -475,7 +475,6 @@ class BaseWorker(GenerationExecutor):
                 sampling_config=request.sampling_params._get_sampling_config(),
                 end_id=-1 if request.sampling_params.ignore_eos else
                 request.sampling_params.end_id,
-                pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(
                     is_pytorch_backend=self._is_pytorch_backend),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value

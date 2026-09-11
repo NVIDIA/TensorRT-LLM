@@ -48,7 +48,7 @@ public:
     }
 
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
-        OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
+        OutputConfig outputConfig, std::optional<TokenIdType> const& endId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
         std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
@@ -69,7 +69,6 @@ public:
         , mSamplingConfig(samplingConfig)
         , mOutputConfig(std::move(outputConfig))
         , mEndId(endId)
-        , mPadId(padId)
         , mPositionIds(std::move(positionIds))
         , mBadWords(std::move(badWords))
         , mStopWords(std::move(stopWords))
@@ -159,11 +158,6 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEndId() const
     {
         return mEndId;
-    }
-
-    [[nodiscard]] std::optional<SizeType32> getPadId() const
-    {
-        return mPadId;
     }
 
     [[nodiscard]] std::optional<std::vector<SizeType32>> getPositionIds() const
@@ -324,11 +318,6 @@ public:
     void setEndId(SizeType32 endId)
     {
         mEndId = endId;
-    }
-
-    void setPadId(SizeType32 padId)
-    {
-        mPadId = padId;
     }
 
     void setPositionIds(std::vector<SizeType32> const& positionIds)
@@ -506,7 +495,6 @@ private:
         lambda(mSamplingConfig);
         lambda(mOutputConfig);
         lambda(mEndId);
-        lambda(mPadId);
         lambda(mPositionIds);
         lambda(mBadWords);
         lambda(mStopWords);
@@ -542,7 +530,6 @@ private:
     SamplingConfig mSamplingConfig;
     OutputConfig mOutputConfig;
     std::optional<SizeType32> mEndId;
-    std::optional<SizeType32> mPadId;
     std::optional<std::vector<SizeType32>> mPositionIds;
     std::optional<std::list<VecTokens>> mBadWords;
     std::optional<std::list<VecTokens>> mStopWords;
