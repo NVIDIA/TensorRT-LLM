@@ -140,13 +140,23 @@ def parse_test_string(test_case_name: str):
     if len(labels) <= 1:
         raise ValueError(f"perf_sanity test must have a config file: {test_case_name}")
 
-    def split_modifiers(rest):
+    def split_modifiers(rest, benchmark_mode):
         """Peel the optional modifier segment off the front of the stem."""
         time_breakdown = bool(rest) and rest[0] == TIME_BREAKDOWN_MODIFIER
         if time_breakdown:
             rest = rest[1:]
         if not rest:
             raise ValueError(f"Test name has a modifier but no config: {test_case_name}")
+        # Same reason the --config-file path refuses this combination below: the id
+        # is well-formed and parses fine, but test_perf_sanity.py never generates
+        # it, so pytest would exit "no tests ran" after the whole job has been
+        # queued, built and allocated.
+        if time_breakdown and benchmark_mode not in TIME_BREAKDOWN_BENCHMARK_MODES:
+            raise ValueError(
+                f"The {TIME_BREAKDOWN_MODIFIER} modifier is not generated for "
+                f"benchmark_mode {benchmark_mode!r}; supported modes are "
+                f"{', '.join(TIME_BREAKDOWN_BENCHMARK_MODES)}: {test_case_name}"
+            )
         return time_breakdown, "-".join(rest)
 
     prefix = labels[0]
@@ -162,7 +172,7 @@ def parse_test_string(test_case_name: str):
         if benchmark_mode not in ("e2e", "gen_only"):
             raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
         runtime_mode = "disaggregated"
-        time_breakdown, config_base_name = split_modifiers(labels[2:])
+        time_breakdown, config_base_name = split_modifiers(labels[2:], benchmark_mode)
         select_pattern = None
     elif is_aggr_prefix:
         # Check if this is ctx_only (aggr_upload-ctx_only-{config_base})
@@ -171,7 +181,7 @@ def parse_test_string(test_case_name: str):
             # Runs in aggregated mode but reads disagg config
             benchmark_mode = "ctx_only"
             runtime_mode = "aggregated"
-            time_breakdown, config_base_name = split_modifiers(labels[2:])
+            time_breakdown, config_base_name = split_modifiers(labels[2:], benchmark_mode)
             select_pattern = None
         else:
             # Regular aggr: aggr_upload-config_yml or aggr_upload-config_yml-server_config_name

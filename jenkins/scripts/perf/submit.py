@@ -74,6 +74,14 @@ DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
 TIME_BREAKDOWN_MODIFIER = "time_breakdown"
 TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
 
+# Benchmark modes test_perf_sanity.py actually mints a time_breakdown test id
+# for. gen_only is deliberately absent: its regression metric is the gen-worker
+# device step time, so the lifecycle spans add nothing there, and the collector
+# generates no such id. Keep in sync with the two *_TIME_BREAKDOWN_CONFIGS loops
+# in test_perf_sanity.py:get_disagg_test_cases and with the identical constant in
+# jenkins/scripts/perf/local/submit.py.
+TIME_BREAKDOWN_BENCHMARK_MODES = ("e2e", "ctx_only")
+
 
 # --------------------------------------------------------------------------- #
 # Test list parsing
@@ -328,7 +336,9 @@ def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_gr
     return selected[0]
 
 
-def _split_modifiers(rest: List[str], bracket_content: str) -> Tuple[bool, str]:
+def _split_modifiers(
+    rest: List[str], bracket_content: str, benchmark_mode: str
+) -> Tuple[bool, str]:
     """Peel the optional modifier segment off the front of the config stem.
 
     Mirrors test_perf_sanity.py:parse_test_string.split_modifiers.
@@ -339,6 +349,16 @@ def _split_modifiers(rest: List[str], bracket_content: str) -> Tuple[bool, str]:
         rest = rest[1:]
     if not rest:
         raise ValueError(f"Test name has a modifier but no config: {bracket_content}")
+    # Reject here rather than let the id through: it is well-formed and parses
+    # fine, but test_perf_sanity.py never generates it, so pytest would exit "no
+    # tests ran" after the whole job has been queued, built and allocated -- and
+    # every gate reports green on an empty selection.
+    if time_breakdown and benchmark_mode not in TIME_BREAKDOWN_BENCHMARK_MODES:
+        raise ValueError(
+            f"The {TIME_BREAKDOWN_MODIFIER} modifier is not generated for "
+            f"benchmark_mode {benchmark_mode!r}; supported modes are "
+            f"{', '.join(TIME_BREAKDOWN_BENCHMARK_MODES)}: {bracket_content}"
+        )
     return time_breakdown, "-".join(rest)
 
 
@@ -377,7 +397,9 @@ def parse_test_case_name(
             )
         runtime_mode = "disaggregated"
         server_name = None
-        time_breakdown, config_base_name = _split_modifiers(parts[2:], bracket_content)
+        time_breakdown, config_base_name = _split_modifiers(
+            parts[2:], bracket_content, benchmark_mode
+        )
         config_yaml_path = os.path.join(llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml")
     elif "aggr" in prefix:
         if len(parts) > 2 and parts[1] == "ctx_only":
@@ -386,7 +408,9 @@ def parse_test_case_name(
             benchmark_mode = "ctx_only"
             runtime_mode = "aggregated"
             server_name = None
-            time_breakdown, config_base_name = _split_modifiers(parts[2:], bracket_content)
+            time_breakdown, config_base_name = _split_modifiers(
+                parts[2:], bracket_content, benchmark_mode
+            )
             config_yaml_path = os.path.join(
                 llm_src, DISAGG_CONFIG_FOLDER, f"{config_base_name}.yaml"
             )

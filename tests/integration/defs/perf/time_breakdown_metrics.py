@@ -681,7 +681,16 @@ def discover_perf_metrics_files(output_dir: str) -> List[str]:
     result = []
     for path in found:
         real = os.path.realpath(path)
-        if real not in seen and os.path.getsize(path) > 0:
+        if real in seen:
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            # Raced with a rename/removal between glob and stat. Treat it as absent
+            # rather than aborting the completion gate, which is meant to expire as a
+            # warning; snapshot() below tolerates the same race on the same syscall.
+            continue
+        if size > 0:
             seen.add(real)
             result.append(path)
     return result
