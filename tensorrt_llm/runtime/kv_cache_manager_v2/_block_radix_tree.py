@@ -237,6 +237,22 @@ def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
     return tree
 
 
+def detach_root_block(root: "RootBlock") -> None:
+    """Remove ``root`` from its tree's top-level ``next`` registry.
+
+    Eager pruning and explicit teardown share this bookkeeping so they cannot
+    diverge: ``detach_next`` calls it once a RootBlock's last child is gone,
+    and ``BlockRadixTree.clear`` calls it directly for roots that never gained
+    a child.  Removing the tree's only strong reference lets the RootBlock be
+    collected; a root owns no blocks or pages itself.
+    """
+    tree = root._prev()
+    root._prev = rawref.NULL
+    if tree is not None and root.key in tree.next:
+        detached_root = tree.next.pop(root.key)
+        assert detached_root is root
+
+
 def detach_next(parent: "Block | RootBlock", key: BlockKey) -> "Block | None":
     child = parent.next.pop(key, None)
     if child is None:
@@ -244,11 +260,7 @@ def detach_next(parent: "Block | RootBlock", key: BlockKey) -> "Block | None":
 
     child._prev = rawref.NULL
     if isinstance(parent, RootBlock) and not parent.next:
-        tree = parent._prev()
-        if tree is not None and parent.key in tree.next:
-            detached_root = tree.next.pop(parent.key)
-            parent._prev = rawref.NULL
-            assert detached_root is parent
+        detach_root_block(parent)
     return child
 
 
@@ -686,8 +698,14 @@ class BlockRadixTree:
         # detach_next() auto-prunes empty RootBlocks from the tree.
         while self.next:
             root = next(iter(self.next.values()))
-            while root.next:
+            if root.next:
                 remove_subtree(next(iter(root.next.values())))
+            else:
+                # A RootBlock that never gained a child has no child whose
+                # detachment could auto-prune it (see detach_next); detach it
+                # explicitly so every iteration makes progress and the loop
+                # terminates even when the tree holds childless roots.
+                detach_root_block(root)
         assert not self.next
 
     def _num_matched_tokens(self, matched: list[tuple[Block, int]]) -> int:
