@@ -350,7 +350,7 @@ class TestFA4PaddedQRaggedK:
         torch.testing.assert_close(out_bhsd, ref, rtol=2e-2, atol=2e-2)
 
 
-class TestPackRaggedKvCache:
+class TestPackRaggedKvMetadataCache:
     """Attention._cu_seqlens_kv_and_max correctness under repeated/interleaved
     kv_lens, cached in a model-scoped metadata_state dict. No FA4/CUDA
     needed - pure tensor bookkeeping, runs on CPU."""
