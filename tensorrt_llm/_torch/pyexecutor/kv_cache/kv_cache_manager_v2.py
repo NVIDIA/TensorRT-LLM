@@ -3008,16 +3008,12 @@ class KVCacheManagerV2(BaseResourceManager):
         and how full was it", so answer it in the message rather than leaving
         it to post-hoc arithmetic over the budget-split log line.
 
-        Best-effort: never let a diagnostic mask the failure it describes.
         """
-        try:
-            live = sum(c.capacity for c in self.kv_cache_map.values())
-            return (
-                f" [draft pool: {len(self.kv_cache_map)} live caches holding "
-                f"{live} tokens, gpu_max_tokens={self._gpu_max_tokens}]"
-            )
-        except Exception:  # noqa: BLE001 - diagnostic only
-            return ""
+        live = sum(c.capacity for c in self.kv_cache_map.values())
+        return (
+            f" [draft pool: {len(self.kv_cache_map)} live caches holding "
+            f"{live} tokens, gpu_max_tokens={self._gpu_max_tokens}]"
+        )
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.

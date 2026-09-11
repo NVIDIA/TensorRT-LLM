@@ -1563,7 +1563,7 @@ class KvCacheCreator:
         """The draft ModelConfig describing the KV pool as it is ALLOCATED.
 
         The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8
-        KV algo onto every loaded model, including an external drafter. The
+        KV algo onto every loaded model, including a standalone drafter. The
         drafter stores and reads its pool in its weights dtype (DFlash
         validates a bf16 pool and otherwise falls back to the max_seq_len-dense
         private arena, which OOMs at long context), so the pool dtype must
@@ -1580,7 +1580,16 @@ class KvCacheCreator:
         rank, as soon as resident context passes ~50% of target utilization.
         """
         effective_draft_config = self._get_effective_draft_config()
-        if not self._speculative_config.spec_dec_mode.is_external_drafter():
+        # Narrower than is_external_drafter(), matching
+        # _should_create_separate_draft_kv_cache: PARD and
+        # DRAFT_TARGET_ONE_MODEL reach here too, via
+        # should_use_separate_draft_kv_cache, and their draft checkpoints can
+        # carry a genuine fp8 KV algo of their own -- with dtype="auto",
+        # validate_and_set_kv_cache_quant returns early and keeps it. Dropping
+        # that would allocate bf16 while their attention modules, built from
+        # the un-neutralized config, still read and write fp8.
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
         quant_config = getattr(effective_draft_config, "quant_config", None)
         if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
@@ -1593,15 +1602,16 @@ class KvCacheCreator:
         neutral_quant.kv_cache_quant_algo = None
         # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
         # and the copy carries the already-computed caches, so BOTH must be
-        # dropped for the mutation to take. Leaving layer_quant_mode stale
-        # silently no-ops the `draft_kv_config.dtype -> "auto"` guard in
-        # _create_one_model_draft_kv_cache_manager, which reads it.
+        # dropped for the mutation to take: _create_kv_cache_manager reads
+        # quant_mode off this copy, and layer_quant_mode is the pair's other
+        # half, stale in the same way.
         neutral_quant.__dict__.pop("quant_mode", None)
         neutral_quant.__dict__.pop("layer_quant_mode", None)
+        # No _frozen dance: ModelConfig.__setattr__ exempts quant_config by
+        # name, and restoring _frozen to True would freeze a copy whose source
+        # may not have been frozen.
         effective_draft_config = copy.copy(effective_draft_config)
-        effective_draft_config._frozen = False
         effective_draft_config.quant_config = neutral_quant
-        effective_draft_config._frozen = True
         return effective_draft_config
 
     def _get_num_draft_layers(self) -> int:
@@ -1661,7 +1671,7 @@ class KvCacheCreator:
 
         # Get the effective draft config (explicit draft_config if available,
         # otherwise fall back to target model config for MTP), with the
-        # target's inherited fp8 KV algo dropped for an external drafter. The
+        # target's inherited fp8 KV algo dropped for a standalone drafter. The
         # budget split in _get_kv_size_per_token resolves it through the SAME
         # helper, so the bytes/token it charges match the pool allocated here.
         effective_draft_config = self._get_draft_kv_model_config()

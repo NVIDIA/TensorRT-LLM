@@ -78,6 +78,13 @@ class DFlashForCausalLM(nn.Module):
     # is about which kernel reads it.
     _paged_ctx_cache = False
 
+    # Positions the worker will actually serve, published once by
+    # DFlashDrafter._lazy_init_ctx_buffers before the first forward. A drafter
+    # that sizes an absolute-position table reads it in place of its
+    # config-derived cap; None means no worker has run (direct construction in
+    # tests), so the config cap stands.
+    _runtime_position_ceiling = None
+
     def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
         """Build the draft model, resolving its architecture from the draft config
         (falling back to a model_type-derived name when the checkpoint uses a

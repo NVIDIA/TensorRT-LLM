@@ -2653,6 +2653,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._mla_rope_params = rope
         self._mla_workspace = None
         self._mla_freqs = None
+        self._mla_freqs_cap = None
         self._mla_noop_weight = None
         # HF DeepSeek folds YaRN's attention scaling into the softmax scale:
         # softmax_scale = mscale^2 / sqrt(qk_nope + qk_rope). NOT 1/sqrt(576) --
@@ -2812,16 +2813,21 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         on. The config-derived cap is the fallback for direct construction in
         tests, where no worker runs.
         """
-        if self._mla_freqs is None:
-            rope = dict(self._mla_rope_params)
-            runtime_cap = getattr(self, "_runtime_position_ceiling", None)
-            if runtime_cap is not None:
-                # Outright, not max(): the published ceiling is already
-                # min(runtime, max_position_embeddings) + lookahead, so it is
-                # both sufficient and the only thing that keeps the table small
-                # when max_seq_len is unset and the config cap is the
-                # checkpoint's advertised 1,048,576.
-                rope["max_positions"] = int(runtime_cap)
+        rope = dict(self._mla_rope_params)
+        runtime_cap = self._runtime_position_ceiling
+        if runtime_cap is not None:
+            # Outright, not max(): the published ceiling is already
+            # min(runtime, max_position_embeddings) + lookahead, so it is
+            # both sufficient and the only thing that keeps the table small
+            # when max_seq_len is unset and the config cap is the
+            # checkpoint's advertised 1,048,576.
+            rope["max_positions"] = int(runtime_cap)
+        # Keyed on the cap, not just built once: _lazy_init_ctx_buffers
+        # re-publishes the ceiling when the KV-estimation probe manager is
+        # swapped for the real one, and drafter forwards do run during
+        # estimation. A table built short for a later, larger cap would index
+        # out of range on freqs[positions].
+        if self._mla_freqs is None or self._mla_freqs_cap != rope["max_positions"]:
             self._mla_freqs = build_dspark_mla_yarn_freqs_cis(
                 dim=self.qk_rope_head_dim,
                 base=rope["theta"],
@@ -2834,6 +2840,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 mscale_all_dim=rope["mscale_all_dim"],
                 device=device,
             )
+            self._mla_freqs_cap = rope["max_positions"]
         return self._mla_freqs
 
     def _build_fused_kv_buffers(self) -> None:
