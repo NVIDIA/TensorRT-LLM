@@ -604,12 +604,30 @@ class CuteDslFusedMoE(MoEImplBase):
 
     input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
 
-    # Kinds mirror the kernel's own SUPPORTED_ACTIVATION_TYPES in
-    # cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py.
+    # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
+    # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
+    #   cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+    #   cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
+    # They agreed until SiTu, which only the Blackwell one implements. This
+    # attribute is the union, because resolution reads it off the class and a
+    # class attribute cannot see which kernel an instance will dispatch to;
+    # ``can_implement`` narrows it back for the SM that lacks the epilogue.
+    #
     # The clamp is a kernel-cache-key scalar and the epilogue has no
     # "clamp absent" branch, so an absent clamp is +inf, not None.
+    #
+    # alpha/beta are declared here rather than narrowed per instance:
+    # ``moe_resolution._activation_rejection`` states the invariant -- an
+    # instance may narrow a shape, never admit one its class refuses.
+    # Declaring UNSUPPORTED here and widening per instance made every K3 layer
+    # resolve away to CUTLASS with "CuteDslFusedMoE kernels take no activation
+    # alpha". Safe for the other two kinds because neither supplies the pair:
+    # ``SwigluActivation.constants()`` fills only ``limit`` and Relu2 fills
+    # nothing. ``SwigluBias`` is the kind that does, and it is not in ``kinds``.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2}),
+        kinds=frozenset(
+            {ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
     )
@@ -734,6 +752,16 @@ class CuteDslFusedMoE(MoEImplBase):
                     MoERejectReason.DEP_MISSING,
                     "NVFP4 CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
                 )
+            # ``activation_support`` above is the union over the act-fusion
+            # kernels ``run_moe_nvfp4`` picks between; only one of them has a
+            # SiTU epilogue. Turn the layer down where the other one would be
+            # chosen, so it stays resolvable by another backend instead of
+            # raising inside the kernel at forward time.
+            if p.activation == "SiTu" and sm_version == 107:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "this device's CuteDSL act-fusion kernel has no SiTU "
+                    "epilogue")
             # process_weights_after_loading() unswizzles the FC1 block scales,
             # which asserts 128-row tiles; without this gate an unaligned shard
             # dies mid weight load with a bare swizzle error.
@@ -955,9 +983,10 @@ class CuteDslFusedMoE(MoEImplBase):
         assert self.has_nvfp4
         assert weight_view is not None
         if self.activation_type not in (ActivationType.Swiglu,
-                                        ActivationType.Relu2):
+                                        ActivationType.Relu2,
+                                        ActivationType.SiTu):
             raise NotImplementedError(
-                "CuteDSL NVFP4 FC1 supports only SwiGLU and Relu2; "
+                "CuteDSL NVFP4 FC1 supports only SwiGLU, Relu2 and SiTU; "
                 f"got {self.activation_type.name}")
         output_dtype = torch.bfloat16
 
@@ -1113,6 +1142,15 @@ class CuteDslFusedMoE(MoEImplBase):
             gather_act_kwargs["activation_type"] = self.activation_type
             gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
         gather_act_kwargs["activation_type"] = self.activation_type
+        # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
+        # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
+        # a uniform scalar by the shape this backend declares. Only forwarded
+        # for SiTU so every other activation keeps hitting the op's sentinel
+        # default -- passing them unconditionally would make the op signature
+        # lie about which kinds have soft-caps.
+        if self.activation_type == ActivationType.SiTu:
+            gather_act_kwargs["situ_beta"] = self.act_alpha
+            gather_act_kwargs["situ_linear_beta"] = self.act_beta
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 

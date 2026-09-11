@@ -1069,6 +1069,16 @@ class KimiK3MoERuntime(nn.Module):
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
+        """Build the routed experts and the shared expert for one MoE layer.
+
+        ``cfg`` is the raw ``PretrainedConfig`` rather than anything derived:
+        the SiTU soft-caps and the routed-expert geometry are Kimi K3 fields
+        that ``ModelConfig`` does not carry.
+
+        ``aux_stream_dict`` is shared across every layer of the model, so the
+        streams reached through it are borrowed and must not be synchronized
+        or reassigned here.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = cfg.hidden_size
@@ -1125,12 +1135,20 @@ class KimiK3MoERuntime(nn.Module):
                 gate_softcap=situ_beta,
                 linear_softcap=situ_linear_beta,
             ),
-            # A MegaMoE request that silently degraded to CUTLASS would be
-            # benchmarked as if it were MegaMoE, and the decline is easy to
-            # trigger (EP-only, own token / top-k limits). Fail in the resolver
+            # A request that silently degraded to CUTLASS would be benchmarked
+            # as if it were the backend that was asked for, and the decline is
+            # easy to trigger: MegaMoE has its own token / top-k limits and is
+            # EP-only, and CuteDSL declines on activation shape, SM version and
+            # the CuTe DSL dependency. Measured 2026-09-08: a CUTEDSL request
+            # was turned down on every one of the 92 MoE layers, on all 16
+            # ranks, and still produced correct text and a zero exit -- the
+            # only trace was a warning line per layer. Fail in the resolver
             # instead, which reports the rejection trail.
+            #
+            # CUTLASS is absent on purpose: it is the fallback target, so
+            # "degraded to CUTLASS" is not a thing that can happen to it.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL"),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
@@ -1313,16 +1331,20 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
+        # Every backend here declares ``ActivationType.SiTu`` in its
+        # ``activation_support``; the list is not a preference order. CUTEDSL
+        # joined once its act-fusion kernel grew the SiTU epilogue.
         supported_backends = {
             "CUTLASS",
             "TRTLLM",
+            "CUTEDSL",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
                 "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
-                "MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
+                "CUTEDSL, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:

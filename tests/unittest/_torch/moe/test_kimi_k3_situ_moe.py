@@ -122,6 +122,66 @@ def test_kimi_situ_betas_must_be_positive(situ_beta, situ_linear_beta):
         modeling_kimi_linear._resolve_kimi_situ_betas(cfg)
 
 
+def test_situ_beta_sentinel_is_the_only_value_that_disables():
+    """Only ``SITU_BETA_DISABLED`` means "this layer is not SiTU".
+
+    The op signature cannot take ``Optional[float]``, so the absence of a
+    soft-cap travels as a sentinel. Canonicalizing the whole non-positive
+    range instead would make ``situ_beta=0.0`` on a SwiGLU layer read as
+    "none supplied" and be accepted, when it should reach the kernel and be
+    refused there.
+    """
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        SITU_BETA_DISABLED,
+        _canonicalize_situ_beta,
+    )
+
+    assert _canonicalize_situ_beta(SITU_BETA_DISABLED) is None
+    assert _canonicalize_situ_beta(None) is None
+    for forwarded in (0.0, -2.0, 1.0, 4.0, 25.0):
+        assert _canonicalize_situ_beta(forwarded) == forwarded
+
+
+@pytest.mark.parametrize(
+    "situ_beta,situ_linear_beta",
+    [
+        (float("nan"), 25.0),
+        (4.0, float("nan")),
+        (float("inf"), 25.0),
+        (4.0, float("inf")),
+        (0.0, 25.0),
+        (-2.0, 25.0),
+    ],
+    ids=["nan_beta", "nan_linear", "inf_beta", "inf_linear", "zero", "negative"],
+)
+def test_cutedsl_kernel_rejects_unusable_situ_betas(situ_beta, situ_linear_beta):
+    """NaN and infinity must be refused, not just zero and negatives.
+
+    The betas fold into the kernel at trace time as ``2/beta`` and
+    ``2*beta``, so a non-finite one is compiled in and comes back as quietly
+    wrong activations. ``<= 0`` does not catch either: every comparison
+    against NaN is false, and an infinity is positive.
+    """
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+        BlockScaledContiguousGatherGroupedGemmKernel,
+    )
+    from tensorrt_llm._torch.utils import ActivationType
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        BlockScaledContiguousGatherGroupedGemmKernel(
+            sf_vec_size=16,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=(1, 1),
+            vectorized_f32=True,
+            topk=8,
+            activation_type=ActivationType.SiTu,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+
+
 def test_clear_checkpoint_fp8_pairs_releases_unconsumed_stashes():
     linear = torch.nn.Linear(2, 2, bias=False)
     setattr(linear.weight, modeling_kimi_linear._K3_CKPT_FP8_ATTR, (torch.ones(1), torch.ones(1)))
@@ -591,6 +651,80 @@ def test_kimi_k3_routed_config_logs_megamoe_capacity_override(monkeypatch):
     )
 
 
+def test_kimi_k3_allow_list_matches_what_the_backends_declare():
+    """The K3 allow-list must be exactly the backends that execute SiTU.
+
+    Asserting agreement with each backend's own ``activation_support``
+    rather than against a literal list: a hand-maintained second copy of a
+    capability set is the defect this module already exists to catch, and
+    it is how CUTEDSL stayed shut after its kernels grew the epilogue.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import MegaMoECuteDsl
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm import MegaMoEDeepGemm
+    from tensorrt_llm._torch.utils import ActivationType
+
+    declares_situ = {
+        "CUTLASS": CutlassFusedMoE,
+        "TRTLLM": TRTLLMGenFusedMoE,
+        "CUTEDSL": CuteDslFusedMoE,
+        "MEGAMOE_CUTEDSL": MegaMoECuteDsl,
+        "MEGAMOE_DEEPGEMM": MegaMoEDeepGemm,
+    }
+    for name, cls in declares_situ.items():
+        assert ActivationType.SiTu in cls.activation_support.kinds, (
+            f"{name} lost SiTU from activation_support; the K3 allow-list "
+            "still offers it, so a layer would resolve here and then fail."
+        )
+        model_config = ModelConfig(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            moe_backend=name,
+        )
+        # Must not raise: this is the gate that kept CUTEDSL out.
+        KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+
+def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass():
+    """An ineligible CUTEDSL request must raise, not silently pick CUTLASS.
+
+    This is the failure this branch was built around: CUTEDSL declined every
+    K3 layer on all 16 ranks, CUTLASS took over, and the run produced correct
+    text and a zero exit while being attributed to CUTEDSL. K3 therefore
+    passes ``allow_backend_degradation=False`` for it; the assertion here is
+    that the resolver honours that rather than that K3 sets it.
+
+    The ``allow_degradation=True`` half is the control -- without it, a
+    resolver that had stopped substituting altogether would pass the first
+    half for the wrong reason.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import resolve_moe_impl
+
+    # SM90 has no NVFP4 CuteDSL path at all, so the request is declined for a
+    # reason that does not depend on this branch's activation work.
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        moe_backend="CUTEDSL",
+    )
+    kwargs = dict(
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+    )
+
+    degraded = resolve_moe_impl(model_config, allow_degradation=True, **kwargs)
+    if not degraded.degraded:
+        pytest.skip("CUTEDSL is eligible on this device; nothing to degrade from")
+
+    with pytest.raises(ValueError) as excinfo:
+        resolve_moe_impl(model_config, allow_degradation=False, **kwargs)
+    # The trail, not just the refusal: without it the caller cannot tell which
+    # gate declined and has to re-derive it.
+    assert "CUTEDSL" in str(excinfo.value)
+
+
 def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -990,6 +1124,39 @@ nvfp4_moe_supported = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() < 100,
     reason="NVFP4 Cutlass MoE requires Blackwell (SM100+)",
 )
+
+
+#: The FP4 backends that serve SiTU. CUTEDSL additionally needs the CuTe DSL
+#: wheel, which is checked inside the test rather than in a ``skipif``:
+#: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
+#: directory to ``sys.path``, and this repository fails the whole pytest
+#: session when a test file does that at collection time.
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL"]
+
+
+def _skip_if_backend_unavailable(moe_backend):
+    """Skip a CUTEDSL parametrization when the CuTe DSL wheel is absent.
+
+    Probed here rather than in a ``pytest.mark.skipif``, because the marker
+    is evaluated at collection time and importing ``cute_dsl_utils`` that
+    early puts the wheel's package directory on ``sys.path`` for every other
+    test file in the session.
+    """
+    if moe_backend != "CUTEDSL":
+        return
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
+    # nvfp4_moe_supported admits every SM >= 100, but only the Blackwell
+    # act-fusion kernel carries the SiTU epilogue. Elsewhere -- SM107 included
+    # -- can_implement() declines SiTu, so without this the case would fail in
+    # backend resolution on hardware it was never claimed to support.
+    if get_sm_version() not in (100, 103):
+        pytest.skip(
+            f"CuteDSL SiTU MoE needs the Blackwell act-fusion kernel "
+            f"(SM100/SM103), got SM{get_sm_version()}"
+        )
 
 
 def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
@@ -1493,7 +1660,7 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+@pytest.mark.parametrize("moe_backend", _NVFP4_SITU_BACKENDS)
 def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 
@@ -1505,16 +1672,23 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     wrong in exactly the way the GSM8K collapse showed, while every
     shape-and-buffer check stayed green.
 
-    Run for both FP4 backends: CUTLASS resolves SiTU through the activation
-    enum, TRTLLM-Gen through a distinct fused-cubin family
-    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``). A silent fallback is a different
-    failure on each, and this comparison is tolerance-free, so it catches
-    both -- including the degenerate all-zero FC1 output, which scores 0
-    against both references and so fails the assertion below.
+    Run for every FP4 backend, because each reaches SiTU by a different
+    mechanism and so fails differently: CUTLASS resolves it through the
+    activation enum, TRTLLM-Gen through a distinct fused-cubin family
+    (``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``), and CuteDSL through soft-caps
+    folded into a JIT-compiled epilogue at trace time. The CuteDSL case is
+    the one this test exists for: its betas travel as trace-time scalars
+    keyed into the kernel cache, so dropping them does not raise -- it
+    compiles a SwiGLU kernel and returns plausible numbers. An internal
+    branch shipped exactly that defect on a sibling backend for weeks.
+
+    The comparison is tolerance-free, so it also catches the degenerate
+    all-zero FC1 output, which scores 0 against both references.
 
     Reported rather than merely asserted: which reference the kernel is
     closer to is the diagnosis.
     """
+    _skip_if_backend_unavailable(moe_backend)
     num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
     gate = _make_test_gate(num_experts=num_experts)
 

@@ -78,6 +78,29 @@ def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
 
 
+#: Sentinel for "this layer is not SiTU". A torch custom op schema cannot carry
+#: ``Optional[float]`` here the way a Python signature can, and 0.0 is not
+#: available as the neutral value: the SiTU epilogue divides by both betas, so
+#: zero is a division by zero rather than a no-op. A negative value is
+#: impossible for a real soft-cap -- ``SiTuActivation`` rejects it at
+#: construction -- which makes it safe to reserve.
+SITU_BETA_DISABLED = -1.0
+
+
+def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
+    """Map the op-boundary sentinel back to ``None`` for the kernel.
+
+    Only the sentinel becomes ``None``. Every other value is forwarded so the
+    kernel's own validation sees it: mapping the whole ``<= 0`` range here
+    would turn ``situ_beta=0.0`` on a SwiGLU layer into "no soft-caps
+    supplied", silently accepting an argument that combination has no meaning
+    for, instead of raising.
+    """
+    if situ_beta is None or situ_beta == SITU_BETA_DISABLED:
+        return None
+    return float(situ_beta)
+
+
 def _get_cute_dsl_swap_ab_candidates(
     m: int,
     output_aligned: bool,
@@ -3370,13 +3393,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      scaling_vector_size: int = 16,
                      activation_type: ActivationType = ActivationType.Swiglu,
-                     swiglu_limit_scalar: float = float("inf")):
+                     swiglu_limit_scalar: float = float("inf"),
+                     situ_beta: Optional[float] = None,
+                     situ_linear_beta: Optional[float] = None):
             """Initialize the runner.
 
             Args:
-                activation_type: ``ActivationType`` for the fused epilogue. Only
-                    ``Swiglu`` (gated) and ``Relu2`` (non-gated) are supported.
+                activation_type: ``ActivationType`` for the fused epilogue.
+                    ``Swiglu`` (gated), ``Relu2`` (non-gated) and ``SiTu``
+                    (gated) are supported.
                 swiglu_limit_scalar: Uniform clamp limit for SwiGLU. ``+inf`` disables clamp.
+                situ_beta: Gate-side SiTU soft-cap. Required for -- and only
+                    valid with -- ``ActivationType.SiTu``.
+                situ_linear_beta: Linear-side SiTU soft-cap, same rule.
             """
             super().__init__()
             self.activation_type = validate_activation_type(activation_type)
@@ -3392,6 +3421,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
             self.swiglu_limit_scalar = swiglu_limit_scalar
+            # Trace-time constants, so they are part of the kernel identity --
+            # see ``unique_id`` and the compile cache key below. Betas that are
+            # not keyed would let a layer silently reuse a kernel compiled for
+            # different soft-caps.
+            self.situ_beta = situ_beta
+            self.situ_linear_beta = situ_linear_beta
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3404,6 +3439,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
         def unique_id(self):
+            """Identity of the compiled kernel, for the autotuner's cache.
+
+            Every entry here is a trace-time constant folded into the kernel,
+            so two runners that differ in any of them are different kernels
+            and must not share a tuning result. That is why the activation
+            soft-caps appear: ``swiglu_limit_scalar`` and the two SiTU betas
+            are baked in as ``const_expr``, not passed at launch.
+            """
             return (
                 self.num_experts,
                 self.top_k,
@@ -3413,6 +3456,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.scaling_vector_size,
                 self.activation_type,
                 self.swiglu_limit_scalar,
+                self.situ_beta,
+                self.situ_linear_beta,
             )
 
         def get_valid_tactics(
@@ -3615,7 +3660,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         self.activation_type, self.swiglu_limit_scalar)
+                         self.activation_type, self.swiglu_limit_scalar,
+                         self.situ_beta, self.situ_linear_beta)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -3627,6 +3673,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raster_along_m=raster_along_m,
                     activation_type=self.activation_type,
                     swiglu_limit=self.swiglu_limit_scalar,
+                    situ_beta=self.situ_beta,
+                    situ_linear_beta=self.situ_linear_beta,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -3712,12 +3760,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        situ_beta: float = SITU_BETA_DISABLED,
+        situ_linear_beta: float = SITU_BETA_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
-        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
-        (non-gated) epilogues; other ``ActivationType`` values raise an
-        assertion in the runner.
+        Supports ``ActivationType.Swiglu`` (gated), ``ActivationType.Relu2``
+        (non-gated) and ``ActivationType.SiTu`` (gated) epilogues; other
+        ``ActivationType`` values raise an assertion in the runner.
+
+        ``situ_beta`` / ``situ_linear_beta`` carry the two SiTU soft-caps.
+        They default to ``SITU_BETA_DISABLED`` rather than ``None`` because the
+        op schema takes plain floats; the runner maps the sentinel back to
+        ``None`` and then rejects a mismatch against ``activation_type``.
         """
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
@@ -3731,7 +3786,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             scaling_vector_size,
             activation_type=ActivationType(activation_type),
-            swiglu_limit_scalar=swiglu_limit_scalar)
+            swiglu_limit_scalar=swiglu_limit_scalar,
+            situ_beta=_canonicalize_situ_beta(situ_beta),
+            situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta))
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -3768,7 +3825,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        situ_beta: float = SITU_BETA_DISABLED,
+        situ_linear_beta: float = SITU_BETA_DISABLED,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Meta-device shapes for the FC1 output and its block scales.
+
+        A gated activation halves the N it emits, so the interleaved
+        gate/up pair collapses to one value per output element; the extra
+        ``// 2`` on the tensor itself is NVFP4's two values per byte.
+
+        The activation soft-caps are accepted and ignored: they change what
+        the kernel computes, never the shape it returns, but the fake must
+        still mirror the op's schema exactly.
+        """
         m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
         is_gated = is_gated_activation(ActivationType(activation_type))

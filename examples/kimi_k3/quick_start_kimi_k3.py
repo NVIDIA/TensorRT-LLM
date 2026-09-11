@@ -10,7 +10,7 @@ Example:
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MambaStateConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MambaStateConfig, MoeConfig
 
 SAMPLES = [
     ("The capital of France is", "Paris"),
@@ -26,6 +26,12 @@ SAMPLES = [
 
 
 def parse_arguments() -> argparse.Namespace:
+    """CLI for the single-node-per-rank Kimi K3 smoke run.
+
+    The defaults describe a DEP16 deployment: ``--tp-size`` sets tensor and
+    expert parallelism together, since Kimi K3 runs attention-DP with
+    expert-parallel MoE and the two sizes are the same number.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model",
@@ -45,12 +51,24 @@ def parse_arguments() -> argparse.Namespace:
         "manager with KDA recurrent-state snapshots; prefix-cache hits "
         "skip recomputing shared prompt prefixes).",
     )
+    parser.add_argument(
+        "--moe-backend",
+        default=None,
+        help="Force moe_config.backend (e.g. CUTEDSL). Default leaves AUTO, "
+        "which Kimi K3 resolves to TRTLLM.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    """Generate the four sample prompts and report whether each hit.
+
+    Prints the expected substring check per prompt rather than asserting, so
+    a run that loads and generates but answers wrongly is visible in the log
+    instead of collapsing into a single non-zero exit.
+    """
     args = parse_arguments()
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model,
         tensor_parallel_size=args.tp_size,
         enable_attention_dp=True,
@@ -72,6 +90,9 @@ def main() -> None:
             else MambaStateConfig(),
         ),
     )
+    if args.moe_backend:
+        llm_kwargs["moe_config"] = MoeConfig(backend=args.moe_backend)
+    llm = LLM(**llm_kwargs)
 
     sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
     prompts = [prompt for prompt, _ in SAMPLES]
