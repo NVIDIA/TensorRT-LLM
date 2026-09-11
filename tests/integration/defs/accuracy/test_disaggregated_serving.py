@@ -1129,6 +1129,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     # Two-model eagle3 (eagle3_one_model=False) is being removed (#18721),
     # so only the one-model path is covered here.
     @parametrize_with_ids("overlap_scheduler", [True, False])
+    # Dual TP4 120B-model startup (weights + Eagle3 draft checkpoint loaded
+    # on both ctx and gen servers) plus a full, unmocked GSM8K eval routinely
+    # exceeds the default test timeout before evaluation even starts.
+    @pytest.mark.timeout(5400)
     def test_eagle3(self, overlap_scheduler, mocker):
         # Eagle3 disagg coverage kept on GPT-OSS; Qwen3.5 has no Eagle3 draft
         # checkpoint yet, so it cannot replace the Llama-3.1-8B Eagle3 case.
