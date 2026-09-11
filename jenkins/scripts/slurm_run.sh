@@ -71,6 +71,15 @@ env | sort | sed -E 's/^([^=]*(TOKEN|SECRET|PASSWORD|CREDENTIALS)[^=]*)=.*/\1=<r
 
 echo "Full Command: $pytestCommand"
 
+# Multiple Slurm jobs and srun steps may share a worker node. Preserve the
+# identifiers needed after the test environment removes Slurm variables, so
+# rank-local artifacts cannot collide and the cross-rank barrier keeps the
+# original task count. This script is always launched by srun, so fail clearly
+# instead of using non-unique fallback identifiers.
+readonly saved_slurm_job_id="${SLURM_JOB_ID:-1}"
+readonly saved_slurm_step_id="${SLURM_STEP_ID:-1}"
+readonly saved_slurm_num_tasks="${SLURM_NTASKS:-1}"
+
 # For single-node test runs or disaggregated benchmark/server runs, clear all
 # environment variables related to Slurm and MPI. This prevents test processes
 # (e.g., pytest) from incorrectly initializing MPI when running under a
@@ -99,7 +108,7 @@ fi
 # aborts every rank instead of merely running late. Fence every rank on the shared
 # $jobWorkspace so they enter pytest together.
 slurm_wait_all_ranks() {
-    local numRanks="${SLURM_NTASKS:-1}"
+    local numRanks="${saved_slurm_num_tasks}"
     if [ "$numRanks" -le 1 ] || [ -z "${jobWorkspace:-}" ]; then
         return 0
     fi
@@ -108,7 +117,7 @@ slurm_wait_all_ranks() {
     # markers from another job, or from an earlier step of this job, must not
     # satisfy the count. Slurm assigns one step id per step across all of its
     # nodes, so every rank of a step agrees on this path.
-    local readyDir="$jobWorkspace/run_ready_job_${SLURM_JOB_ID:-local}_step_${SLURM_STEP_ID:-0}"
+    local readyDir="$jobWorkspace/run_ready_job_${saved_slurm_job_id}_step_${saved_slurm_step_id}"
     mkdir -p "$readyDir"
     touch "$readyDir/rank_${SLURM_PROCID}.ready"
 
@@ -141,6 +150,26 @@ slurm_wait_all_ranks() {
 
 slurm_wait_all_ranks
 
+# Paths used for timeout classification.  All ranks share $jobWorkspace via
+# NFS, so each rank can write there and uploadResults() can collect the
+# completed records from the login node without any extra copy step.
+#
+# A pytest-timeout kill can happen on ANY rank in a multi-node distributed
+# run, not just rank 0 -- so every rank captures its own log and classifies
+# it independently. Each rank writes to its OWN per-rank JSONL
+# (timeout_data_step${saved_slurm_step_id}_rank${SLURM_PROCID}.jsonl) rather than
+# the shared timeout_data.jsonl: multiple ranks appending concurrently to one
+# file over NFS is not safe (a >PIPE_BUF snippet write is not guaranteed
+# atomic), so concurrent writes are avoided entirely.
+# After the Slurm job finishes, uploadResults() downloads every rank file and
+# generate_timeout_xml.py merges them while it creates results-timeout.xml.
+# The full pytest log is transient, so keep it on the worker node rather than
+# streaming it to the shared workspace.
+PYTEST_LOG="/tmp/pytest_output_job${saved_slurm_job_id}_step${saved_slurm_step_id}_rank${SLURM_PROCID}.log"
+TIMEOUT_DATA_RANK="${jobWorkspace}/timeout_data_step${saved_slurm_step_id}_rank${SLURM_PROCID}.jsonl"
+UNFINISHED_FILE="${jobWorkspace}/unfinished_test.txt"
+PYTEST_WRAPPER="${llmSrcNode}/jenkins/scripts/run_pytest_with_log.sh"
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
@@ -148,7 +177,11 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
+# The shared wrapper preserves the pytest status while each rank captures and
+# classifies its own output.
+bash "${PYTEST_WRAPPER}" \
+    "${PYTEST_LOG}" "${TIMEOUT_DATA_RANK}" "${UNFINISHED_FILE}" \
+    -- bash -c "${pytestCommand}"
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
