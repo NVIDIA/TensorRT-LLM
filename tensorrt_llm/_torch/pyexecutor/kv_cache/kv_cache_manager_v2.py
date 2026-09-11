@@ -975,12 +975,12 @@ class KVCacheManagerV2Pair:
 
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Revert this iteration's context growth in every KV pool."""
-        target_reverted = self.target.revert_allocate_context(req)
+        target_kept_cache = self.target.revert_allocate_context(req)
         if self.draft is not None:
-            draft_reverted = self.draft.revert_allocate_context(req)
-            if not target_reverted and draft_reverted:
+            draft_kept_cache = self.draft.revert_allocate_context(req)
+            if not target_kept_cache and draft_kept_cache:
                 self.draft.free_resources(req)
-        return target_reverted
+        return target_kept_cache
 
     def release_index_slot(self, request_id: int) -> None:
         """Release the request's IndexMapper slot in every KV pool."""
