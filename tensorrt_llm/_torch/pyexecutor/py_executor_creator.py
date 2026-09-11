@@ -821,11 +821,6 @@ def _create_py_executor_impl(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
 
-        if mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
-            )
-
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -834,6 +829,13 @@ def _create_py_executor_impl(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            if mapping.enable_attention_dp:
+                if mapping.pp_size != 1 or mapping.cp_size != 1:
+                    raise NotImplementedError(
+                        "Attention-DP KV connector requires PP=1 and CP=1.")
+                KvCacheConnectorManager.validate_attention_dp(
+                    worker_cls, scheduler_cls)
+
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -841,7 +843,8 @@ def _create_py_executor_impl(
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                if scheduler_cls is not None and (rank == 0 or
+                                                  mapping.enable_attention_dp):
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -857,7 +860,9 @@ def _create_py_executor_impl(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                enable_attention_dp=mapping.enable_attention_dp)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
