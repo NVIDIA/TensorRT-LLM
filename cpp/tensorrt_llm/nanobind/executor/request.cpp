@@ -608,7 +608,7 @@ void initRequestBindings(nb::module_& m)
             nb::cast<bool>(state[18]), nb::cast<tle::PriorityType>(state[19]), nb::cast<tle::RequestType>(state[20]),
             nb::cast<std::optional<tle::ContextPhaseParams>>(state[21]),
             nb::cast<std::optional<tle::Tensor>>(state[22]), nb::cast<std::optional<SizeType32>>(state[23]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[24]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[24]), std::nullopt,
             nb::cast<std::optional<tle::IdType>>(state[25]), nb::cast<std::optional<std::string>>(state[26]));
     };
 
@@ -652,7 +652,6 @@ void initRequestBindings(nb::module_& m)
                 std::optional<tle::ContextPhaseParams> context_phase_params,
                 std::optional<tle::Tensor> encoder_input_features, std::optional<tle::SizeType32> encoder_output_length,
                 std::optional<tle::GuidedDecodingParams> guided_decoding_params,
-                std::optional<tle::SizeType32> language_adapter_uid,
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
                 std::optional<std::string> cache_salt)
             {
@@ -663,7 +662,7 @@ void initRequestBindings(nb::module_& m)
                     std::move(kv_cache_retention_config), std::move(encoder_input_token_ids), client_id,
                     return_all_generated_tokens, priority, type, std::move(context_phase_params),
                     std::move(encoder_input_features), encoder_output_length, std::move(guided_decoding_params),
-                    language_adapter_uid, allotted_time_ms, disagg_request_id, std::move(cache_salt));
+                    allotted_time_ms, disagg_request_id, std::move(cache_salt));
             },
             // clang-format off
         nb::arg("input_token_ids"),
@@ -692,7 +691,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("encoder_input_features") = nb::none(),
         nb::arg("encoder_output_length") = nb::none(),
         nb::arg("guided_decoding_params") = nb::none(),
-        nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
         nb::arg("disagg_request_id") = nb::none(),
         nb::arg("cache_salt") = nb::none()

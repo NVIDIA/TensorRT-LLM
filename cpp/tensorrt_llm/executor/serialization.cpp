@@ -849,7 +849,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto encoderInputFeatures = su::deserialize<std::optional<Tensor>>(is);
     auto encoderOutputLength = su::deserialize<std::optional<SizeType32>>(is);
     auto guidedDecodingParams = su::deserialize<std::optional<GuidedDecodingParams>>(is);
-    auto languageAdapterUid = su::deserialize<std::optional<SizeType32>>(is);
     auto allottedTimeInt = su::deserialize<std::optional<std::chrono::milliseconds::rep>>(is);
     auto allottedTimeMs = allottedTimeInt
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
@@ -862,8 +861,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
         std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(encoderInputTokenIds), clientId,
         returnAllGeneratedTokens, priority, requestType, std::move(contextPhaseParams), std::move(encoderInputFeatures),
-        encoderOutputLength, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId,
-        std::move(cacheSalt));
+        encoderOutputLength, std::move(guidedDecodingParams), allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
