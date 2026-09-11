@@ -280,6 +280,7 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_grace_
 perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_2_nodes_grace_blackwell-glm5_fp4_tep8_mtp3_8k1k] SKIP (https://nvbugs/6746175)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL] SKIP (https://nvbugs/6746175)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL] SKIP (https://nvbugs/6746175)
+perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] SKIP (https://nvbugs/6759009)
 test_doc.py::test_http_url_validity SKIP (https://nvbugs/6709495)
 test_doc.py::test_relative_path_validity SKIP (https://nvbugs/6731971)
 test_e2e.py::test_openai_chat_harmony SKIP (https://nvbugs/6751484)
