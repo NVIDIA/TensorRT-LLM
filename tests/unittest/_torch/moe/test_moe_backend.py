@@ -1092,27 +1092,53 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
 def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Standard serving must not pay for the 36-tactic sweep by default.
+    # Standard serving must not pay for the tactic sweep by default.
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.tactic_autotune is False
 
 
-def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
+@pytest.mark.parametrize(
+    "sm_version,decode_count,prefill_count", [(100, 36, 40), (103, 36, 40), (107, 11, 13)]
+)
+def test_enumerate_megamoe_candidate_tactics_curated_space(
+    sm_version: int, decode_count: int, prefill_count: int
+) -> None:
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
-    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
-    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
-    assert len(decode) == len(prefill) == 36
+    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
+    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
+    assert (len(decode), len(prefill)) == (decode_count, prefill_count)
+    assert all(len(t) == 10 for t in decode + prefill)
     assert {t[-1] for t in decode} == {(1, 1)}
     assert {t[-1] for t in prefill} == {(2, 4)}
-    # The deterministic fallback stays inside the curated axes.
+    for tactic in decode + prefill:
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     for num_tokens in (64, 4096, 16384):
-        megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
+        megamoe_op.validate_megamoe_tactic(
+            megamoe_op.default_megamoe_tactic(num_tokens), sm_version=sm_version
+        )
+    if sm_version == 107:
+        for bucket, tactic in megamoe_op._SM107_GENPHASE_TACTICS.items():
+            megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
+            assert (
+                megamoe_op._default_megamoe_tactic_for_problem(
+                    sm_version=sm_version,
+                    max_tokens_per_rank=bucket,
+                    num_tokens=bucket,
+                    apply_topk_in_fc1=False,
+                    in_kernel_fc2_reduce=False,
+                    combine_format="bf16",
+                )
+                == tactic
+            )
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
-    invalid_tactic[2] = 511
-    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
+    invalid_tactic[3] = ("grouped", 0)
+    with pytest.raises(ValueError, match=r"schedule_policy hint must be a positive int or None"):
+        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic), sm_version=sm_version)
+    legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
+    megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
+    assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
 
 
 def run_backend_moe(
