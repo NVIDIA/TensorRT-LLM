@@ -194,7 +194,9 @@ def test_trtllm_forward_logs_and_reraises_kernel_failure(monkeypatch) -> None:
     metadata.request_ids = [11, 12, 13]
     metadata.num_contexts = 2
     metadata.num_generations = 1
-    metadata.num_tokens = num_tokens
+    # `num_tokens` is a read-only property backed by `_num_tokens`; set the field
+    # directly since we bypass `__init__`/`__post_init__` (which would derive it).
+    metadata._num_tokens = num_tokens
     metadata.kv_cache_block_offsets = torch.zeros((1, 3, 2, 8), dtype=torch.int32)
     metadata.workspace = torch.zeros(1024, dtype=torch.int8)
     metadata.cu_q_seqlens = torch.zeros(batch + 1, dtype=torch.int32)
