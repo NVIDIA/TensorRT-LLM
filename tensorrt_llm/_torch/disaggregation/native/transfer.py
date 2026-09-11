@@ -61,6 +61,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     get_non_empty_aux_indices,
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
@@ -2831,6 +2832,10 @@ class Receiver(ReceiverBase):
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
+                    self._registrar.self_extractor.page_table,
+                    sender_info.page_table,
+                )
+                AttentionPolicy.validate_peer_compatible(
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
