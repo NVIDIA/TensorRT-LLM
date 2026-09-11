@@ -328,19 +328,13 @@
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/*Moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/moeLoadBalance @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/thop/*Moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/thop/moe* @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moe @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/thop/moe @NVIDIA/trt-llm-moe-devs
+/cpp/tests/unit_tests/kernels/moe @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moeCommKernelsCommon.h @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moeTopKFuncs.cuh @NVIDIA/trt-llm-moe-devs
+/cpp/tensorrt_llm/kernels/moe_utils.cuh @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/*moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/communicationKernels/moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cuteDslKernels/moe* @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h @NVIDIA/trt-llm-moe-devs
-/cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/kernels/llama4MinLatencyKernels/*Moe* @NVIDIA/trt-llm-moe-devs
