@@ -47,13 +47,13 @@ add_library(
   asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  cuteDslMoeUtilsOp.cpp
+  moe/cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   marlinNvfp4MM.cpp
-  marlinNvfp4MoeMM.cpp
+  moe/marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
   fmhaPackMaskOp.cpp
@@ -93,20 +93,20 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
-  moeOp.cpp
-  moeUtilOp.cpp
-  moeGateOp.cpp
-  moeCommOp.cpp
-  moeAlltoAllOp.cpp
-  moeLoadBalanceOp.cpp
-  moeAlignOp.cpp
-  megaMoePrepareOp.cpp
-  mxFp4BlockScaleMoe.cpp
+  moe/moeOp.cpp
+  moe/moeUtilOp.cpp
+  moe/moeGateOp.cpp
+  moe/moeCommOp.cpp
+  moe/moeAlltoAllOp.cpp
+  moe/moeLoadBalanceOp.cpp
+  moe/moeAlignOp.cpp
+  moe/megaMoePrepareOp.cpp
+  moe/mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
-  fp8BlockScaleMoe.cpp
-  fp8PerTensorScaleMoe.cpp
-  fp4BlockScaleMoe.cpp
+  moe/fp8BlockScaleMoe.cpp
+  moe/fp8PerTensorScaleMoe.cpp
+  moe/fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
@@ -123,7 +123,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  customMoeRoutingOp.cpp
+  moe/customMoeRoutingOp.cpp
   localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
