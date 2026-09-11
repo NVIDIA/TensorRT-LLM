@@ -31,10 +31,12 @@ try:
 except ImportError:
     from cuda import cuda
 
-from ._dlpack_utils import pack_strided_memory
 from torch.utils._python_dispatch import _disable_current_modes
 
+from ._dlpack_utils import pack_strided_memory
 from ._utils import get_sm_version, mpi_comm, mpi_disabled
+from .logger import logger
+from .mapping import Mapping
 
 
 class ProcessGroupComm:
@@ -54,7 +56,7 @@ class ProcessGroupComm:
     takes this ProcessGroup route; this brings _mnnvl_utils in line with it.
     """
 
-    def __init__(self, pg):
+    def __init__(self, pg: torch.distributed.ProcessGroup) -> None:
         self._pg = pg
 
     def Get_size(self) -> int:
@@ -63,8 +65,8 @@ class ProcessGroupComm:
     def Get_rank(self) -> int:
         return torch.distributed.get_rank(group=self._pg)
 
-    def allgather(self, obj):
-        gathered = [None] * self.Get_size()
+    def allgather(self, obj: Any) -> list[Any]:
+        gathered: list[Any] = [None] * self.Get_size()
         # MNNVL workspaces are set up while the model may be under MetaInitMode.
         # all_gather_object materializes real CPU tensors and calls
         # aten.set_.source_Storage on them, which that TorchDispatchMode rejects
@@ -79,8 +81,7 @@ class ProcessGroupComm:
         # operator and gets intercepted before it reaches Gloo. Call the CPU
         # backend directly, as ops.py::_mnnvl_workspace_barrier does.
         self._pg._get_backend(torch.device("cpu")).barrier().wait()
-from .logger import logger
-from .mapping import Mapping
+
 
 _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S = 20.0
 _MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S = 0.01
