@@ -18,6 +18,8 @@
 # and https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/mamba/causal_conv1d_triton.py
 # -*- coding: utf-8 -*-
 
+import functools
+import os
 from typing import List, Optional, Union
 
 import torch
@@ -963,6 +965,123 @@ def _causal_conv1d_update_kernel(
             )
 
 
+# Minimum compute capability for the packed path. Its kernels emit 256-bit
+# wide loads/stores, which ptxas rejects outright below sm_100 ("Feature
+# '256 bit wide load/store' requires .target sm_100 or higher"). On sm_90 the
+# bands that do still compile lose to the kernel below from batch 63 up
+# (0.97x at 63/64, 0.92x at 96, 0.79x at 127), so there is nothing to fall
+# back to there either.
+_PACKED_CONV_MIN_SM = 100
+
+# Tri-state: unset selects the packed path wherever the guard admits it, which
+# on sm_100+ is everywhere it is also faster (1.10-1.77x, measured over
+# batch 1-1024 with no batch slower). "0" forces it off, "1" forces it on.
+_PACKED_CONV_ENABLED = os.environ.get("TRTLLM_GDN_CONV_PACKED", "1") == "1"
+
+
+def _packed_conv_applicable(
+    x,
+    conv_state,
+    weight,
+    bias,
+    activation,
+    batch,
+    dim,
+    seqlen,
+    state_len,
+    width,
+    cache_seqlens,
+    conv_state_indices,
+    num_accepted_tokens,
+    intermediate_conv_window,
+    intermediate_state_indices,
+    retrieve_next_token,
+):
+    """Host-side contract check for the packed conv path. No device sync."""
+    if get_sm_version() < _PACKED_CONV_MIN_SM:
+        return False
+    # Shape/dtype contract the kernel bakes in (strides 12288 / 36864 hardcoded).
+    if (dim, seqlen, state_len, width) != (4096, 3, 3, 4):
+        return False
+    if x.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
+        return False
+    if activation not in ("silu", "swish"):
+        return False
+    # Continuous batching with the MTP intermediate-window capture, no spec
+    # rollback offset, no circular buffer, no eagle tree.
+    if conv_state_indices is None or intermediate_conv_window is None:
+        return False
+    if intermediate_state_indices is None or bias is None:
+        return False
+    if (
+        cache_seqlens is not None
+        or num_accepted_tokens is not None
+        or retrieve_next_token is not None
+    ):
+        return False
+    # Exact strides the kernel addresses against.
+    if x.stride() != (seqlen * dim, 1, dim):
+        return False
+    if conv_state.stride() != (dim * state_len, state_len, 1):
+        return False
+    if intermediate_conv_window.stride() != (
+        seqlen * dim * state_len,
+        dim * state_len,
+        state_len,
+        1,
+    ):
+        return False
+    if weight.stride() != (width, 1):
+        return False
+    return True
+
+
+_DEFAULT_NUM_WARPS = 4
+# Programs per SM above which halving the warp count pays. Set at the
+# conservative edge of the measured crossover, which sits inside [8, 16).
+_WARP2_MIN_PROGRAMS_PER_SM = 16
+# Bytes of conv_state per feature above which it stops paying: past this the
+# state traffic dominates and the lost parallelism is not recovered.
+_WARP2_MAX_WINDOW_BYTES = 8
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_num_warps(
+    batch: int, dim: int, block_n: int, window_bytes: int, save_intermediate: bool
+) -> int:
+    """Warp count for the update kernel.
+
+    With no intermediate window to write, what the kernel moves is dominated by
+    the feature-contiguous tensors (x, out, weight, bias). Halving the warps
+    gives each thread two features instead of one, which is enough for the
+    compiler to widen those accesses, and that is worth more than the warps it
+    costs -- but only once there are enough programs to keep every SM busy
+    several times over. Below that the lost parallelism dominates.
+
+    The intermediate-window stores are stride-(width-1) 2-byte accesses that
+    cannot be widened at any warp count, so when they are present the wider
+    default stays best.
+
+    It also stops paying once a feature's conv-state window is wide enough to
+    dominate what the kernel moves -- measured at (width - 1) * itemsize > 8 B,
+    i.e. fp32 at width 4, which is the one combination that regresses.
+
+    Measured on B200 over ~720 shapes (width 2-4, bf16/fp16/fp32, seqlen 1-4,
+    dim 768-6144, batch 1-640): no regression where it applies, median 1.25x.
+    """
+    if save_intermediate:
+        return _DEFAULT_NUM_WARPS
+    if window_bytes > _WARP2_MAX_WINDOW_BYTES:
+        return _DEFAULT_NUM_WARPS
+    programs = batch * triton.cdiv(dim, block_n)
+    if programs >= _WARP2_MIN_PROGRAMS_PER_SM * _sm_count(torch.cuda.current_device()):
+        return 2
+    return _DEFAULT_NUM_WARPS
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1055,6 +1174,63 @@ def causal_conv1d_update(
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
     out = torch.empty_like(x)
+
+    # ---- Packed fast path ----
+    # Same arithmetic; packed bf16x2 loads/stores coalesce the stride-3
+    # state_len-innermost traffic the kernel below issues one element at a
+    # time. Guarded to the exact contract it was written and validated for;
+    # anything else falls through to the kernel below.
+    if _PACKED_CONV_ENABLED and _packed_conv_applicable(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        width,
+        cache_seqlens,
+        conv_state_indices,
+        num_accepted_tokens,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        retrieve_next_token,
+    ):
+        from .gdn_conv_packed import run as _packed_conv_run
+
+        # The kernel writes a contiguous (batch, seqlen, dim) buffer, which is
+        # byte-identical to the (batch, dim, seqlen)/(seqlen*dim, 1, dim) tensor
+        # every caller expects -- so the transpose below is a free view, and the
+        # kernel gets a fully coalesced 4096-wide bf16 store per (seq, step).
+        out_packed = torch.empty((batch, seqlen, dim), device=x.device, dtype=x.dtype)
+        _packed_conv_run(
+            x,
+            conv_state,
+            weight,
+            bias,
+            conv_state_indices,
+            intermediate_conv_window,
+            intermediate_state_indices,
+            out_packed,
+        )
+        out = out_packed.transpose(1, 2)
+        return out.squeeze(-1) if unsqueeze else out
+
+    block_n = _block_n if _block_n is not None else 128
+    num_warps = (
+        _num_warps
+        if _num_warps is not None
+        else _select_num_warps(
+            batch,
+            dim,
+            block_n,
+            (width - 1) * conv_state.element_size(),
+            intermediate_conv_window is not None,
+        )
+    )
+
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
@@ -1173,11 +1349,11 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=_block_n if _block_n is not None else 128,
+        BLOCK_N=block_n,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels,
-        num_warps=_num_warps if _num_warps is not None else 4,
+        num_warps=num_warps,
         **({"num_stages": _num_stages} if _num_stages else {}),
     )
     if unsqueeze:
