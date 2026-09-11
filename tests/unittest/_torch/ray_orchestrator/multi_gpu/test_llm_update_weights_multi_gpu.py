@@ -724,6 +724,7 @@ def _run_qwen35_35b_tp8_multinode_update() -> None:
     with LLM(
         model=model_dir,
         ray_worker_extension_cls=_QWEN35_35B_TP8_EXTENSION,
+        orchestrator_type="ray",
         tensor_parallel_size=_QWEN35_35B_TP8,
         load_format="dummy",
         pipeline_parallel_size=1,
@@ -1364,6 +1365,15 @@ def _run_qwen35_397b_mxfp8_tp8_multinode(
     llm_kwargs = {}
     if torch_compile_config is not None:
         llm_kwargs["torch_compile_config"] = torch_compile_config
+    # Temporary isolation control: distinguish torch.compile/MXFP8 refit from any CUDA-graph recapture.
+    if os.environ.get("TLLM_TEST_DISABLE_CUDA_GRAPHS"):
+        llm_kwargs["cuda_graph_config"] = None
+    # Diagnostic override for the Rubin TP8 PCG regression: retain AUTO as the
+    # production default, but permit an isolated NCCL control run without
+    # changing the model/refit/capture lifecycle under test.
+    allreduce_strategy = os.environ.get("TLLM_TEST_ALLREDUCE_STRATEGY")
+    if allreduce_strategy:
+        llm_kwargs["allreduce_strategy"] = allreduce_strategy
 
     with LLM(
         model=model_dir,
@@ -1385,8 +1395,12 @@ def _run_qwen35_397b_mxfp8_tp8_multinode(
         disable_mm_encoder=True,
         **llm_kwargs,
     ) as llm:
-        # Match RL by capturing the dummy model before refit.
-        llm.generate(prompts, sampling_params)
+        # Match RL by capturing the dummy model before refit.  The opt-out is
+        # an isolation control for the Rubin PCG regression: it leaves the
+        # real MXFP8 refit and final PCG capture intact, but removes only the
+        # initial capture -> release -> recapture lifecycle.
+        if not os.environ.get("TLLM_TEST_SKIP_PREFIT_PCG_CAPTURE"):
+            llm.generate(prompts, sampling_params)
         for group in groups:
             llm._collective_rpc(
                 "update_mxfp8_weights_from_local_checkpoint",
@@ -1404,6 +1418,67 @@ def _run_qwen35_397b_mxfp8_tp8_multinode(
 
 @pytest.mark.high_cuda_memory
 @skip_pre_blackwell
+def _run_qwen35_397b_bf16_tp8_multinode(
+    torch_compile_config: Optional[TorchCompileConfig],
+) -> List[torch.Tensor]:
+    """TP8 BF16 refit control matching the 397B MXFP8 repro topology."""
+    model_dir = _mxfp8_397b_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    groups = sorted({_qwen35_35b_weight_group(name)
+                     for name in _qwen35_35b_selected_checkpoint_names(model_dir)})
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=4)
+    llm_kwargs = {}
+    if torch_compile_config is not None:
+        llm_kwargs["torch_compile_config"] = torch_compile_config
+    # Temporary isolation control: disable normal CUDA graphs while retaining torch.compile.
+    if os.environ.get("TLLM_TEST_DISABLE_CUDA_GRAPHS"):
+        llm_kwargs["cuda_graph_config"] = None
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls=_QWEN35_35B_TP8_EXTENSION,
+        orchestrator_type="ray",
+        tensor_parallel_size=_QWEN35_35B_TP8,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.05,
+                                      mamba_ssm_cache_dtype="float32"),
+        model_kwargs=_qwen35_35b_model_kwargs(),
+        moe_config=MoeConfig(backend="CUTLASS"),
+        enable_chunked_prefill=True,
+        disable_mm_encoder=True,
+        **llm_kwargs,
+    ) as llm:
+        llm.generate(prompts, sampling_params)
+        for group in groups:
+            llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, group))
+        llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, None))
+        return [output.outputs[0].generation_logits.detach().cpu()
+                for output in llm.generate(prompts, sampling_params)]
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_bf16_tp8_compiled_no_pcg(monkeypatch):
+    """BF16 control: eager and torch.compile TP8 refits must agree without PCG."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    eager_logits = _run_qwen35_397b_bf16_tp8_multinode(None)
+    compiled_logits = _run_qwen35_397b_bf16_tp8_multinode(TorchCompileConfig())
+    assert all(torch.isfinite(logits).all() for logits in eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in compiled_logits)
+    compare_logits(compiled_logits, eager_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
 def test_llm_update_weights_qwen35_397b_mxfp8_tp8_piecewise_cuda_graph(
     monkeypatch,
 ):
@@ -1416,6 +1491,34 @@ def test_llm_update_weights_qwen35_397b_mxfp8_tp8_piecewise_cuda_graph(
     assert all(torch.isfinite(logits).all() for logits in eager_logits)
     assert all(torch.isfinite(logits).all() for logits in piecewise_logits)
     compare_logits(piecewise_logits, eager_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_mxfp8_tp8_eager_repeat(
+    monkeypatch,
+):
+    """Control: two independent TP8 MXFP8 refits without PCG must agree."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    first_eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    second_eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    assert all(torch.isfinite(logits).all() for logits in first_eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in second_eager_logits)
+    compare_logits(second_eager_logits, first_eager_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_mxfp8_tp8_compiled_no_pcg(
+    monkeypatch,
+):
+    """Control: torch.compile without piecewise CUDA graphs must agree with eager."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    compiled_logits = _run_qwen35_397b_mxfp8_tp8_multinode(TorchCompileConfig())
+    assert all(torch.isfinite(logits).all() for logits in eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in compiled_logits)
+    compare_logits(compiled_logits, eager_logits)
 
 
 @pytest.mark.high_cuda_memory

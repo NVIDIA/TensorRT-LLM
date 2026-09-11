@@ -1336,12 +1336,46 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(engine.is_multimodal)
         engine._validate_breakable_cuda_graph_compatibility()
 
+<<<<<<< HEAD
     def test_piecewise_refit_recapture_preserves_padding_dummy_requests(
             self) -> None:
         padding_dummy = object()
         padding_dummy_requests = {0: padding_dummy}
+=======
+    def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyMultimodalIndexModel()
+
+        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
+            [1, 90, 2, 91, 3])
+
+        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
+        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
+
+    def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+
+        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
+            [1, 90, 2, 91, 3])
+
+        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
+        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
+
+    def test_restore_after_refit_rewraps_without_recapture(self) -> None:
+        """Restore re-wraps torch.compile and does nothing else.
+
+        Refit moves no tensor, so the piecewise captures stay valid across it;
+        recapturing them costs a full re-capture per refit and leaves PWCG cold
+        in between. This pins the cheap path -- reintroducing the recapture or
+        the torch.compiler.reset() fails here.
+
+        Replaces test_piecewise_refit_recapture_preserves_padding_dummy_requests,
+        which asserted the refit path recaptures. That path no longer exists.
+        """
+>>>>>>> ec0cd91d12 ([None][fix] Unwrap torch.compile before refit, and Rubin PCG fixes)
         cuda_graph_runner = SimpleNamespace(
-            padding_dummy_requests=padding_dummy_requests,
+            padding_dummy_requests={0: object()},
             allow_capture=lambda: nullcontext(),
         )
         model_engine = SimpleNamespace(
@@ -1353,17 +1387,74 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             _apply_torch_compile=Mock(),
             _capture_piecewise_cuda_graphs=Mock(),
         )
-        recapture = PyTorchModelEngine.recapture_piecewise_cuda_graphs_after_refit
-        recapture_core = recapture.__wrapped__.__wrapped__
+        # Strip the warmup/kv-cleanup decorators; they need a real engine.
+        restore_core = (PyTorchModelEngine.restore_compiled_model_after_refit.
+                        __wrapped__.__wrapped__)
 
-        with patch("torch.compiler.reset"), patch("gc.collect"):
-            recapture_core(model_engine, resource_manager=object())
+        with patch("torch.compiler.reset") as reset, patch("gc.collect"):
+            restore_core(model_engine, resource_manager=object())
 
-        self.assertIs(cuda_graph_runner.padding_dummy_requests,
-                      padding_dummy_requests)
-        self.assertIs(cuda_graph_runner.padding_dummy_requests[0],
-                      padding_dummy)
-        model_engine._capture_piecewise_cuda_graphs.assert_called_once()
+        model_engine._apply_torch_compile.assert_called_once()
+        model_engine._capture_piecewise_cuda_graphs.assert_not_called()
+        reset.assert_not_called()
+
+    def test_restore_after_refit_noop_when_torch_compile_disabled(self) -> None:
+        """An eager engine must not be silently handed a compiled wrapper."""
+        model_engine = SimpleNamespace(
+            _torch_compile_enabled=False,
+            _apply_torch_compile=Mock(),
+        )
+        restore_core = (PyTorchModelEngine.restore_compiled_model_after_refit.
+                        __wrapped__.__wrapped__)
+        restore_core(model_engine, resource_manager=object())
+        model_engine._apply_torch_compile.assert_not_called()
+
+    def test_unwrap_for_refit_gates_on_torch_compile_not_piecewise(self) -> None:
+        """Compile-on/piecewise-off must still unwrap.
+
+        This is the original defect: the hook was gated on the piecewise flag,
+        so TorchCompileConfig() -- compile on, piecewise off -- got no refit
+        lifecycle and refit loaded into a wrapped model, matching nothing.
+        """
+        for piecewise in (True, False):
+            with self.subTest(piecewise=piecewise):
+                model_engine = SimpleNamespace(
+                    _torch_compile_enabled=True,
+                    _torch_compile_piecewise_cuda_graph=piecewise,
+                    _torch_compile_backend=Mock(),
+                    _remove_torch_compile=Mock(),
+                )
+                unwrap_core = (
+                    PyTorchModelEngine.unwrap_compiled_model_for_refit)
+                with patch("torch.cuda.synchronize"):
+                    unwrap_core(model_engine)
+                model_engine._remove_torch_compile.assert_called_once()
+                # The captures are kept, not cleared: refit moves no tensor, so
+                # clearing them only forces PWCG cold for no benefit.
+                model_engine._torch_compile_backend \
+                    .clear_piecewise_cuda_graphs.assert_not_called()
+
+        # Eager engine: the hook must be a no-op.
+        eager = SimpleNamespace(
+            _torch_compile_enabled=False,
+            _torch_compile_piecewise_cuda_graph=False,
+            _torch_compile_backend=Mock(),
+            _remove_torch_compile=Mock(),
+        )
+        PyTorchModelEngine.unwrap_compiled_model_for_refit(eager)
+        eager._remove_torch_compile.assert_not_called()
+
+    def test_refit_lifecycle_aliases_point_at_renamed_hooks(self) -> None:
+        """NeMo-RL resolves these with getattr() and falls back to doing nothing.
+
+        Dropping an alias would therefore not raise -- it would silently skip
+        the unwrap and reintroduce the refit corruption.
+        """
+        self.assertIs(PyTorchModelEngine.release_piecewise_cuda_graphs_for_refit,
+                      PyTorchModelEngine.unwrap_compiled_model_for_refit)
+        self.assertIs(
+            PyTorchModelEngine.recapture_piecewise_cuda_graphs_after_refit,
+            PyTorchModelEngine.restore_compiled_model_after_refit)
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
