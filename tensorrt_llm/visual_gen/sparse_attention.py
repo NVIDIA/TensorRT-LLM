@@ -269,8 +269,10 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
             "protects the high-noise prefix. Use None (not 0.0) to disable the "
             "prefix; 0.0 is rejected because it would run dense on every step "
             "and silently turn Sol-Attn off entirely. "
-            "The timestep is supplied as a forward kwarg by every VisualGen "
-            "pipeline, so no per-pipeline wiring is required."
+            "Read from the `timestep` forward kwarg, which must be the normalized "
+            "scheduler time (larger = noisier). WAN and LTX-2 pass it; a pipeline "
+            "that does not, or that passes something else, gets a one-time warning "
+            "and runs sparse on every step (fail-open)."
         ),
     )
     dense_layers: Optional[str] = PydanticField(

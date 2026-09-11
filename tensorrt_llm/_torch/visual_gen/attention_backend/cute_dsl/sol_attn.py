@@ -49,9 +49,12 @@ from typing import Any, Optional
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 
+from ....attention.backends.interface import PredefinedAttentionMask
 from ..interface import AttentionBackend, AttentionTensorLayout
+from ..vanilla import VanillaAttention
 
 _sol_attn_import_error = None
 try:
@@ -147,6 +150,16 @@ class SolAttention(AttentionBackend):
         # switched off entirely, against a 0.25 gate.
         from .fmha import CuTeDSLAttention
 
+        # The only backend that consumes `key_padding_mask` (CuTeDSL's `_fwd`
+        # swallows it via **kwargs, silently). Masked self-attention is routed
+        # here rather than to the mask-blind sparse kernel or to `_inner`.
+        self._vanilla = VanillaAttention(
+            layer_idx=layer_idx,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=self.num_kv_heads,
+            dtype=dtype,
+        )
         self._inner = CuTeDSLAttention(
             layer_idx=layer_idx,
             num_heads=num_heads,
@@ -177,10 +190,15 @@ class SolAttention(AttentionBackend):
     # phases still compile as separate graphs -- they run different kernels.
     @torch.compiler.disable
     def _dense_by_step(self, timestep: Any) -> bool:
-        phase = SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-            timestep,
-            disabled_until_timestep=self.disabled_until_timestep,
-        )
+        # Under CUDA-graph capture the runner has already resolved the phase
+        # host-side (it is part of the graph key); reading the tensor here
+        # would `.item()` inside capture, which CUDA forbids.
+        phase = resolved_extra_key("sol_attn_phase")
+        if phase is None:
+            phase = SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+                timestep,
+                disabled_until_timestep=self.disabled_until_timestep,
+            )
         if phase is None:
             # Fail open, matching the CuTeDSL skip-softmax path: without a
             # timestep we cannot tell which phase we are in, so run the
@@ -198,10 +216,26 @@ class SolAttention(AttentionBackend):
         return phase == 0
 
     @staticmethod
-    def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Dense attention via torch SDPA, for devices CuTe DSL cannot serve."""
+    def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Dense attention via torch SDPA, for devices CuTe DSL cannot serve.
+
+        Honors the same two mask kwargs the backends accept: ``attention_mask``
+        (``CAUSAL``) and ``key_padding_mask`` (``[B, S_kv]`` bool, True = valid).
+        """
+        is_causal = kwargs.get("attention_mask", PredefinedAttentionMask.FULL) == (
+            PredefinedAttentionMask.CAUSAL
+        )
+        key_padding_mask = kwargs.get("key_padding_mask")
+        attn_mask = None
+        if key_padding_mask is not None:
+            # SDPA wants a broadcastable bool mask where True = attend.
+            attn_mask = key_padding_mask.to(torch.bool)[:, None, None, :]
         return torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=attn_mask,
+            is_causal=is_causal and attn_mask is None,
         ).transpose(1, 2)
 
     def _delegate(
@@ -214,14 +248,25 @@ class SolAttention(AttentionBackend):
         needed: the construction-time probe inspects the current CUDA device, so
         it says yes on a GPU host even when a caller passes CPU tensors.
         """
+        if kwargs.get("key_padding_mask") is not None:
+            # CuTeDSL does not consume `key_padding_mask`, so staying in-family
+            # here would silently attend to padded tokens; VANILLA honors it.
+            # VANILLA works in HND ([B, H, S, D]); this backend is NHD.
+            if self._vanilla.preferred_layout == AttentionTensorLayout.HND:
+                out = self._vanilla.forward(
+                    q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **kwargs
+                )
+                return out.transpose(1, 2)
+            return self._vanilla.forward(q, k, v, **kwargs)
         if self._cute_dense_ok and q.is_cuda:
+            # CAUSAL is fine here: CuTeDSL handles it via `_prepare_inputs`.
             return self._inner.forward(q, k, v, **kwargs)
-        return self._sdpa(q, k, v)
+        return self._sdpa(q, k, v, **kwargs)
 
     def _can_serve(self, q: torch.Tensor, k: torch.Tensor, **kwargs: Any) -> bool:
         """Whether the sparse kernel applies to this particular call.
 
-        Everything false here is delegated to ``_inner``. Deciding it from the
+        Everything false here is delegated (see ``_delegate``). Deciding it from the
         tensors, per call, is deliberate, and it is why ``modules/attention.py``
         has no ``SEPARATE_QKV`` rule for Sol-Attn: ``qkv_mode`` describes how
         Q/K/V are *projected*, not whether K/V come from another sequence, so a
@@ -233,6 +278,17 @@ class SolAttention(AttentionBackend):
         # Cross-attention: K/V come from another sequence. Sol-Attn's routing
         # assumes one self-attending sequence.
         if k.shape[1] != q.shape[1]:
+            return False
+        # Masks: the sparse kernel is noncausal and takes no mask, so a masked
+        # call -- HunyuanVideo1.5 / GLM-Image `key_padding_mask`, Cosmos3
+        # `CAUSAL` -- must go to a backend that honors it. Equal Q/K lengths do
+        # not imply "unmasked self-attention".
+        if kwargs.get("key_padding_mask") is not None:
+            return False
+        if (
+            kwargs.get("attention_mask", PredefinedAttentionMask.FULL)
+            != PredefinedAttentionMask.FULL
+        ):
             return False
         if self.layer_idx in self.dense_layers:
             return False

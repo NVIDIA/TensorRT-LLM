@@ -1714,7 +1714,6 @@ class LTX2Pipeline(BasePipeline):
         audio_scheduler = copy.deepcopy(self.scheduler)
         audio_scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         timesteps = self.scheduler.timesteps
-        num_steps = len(timesteps)
 
         # ---- 7. Build perturbation config for STG -----------------------
         stg_perturbation: PerturbationConfig | None = None
@@ -1842,7 +1841,11 @@ class LTX2Pipeline(BasePipeline):
                 audio=audio_mod,
                 perturbations=perturbations,
                 text_cache=text_cache,
-                timestep=timestep_val.new_tensor(float(step_index) / num_steps),
+                # The scheduler sigma is already normalized to [0, 1] with the
+                # contract's sense (larger = noisier). The previous
+                # step_index / num_steps was ascending, which inverted the
+                # sparse-attention dense prefix on this model.
+                timestep=timestep_val,
                 step_index=step_index,
             )
 
