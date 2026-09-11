@@ -61,6 +61,7 @@ class DisaggLoopDelegates:
     revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
     receive_gen_init: Callable[[List[LlmRequest]], None]
     poll_progress_when_idle: Callable[[], None]
+    retire_transfer_only: Callable[["ScheduledRequests"], None]
     prepare_transmission_completed: Callable[["ScheduledRequests"], None]
     # Rank-local transfer error handling; reached from the reaps. CS-3.
     check_transfer_errors: Callable[[str], None]
@@ -198,6 +199,10 @@ class DisaggTransferCoordinator:
         self._d.poll_progress_when_idle()
 
     # -- batch execution -----------------------------------------------------
+
+    def retire_transfer_only(self, scheduled_batch: "ScheduledRequests") -> None:
+        """Finish gen requests that only pull KV, before the batch is gated."""
+        self._d.retire_transfer_only(scheduled_batch)
 
     def prepare_transmission_completed(self, scheduled_batch: "ScheduledRequests") -> None:
         """Turn gen requests whose receive completed into running requests."""

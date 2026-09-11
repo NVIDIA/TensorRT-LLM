@@ -823,6 +823,12 @@ models:
 
   ChatCompletionResponseChoice:
     fields:
+      token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
       index:
         kind: openai
         type: int
@@ -925,6 +931,12 @@ models:
 
   ChatCompletionResponseStreamChoice:
     fields:
+      token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
       index:
         kind: openai
         type: int

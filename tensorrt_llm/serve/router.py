@@ -489,6 +489,13 @@ class Router(ABC):
                              req_id: Optional[int] = None):
         pass
 
+    def keeps_conversation_affinity(self) -> bool:
+        """True when one conversation's turns all go to one server.
+
+        e.g. kv_cache_aware or conversation router.
+        """
+        return False
+
     @property
     def session(self) -> aiohttp.ClientSession:
         if not self._session:
@@ -1114,6 +1121,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             # Fire-and-forget; poll runs in background and coalesces per server.
             self._server_state[server].schedule_poll_and_update(session)
 
+    def keeps_conversation_affinity(self) -> bool:
+        return True
+
     # ---- coordinator delegation: thin wrappers over the shared _route core ---
     # The fleet worker computes routing_key() locally; the coordinator (owns
     # _server_state) runs get_next_server_by_key(). Both use the same _route core
@@ -1334,8 +1344,10 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         return self._server_content_load.get(server, 0)
 
     def _get_server_load(self, server: str) -> int:
-        """Use content weight so ``_select_least_loaded`` balances by
-        estimated tokens rather than request count.
+        """Use content weight when balancing load.
+
+        ``_select_least_loaded`` then balances by estimated tokens rather than
+        request count.
         """
         return self._get_content_load(server)
 
@@ -1596,6 +1608,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             logger.debug(f"ConversationRouter: FINISH server={server}, "
                          f"content_loads={loads}")
 
+    def keeps_conversation_affinity(self) -> bool:
+        return True
+
     # -- coordinator-path: conversation_id-only sticky routing --
     # The coordinator has no request object, so per-request load is tracked by an
     # opaque handle instead of id(request). Only explicit conversation_id sessions
@@ -1812,6 +1827,9 @@ class CoordinatorDelegatingRouter(Router):
                     f"CoordinatorDelegatingRouter finish queue full; "
                     f"coordinator expiration will release dropped requests "
                     f"(dropped={self._dropped_finishes})")
+
+    def keeps_conversation_affinity(self) -> bool:
+        return self._local.keeps_conversation_affinity()
 
     def _ensure_finish_workers(self) -> None:
         if self._finish_workers:
