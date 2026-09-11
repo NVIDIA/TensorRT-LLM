@@ -828,7 +828,7 @@ class TestKVCacheV2SchedulerCrossParam:
         assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
         assert kwargs["enable_recompute_pause"] is enable_recompute_pause
 
-    def test_factory_forwards_shared_target_draft_v2_pair(self):
+    def test_factory_forwards_shared_target_draft_v2_pair(self) -> None:
         from tensorrt_llm._torch.pyexecutor._util import create_py_executor_instance
 
         target_mgr = object.__new__(KVCacheManagerV2)
