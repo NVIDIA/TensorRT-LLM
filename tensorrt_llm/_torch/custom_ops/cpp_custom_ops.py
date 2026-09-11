@@ -122,6 +122,11 @@ def _register_fake():
         return allreduce(input, residual, norm_weight, scale, bias, workspace,
                          group, strategy, op, eps, trigger_completion_at_end)
 
+    @torch.library.register_fake("trtllm::allreduce_pg_warmup_by_name")
+    def _(token: torch.Tensor, group: List[int], rank: int,
+          group_name: str) -> torch.Tensor:
+        return token
+
     # MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_fusion_allreduce")
     def _(input,

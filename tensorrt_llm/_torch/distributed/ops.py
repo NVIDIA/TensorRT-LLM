@@ -99,6 +99,33 @@ class _MnnvlWorkspace(TypedDict):
     mpi_comm: Optional[_MpiCommProtocol]
 
 
+_named_allreduce_topology_warmups = set()
+_named_allreduce_topology_warmups_lock = threading.Lock()
+
+
+def _warmup_named_allreduce_topology(mapping: Mapping,
+                                     group_name: str) -> None:
+    """Complete native TP topology discovery before PCG capture.
+
+    ``allreduce_pg_by_name`` keeps its optimized C++ collective implementation.
+    Its one-time ProcessGroup setup and first NCCL launch must happen eagerly:
+    a CUDA graph capture is not a safe place to initialize host-side c10d
+    metadata or lazily create the communicator.  Cache per group so model
+    construction pays this cost once, not once per all-reduce module.
+    """
+    if (not group_name or not torch.cuda.is_available()
+            or torch.compiler.is_compiling()):
+        return
+    with _named_allreduce_topology_warmups_lock:
+        if group_name in _named_allreduce_topology_warmups:
+            return
+        token = torch.ones(1, device="cuda", dtype=torch.float32)
+        torch.ops.trtllm.allreduce_pg_warmup_by_name(token, mapping.tp_group,
+                                                      mapping.tp_rank,
+                                                      group_name)
+        _named_allreduce_topology_warmups.add(group_name)
+
+
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
         setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
@@ -885,6 +912,9 @@ class AllReduce(nn.Module):
 
         self.all_reduce_op = (torch.ops.trtllm.allreduce_pg_by_name if
                               self._disable_mpi else torch.ops.trtllm.allreduce)
+
+        if self._disable_mpi and self.mapping.tp_size > 1:
+            _warmup_named_allreduce_topology(self.mapping, self._group_name)
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
