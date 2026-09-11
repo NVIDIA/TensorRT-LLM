@@ -618,7 +618,6 @@ public:
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration
     /// @param loraConfig The LoRA configuration
-    /// @param lookaheadConfig The lookahead speculative decoding configuration
     /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
     /// @param logitsPostProcessorName The logits postprocessor name.
     /// @param logitsPostProcessor The logits postprocessor dynamically specified per request; only supported with
@@ -653,7 +652,6 @@ public:
         std::optional<MultimodalInput> multimodalInput = std::nullopt,
         std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
-        std::optional<LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         std::optional<std::string> logitsPostProcessorName = std::nullopt,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
@@ -695,7 +693,6 @@ public:
     [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
-    [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadConfig() const;
     [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const;
     [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
     [[nodiscard]] std::optional<LogitsPostProcessor> getLogitsPostProcessor() const;
@@ -727,7 +724,6 @@ public:
     void setMultimodalInput(MultimodalInput const& multimodalInput);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
-    void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig);
     void setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig);
     void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
     void setLogitsPostProcessor(std::optional<LogitsPostProcessor> const& logitsPostProcessor);

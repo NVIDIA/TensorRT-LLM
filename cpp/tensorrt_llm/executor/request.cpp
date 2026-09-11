@@ -31,18 +31,18 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
     std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
     std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
-    std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
-    std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig, std::optional<std::string> logitsPostProcessorName,
-    std::optional<LogitsPostProcessor> logitslogitsPostProcessor, std::optional<VecTokens> encoderInputTokenIds,
-    std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
-    std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
-    std::optional<SizeType32> encoderOutputLength, std::optional<GuidedDecodingParams> guidedDecodingParams,
-    std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
-    std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
+    std::optional<LoraConfig> loraConfig, std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
+    std::optional<std::string> logitsPostProcessorName, std::optional<LogitsPostProcessor> logitslogitsPostProcessor,
+    std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
+    float priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
+    std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
+    std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
+    std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
+    std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
-        std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
+        std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
         std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
         priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
@@ -147,11 +147,6 @@ std::optional<MropeConfig> Request::getMropeConfig() const
 std::optional<LoraConfig> Request::getLoraConfig() const
 {
     return mImpl->getLoraConfig();
-}
-
-std::optional<LookaheadDecodingConfig> Request::getLookaheadConfig() const
-{
-    return mImpl->getLookaheadConfig();
 }
 
 std::optional<KvCacheRetentionConfig> Request::getKvCacheRetentionConfig() const
@@ -297,11 +292,6 @@ void Request::setMropeConfig(MropeConfig const& mRopeConfig)
 void Request::setLoraConfig(LoraConfig const& loraConfig)
 {
     mImpl->setLoraConfig(loraConfig);
-}
-
-void Request::setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig)
-{
-    mImpl->setLookaheadConfig(lookaheadConfig);
 }
 
 void Request::setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig)

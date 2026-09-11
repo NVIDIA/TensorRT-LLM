@@ -53,8 +53,7 @@ public:
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
         std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
         std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
-        std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
-        std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
+        std::optional<LoraConfig> loraConfig, std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
         std::optional<std::string> logitsPostProcessorName, std::optional<LogitsPostProcessor> logitsPostProcessor,
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
         PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
@@ -77,7 +76,6 @@ public:
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeConfig(std::move(mRopeConfig))
         , mLoraConfig(std::move(loraConfig))
-        , mLookaheadConfig(lookaheadConfig)
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
         , mLogitsPostProcessorName(std::move(logitsPostProcessorName))
         , mLogitsPostProcessor(std::move(logitsPostProcessor))
@@ -200,11 +198,6 @@ public:
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const
     {
         return mLoraConfig;
-    }
-
-    [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadConfig() const
-    {
-        return mLookaheadConfig;
     }
 
     [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const
@@ -352,11 +345,6 @@ public:
         mLoraConfig = loraConfig;
     }
 
-    void setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig)
-    {
-        mLookaheadConfig = lookaheadConfig;
-    }
-
     void setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig)
     {
         mKvCacheRetentionConfig = kvCacheRetentionConfig;
@@ -481,7 +469,6 @@ private:
         lambda(mMultimodalEmbedding);
         lambda(mMropeConfig);
         lambda(mLoraConfig);
-        lambda(mLookaheadConfig);
         lambda(mKvCacheRetentionConfig);
         lambda(mLogitsPostProcessorName);
         lambda(mEncoderInputTokenIds);
@@ -514,7 +501,6 @@ private:
     std::optional<Tensor> mMultimodalEmbedding;
     std::optional<MropeConfig> mMropeConfig;
     std::optional<LoraConfig> mLoraConfig;
-    std::optional<LookaheadDecodingConfig> mLookaheadConfig;
     std::optional<KvCacheRetentionConfig> mKvCacheRetentionConfig;
     std::optional<std::string> mLogitsPostProcessorName;
     std::optional<LogitsPostProcessor> mLogitsPostProcessor;
