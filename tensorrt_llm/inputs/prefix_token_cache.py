@@ -140,6 +140,8 @@ class PrefixTokenCache:
         self._buckets: dict[int, dict[int, _Entry]] = {}
         self._total_chars = 0
         self._next_id = 0
+        # Read and written without the lock: a bool flip is atomic, and the
+        # worst case of a race is two threads each logging the disable warning.
         self.disabled = False
         # Counters, reported by periodic log lines and read by tests.
         self.hits = 0
