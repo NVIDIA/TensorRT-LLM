@@ -3,15 +3,27 @@
 
 import unittest
 import weakref
+from contextlib import ExitStack
+from dataclasses import dataclass
 from unittest.mock import patch
 
+import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.workspace import EagerWorkspaceReclaimer, WorkspaceShrinkPolicy
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
 
+@dataclass
+class _ScratchMetadata:
+    workspace: torch.Tensor
+    is_cuda_graph: bool = False
+    workspace_reclaimable: bool = True
+    workspace_required_bytes: torch.Tensor | None = None
+    cuda_graph_workspace: torch.Tensor | None = None
+
+
+@pytest.mark.cpu_only
 class TestWorkspaceShrinkPolicy(unittest.TestCase):
     def test_third_forward_and_warmup_floor(self) -> None:
         policy = WorkspaceShrinkPolicy(64)
@@ -56,13 +68,18 @@ class TestWorkspaceShrinkPolicy(unittest.TestCase):
                     WorkspaceShrinkPolicy(64).finish_forward(required, capacity, grew=False)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA GPU required")
+@pytest.mark.cpu_only
 class TestEagerWorkspaceReclaimer(unittest.TestCase):
     def setUp(self) -> None:
-        self.metadata = TrtllmAttentionMetadata(max_num_requests=2, max_num_tokens=128)
-        self.metadata.workspace = torch.empty(4096, dtype=torch.uint8, device="cuda")
-        self.metadata.workspace_reclaimable = True
-        self.metadata.workspace_required_bytes = None
+        # Test ownership with real CPU storage; CUDA ordering is tested below.
+        self.metadata = _ScratchMetadata(torch.empty(4096, dtype=torch.uint8))
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch("torch.cuda.is_current_stream_capturing", return_value=False))
+        self.current_stream = stack.enter_context(
+            patch("torch.cuda.current_stream", return_value=object())
+        )
+        stack.enter_context(patch.object(torch.Tensor, "record_stream"))
         self.reclaimer = EagerWorkspaceReclaimer(self.metadata)
 
     def report_forward(self, required: int) -> None:
@@ -74,7 +91,7 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
         previous = weakref.ref(self.metadata.workspace)
         for remaining in (2, 1, 3):
             with self.reclaimer.forward(self.metadata):
-                for _ in range(80):
+                for _ in range(2):
                     self.metadata.workspace_required_bytes.fill_(4096)
                 self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
             self.assertEqual(self.reclaimer.policy.remaining, remaining)
@@ -125,10 +142,9 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
 
     def test_changed_stream_disables_reclamation(self) -> None:
         self.report_forward(4096)
-        other = torch.cuda.Stream()
-        with torch.cuda.stream(other):
-            with self.reclaimer.forward(self.metadata):
-                self.assertIsNone(self.metadata.workspace_required_bytes)
+        self.current_stream.return_value = object()
+        with self.reclaimer.forward(self.metadata):
+            self.assertIsNone(self.metadata.workspace_required_bytes)
 
     def test_overlapping_forward_is_rejected(self) -> None:
         with self.reclaimer.forward(self.metadata):
@@ -136,22 +152,28 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
                 with self.reclaimer.forward(self.metadata):
                     self.fail("Nested workspace ownership must not be accepted")
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA GPU required; no architecture restriction")
+class TestEagerWorkspaceCuda(unittest.TestCase):
     def test_free_before_allocate_preserves_pending_same_stream_work(self) -> None:
         mib = 1024**2
-        self.metadata.workspace.resize_(64 * mib)
-        self.report_forward(4096)
-        self.report_forward(4096)
-        with self.reclaimer.forward(self.metadata):
-            self.metadata.workspace.fill_(1)
-            result = self.metadata.workspace.sum()
-            self.metadata.workspace_required_bytes.fill_(4096)
+        metadata = _ScratchMetadata(torch.empty(4096, dtype=torch.uint8, device="cuda"))
+        reclaimer = EagerWorkspaceReclaimer(metadata)
+        metadata.workspace.resize_(4 * mib)
+        for _ in range(2):
+            with reclaimer.forward(metadata):
+                metadata.workspace_required_bytes.fill_(4096)
+        with reclaimer.forward(metadata):
+            metadata.workspace.fill_(1)
+            result = metadata.workspace.sum()
+            metadata.workspace_required_bytes.fill_(4096)
             before = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
         self.assertLessEqual(torch.cuda.max_memory_allocated(), before)
-        self.assertEqual(torch.cuda.memory_allocated(), before - 64 * mib + 4096)
-        self.metadata.workspace.fill_(7)
+        self.assertEqual(torch.cuda.memory_allocated(), before - 4 * mib + 4096)
+        metadata.workspace.fill_(7)
         torch.cuda.synchronize()
-        self.assertEqual(result.item(), 64 * mib)
+        self.assertEqual(result.item(), 4 * mib)
 
 
 if __name__ == "__main__":

@@ -17,11 +17,7 @@ if TYPE_CHECKING:
 
 
 class WorkspaceShrinkPolicy:
-    """Shrink after three underfilled forwards, never below warmup capacity.
-
-    The requirement must be the maximum across all workspace users within a
-    completed forward, not the allocation's capacity or a profiling estimate.
-    """
+    """Shrink after three underfilled forwards using their maximum demand."""
 
     def __init__(self, floor_bytes: int) -> None:
         if floor_bytes < 0:
@@ -51,11 +47,7 @@ class WorkspaceShrinkPolicy:
 
 
 class EagerWorkspaceReclaimer:
-    """Reclaim metadata-owned pure scratch, on one stream, after warmup.
-
-    The CPU int64 report is updated synchronously at the native sizing point;
-    reading it does not synchronize the GPU. Graph storage never participates.
-    """
+    """Reclaim single-stream eager scratch, preserving the warmup floor."""
 
     def __init__(self, metadata: "TrtllmAttentionMetadata") -> None:
         if metadata.workspace is None:
@@ -90,8 +82,7 @@ class EagerWorkspaceReclaimer:
         if metadata.workspace is None:
             raise RuntimeError("Eager workspace was removed outside its reclaimer")
         capacity_before = metadata.workspace.untyped_storage().nbytes()
-        # Warmup may allocate on another stream. Protect the current consumer
-        # even after dropping the reference; this does not synchronize the GPU.
+        # Protect the consumer if warmup allocated this storage on another stream.
         metadata.workspace.record_stream(self._stream)
         self._required_bytes.zero_()
         metadata.workspace_required_bytes = self._required_bytes
