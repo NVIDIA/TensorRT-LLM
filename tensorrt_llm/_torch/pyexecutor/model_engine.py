@@ -64,7 +64,8 @@ from ..moe.fused_moe.moe_comm_timeout_guard import (moe_comm_serving_timeouts,
                                                     set_moe_comm_warmup)
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
-from ..nccl_window_tensor_scope import (install_eager_nccl_window_tensor_scopes,
+from ..nccl_window_tensor_scope import (discard_nccl_window_tensor_outputs,
+                                        install_eager_nccl_window_tensor_scopes,
                                         nccl_window_tensor_scope)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
@@ -338,6 +339,22 @@ def _configure_deep_gemm_pdl() -> None:
 
     deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
     _DEEP_GEMM_PDL_CONFIGURED = True
+
+
+def _discarded_warmup_scope(engine: Any, inputs: Any = None):
+    # Warmup inputs may be host-only. The persistent CUDA input buffer
+    # ensures the native scope opens before forward creates window tensors.
+    return discard_nccl_window_tensor_outputs((getattr(engine, "input_ids_cuda",
+                                                       None), inputs))
+
+
+def _run_discarded_warmup_forward(engine: Any, batch: ScheduledRequests,
+                                  resource_manager: ResourceManager) -> None:
+    """Run an eager warmup through its last consumer and release its outputs."""
+    with _discarded_warmup_scope(engine, batch):
+        engine.forward(batch,
+                       new_tensors_device=None,
+                       resource_manager=resource_manager)
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -2039,9 +2056,8 @@ class PyTorchModelEngine(ModelEngine):
                             f"num_gen_tokens={num_gen_tokens}",
                             record=False,
                             log_start=False):
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                        _run_discarded_warmup_forward(
+                            self, batch, resource_manager)
                         torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 if self._is_distributed_forward():
@@ -2156,9 +2172,8 @@ class PyTorchModelEngine(ModelEngine):
                         record=False,
                         log_start=True):
                     with trtllm_gen_fmha_jit_warmup():
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                        _run_discarded_warmup_forward(
+                            self, batch, resource_manager)
                     torch.cuda.synchronize()
 
     @staticmethod
@@ -2307,9 +2322,8 @@ class PyTorchModelEngine(ModelEngine):
                                 f"num_gen_requests={num_gen_requests}",
                                 record=False,
                                 log_start=True):
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
                             ran_forward = True
                             torch.cuda.synchronize()
 
@@ -2508,9 +2522,8 @@ class PyTorchModelEngine(ModelEngine):
                                     Eagle3ResourceManager):
                                 spec_resource_manager.is_first_draft = True
 
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
 
                             if autotuner_enabled:
                                 AutoTuner.get().cache_pp_recv()
@@ -2843,9 +2856,13 @@ class PyTorchModelEngine(ModelEngine):
                                 batch, draft_len > 0, resource_manager)
                             if self._is_encoder_decoder_model():
                                 prepare_cross_batch(batch, resource_manager)
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            if self.cuda_graph_runner.is_warmup_only:
+                                _run_discarded_warmup_forward(
+                                    self, batch, resource_manager)
+                            else:
+                                self.forward(batch,
+                                             new_tensors_device=None,
+                                             resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
@@ -3055,9 +3072,13 @@ class PyTorchModelEngine(ModelEngine):
                     try:
                         self.enable_spec_decode = False
                         self.runtime_draft_len = 0
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                        if runner.is_warmup_only:
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
+                        else:
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
                         torch.cuda.synchronize()
                     finally:
                         self.enable_spec_decode = saved_enable_spec_decode
@@ -3097,13 +3118,13 @@ class PyTorchModelEngine(ModelEngine):
                             num_tokens, lambda: self.forward(
                                 batch,
                                 new_tensors_device=None,
-                                resource_manager=resource_manager))
+                                resource_manager=resource_manager),
+                            self.input_ids_cuda)
                     else:
                         # Run a few times to ensure torch.compile capture.
                         for _ in range(4):
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            _run_discarded_warmup_forward(
+                                self, batch, resource_manager)
 
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
@@ -3128,11 +3149,10 @@ class PyTorchModelEngine(ModelEngine):
                                                  new_tensors_device=None,
                                                  resource_manager=
                                                  resource_manager),
+                            self.input_ids_cuda,
                             steps=1)
                 else:
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
+                    _run_discarded_warmup_forward(self, batch, resource_manager)
                 torch.cuda.synchronize()
 
     ### Helper methods promoted from the original warmup method ###

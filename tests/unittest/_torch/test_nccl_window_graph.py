@@ -334,6 +334,15 @@ def test_tensor_scope_transfers_outputs_and_releases_other_leases(tensor_scope_e
     assert tensor_scope_events == [("begin", inputs), ("end", inputs, outputs, False)]
 
 
+def test_discard_scope_preserves_inputs_and_releases_outputs(tensor_scope_events):
+    inputs = [object()]
+
+    with nccl_window_tensor_scope.discard_nccl_window_tensor_outputs(inputs):
+        pass
+
+    assert tensor_scope_events == [("begin", inputs), ("end", inputs, inputs, False)]
+
+
 def test_tensor_scope_quarantines_adopted_leases_on_failure(tensor_scope_events):
     inputs = [object()]
 

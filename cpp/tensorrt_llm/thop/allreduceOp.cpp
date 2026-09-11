@@ -516,6 +516,7 @@ private:
 
         torch::Tensor inputTensor = input;
         void* inputPtr = input.data_ptr();
+        bool ownsSymmetricInput = false;
 
         // If buffer is not registered, decide whether to register based on size
         if (!windowBuffer0.isValid())
@@ -552,6 +553,7 @@ private:
                     windowBuffer0 = symmetricBuffer0;
                     inputTensor = symmetricInput; // Swap to window-backed tensor
                     inputPtr = windowBuffer0.ptr;
+                    ownsSymmetricInput = true;
                 }
             }
         }
@@ -577,13 +579,29 @@ private:
         // Perform allreduce
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
+        // This operation owns only the temporary used to copy an unregistered input. The collective
+        // is its final consumer, and same-stream release makes it reusable without synchronizing.
+        // A window-backed input is borrowed from the caller and remains owned by its outer scope.
+        if (ownsSymmetricInput)
+        {
+            TLLM_CHECK(allocator.releaseTensorBuffer(comm, inputTensor.storage().unsafeGetStorageImpl(), stream));
+        }
+
         if (mOp == AllReduceFusionOp::NONE)
         {
             return {outputTensor};
         }
 
         // Treat any other patterns as fallback cases.
-        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+        auto outputs = fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, outputTensor);
+
+        // RMS_NORM does not return the all-reduce output, so its internal window is complete after
+        // the fused fallback is enqueued. Other fusion modes return it as their residual output.
+        if (mOp == AllReduceFusionOp::RMS_NORM && windowBuffer1.isValid())
+        {
+            TLLM_CHECK(allocator.releaseTensorBuffer(comm, outputTensor.storage().unsafeGetStorageImpl(), stream));
+        }
+        return outputs;
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
