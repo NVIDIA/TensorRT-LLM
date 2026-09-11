@@ -151,7 +151,7 @@ TEST(RequestTest, serializeDeserialize)
     data[2] = 789;
     data[3] = 10;
 
-    auto request = Request({1, 2, 3, 4}, 11, true, SamplingConfig(), OutputConfig(), 112, 113,
+    auto request = Request({1, 2, 3, 4}, 11, true, SamplingConfig(), OutputConfig(), 112,
         std::make_optional<std::vector<SizeType32>>({0, 1, 2, 3}), std::list<VecTokens>{{1, 2, 3}, {2, 3, 4}},
         std::nullopt, std::nullopt, PromptTuningConfig(embeddingTable, VecTokenExtraIds({1, 2, 3, 4})), std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -173,7 +173,6 @@ TEST(RequestTest, serializeDeserialize)
     EXPECT_EQ(newRequest.getStreaming(), request.getStreaming());
     EXPECT_EQ(newRequest.getSamplingConfig(), request.getSamplingConfig());
     EXPECT_EQ(newRequest.getEndId(), request.getEndId());
-    EXPECT_EQ(newRequest.getPadId(), request.getPadId());
     EXPECT_EQ(newRequest.getPositionIds(), request.getPositionIds());
     EXPECT_EQ(newRequest.getBadWords(), request.getBadWords());
     EXPECT_TRUE(request.getLogitsPostProcessorName().has_value());

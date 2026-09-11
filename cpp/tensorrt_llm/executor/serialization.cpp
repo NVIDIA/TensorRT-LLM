@@ -832,7 +832,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto samplingConfig = su::deserialize<SamplingConfig>(is);
     auto outputConfig = su::deserialize<OutputConfig>(is);
     auto endId = su::deserialize<std::optional<SizeType32>>(is);
-    auto padId = su::deserialize<std::optional<SizeType32>>(is);
     auto positionIds = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto badWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto stopWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
@@ -864,7 +863,7 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto disaggRequestId = su::deserialize<std::optional<IdType>>(is);
     auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
 
-    return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
+    return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
         std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),

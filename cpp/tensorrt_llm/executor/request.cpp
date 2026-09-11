@@ -26,7 +26,7 @@
 namespace tensorrt_llm::executor
 {
 Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, SamplingConfig const& samplingConfig,
-    OutputConfig const& outputConfig, std::optional<SizeType32> const& endId, std::optional<SizeType32> const& padId,
+    OutputConfig const& outputConfig, std::optional<SizeType32> const& endId,
     std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
     std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
     std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
@@ -41,7 +41,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
     std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
-        padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
+        std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
         std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
         std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
@@ -104,11 +104,6 @@ OutputConfig Request::getOutputConfig() const
 std::optional<SizeType32> Request::getEndId() const
 {
     return mImpl->getEndId();
-}
-
-std::optional<SizeType32> Request::getPadId() const
-{
-    return mImpl->getPadId();
 }
 
 std::optional<std::vector<SizeType32>> Request::getPositionIds() const
@@ -269,11 +264,6 @@ void Request::setOutputConfig(OutputConfig const& outputConfig)
 void Request::setEndId(SizeType32 endId)
 {
     mImpl->setEndId(endId);
-}
-
-void Request::setPadId(SizeType32 padId)
-{
-    mImpl->setPadId(padId);
 }
 
 void Request::setPositionIds(std::vector<SizeType32> const& positionIds)
