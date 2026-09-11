@@ -276,7 +276,9 @@ def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
 
-def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
+def _generate_ltx2_cuda_graph_trtllm_backend_video(
+    output_path: str | os.PathLike[str], *, enable_cuda_graph: bool = True
+) -> None:
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
     from tensorrt_llm.visual_gen.args import (
         AttentionConfig,
@@ -315,7 +317,7 @@ def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
             ],
             num_frames=[LTX2_LPIPS_NUM_FRAMES],
         ),
-        cuda_graph_config=CudaGraphConfig(enable=True),
+        cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
         torch_compile_config=TorchCompileConfig(
             enable=True,
             enable_fullgraph=False,
@@ -393,28 +395,40 @@ def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path):
+def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path, monkeypatch):
+    reference_path = tmp_path / "ltx2_trtllm_backend_generated.mp4"
     generated_path = tmp_path / "ltx2_cuda_graph_trtllm_backend_generated.mp4"
-    golden_path = _golden_media_path(
-        tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
-    )
+    # Compare the same NVFP4, attention, and compilation configuration. The BF16
+    # golden has different numerics; fixed-golden accuracy is covered separately.
+    # Reuse the reference worker's tuning decisions so only graph capture differs.
+    autotuner_cache_path = tmp_path / "ltx2_autotuner_cache.json"
+    monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_PATH", str(autotuner_cache_path))
+    _generate_ltx2_cuda_graph_trtllm_backend_video(reference_path, enable_cuda_graph=False)
+    assert autotuner_cache_path.is_file(), "Reference worker did not save its tuning decisions"
     _generate_ltx2_cuda_graph_trtllm_backend_video(generated_path)
     score = _run_lpips_eval(
         tmp_path,
         "ltx2_cuda_graph_trtllm_backend",
         "video",
         LTX2_T2V_PROMPT,
-        golden_path,
+        reference_path,
         generated_path,
     )
     _preserve_lpips_candidate_on_failure(
         request,
         score,
-        LTX2_LPIPS_THRESHOLD,
+        LTX2_CUDA_GRAPH_LPIPS_THRESHOLD,
+        reference_path,
+        "ltx2_trtllm_backend_generated.mp4",
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_CUDA_GRAPH_LPIPS_THRESHOLD,
         generated_path,
         "ltx2_cuda_graph_trtllm_backend_generated.mp4",
     )
-    _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, LTX2_CUDA_GRAPH_LPIPS_THRESHOLD)
 
 
 @pytest.fixture(scope="session")
