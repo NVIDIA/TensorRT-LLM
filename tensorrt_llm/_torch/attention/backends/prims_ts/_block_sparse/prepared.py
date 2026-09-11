@@ -22,6 +22,7 @@ from .common import _SIGNED_INT32_MAX, _block_sparse_kv_atom_size
 
 _SECTION_ALIGNMENT_WORDS = 4
 _PREPARED_ROUTE_IS_FULL_FLAG = 1 << 0
+_PREPARED_ROUTE_IS_PROXY_FLAG = 1 << 1
 _SUPPORTED_KV_ROUTE_SIZES = (128, 256)
 _SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
 
@@ -91,13 +92,16 @@ class _BlockSparseRouteLayout:
 
     Each route's metadata stores logical KV-token atom origins, optional
     physical page IDs, one atom-valid-mask word, one route-flags word, and
-    optional token-valid words. ``page_size is None`` selects the contiguous
+    optional token-mask words. ``page_size is None`` selects the contiguous
     record; otherwise the paged record adds one page-ID word per logical
     origin. Logical origins remain independent of the K/V storage locator used
-    by the attention load path. An invalid logical origin is encoded as
-    ``-1``. Bit ``i`` of the atom-valid mask corresponds to logical origin
-    ``i``. ``_PREPARED_ROUTE_IS_FULL_FLAG`` (bit 0) states that the route is
-    both structurally full and, when token bits are present, token-full.
+    by the attention load path. Exact routes address raw-token origins, while
+    proxy routes address summary-token origins and set
+    ``_PREPARED_ROUTE_IS_PROXY_FLAG`` (bit 1). An invalid logical origin is
+    encoded as ``-1``. Bit ``i`` of the atom-valid mask corresponds to logical
+    origin ``i``. ``_PREPARED_ROUTE_IS_FULL_FLAG`` (bit 0) states that the
+    route is both structurally full and, when token-mask bits are present,
+    mask-full.
     """
 
     # Store semantic inputs plus the three validated allocation values. All
@@ -239,6 +243,17 @@ class _BlockSparseRouteLayout:
         return self.route_flags_word_offset + 1 if self.has_token_bits else None
 
     @property
+    def uses_one_warp_transport(self) -> bool:
+        """Whether this layout uses the continuous one-warp transport."""
+
+        token_words_word_offset = self.token_words_word_offset
+        return (
+            not self.is_paged
+            and token_words_word_offset is not None
+            and token_words_word_offset + self.token_words_per_route <= 32
+        )
+
+    @property
     def route_metadata_capacity(self) -> int:
         """Number of routes whose metadata fits in the mutable workspace."""
 
@@ -249,5 +264,6 @@ class _BlockSparseRouteLayout:
 
 __all__ = [
     "_PREPARED_ROUTE_IS_FULL_FLAG",
+    "_PREPARED_ROUTE_IS_PROXY_FLAG",
     "_BlockSparseRouteLayout",
 ]

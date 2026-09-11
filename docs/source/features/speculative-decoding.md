@@ -169,8 +169,8 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.
-* `drafter`: An object of type `Drafter` that implements the `prepare_draft_tokens` method (see [Developer Guide](speculative-decoding.md#developer-guide) 7.)
-* `resource_manager`: An optional `ResourceManager` object (see [Developer Guide](speculative-decoding.md#developer-guide) 4.)
+* `drafter`: An object of type `Drafter` that implements the `prepare_draft_tokens` method (see [User-provided drafting](speculative-decoding.md#user-provided-drafting) 7.)
+* `resource_manager`: An optional `ResourceManager` object (see [User-provided drafting](speculative-decoding.md#user-provided-drafting) 4.)
 
 ```python
 from tensorrt_llm.llmapi import UserProvidedDecodingConfig
