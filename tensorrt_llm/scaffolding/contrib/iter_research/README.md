@@ -1,6 +1,6 @@
 # IterResearch (TensorRT-LLM Scaffolding)
 
-This package is a **reference integration** of **IterResearch** with the TensorRT-LLM **Scaffolding** stack: multi-turn tool use, a **Visit** sub-controller for web retrieval, and an OpenAI-compatible inference backend (e.g. `trtllm-serve`), all wired through **MCP over SSE**.
+This package is a **reference integration** of **IterResearch** with the TensorRT-LLM **Scaffolding** stack: multi-turn tool use, a **Visit** sub-controller for web retrieval, and an OpenAI-compatible inference backend (e.g. `trtllm-serve`), all wired through **MCP over Streamable HTTP**.
 
 ## Overview
 
@@ -18,9 +18,9 @@ tensorrt_llm/scaffolding/contrib/iter_research/
 
 examples/scaffolding/contrib/iter_research/
 ├── config.yaml          # SerpAPI, Jina, MCP ports, Apiary gateway, runner settings
-└── run_iter_research.py # Entry: load config, MCP SSE URLs, ScaffoldingLlm, question
+└── run_iter_research.py # Entry: load config, MCP URLs, ScaffoldingLlm, question
 
-examples/scaffolding/mcp/          # Four MCP servers (SSE) used by this flow
+examples/scaffolding/mcp/          # Four MCP servers used by this flow
 ├── google_search/     # SerpAPI web search (ports from config.yaml)
 ├── google_scholar/    # SerpAPI Scholar + web search
 ├── fetch_webpage/     # Jina Reader / ScraperAPI for HTML/PDF-style fetch paths
@@ -37,7 +37,7 @@ examples/scaffolding/mcp/          # Four MCP servers (SSE) used by this flow
 | `fetch_webpage/` | `fetch_webpage` | Fetches URL content (implementation chooses HTML/Markdown/PDF paths). |
 | `coder/` | `python_interpreter` (among others) | Executes Python code inside a per-client Apiary sandbox session (shared with `read_file`, `shell`, `exec`, ...). |
 
-The runner builds `http://<host>:<port>/sse` for each service from `mcp_tools.*` and `mcp_client_host` in `config.yaml`. `coder_mcp.py` talks to the Apiary daemon directly via `ApiarySessionMux` — no standalone Python gateway is needed.
+The runner builds `http://<host>:<port>/mcp` for each service from `mcp_tools.*` and `mcp_client_host` in `config.yaml`. `coder_mcp.py` talks to the Apiary daemon directly via `ApiarySessionMux` — no standalone Python gateway is needed.
 
 ## Docker-based startup
 
@@ -127,7 +127,7 @@ The following steps start **after** you are inside a TensorRT-LLM dev or inferen
         --port 8086
    ```
 
-   The `coder_mcp` server provides the `python_interpreter` tool (plus `read_file`, `shell`, `exec`, ...) backed directly by the Apiary daemon — no standalone Python gateway is required. Point `--apiary-url` at **Container 1**’s `apiary daemon`, and ensure the runner reaches this SSE endpoint at `mcp_tools.python_interpreter` (host/port in `config.yaml`).
+   The `coder_mcp` server provides the `python_interpreter` tool (plus `read_file`, `shell`, `exec`, ...) backed directly by the Apiary daemon — no standalone Python gateway is required. Point `--apiary-url` at **Container 1**’s `apiary daemon`, and ensure the runner reaches this Streamable HTTP endpoint at `mcp_tools.python_interpreter` (host/port in `config.yaml`).
 
 3. **Run the IterResearch example with terminal 6**
 
@@ -141,7 +141,7 @@ The following steps start **after** you are inside a TensorRT-LLM dev or inferen
 ## Configuration (summary)
 
 - **`config.yaml`**: Central place for SerpAPI/Jina keys, `mcp_tools` ports, and runner `base_url` / `model`. The `python_interpreter` tool is served by `coder_mcp.py` and talks to Apiary directly, so the former `apiary_python_gateway` / `sandbox_endpoint` settings are no longer used by this flow (Apiary URL is passed via `coder_mcp.py --apiary-url`). Do not commit real secrets to a public repository.
-- **Networking**: If MCP processes and the runner are not all on `127.0.0.1`, set `mcp_client_host` and/or per-service `mcp_tools.*.host` so the runner can reach every `/sse` endpoint.
+- **Networking**: If MCP processes and the runner are not all on `127.0.0.1`, set `mcp_client_host` and/or per-service `mcp_tools.*.host` so the runner can reach every `/mcp` endpoint.
 
 ## Acknowledgement
 

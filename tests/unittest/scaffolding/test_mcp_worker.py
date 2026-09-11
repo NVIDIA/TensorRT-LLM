@@ -7,13 +7,10 @@ from typing import Optional
 import pytest
 import requests
 import uvicorn
-from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
-from starlette.routing import Mount, Route
+from starlette.responses import JSONResponse
 
 from tensorrt_llm.scaffolding.controller import ChatWithMCPController, NativeGenerationController
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
@@ -49,42 +46,19 @@ async def echo_message(message: str) -> str:
     return f"Echo: {message}"
 
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
-    sse = SseServerTransport("/messages/")
-    print("Creating Starlette app with SSE transport")
+@mcp.custom_route("/health", methods=["GET"])
+async def handle_health(_request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
 
-    async def handle_sse(request: Request) -> StreamingResponse:
-        async with sse.connect_sse(
-            request.scope,
-            request.receive,
-            request._send,  # noqa: SLF001
-        ) as (read_stream, write_stream):
-            await mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp_server.create_initialization_options(),
-            )
-        # Return an empty streaming response after SSE connection closes
-        return StreamingResponse(iter([]), media_type="text/event-stream")
 
-    async def handle_health(_request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok"})
-
-    return Starlette(
-        debug=debug,
-        routes=[
-            Route("/health", endpoint=handle_health),
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
-        ],
-    )
+def create_starlette_app() -> Starlette:
+    return mcp.streamable_http_app()
 
 
 def run_mcp_server(host: str, port: int):
     """Run MCP server in a separate process."""
     print(f"Running MCP server on {host}:{port}")
-    mcp_server = mcp._mcp_server  # noqa: WPS437
-    starlette_app = create_starlette_app(mcp_server, debug=False)
+    starlette_app = create_starlette_app()
     uvicorn.run(starlette_app, host=host, port=port, log_level="error")
 
 
@@ -142,7 +116,6 @@ class RemoteMCPServer:
             try:
                 # Try to connect to server
                 requests.get(url, timeout=1)
-                # SSE endpoint should return a response (even if connection will be closed)
                 break
             except (requests.ConnectionError, requests.Timeout) as err:
                 # Check if process exited unexpectedly
@@ -161,11 +134,11 @@ class RemoteMCPServer:
         return f"http://{self.host}:{self.port}"
 
     @property
-    def sse_url(self) -> str:
-        return f"{self.url_root}/sse"
+    def mcp_url(self) -> str:
+        return f"{self.url_root}/mcp"
 
-    def get_sse_url(self) -> str:
-        return self.sse_url
+    def get_mcp_url(self) -> str:
+        return self.mcp_url
 
 
 # ============================================================
@@ -231,9 +204,9 @@ class DummyWorker(Worker):
 
 @pytest.mark.asyncio
 async def test_mcp_worker_add_numbers(mcp_server):
-    # 1. Initialize MCPWorker with mcp_server's SSE URL
-    sse_url = mcp_server.get_sse_url()
-    worker = MCPWorker(urls=[sse_url])
+    # 1. Initialize MCPWorker with mcp_server's Streamable HTTP URL
+    mcp_url = mcp_server.get_mcp_url()
+    worker = MCPWorker(urls=[mcp_url])
 
     # 2. Initialize worker in asyncio event loop
     await worker.init_in_asyncio_event_loop()
@@ -268,8 +241,8 @@ async def test_mcp_worker_add_numbers(mcp_server):
 @pytest.mark.asyncio
 async def test_mcp_worker_echo_message(mcp_server):
     # Initialize MCPWorker
-    sse_url = mcp_server.get_sse_url()
-    worker = MCPWorker(urls=[sse_url])
+    mcp_url = mcp_server.get_mcp_url()
+    worker = MCPWorker(urls=[mcp_url])
 
     # Initialize in event loop
     await worker.init_in_asyncio_event_loop()
@@ -302,8 +275,8 @@ async def test_mcp_worker_multiple_calls(mcp_server):
     from tensorrt_llm.scaffolding.worker import MCPWorker
 
     # Initialize MCPWorker
-    sse_url = mcp_server.get_sse_url()
-    worker = MCPWorker(urls=[sse_url])
+    mcp_url = mcp_server.get_mcp_url()
+    worker = MCPWorker(urls=[mcp_url])
 
     await worker.init_in_asyncio_event_loop()
 
@@ -348,8 +321,8 @@ async def test_mcp_worker_multiple_calls(mcp_server):
 
 @pytest.mark.asyncio
 async def test_multiple_calls_to_same_tool(mcp_server):
-    sse_url = mcp_server.get_sse_url()
-    worker = MCPWorker(urls=[sse_url])
+    mcp_url = mcp_server.get_mcp_url()
+    worker = MCPWorker(urls=[mcp_url])
     await worker.init_in_asyncio_event_loop()
 
     task1 = MCPCallTask()
@@ -379,8 +352,8 @@ async def test_multiple_calls_to_same_tool(mcp_server):
 @pytest.mark.asyncio
 async def test_scaffolding_with_chat_mcp_controller(mcp_server):
     # Initialize workers
-    sse_url = mcp_server.get_sse_url()
-    mcp_worker = MCPWorker(urls=[sse_url])
+    mcp_url = mcp_server.get_mcp_url()
+    mcp_worker = MCPWorker(urls=[mcp_url])
     await mcp_worker.init_in_asyncio_event_loop()
 
     dummy_worker = DummyWorker()
@@ -456,13 +429,12 @@ async def test_scaffolding_with_chat_mcp_controller(mcp_server):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run test MCP SSE-based server")
+    parser = argparse.ArgumentParser(description="Run test MCP Streamable HTTP server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8090, help="Port to listen on")
     args = parser.parse_args()
 
-    mcp_server = mcp._mcp_server  # noqa: WPS437
-    starlette_app = create_starlette_app(mcp_server, debug=True)
+    starlette_app = create_starlette_app()
 
     print(f"Starting MCP server on {args.host}:{args.port}")
     uvicorn.run(starlette_app, host=args.host, port=args.port)
