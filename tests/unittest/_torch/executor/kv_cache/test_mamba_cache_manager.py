@@ -392,10 +392,10 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
         is_draft=False,
     )
     kwargs = captured["kwargs"]
+    assert "vocab_size" not in kwargs
     assert kwargs["model_type"] == "qwen3_next"
     assert "conv_state_layout" not in kwargs
     assert "kda_replay_num_spec" not in kwargs
-    assert "vocab_size" not in kwargs
 
 
 def test_v2_manager_rejects_model_type_kwarg() -> None:
