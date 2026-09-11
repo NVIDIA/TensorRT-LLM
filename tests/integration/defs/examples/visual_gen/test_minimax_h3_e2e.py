@@ -20,6 +20,7 @@ MINIMAX_H3_CHECKPOINT. Reference and candidate run sequentially on one GPU.
 """
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import diffusers
@@ -99,6 +100,19 @@ MINIMAX_H3_LPIPS_THRESHOLD = 0.15
 # perceptual acceptance score. Its scale is independent of LPIPS.
 MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD = 0.10
 MINIMAX_H3_LPIPS_BATCH_SIZE = 16
+
+
+@pytest.fixture
+def _full_cuda_memory_budget() -> Iterator[None]:
+    # Earlier LLM tests can leave a process-wide allocator cap after shutdown.
+    # The reference and candidate run sequentially and need the full GPU budget.
+    device = torch.cuda.current_device()
+    previous_fraction = torch.cuda.get_per_process_memory_fraction(device)
+    torch.cuda.set_per_process_memory_fraction(1.0, device)
+    try:
+        yield
+    finally:
+        torch.cuda.set_per_process_memory_fraction(previous_fraction, device)
 
 
 def _minimax_h3_checkpoint_path() -> str:
@@ -487,7 +501,7 @@ def test_minimax_h3_public_visual_gen_api_smoke() -> None:
     ids=["t2va", "fl2va", "t2va-fp8-blockwise"],
 )
 def test_minimax_h3_diffusers_lpips_and_audio_reference(
-    task: str, quant_algo: str | None, tmp_path: Path
+    task: str, quant_algo: str | None, tmp_path: Path, _full_cuda_memory_budget: None
 ) -> None:
     """Gate both supported tasks against a fresh Diffusers reference."""
     checkpoint_path = _minimax_h3_checkpoint_path()
