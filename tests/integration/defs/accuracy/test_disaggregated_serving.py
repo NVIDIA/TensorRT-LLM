@@ -586,7 +586,8 @@ def run_parallel_test(model_name: str,
                       cache_transceiver_backend: str = "DEFAULT",
                       trust_remote_code: bool = False,
                       quant_algo: str = None,
-                      kv_cache_quant_algo: str = None):
+                      kv_cache_quant_algo: str = None,
+                      max_batch_size: int = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -618,6 +619,9 @@ def run_parallel_test(model_name: str,
             "max_tokens_in_buffer": 4096
         }
     }
+    if max_batch_size is not None:
+        ctx_server_config["max_batch_size"] = max_batch_size
+        gen_server_config["max_batch_size"] = max_batch_size
     if trust_remote_code:
         ctx_server_config["trust_remote_code"] = True
         gen_server_config["trust_remote_code"] = True
@@ -1679,19 +1683,28 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         # Replaces the waived TestQwen3_30B_A3B::test_mixed_ctx_gen_model
         # asymmetric PP/TP configuration with a smaller model.
         mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
-        return run_parallel_test(self.MODEL_NAME,
-                                 self.MODEL_PATH,
-                                 ctx_pp=2,
-                                 ctx_tp=1,
-                                 gen_pp=1,
-                                 gen_tp=2,
-                                 ctx_instances=1,
-                                 gen_instances=1,
-                                 test_sets=[GSM8K],
-                                 cache_transceiver_backend="NIXL",
-                                 trust_remote_code=True,
-                                 quant_algo="FP8_BLOCK_SCALES",
-                                 kv_cache_quant_algo="FP8")
+        return run_parallel_test(
+            self.MODEL_NAME,
+            self.MODEL_PATH,
+            ctx_pp=2,
+            ctx_tp=1,
+            gen_pp=1,
+            gen_tp=2,
+            ctx_instances=1,
+            gen_instances=1,
+            test_sets=[GSM8K],
+            cache_transceiver_backend="NIXL",
+            trust_remote_code=True,
+            quant_algo="FP8_BLOCK_SCALES",
+            kv_cache_quant_algo="FP8",
+            # Qwen3.5 is a hybrid-Mamba model: the V2
+            # cache manager's live-state quota scales
+            # with max_batch_size * pp_size, so the
+            # default max_batch_size=2048 combined with
+            # ctx_pp=2 overflows the KV cache quota.
+            # Other Qwen3.5-4B tests cap this at 32
+            # (see test_llm_api_pytorch.py).
+            max_batch_size=32)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
