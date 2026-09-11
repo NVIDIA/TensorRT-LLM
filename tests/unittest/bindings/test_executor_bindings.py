@@ -111,7 +111,6 @@ def test_multimodal_embedding():
             "prompt_tuning_config":
             trtllm.PromptTuningConfig(torch.ones(100, 64)),
             "lora_config": trtllm.LoraConfig(1),
-            "logits_post_processor_name": "my_logits_pp",
             "client_id": 1234,
         }
 
@@ -333,7 +332,6 @@ def test_request():
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
         "multimodal_embedding": torch.ones(100, 64),
         "lora_config": trtllm.LoraConfig(1),
-        "logits_post_processor_name": "my_logits_pp",
         "client_id": 1234,
     }
     request = trtllm.Request(**kwargs)

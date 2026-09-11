@@ -619,9 +619,6 @@ public:
     /// @param mRopeConfig The mrope configuration
     /// @param loraConfig The LoRA configuration
     /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
-    /// @param logitsPostProcessorName The logits postprocessor name.
-    /// @param logitsPostProcessor The logits postprocessor dynamically specified per request; only supported with
-    /// replicate=false or no tensor parallelism.
     /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
     /// @param clientId
     /// @param returnAllGeneratedTokens Indicates whether to return the full beams or just the newly generated tokens
@@ -653,8 +650,6 @@ public:
         std::optional<Tensor> multimodalEmbedding = std::nullopt, std::optional<MropeConfig> mRopeConfig = std::nullopt,
         std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
-        std::optional<std::string> logitsPostProcessorName = std::nullopt,
-        std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         std::optional<VecTokens> encoderInputTokenIds = std::nullopt, std::optional<IdType> clientId = std::nullopt,
         bool returnAllGeneratedTokens = false, PriorityType priority = kDefaultPriority,
         RequestType type = RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
@@ -665,11 +660,6 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt);
-
-    /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
-    static auto constexpr kBatchedPostProcessorName = "batched";
-    /// @brief Dynamic logits postprocessor name will be "dynamic" + requestId
-    static auto constexpr kDynamicPostProcessorNamePrefix = "dynamic";
 
     Request(Request const& other);
     Request(Request&& other) noexcept;
@@ -694,8 +684,6 @@ public:
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
     [[nodiscard]] std::optional<KvCacheRetentionConfig> getKvCacheRetentionConfig() const;
-    [[nodiscard]] std::optional<std::string> getLogitsPostProcessorName() const;
-    [[nodiscard]] std::optional<LogitsPostProcessor> getLogitsPostProcessor() const;
     [[nodiscard]] std::optional<VecTokens> getEncoderInputTokenIds() const;
     [[nodiscard]] std::optional<IdType> getClientId() const;
     [[nodiscard]] PriorityType getPriority() const;
@@ -725,8 +713,6 @@ public:
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
     void setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig);
-    void setLogitsPostProcessorName(std::string const& logitsPostProcessorName);
-    void setLogitsPostProcessor(std::optional<LogitsPostProcessor> const& logitsPostProcessor);
     void setEncoderInputTokenIds(VecTokens const& encoderInputTokenIds);
     void setClientId(IdType clientId);
     void setPriority(PriorityType priority);
