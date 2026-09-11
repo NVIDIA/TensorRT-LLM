@@ -149,6 +149,28 @@ def test_repeated_prompt_is_not_stored_twice() -> None:
     assert cache.hits == 1
 
 
+def test_conversations_sharing_a_long_preamble_find_their_own_entry() -> None:
+    """The probe must tell apart entries the bucket key and last char cannot.
+
+    Agentic prompts share a system preamble far longer than min_chars and end
+    with the same chat-template suffix.
+    """
+    tokenizer, cache = _MergeTokenizer(), _cache()
+    preamble = "shared system prompt and tool schema. " * 40
+    suffix = "<|assistant|>\n"
+    turns = {i: preamble + f"user {i} says hi.{suffix}" for i in range(16)}
+    for prompt in turns.values():
+        cache.encode(tokenizer, prompt)
+    assert len(cache._buckets) == 1
+    for i, prompt in turns.items():
+        # The next turn keeps the previous prompt, generation suffix included.
+        extended = prompt + f"reply to {i}.<|user|>\nmore from {i}.{suffix}"
+        found = cache._lookup(extended)
+        assert found is not None and found[1].text == prompt
+        assert cache.encode(tokenizer, extended) == tokenizer(extended)["input_ids"]
+    assert cache.hits == 16 and cache.resync_failures == 0
+
+
 def test_eviction_bounds_entry_count() -> None:
     tokenizer, cache = _MergeTokenizer(), _cache(max_entries=8)
     for prompt in _conversations(40):

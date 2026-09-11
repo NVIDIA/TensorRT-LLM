@@ -42,6 +42,14 @@ ENABLE_ENV_VAR = "TLLM_PREFIX_TOKEN_CACHE"
 # Log the hit rate every this many cache-eligible requests, so an operator can
 # see whether the cache is doing anything without reading its counters.
 LOG_EVERY_REQUESTS = 1000
+# Agentic prompts share a system/tool preamble that can run to tens of thousands
+# of characters, so entries in one bucket cannot be told apart by their start,
+# and they end with the same chat-template suffix, so CPython's own last-character
+# shortcut in str.startswith does not help either. Each entry keeps its last
+# PROBE_CHARS characters; a candidate is only compared in full when the incoming
+# text has that probe at the same position. The probe must be longer than any
+# suffix the chat template appends after the last message.
+PROBE_CHARS = 256
 
 
 def prefix_cache_enabled() -> bool:
@@ -102,7 +110,7 @@ class PrefixTokenCacheConfig:
         return cls(**overrides)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class _Entry:
     text: str
     ids: array  # int32
@@ -110,6 +118,7 @@ class _Entry:
     # token ``split_token``, which starts at character ``split_char``.
     split_token: int
     split_char: int
+    probe: str  # the last PROBE_CHARS characters of ``text``
 
 
 class PrefixTokenCache:
@@ -128,7 +137,7 @@ class PrefixTokenCache:
         self._config = config
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, _Entry] = OrderedDict()  # LRU order
-        self._buckets: dict[int, set[int]] = {}
+        self._buckets: dict[int, dict[int, _Entry]] = {}
         self._total_chars = 0
         self._next_id = 0
         self.disabled = False
@@ -214,23 +223,38 @@ class PrefixTokenCache:
     def _lookup(self, text: str) -> tuple[int, _Entry] | None:
         """Longest cached entry that is a prefix of ``text``, promoted to MRU."""
         with self._lock:
-            candidates = self._buckets.get(self._bucket_key(text), ())
-            for eid in sorted(candidates, key=lambda e: len(self._entries[e].text), reverse=True):
-                entry = self._entries[eid]
-                if text.startswith(entry.text):
-                    self._entries.move_to_end(eid)
-                    return eid, entry
-            return None
+            candidates = list(self._buckets.get(self._bucket_key(text), {}).items())
+        # Entries are immutable, so the comparisons run outside the lock. The
+        # probe check rejects other conversations in O(PROBE_CHARS); only a true
+        # prefix pays the full compare over the shared preamble.
+        best: tuple[int, _Entry] | None = None
+        for eid, entry in candidates:
+            n = len(entry.text)
+            if (
+                n <= len(text)
+                and (best is None or n > len(best[1].text))
+                and text[n - len(entry.probe) : n] == entry.probe
+                and text.startswith(entry.text)
+            ):
+                best = (eid, entry)
+        if best is not None:
+            with self._lock:
+                if best[0] in self._entries:
+                    self._entries.move_to_end(best[0])
+            # If it was evicted meanwhile the entry is still a valid prefix to
+            # splice from; _remove() on it is a no-op.
+        return best
 
     def _insert(self, text: str, ids: Sequence[int], split_token: int, split_char: int) -> None:
         """Caller holds the lock."""
         key = self._bucket_key(text)
-        bucket = self._buckets.setdefault(key, set())
-        if any(self._entries[eid].text == text for eid in bucket):
+        bucket = self._buckets.setdefault(key, {})
+        if any(entry.text == text for entry in bucket.values()):
             return  # concurrent misses on the same prompt
         eid, self._next_id = self._next_id, self._next_id + 1
-        self._entries[eid] = _Entry(text, array("i", ids), split_token, split_char)
-        bucket.add(eid)
+        entry = _Entry(text, array("i", ids), split_token, split_char, text[-PROBE_CHARS:])
+        self._entries[eid] = entry
+        bucket[eid] = entry
         self._total_chars += len(text)
         while self._entries and (
             len(self._entries) > self._config.max_entries
@@ -246,7 +270,7 @@ class PrefixTokenCache:
         self._total_chars -= len(entry.text)
         key = self._bucket_key(entry.text)
         bucket = self._buckets[key]
-        bucket.discard(eid)
+        bucket.pop(eid, None)
         if not bucket:
             del self._buckets[key]
 
