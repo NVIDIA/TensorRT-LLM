@@ -631,3 +631,46 @@ def test_gdn_attaches_only_static_fp8_scale():
     layer.out_proj.force_dynamic_quantization = True
     layer.cache_derived_state()
     assert layer.norm.fp8_scale is None
+
+
+# ---- Speculative decode/verify routing (_decode_is_target_verify) ----
+
+
+@pytest.mark.parametrize("runtime_draft_len,expected", [(0, False), (1, True), (2, True)])
+def test_decode_is_target_verify_routes_by_draft_len(runtime_draft_len, expected):
+    """The draft-0 band (runtime_draft_len == 0) must NOT take the multi-token
+    verify path: a single-token "verify" is a plain decode step, and the verify
+    machinery's per-step intermediate conv/SSM-state bookkeeping is both
+    unnecessary and slower there. draft_len >= 1 keeps the verify path."""
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+
+    spec_metadata = SimpleNamespace(runtime_draft_len=runtime_draft_len)
+    kv_cache_manager = SimpleNamespace(is_speculative=lambda: True)
+    layer_cache = SimpleNamespace()
+
+    assert (
+        Qwen3NextGatedDeltaNet._decode_is_target_verify(
+            4, spec_metadata, kv_cache_manager, layer_cache
+        )
+        is expected
+    )
+
+
+def test_decode_is_target_verify_guard_conditions():
+    """Every guard is load-bearing: no decode tokens, no spec metadata, a
+    non-speculative KV cache, or a missing per-layer cache each fall back to the
+    plain decode path even when a draft would otherwise be active."""
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+
+    spec = SimpleNamespace(runtime_draft_len=2)
+    spec_kv = SimpleNamespace(is_speculative=lambda: True)
+    layer_cache = SimpleNamespace()
+    f = Qwen3NextGatedDeltaNet._decode_is_target_verify
+
+    assert f(4, spec, spec_kv, layer_cache) is True  # all conditions satisfied
+    assert f(0, spec, spec_kv, layer_cache) is False  # no decode tokens
+    assert f(4, None, spec_kv, layer_cache) is False  # non-spec model
+    assert (
+        f(4, spec, SimpleNamespace(is_speculative=lambda: False), layer_cache) is False
+    )  # KV cache not speculative
+    assert f(4, spec, spec_kv, None) is False  # missing per-layer cache

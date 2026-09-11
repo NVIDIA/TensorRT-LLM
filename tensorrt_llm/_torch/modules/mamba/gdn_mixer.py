@@ -1018,6 +1018,33 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         return self._postprocess_gdn_output(attn_out, z, all_reduce_params)
 
+    @staticmethod
+    def _decode_is_target_verify(
+        num_decodes: int,
+        spec_metadata: Optional[SpecMetadata],
+        kv_cache_manager,
+        layer_cache,
+    ) -> bool:
+        """Whether the GDN decode batch runs the speculative multi-token verify
+        path.
+
+        The verify path reshapes the batch to ``[num_decodes, draft_len + 1]``
+        and drives the per-step intermediate conv/SSM-state machinery so a later
+        ``update_mamba_states()`` can pick the accepted state. It is only correct
+        (and only worthwhile) when the step actually drafts tokens. In the
+        draft-0 band (``runtime_draft_len == 0``) every request verifies a single
+        token, i.e. ``draft_len + 1 == 1``; that degenerate case is exactly a
+        plain decode step, which the single-token kernels handle directly without
+        the verify path's intermediate-state bookkeeping.
+        """
+        return (
+            num_decodes > 0
+            and spec_metadata is not None
+            and spec_metadata.runtime_draft_len > 0
+            and kv_cache_manager.is_speculative()
+            and layer_cache is not None
+        )
+
     def forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -1057,11 +1084,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 conv_states,
             )
 
-        is_target_verify = (
-            num_decodes > 0
-            and spec_metadata is not None
-            and attn_metadata.kv_cache_manager.is_speculative()
-            and layer_cache is not None
+        is_target_verify = self._decode_is_target_verify(
+            num_decodes,
+            spec_metadata,
+            attn_metadata.kv_cache_manager,
+            layer_cache,
         )
         intermediate_conv_states = (
             layer_cache.intermediate_conv_window if is_target_verify else None

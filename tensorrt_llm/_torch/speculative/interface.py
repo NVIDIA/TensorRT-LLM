@@ -1195,24 +1195,33 @@ class SpecMetadata:
         per_request_slot_ids: list[int] = []
 
         for request in requests:
-            sampling_config = request.sampling_config
-            temp_val = sampling_config.temperature
-            tk_val = sampling_config.top_k
-            tp_val = sampling_config.top_p
-
-            # Context requests have no draft tokens yet.
-            num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            # A request's sampling params are fixed for its lifetime, so the
+            # normalized (temperature, top_k, top_p, is_greedy) tuple is
+            # computed once and cached on the request. Both per-step scans
+            # (update_is_all_greedy_sample and
+            # populate_sampling_params_for_one_model) then reuse it instead of
+            # re-normalizing every step. num_tokens and the batch-level enabled
+            # flags below still depend on request state / batch composition and
+            # are recomputed fresh every step (never cached across steps).
+            normalized = getattr(request, "py_one_model_norm_sampling", None)
+            if normalized is None:
+                sampling_config = request.sampling_config
+                normalized = _normalize_request_sampling_params(
+                    temperature=sampling_config.temperature,
+                    top_k=sampling_config.top_k,
+                    top_p=sampling_config.top_p,
+                )
+                request.py_one_model_norm_sampling = normalized
 
             (
                 temp_val,
                 tk_val,
                 tp_val,
                 is_greedy,
-            ) = _normalize_request_sampling_params(
-                temperature=temp_val,
-                top_k=tk_val,
-                top_p=tp_val,
-            )
+            ) = normalized
+
+            # Context requests have no draft tokens yet.
+            num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
             has_non_greedy_requests |= not is_greedy
 

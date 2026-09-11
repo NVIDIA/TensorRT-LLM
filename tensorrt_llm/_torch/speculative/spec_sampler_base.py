@@ -273,11 +273,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def _request_common_handling(
         self,
         request: LlmRequest,
-        next_draft_tokens: list[list[int]],
+        next_draft_tokens: Optional[list[list[int]]],
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
+        if next_draft_tokens is None:
+            # Draft-0 band: no draft tokens for the next step (equivalent to the
+            # empty [:0] slice); the next_draft_tokens host readback was skipped.
+            request.py_draft_tokens = []
+        else:
+            request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
     def update_requests(
@@ -296,11 +301,19 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         assert isinstance(state, SampleStateSpec)
 
         state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens.tolist()
-        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
-        next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
+        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        if runtime_draft_len == 0:
+            # Draft-0 band: every request accepts exactly its single base token
+            # (new_tokens_lens == 1) and produces no next-iteration draft tokens,
+            # so read back only the first accepted-token row and skip the
+            # next_draft_tokens host copy entirely.
+            new_tokens = state.host.new_tokens[:1].tolist()
+            next_draft_tokens_list = None
+        else:
+            new_tokens = state.host.new_tokens.tolist()
+            next_draft_tokens_list = state.host.next_draft_tokens.tolist()
 
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
