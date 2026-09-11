@@ -977,6 +977,18 @@ class TestSelectiveTransientTcpRetry:
         assert session.post.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_no_retry_env_disables_all_http_retries(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        with patch("tensorrt_llm.serve.openai_client.logger.info") as log_info:
+            client = self._make_client(session, max_retries=5)
+        assert "TRTLLM_DISAGG_NO_RETRY=1" in log_info.call_args.args[0]
+        session.post.side_effect = aiohttp.ServerDisconnectedError()
+        with pytest.raises(aiohttp.ServerDisconnectedError):
+            await client.send_request(self._make_request())
+        assert session.post.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_transient_tcp_capped_at_5_when_max_retries_smaller(self):
         """If transient TCP keeps failing, give up after the extended budget."""
         session = AsyncMock(spec=aiohttp.ClientSession)

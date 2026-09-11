@@ -21,7 +21,7 @@ future***.
 In TensorRT-LLM, the GPT attention operator supports two different types
 of QKV inputs: Padded and packed (i.e. non padded) inputs. The mode is
 determined by the global configuration parameter `remove_input_padding` defined
-in [`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/plugin/plugin.py).
+in [`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tensorrt_llm/plugin/plugin.py).
 
 When padding is enabled (that is, `remove_input_padding` is `False`), the sequences
 that are shorter than the `max_sequence_length` are padded to that maximum
@@ -43,7 +43,7 @@ context and generation phases in auto-regressive models like GPT.
 ### Context Phase
 
 If the `context_fmha_type` is set to `disabled` (refer to
-[`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/plugin/plugin.py)),
+[`tensorrt_llm.plugin`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tensorrt_llm/plugin/plugin.py)),
 the implementation maps to a sequence of GPU kernels that will store the
 intermediate `Q*K^T` tensor in memory before calling the softmax operator. It
 is the slowest method and the memory footprint is significant (quadratically

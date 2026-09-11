@@ -497,6 +497,16 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
+    def dp_num_tokens(self) -> int:
+        # The two modes use a different convention:
+        #   - MTP Eagle: keep the 1st-iter shape (matches input_ids).
+        #   - Eagle3: subtract to the subseq shape.
+        if self.spec_dec_mode.is_mtp_eagle_one_model():
+            return self.num_tokens
+        per_seq = (self.max_total_draft_tokens
+                   if self.is_spec_dec_tree else self.max_draft_len)
+        return self.num_tokens - self.num_generations * per_seq
+
     def prepare(self):
         super().prepare()
         assert self.request_ids is not None
@@ -514,18 +524,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         # rewritten to the attention-DP subseq shape and would otherwise drop the
         # draft-verification positions from the captured hidden states.
         self.num_capture_tokens = self.num_tokens
-        # `num_tokens` here only feeds the attention-DP shape hint
-        # (allgathered in model_engine and overridden into
-        # `attn_metadata.all_rank_num_tokens` on the step-0 draft forward).
-        # Each mode uses a different convention:
-        #   - MTP Eagle: keep the 1st-iter shape (matches input_ids).
-        #   - Eagle3: subtract to the subseq shape.
-        if not self.spec_dec_mode.is_mtp_eagle_one_model():
-            if self.is_spec_dec_tree:
-                self.num_tokens -= (
-                    self.num_generations) * self.max_total_draft_tokens
-            else:
-                self.num_tokens -= (self.num_generations) * self.max_draft_len
+        self.num_tokens = self.dp_num_tokens()
 
         if getattr(self.spec_resource_manager, "slot_manager",
                    None) is not None:
@@ -1227,20 +1226,25 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _prepare_flash_mla_generation_layout(self, attn_metadata, num_contexts,
                                              batch_size):
-        """Reorder ``kv_block_ids_per_seq`` so gen requests precede context.
+        """Stage the FlashMLA block table in batch order for this draft step.
 
-        Flash MLA on first-step expects the layout used during normal
-        generation; both Eagle3 and MTP Eagle hit this when context requests
-        share the batch with gen requests.
+        The caller has already set ``num_contexts = 0``, which makes
+        ``num_generations`` the whole batch, so every row is a generation row
+        and the block table must be staged in the batch's own order:
+        ``kv_lens_cuda`` is updated in place (also in batch order) and
+        ``_compute_flash_mla_metadata`` slices it from ``num_contexts`` -- now
+        0. ``kv_block_ids_per_seq`` already holds that order, so copy it across
+        unrotated. Rotating so gen rows precede context rows would pair each
+        row's kv_len with another row's block pointers, corrupting the drafted
+        tokens and depressing acceptance length.
+
+        With no context rows ``prepare_flash_mla`` already staged this exact
+        layout, so the early return merely skips a redundant copy.
         """
         if num_contexts <= 0 or not attn_metadata.enable_flash_mla:
             return
-        reorder_block_ids_per_seq = torch.cat([
-            attn_metadata.kv_block_ids_per_seq[num_contexts:batch_size],
-            attn_metadata.kv_block_ids_per_seq[:num_contexts]
-        ])
-        attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
-            reorder_block_ids_per_seq, non_blocking=True)
+        attn_metadata.block_ids_per_seq[:batch_size].copy_(
+            attn_metadata.kv_block_ids_per_seq[:batch_size], non_blocking=True)
 
     @torch.compile(options={"max-autotune": True})
     def _topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,

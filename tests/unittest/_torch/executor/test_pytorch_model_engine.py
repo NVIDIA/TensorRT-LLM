@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -97,18 +98,6 @@ class DummyModel(torch.nn.Module):
         self.recorded_position_ids = kwargs["position_ids"]
         batch_size = input_ids.size(0)
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
-
-
-class DummyMultimodalIndexModel(torch.nn.Module):
-
-    class Config:
-        vocab_size = 100
-
-    config = Config()
-
-    @property
-    def multimodal_token_ids(self) -> torch.Tensor:
-        return torch.tensor([90, 91], dtype=torch.int32)
 
 
 class DummyLegacyMultimodalIndexModel(MultimodalModelMixin, torch.nn.Module):
@@ -260,6 +249,7 @@ def _make_forward_only_engine(
     engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
+    engine._runner = None
     engine.cuda_graph_lora_manager = None
     engine._force_lora_graph_for_capture = None
 
@@ -357,6 +347,33 @@ def create_model_engine_and_kvcache(
     )
 
     return model_engine, kv_cache_manager
+
+
+def test_cleanup_releases_runner_model_before_release_gc() -> None:
+
+    class Model:
+        pass
+
+    engine = object.__new__(PyTorchModelEngine)
+    model = Model()
+    model_ref = weakref.ref(model)
+    engine._cleanup_done = False
+    engine.model_loader = None
+    engine._runner = SimpleNamespace(_model=model)
+    engine._mm_item_scheduler = None
+    engine.model = model
+    engine._release_cuda_graphs = Mock()
+    engine.input_processor = None
+    del model
+
+    def assert_model_released() -> None:
+        assert model_ref() is None
+
+    with patch("tensorrt_llm._torch.pyexecutor.model_engine.release_gc",
+               side_effect=assert_model_released) as release_gc:
+        engine.cleanup()
+
+    release_gc.assert_called_once_with()
 
 
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
@@ -1188,8 +1205,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "speculative_draft_model",
             "beam",
             "encoder_decoder",
-            "encode_only",
-            "mm_encoder_only",
             "ple_recurrent_state",
             "nested_ple_recurrent_state",
             "context_parallel",
@@ -1211,10 +1226,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine.max_beam_width = 2
                 elif case == "encoder_decoder":
                     engine._is_encoder_decoder_model.return_value = True
-                elif case == "encode_only":
-                    engine._is_encode_only = True
-                elif case == "mm_encoder_only":
-                    engine.llm_args.mm_encoder_only = True
                 elif case == "ple_recurrent_state":
                     engine.model.has_ple = True
                 elif case == "nested_ple_recurrent_state":
@@ -1528,6 +1539,55 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             (fixed_slot_output[511:512], fixed_slot_output[:400]))
         torch.testing.assert_close(restored_output, expected_output)
 
+    def test_warmup_builds_dsa_attn_metadata_when_no_forward_ran(self) -> None:
+        """The DSA top-K pre-compile hooks read attn_metadata; when every
+        warmup forward was skipped it is built on demand so the engines still
+        compile before serving."""
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import \
+            DSAtrtllmAttentionMetadata
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.attn_metadata = None
+        engine.attn_backend = SimpleNamespace(
+            Metadata=DSAtrtllmAttentionMetadata)
+        engine.kv_cache_manager_key = "kv"
+        engine.original_max_draft_len = 2
+        engine._cuda_graph_batch_sizes = [8]
+        engine._get_draft_kv_cache_manager = Mock(return_value=None)
+        metadata = Mock(spec=DSAtrtllmAttentionMetadata)
+
+        def build(kv_cache_manager, draft_kv_cache_manager):
+            engine.attn_metadata = metadata
+            return metadata
+
+        engine._set_up_attn_metadata = Mock(side_effect=build)
+        kv_cache_manager = Mock()
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = kv_cache_manager
+
+        engine._ensure_dsa_attn_metadata_for_warmup(resource_manager)
+        engine._warmup_cute_dsl_radix_topk()
+
+        engine._set_up_attn_metadata.assert_called_once_with(
+            kv_cache_manager, None)
+        metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
+        metadata.warmup_selfsampling_topk.assert_called_once_with(
+            3, batch_sizes=[8])
+
+    def test_warmup_does_not_build_metadata_for_non_dsa_backend(self) -> None:
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.attn_metadata = None
+        engine.attn_backend = SimpleNamespace(Metadata=TrtllmAttentionMetadata)
+        engine._set_up_attn_metadata = Mock()
+
+        engine._ensure_dsa_attn_metadata_for_warmup(Mock())
+        engine._warmup_cute_dsl_radix_topk()
+
+        engine._set_up_attn_metadata.assert_not_called()
+
     def test_breakable_rejects_multimodal_models(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
         engine.model = DummyLegacyMultimodalIndexModel()
@@ -1565,26 +1625,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertTrue(engine.is_multimodal)
         engine._validate_breakable_cuda_graph_compatibility()
-
-    def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
-
-    def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:

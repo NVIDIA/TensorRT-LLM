@@ -754,9 +754,19 @@ class Indexer(nn.Module):
                 if self.use_cute_dsl_topk
                 else TopKImplementation.CUDA_RADIX
             )
+        # Prefill uses the self-sampling engine on exactly the layers where the
+        # decode dispatch picks it; the temporal-hint engine has no prefill form.
+        prefill_top_k_implementation = (
+            TopKImplementation.CUTE_DSL_GVR
+            if (
+                decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
+                and self._use_self_sampling_topk
+            )
+            else TopKImplementation.CUDA_RADIX
+        )
         self.top_k = TopK(
             self.index_topk,
-            prefill_implementation=TopKImplementation.CUDA_RADIX,
+            prefill_implementation=prefill_top_k_implementation,
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
             gvr_self_sampling=self._use_self_sampling_topk,
@@ -1871,6 +1881,8 @@ class Indexer(nn.Module):
                 if gvr_prior_indices is not None
                 else None
             )
+            assert metadata.radix_aux_indices is not None
+            assert metadata.radix_aux_logits is not None
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
@@ -1880,6 +1892,8 @@ class Indexer(nn.Module):
                 next_n=next_n,
                 max_seq_len=indexer_max_seq_len,
                 gvr_ext_kwargs=gvr_ext_kwargs,
+                radix_aux_indices=metadata.radix_aux_indices,
+                radix_aux_logits=metadata.radix_aux_logits,
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:

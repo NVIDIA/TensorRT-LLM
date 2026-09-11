@@ -73,7 +73,7 @@ ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
 
-MODEL_EXPRESS_VERSION = "0.4.1"
+MODEL_EXPRESS_VERSION = "0.5.1"
 MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
 MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
@@ -1623,6 +1623,8 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
+    extraInternalEnv += " TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1"
     // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
     // that repeated tactic profiling is reused across testcases within one stage.
     // /tmp lives on the container overlay (srun --no-container-mount-home / fresh
@@ -2106,7 +2108,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'BUILD_URL',
                     'JOB_NAME',
                     'globalVars',
-                    'gitlabCommit'
+                    'gitlabCommit',
+                    'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
                 ]
                 def envVarsToExport = [:]
                 envVarNames.each { varName ->
@@ -3740,7 +3743,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - name: TRTLLM_MX_E2E_REQUIRED
                       value: "1"
         """
-        // Mirrors the ModelExpress v0.4.1 Redis deployment and image contract.
+        // Mirrors the ModelExpress Redis deployment and image contract.
         // The image exposes /app/modelexpress-server and accepts the port/backend settings below.
         // Use regular containers because the Jenkins Kubernetes launcher does not
         // reliably attach to pods containing restartable init-container sidecars.
@@ -5025,7 +5028,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             } else {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: """
@@ -5040,7 +5042,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             if (stageName.contains("-ModelExpress-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
-                // ModelExpress 0.4.1 imports nixl._api, while requirements-dev.txt
+                // ModelExpress imports nixl._api, while requirements-dev.txt
                 // installs only the nixl-cu13 backend. Install the matching
                 // namespace shim without pulling the unused CUDA 12 backend.
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")
