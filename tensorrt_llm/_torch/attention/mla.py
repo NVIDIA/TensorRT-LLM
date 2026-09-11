@@ -177,16 +177,15 @@ def _cute_dsl_fp8_bmm_out(
     mat2_scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    """FP8 block-scaled BMM through the CuTe DSL op for the current SM."""
-    sm_version = get_sm_version()
-    if sm_version == 107:
+    """FP8 block-scaled BMM through the CuTe DSL op for the current SM.
+
+    Callers gate on SM before reaching here; on every SM other than 107 this
+    matches main's unconditional cute_dsl_fp8_bmm_blackwell call exactly.
+    """
+    if get_sm_version() == 107:
         torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
-    elif sm_version in (100, 103):
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
     else:
-        raise NotImplementedError(
-            f"CuTe DSL FP8 block-scaled BMM is not available on SM{sm_version}"
-        )
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
 
 
 def fp8_block_scaling_bmm_out(
