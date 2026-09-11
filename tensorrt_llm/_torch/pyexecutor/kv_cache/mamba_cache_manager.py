@@ -979,8 +979,10 @@ class PythonMambaCacheManager(BaseResourceManager):
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(
                 torch.as_tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask.copy_(self._dummy_request_mask_host,
-                                       non_blocking=True)
+        mask_staging = torch.empty_like(self._dummy_request_mask_host,
+                                        pin_memory=prefer_pinned())
+        mask_staging.copy_(self._dummy_request_mask_host)
+        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         layer_offset = self.mamba_layer_offsets[layer_idx]
@@ -1456,8 +1458,10 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(
                 torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask.copy_(self._dummy_request_mask_host,
-                                       non_blocking=True)
+        mask_staging = torch.empty_like(self._dummy_request_mask_host,
+                                        pin_memory=prefer_pinned())
+        mask_staging.copy_(self._dummy_request_mask_host)
+        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
@@ -2870,8 +2874,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 )
             self._host_state_indices[:n] = values
 
-        self.cuda_state_indices.copy_(self._host_state_indices,
-                                      non_blocking=True)
+        idx_staging = torch.empty_like(self._host_state_indices,
+                                       pin_memory=prefer_pinned())
+        idx_staging.copy_(self._host_state_indices)
+        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
 
@@ -4315,8 +4321,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"request {req.py_request_id}")
                 self._host_state_indices[i] = base_index
 
-        self.cuda_state_indices.copy_(self._host_state_indices,
-                                      non_blocking=True)
+        idx_staging = torch.empty_like(self._host_state_indices,
+                                       pin_memory=prefer_pinned())
+        idx_staging.copy_(self._host_state_indices)
+        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
