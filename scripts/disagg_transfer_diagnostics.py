@@ -508,22 +508,25 @@ def _derive_phase(
 
     Boundary = tuple[ClockDomain, tuple[object, ...], int]
 
-    def timed(boundaries: list[_ParsedEvent]) -> list[Boundary]:
+    def timed(boundaries: list[_ParsedEvent]) -> tuple[list[Boundary], int, int]:
         result = []
+        invalid_clock_count = 0
+        missing_correlation_count = 0
         for event in boundaries:
             domain = _clock_domain(event.record)
             timestamp = _monotonic_ns(event.record)
+            if domain is None or timestamp is None:
+                invalid_clock_count += 1
+                continue
             correlation = _correlation(event.record, phase.correlation_fields)
-            if (
-                domain is not None
-                and timestamp is not None
-                and all(value is not None for value in correlation)
-            ):
-                result.append((domain, correlation, timestamp))
-        return result
+            if any(value is None for value in correlation):
+                missing_correlation_count += 1
+                continue
+            result.append((domain, correlation, timestamp))
+        return result, invalid_clock_count, missing_correlation_count
 
-    timed_starts = timed(starts)
-    timed_ends = timed(ends)
+    timed_starts, invalid_clock_starts, missing_correlation_starts = timed(starts)
+    timed_ends, invalid_clock_ends, missing_correlation_ends = timed(ends)
     grouped_starts: dict[tuple[ClockDomain, tuple[object, ...]], list[int]] = defaultdict(list)
     grouped_ends: dict[tuple[ClockDomain, tuple[object, ...]], list[int]] = defaultdict(list)
     for domain, correlation, timestamp in timed_starts:
@@ -604,15 +607,23 @@ def _derive_phase(
                     gap["correlation"] = dict(zip(phase.correlation_fields, correlation))
                 unmeasured.append(gap)
 
-    if len(timed_starts) != len(starts) or len(timed_ends) != len(ends):
-        unmeasured.append(
-            {
-                "phase": phase.name,
-                "reason": "invalid_clock_metadata",
-                "start_count": len(starts) - len(timed_starts),
-                "end_count": len(ends) - len(timed_ends),
-            }
-        )
+    for reason, start_count, end_count in (
+        ("invalid_clock_metadata", invalid_clock_starts, invalid_clock_ends),
+        (
+            "missing_correlation_fields",
+            missing_correlation_starts,
+            missing_correlation_ends,
+        ),
+    ):
+        if start_count or end_count:
+            unmeasured.append(
+                {
+                    "phase": phase.name,
+                    "reason": reason,
+                    "start_count": start_count,
+                    "end_count": end_count,
+                }
+            )
     if durations:
         return durations, unmeasured
     start_domains = {start[0] for start in timed_starts}

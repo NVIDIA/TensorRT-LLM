@@ -210,24 +210,34 @@ def test_invalid_known_field_is_quarantined(field: str, value: object) -> None:
 def test_missing_fanout_correlation_is_unmeasured() -> None:
     result = analyze_lines(
         [
-            _event("ctx_transfer_queued", 6, 1, side="ctx"),
-            _event("ctx_worker_dequeued", 6, 2, side="ctx"),
+            _event("ctx_transfer_queued", 6, 1, side="ctx", slice_id=0),
+            _event("ctx_worker_dequeued", 6, 2, side="ctx", slice_id=0),
         ]
     )
 
     request = _request(result, 6)
     assert all(duration["phase"] != "ctx_worker_queue_wait" for duration in request["durations"])
-    assert any(
-        phase["phase"] == "ctx_worker_queue_wait" and phase["reason"] == "invalid_clock_metadata"
-        for phase in request["unmeasured_phases"]
-    )
+    assert {
+        "phase": "ctx_worker_queue_wait",
+        "reason": "missing_correlation_fields",
+        "start_count": 1,
+        "end_count": 1,
+    } in request["unmeasured_phases"]
 
 
 def test_single_pair_invalid_metadata_is_reported_once() -> None:
     result = analyze_lines(
         [
-            _event("gen_request_data_sent", 8, 1),
-            _event("gen_writer_result_received", 8, 2, outcome="success"),
+            _event("gen_request_data_sent", 8, 1, host="", slice_id=0, peer_rank=1),
+            _event(
+                "gen_writer_result_received",
+                8,
+                2,
+                host="",
+                outcome="success",
+                slice_id=0,
+                peer_rank=1,
+            ),
         ]
     )
 
