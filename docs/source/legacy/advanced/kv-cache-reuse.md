@@ -10,9 +10,11 @@ There are two steps to enabling kv cache reuse.
 
 1. Model must support it
 
-KV cache reuse requires the model to be built for paged context attention. This is done with `trtllm-build`:
+KV cache reuse requires the model to be built for paged context attention. This is done by enabling the flag `use_paged_context_fmha` when running `trtllm-build`:
 
-```trtllm-build --use_paged_context_fmha enable```
+```trtllm-build --use_paged_context_fmha enable ...```
+
+Note that this is just a snippet, you enable this flag in addition to all the other arguments you would provide for your specific situation.
 
 2. KV cache reuse is enabled by default in KVCacheManager
 
