@@ -128,6 +128,16 @@ def _locality_domain_forkjoin_enabled(kv_cache_manager) -> bool:
     return getattr(kv_cache_manager, "fork_join_attn", False)
 
 
+def sort_generation_requests_by_locality_domain(
+        requests: List[LlmRequest]) -> List[LlmRequest]:
+    """Group by locality domain, keeping CUDA graph padding dummies at the tail
+    so ``pad_batch``'s ``generation_requests[:-padding_size]`` trims only them.
+    """
+    return sorted(requests,
+                  key=lambda r:
+                  (r.is_cuda_graph_dummy, r.py_locality_domain_id))
+
+
 def _get_context_prompt_lookahead_token(request: LlmRequest,
                                         chunk_end: int) -> int:
     """Prompt token immediately following a context chunk. Uses the live C++
@@ -5674,10 +5684,8 @@ class PyTorchModelEngine(ModelEngine):
         _all_gen_reqs = list(scheduled_requests.generation_requests)
         _gen_dispatch_locality_domain: dict[int, int] = {}
         if _locality_domain_reorder and _all_gen_reqs:
-            _all_gen_perm = sorted(
-                range(len(_all_gen_reqs)),
-                key=lambda i: _all_gen_reqs[i].py_locality_domain_id)
-            _all_gen_reqs = [_all_gen_reqs[i] for i in _all_gen_perm]
+            _all_gen_reqs = sort_generation_requests_by_locality_domain(
+                _all_gen_reqs)
             scheduled_requests.generation_requests = _all_gen_reqs
             if scheduled_requests.num_context_requests == 0:
                 num_locality_domains_local = kv_cache_manager.num_locality_domains
