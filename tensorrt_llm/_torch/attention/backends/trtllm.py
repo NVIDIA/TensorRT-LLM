@@ -44,10 +44,10 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
-                        log_attention_failure_context,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
+from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 

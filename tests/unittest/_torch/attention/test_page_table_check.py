@@ -21,10 +21,7 @@ no attention backend are involved.
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.attention.backends.page_table_check import (
-    PLACEHOLDER_PAGE_INDEX,
-    check_page_table,
-)
+from tensorrt_llm._torch.attention.backends.utils import PLACEHOLDER_PAGE_INDEX, check_page_table
 
 PAGE_SIZE = 4
 
