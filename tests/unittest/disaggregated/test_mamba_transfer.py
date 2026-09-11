@@ -33,7 +33,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native import peer as native_peer
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -333,6 +333,7 @@ def test_mamba_receiver_payload_bytes_matched_tp():
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=conv_slot_bytes,
+            section_bytes=[512, 256, 256],
         ),
         PoolView(
             pool_idx=1,
@@ -342,6 +343,7 @@ def test_mamba_receiver_payload_bytes_matched_tp():
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_slot_bytes,
+            bytes_per_head=64,
         ),
         PoolView(
             pool_idx=2,
@@ -360,8 +362,6 @@ def test_mamba_receiver_payload_bytes_matched_tp():
         pool_group_idx=1,
         local_layers=local_layers,
         pool_views=pool_views,
-        conv_section_bytes=[512, 256, 256],
-        ssm_bytes_per_head=64,
     )
     pt = KVCachePageTable(
         tokens_per_block=8,
@@ -431,6 +431,7 @@ def _make_side_state_page_table(*, include_side: bool = True):
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=16,
+            section_bytes=[4, 4, 8],
         ),
         PoolView(
             pool_idx=1,
@@ -438,6 +439,7 @@ def _make_side_state_page_table(*, include_side: bool = True):
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=16,
+            bytes_per_head=16,
         ),
     ]
     if include_side:
@@ -458,8 +460,6 @@ def _make_side_state_page_table(*, include_side: bool = True):
                 pool_group_idx=0,
                 local_layers=local_layers,
                 pool_views=views,
-                conv_section_bytes=[4, 4, 8],
-                ssm_bytes_per_head=16,
             )
         ],
         pool_groups=[PhysicalPoolGroup(pools=pools)],
@@ -468,27 +468,46 @@ def _make_side_state_page_table(*, include_side: bool = True):
 
 def test_mamba_policy_rejects_incompatible_replicated_side_state():
     rank_info = _make_rank_info(tp_size=1)
+    pt_with_side = _make_side_state_page_table()
+    pt_without_side = _make_side_state_page_table(include_side=False)
 
+    # Replicated recurrent state is validated by MambaPolicy; the attention
+    # policy only looks at PAGED groups and must not reject this pair.
     with pytest.raises(ValueError, match="differ on overlapping layers"):
-        native_peer.ReplicatedPolicy.validate_peer_compatible(
-            _make_side_state_page_table(),
-            _make_side_state_page_table(include_side=False),
+        peer.MambaPolicy.validate_peer_compatible(
+            rank_info, rank_info, pt_with_side, pt_without_side
         )
+    AttentionPolicy.validate_peer_compatible(pt_with_side, pt_without_side)
 
-    # The state layer group selects the per-layer-pointer mapper.
-    state_lg = _make_side_state_page_table().layer_groups[0]
+    # Same roles but a different per-layer size is rejected up front.
+    pt_wider_side = _make_side_state_page_table()
+    side_view = pt_wider_side.layer_groups[0].pool_views[2]
+    side_view.buffer_entries = np.array([(1, 0, 16)], dtype=side_view.buffer_entries.dtype)
+    side_view.bytes_per_layer = 16
+    with pytest.raises(ValueError, match="replicated state size differs"):
+        peer.MambaPolicy.validate_peer_compatible(rank_info, rank_info, pt_with_side, pt_wider_side)
+
+    # REPLICATED state under the STATE life cycle uses the per-layer-pointer
+    # head-match mapper and requires equal per-layer sizes.
+    state_lg = pt_with_side.layer_groups[0]
+    common = dict(
+        peer_ri=rank_info,
+        mapper_kind=peer.MapperKind.REPLICATED,
+        self_layer_offsets=np.array([0], dtype=np.int64),
+        peer_layer_offsets=np.array([0], dtype=np.int64),
+        src_layer_off=0,
+        dst_layer_off=0,
+        self_lg=state_lg,
+        peer_lg=state_lg,
+    )
     with pytest.raises(ValueError, match="Replicated state size differs"):
-        native_peer.ReplicatedPolicy(rank_info).build_mapper(
-            peer_ri=rank_info,
-            mapper_kind=peer.MapperKind.REPLICATED,
-            self_layer_offsets=np.array([0], dtype=np.int64),
-            peer_layer_offsets=np.array([0], dtype=np.int64),
-            self_bytes_per_layer=8,
-            peer_bytes_per_layer=16,
-            src_layer_off=0,
-            dst_layer_off=0,
-            self_lg=state_lg,
+        peer.MambaPolicy(rank_info).build_mapper(
+            self_bytes_per_layer=8, peer_bytes_per_layer=16, **common
         )
+    mapper = peer.MambaPolicy(rank_info).build_mapper(
+        self_bytes_per_layer=8, peer_bytes_per_layer=8, **common
+    )
+    assert isinstance(mapper, peer.MambaHeadMatchMapper)
 
 
 # ---------------------------------------------------------------------------

@@ -20,9 +20,7 @@ import torch
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
-    _build_layer_group_for_v2_mamba,
     _build_mamba_pool_views,
-    _build_v2_mamba_state_pool,
     build_page_table,
     build_page_table_from_manager,
 )
@@ -531,6 +529,7 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
+        get_disagg_role_layouts=lambda: {},
     )
 
 
@@ -705,20 +704,22 @@ def test_mamba_layer_group_serialization():
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_slot_bytes,
+            bytes_per_head=128,
         ),
     ]
+    pool_views[0].section_bytes = [512, 256, 256]
     mlg = MambaLayerGroup(
         pool_group_idx=1,
         local_layers=local_layers,
         pool_views=pool_views,
-        conv_section_bytes=[512, 256, 256],
-        ssm_bytes_per_head=128,
     )
 
     d = mlg.to_dict()
-    assert d["conv_section_bytes"] == [512, 256, 256]
+    assert d["pool_views"][0]["section_bytes"] == [512, 256, 256]
+    assert d["pool_views"][1]["bytes_per_head"] == 128
     assert d["kind"] == int(CacheKind.STATE)
     assert "mamba_layer_offsets" not in d
+    assert "conv_section_bytes" not in d
 
     restored = LayerGroup.from_dict(d)
     assert isinstance(restored, MambaLayerGroup)
@@ -729,8 +730,10 @@ def test_mamba_layer_group_serialization():
     assert restored.pool_views[1].pool_role == MAMBA_SSM_ROLE
     assert restored.pool_views[1].bytes_per_layer == ssm_slot_bytes
     assert restored.pool_views[1].mapper_kind == MapperKind.INDEXED
-    assert restored.conv_section_bytes == [512, 256, 256]
-    assert restored.ssm_bytes_per_head == 128
+    assert restored.pool_views[0].section_bytes == [512, 256, 256]
+    assert restored.pool_views[0].bytes_per_head is None
+    assert restored.pool_views[1].bytes_per_head == 128
+    assert restored.pool_views[1].section_bytes is None
     assert [(ll.local_layer_id, ll.global_layer_id) for ll in restored.local_layers] == [
         (0, 10),
         (1, 11),
@@ -742,109 +745,191 @@ def test_mamba_layer_group_serialization():
     assert legacy_pool.layer_stride_bytes == legacy_pool.num_slots * legacy_pool.slot_bytes
 
 
-def test_v2_mamba_state_pool_uses_affine_layer_and_slot_strides():
-    num_slots = 3
-    state_bytes = 64
-    storage = torch.empty((num_slots, 4, state_bytes), dtype=torch.uint8)
-    states = [storage[:, 0, :], storage[:, 2, :]]
+def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
+    """Duck-typed MambaHybridCacheManagerV2 whose descriptors hold two life cycles.
 
-    pool = _build_v2_mamba_state_pool(states)
+    Life cycle 0 is recurrent (layers 0 and 1): SSM and conv state coalesce
+    into one 64-byte pool in ``[ssm, conv]`` order per layer, and PLE n-gram
+    context lives in a second, 32-byte pool on ``ple_on_layer`` only. Life
+    cycle 1 is attention (layer 2) with K/V in its own pool group.
+    """
+    from types import SimpleNamespace
 
-    assert pool.base_address == states[0].data_ptr()
-    assert pool.slot_bytes == state_bytes
-    assert pool.num_slots == num_slots
-    assert pool.slot_stride_bytes == 4 * state_bytes
-    assert pool.layer_stride_bytes == 2 * state_bytes
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 
+    def buf(layer_id, role):
+        return SimpleNamespace(layer_id=layer_id, role=role)
 
-def test_v2_mamba_state_pool_allows_interleaved_unrelated_roles():
-    state_bytes = 64
-    storage = torch.empty((3, 7, state_bytes), dtype=torch.uint8)
-    states = [storage[:, 0, :], storage[:, 3, :]]
-
-    pool = _build_v2_mamba_state_pool(states)
-
-    assert pool.slot_stride_bytes == 7 * state_bytes
-    assert pool.layer_stride_bytes == 3 * state_bytes
-
-
-def test_v2_mamba_layer_group_grafts_replicated_side_state():
-    """Side views built from the V2 descriptors address the right slot bytes."""
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        KVCachePageTable,
-        PhysicalPool,
-        PoolView,
+    recurrent_pg = SimpleNamespace(
+        pool_group_index=0,
+        num_slots=4,
+        pools=[
+            SimpleNamespace(pool_index=0, base_address=0x10000, slot_bytes=256),
+            SimpleNamespace(pool_index=1, base_address=0x20000, slot_bytes=32),
+        ],
+        slot_desc=SimpleNamespace(
+            variants=[
+                SimpleNamespace(
+                    layer_group_id=0,
+                    coalesced_buffers=[
+                        SimpleNamespace(
+                            single_buffer_size=64,
+                            buffer_ids=[
+                                buf(0, MambaRole.SSM_STATE),
+                                buf(0, MambaRole.CONV_STATE),
+                                buf(1, MambaRole.SSM_STATE),
+                                buf(1, MambaRole.CONV_STATE),
+                            ],
+                        ),
+                        SimpleNamespace(
+                            single_buffer_size=32,
+                            buffer_ids=[buf(ple_on_layer, MambaRole.PLE_NGRAM_CONTEXT)],
+                        ),
+                    ],
+                )
+            ]
+        ),
+    )
+    attention_pg = SimpleNamespace(
+        pool_group_index=1,
+        num_slots=8,
+        pools=[SimpleNamespace(pool_index=0, base_address=0x30000, slot_bytes=128)],
+        slot_desc=SimpleNamespace(
+            variants=[
+                SimpleNamespace(
+                    layer_group_id=1,
+                    coalesced_buffers=[
+                        SimpleNamespace(
+                            single_buffer_size=64,
+                            buffer_ids=[buf(2, Role.KEY), buf(2, Role.VALUE)],
+                        )
+                    ],
+                )
+            ]
+        ),
     )
 
-    num_slots = 3
-    conv_storage = torch.empty((num_slots, 4, 4, 3), dtype=torch.float32)
-    ssm_storage = torch.empty((num_slots, 4, 2, 4, 5), dtype=torch.float32)
-    # One coalesced V2 slot holding two 64-byte buffers; the side role is the
-    # second, so it starts 64 bytes into every slot.
-    side_storage = torch.empty((num_slots, 2, 64), dtype=torch.uint8)
     manager = object.__new__(MambaHybridCacheManagerV2)
-    manager.mamba_layer_offsets = {10: 0, 11: 1}
-    manager.all_conv_states = [conv_storage[:, 0], conv_storage[:, 2]]
-    manager.all_ssm_states = [ssm_storage[:, 0], ssm_storage[:, 2]]
-    manager.conv_state_shape = [4, 3]
-    manager.conv_section_dims = [1, 1, 2]
-    manager.ssm_state_shape = [2, 4, 5]
+    manager.impl = SimpleNamespace(
+        layer_grouping=((0, 1), (2,)),
+        init_config=SimpleNamespace(
+            tokens_per_block=16,
+            layers=[SimpleNamespace(window_size=None) for _ in range(3)],
+        ),
+        pool_group_descs=[recurrent_pg, attention_pg],
+    )
+    manager.pp_layers = [0, 1, 2]
+    manager._mamba_layer_mask = [True, True, False]
+    manager.local_num_mamba_layers = 2
+    manager.num_kv_heads_per_layer = [1, 1, 1]
+    # conv: [8, 4] fp16 = 64 bytes as sections [2, 2, 4] * 4 * 2 = [16, 16, 32]
+    manager.conv_state_shape = [8, 4]
+    manager.conv_state_dtype = torch.float16
+    manager.conv_section_dims = [2, 2, 4]
+    # ssm: [2 heads, 4, 4] fp16 = 64 bytes, 32 bytes per head
+    manager.ssm_state_shape = [2, 4, 4]
+    manager.ssm_state_dtype = torch.float16
+    return manager
 
-    side_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array([(1, 64, 64)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)}),
-            mapper_kind=MapperKind.REPLICATED,
-            bytes_per_layer=64,
-        )
+
+def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
+    """Conv, SSM and PLE views all come from pool_group_descs, geometry included."""
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        AttentionLayerGroup,
+        MambaLayerGroup,
+    )
+
+    manager = _make_fake_v2_mamba_manager()
+    page_table = build_page_table_from_manager(manager)
+
+    assert len(page_table.layer_groups) == 2
+    recurrent, attention = page_table.layer_groups
+    assert isinstance(recurrent, MambaLayerGroup)
+    assert isinstance(attention, AttentionLayerGroup)
+    # The recurrent group uses the shared descriptor pool group, not a
+    # dedicated tensor-derived one, and keeps V2 layer numbering.
+    assert recurrent.pool_group_idx == 0
+    assert recurrent.slot_major_layout
+    assert [(ll.local_layer_id, ll.global_layer_id) for ll in recurrent.local_layers] == [
+        (0, 0),
+        (1, 1),
     ]
-    side_pools = {
-        0: PhysicalPool(base_address=side_storage.data_ptr(), slot_bytes=128, num_slots=num_slots)
+    pools = page_table.pool_groups[recurrent.pool_group_idx].pools
+    assert (pools[0].base_address, pools[0].slot_bytes, pools[0].num_slots) == (0x10000, 256, 4)
+
+    by_role = {pv.pool_role: pv for pv in recurrent.pool_views}
+    assert set(by_role) == {
+        MAMBA_SSM_ROLE,
+        MAMBA_CONV_ROLE,
+        frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)}),
     }
 
-    layer_group, pool_group = _build_layer_group_for_v2_mamba(
-        manager, pool_group_idx=0, side_state=(side_views, side_pools)
+    ssm = by_role[MAMBA_SSM_ROLE]
+    assert ssm.pool_idx == 0
+    assert ssm.mapper_kind == MapperKind.INDEXED
+    assert ssm.bytes_per_layer == 64
+    assert ssm.bytes_per_head == 32
+    assert ssm.section_bytes is None
+    assert [tuple(int(x) for x in e) for e in ssm.buffer_entries] == [(0, 0, 64), (1, 128, 64)]
+
+    conv = by_role[MAMBA_CONV_ROLE]
+    assert conv.pool_idx == 0
+    assert conv.mapper_kind == MapperKind.SECTIONED
+    assert conv.bytes_per_layer == 64
+    assert conv.section_bytes == [16, 16, 32]
+    assert conv.bytes_per_head is None
+    assert [tuple(int(x) for x in e) for e in conv.buffer_entries] == [(0, 64, 64), (1, 192, 64)]
+
+    ple = by_role[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
+    assert ple.pool_idx == 1
+    assert ple.mapper_kind == MapperKind.REPLICATED
+    assert ple.bytes_per_layer == 32
+    assert [tuple(int(x) for x in e) for e in ple.buffer_entries] == [(1, 0, 32)]
+
+    # extract_slot addresses layer regions inside the descriptor slot.
+    # (Look views up by role: PoolView.__eq__ compares numpy entries.)
+    extractor = KVRegionExtractorV1(page_table)
+    view_index = {pv.pool_role: idx for idx, pv in enumerate(recurrent.pool_views)}
+    conv_idx = view_index[MAMBA_CONV_ROLE]
+    ple_idx = view_index[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
+    assert extractor.extract_slot(2, 0, conv_idx).memory.ptrs.tolist() == [
+        0x10000 + 2 * 256 + 64,
+        0x10000 + 2 * 256 + 192,
+    ]
+    assert extractor.extract_slot(3, 0, ple_idx).memory.ptrs.tolist() == [0x20000 + 3 * 32]
+
+    # Attention life cycle is untouched by the recurrent one.
+    assert attention.pool_group_idx == 1
+    assert [ll.global_layer_id for ll in attention.local_layers] == [2]
+
+
+def test_v2_builder_rejects_sectioned_view_in_attention_life_cycle():
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(pool_index=0, offset=0, size=64),
+        (0, Role.VALUE): SimpleNamespace(pool_index=0, offset=64, size=64),
+        (1, Role.KEY): SimpleNamespace(pool_index=0, offset=128, size=64),
+        (1, Role.VALUE): SimpleNamespace(pool_index=0, offset=192, size=64),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.INDEXED, Role.KEY: MapperKind.SECTIONED},
+        slot_bytes_list=(256,),
     )
-
-    side_view_idx = next(
-        index
-        for index, view in enumerate(layer_group.pool_views)
-        if view.pool_role == frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})
-    )
-    # The graft must renumber pool_idx past the conv and ssm pools.
-    assert layer_group.pool_views[side_view_idx].pool_idx == 2
-    assert pool_group.pools[2].base_address == side_storage.data_ptr()
-
-    page_table = KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[layer_group],
-        pool_groups=[pool_group],
-    )
-    extracted = KVRegionExtractorV1(page_table).extract_slot(
-        slot_id=2, layer_group_id=0, pool_idx=side_view_idx
-    )
-    assert extracted.memory.ptrs.tolist() == [side_storage[2, 1].data_ptr()]
+    with pytest.raises(ValueError, match="no mapper for SECTIONED"):
+        build_page_table_from_manager(manager)
 
 
-def test_v2_mamba_single_layer_pool_preserves_shared_role_footprint():
-    state_bytes = 64
-    storage = torch.empty((3, 2, state_bytes), dtype=torch.uint8)
-
-    pool = _build_v2_mamba_state_pool([storage[:, 1, :]])
-
-    assert pool.slot_bytes == state_bytes
-    assert pool.slot_stride_bytes == 2 * state_bytes
-    assert pool.layer_stride_bytes == 2 * state_bytes
-
-
-def test_v2_mamba_state_pool_rejects_non_affine_layer_offsets():
-    storage = torch.empty((3, 6, 64), dtype=torch.uint8)
-    states = [storage[:, 0, :], storage[:, 2, :], storage[:, 5, :]]
-
-    with pytest.raises(ValueError, match="uniform layer stride"):
-        _build_v2_mamba_state_pool(states)
+def test_v2_builder_rejects_section_bytes_that_do_not_cover_the_layer():
+    manager = _make_fake_v2_mamba_manager()
+    manager.conv_section_dims = [2, 2, 2]  # 48 bytes, but the conv buffer is 64
+    with pytest.raises(ValueError, match="do not sum to bytes_per_layer"):
+        build_page_table_from_manager(manager)
 
 
 def test_v2_mamba_registration_uses_coalesced_physical_pool():
@@ -931,7 +1016,11 @@ def test_legacy_mamba_pool_views_address_layers_past_four_gib() -> None:
         LocalLayer(local_layer_id=lid, global_layer_id=10 + lid) for lid in range(num_layers)
     ]
 
-    conv_view, _ = _build_mamba_pool_views(conv_pool, ssm_pool, local_layers)
+    conv_view, ssm_view = _build_mamba_pool_views(
+        conv_pool, ssm_pool, local_layers, conv_section_bytes=[1 << 18] * 4, ssm_bytes_per_head=4096
+    )
+    assert conv_view.section_bytes == [1 << 18] * 4
+    assert ssm_view.bytes_per_head == 4096
 
     assert [int(entry["offset"]) for entry in conv_view.buffer_entries] == [
         lid * num_slots * slot_bytes for lid in range(num_layers)
@@ -1057,6 +1146,7 @@ def test_mixed_page_table_serialization():
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=1024,
+            section_bytes=[256, 128, 128],
         ),
         PoolView(
             pool_idx=1,
@@ -1066,14 +1156,13 @@ def test_mixed_page_table_serialization():
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=2048,
+            bytes_per_head=64,
         ),
     ]
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
         local_layers=mamba_local_layers,
         pool_views=mamba_pool_views,
-        conv_section_bytes=[256, 128, 128],
-        ssm_bytes_per_head=64,
     )
 
     page_table = KVCachePageTable(

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from collections.abc import Sequence
+from typing import Optional
 
 import numpy as np
 
@@ -25,7 +26,8 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -481,8 +483,16 @@ class AttentionPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
-    def should_send(self, peer_overlap, peer_rank_info) -> bool:
-        """Attention uses head-duplication routing."""
+    def should_send(
+        self, peer_overlap, peer_rank_info, *, mapper_kind: Optional[MapperKind] = None
+    ) -> "bool | None":
+        """Attention uses head-duplication routing.
+
+        REPLICATED views (index-key side caches) hold identical bytes on every
+        TP rank, so they return None to defer to fan-in election instead.
+        """
+        if mapper_kind == MapperKind.REPLICATED:
+            return None
         dup = peer_overlap.duplicate_head_factor
         if dup <= 1:
             return True
@@ -545,6 +555,24 @@ class AttentionPolicy:
             peer,
         )
         return False
+
+    @staticmethod
+    def validate_peer_compatible(
+        self_page_table: Optional[KVCachePageTable],
+        peer_page_table: Optional[KVCachePageTable],
+    ) -> None:
+        """Reject a peer whose PAGED groups declare different replicated roles.
+
+        Pool matching drops a view with no counterpart silently, so an
+        index-key side cache the peer never declares would leave the receiver
+        holding zeroed state instead of raising. Raises ``ValueError``.
+        """
+        differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
+        if differing:
+            raise ValueError(
+                "AttentionPolicy.validate_peer_compatible: replicated roles differ on "
+                f"overlapping layers: {differing}"
+            )
 
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention
@@ -628,6 +656,8 @@ class AttentionPolicy:
         peer_buffers_per_layer: int = 1,
         self_lg=None,
         peer_lg=None,
+        self_pv=None,
+        peer_pv=None,
     ) -> RegionMapperBase:
         """Pick the mapper for one view pair.
 
@@ -636,6 +666,8 @@ class AttentionPolicy:
         (other role classes may interleave between this class's layers).
         The kind only decides the two irreducible semantic differences:
 
+        - REPLICATED skips head matching entirely (bytes are identical on
+          every TP rank; fan-in ownership is decided by ``should_send``).
         - Under head mismatch, HND (INDEXED) slices one contiguous head
           range per K/V buffer, while NHD must slice inside every token.
 
@@ -643,6 +675,14 @@ class AttentionPolicy:
         whose run merging degrades to a single whole-region copy per block
         when the selected layers are contiguous on both sides.
         """
+        if mapper_kind == MapperKind.REPLICATED:
+            return ReplicatedMapper(
+                self_layer_offsets,
+                peer_layer_offsets,
+                self_bytes_per_layer,
+                peer_bytes_per_layer,
+            )
+
         head_match, _ = self.head_match(peer_ri)
         if head_match:
             return IntactMapper(
