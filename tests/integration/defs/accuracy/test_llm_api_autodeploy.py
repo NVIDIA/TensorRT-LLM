@@ -841,53 +841,6 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
-class TestMiniMaxM2(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for MiniMax M2.
-
-    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
-    """
-
-    MODEL_NAME = "MiniMaxAI/MiniMax-M2"
-    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
-    # Set minimum possible seq len + small buffer, for test speed & memory usage
-    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
-
-    def get_default_kwargs(self):
-        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
-        return {
-            "yaml_extra": yaml_paths,
-            "skip_tokenizer_init": False,
-            "trust_remote_code": True,
-            "attn_backend": "trtllm",
-            "compile_backend": "torch-cudagraph",
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.7,
-                "enable_block_reuse": False,
-            },
-            "max_batch_size": 64,
-            "max_seq_len": self.MAX_SEQ_LEN,
-            "max_num_tokens": self.MAX_SEQ_LEN,
-            "enable_chunked_prefill": True,
-            "cuda_graph_config": {
-                "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64]
-            },
-        }
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device(4)
-    def test_finegrained_fp8(self):
-        kwargs = self.get_default_kwargs()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
-                           world_size=4,
-                           **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestKimiK2_5(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for Kimi-K2.5 (moonshotai/Kimi-K2.5) via AutoDeploy.
 

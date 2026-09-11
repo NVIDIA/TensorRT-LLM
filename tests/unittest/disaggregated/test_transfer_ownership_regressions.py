@@ -1475,10 +1475,9 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
         end_transfer=end_transfer,
     )
     executor.active_requests = [request]
-    executor._disagg_timed_out_ctx_cancelled_ids = set()
     executor._check_cache_transfer_errors = Mock()
 
-    PyExecutor._check_disagg_ctx_cache_transfer_status(executor)
+    executor.disagg.reap_context_sends(0)
 
     assert transfers == {}
     end_transfer.assert_called_once_with(request)
@@ -1537,7 +1536,7 @@ def test_bridge_rejection_releases_only_without_physical_owner(
     executor.active_requests = [request]
     executor.canceled_req_ids = []
 
-    PyExecutor._send_disagg_ctx_kv_async(executor, [request])
+    executor.disagg.send_completed_context([request])
 
     async_transfer_manager.start_transfer.assert_called_once_with(request)
     if releases_claim:

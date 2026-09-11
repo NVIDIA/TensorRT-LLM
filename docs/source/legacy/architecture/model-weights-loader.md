@@ -195,7 +195,7 @@ loader = ModelWeightsLoader(external_checkpoint_dir, llava_dict)
 loader.generate_tllm_weights(trtllm_model)
 ```
 Users need to specify the different part from the default `tllm_to_externel_key_dict`. The loader still have support across different precisions.
-The support for LLaVA and Exaone is in `LLaMAForCausalLM.from_hugging_face()` of [model.py](../../../tensorrt_llm/models/llama/model.py), and can also be taken as examples.
+The support for LLaVA and Exaone is in `LLaMAForCausalLM.from_hugging_face()` of [model.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tensorrt_llm/models/llama/model.py), and can also be taken as examples.
 
 ### Models with customized weight layout
 For models with different weight layout, users can write the conversion loop explicitly and do customized operations.
@@ -229,7 +229,7 @@ for tllm_key, _ in tqdm(trtllm_model.named_parameters()):
 loader.fill(tllm_weights)
 ```
 This will apply `preprocess` after `load_tensor()` and before `postprocess`, and demonstrates how to convert the loaded shard into default HF layout. The loader still have support for precisions quantized from FP16/BF16 (e.g. INT8-wo/INT4-wo), the other precisions may require special operations, and can be addressed inside the `preprocess` function.
-The support for Qwen-1 is in `QWenForCausalLM.from_hugging_face()` of [model.py](../../../tensorrt_llm/models/qwen/model.py), and can also be taken as example.
+The support for Qwen-1 is in `QWenForCausalLM.from_hugging_face()` of [model.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/tensorrt_llm/models/qwen/model.py), and can also be taken as example.
 
 ### Fully customized
 If the model weights loader cannot satisfy the requirements, users can write the conversion loop totally on their own.
