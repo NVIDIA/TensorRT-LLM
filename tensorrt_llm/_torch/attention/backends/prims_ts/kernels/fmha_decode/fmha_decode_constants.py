@@ -45,8 +45,12 @@ KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 # Keep the old maximum as the exponent reference while a new maximum is at
 # most eight log2 units larger. This avoids an output-correction round without
 # letting an intermediate probability exceed 2**8; the softmax identity is
-# unchanged apart from normal finite-precision rounding.
-KV_TILE_256_RESCALE_THRESHOLD_LOG2 = 8.0
+# unchanged apart from normal finite-precision rounding. As in the
+# FlashInfer/TRT-LLM policy, this assumes normal model logits rather than
+# adversarial values outside the qualified probability bound. Streamed KV256
+# and block-sparse Keeps profiles apply it; see
+# ``FmhaDecodeConfig.defers_softmax_anchor_updates``.
+SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
 
 # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
 # the resulting register hand-off has a fixed cost. Paired B200 measurements
