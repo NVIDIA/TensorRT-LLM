@@ -19,6 +19,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.logger import logger
 
 from .interfaces import ActiveRequestRegistry, ExecutorEffects
@@ -56,7 +57,6 @@ class DisaggLoopDelegates:
     """
 
     handle_errors_synced: Callable[[], None]
-    prepare_context_schedulable: Callable[[List[LlmRequest]], None]
     admit: Callable[[List[LlmRequest]], Tuple[List[LlmRequest], bool]]
     revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
     receive_gen_init: Callable[[List[LlmRequest]], None]
@@ -117,9 +117,23 @@ class DisaggTransferCoordinator:
         """Fail requests whose transfer errored; rank-synchronized."""
         self._d.handle_errors_synced()
 
+    @nvtx_range("prepare_context_schedulable")
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
-        """Let the transceiver gate generation-first context requests."""
-        self._d.prepare_context_schedulable(new_requests)
+        """Let the transceiver gate generation-first context requests.
+
+        Context-first context requests are schedulable at once; for
+        generation-first ones the transceiver decides when the peer is ready.
+        """
+        gen_first_ctx_requests = [
+            req
+            for req in new_requests
+            if req.is_context_only_request
+            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        ]
+        # Always call prepare_context_requests, with new requests or without,
+        # so the consensus inside it can promote requests whose peer info has
+        # arrived on every rank.
+        self._transceiver.prepare_context_requests(gen_first_ctx_requests)
 
     @nvtx_range("poll_gen_transfers")
     def poll_gen_transfers(self) -> None:
@@ -574,6 +588,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
         return fitting_gen_init, False
+
+    def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
+        return None
 
     def poll_gen_transfers(self) -> None:
         return None

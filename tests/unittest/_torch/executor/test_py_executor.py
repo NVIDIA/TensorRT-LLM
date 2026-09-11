@@ -1452,7 +1452,6 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     executor.is_shutdown = False
     executor._handle_control_request = Mock()
     executor.kv_cache_transceiver = Mock()
-    executor._check_disagg_ctx_schedulable_status = Mock()
     executor._pad_attention_dp_dummy_request = Mock()
     executor._pp_retry_until_can_schedule = Mock()
     executor._mm_encoder_item_scheduling_enabled = False
@@ -3270,7 +3269,6 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.waiting_queue = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prefetch_for_context_requests = Mock()
         ex._prepare_disagg_gen_init = Mock()

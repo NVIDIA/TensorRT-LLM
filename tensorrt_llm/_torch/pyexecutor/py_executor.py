@@ -3587,8 +3587,6 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             delegates=DisaggLoopDelegates(
                 handle_errors_synced=self._handle_disagg_cache_errors_synced,
-                prepare_context_schedulable=self.
-                _check_disagg_ctx_schedulable_status,
                 admit=self._apply_disagg_transfer_admission,
                 revert_deferred_gen_init=self.
                 _revert_deferred_disagg_gen_init_alloc,
@@ -6877,26 +6875,6 @@ class PyExecutor:
                 continue
             req.py_encoder_output = None
             req.py_skip_cross_kv_projection = True
-
-    @nvtx_range("_check_disagg_ctx_schedulable_status")
-    def _check_disagg_ctx_schedulable_status(self,
-                                             new_requests: List[LlmRequest]):
-        """
-        In context-first mode, context requests are schedulable immediately,
-        otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
-        """
-        if not self.kv_cache_transceiver:
-            return
-        gen_first_ctx_requests = [
-            req for req in new_requests
-            if req.is_context_only_request and req.py_disaggregated_params.
-            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        ]
-        # Always call prepare_context_requests when there are new requests
-        # or previously-waiting requests, so the tp_allgather consensus
-        # can promote requests whose peer info has arrived on all ranks.
-        self.kv_cache_transceiver.prepare_context_requests(
-            gen_first_ctx_requests)
 
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.

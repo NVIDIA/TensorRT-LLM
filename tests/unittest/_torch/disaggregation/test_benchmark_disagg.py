@@ -876,7 +876,6 @@ class TestPrepareAndScheduleBatchNoBlock:
 
         mock_fetch = Mock(return_value=[])
         ex._fetch_and_activate_new_requests = mock_fetch
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
@@ -1269,7 +1268,6 @@ class TestFailFastDuringBenchmarkFill:
         ex.active_requests = init_reqs + ready_reqs
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prepare_disagg_gen_init = Mock()
@@ -1541,7 +1539,6 @@ class TestFillPhaseEndToEnd:
         ex.active_requests = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prepare_disagg_gen_init = Mock()

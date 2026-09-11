@@ -10,11 +10,14 @@ then asks its executor to do. FakeDist checks the protocol only; blocking
 semantics of real collectives need multi-process coverage.
 """
 
+from types import SimpleNamespace
+
 import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
 from fake_dist import FakeDistGroup
 
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
 pytestmark = pytest.mark.cpu_only
 
@@ -206,3 +209,49 @@ def test_sync_idle_poll_is_skipped_by_every_rank_of_a_multi_rank_worker(monkeypa
     group.run(lambda rank: ranks[rank].coordinator.poll_progress_when_idle())
 
     assert [h.transceiver.call_log for h in ranks] == logs
+
+
+# -- generation-first context gate -------------------------------------------
+
+
+def _ctx_request(rid: int, schedule_style: DisaggScheduleStyle) -> TransferRequest:
+    return TransferRequest(
+        rid, py_disaggregated_params=SimpleNamespace(schedule_style=schedule_style)
+    )
+
+
+def test_context_gate_is_entered_even_without_new_requests() -> None:
+    """The transceiver runs a consensus inside prepare_context_requests, so it
+    is entered every iteration; skipping it on an empty list would leave a
+    waiting request unpromoted on the ranks whose peer info arrived late."""
+    h = CoordinatorHarness()
+
+    h.coordinator.prepare_context_schedulable([])
+
+    assert h.transceiver.call_log == ["prepare_context_requests:[]"]
+
+
+def test_context_gate_receives_only_generation_first_context_requests() -> None:
+    """Disaggregated params are read for context-only requests only."""
+    h = CoordinatorHarness()
+    gen_first = _ctx_request(1, DisaggScheduleStyle.GENERATION_FIRST)
+    ctx_first = _ctx_request(2, DisaggScheduleStyle.CONTEXT_FIRST)
+    gen_only = TransferRequest(3, is_context_only_request=False)
+
+    h.coordinator.prepare_context_schedulable([ctx_first, gen_first, gen_only])
+
+    assert h.transceiver.call_log == ["prepare_context_requests:[1]"]
+
+
+def test_context_gate_is_entered_once_per_rank_whatever_arrived_locally() -> None:
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _ranks(group)
+    arrivals = [[], [_ctx_request(1, DisaggScheduleStyle.GENERATION_FIRST)]]
+
+    group.run(lambda rank: ranks[rank].coordinator.prepare_context_schedulable(arrivals[rank]))
+
+    assert [h.transceiver.call_log for h in ranks] == [
+        ["prepare_context_requests:[]"],
+        ["prepare_context_requests:[1]"],
+    ]
+    assert [h.dist.calls for h in ranks] == [[], []]
