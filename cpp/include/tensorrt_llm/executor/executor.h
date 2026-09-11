@@ -631,7 +631,6 @@ public:
     /// convolution down-sampling, etc.)
     /// @param eagleConfig The EAGLE speculative decoding configuration
     /// @param guidedDecodingParams The guided decoding parameters.
-    /// @param languageAdapterUid Task Uid for language adapter.
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
@@ -657,7 +656,6 @@ public:
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt);
 
@@ -693,7 +691,6 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const;
     [[nodiscard]] RequestType getRequestType() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
-    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<std::string> getCacheSalt() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
@@ -722,7 +719,6 @@ public:
     void setEncoderInputFeatures(Tensor encoderInputFeatures);
     void setEncoderOutputLength(SizeType32 encoderOutputLength);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
-    void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setCacheSalt(std::optional<std::string> cacheSalt);
     void setDisaggRequestId(IdType disaggRequestId);

@@ -57,9 +57,8 @@ public:
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
         PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
-        std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-        std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<MillisecondsType> allottedTimeMs,
+        std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -85,7 +84,6 @@ public:
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
-        , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(validateCacheSalt(std::move(cacheSalt)))
         , mDisaggRequestId(disaggRequestId)
@@ -246,11 +244,6 @@ public:
         return mGuidedDecodingParams;
     }
 
-    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const
-    {
-        return mLanguageAdapterUid;
-    }
-
     [[nodiscard]] std::optional<std::string> getCacheSalt() const
     {
         return mCacheSalt;
@@ -381,11 +374,6 @@ public:
         mAllottedTimeMs = allottedTimeMs;
     }
 
-    void setLanguageAdapterUid(SizeType32 languageAdapterUid)
-    {
-        mLanguageAdapterUid = languageAdapterUid;
-    }
-
     void setCacheSalt(std::optional<std::string> cacheSalt)
     {
         mCacheSalt = validateCacheSalt(std::move(cacheSalt));
@@ -445,7 +433,6 @@ private:
         lambda(mEncoderInputFeatures);
         lambda(mEncoderOutputLength);
         lambda(mGuidedDecodingParams);
-        lambda(mLanguageAdapterUid);
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
         lambda(mDisaggRequestId);
         lambda(mCacheSalt);
@@ -476,7 +463,6 @@ private:
     std::optional<Tensor> mEncoderInputFeatures;
     std::optional<SizeType32> mEncoderOutputLength;
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
-    std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;
     std::optional<std::string> mCacheSalt;
     std::optional<IdType> mDisaggRequestId;

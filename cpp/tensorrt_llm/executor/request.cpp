@@ -35,16 +35,14 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
     float priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
     std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
-    std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-    std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
-    std::optional<std::string> cacheSalt)
+    std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<MillisecondsType> allottedTimeMs,
+    std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
         std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(encoderInputTokenIds), clientId,
         returnAllGeneratedTokens, priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures),
-        encoderOutputLength, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId,
-        std::move(cacheSalt)))
+        encoderOutputLength, std::move(guidedDecodingParams), allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
 }
 
@@ -203,11 +201,6 @@ std::optional<GuidedDecodingParams> Request::getGuidedDecodingParams() const
     return mImpl->getGuidedDecodingParams();
 }
 
-std::optional<SizeType32> Request::getLanguageAdapterUid() const
-{
-    return mImpl->getLanguageAdapterUid();
-}
-
 std::optional<std::string> Request::getCacheSalt() const
 {
     return mImpl->getCacheSalt();
@@ -336,11 +329,6 @@ void Request::setGuidedDecodingParams(GuidedDecodingParams const& guidedDecoding
 void Request::setAllottedTimeMs(MillisecondsType allottedTimeMs)
 {
     mImpl->setAllottedTimeMs(allottedTimeMs);
-}
-
-void Request::setLanguageAdapterUid(SizeType32 languageAdapterUid)
-{
-    mImpl->setLanguageAdapterUid(languageAdapterUid);
 }
 
 void Request::setCacheSalt(std::optional<std::string> cacheSalt)
