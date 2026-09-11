@@ -349,7 +349,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         from tensorrt_llm._torch.attention.backends.trtllm import \
             TrtllmAttention
         from tensorrt_llm._torch.attention.mla import MLA
-        from tensorrt_llm._torch.pyexecutor.config_utils import has_fp4_kv_cache
 
         # Inspect the actual worker's quantization, cache pools and FMHA choice.
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
@@ -368,7 +367,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             executor = llm._executor.engine
             quant_config = executor.model_engine.model.model_config.quant_config
             assert quant_config.quant_algo == QuantAlgo.NVFP4
-            assert has_fp4_kv_cache(quant_config)
+            assert quant_config.quant_mode.has_fp4_kv_cache()
             manager = executor.kv_cache_manager
             assert isinstance(manager, Fp4MlaKVCacheManagerV2)
             assert manager.get_mla_v_scale_pool().numel() > 0
