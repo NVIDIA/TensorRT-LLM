@@ -1334,6 +1334,24 @@ class GpuCacheLevelStorage(CacheLevelStorage):
         """Per-locality domain slot count (symmetric allocation: same for all locality domains)."""
         return typed_map(self._pool_groups, lambda pg: pg.num_slots(0))
 
+    @override
+    def compute_slot_count_list(
+        self,
+        ratio_list: TypedIndexList[PoolGroupIndex, float],
+        min_slots: TypedIndexList[PoolGroupIndex, int],
+        total_quota: int | None = None,
+    ) -> TypedIndexList[PoolGroupIndex, int]:
+        """Per-locality domain slot counts.
+
+        ``total_quota`` spans every locality domain, so divide the result the same
+        way ``__init__`` does; callers treat these counts as per-locality domain.
+        """
+        counts = super().compute_slot_count_list(ratio_list, min_slots, total_quota)
+        num_locality_domains = self.num_locality_domains
+        if num_locality_domains > 1:
+            counts = typed_map(counts, lambda c: max(1, c // num_locality_domains))
+        return counts
+
     # ------------------------------------------------------------------
     # Granularity, post_resize, destroy
     # ------------------------------------------------------------------
