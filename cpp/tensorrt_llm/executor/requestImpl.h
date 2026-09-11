@@ -59,7 +59,6 @@ public:
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
         PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
-        std::optional<Tensor> crossAttentionMask, std::optional<Tensor> skipCrossAttnBlocks,
         std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
         std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
         std::optional<std::string> cacheSalt = std::nullopt)
@@ -90,8 +89,6 @@ public:
         , mContextPhaseParams(std::move(contextPhaseParams))
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
-        , mCrossAttentionMask(std::move(crossAttentionMask))
-        , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
@@ -265,19 +262,9 @@ public:
         return mEncoderInputFeatures;
     }
 
-    [[nodiscard]] std::optional<Tensor> getCrossAttentionMask() const
-    {
-        return mCrossAttentionMask;
-    }
-
     [[nodiscard]] std::optional<SizeType32> getEncoderOutputLength() const
     {
         return mEncoderOutputLength;
-    }
-
-    [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const
-    {
-        return mSkipCrossAttnBlocks;
     }
 
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const
@@ -420,19 +407,9 @@ public:
         mEncoderInputFeatures = encoderInputFeatures;
     }
 
-    void setCrossAttentionMask(Tensor crossAttentionMask)
-    {
-        mCrossAttentionMask = crossAttentionMask;
-    }
-
     void setEncoderOutputLength(SizeType32 encoderOutputLength)
     {
         mEncoderOutputLength = encoderOutputLength;
-    }
-
-    void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
-    {
-        mSkipCrossAttnBlocks = skipCrossAttnBlocks;
     }
 
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams)
@@ -515,8 +492,6 @@ private:
         lambda(mContextPhaseParams);
         lambda(mEncoderInputFeatures);
         lambda(mEncoderOutputLength);
-        lambda(mCrossAttentionMask);
-        lambda(mSkipCrossAttnBlocks);
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
@@ -551,8 +526,6 @@ private:
     std::optional<ContextPhaseParams> mContextPhaseParams;
     std::optional<Tensor> mEncoderInputFeatures;
     std::optional<SizeType32> mEncoderOutputLength;
-    std::optional<Tensor> mCrossAttentionMask;
-    std::optional<Tensor> mSkipCrossAttnBlocks;
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;

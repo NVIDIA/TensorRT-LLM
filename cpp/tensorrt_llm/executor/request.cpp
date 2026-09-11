@@ -36,8 +36,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<LogitsPostProcessor> logitslogitsPostProcessor, std::optional<VecTokens> encoderInputTokenIds,
     std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
     std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
-    std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
-    std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
+    std::optional<SizeType32> encoderOutputLength, std::optional<GuidedDecodingParams> guidedDecodingParams,
     std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
     std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
@@ -46,8 +45,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
         std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
         priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        crossAttentionMask, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs,
-        disaggRequestId, std::move(cacheSalt)))
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
 }
 
@@ -216,16 +214,6 @@ std::optional<SizeType32> Request::getEncoderOutputLength() const
     return mImpl->getEncoderOutputLength();
 }
 
-std::optional<Tensor> Request::getCrossAttentionMask() const
-{
-    return mImpl->getCrossAttentionMask();
-}
-
-std::optional<Tensor> Request::getSkipCrossAttnBlocks() const
-{
-    return mImpl->getSkipCrossAttnBlocks();
-}
-
 std::optional<GuidedDecodingParams> Request::getGuidedDecodingParams() const
 {
     return mImpl->getGuidedDecodingParams();
@@ -369,16 +357,6 @@ void Request::setEncoderInputFeatures(Tensor encoderInputFeatures)
 void Request::setEncoderOutputLength(SizeType32 encoderOutputLength)
 {
     mImpl->setEncoderOutputLength(encoderOutputLength);
-}
-
-void Request::setCrossAttentionMask(Tensor crossAttentionMask)
-{
-    mImpl->setCrossAttentionMask(crossAttentionMask);
-}
-
-void Request::setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
-{
-    mImpl->setSkipCrossAttnBlocks(skipCrossAttnBlocks);
 }
 
 void Request::setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams)
