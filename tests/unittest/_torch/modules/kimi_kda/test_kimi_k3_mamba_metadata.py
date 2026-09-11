@@ -58,12 +58,22 @@ def test_k3_prepare_metadata_match_chunk_indices() -> None:
 
 def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
     class KdaCacheManager:
-        use_kda_replay_update = True
-
         def __init__(self) -> None:
-            self.state_indices = torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda")
+            self.state_indices = torch.tensor(
+                [9, 4, 7],
+                dtype=torch.int32,
+                device="cuda",
+            )
 
-        def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
+        def get_state_update_strategy(self) -> SimpleNamespace:
+            return SimpleNamespace(state_indices_alignment=16)
+
+        def get_state_indices(
+            self,
+            request_ids: list[int],
+            is_padding: list[bool],
+        ) -> torch.Tensor:
+            del is_padding
             return self.state_indices[: len(request_ids)]
 
     manager = KdaCacheManager()

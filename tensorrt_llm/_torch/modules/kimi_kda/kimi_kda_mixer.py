@@ -376,7 +376,11 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
         ssm_pool = layer_cache.temporal  # [slots, H, V, K] fp32
-        generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
+        generation_state_indices = getattr(
+            mamba_metadata,
+            "generation_state_indices",
+            None,
+        )
         if generation_state_indices is None:
             generation_state_indices = state_indices[num_prefills:]
 
@@ -448,7 +452,7 @@ class KimiKDALinearAttention(nn.Module):
 
     def _has_kda_replay_caches(self, layer_cache) -> bool:
         """True when the manager allocated the fused-verify replay caches."""
-        return layer_cache is not None and layer_cache.has_kda_replay_caches
+        return bool(getattr(layer_cache, "has_kda_replay_caches", False))
 
     def _sync_kda_replay_conv_window(self, layer_cache, slot_indices, conv_pool) -> None:
         """Seed replay conv caches from the live committed conv pool.

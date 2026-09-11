@@ -101,8 +101,11 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     captured: dict[str, torch.Tensor] = {}
 
     def forward_prefill(
-        hidden_states: torch.Tensor, *args: object, **kwargs: object
+        hidden_states: torch.Tensor,
+        *args: object,
+        **kwargs: object,
     ) -> torch.Tensor:
+        del args, kwargs
         return torch.zeros_like(hidden_states)
 
     def forward_verify(
@@ -114,6 +117,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         slot_indices: torch.Tensor,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del num_steps, layer_cache, conv_pool, ssm_pool, output
         captured["slot_indices"] = slot_indices
         return torch.zeros_like(hidden_states)
 
@@ -125,19 +129,34 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     )
 
     class KdaCacheManager:
-        use_kda_replay_update = True
-
         def __init__(self) -> None:
-            self.state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+            self.state_indices = torch.tensor(
+                [9, 4],
+                dtype=torch.int32,
+                device="cuda",
+            )
 
-        def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
+        def get_state_update_strategy(self) -> SimpleNamespace:
+            return SimpleNamespace(state_indices_alignment=16)
+
+        def get_state_indices(
+            self,
+            request_ids: list[int],
+            is_padding: list[bool],
+        ) -> torch.Tensor:
+            del is_padding
             return self.state_indices[: len(request_ids)]
 
         def mamba_layer_cache(self, layer_idx: int) -> SimpleNamespace:
+            del layer_idx
             return layer_cache
 
     manager = KdaCacheManager()
-    mamba_metadata = KimiK3MambaMetadata(max_batch_size=2, chunk_size=8, max_num_tokens=4)
+    mamba_metadata = KimiK3MambaMetadata(
+        max_batch_size=2,
+        chunk_size=8,
+        max_num_tokens=4,
+    )
     metadata = SimpleNamespace(
         num_contexts=1,
         num_ctx_tokens=1,
@@ -152,7 +171,12 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     )
     mamba_metadata.prepare(metadata)
     metadata.mamba_metadata = mamba_metadata
-    hidden_states = torch.empty(4, _Cfg.hidden_size, dtype=torch.bfloat16, device="cuda")
+    hidden_states = torch.empty(
+        4,
+        _Cfg.hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
     generation_slice = mamba_metadata.state_indices[1:]
     aligned_indices = mamba_metadata.generation_state_indices
 

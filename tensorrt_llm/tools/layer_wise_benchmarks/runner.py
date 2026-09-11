@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import inspect
@@ -959,18 +962,17 @@ class Runner:
                 full_mamba_layer_mask[i] and i in layer_indices
                 for i in range(text_config.num_hidden_layers)
             ]
-            kimi_extra_kwargs = {}
-            if spec_config is not None and issubclass(
-                kv_cache_manager_cls, MixedMambaHybridCacheManager
-            ):
-                # Multi-token verify reads per-slot replay caches when the fused
-                # kernel is available, else the legacy per-step buffers.
-                from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
-                    is_kda_mtp_verify_available,
-                )
+            from tensorrt_llm._torch.modules.kimi_kda.cache_manager import get_kda_replay_num_spec
 
-                if is_kda_mtp_verify_available():
-                    kimi_extra_kwargs["kda_replay_num_spec"] = spec_config.tokens_per_gen_step - 1
+            kimi_extra_kwargs = {}
+            kda_replay_num_spec = get_kda_replay_num_spec(
+                spec_config,
+                manager_supports_replay=issubclass(
+                    kv_cache_manager_cls, MixedMambaHybridCacheManager
+                ),
+            )
+            if kda_replay_num_spec is not None:
+                kimi_extra_kwargs["kda_replay_num_spec"] = kda_replay_num_spec
             kv_cache_manager = kv_cache_manager_cls(
                 # mamba (KDA) cache parameters
                 mamba_params.state_size,

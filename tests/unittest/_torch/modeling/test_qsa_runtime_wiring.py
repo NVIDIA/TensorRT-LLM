@@ -268,8 +268,11 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
     monkeypatch.setattr(
         _util, "extract_mamba_kv_cache_params", lambda *args, **kwargs: mamba_params
     )
-    monkeypatch.setattr(_util, "get_sm_version", lambda: 103)
-    monkeypatch.setattr(_util, "is_gdn_replay_enabled", lambda: False)
+    monkeypatch.setattr("tensorrt_llm._torch.modules.fla.cache_manager.get_sm_version", lambda: 103)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.cache_manager.is_gdn_replay_enabled",
+        lambda: False,
+    )
     monkeypatch.setattr(MambaHybridCacheManagerV2, "__init__", lambda self, *args, **kwargs: None)
 
     manager = _create_kv_cache_manager(
