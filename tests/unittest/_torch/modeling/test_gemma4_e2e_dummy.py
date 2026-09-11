@@ -48,7 +48,13 @@ _GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
 
 # Imported after the module-level skip guard so that collecting this module on
 # a machine without LLM_MODELS_ROOT does not pull in the runtime import.
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
+from tensorrt_llm.llmapi import (  # noqa: E402
+    LLM,
+    CudaGraphConfig,
+    KvCacheConfig,
+    SamplingParams,
+    SchedulingParams,
+)
 
 # These dummy models are tiny, but the default KV-cache fraction sizes the pool
 # to most of the (very large B200) device memory, leaving nothing for the other
@@ -58,11 +64,18 @@ _KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
 # Real model paths — used for tokenizer + base config
 MODEL_PATHS = {
+    "12B": os.path.join(_GEMMA4_MODELS, "gemma-4-12B-it"),
     "26B": os.path.join(_GEMMA4_MODELS, "gemma-4-26B-A4B-it"),
     "E2B": os.path.join(_GEMMA4_MODELS, "gemma-4-E2B-it"),
     "31B": os.path.join(_GEMMA4_MODELS, "gemma-4-31B-it"),
     "E4B": os.path.join(_GEMMA4_MODELS, "gemma-4-E4B-it"),
 }
+
+_FEATURE_TEST_MODELS = (
+    pytest.param("26B", 4, id="Gemma4ForConditionalGeneration"),
+    pytest.param("12B", 1, id="Gemma4UnifiedForConditionalGeneration"),
+)
+_ATTENTION_DP_SIZE = 4
 
 
 def _make_dummy_config_dir(
@@ -308,6 +321,61 @@ def test_e2e_text_e4b_dummy():
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
             assert len(output[0].outputs[0].token_ids) > 0
+    finally:
+        shutil.rmtree(dummy_dir, ignore_errors=True)
+
+
+@requires_gemma4_transformers
+@pytest.mark.parametrize("model_name,moe_expert_parallel_size", _FEATURE_TEST_MODELS)
+def test_e2e_cuda_graph_overlap_scheduler_attention_dp_dummy(
+    model_name: str,
+    moe_expert_parallel_size: int,
+) -> None:
+    """Exercise CUDA graphs and overlap scheduling on four Attention-DP ranks."""
+    dummy_dir = _make_dummy_config_dir(MODEL_PATHS[model_name])
+    try:
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            tensor_parallel_size=_ATTENTION_DP_SIZE,
+            moe_expert_parallel_size=moe_expert_parallel_size,
+            enable_attention_dp=True,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[1, _ATTENTION_DP_SIZE],
+                enable_padding=False,
+            ),
+            max_batch_size=_ATTENTION_DP_SIZE,
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
+        with llm:
+            assert llm.args.enable_attention_dp is True
+            assert llm.args.disable_overlap_scheduler is False
+            assert llm.args.cuda_graph_config is not None
+
+            prompts = [[2, 42, 43] for _ in range(_ATTENTION_DP_SIZE)]
+            scheduling_params = [
+                SchedulingParams(attention_dp_rank=rank, attention_dp_relax=False)
+                for rank in range(_ATTENTION_DP_SIZE)
+            ]
+            outputs = llm.generate(
+                prompts,
+                SamplingParams(max_tokens=4, temperature=0, end_id=-1),
+                scheduling_params=scheduling_params,
+                use_tqdm=False,
+            )
+
+            assert len(outputs) == _ATTENTION_DP_SIZE
+            reference_token_ids = outputs[0].outputs[0].token_ids
+            assert len(reference_token_ids) == 4
+            for rank, output in enumerate(outputs):
+                token_ids = output.outputs[0].token_ids
+                assert len(token_ids) == 4
+                assert token_ids == reference_token_ids, (
+                    f"Attention-DP rank {rank} produced tokens that differ from rank 0"
+                )
     finally:
         shutil.rmtree(dummy_dir, ignore_errors=True)
 

@@ -88,8 +88,8 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `KimiK3ForConditionalGeneration` [^15] [^17] | Yes               | Yes        | Yes                        | Yes                   | Yes             | DSpark                     | Yes           | Yes            | N/A                      | Yes                   | Yes             |
 | `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No                         | Yes           | Yes            | N/A                      | No [^21]              | Untested        |
 | `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes            | N/A                      | Yes                   | Untested        |
-| `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | MTP                        | Yes           | No             | Yes                      | Untested [^22]        | Untested        |
-| `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested                   | No                    | Yes             | No                         | Yes           | No             | Yes                      | Yes [^23]             | Untested        |
+| `Gemma4ForConditionalGeneration` | Yes [^24]          | Yes        | Yes [^24]                  | No                    | Yes             | MTP                        | Yes           | No             | Yes                      | Untested [^22]        | Untested        |
+| `Gemma4UnifiedForConditionalGeneration` | Yes [^24]          | Yes [^24] | Yes [^24]                  | No                    | Yes             | No                         | Yes           | No             | Yes                      | Yes [^23]             | Untested        |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | No             | Yes                      | Yes                   | Untested        |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No                         | Yes           | No             | N/A                      | Yes                   | Untested        |
 
@@ -115,6 +115,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^21]: Logits post processors are not supported by the AutoDeploy `ADEngine` used for `Glm4MoeLiteForCausalLM`.
 [^22]: Logits post-processor testing for `Gemma4ForConditionalGeneration` is blocked before sampling by unsupported attention head geometry on H100 and a KV-cache initialization failure on B200.
 [^23]: Logits post-processor coverage for `Gemma4UnifiedForConditionalGeneration` uses a representative dummy-weight end-to-end test with supported attention head dimensions because the real checkpoint encounters the same attention limitation as `Gemma4ForConditionalGeneration`.
+[^24]: Overlap scheduler, CUDA graph, and attention data parallelism coverage for the Gemma 4 architectures uses representative dummy-weight end-to-end tests with supported attention head dimensions.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -140,8 +141,8 @@ complete encoder input must fit in the iteration token budget.
 | ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | -------------- | --------------------- | ------------------------- | --------- |
 | `Exaone4_5_ForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
 | `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | N/A            | Yes                   | No                        | L + I     |
-| `Gemma4ForConditionalGeneration`     | Untested          | Yes        | Yes             | Yes           | No             | Untested              | No                        | L + I + V + A [^9] |
-| `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested        | Yes           | No             | Untested              | No                        | L + I + A |
+| `Gemma4ForConditionalGeneration`     | Yes [^24]          | Yes        | Yes             | Yes           | No             | Untested              | No                        | L + I + V + A [^9] |
+| `Gemma4UnifiedForConditionalGeneration` | Yes [^24]          | Yes [^24] | Untested        | Yes           | No             | Untested              | No                        | L + I + A |
 | `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes            | Yes                   | No                        | L + I     |
 | `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I + V |
 | `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I     |
