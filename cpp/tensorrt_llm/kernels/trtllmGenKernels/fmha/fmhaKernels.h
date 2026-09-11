@@ -311,8 +311,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
@@ -409,8 +409,8 @@ private:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
@@ -527,8 +527,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
 
         // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
         // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
@@ -663,43 +663,6 @@ public:
     }
 
 private:
-    std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelWithCgaSmemReductionLimit(
-        FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
-    {
-        if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
-        {
-            constexpr int kMaxCgaClusterDimX = 16;
-            constexpr int kMinPreSelectCgaClusterDimX = 2;
-            // selectKernel may promote this candidate to CgaSmemReduction and call computeNumCtas
-            // before returning the selected options. Keep the candidate legal for both 1-CTA and
-            // 2-CTA FMHA kernels; the exact selected clusterDimX is applied below.
-            options.mMaxNumCtasPerSeqKv = std::min(options.mMaxNumCtasPerSeqKv,
-                kMaxCgaClusterDimX / std::max(options.mClusterDimX, kMinPreSelectCgaClusterDimX));
-        }
-
-        int32_t ctaDim = 512;
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
-        limitCgaSmemReductionCtasKv(options);
-        return {options, optionsFromArgs, ctaDim};
-    }
-
-    void limitCgaSmemReductionCtasKv(FmhaOptions& options) const
-    {
-        if (!isCgaSmemReduction(options.mMultiCtasKvMode))
-        {
-            return;
-        }
-        constexpr int kMaxCgaClusterDimX = 16;
-        if (options.mClusterDimX * options.mMaxNumCtasPerSeqKv > kMaxCgaClusterDimX)
-        {
-            TLLM_LOG_WARNING(
-                "CGA reduction is not supported when numCtasPerSeqKv * clusterDimX > 16. Set mMaxNumCtasPerSeqKv to "
-                "16 / clusterDimX");
-            options.mMaxNumCtasPerSeqKv = kMaxCgaClusterDimX / options.mClusterDimX;
-        }
-    }
-
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
         bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool groupsHeadsQ,

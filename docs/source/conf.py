@@ -11,6 +11,7 @@ import importlib.util
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 import os
+import re
 import subprocess
 import sys
 
@@ -182,6 +183,15 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
     return [node], []
 
 
+def _expand_visualgen_navigation(_app, docname: str, source: list[str]) -> None:
+    """Keep Sphinx navigation hidden in GitHub's Markdown preview."""
+    if docname == 'features/visual-generation':
+        source[0] = re.sub(r'<!-- sphinx-only\n(.*?)\n-->',
+                           r'\1',
+                           source[0],
+                           flags=re.DOTALL)
+
+
 def setup(app):
     from helper import (check_llmapi_reference_size,
                         compact_llmapi_search_signature, generate_examples,
@@ -209,6 +219,7 @@ def setup(app):
         print(f"Warning: {msg}; skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
+    app.connect('source-read', _expand_visualgen_navigation)
     app.connect('autodoc-process-docstring', strip_llmapi_search_docstrings)
     app.connect('autodoc-process-signature', compact_llmapi_search_signature)
     app.connect('build-finished', check_llmapi_reference_size)

@@ -59,7 +59,7 @@ class FallbackFmha(Fmha):
     supports_skip_correction = True
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
         if sparse_algorithm in ("deepseek_v4", "dsa"):
             if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
@@ -68,7 +68,7 @@ class FallbackFmha(Fmha):
                 return False
         return True
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
