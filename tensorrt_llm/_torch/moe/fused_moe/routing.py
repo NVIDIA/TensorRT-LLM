@@ -232,7 +232,7 @@ def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
 
 
 # The type of method in top-K routing, for use in torch custom op
-# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
+# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/moe/trtllmGen/runner.h
 class RoutingMethodType(IntEnum):
     # Default: Softmax -> TopK
     Default = 0,
