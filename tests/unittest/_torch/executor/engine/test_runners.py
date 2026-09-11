@@ -179,21 +179,29 @@ def test_model_engine_initializes_runner_by_family(
     initializer.assert_called_once_with(runner_type)
 
 
-@pytest.mark.parametrize("cuda_graph_config", [None, CudaGraphConfig()])
-def test_encoder_runner_initialization_preserves_encoder_graph_config_fallback(
+@pytest.mark.parametrize(
+    ("cuda_graph_config", "expected_encode_config"),
+    [
+        (None, False),
+        (CudaGraphConfig(), False),
+        (EncodeCudaGraphConfig(batch_sizes=[1], num_tokens=[16], seq_lens=[16]), True),
+    ],
+)
+def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     cuda_graph_config: CudaGraphConfig | None,
+    expected_encode_config: bool,
 ) -> None:
-    encoder_graph_config = EncodeCudaGraphConfig(
-        batch_sizes=[1],
-        num_tokens=[16],
-        seq_lens=[16],
-    )
+    """Encode-only takes its buckets from `cuda_graph_config`, never from llm_args."""
     engine = object.__new__(PyTorchModelEngine)
     engine.model = object()
     engine.mapping = object()
     engine.cuda_graph_config = cuda_graph_config
     engine.llm_args = SimpleNamespace(
-        encoder_cuda_graph_config=encoder_graph_config,
+        encoder_cuda_graph_config=EncodeCudaGraphConfig(
+            batch_sizes=[8],
+            num_tokens=[64],
+            seq_lens=[64],
+        ),
         enable_autotuner=False,
     )
     engine.batch_size = 4
@@ -217,7 +225,8 @@ def test_encoder_runner_initialization_preserves_encoder_graph_config_fallback(
         actual = engine._initialize_encoder_runner(runner_type)
 
     assert actual is expected_runner
-    assert create_config.call_args.kwargs["graph_config"] is encoder_graph_config
+    resolved = create_config.call_args.kwargs["graph_config"]
+    assert resolved is (cuda_graph_config if expected_encode_config else None)
     runner_type.assert_called_once_with(engine.model, deps, runner_config)
 
 

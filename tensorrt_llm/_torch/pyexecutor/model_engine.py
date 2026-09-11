@@ -905,8 +905,7 @@ class PyTorchModelEngine(ModelEngine):
             model=self.model,
             mapping=self.mapping,
             graph_config=(self.cuda_graph_config if isinstance(
-                self.cuda_graph_config, EncodeCudaGraphConfig) else
-                          self.llm_args.encoder_cuda_graph_config),
+                self.cuda_graph_config, EncodeCudaGraphConfig) else None),
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,

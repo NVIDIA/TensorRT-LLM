@@ -198,6 +198,33 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
     assert build_metadata.call_args.kwargs["cache_indirection"] is None
 
 
+def test_multi_item_batch_leaves_the_graph_refusal_to_the_graph_runner() -> None:
+    """`maybe_get_cuda_graph` owns the multi-item policy and its one-time warning."""
+    runner = object.__new__(EncoderRunner)
+
+    @contextmanager
+    def pad_batch(inputs, batch_size):
+        yield dict(inputs)
+
+    graph_runner = SimpleNamespace(
+        pad_batch=pad_batch,
+        maybe_get_cuda_graph=Mock(return_value=(None, None)),
+        is_encoder_decoder=False,
+    )
+    runner._encoder_cuda_graph_runner = graph_runner
+    inputs = {
+        "input_ids": [11, 12],
+        "seq_lens": [2],
+        "multi_item_part_lens": [[1, 1]],
+    }
+
+    assert runner._prepare_encoder_graph_inputs(inputs, object()) is None
+
+    graph_runner.maybe_get_cuda_graph.assert_called_once()
+    consulted_inputs = graph_runner.maybe_get_cuda_graph.call_args.args[0]
+    assert consulted_inputs["multi_item_part_lens"] == [[1, 1]]
+
+
 def test_encoder_runner_collects_scheduled_inputs_without_losing_request_boundaries() -> None:
     requests = [
         SimpleNamespace(
