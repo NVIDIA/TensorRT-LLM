@@ -646,6 +646,46 @@ def _run_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
         assert r is True
 
 
+@pytest.mark.parametrize(
+    "num_tokens,group_size,fusion_op,expected",
+    [
+        pytest.param(4,
+                     16,
+                     AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                     False,
+                     id="tp16-oneshot-fusion"),
+        pytest.param(5,
+                     16,
+                     AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                     True,
+                     id="tp16-twoshot-fusion"),
+        pytest.param(
+            5, 16, AllReduceFusionOp.NONE, False, id="tp16-twoshot-unfused"),
+        pytest.param(5,
+                     16,
+                     AllReduceFusionOp.RMS_NORM,
+                     False,
+                     id="tp16-twoshot-unsupported-fusion"),
+        pytest.param(10,
+                     8,
+                     AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                     False,
+                     id="tp8-twoshot-fusion"),
+    ],
+)
+def test_mnnvl_fused_twoshot_nccl_fallback_policy(num_tokens: int,
+                                                  group_size: int,
+                                                  fusion_op: AllReduceFusionOp,
+                                                  expected: bool) -> None:
+    assert MNNVLAllReduce.requires_nccl_fallback(
+        num_tokens=num_tokens,
+        hidden_dim=7168,
+        group_size=group_size,
+        dtype=torch.bfloat16,
+        fusion_op=fusion_op,
+    ) is expected
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("seq_len", SEQ_LEN_CASES, ids=_seq_len_id)

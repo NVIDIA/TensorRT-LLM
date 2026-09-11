@@ -46,6 +46,7 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+_MNNVL_MAX_FUSED_TWO_SHOT_TP_SIZE = 8
 
 _thread_local = threading.local()
 
@@ -708,6 +709,24 @@ class MNNVLAllReduce(nn.Module):
                 num_tokens / group_size) * group_size * hidden_dim * elem_size
         return workspace_size
 
+    @staticmethod
+    def requires_nccl_fallback(num_tokens: int, hidden_dim: int,
+                               group_size: int, dtype: torch.dtype,
+                               fusion_op: AllReduceFusionOp) -> bool:
+        """Return whether this shape must avoid fused two-shot MNNVL.
+
+        Fused two-shot MNNVL can leave TP16+ ranks polling the Lamport buffer indefinitely. Keep
+        one-shot fusion and unfused two-shot MNNVL enabled, but use the NCCL collective plus
+        subsequent epilogue kernels for this unsafe combination.
+        """
+        if (fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS
+                or group_size <= _MNNVL_MAX_FUSED_TWO_SHOT_TP_SIZE):
+            return False
+
+        elem_size = torch.finfo(dtype).bits // 8
+        message_size = num_tokens * hidden_dim * group_size * elem_size
+        return message_size > _MNNVL_ONE_SHOT_THRESHOLD_BYTES
+
     def checkpoint_prepare(self) -> None:
         """Collectively detach handles after external global quiescence.
 
@@ -1044,10 +1063,27 @@ class AllReduce(nn.Module):
 
         # Try MNNVL AllReduce if symm_mem didn't handle it
         if self.mnnvl_allreduce:
-            mnnvl_output = self.mnnvl_allreduce(
-                input, all_reduce_params=all_reduce_params)
-            if mnnvl_output is not None:
-                return mnnvl_output
+            hidden_dim = input.shape[-1]
+            num_tokens = input.numel() // hidden_dim
+            requires_nccl_fallback = self.mnnvl_allreduce.requires_nccl_fallback(
+                num_tokens,
+                hidden_dim,
+                self.mapping.tp_size,
+                input.dtype,
+                all_reduce_params.fusion_op,
+            )
+            if requires_nccl_fallback:
+                allreduce_strategy = AllReduceStrategy.NCCL
+                logger.warning_once(
+                    f"Falling back to NCCL for fused two-shot MNNVL at "
+                    f"TP{self.mapping.tp_size} with input shape {tuple(input.shape)}.",
+                    key=(self.mapping.tp_rank, "fused_twoshot_mnnvl_fallback"),
+                )
+            else:
+                mnnvl_output = self.mnnvl_allreduce(
+                    input, all_reduce_params=all_reduce_params)
+                if mnnvl_output is not None:
+                    return mnnvl_output
 
         # Fall back to regular AllReduce if specialized methods are not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
