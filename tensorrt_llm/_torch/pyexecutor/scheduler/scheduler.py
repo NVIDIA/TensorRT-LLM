@@ -449,10 +449,6 @@ class ContextChunkingConfig:
     chunk_unit_size: int
 
 
-class MicroBatchScheduler:
-    """Base class to match structure."""
-
-
 def _reuse_adjusted_compute(chunk_size: int, reusable: int, context_remaining: int) -> int:
     """Return the forward-pass token cost for a context chunk with KV cache reuse.
 
