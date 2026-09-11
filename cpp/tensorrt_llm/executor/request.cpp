@@ -15,13 +15,12 @@
  * limitations under the License.
  */
 
-#include <utility>
-
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestImpl.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+
+#include <utility>
 
 namespace tensorrt_llm::executor
 {
