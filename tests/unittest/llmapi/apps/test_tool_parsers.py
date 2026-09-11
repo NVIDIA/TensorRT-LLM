@@ -5597,8 +5597,15 @@ class TestUnparsedToolCallWarning:
         from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
 
         args = self._chat_args("qwen3")
-        text = ('<tool_call>{"name": "get_weather", '
-                '"arguments": {"location": "Paris"}}</tool_call>')
+        # Qwen3 wraps the call as "<tool_call>\n{...}\n</tool_call>": its
+        # bot/eot tokens carry the newlines, so a newline-less payload is not
+        # recognised as markup at all and would make this case pass for the
+        # wrong reason.
+        text = ('<tool_call>\n{"name": "get_weather", '
+                '"arguments": {"location": "Paris"}}\n</tool_call>')
+        assert Qwen3ToolParser().has_tool_call(text), (
+            "the silence below must come from the extracted call, not from "
+            "the parser failing to detect the markup")
         with self._patched_logger() as mock_logger:
             _, calls = apply_tool_parser(args, 0, text, streaming=False)
 
