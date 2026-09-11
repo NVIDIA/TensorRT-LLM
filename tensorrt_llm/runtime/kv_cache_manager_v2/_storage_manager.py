@@ -674,6 +674,7 @@ class StorageManager:
         update_src: bool,
         migration_recorder: MigrationRecorder | None = None,
         defrag: bool = False,  # we are doing defragmentation
+        dst_locality_domain_id: int | None = None,
     ) -> Sequence[Slot] | None:
         """Free slots must be prepared before calling this function.
 
@@ -685,13 +686,13 @@ class StorageManager:
           locality domain-aware.
         - Same-level defragmentation: moves slots within the same tier and
           same locality domain to eliminate fragmentation after a shrink.
+          Pass ``dst_locality_domain_id`` so destination slots are drawn from the
+          same locality domain as the source pages.
 
         Not supported:
 
         - Same-level cross-locality domain migration (moving data between locality domains within
-          the GPU tier).  If added, dst_pool_group operations
-          (.num_free_slots, .allocate_multiple, .slot_address) would need an
-          explicit target locality_domain_id.
+          the GPU tier).
         """
         assert defrag or dst_level != src_level, (
             "dst_level and src_level must be different unless performing defragmentation"
@@ -700,13 +701,17 @@ class StorageManager:
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
+        dst_ldid = dst_locality_domain_id if dst_locality_domain_id is not None else 0
         if isinstance(dst_pool_group, GpuPoolGroup):
-            dst_num_free_slots = dst_pool_group.num_free_slots()
+            dst_num_free_slots = dst_pool_group.num_free_slots(dst_ldid)
         else:
             dst_num_free_slots = dst_pool_group.num_free_slots
         if dst_num_free_slots < num_slots:
             raise OutOfPagesError("Not enough free slots")
-        dst_slots = dst_pool_group.allocate_multiple(num_slots)
+        if isinstance(dst_pool_group, GpuPoolGroup):
+            dst_slots = dst_pool_group.allocate_multiple(num_slots, dst_ldid)
+        else:
+            dst_slots = dst_pool_group.allocate_multiple(num_slots)
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
@@ -716,7 +721,10 @@ class StorageManager:
             for src, dst in zip(src_pages, dst_slots):
                 assert defrag or src.node_ref is None
                 prior_events.update((dst.ready_event, src.ready_event))
-                dst_addresses = dst_pool_group.slot_address(dst.slot_id)
+                if isinstance(dst_pool_group, GpuPoolGroup):
+                    dst_addresses = dst_pool_group.slot_address(dst.slot_id, dst_ldid)
+                else:
+                    dst_addresses = dst_pool_group.slot_address(dst.slot_id)
                 if isinstance(src_pool_group, GpuPoolGroup):
                     src_addresses = src_pool_group.slot_address(src.slot_id, src.locality_domain_id)
                 else:
@@ -919,6 +927,7 @@ class StorageManager:
         pg_idx: PoolGroupIndex,
         new_num_slots: int,
         persistent_pages: list[Page],
+        locality_domain_id: int | None = None,
     ) -> None:
         """Move pages to eliminate overflow slots then shrink the pool group"""
         lc2pg = self._life_cycle_grouping
@@ -927,11 +936,26 @@ class StorageManager:
         ), "Not enough slots"
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         if isinstance(pool_group, GpuPoolGroup):
-            current_num_slots = pool_group.num_slots(0)
-            allocator = pool_group._slot_allocators[0]
+            ldid = locality_domain_id if locality_domain_id is not None else 0
+            current_num_slots = pool_group.num_slots(ldid)
+            allocator = pool_group._slot_allocators[ldid]
+
+            def local_index(slot_id: SlotId) -> int:
+                return pool_group.get_local_slot_index(slot_id, ldid)
+
+            def in_scope(page: Page) -> bool:
+                return pool_group.num_locality_domains == 1 or page.locality_domain_id == ldid
         else:
+            ldid = None
             current_num_slots = pool_group.num_slots
             allocator = pool_group._slot_allocator
+
+            def local_index(slot_id: SlotId) -> int:
+                return int(slot_id)
+
+            def in_scope(page: Page) -> bool:
+                return True
+
         assert new_num_slots < current_num_slots, "Not required for expansion of pools"
         # Fast path: when no slot id has ever been issued in the to-be-removed
         # range [new_num_slots, _capacity), there is nothing to migrate.
@@ -939,8 +963,8 @@ class StorageManager:
         if allocator._num_active_slots <= new_num_slots:
             allocator.prepare_for_shrink(new_num_slots)
             allocator.finish_shrink()
-            if isinstance(pool_group, GpuPoolGroup):
-                pool_group.resize_pools(new_num_slots, 0)
+            if ldid is not None:
+                pool_group.resize_pools(new_num_slots, ldid)
             else:
                 pool_group.resize_pools(new_num_slots)
             return
@@ -948,9 +972,11 @@ class StorageManager:
         # pages with overflow slots and their indices in the eviction queue.
         overflow_slots = deque[tuple[int, Page]]()
         for i, p in enumerate(cast(Iterator[Page], ctrl.page_iterator(pg_idx))):
-            if p.slot_id >= new_num_slots:
+            if in_scope(p) and local_index(p.slot_id) >= new_num_slots:
                 overflow_slots.append((i, p))
-        overflow_persistent_pages = [p for p in persistent_pages if p.slot_id >= new_num_slots]
+        overflow_persistent_pages = [
+            p for p in persistent_pages if in_scope(p) and local_index(p.slot_id) >= new_num_slots
+        ]
         num_overflow_persistent = len(overflow_persistent_pages)
         if num_overflow_persistent > new_num_slots:
             raise OutOfPagesError("Not enough slots to hold all persistent pages")
@@ -973,30 +999,43 @@ class StorageManager:
         overflow_pages = [s[1] for s in overflow_slots] + overflow_persistent_pages
         requirements = filled_list(0, self.num_pool_groups)
         requirements[pg_idx] = len(overflow_pages)
-        self.prepare_free_slots(level, requirements)
+        self.prepare_free_slots(level, requirements, locality_domain_id=ldid)
         assert NDEBUG or all(p.cache_level == level for p in overflow_pages), (
             "Some pages are not overflowed"
         )
-        self._batched_migrate(pg_idx, level, level, overflow_pages, update_src=True, defrag=True)
+        self._batched_migrate(
+            pg_idx,
+            level,
+            level,
+            overflow_pages,
+            update_src=True,
+            defrag=True,
+            dst_locality_domain_id=ldid,
+        )
         assert (
             len(allocator._overflow_slots)
             == allocator._num_active_slots - allocator._target_capacity
         )
         allocator.finish_shrink()
-        if isinstance(pool_group, GpuPoolGroup):
-            pool_group.resize_pools(new_num_slots, 0)
+        if ldid is not None:
+            pool_group.resize_pools(new_num_slots, ldid)
         else:
             pool_group.resize_pools(new_num_slots)
 
     def expand_pool_group(
-        self, level: CacheLevel, pg_idx: PoolGroupIndex, new_num_slots: int
+        self,
+        level: CacheLevel,
+        pg_idx: PoolGroupIndex,
+        new_num_slots: int,
+        locality_domain_id: int | None = None,
     ) -> None:
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         if isinstance(pool_group, GpuPoolGroup):
-            current_num_slots = pool_group.num_slots(0)
+            ldid = locality_domain_id if locality_domain_id is not None else 0
+            current_num_slots = pool_group.num_slots(ldid)
             assert new_num_slots > current_num_slots
-            pool_group.resize_pools(new_num_slots, 0)
-            pool_group._slot_allocators[0].expand(new_num_slots)
+            pool_group.resize_pools(new_num_slots, ldid)
+            pool_group._slot_allocators[ldid].expand(new_num_slots)
         else:
             assert new_num_slots > pool_group.num_slots
             pool_group.resize_pools(new_num_slots)
@@ -1032,17 +1071,31 @@ class StorageManager:
             assert persistent_pages is None, (
                 "Persistent pages should be None for non-last level cache"
             )
-        # shrink first
+
+        def locality_domain_ids(pg_idx: PoolGroupIndex) -> list[int | None]:
+            pool_group = lvl_storage._pool_groups[pg_idx]
+            if isinstance(pool_group, GpuPoolGroup):
+                return list(range(pool_group.num_locality_domains))
+            return [None]
+
+        # shrink first: the pools share one physical memory pool, so memory must be
+        # released before a growing pool group can claim it.
         for pg_idx in typed_range(self.num_pool_groups):
             if new_num_slots[pg_idx] >= old_num_slots[pg_idx]:
                 continue
             pages = persistent_pages[pg_idx] if persistent_pages is not None else []
-            self.shrink_pool_group(level, pg_idx, new_num_slots[pg_idx], pages)
+            for ldid in locality_domain_ids(pg_idx):
+                self.shrink_pool_group(
+                    level, pg_idx, new_num_slots[pg_idx], pages, locality_domain_id=ldid
+                )
         # then expand
         for pg_idx in typed_range(self.num_pool_groups):
             if new_num_slots[pg_idx] <= old_num_slots[pg_idx]:
                 continue
-            self.expand_pool_group(level, pg_idx, new_num_slots[pg_idx])
+            for ldid in locality_domain_ids(pg_idx):
+                self.expand_pool_group(
+                    level, pg_idx, new_num_slots[pg_idx], locality_domain_id=ldid
+                )
         lvl_storage.post_resize()
 
     def ratio_from_length(
