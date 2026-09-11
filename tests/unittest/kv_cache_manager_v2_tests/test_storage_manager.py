@@ -632,6 +632,94 @@ class TestStorageManagerLocalized(unittest.TestCase):
         sm.release_slot(LifeCycleId(0), host_level, ret[LifeCycleId(0)][0])
 
     # ------------------------------------------------------------------
+    # Test 2c: resizing must keep every locality domain the same size
+    # ------------------------------------------------------------------
+    def _gpu_pool_group(self, sm: StorageManager, pg: PoolGroupIndex):
+        return sm._levels[GPU_LEVEL].storage._pool_groups[pg]
+
+    def test_expand_pool_group_targets_the_requested_locality_domain(self) -> None:
+        """Expand must act on the named locality domain, leaving the others alone."""
+        self.storage_manager = self._make_localized_sm(num_layers=2)
+        sm = self.storage_manager
+        pg = PoolGroupIndex(0)
+        pool_group = self._gpu_pool_group(sm, pg)
+        self.assertGreater(pool_group.num_locality_domains, 1)
+
+        before = [pool_group.num_slots(uid) for uid in range(pool_group.num_locality_domains)]
+        # expand allocates new physical memory, which re-enters the localized
+        # allocator, so it needs the mock capability the fixture only applies
+        # during construction.
+        with _override_localization_mode("1"):
+            sm.expand_pool_group(GPU_LEVEL, pg, before[1] + 1, locality_domain_id=1)
+        after = [pool_group.num_slots(uid) for uid in range(pool_group.num_locality_domains)]
+
+        self.assertEqual(after[1], before[1] + 1, "requested locality domain must grow")
+        self.assertEqual(after[0], before[0], "other locality domains must be untouched")
+
+    def test_shrink_pool_group_targets_the_requested_locality_domain(self) -> None:
+        """Shrink must act on the named locality domain, leaving the others alone."""
+        self.storage_manager = self._make_localized_sm(num_layers=2)
+        sm = self.storage_manager
+        pg = PoolGroupIndex(0)
+        pool_group = self._gpu_pool_group(sm, pg)
+        self.assertGreater(pool_group.num_locality_domains, 1)
+
+        before = [pool_group.num_slots(uid) for uid in range(pool_group.num_locality_domains)]
+        self.assertGreater(before[1], 1, "need room to shrink")
+        sm.shrink_pool_group(GPU_LEVEL, pg, before[1] - 1, [], locality_domain_id=1)
+        after = [pool_group.num_slots(uid) for uid in range(pool_group.num_locality_domains)]
+
+        self.assertEqual(after[1], before[1] - 1, "requested locality domain must shrink")
+        self.assertEqual(after[0], before[0], "other locality domains must be untouched")
+
+    def test_resizing_each_locality_domain_keeps_them_equal(self) -> None:
+        """The caller resizes every locality domain, so the halves stay symmetric."""
+        self.storage_manager = self._make_localized_sm(num_layers=2)
+        sm = self.storage_manager
+        pg = PoolGroupIndex(0)
+        pool_group = self._gpu_pool_group(sm, pg)
+        num_locality_domains = pool_group.num_locality_domains
+        target = pool_group.num_slots(0) - 1
+
+        for uid in range(num_locality_domains):
+            sm.shrink_pool_group(GPU_LEVEL, pg, target, [], locality_domain_id=uid)
+
+        sizes = [pool_group.num_slots(uid) for uid in range(num_locality_domains)]
+        self.assertTrue(
+            all(n == target for n in sizes),
+            f"every locality domain must reach the target size: {sizes}",
+        )
+
+    def test_compute_slot_count_list_is_per_locality_domain(self) -> None:
+        """The aggregate quota must be divided per locality domain, as __init__ does.
+
+        slot_count_list reports per-locality domain counts, so a count computed from
+        total_quota must be comparable with it; otherwise adjust_cache_level compares
+        a total against a per-domain value and picks shrink vs expand wrongly.
+        """
+        self.storage_manager = self._make_localized_sm(num_layers=2)
+        sm = self.storage_manager
+        gpu_storage = sm._levels[GPU_LEVEL].storage
+        num_locality_domains = gpu_storage.num_locality_domains
+        self.assertGreater(num_locality_domains, 1, "test needs localized storage")
+
+        per_locality_domain = gpu_storage.slot_count_list
+        ratio_list = [1.0 / int(sm.num_pool_groups)] * int(sm.num_pool_groups)
+        min_slots = sm._min_slots_for_level(GPU_LEVEL)
+        computed = gpu_storage.compute_slot_count_list(
+            ratio_list, min_slots, gpu_storage.total_quota
+        )
+
+        for pg in typed_range(sm.num_pool_groups):
+            self.assertLessEqual(
+                computed[pg],
+                per_locality_domain[pg] + 1,
+                f"computed count {computed[pg]} must be per-locality domain, "
+                f"not the {num_locality_domains}x aggregate "
+                f"(per-domain is {per_locality_domain[pg]})",
+            )
+
+    # ------------------------------------------------------------------
     # Test 3: both locality domains receive equal slot counts (symmetric quota split)
     # ------------------------------------------------------------------
     def test_num_slots_per_locality_domain_are_equal(self) -> None:
@@ -740,6 +828,47 @@ class TestStorageManagerLocalized(unittest.TestCase):
             free_before,
             "Free count must be restored after release_slot",
         )
+
+    def test_batched_migrate_destination_stays_in_the_requested_locality_domain(self) -> None:
+        """Defragmentation must draw destination slots from the source's locality domain.
+
+        The source side already passes ``src.locality_domain_id``; the destination side
+        defaulted to locality domain 0, so a domain-1 page was copied into domain 0's
+        memory while its owner still addressed it as domain 1.
+        """
+        self.storage_manager = self._make_localized_sm(num_layers=2)
+        sm = self.storage_manager
+        pg = PoolGroupIndex(0)
+        pool_group = self._gpu_pool_group(sm, pg)
+        self.assertGreater(pool_group.num_locality_domains, 1)
+
+        src_slots = sm.new_slots_for_pool_group(GPU_LEVEL, pg, 1, locality_domain_id=1)
+        src = _FakeEvictablePage(LifeCycleId(0), locality_domain_id=1)
+        src.slot_id = src_slots[0].slot_id
+        src.ready_event = src_slots[0].ready_event
+        self.assertEqual(pool_group.get_locality_domain_id(src.slot_id), 1)
+
+        dst_slots = sm._batched_migrate(
+            pg,
+            GPU_LEVEL,
+            GPU_LEVEL,
+            [src],
+            update_src=False,
+            defrag=True,
+            dst_locality_domain_id=1,
+        )
+        try:
+            self.assertIsNotNone(dst_slots)
+            self.assertEqual(len(dst_slots), 1)
+            self.assertEqual(
+                pool_group.get_locality_domain_id(dst_slots[0].slot_id),
+                1,
+                "destination slot must come from the source's locality domain",
+            )
+        finally:
+            for slot in dst_slots or []:
+                pool_group.release(slot, 1)
+            sm.release_slot(LifeCycleId(0), GPU_LEVEL, src_slots[0])
 
     def test_eviction_filter_selects_target_locality_domain(self) -> None:
         """Localized eviction must only free pages from the locality domain being allocated."""
