@@ -33,3 +33,7 @@ l0_gb300:
   # architecture, and this list is the sm_103 one. comm/ is excluded here and
   # carried by l0_gb300_multi_gpus.yml, since those two need 4 ranks.
   - unittest/_torch/staircase --ignore=unittest/_torch/staircase/comm
+  # Staircase whole-model gate. The op-level entry above certifies the
+  # vocabulary; this certifies the assembly that calls it.
+  - accuracy/test_staircase.py::TestStaircaseGptOss120bSm103Tp1::test_gsm8k
+  - accuracy/test_staircase.py::test_staircase_off_is_the_default
