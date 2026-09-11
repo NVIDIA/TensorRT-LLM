@@ -506,7 +506,6 @@ include = [
     "tests/integration/defs/examples/run_llm_quickstart_atexit.py",
     "tests/integration/defs/examples/serve/test_serve.py",
     "tests/integration/defs/examples/serve/test_serve_negative.py",
-    "tests/integration/defs/examples/test_ad_guided_decoding.py",
     "tests/integration/defs/examples/test_gpt.py",
     "tests/integration/defs/examples/test_llm_api_with_mpi.py",
     "tests/integration/defs/examples/test_phi.py",
