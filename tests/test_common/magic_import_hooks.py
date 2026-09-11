@@ -54,11 +54,6 @@ _NON_TEST_TREES = (
     # cpp/<build-dir>/_deps/cutlass-src/python. The build directory is named by
     # the developer, so the whole tree is accepted.
     "cpp",
-    # cbts is a standalone tool vendored here, whose modules import each other
-    # by bare name and so put their own directories on sys.path. Reworking that
-    # layout is a separate change; exempting it keeps this check useful in the
-    # meantime.
-    "jenkins/scripts/cbts",
 )
 
 # Debug variable for local runs to skip this check.
