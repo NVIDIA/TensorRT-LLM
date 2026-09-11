@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # TensorRT-LLM Model Weights Loader
 
 ## Overview

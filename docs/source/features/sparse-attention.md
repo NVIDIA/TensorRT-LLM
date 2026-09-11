@@ -259,7 +259,7 @@ sparse_attention_config:
 ```
 
 See the
-[DeepSeek V3/V3.2 example](../../../examples/models/core/deepseek_v3/README.md)
+[DeepSeek V3/V3.2 example](source:examples/models/core/deepseek_v3/README.md)
 for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
 and disaggregated-serving support.
 
@@ -288,7 +288,7 @@ sparse_attention_config:
 ```
 
 See the
-[DeepSeek-V4 example](../../../examples/models/core/deepseek_v4/README.md) for
+[DeepSeek-V4 example](source:examples/models/core/deepseek_v4/README.md) for
 checkpoint-derived configuration and deployment constraints.
 
 #### MiniMax-M3 Block-Sparse GQA
@@ -452,7 +452,7 @@ trtllm-bench --model deepseek-ai/DeepSeek-V3.2 throughput \
 Use a local checkpoint path in place of the Hugging Face model ID when needed.
 Other sparse algorithms use the same YAML entry point with their own
 `algorithm` discriminator and settings. See the
-[DeepSeek V3/V3.2 example](../../../examples/models/core/deepseek_v3/README.md)
+[DeepSeek V3/V3.2 example](source:examples/models/core/deepseek_v3/README.md)
 for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
 and disaggregated-serving configurations.
 
