@@ -35,8 +35,9 @@ from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
     DFlashDecodingConfig, DSparkDecodingConfig, Eagle3DecodingConfig,
     KvCacheConfig, MambaStateConfig, MiniMaxM3SparseAttentionConfig, MoeConfig,
-    MTPDecodingConfig, PrefillCudaGraphBackend, SamplingParams, SchedulerConfig,
-    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
+    MTPDecodingConfig, PrefillCudaGraphBackend, QSASparseAttentionConfig,
+    SamplingParams, SchedulerConfig, SkipSoftmaxAttentionConfig,
+    SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
@@ -6357,17 +6358,24 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         chat_template_kwargs=dict(enable_thinking=False),
     )
 
-    def _build_llm(self,
-                   model_path: str,
-                   tensor_parallel_size: int,
-                   moe_backend: str,
-                   max_draft_len: Optional[int],
-                   check_acceptance_length: bool,
-                   moe_expert_parallel_size: int = 1,
-                   enable_attention_dp: bool = False,
-                   cover_guided_decoding: bool = False,
-                   enable_block_reuse: bool = False) -> LLM:
-        """Construct the engine shared by both evaluation tasks."""
+    def _build_llm(
+        self,
+        model_path: str,
+        tensor_parallel_size: int,
+        moe_backend: str,
+        max_draft_len: Optional[int],
+        check_acceptance_length: bool,
+        moe_expert_parallel_size: int = 1,
+        enable_attention_dp: bool = False,
+        cover_guided_decoding: bool = False,
+        enable_block_reuse: bool = False,
+        sparse_attention_config: Optional[QSASparseAttentionConfig] = None
+    ) -> LLM:
+        """Construct the engine shared by both evaluation tasks.
+
+        Leaving `sparse_attention_config` unset keeps the model default, which
+        is QSA with every indexer knob at its default.
+        """
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=enable_block_reuse,
                                         mamba_ssm_cache_dtype="bfloat16")
@@ -6384,6 +6392,9 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         guided_decoding_args = ({
             "guided_decoding_backend": "xgrammar"
         } if cover_guided_decoding else {})
+        sparse_args = ({} if sparse_attention_config is None else {
+            "sparse_attention_config": sparse_attention_config
+        })
         return LLM(model_path,
                    trust_remote_code=True,
                    tensor_parallel_size=tensor_parallel_size,
@@ -6396,21 +6407,25 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    cuda_graph_config=cuda_graph_config,
                    moe_config=MoeConfig(backend=moe_backend),
                    speculative_config=mtp_config,
+                   **sparse_args,
                    **stats_args,
                    **guided_decoding_args)
 
-    def _run_evals(self,
-                   model_path: str,
-                   tensor_parallel_size: int,
-                   moe_backend: str,
-                   max_draft_len: Optional[int],
-                   expected_quant_algo: Optional[QuantAlgo],
-                   monkeypatch: pytest.MonkeyPatch,
-                   mocker,
-                   moe_expert_parallel_size: int = 1,
-                   enable_attention_dp: bool = False,
-                   cover_guided_decoding: bool = False,
-                   enable_block_reuse: bool = False) -> None:
+    def _run_evals(
+        self,
+        model_path: str,
+        tensor_parallel_size: int,
+        moe_backend: str,
+        max_draft_len: Optional[int],
+        expected_quant_algo: Optional[QuantAlgo],
+        monkeypatch: pytest.MonkeyPatch,
+        mocker,
+        moe_expert_parallel_size: int = 1,
+        enable_attention_dp: bool = False,
+        cover_guided_decoding: bool = False,
+        enable_block_reuse: bool = False,
+        sparse_attention_config: Optional[QSASparseAttentionConfig] = None
+    ) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
@@ -6421,15 +6436,17 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             and tensor_parallel_size == 4 and moe_backend == "TRTLLM"
             and max_draft_len == 3 and moe_expert_parallel_size == 4
             and enable_attention_dp and not enable_block_reuse)
-        with self._build_llm(model_path,
-                             tensor_parallel_size,
-                             moe_backend,
-                             max_draft_len,
-                             check_acceptance_length,
-                             moe_expert_parallel_size=moe_expert_parallel_size,
-                             enable_attention_dp=enable_attention_dp,
-                             cover_guided_decoding=cover_guided_decoding,
-                             enable_block_reuse=enable_block_reuse) as llm:
+        with self._build_llm(
+                model_path,
+                tensor_parallel_size,
+                moe_backend,
+                max_draft_len,
+                check_acceptance_length,
+                moe_expert_parallel_size=moe_expert_parallel_size,
+                enable_attention_dp=enable_attention_dp,
+                cover_guided_decoding=cover_guided_decoding,
+                enable_block_reuse=enable_block_reuse,
+                sparse_attention_config=sparse_attention_config) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if cover_guided_decoding:
                 assert_guided_decoding_regex(llm)
@@ -6513,7 +6530,11 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
     def test_nvfp4_adp4_mtp3_trtllm_ple_offload(self,
                                                 monkeypatch: pytest.MonkeyPatch,
                                                 mocker) -> None:
-        """NVFP4 on four GPUs with attention DP, MTP3 and PLE offload."""
+        """NVFP4 on four GPUs with attention DP, MTP3 and PLE offload.
+
+        Blackwell-only, so the GVR Top-K prerequisites hold; this is the case
+        that keeps the heuristic indexer selection under accuracy guard.
+        """
         self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
                         tensor_parallel_size=4,
                         moe_backend="TRTLLM",
@@ -6522,7 +6543,9 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         monkeypatch=monkeypatch,
                         mocker=mocker,
                         moe_expert_parallel_size=4,
-                        enable_attention_dp=True)
+                        enable_attention_dp=True,
+                        sparse_attention_config=QSASparseAttentionConfig(
+                            enable_heuristic_topk=True))
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)

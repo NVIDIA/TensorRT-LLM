@@ -37,6 +37,8 @@ class QSASparseParams(SparseParams):
     compress_ratio: int
     # Requested dense cutoff; the effective cutoff never falls below token_topk.
     seq_len_threshold: int | None = None
+    # Opt in to the Guess-Verify-Refine Top-K instead of the exact radix one.
+    enable_heuristic_topk: bool = False
 
     def __post_init__(self) -> None:
         values = {

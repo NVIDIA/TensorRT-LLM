@@ -65,6 +65,30 @@ def test_qsa_config_uses_checkpoint_geometry_without_mutating_user_config() -> N
     assert sparse_config.model_dump() == initial_config
 
 
+def test_qsa_config_forwards_heuristic_topk_opt_in() -> None:
+    """The GVR opt-in is a serving knob, not checkpoint geometry."""
+    checkpoint_config = SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+
+    params = QSASparseAttentionConfig(enable_heuristic_topk=True).to_sparse_params(
+        pretrained_config=checkpoint_config
+    )
+
+    assert params.enable_heuristic_topk is True
+    assert params.block_topk == 512
+    assert (
+        QSASparseAttentionConfig()
+        .to_sparse_params(pretrained_config=checkpoint_config)
+        .enable_heuristic_topk
+        is False
+    )
+
+
 def test_qsa_config_rejects_missing_checkpoint_geometry() -> None:
     with pytest.raises(ValueError, match="indexer_budget"):
         QSASparseAttentionConfig().to_sparse_params(pretrained_config=SimpleNamespace())
