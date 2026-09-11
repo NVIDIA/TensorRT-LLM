@@ -54,6 +54,10 @@ feature you turned on.
   hash of the first `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` characters.
 - An unexpected exception inside the cache disables it, with a warning, and the
   request is tokenized normally. A cache problem never fails a request.
+- The cache logs its configuration at startup and, every 1000 cache-eligible
+  requests, an `INFO` line with the hit rate, the number of re-synchronization
+  fallbacks, and its occupancy, so a cache that is enabled but never hitting is
+  visible in the server log.
 
 ## Measured effect
 

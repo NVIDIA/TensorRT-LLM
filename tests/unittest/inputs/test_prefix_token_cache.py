@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tensorrt_llm.inputs import prefix_token_cache
 from tensorrt_llm.inputs.prefix_token_cache import (
     ENABLE_ENV_VAR,
     PrefixTokenCache,
@@ -198,6 +199,20 @@ def test_concurrent_encode_is_correct() -> None:
     for t in threads:
         t.join()
     assert not errors
+
+
+def test_hit_rate_is_logged_periodically() -> None:
+    tokenizer, cache = _MergeTokenizer(), _cache()
+    prompts = _turns(8)
+    with (
+        patch.object(prefix_token_cache, "LOG_EVERY_REQUESTS", 4),
+        patch.object(prefix_token_cache.logger, "info") as info,
+    ):
+        for prompt in prompts:
+            cache.encode(tokenizer, prompt)
+    assert info.call_count == 2
+    assert "hits (" in info.call_args.args[0]
+    assert "resync fallbacks" in cache.summary()
 
 
 def test_error_disables_cache_and_still_returns_ids() -> None:
