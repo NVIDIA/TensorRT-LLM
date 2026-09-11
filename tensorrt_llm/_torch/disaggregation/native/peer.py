@@ -48,7 +48,9 @@ class PeerOverlap:
 
 
 class PeerRegistrar:
-    # Registry: CacheKind -> PolicyClass. Add new layer types here.
+    # Registry: CacheKind -> PolicyClass. Add new layer types here. The
+    # policy owns every mapper kind of its life cycle and picks the mapper
+    # per view in build_mapper.
     _POLICY_CLASSES = {
         CacheKind.PAGED: AttentionPolicy,
         CacheKind.STATE: MambaPolicy,
@@ -158,12 +160,16 @@ class PeerRegistrar:
         # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a
         # field-level diagnostic instead of returning False, so the precise
         # mismatch reaches the caller of register().
+        self_page_table = (
+            self._self_ext_cache.page_table if self._self_ext_cache is not None else None
+        )
         MambaPolicy.validate_peer_compatible(
             self._ri,
             peer_ri,
-            self._self_ext_cache.page_table if self._self_ext_cache is not None else None,
+            self_page_table,
             peer_ri.page_table,
         )
+        AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -306,8 +312,7 @@ class PeerRegistrar:
     def _get_policy(self, kind: CacheKind) -> Union[AttentionPolicy, MambaPolicy]:
         """Return the policy for a CacheKind (lazily instantiated)."""
         if kind not in self._policies:
-            cls = self._POLICY_CLASSES[kind]
-            self._policies[kind] = cls(self._ri)
+            self._policies[kind] = self._POLICY_CLASSES[kind](self._ri)
         return self._policies[kind]
 
     def get_kv_map(
@@ -393,17 +398,12 @@ class PeerRegistrar:
         # the mapper must slice only the overlapping subset.
         extra_kwargs = {}
         if self_lg.kind == CacheKind.STATE:
-            # Position of each overlapping layer in the full sorted local_layer_ids
-            # used by extract_slot. These are indices into the ptrs array.
-            self_all_lids = sorted(set(int(e["local_layer_id"]) for e in self_pv.buffer_entries))
-            peer_all_lids = sorted(set(int(e["local_layer_id"]) for e in peer_pv.buffer_entries))
-            self_lid_to_pos = {lid: i for i, lid in enumerate(self_all_lids)}
-            peer_lid_to_pos = {lid: i for i, lid in enumerate(peer_all_lids)}
-            # overlapping_layers are global IDs; map them to local_layer_ids
-            self_overlap_positions = [self_lid_to_pos[self_g2l[gid]] for gid in overlapping_layers]
-            peer_overlap_positions = [
-                peer_lid_to_pos[peer_g2l[gid]] for gid in overlapping_layers if gid in peer_g2l
-            ]
+            # Positions index the ptr array ``extract_slot`` builds, which is
+            # ordered by view offset.
+            self_gid_to_pos = {gid: i for i, gid in enumerate(self_global_ids)}
+            peer_gid_to_pos = {gid: i for i, gid in enumerate(peer_global_ids)}
+            self_overlap_positions = [self_gid_to_pos[gid] for gid in overlapping_layers]
+            peer_overlap_positions = [peer_gid_to_pos[gid] for gid in overlapping_layers]
             # Under contiguous PP partitioning, overlapping layers form a
             # contiguous block in the ptrs array.
             extra_kwargs["src_layer_off"] = (
@@ -424,6 +424,8 @@ class PeerRegistrar:
             peer_buffers_per_layer=peer_buffers_per_layer,
             self_lg=self_lg,
             peer_lg=peer_lg,
+            self_pv=self_pv,
+            peer_pv=peer_pv,
             **extra_kwargs,
         )
 
@@ -565,8 +567,8 @@ class PeerRegistrar:
         ``pool_idx`` indexes the layer group's ``pool_views`` list (one view
         per role class; several views may share a physical pool). Each view
         is kind-homogeneous, so ownership is a single per-view decision:
-        replicated views use one sender per fan-in group, sharded views
-        retain head-duplication routing.
+        replicated views use one sender per fan-in group (the policy returns
+        None for them), sharded views retain head-duplication routing.
 
         For mamba layer groups, ownership is based on mamba's own TP routing
         (independent of attention's duplicate-head logic):
@@ -575,12 +577,9 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
-        if pool_view.mapper_kind == MapperKind.REPLICATED:
-            return self._owns_tp_fan_in(peer_rank_info)
-
         # Delegate to the policy's should_send. None means fan-in election.
         policy = self._get_policy(layer_group.kind)
-        result = policy.should_send(peer_overlap, peer_rank_info)
+        result = policy.should_send(peer_overlap, peer_rank_info, mapper_kind=pool_view.mapper_kind)
         return self._owns_tp_fan_in(peer_rank_info) if result is None else result
 
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
