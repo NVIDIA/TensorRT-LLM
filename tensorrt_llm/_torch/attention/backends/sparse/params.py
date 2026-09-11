@@ -20,6 +20,31 @@ from typing import Literal, Optional
 import torch
 
 
+def use_self_sampling_gvr(
+    *,
+    enable_heuristic_topk: bool,
+    use_self_sampling_topk: bool,
+    index_topk: int | None,
+    compress_ratio: int,
+    is_cute_dsl_available: bool,
+    sm_version: int,
+) -> bool:
+    """Return whether the two-level dispatch picks the self-sampling engine.
+
+    Shared by the indexer (per-layer TopK construction) and the attention
+    metadata (prior-state allocation and warmup) so both sides of the
+    dispatch agree.
+    """
+    return (
+        enable_heuristic_topk
+        and use_self_sampling_topk
+        and is_cute_dsl_available
+        and sm_version in (100, 103)
+        and index_topk in (512, 1024, 2048)
+        and compress_ratio in (1, 4)
+    )
+
+
 class SparseParams:
     """Base parameters for a sparse attention backend."""
 
