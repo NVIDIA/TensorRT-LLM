@@ -1124,17 +1124,23 @@ class StorageManager:
         self,
         dst_lvl: CacheLevel,
         pages: TypedIndexList[PoolGroupIndex, TypedIndexList[CacheLevel, list[Page]]],
-    ) -> None:
+    ) -> int:
         """Dispatch page migration to the destination cache level.
 
         Args:
             dst_lvl: Destination cache level for pages currently in lower tiers.
             pages: Pages grouped by pool group and current cache level.
 
+        Returns:
+            How many pages it moved off the disk tier, counted per migrated batch rather than per
+            page. A raise reports nothing, which in practice means slot preparation failed before
+            anything moved.
+
         Raises:
             OutOfPagesError: If there are not enough pages available for the prefetch hint.
         """
         num_slots = filled_list(0, self.num_pool_groups)
+        disk_blocks_migrated = 0
         scheduled = list[Page]()
         try:
             for pg_idx, pg_pages in typed_enumerate(pages):
@@ -1155,6 +1161,11 @@ class StorageManager:
                 for lvl in typed_range(CacheLevel(dst_lvl + 1), self.num_cache_levels):
                     lvl_tasks = pg_tasks[lvl]
                     self._batched_migrate(pg_idx, dst_lvl, lvl, lvl_tasks, True)
+                    # Per batch, after it landed: the tasks are already grouped by source level, so
+                    # this costs nothing per page and never credits a batch that did not run.
+                    if self.cache_tiers[lvl] == CacheTier.DISK:
+                        disk_blocks_migrated += len(lvl_tasks)
         finally:
             for p in scheduled:
                 self.schedule_for_eviction(p)
+        return disk_blocks_migrated

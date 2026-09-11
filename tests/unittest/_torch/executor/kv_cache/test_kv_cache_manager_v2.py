@@ -1394,6 +1394,8 @@ def test_per_conversation_policy_retains_configured_number_of_turns(
 
         assert manager.prepare_context(request_a_probe)
         assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
+        probe_kv_cache = manager.kv_cache_map[request_a_probe.py_request_id]
+        assert list(probe_kv_cache.cached_tokens_by_level)[0] == 7
         _free_if_active(manager, request_a_probe)
 
         _run_context(manager, request_c)
@@ -1475,10 +1477,15 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         get_and_reset_iteration_stats=lambda: {},
         get_and_reset_ssm_snapshot_iteration_stats=lambda: {3: snapshot_delta},
         get_and_reset_iteration_suspend_resume_stats=lambda: (0, 0),
+        get_and_reset_iteration_disk_prefetch_blocks=lambda: 7,
+        get_and_reset_iteration_cached_tokens_by_level=lambda: [5, 2, 1],
+        get_and_reset_iteration_reused_blocks_by_level=lambda: {},
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
-    manager._get_and_reset_iteration_peak_block_stats = lambda _level: [None, None]
+    manager._get_and_reset_iteration_peak_block_stats_by_level = lambda num_levels: [
+        [None, None] for _ in range(num_levels)
+    ]
     manager._get_storage_statistics = lambda _level: [object(), object()]
     manager._build_pool_group_iteration_stats = lambda pool_group_id, *_args: pool_group_id
 
@@ -1490,6 +1497,91 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.pool_group_id == 1
     assert ssm_stats.snapshot_stats.iter_snapshot_hit_rate == 0.5
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
+    assert stats.disk_prefetch_blocks == 7
+    assert stats.cached_tokens_by_level == [5, 2, 1]
+
+
+def _make_admission_manager(
+    *,
+    is_estimating_kv_cache: bool = False,
+    overwrites_whole_cached_prefix: bool = False,
+) -> tuple[KVCacheManagerV2, SimpleNamespace]:
+    """Partial manager whose kv_cache_map already holds a cache for request 1.
+
+    Exercises the cached-token attribution branch of _prepare_context_impl without a GPU. The
+    attribution itself is staged inside the core; the manager only decides when to drop it.
+    """
+    manager = object.__new__(KVCacheManagerV2)
+    manager.conversation_manager = None
+    manager.enable_block_reuse = True
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager.is_draft = False
+    manager.kv_cache_type = CacheType.SELF
+    manager.is_estimating_kv_cache = is_estimating_kv_cache
+    manager._disagg_transfer_overwrites_whole_cached_prefix = lambda: overwrites_whole_cached_prefix
+    manager._resume_and_restore = lambda _req_id, _kv_cache: True
+    kv_cache = SimpleNamespace(
+        num_committed_tokens=7,
+        enable_swa_scratch_reuse=True,
+        drop_cached_token_attribution=Mock(),
+        drop_partial_block_cached_token_attribution=Mock(),
+    )
+    manager.kv_cache_map = {1: kv_cache}
+    return manager, kv_cache
+
+
+def test_prepare_context_keeps_cached_token_attribution_staged_by_the_core() -> None:
+    manager, kv_cache = _make_admission_manager()
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+
+    assert manager.prepare_context(request)
+
+    kv_cache.drop_cached_token_attribution.assert_not_called()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
+    assert request.prepopulated_prompt_len == 7
+
+
+def test_prepare_context_drops_cached_token_attribution_while_estimating() -> None:
+    manager, kv_cache = _make_admission_manager(is_estimating_kv_cache=True)
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+
+    assert manager.prepare_context(request)
+
+    kv_cache.drop_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
+
+
+def test_disagg_gen_init_drops_only_the_partial_block() -> None:
+    manager, kv_cache = _make_admission_manager()
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+
+    assert manager._prepare_context_impl(request)
+
+    kv_cache.drop_partial_block_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_cached_token_attribution.assert_not_called()
+
+
+def test_disagg_gen_init_drops_everything_when_the_transfer_overwrites_the_prefix() -> None:
+    manager, kv_cache = _make_admission_manager(overwrites_whole_cached_prefix=True)
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+
+    assert manager._prepare_context_impl(request)
+
+    kv_cache.drop_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
+
+
+def test_disagg_gen_init_drops_everything_in_gen_only_benchmark_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
+    manager, kv_cache = _make_admission_manager()
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1", is_disagg_generation_init_state=True)
+
+    assert manager._prepare_context_impl(request)
+
+    kv_cache.drop_cached_token_attribution.assert_called_once_with()
+    kv_cache.drop_partial_block_cached_token_attribution.assert_not_called()
 
 
 def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:

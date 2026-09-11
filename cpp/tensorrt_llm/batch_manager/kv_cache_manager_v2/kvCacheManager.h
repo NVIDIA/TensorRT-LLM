@@ -229,9 +229,17 @@ public:
     KVCacheStatsDelta getCommittedStats() const;
     IterationStatsByLifeCycle getAndResetIterationStats();
     PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
+    // Drain every level at once. The peaks are already tracked as one per-level record, so a
+    // caller that wants all of them should not take that record apart one level at a time.
+    PeakBlockStatsByCacheLevel getAndResetIterationPeakBlockStatsByLevel();
 
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();
+
+    // Per-cache-level split of the reuse block counts, committed alongside the scalar
+    // iteration stats so both views cover exactly the same requests.
+    void commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle);
+    ReusedBlocksByLevelByLifeCycle getAndResetIterationReusedBlocksByLevel();
 
     // Count one ACTIVE->SUSPENDED transition for the current iteration window.
     void recordRequestSuspended();
@@ -240,6 +248,19 @@ public:
     // counts; a freshly-created cache is activated by its first resume(), but
     // that is an admission, not a recovery, and is not counted.
     void recordRequestResumed();
+    // Add the blocks a prefetch call actually migrated off disk in the current iteration window.
+    // Independent of reuse-hit attribution, which asks where matched tokens lived rather than
+    // what a prefetch moved.
+    void recordDiskPrefetchBlocks(int64_t numBlocks);
+    // Return the number of disk-prefetched blocks since the last drain and reset it.
+    int64_t getAndResetIterationDiskPrefetchBlocks();
+    // Accumulate a request's initial current-residency cached-token attribution, indexed by cache
+    // level, into the current iteration window. Committed alongside the scalar iteration stats so
+    // both views cover exactly the same requests.
+    void commitCachedTokensByLevel(CountsByLevel const& counts);
+    // Return the per-cache-level cached-token counts accumulated since the last drain and reset
+    // them.
+    CountsByLevel getAndResetIterationCachedTokensByLevel();
     // Return {suspended, resumed} counts since the last drain and reset them.
     // Both counters track the same population, so the running
     // (suspended - resumed) total is the number of requests still parked in
@@ -360,11 +381,14 @@ private:
     KVCacheStatsDelta mCommittedStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
+    ReusedBlocksByLevelByLifeCycle mIterReusedBlocksByLevel;
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
     int64_t mIterSuspendedRequests{0};
     int64_t mIterResumedRequests{0};
+    int64_t mIterDiskPrefetchBlocks{0};
+    CountsByLevel mIterCachedTokensByLevel;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

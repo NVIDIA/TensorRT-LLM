@@ -2969,6 +2969,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _ple_conv_state_shape: list[int] = []
     _ple_ngram_context_shape: list[int] = []
 
+    def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
+        # The incoming recurrent state overwrites the whole local slot and summarizes the
+        # complete prefix, so none of those tokens count as a local cache hit.
+        return (self.local_num_mamba_layers > 0
+                or super()._disagg_transfer_overwrites_whole_cached_prefix())
+
     def __init__(
         self,
         # mamba cache parameters

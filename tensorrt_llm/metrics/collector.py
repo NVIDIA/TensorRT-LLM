@@ -45,6 +45,7 @@ class MetricsCollector:
             trtllm_prompt_tokens_total
             trtllm_generation_tokens_total
             trtllm_prompt_cached_tokens_total
+            trtllm_prompt_cache_hit_tokens_total
             trtllm_prompt_cached_tokens_per_request
             trtllm_spec_decode_drafted_tokens_total
             trtllm_spec_decode_accepted_tokens_total
@@ -66,6 +67,7 @@ class MetricsCollector:
             trtllm_kv_cache_gen_alloc_blocks_total
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
+            trtllm_kv_cache_disk_prefetch_blocks_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -102,6 +104,8 @@ class MetricsCollector:
             trtllm_kv_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
+    labelname_cache_level = "cache_level"
+    labelname_cache_tier = "cache_tier"
 
     def __init__(
         self,
@@ -291,6 +295,13 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
             labelnames=self.labels.keys())
+        self.kv_cache_disk_prefetch_blocks_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_prefetch_blocks_total",
+            documentation=(
+                "Process-lifetime total V2 KV-cache blocks migrated from disk "
+                "to host by the prefetch mechanism. "
+                "Resets only when the serving process restarts."),
+            labelnames=self.labels.keys())
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
             documentation=
@@ -415,8 +426,31 @@ class MetricsCollector:
         # Prompt cache hit tracking
         self.counter_tokens_cached_prompt = Counter(
             name=self.metric_prefix + "prompt_cached_tokens_total",
-            documentation="Total prompt tokens served from KV cache.",
+            documentation=(
+                "Process-lifetime total prompt tokens served from KV cache. "
+                "Resets only when the serving process restarts, not when the "
+                "KV cache is flushed or evicted."),
             labelnames=self.labels.keys())
+        self.counter_tokens_cached_prompt.labels(**self.labels)
+        self.labels_with_cache_level = {
+            **self.labels,
+            self.labelname_cache_level: "",
+            self.labelname_cache_tier: "",
+        }
+        self.counter_tokens_cached_prompt_by_tier = Counter(
+            name=self.metric_prefix + "prompt_cache_hit_tokens_total",
+            documentation=(
+                "Process-lifetime total prompt tokens served from each KV "
+                "cache level. Resets only when the serving process restarts, "
+                "not when the KV cache is flushed or evicted. cache_level is "
+                "the index into the configured tier list and cache_tier names "
+                "the memory backing it, so a deployment with a hot and a cold "
+                "GPU level reports them as two series sharing the gpu name. "
+                "Pages already prefetched from disk to host count as host."),
+            labelnames=self.labels_with_cache_level.keys())
+        # The configured levels are only known once stats arrive; children are created then so
+        # that zero-valued levels are still visible before their first cache hit.
+        self._registered_cache_levels = False
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -535,11 +569,41 @@ class MetricsCollector:
         # Convenience function for logging to histogram.
         histogram.labels(**self.labels).observe(data)
 
+    def _cache_level_labels(self, level: int,
+                            level_tiers: Optional[List[str]]) -> Dict[str, str]:
+        tier = level_tiers[level] if level_tiers and level < len(
+            level_tiers) else ""
+        return {
+            self.labelname_cache_level: str(level),
+            self.labelname_cache_tier: tier,
+        }
+
+    def _log_cached_tokens_by_level(self, counts: Optional[List[int]],
+                                    level_tiers: Optional[List[str]]) -> None:
+        """Log cached prompt tokens for each configured cache level.
+
+        The level count comes from the engine's tier list, so the series are created on the
+        first stats report rather than at construction time.
+        """
+        if not counts:
+            return
+        if not self._registered_cache_levels:
+            for level in range(len(counts)):
+                self.counter_tokens_cached_prompt_by_tier.labels(
+                    **self.labels,
+                    **self._cache_level_labels(level, level_tiers))
+            self._registered_cache_levels = True
+        for level, count in enumerate(counts):
+            if count > 0:
+                self._log_counter(self.counter_tokens_cached_prompt_by_tier,
+                                  self._cache_level_labels(level, level_tiers),
+                                  count)
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
 
-    def log_request_metrics_dict(self, metrics_dict: dict[str, float]) -> None:
+    def log_request_metrics_dict(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -553,6 +617,7 @@ class MetricsCollector:
         - histogram_inference_time_request
         - counter_prompt_tokens
         - counter_generation_tokens
+        - counter_tokens_cached_prompt
 
         Args:
             metrics_dict: A dictionary containing request metrics with the following expected keys:
@@ -567,6 +632,8 @@ class MetricsCollector:
                 - `MetricNames.INFERENCE_TIME` (float): Total inference duration in seconds.
                 - `MetricNames.PROMPT_TOKENS` (int): Number of input tokens.
                 - `MetricNames.GENERATION_TOKENS` (int): Number of output tokens.
+                - `MetricNames.PROMPT_CACHE_CACHED_TOKENS` (int): Number of prompt tokens served
+                  from KV cache.
 
         Returns:
             None: Metrics are logged to Prometheus; nothing is returned.
@@ -799,6 +866,15 @@ class MetricsCollector:
 
         # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
         # storage/transfer counters by pool group; legacy V1 uses window stats.
+        disk_prefetch_blocks = iteration_stats.get("iterDiskPrefetchBlocks", 0)
+        if disk_prefetch_blocks > 0:
+            self._log_counter(self.kv_cache_disk_prefetch_blocks_total, {},
+                              disk_prefetch_blocks)
+
+        self._log_cached_tokens_by_level(
+            iteration_stats.get("iterCachedTokensByLevel"),
+            iteration_stats.get("kvCacheLevelTiers"))
+
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(
             "kvCacheIterationStatsByLifecycle")
