@@ -1619,7 +1619,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly)
+                bool textOnly, int rebalanceMinSampledKvCaches, double rebalanceCooldownSecs,
+                int rebalanceTargetRatioUpdateInterval, float rebalanceRatioThreshold,
+                double rebalanceMovingAverageDecay)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1642,6 +1644,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
+                cfg->rebalanceMinSampledKvCaches = rebalanceMinSampledKvCaches;
+                cfg->rebalanceCooldownSecs = rebalanceCooldownSecs;
+                cfg->rebalanceTargetRatioUpdateInterval = rebalanceTargetRatioUpdateInterval;
+                cfg->rebalanceRatioThreshold = rebalanceRatioThreshold;
+                cfg->rebalanceMovingAverageDecay = rebalanceMovingAverageDecay;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1651,7 +1658,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_match_backoff") = 0, nb::arg("typical_step") = std::nullopt,
             nb::arg("constraints") = std::vector<kv::BatchDesc>{}, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
-            nb::arg("enable_stats") = true, nb::arg("text_only") = false)
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false,
+            nb::arg("rebalance_min_sampled_kv_caches") = 2000, nb::arg("rebalance_cooldown_secs") = 120.0,
+            nb::arg("rebalance_target_ratio_update_interval") = 100, nb::arg("rebalance_ratio_threshold") = 1.25f,
+            nb::arg("rebalance_moving_average_decay") = 0.9999)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1666,6 +1676,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
+        .def_rw("rebalance_min_sampled_kv_caches", &kv::KVCacheManagerConfig::rebalanceMinSampledKvCaches)
+        .def_rw("rebalance_cooldown_secs", &kv::KVCacheManagerConfig::rebalanceCooldownSecs)
+        .def_rw("rebalance_target_ratio_update_interval", &kv::KVCacheManagerConfig::rebalanceTargetRatioUpdateInterval)
+        .def_rw("rebalance_ratio_threshold", &kv::KVCacheManagerConfig::rebalanceRatioThreshold)
+        .def_rw("rebalance_moving_average_decay", &kv::KVCacheManagerConfig::rebalanceMovingAverageDecay)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 

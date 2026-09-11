@@ -305,6 +305,20 @@ struct KVCacheManagerConfig
     // Collect V2 KV cache allocation, reuse, and transfer statistics.
     bool enableStats = true;
 
+    // ---- Pool rebalancing tuning (see KvCacheManager::needAdjustment / adjust) -------------
+    // Minimum number of sampled (closed) KvCaches observed before rebalancing is considered.
+    int rebalanceMinSampledKvCaches = 2000;
+    // Minimum time, in seconds, between successive rebalancing adjustments.
+    double rebalanceCooldownSecs = 120.0;
+    // Number of newly sampled KvCaches between recomputations of the target pool ratios.
+    int rebalanceTargetRatioUpdateInterval = 100;
+    // Relative deviation between current and target pool-group ratios that triggers a
+    // rebalance (e.g. 1.25 means a >25% deviation in either direction triggers adjustment).
+    float rebalanceRatioThreshold = 1.25f;
+    // Decay factor for the exponential moving averages (reused length, capacity, history
+    // length) used to compute target pool ratios. Higher values react more slowly to change.
+    double rebalanceMovingAverageDecay = 0.9999;
+
     // Deployment-level guarantee that no request carries multi-modal content, so token
     // sequences never contain digests. Lets block-key hashing take the digest-free fast
     // path without scanning. A per-KvCache text_only override may only tighten this

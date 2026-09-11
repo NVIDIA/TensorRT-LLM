@@ -2295,6 +2295,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
+            rebalance_min_sampled_kv_caches=kv_cache_config.kv_pool_rebalance_min_sampled_kv_caches,
+            rebalance_cooldown_secs=kv_cache_config.kv_pool_rebalance_cooldown_secs,
+            rebalance_target_ratio_update_interval=kv_cache_config.kv_pool_rebalance_target_ratio_update_interval,
+            rebalance_ratio_threshold=kv_cache_config.kv_pool_rebalance_ratio_threshold,
+            rebalance_moving_average_decay=kv_cache_config.kv_pool_rebalance_moving_average_decay,
         )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:

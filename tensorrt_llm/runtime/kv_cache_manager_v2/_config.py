@@ -17,6 +17,7 @@
 # block index, but different base address.
 # As the ratio between KV data size and KV block scale size is fixed, we can simply use a pool with
 # smaller block size and the same number of blocks for block scale.
+import math
 import os
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -270,6 +271,34 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
+    rebalance_min_sampled_kv_caches: int = 2000
+    """
+    Minimum number of sampled (closed) KvCaches observed before pool rebalancing is
+    considered.
+    """
+
+    rebalance_cooldown_secs: float = 120.0
+    """
+    Minimum time, in seconds, between successive pool rebalancing adjustments.
+    """
+
+    rebalance_target_ratio_update_interval: int = 100
+    """
+    Number of newly sampled KvCaches between recomputations of the target pool ratios.
+    """
+
+    rebalance_ratio_threshold: float = 1.25
+    """
+    Relative deviation between current and target pool-group ratios that triggers a
+    rebalance (e.g. 1.25 means a >25% deviation in either direction triggers adjustment).
+    """
+
+    rebalance_moving_average_decay: float = 0.9999
+    """
+    Decay factor for the exponential moving averages (reused length, capacity, history
+    length) used to compute target pool ratios. Higher values react more slowly to change.
+    """
+
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self.swa_scratch_reuse is not None
@@ -289,3 +318,10 @@ class KVCacheManagerConfig:
             assert self.commit_min_snapshot, (
                 "commit_min_snapshot must be True when SSM layers are present"
             )
+        assert self.rebalance_min_sampled_kv_caches >= 0
+        assert math.isfinite(self.rebalance_cooldown_secs) and self.rebalance_cooldown_secs >= 0
+        assert self.rebalance_target_ratio_update_interval > 0
+        assert (
+            math.isfinite(self.rebalance_ratio_threshold) and self.rebalance_ratio_threshold > 1.0
+        )
+        assert 0.0 < self.rebalance_moving_average_decay < 1.0

@@ -283,7 +283,7 @@ class KVCacheManager:
         radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         self._storage = storage
         self._radix_tree = radix_tree
-        decay = 0.9999
+        decay = config.rebalance_moving_average_decay
         self._avg_reused_length = MovingAverage(decay)
         self._avg_sqr_capacity = MovingAverage(decay)
         self._avg_sqr_history_length = MovingAverage(decay)
@@ -894,10 +894,13 @@ class KVCacheManager:
         ) -> bool:
             return any(not (1 / thres < x / y < thres) for x, y in zip(a, b, strict=True))
 
+        threshold = self._init_config.rebalance_ratio_threshold
         if level == GPU_LEVEL:
-            return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, 1.25)
+            return check_mismatch(self._target_ratio_list_gpu, self._current_gpu_ratio, threshold)
         else:
-            return check_mismatch(self._target_ratio_list_other, self._current_other_ratios, 1.25)
+            return check_mismatch(
+                self._target_ratio_list_other, self._current_other_ratios, threshold
+            )
 
     def _adjust_level(self, level: CacheLevel, new_quota: int | None = None) -> None:
         new_ratio_list = self._get_target_ratio_list(level)
@@ -931,9 +934,12 @@ class KVCacheManager:
 
     @property
     def need_adjustment(self) -> bool:
-        if self._num_sampled_kv_caches < 2000:
+        if self._num_sampled_kv_caches < self._init_config.rebalance_min_sampled_kv_caches:
             return False
-        if time.monotonic() - self._last_adjustment_time < 120:
+        if (
+            time.monotonic() - self._last_adjustment_time
+            < self._init_config.rebalance_cooldown_secs
+        ):
             return False
         return self._need_adjustment(GPU_LEVEL) or self._need_adjustment(
             CacheLevel(self._storage.num_cache_levels - 1)
@@ -955,7 +961,10 @@ class KVCacheManager:
         self._last_adjustment_time = time.monotonic()
 
     def _try_update_target_ratios(self) -> None:
-        if self._num_sampled_kv_caches - self._last_update_num_sampled_kv_caches < 100:
+        if (
+            self._num_sampled_kv_caches - self._last_update_num_sampled_kv_caches
+            < self._init_config.rebalance_target_ratio_update_interval
+        ):
             return
         self._last_update_num_sampled_kv_caches = self._num_sampled_kv_caches
         tokens_per_block = self.tokens_per_block

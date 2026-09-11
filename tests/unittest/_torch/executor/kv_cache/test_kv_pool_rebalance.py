@@ -174,6 +174,39 @@ def _make_request(req_id: int) -> MagicMock:
 
 
 # --------------------------------------------------------------------------- #
+# Constructor validation
+# --------------------------------------------------------------------------- #
+
+
+class TestKvPoolRebalanceCheckIntervalValidation:
+    """``kv_pool_rebalance_check_interval`` must be validated before it can
+
+    reach the ``iter_counter % self._rebalance_check_interval`` modulo in
+    ``_can_pause_for_rebalance``, where a non-positive value would raise
+    ``ZeroDivisionError`` (or silently mis-throttle, for a negative value)
+    deep inside the executor loop instead of failing fast at construction.
+
+    The check is the first statement in ``PyExecutor.__init__`` -- before any
+    CUDA or dependency access -- specifically so it can be exercised here as
+    an unbound call with placeholder positional args that are never touched.
+    """
+
+    @pytest.mark.parametrize("bad_interval", [0, -1])
+    def test_non_positive_interval_raises_before_construction(self, bad_interval):
+        with pytest.raises(ValueError, match="kv_pool_rebalance_check_interval"):
+            PyExecutor.__init__(
+                MagicMock(spec=PyExecutor),
+                resource_manager=None,
+                scheduler=None,
+                model_engine=None,
+                sampler=None,
+                dist=None,
+                max_num_sequences=1,
+                kv_pool_rebalance_check_interval=bad_interval,
+            )
+
+
+# --------------------------------------------------------------------------- #
 # Gate tests
 # --------------------------------------------------------------------------- #
 

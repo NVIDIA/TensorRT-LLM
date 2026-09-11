@@ -885,6 +885,48 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_check_interval"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_cooldown_secs"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_min_sampled_kv_caches"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_moving_average_decay"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_ratio_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_target_ratio_update_interval"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",
