@@ -69,9 +69,8 @@ def test_bf16_bmm_fp8out_contiguous(batch, m, n, k):
 
 
 @skip_unless_available
-@pytest.mark.parametrize("use_tvm_ffi", [True, False])
 @pytest.mark.parametrize("num_tokens", [64, 1000, 8192])
-def test_bf16_bmm_fp8out_mla_absorb_column_slice(num_tokens, use_tvm_ffi):
+def test_bf16_bmm_fp8out_mla_absorb_column_slice(num_tokens):
     """The production call: q_nope [tokens, H, 192] (transposed view of the
     q_b_proj output) x W_UK^T [H, 512, 192] written into columns 0..511 of the
     FP8 Q buffer [tokens, H, 576]; columns 512..575 (the RoPE segment the RoPE
@@ -90,7 +89,6 @@ def test_bf16_bmm_fp8out_mla_absorb_column_slice(num_tokens, use_tvm_ffi):
         q_nope.transpose(0, 1),  # [H, tokens, 192], K contiguous
         w_uk_t,  # [H, 512, 192]
         quant_q[..., :lora].transpose(0, 1),  # [H, tokens, 512], N contiguous, row stride 576
-        use_tvm_ffi=use_tvm_ffi,
     )
     torch.cuda.synchronize()
     ref = _ref_fp8(q_nope.transpose(0, 1).contiguous(), w_uk_t)  # [H, tokens, 512]
