@@ -28,6 +28,7 @@ Welcome to TensorRT LLM's Documentation!
    examples/dynamo_k8s_example.rst
    deployment-guide/index.rst
    deployment-guide/configuring-cpu-affinity.md
+   deployment-guide/prefix-tokenization-cache.md
 
 .. toctree::
    :maxdepth: 2
