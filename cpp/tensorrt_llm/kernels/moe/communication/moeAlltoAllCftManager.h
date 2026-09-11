@@ -48,7 +48,7 @@
 #include <thread>
 #include <vector>
 
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllCftSupport.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
 
 #if TLLM_CFT_HAS_CUDA_13_4_SUPPORT
 // Function pointer types matching real CUDA 13.4 LE API signatures

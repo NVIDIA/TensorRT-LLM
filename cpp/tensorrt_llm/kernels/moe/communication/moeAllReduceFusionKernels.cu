@@ -17,7 +17,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/common/tllmDataType.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
