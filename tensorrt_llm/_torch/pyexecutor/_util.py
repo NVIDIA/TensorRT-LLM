@@ -62,11 +62,10 @@ from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
-                                           CppMambaHybridCacheManager,
-                                           MambaHybridCacheManagerV2,
-                                           MixedMambaHybridCacheManager,
-                                           use_py_mamba_cache_manager)
+from .kv_cache.mamba_cache_manager import (
+    BaseMambaCacheManager, CppMambaHybridCacheManager,
+    MambaHybridCacheManagerV2, MixedMambaHybridCacheManager,
+    _get_num_cuda_graph_padding_dummy_slots, use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -2569,6 +2568,12 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        if is_draft and not issubclass(kv_cache_manager_cls,
+                                       MambaHybridCacheManagerV2):
+            manager_extra_kwargs["num_reserved_index_slots"] = (
+                _get_num_cuda_graph_padding_dummy_slots(spec_config,
+                                                        max_batch_size) +
+                int(mapping.enable_attention_dp))
         # V2 builds the block-reuse cache key of a multimodal token run from
         # the vocabulary size. Resolve it here rather than per-branch: the
         # manager needs it whenever block reuse can meet multimodal input,
