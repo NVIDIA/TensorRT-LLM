@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/fusedMoeCommKernels.h"
 
 using namespace tensorrt_llm::kernels;
 

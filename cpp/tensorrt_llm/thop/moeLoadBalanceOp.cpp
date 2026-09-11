@@ -25,7 +25,7 @@
 #include <c10/util/intrusive_ptr.h> // for c10::make_intrusive#include <torch/extension.h>
 #include <vector>
 
-#include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/runtime/moeLoadBalancer/moeLoadBalancer.h"
 

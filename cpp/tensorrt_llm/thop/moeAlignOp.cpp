@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/kernels/moeAlignKernels.h"
+#include "tensorrt_llm/kernels/moe/utils/moeAlignKernels.h"
 #include "thUtils.h"
 #include <torch/extension.h>
 

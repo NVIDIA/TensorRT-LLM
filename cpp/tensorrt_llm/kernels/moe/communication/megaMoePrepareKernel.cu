@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/megaMoePrepareKernel.h"
+#include "tensorrt_llm/kernels/moe/communication/megaMoePrepareKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 #include <algorithm>

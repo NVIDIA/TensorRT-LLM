@@ -21,8 +21,8 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
-#include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
 #include "tensorrt_llm/kernels/ll128Proto.cuh"
+#include "tensorrt_llm/kernels/moe/communication/fusedMoeCommKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 TRTLLM_NAMESPACE_BEGIN

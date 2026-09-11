@@ -21,7 +21,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
 
 namespace cg = cooperative_groups;
 

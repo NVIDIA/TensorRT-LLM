@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-#include "moeTopKFuncs.cuh"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/archCondition.h"
-#include "tensorrt_llm/kernels/customMoeRoutingKernels.h"
+#include "tensorrt_llm/kernels/moe/routing/customMoeRoutingKernels.h"
+#include "tensorrt_llm/kernels/moeTopKFuncs.cuh"
 #include <climits> // For INT_MAX
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
