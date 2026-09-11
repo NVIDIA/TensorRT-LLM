@@ -1707,8 +1707,24 @@ class TestDisagg:
         target_mgr.prepare_disagg_gen_init.assert_called_once_with(req)
         draft_mgr._prepare_draft_disagg_gen_init.assert_called_once_with(req)
 
-    def test_disagg_draft_admission_failure_rolls_back_both_pools(self):
-        target_mgr = make_kv_cache_manager()
+    def test_disagg_draft_admission_failure_rolls_back_both_pools(self) -> None:
+        # Model a one-slot target pool so request 1 fits only if request 0's
+        # failed joint admission releases its target reservation.
+        target_slot_in_use = False
+
+        def prepare_target(_req: object) -> bool:
+            nonlocal target_slot_in_use
+            if target_slot_in_use:
+                return False
+            target_slot_in_use = True
+            return True
+
+        def release_target_slot(_req: object) -> None:
+            nonlocal target_slot_in_use
+            target_slot_in_use = False
+
+        target_mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_target)
+        target_mgr.suspend_request.side_effect = release_target_slot
         draft_mgr = make_kv_cache_manager(
             prepare_draft_disagg_gen_init_fn=lambda req: req.request_id == 1,
             is_draft=True,
@@ -1722,6 +1738,7 @@ class TestDisagg:
         assert target_mgr.prepare_disagg_gen_init.call_args_list == [call(reqs[0]), call(reqs[1])]
         target_mgr.suspend_request.assert_called_once_with(reqs[0])
         draft_mgr.suspend_request.assert_called_once_with(reqs[0])
+        assert target_slot_in_use
 
     def test_disagg_target_admission_failure_does_not_touch_draft(self):
         target_mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=lambda req: False)
