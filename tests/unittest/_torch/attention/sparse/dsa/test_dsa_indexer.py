@@ -4825,3 +4825,52 @@ def test_topk_indices_buffer_cuda_graph():
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "use_self_sampling,k_dtype,use_dsl_scorer,expected",
+    [
+        (True, "fp4", True, True),  # self-sampling + FP4 + DSL scorer: armed
+        (True, "fp4", False, False),  # DeepGEMM scorer emits no block maxima
+        (True, "fp8", True, False),  # FP8 indexer: not wired
+        (False, "fp4", True, False),  # temporal (V1) path has its own emission tiers
+    ],
+)
+def test_indexer_gvr_block_skip_dispatch(use_self_sampling, k_dtype, use_dsl_scorer, expected):
+    """The self-sampling block-max skip is armed exactly on FP4 layers with the
+    DSL paged-MQA scorer under the self-sampling engine; the per-geometry
+    dispatch check picks the streaming families only."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=1024,
+        indexer_k_dtype=k_dtype,
+        use_cute_dsl_paged_mqa_logits=use_dsl_scorer,
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=use_self_sampling,
+    )
+    assert sparse_config.to_sparse_params().use_gvr_block_skip is True
+    assert sparse_config.to_sparse_metadata_params().use_gvr_block_skip is True
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
+            return_value=100,
+        ),
+    ):
+        indexer = create_indexer(sparse_config)
+    assert indexer.use_gvr_block_skip is expected
+    if expected:
+        # 128 rows at a 1M-token envelope: single-CTA streaming main
+        assert indexer._block_skip_useful(128, 262144)
+        # 32 rows at 1M: cluster family, measured as a loss
+        assert not indexer._block_skip_useful(32, 262144)
+        # 1 row at 1M: multi-CTA SPLIT main, not worth the extra round trip
+        assert not indexer._block_skip_useful(1, 262144)
+        # 8 rows at 64k: register family, block maxima unused
+        assert not indexer._block_skip_useful(8, 16384)

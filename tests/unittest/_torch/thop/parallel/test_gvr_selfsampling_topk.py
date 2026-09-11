@@ -1793,3 +1793,198 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan():
         ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
         torch.cuda.synchronize()
         _check_prefill_exact(lg, out, rs, re, k)
+
+
+# ---------------------------------------------------------------------------
+# block-max skip (streaming families gate their row scan by per-32-position
+# maxima; register families ignore the tensor)
+# ---------------------------------------------------------------------------
+def _host_block_max(logits, kv_lens, next_n, compress_ratio, grain=32):
+    """Reference of the FP4 indexer epilogue's block_max record: entry j = max
+    over positions [32j, 32j+32) of the row's valid prefix, -FLT_MAX beyond."""
+    rows, npad = logits.shape
+    nb = (npad + grain - 1) // grain
+    x = torch.full((rows, nb * grain), float("-inf"), dtype=torch.float32, device=logits.device)
+    x[:, :npad] = logits
+    lengths = kv_lens.tolist()
+    for row in range(rows):
+        valid = max(lengths[row // next_n] - next_n + row % next_n + 1, 0) // compress_ratio
+        x[row, min(valid, npad) :] = float("-inf")
+    return torch.clamp(
+        x.view(rows, nb, grain).amax(2), min=torch.finfo(torch.float32).min
+    ).contiguous()
+
+
+def _check_varlen_against_reference(lg, out, ref, tag=""):
+    for r in range(lg.shape[0]):
+        if (ref[r] >= 0).any():
+            row = lg[r].float()
+            got = row[out[r].long().clamp_min(0)].sort().values
+            want = row[ref[r].long().clamp_min(0)].sort().values
+            assert torch.equal(got, want), f"{tag} row {r} value multiset mismatch"
+            assert torch.equal(out[r] < 0, ref[r] < 0), f"{tag} row {r} pad mask mismatch"
+        else:
+            assert torch.equal(out[r], ref[r]), f"{tag} row {r} expected all -1"
+
+
+@pytest.mark.parametrize(
+    "rows,msl_c,k,family,dist",
+    [
+        (128, 65536, 1024, "main", "randn"),  # single-CTA streaming main
+        (128, 65536, 1024, "main", "spiky"),  # candidates concentrated in a few blocks
+        (128, 65536, 512, "main", "ties"),  # integer plateaus: many exact ties
+        (32, 131072, 1024, "clus", "randn"),  # 4-CTA cluster
+        (64, 131072, 512, "clus", "relu"),  # 2-CTA cluster, indexer-like zero plateau
+        (4, 262144, 1024, "main", "randn"),  # SPLIT main (R=37): skip is legal, just not useful
+        (8, 32768, 1024, "reg_clus", "randn"),  # register family: block_max ignored
+    ],
+    ids=lambda v: str(v) if not isinstance(v, str) else v,
+)
+def test_selfsampling_block_skip_exact(rows, msl_c, k, family, dist):
+    """With the scorer's block maxima the streaming engines must stay tie-aware
+    exact (the skipped blocks cannot hold a candidate), including an
+    over-estimated block_max (still a valid upper bound), heterogeneous row
+    lengths with short / zero-window rows (next_n=4), and rows whose
+    candidates sit in a handful of blocks."""
+    nn, cr = 4, 4
+    npad = msl_c
+    plan = ss_host.route(rows, msl_c, npad, k)
+    assert plan["kernel"] == family, plan["kernel"]
+    torch.manual_seed(rows * 31 + msl_c // 1024 + k)
+    lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
+    if dist == "spiky":
+        lg.mul_(0.05)
+        for r in range(rows):
+            for j in torch.randint(0, npad // 32, (12,)).tolist():
+                lg[r, j * 32 : j * 32 + 32] += 5.0
+    elif dist == "ties":
+        lg.copy_(torch.randint(0, 40, (rows, npad), device=_DEV).float())
+    elif dist == "relu":
+        lg.copy_(torch.relu(lg * 2.0 - 1.0))
+        lg[:, : npad // 3] = 0.0
+    batch = rows // nn
+    lens = [msl_c * cr, 900, nn - 1, msl_c * cr // 2, 40000, 200000, msl_c * cr - 4 * 33]
+    kv = torch.tensor([lens[i % len(lens)] for i in range(batch)], dtype=torch.int32, device=_DEV)
+    bm = _host_block_max(lg, kv, nn, cr)
+    ref = _reference_varlen_indices(lg, kv, nn, cr, k)
+    for tag, bmx in (("bmax", bm), ("bmax+0.5", bm + 0.5)):
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(
+            lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bmx
+        )
+        torch.cuda.synchronize()
+        _check_varlen_against_reference(lg, out, ref, tag)
+    key = (*_varlen_cache_key(rows, npad, k, msl_c, nn, cr), "skip")
+    assert ss_host._VARLEN_CACHE[key][0] == family, ss_host._VARLEN_CACHE[key][0]
+    # the dense engine is a separate cache entry and stays untouched
+    out_d = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out_d, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out_d, ref, "dense")
+    assert _varlen_cache_key(rows, npad, k, msl_c, nn, cr) in ss_host._VARLEN_CACHE
+
+
+def test_selfsampling_block_skip_beyond_table_runs_dense():
+    """Rows longer than the skip table (262144 compressed positions) fall back
+    to the dense scan inside the kernel and stay exact."""
+    rows, msl_c, k, cr = 64, 270336, 1024, 4  # 264 blocks of 1024 past the 8192-block table
+    torch.manual_seed(5)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+    bm = _host_block_max(lg, kv, 1, cr)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+    )
+    torch.cuda.synchronize()
+    ref_v = torch.topk(lg, k, dim=1).values.sort(dim=1).values
+    got = lg.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+    assert torch.equal(got, ref_v)
+
+
+def test_selfsampling_block_skip_cuda_graph():
+    """The skipping engines must be CUDA-graph capturable (warmed engine,
+    capture one launch, replay twice, exact each time), for the single-CTA
+    main and the cluster family."""
+    cr = 4
+    for rows, msl_c, k in ((128, 65536, 1024), (32, 131072, 1024)):
+        torch.manual_seed(rows)
+        lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+        kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+        bm = _host_block_max(lg, kv, 1, cr)
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(
+            lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+        )
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        out.fill_(-7)
+        with torch.cuda.graph(g):
+            ss_host.run_varlen(
+                lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm
+            )
+        ref_v = torch.topk(lg, k, dim=1).values.sort(dim=1).values
+        for _ in range(2):
+            out.fill_(-7)
+            g.replay()
+            torch.cuda.synchronize()
+            got = lg.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+            assert torch.equal(got, ref_v)
+
+
+def test_selfsampling_block_skip_guards():
+    """block_max contract violations raise instead of silently running dense."""
+    rows, msl_c, k, cr = 128, 65536, 1024, 4
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    bm = _host_block_max(lg, kv, 1, cr)
+    with pytest.raises(RuntimeError, match="float32"):
+        ss_host.run_varlen(
+            lg, kv, out, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm.half()
+        )
+    with pytest.raises(RuntimeError, match="num_rows"):
+        ss_host.run_varlen(lg, kv, out, compress_ratio=cr, max_seq_len=msl_c * cr, block_max=bm[:8])
+    with pytest.raises(RuntimeError, match="covers"):
+        ss_host.run_varlen(
+            lg,
+            kv,
+            out,
+            compress_ratio=cr,
+            max_seq_len=msl_c * cr,
+            block_max=bm[:, :16].contiguous(),
+        )
+
+
+def test_selfsampling_block_skip_useful_families():
+    """The glue arms the skip only where it measured a win: the single-CTA
+    streaming main at envelopes of >= 512k raw tokens; shorter envelopes, the
+    cluster family, the register families and the multi-CTA SPLIT main are
+    excluded."""
+    k = 1024
+    assert ss_host.block_skip_useful(128, 131072, k, 131072)  # main R=1, 512k
+    assert ss_host.block_skip_useful(128, 262144, k, 262144)  # main R=1, 1M
+    assert not ss_host.block_skip_useful(128, 65536, k, 65536)  # main R=1 but 256k
+    assert not ss_host.block_skip_useful(64, 131072, k, 131072)  # clus cs=2
+    assert not ss_host.block_skip_useful(32, 262144, k, 262144)  # clus cs=4
+    assert not ss_host.block_skip_useful(1, 262144, k, 262144)  # SPLIT main R=64
+    assert not ss_host.block_skip_useful(8, 65536, k, 65536)  # reg_clus
+    assert not ss_host.block_skip_useful(1, 16384, k, 16384)  # reg
+
+
+def test_selfsampling_warmup_block_skip_populates_launchers():
+    """warmup_varlen(block_skip=True) compiles the skipping engines and fills
+    the tagged launcher keys the serving path looks up under capture."""
+    k, msl_c, cr = 1024, 65536, 4
+    ss_host.warmup_varlen(
+        k,
+        msl_c * cr,
+        compress_ratio=cr,
+        next_n=1,
+        num_rows_list=(128,),
+        row_stride=msl_c,
+        block_skip=True,
+    )
+    key = (*_varlen_cache_key(128, msl_c, k, msl_c, 1, cr), "skip")
+    assert key in ss_host._VARLEN_CACHE
+    assert ss_host._VARLEN_CACHE[key][0] == "main"

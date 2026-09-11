@@ -784,10 +784,54 @@ class Indexer(nn.Module):
             and self.use_cute_dsl_paged_mqa_logits
             and self.use_fp4
         )
+        # Block-max skip for the self-sampling engine (FP4 + DSL scorer): the
+        # epilogue emits per-32-position maxima and the single-CTA streaming
+        # top-k skips the blocks below its sampled line. Armed per launch
+        # geometry (large batch at >= 512k-token envelopes, where the row scan
+        # is bandwidth-bound; see gvr_topk_decode_self_sampling_host.block_skip_useful).
+        self.use_gvr_block_skip = (
+            getattr(sparse_params, "use_gvr_block_skip", True)
+            and self._use_self_sampling_topk
+            and decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
+            and self.use_cute_dsl_paged_mqa_logits
+            and self.use_fp4
+        )
+        self._gvr_block_skip_cache: dict = {}
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
+
+    def _block_skip_useful(self, num_rows: int, max_seq_len_c: int) -> bool:
+        """Cached pure-host dispatch check: does the self-sampling engine's
+        family for this geometry (rows, DSL arena row stride, k, envelope)
+        gate its row scan by block maxima?"""
+        key = (int(num_rows), int(max_seq_len_c))
+        hit = self._gvr_block_skip_cache.get(key)
+        if hit is None:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host import (
+                _device_profile_key,
+                _unpack_device_profile,
+                block_skip_useful,
+            )
+
+            npad = (int(max_seq_len_c) + 255) // 256 * 256  # DSL paged-MQA arena row stride
+            # the engine routes on the device's SM count / architecture too
+            num_sms, sm_version = _unpack_device_profile(
+                _device_profile_key(torch.cuda.current_device())
+            )
+            hit = bool(
+                block_skip_useful(
+                    int(num_rows),
+                    npad,
+                    int(self.index_topk),
+                    int(max_seq_len_c),
+                    num_sms,
+                    sm_version,
+                )
+            )
+            self._gvr_block_skip_cache[key] = hit
+        return hit
 
     def cache_derived_state(self) -> None:
         """Fuse wk and weights_proj for F.linear with TF32 tensor cores on Ampere+."""
@@ -1763,6 +1807,17 @@ class Indexer(nn.Module):
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
                 gvr_emit_kwargs: dict = {}
+                gvr_block_max = None
+                if (
+                    self.use_gvr_block_skip
+                    and metadata.gvr_block_max is not None
+                    and not dsl_atom_split
+                    and self._block_skip_useful(num_gen_tokens, indexer_max_seq_len)
+                ):
+                    gvr_block_max = metadata.gvr_block_max[:num_gen_tokens]
+                    gvr_emit_kwargs = dict(
+                        emit_block_meta=True, emit_hit_stats=False, block_max_out=gvr_block_max
+                    )
                 # emitting for a step the Top-K cannot consume only churns
                 # the closed-loop state, so gate on the consumable shape
                 if (
@@ -1884,6 +1939,8 @@ class Indexer(nn.Module):
             )
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
+            if gvr_block_max is not None:
+                gvr_ext_kwargs = dict(gvr_ext_kwargs or {}, gvr_block_max=gvr_block_max)
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
