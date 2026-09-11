@@ -5,7 +5,8 @@ build
 colored
 cuda-python>=13
 # Diffusers 0.40 is required for MiniMax H3 support.
-diffusers>=0.40.0
+# Recheck H3's experimental modular imports before lifting the minor-version cap.
+diffusers>=0.40.0,<0.41
 safetensors>=0.8.0
 ftfy
 lark
