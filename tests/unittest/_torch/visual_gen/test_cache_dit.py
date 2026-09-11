@@ -4,8 +4,8 @@
 """Tests for Cache-DiT in visual generation.
 
 Wan 2.2 step-split logic is covered with small CPU-side tests. Wan, FLUX, and LTX-2
-integration tests run on GPU only when cache_dit is installed, CUDA is available, and
-checkpoints can be resolved (TRTLLM_CACHE_DIT_* env vars or the fallbacks inside each test).
+integration tests run on GPU only when cache_dit is installed and CUDA is available; the
+checkpoints they need are resolved under LLM_MODELS_ROOT and fail loudly when unavailable.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import logging
-import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import split_wan22_inference_steps
 
@@ -38,113 +38,11 @@ requires_cuda = pytest.mark.skipif(
     reason="CUDA not available",
 )
 
-_WAN_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
-_FLUX_SUBPATH = "FLUX.1-dev"
-_QWEN_IMAGE_SUBPATH = "qwen-image"
-_LTX2_DIR = "LTX-2"
-_LTX2_WEIGHTS_FILE = "ltx-2-19b-dev.safetensors"
-_LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
-# Same share as other Gemma checkpoints (e.g. google/gemma-3-1b-it -> gemma/gemma-3-1b-it).
-_LTX2_TEXT_ENCODER_RELATIVE_PATHS = (
-    _LTX2_TEXT_ENCODER_SUBPATH,
-    os.path.join("gemma", _LTX2_TEXT_ENCODER_SUBPATH),
-)
-# Default NFS layout used on CI runners (override via TRTLLM_CACHE_DIT_*_CHECKPOINT).
-_CI_DEFAULT_LLM_MODELS = "/home/scratch.trt_llm_data_ci/llm-models"
-_DEFAULT_WAN_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _WAN_SUBPATH)
-_DEFAULT_FLUX_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _FLUX_SUBPATH)
-_DEFAULT_LTX2_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _LTX2_DIR, _LTX2_WEIGHTS_FILE)
-_DEFAULT_LTX2_TEXT_ENCODER = os.path.join(_CI_DEFAULT_LLM_MODELS, _LTX2_TEXT_ENCODER_SUBPATH)
-_DEFAULT_QWEN_IMAGE_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _QWEN_IMAGE_SUBPATH)
-
-
-def _resolve_qwen_image_checkpoint() -> str | None:
-    """Qwen-Image: explicit env, CI default tree, then LLM_MODELS_ROOT."""
-    explicit = os.environ.get("TRTLLM_CACHE_DIT_QWEN_IMAGE_CHECKPOINT", "").strip()
-    if explicit and os.path.isdir(explicit):
-        return os.path.abspath(explicit)
-    if os.path.isdir(_DEFAULT_QWEN_IMAGE_CHECKPOINT):
-        return os.path.abspath(_DEFAULT_QWEN_IMAGE_CHECKPOINT)
-    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
-    if root:
-        cand = os.path.join(root, _QWEN_IMAGE_SUBPATH)
-        if os.path.isdir(cand):
-            return os.path.abspath(cand)
-    return None
-
-
-def _resolve_wan_checkpoint() -> str | None:
-    """Wan 2.1 1.3B: explicit env, then CI default tree, then LLM_MODELS_ROOT."""
-    explicit = os.environ.get("TRTLLM_CACHE_DIT_WAN_CHECKPOINT", "").strip()
-    if explicit and os.path.isdir(explicit):
-        return os.path.abspath(explicit)
-    if os.path.isdir(_DEFAULT_WAN_CHECKPOINT):
-        return os.path.abspath(_DEFAULT_WAN_CHECKPOINT)
-    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
-    if root:
-        cand = os.path.join(root, _WAN_SUBPATH)
-        if os.path.isdir(cand):
-            return os.path.abspath(cand)
-    return None
-
-
-def _resolve_flux_checkpoint() -> str | None:
-    """FLUX.1 dev tree: explicit env, FLUX1_MODEL_PATH, CI default, then LLM_MODELS_ROOT."""
-    explicit = os.environ.get("TRTLLM_CACHE_DIT_FLUX_CHECKPOINT", "").strip()
-    if explicit and os.path.isdir(explicit):
-        return os.path.abspath(explicit)
-    flux1 = os.environ.get("FLUX1_MODEL_PATH", "").strip()
-    if flux1 and os.path.isdir(flux1):
-        return os.path.abspath(flux1)
-    if os.path.isdir(_DEFAULT_FLUX_CHECKPOINT):
-        return os.path.abspath(_DEFAULT_FLUX_CHECKPOINT)
-    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
-    if root:
-        cand = os.path.join(root, _FLUX_SUBPATH)
-        if os.path.isdir(cand):
-            return os.path.abspath(cand)
-    return None
-
-
-def _resolve_ltx2_checkpoint() -> str | None:
-    """LTX-2 weights file: explicit env, LTX2_MODEL_PATH, CI default, then LLM_MODELS_ROOT (same tiers as Wan/Flux)."""
-    explicit = os.environ.get("TRTLLM_CACHE_DIT_LTX2_CHECKPOINT", "").strip()
-    if explicit:
-        if os.path.isfile(explicit):
-            return os.path.abspath(explicit)
-        if os.path.isdir(explicit):
-            cand = os.path.join(explicit, _LTX2_WEIGHTS_FILE)
-            if os.path.isfile(cand):
-                return os.path.abspath(cand)
-    ltx2_model = os.environ.get("LTX2_MODEL_PATH", "").strip()
-    if ltx2_model and os.path.isfile(ltx2_model):
-        return os.path.abspath(ltx2_model)
-    if os.path.isfile(_DEFAULT_LTX2_CHECKPOINT):
-        return os.path.abspath(_DEFAULT_LTX2_CHECKPOINT)
-    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
-    if root:
-        cand = os.path.join(root, _LTX2_DIR, _LTX2_WEIGHTS_FILE)
-        if os.path.isfile(cand):
-            return os.path.abspath(cand)
-    return None
-
-
-def _resolve_ltx2_text_encoder() -> str | None:
-    """Gemma text encoder directory: explicit env, CI default, then LLM_MODELS_ROOT."""
-    explicit = os.environ.get("TRTLLM_CACHE_DIT_LTX2_TEXT_ENCODER", "").strip()
-    if explicit and os.path.isdir(explicit):
-        return os.path.abspath(explicit)
-    for rel in _LTX2_TEXT_ENCODER_RELATIVE_PATHS:
-        cand = os.path.join(_CI_DEFAULT_LLM_MODELS, rel)
-        if os.path.isdir(cand):
-            return os.path.abspath(cand)
-    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
-    if root:
-        for rel in _LTX2_TEXT_ENCODER_RELATIVE_PATHS:
-            cand = os.path.join(root, rel)
-            if os.path.isdir(cand):
-                return os.path.abspath(cand)
-    return None
+_WAN_SUBDIR = "Wan2.1-T2V-1.3B-Diffusers"
+_FLUX_SUBDIR = "FLUX.1-dev"
+_QWEN_IMAGE_SUBDIR = "qwen-image"
+_LTX2_CHECKPOINT_SUBDIR = "LTX-2/ltx-2-19b-dev.safetensors"
+_LTX2_TEXT_ENCODER_SUBDIR = "gemma/gemma-3-12b-it"
 
 
 @contextlib.contextmanager
@@ -341,13 +239,7 @@ class TestCacheDiTRealPipelineForward:
         return loader.load(skip_warmup=True)
 
     def test_wan_cache_dit_skips_blocks_after_forward(self):
-        ckpt = _resolve_wan_checkpoint()
-        if ckpt is None:
-            pytest.skip(
-                "Wan 2.1 1.3B not found: set TRTLLM_CACHE_DIT_WAN_CHECKPOINT, "
-                f"install under {_DEFAULT_WAN_CHECKPOINT}, "
-                f"or under $LLM_MODELS_ROOT/{_WAN_SUBPATH}"
-            )
+        ckpt = get_checkpoint(_WAN_SUBDIR)
 
         pipeline = None
         with _suppress_stdlib_logging_for_cache_dit():
@@ -388,13 +280,7 @@ class TestCacheDiTRealPipelineForward:
         torch.compile would contribute nothing — a perf-only regression that
         is invisible to the correctness assertions of the compile-off tests.
         """
-        ckpt = _resolve_wan_checkpoint()
-        if ckpt is None:
-            pytest.skip(
-                "Wan 2.1 1.3B not found: set TRTLLM_CACHE_DIT_WAN_CHECKPOINT, "
-                f"install under {_DEFAULT_WAN_CHECKPOINT}, "
-                f"or under $LLM_MODELS_ROOT/{_WAN_SUBPATH}"
-            )
+        ckpt = get_checkpoint(_WAN_SUBDIR)
 
         pipeline = None
         with _suppress_stdlib_logging_for_cache_dit():
@@ -440,13 +326,7 @@ class TestCacheDiTRealPipelineForward:
                 torch._dynamo.reset()
 
     def test_flux_cache_dit_skips_blocks_after_forward(self):
-        ckpt = _resolve_flux_checkpoint()
-        if ckpt is None:
-            pytest.skip(
-                "FLUX.1-dev not found: set TRTLLM_CACHE_DIT_FLUX_CHECKPOINT or FLUX1_MODEL_PATH, "
-                f"install under {_DEFAULT_FLUX_CHECKPOINT}, "
-                f"or under $LLM_MODELS_ROOT/{_FLUX_SUBPATH}"
-            )
+        ckpt = get_checkpoint(_FLUX_SUBDIR)
 
         pipeline = None
         with _suppress_stdlib_logging_for_cache_dit():
@@ -454,7 +334,7 @@ class TestCacheDiTRealPipelineForward:
                 pipeline = self._load_visual_gen_pipeline(ckpt)
                 name = pipeline.__class__.__name__
                 if name not in ("FluxPipeline", "Flux2Pipeline"):
-                    pytest.skip(f"Checkpoint resolved to {name}, not a FLUX visual_gen pipeline")
+                    pytest.fail(f"Checkpoint resolved to {name}, not a FLUX visual_gen pipeline")
 
                 assert pipeline.cache_accelerator is not None
                 assert pipeline.cache_accelerator.is_enabled()
@@ -481,25 +361,8 @@ class TestCacheDiTRealPipelineForward:
                     self._teardown_cache_dit(pipeline)
 
     def test_ltx2_cache_dit_skips_blocks_after_forward(self):
-        ckpt = _resolve_ltx2_checkpoint()
-        text_enc = _resolve_ltx2_text_encoder()
-        if ckpt is None or text_enc is None:
-            missing = []
-            if ckpt is None:
-                missing.append("LTX-2 checkpoint")
-            if text_enc is None:
-                missing.append("Gemma text encoder")
-            pytest.skip(
-                f"Missing {' and '.join(missing)}: set "
-                "TRTLLM_CACHE_DIT_LTX2_CHECKPOINT (file or directory with "
-                f"{_LTX2_WEIGHTS_FILE}) and TRTLLM_CACHE_DIT_LTX2_TEXT_ENCODER, "
-                "or LTX2_MODEL_PATH, or stage under CI tree "
-                f"{_DEFAULT_LTX2_CHECKPOINT} and one of "
-                f"{', '.join(os.path.join(_CI_DEFAULT_LLM_MODELS, r) for r in _LTX2_TEXT_ENCODER_RELATIVE_PATHS)} "
-                f"(same as Wan/Flux under {_CI_DEFAULT_LLM_MODELS}), "
-                f"or $LLM_MODELS_ROOT/{_LTX2_DIR}/{_LTX2_WEIGHTS_FILE} and "
-                f"$LLM_MODELS_ROOT/<{' or '.join(_LTX2_TEXT_ENCODER_RELATIVE_PATHS)}>"
-            )
+        ckpt = get_checkpoint(_LTX2_CHECKPOINT_SUBDIR)
+        text_enc = get_checkpoint(_LTX2_TEXT_ENCODER_SUBDIR)
 
         pipeline = None
         with _suppress_stdlib_logging_for_cache_dit():
@@ -507,7 +370,7 @@ class TestCacheDiTRealPipelineForward:
                 pipeline = self._load_visual_gen_pipeline(ckpt, text_encoder_path=text_enc)
                 name = pipeline.__class__.__name__
                 if name != "LTX2Pipeline":
-                    pytest.skip(f"Checkpoint resolved to {name}, not LTX2Pipeline")
+                    pytest.fail(f"Checkpoint resolved to {name}, not LTX2Pipeline")
 
                 assert pipeline.cache_accelerator is not None
                 assert pipeline.cache_accelerator.is_enabled()
@@ -537,13 +400,7 @@ class TestCacheDiTRealPipelineForward:
                     self._teardown_cache_dit(pipeline)
 
     def test_qwen_image_cache_dit_skips_blocks_after_forward(self):
-        ckpt = _resolve_qwen_image_checkpoint()
-        if ckpt is None:
-            pytest.skip(
-                "Qwen-Image not found: set TRTLLM_CACHE_DIT_QWEN_IMAGE_CHECKPOINT, "
-                f"install under {_DEFAULT_QWEN_IMAGE_CHECKPOINT}, "
-                f"or under $LLM_MODELS_ROOT/{_QWEN_IMAGE_SUBPATH}"
-            )
+        ckpt = get_checkpoint(_QWEN_IMAGE_SUBDIR)
 
         pipeline = None
         with _suppress_stdlib_logging_for_cache_dit():
@@ -551,7 +408,7 @@ class TestCacheDiTRealPipelineForward:
                 pipeline = self._load_visual_gen_pipeline(ckpt)
                 name = pipeline.__class__.__name__
                 if name != "QwenImagePipeline":
-                    pytest.skip(f"Checkpoint resolved to {name}, not QwenImagePipeline")
+                    pytest.fail(f"Checkpoint resolved to {name}, not QwenImagePipeline")
 
                 assert pipeline.cache_accelerator is not None
                 assert pipeline.cache_accelerator.is_enabled()

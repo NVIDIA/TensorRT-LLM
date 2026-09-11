@@ -8,10 +8,6 @@ set: recipe validation, Nemotron norm semantics, the generator-only und
 K-norm, native flow schedule parity against cosmos-framework, strict weight
 loading, and per-family defaults. Checkpoint-gated tests cover the real
 checkpoint (tokenizer, recipe/scheduler wiring, load + forward).
-
-Override checkpoint:
-    DIFFUSION_MODEL_PATH_COSMOS3_EDGE=/path/to/Cosmos3-Edge \\
-        pytest tests/unittest/_torch/visual_gen/test_cosmos3_edge.py -v
 """
 
 import gc
@@ -25,6 +21,7 @@ import PIL.Image
 import pytest
 import torch
 from diffusers import UniPCMultistepScheduler
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -78,16 +75,8 @@ def _cleanup_gpu():
 
 def _require_edge_checkpoint() -> str:
     """Resolve the Edge checkpoint lazily so unit tests collect and run on
-    machines without model storage; only checkpoint-gated tests skip."""
-    path = os.environ.get("DIFFUSION_MODEL_PATH_COSMOS3_EDGE")
-    if not path:
-        root = Path(os.environ.get("LLM_MODELS_ROOT", "/home/scratch.trt_llm_data_ci/llm-models/"))
-        if not root.exists():
-            root = Path("/scratch/trt_llm_data/llm-models/")
-        path = str(root / "Cosmos3-Edge")
-    if not os.path.isdir(path):
-        pytest.skip(f"Checkpoint not found: {path}")
-    return path
+    machines without model storage; only checkpoint-gated tests fail."""
+    return get_checkpoint("Cosmos3-Edge")
 
 
 def _reduced_edge_config() -> SimpleNamespace:

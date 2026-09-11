@@ -16,10 +16,6 @@ Each test loads all pipeline components and calls pipeline.forward().
 
 Run all:
     pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_offload.py -v -s
-
-Override checkpoint path:
-    DIFFUSION_MODEL_PATH_WAN22_T2V=/path/to/wan22 \\
-        pytest tests/unittest/_torch/visual_gen/test_wan22_t2v_offload.py -v -s
 """
 
 import os
@@ -27,12 +23,12 @@ import os
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
-from pathlib import Path
 from typing import Optional
 
 import pytest
 import torch
 import torch.nn.functional as F
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import (
@@ -58,29 +54,7 @@ def _cleanup_gpu():
     torch.cuda.empty_cache()
 
 
-# ============================================================================
-# Path helpers
-# ============================================================================
-
-
-def _llm_models_root() -> Path:
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    else:
-        root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return root
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or str(_llm_models_root() / default_name)
-
-
-WAN22_A14B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN22_T2V", "Wan2.2-T2V-A14B-Diffusers")
+WAN22_A14B_SUBDIR = "Wan2.2-T2V-A14B-Diffusers"
 
 INFER_PROMPT = "A cat sitting on a sunny windowsill watching birds outside."
 INFER_NEGATIVE_PROMPT = ""
@@ -102,8 +76,6 @@ def _make_pipeline(
     enable_offload: bool = False,
     quant_config: Optional[dict] = None,
 ):
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
@@ -122,12 +94,12 @@ def _require_fp8_quant_ops() -> None:
         _ = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor
         _ = torch.ops.tensorrt_llm.quantize_e4m3_activation
     except (AttributeError, RuntimeError) as e:
-        pytest.skip(f"FP8 quantization ops not available: {e}")
+        pytest.fail(f"FP8 quantization ops not available: {e}")
 
 
 @pytest.fixture
 def wan22_offload_pipeline():
-    pipeline = _make_pipeline(WAN22_A14B_PATH, enable_offload=True)
+    pipeline = _make_pipeline(get_checkpoint(WAN22_A14B_SUBDIR), enable_offload=True)
     yield pipeline
     del pipeline
     torch.cuda.empty_cache()
@@ -225,12 +197,12 @@ class TestWan22_A14B_Offload:
         _assert_offload_forward(wan22_offload_pipeline, model="T2V-A14B")
 
     def test_wan22_offload_matches_baseline(self):
-        _assert_offload_matches_baseline(WAN22_A14B_PATH, model="Wan2.2-T2V-A14B")
+        _assert_offload_matches_baseline(get_checkpoint(WAN22_A14B_SUBDIR), model="Wan2.2-T2V-A14B")
 
     def test_wan22_fp8_offload_matches_baseline(self):
         _require_fp8_quant_ops()
         _assert_offload_matches_baseline(
-            WAN22_A14B_PATH,
+            get_checkpoint(WAN22_A14B_SUBDIR),
             model="Wan2.2-T2V-A14B FP8",
             quant_config={"quant_algo": "FP8", "dynamic": True},
         )
@@ -242,10 +214,8 @@ class TestWanT2VOffloadCudaGraphRaisesError:
     """CUDA graphs plus offloading must raise NotImplementedError on pipeline load."""
 
     def test_wan22_raises_if_cuda_graph_and_offload_enabled(self):
-        if not os.path.exists(WAN22_A14B_PATH):
-            pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
         args = VisualGenArgs(
-            model=WAN22_A14B_PATH,
+            model=get_checkpoint(WAN22_A14B_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
             cuda_graph_config=CudaGraphConfig(enable=True),
             cpu_offload_config=CpuOffloadConfig(enable=True),

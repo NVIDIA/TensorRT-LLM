@@ -29,13 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.distributed import all_to_all_4d
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-
+from tensorrt_llm._torch.distributed import all_to_all_4d
 
 # Loop count must comfortably exceed kNumSlots so the ring wraps at least
 # twice. kNumSlots is 3 today; 8 iterations = ~2.67 full rotations.
@@ -257,8 +251,6 @@ def _worker_multi_pg(rank, world_size, port):
 
 
 def _run(world_size: int, test_fn: Callable):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     # Spawn distributed workers via a helper that retries with a fresh master

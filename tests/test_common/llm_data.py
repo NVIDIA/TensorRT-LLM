@@ -86,6 +86,17 @@ def llm_models_root(check: bool = False) -> Optional[Path]:
     return root if root.exists() else None
 
 
+def get_checkpoint(model_subdir: str) -> str:
+    """Resolve a checkpoint under LLM_MODELS_ROOT, or fail loudly if missing."""
+    root = llm_models_root(check=True)
+    path = root / model_subdir
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {path}. Stage '{model_subdir}' under LLM_MODELS_ROOT to run this test."
+        )
+    return str(path)
+
+
 def llm_datasets_root() -> str:
     return os.path.join(llm_models_root(check=True), "datasets")
 

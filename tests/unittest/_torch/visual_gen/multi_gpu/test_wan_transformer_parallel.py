@@ -35,19 +35,14 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
-    from .tp_shard_utils import copy_tp_parameter
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from .tp_shard_utils import copy_tp_parameter
 
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
@@ -101,8 +96,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True, **kwargs):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
@@ -417,8 +410,6 @@ class TestWanTransformerParallel:
     """Transformer-only WAN correctness across parallel topologies."""
 
     def _skip_if_unavailable(self):
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
         if not _flash_attn4_available:
             pytest.skip("FlashAttn4 JIT kernels not available")
 

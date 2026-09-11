@@ -21,7 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from test_common.llm_data import llm_models_root
+from test_common.llm_data import get_checkpoint, llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
@@ -51,18 +51,15 @@ SKIP_COMPONENTS = [
 
 
 _LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
-_GEMMA3_DEFAULT = os.path.join(str(llm_models_root(check=True)), "gemma", "gemma-3-12b-it")
 
+_LTX2_BF16_SUBDIR = "LTX-2/ltx-2-19b-dev.safetensors"
+_LTX2_FP8_SUBDIR = "LTX-2/ltx-2-19b-dev-fp8.safetensors"
+_LTX2_GEMMA3_SUBDIR = "gemma/gemma-3-12b-it"
+_LTX2_UPSAMPLER_SUBDIR = "LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+_LTX2_LORA_SUBDIR = "LTX-2/ltx-2-19b-distilled-lora-384.safetensors"
 
-CHECKPOINT_PATH_BF16 = os.environ.get(
-    "LTX2_MODEL_PATH",
-    os.path.join(_LTX2_BASE, "ltx-2-19b-dev.safetensors"),
-)
-CHECKPOINT_PATH_FP8 = os.environ.get(
-    "LTX2_MODEL_PATH_FP8",
-    os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors"),
-)
-GEMMA3_PATH = os.environ.get("LTX2_TEXT_ENCODER_PATH", _GEMMA3_DEFAULT)
+CHECKPOINT_PATH_BF16 = os.path.join(_LTX2_BASE, "ltx-2-19b-dev.safetensors")
+CHECKPOINT_PATH_FP8 = os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors")
 
 
 def _ltx2_pipeline_config(**overrides):
@@ -73,7 +70,7 @@ def _ltx2_pipeline_config(**overrides):
     load needs ``text_encoder_path`` set. Tests can pass extra keys via
     ``overrides`` (e.g. ``spatial_upsampler_path`` for two-stage).
     """
-    cfg = {"text_encoder_path": GEMMA3_PATH}
+    cfg = {"text_encoder_path": get_checkpoint(_LTX2_GEMMA3_SUBDIR)}
     cfg.update(overrides)
     return cfg
 
@@ -171,24 +168,14 @@ def _find_first_quantizable_linear(transformer):
 
 @pytest.fixture
 def ltx2_bf16_checkpoint_exists():
-    """Check if LTX2 BF16 checkpoint is available locally."""
-    if not CHECKPOINT_PATH_BF16 or not os.path.exists(CHECKPOINT_PATH_BF16):
-        pytest.skip(
-            f"LTX2 BF16 checkpoint not found at {CHECKPOINT_PATH_BF16}. "
-            "Set LTX2_MODEL_PATH or stage checkpoint under LLM_MODELS_ROOT/LTX-2/."
-        )
-    return True
+    """Resolve the LTX2 BF16 checkpoint, failing loudly if it is not staged."""
+    return get_checkpoint(_LTX2_BF16_SUBDIR)
 
 
 @pytest.fixture
 def ltx2_fp8_checkpoint_exists():
-    """Check if LTX2 FP8 checkpoint is available locally."""
-    if not CHECKPOINT_PATH_FP8 or not os.path.exists(CHECKPOINT_PATH_FP8):
-        pytest.skip(
-            f"LTX2 FP8 checkpoint not found at {CHECKPOINT_PATH_FP8}. "
-            "Set LTX2_MODEL_PATH_FP8 or stage checkpoint under LLM_MODELS_ROOT/LTX-2/."
-        )
-    return True
+    """Resolve the LTX2 FP8 checkpoint, failing loudly if it is not staged."""
+    return get_checkpoint(_LTX2_FP8_SUBDIR)
 
 
 # ============================================================================
@@ -1168,30 +1155,16 @@ class TestTwoStageFP4Helpers:
 # Two-Stage Pipeline Loading Tests (requires checkpoints)
 # ============================================================================
 
-UPSAMPLER_PATH = os.environ.get(
-    "LTX2_UPSAMPLER_CHECKPOINT",
-    os.path.join(_LTX2_BASE, "ltx-2-spatial-upscaler-x2-1.0.safetensors"),
-)
-LORA_PATH = os.environ.get(
-    "LTX2_LORA_CHECKPOINT",
-    os.path.join(_LTX2_BASE, "ltx-2-19b-distilled-lora-384.safetensors"),
-)
-
-_HAS_TWO_STAGE_ASSETS = (
-    os.path.exists(CHECKPOINT_PATH_BF16)
-    and os.path.exists(UPSAMPLER_PATH)
-    and os.path.exists(LORA_PATH)
-)
+UPSAMPLER_PATH = os.path.join(_LTX2_BASE, "ltx-2-spatial-upscaler-x2-1.0.safetensors")
+LORA_PATH = os.path.join(_LTX2_BASE, "ltx-2-19b-distilled-lora-384.safetensors")
 
 
 @pytest.fixture
 def ltx2_two_stage_assets_exist():
-    """Check if all two-stage assets (checkpoint + upsampler + LoRA) are available."""
-    if not _HAS_TWO_STAGE_ASSETS:
-        pytest.skip(
-            f"Two-stage assets not found. Need checkpoint at {CHECKPOINT_PATH_BF16}, "
-            f"upsampler at {UPSAMPLER_PATH}, and LoRA at {LORA_PATH}."
-        )
+    """Resolve all two-stage assets (checkpoint + upsampler + LoRA), failing loudly if missing."""
+    get_checkpoint(_LTX2_BF16_SUBDIR)
+    get_checkpoint(_LTX2_UPSAMPLER_SUBDIR)
+    get_checkpoint(_LTX2_LORA_SUBDIR)
     return True
 
 

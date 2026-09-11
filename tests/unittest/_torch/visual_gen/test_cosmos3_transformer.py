@@ -11,21 +11,17 @@ Run unit tests:
 
 Run all:
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_transformer.py -v -s
-
-Override checkpoint:
-    DIFFUSION_MODEL_PATH_COSMOS3=/path/to/Cosmos3-Nano \\
-        pytest tests/unittest/_torch/visual_gen/test_cosmos3_transformer.py -v -s
 """
 
 import gc
 import os
-from pathlib import Path
 from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
@@ -57,24 +53,6 @@ def _cleanup_gpu():
         torch.cuda.empty_cache()
 
 
-def _llm_models_root() -> str:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch/trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-COSMOS3_NANO_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
-
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 _NUM_TRAIN_TIMESTEPS = 1000.0
@@ -97,12 +75,11 @@ def _transformer_config_path(checkpoint_dir: str) -> str:
 
 
 def _require_checkpoint() -> str:
-    if not COSMOS3_NANO_PATH or not os.path.isdir(COSMOS3_NANO_PATH):
-        pytest.skip(f"Checkpoint not found: {COSMOS3_NANO_PATH}")
-    config_path = _transformer_config_path(COSMOS3_NANO_PATH)
+    checkpoint_dir = get_checkpoint("Cosmos3-Nano")
+    config_path = _transformer_config_path(checkpoint_dir)
     if not os.path.isfile(config_path):
-        pytest.skip(f"Transformer config not found: {config_path}")
-    return COSMOS3_NANO_PATH
+        pytest.fail(f"Transformer config not found: {config_path}")
+    return checkpoint_dir
 
 
 def _load_model_config(checkpoint_dir: str) -> DiffusionModelConfig:

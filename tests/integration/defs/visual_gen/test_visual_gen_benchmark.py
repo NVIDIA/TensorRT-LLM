@@ -43,13 +43,12 @@ _WAN_T2V_MODEL = "Wan2.1-T2V-1.3B-Diffusers"
 
 
 def _wan_t2v_path() -> Path:
-    """Resolve the Wan T2V model path, or call pytest.skip if unavailable."""
+    """Resolve the Wan T2V model path."""
     root = Path(conftest.llm_models_root())
     model_path = root / _WAN_T2V_MODEL
     if not model_path.is_dir():
-        pytest.skip(
-            f"Wan T2V model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {_WAN_T2V_MODEL} under scratch)"
+        raise FileNotFoundError(
+            f"Wan T2V model not found: {model_path} (stage {_WAN_T2V_MODEL} under LLM_MODELS_ROOT)"
         )
     return model_path
 
