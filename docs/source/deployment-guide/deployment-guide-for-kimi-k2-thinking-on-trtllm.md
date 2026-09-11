@@ -21,7 +21,7 @@ This is a quickstart guide for running the Kimi K2 Thinking model on TensorRT LL
 
 ### Prepare Docker image
 
-Build and run the docker container. See the [Docker guide](../../../docker/README.md) for details.
+Build and run the docker container. See the [Docker guide](source:docker/README.md) for details.
 ```bash
 cd TensorRT-LLM
 
@@ -70,7 +70,7 @@ trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
 
 TensorRT LLM will load weights and select the best kernels during startup. The server is successfully launched when the following log is shown:
 
-```log
+```text
 INFO:     Started server process [xxxxx]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
@@ -232,7 +232,7 @@ Run `bench.sh` to begin a serving benchmark.
 
 Since Kimi K2 Thinking has a larger weight size than other models, it is possible to see host OOM issues, such as the following:
 
-```log
+```text
 Loading weights: 100%|█████████████████████| 1408/1408 [03:43<00:00,  6.30it/s]
  0: [12/04/2025-18:38:28] [TRT-LLM] [RANK 0] [I] moe_load_balancer finalizing model...
  1: [nvl72136-T14:452151:0:452151] Caught signal 7 (Bus error: nonexistent physical address)

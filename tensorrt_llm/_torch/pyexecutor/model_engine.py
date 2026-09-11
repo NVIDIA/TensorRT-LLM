@@ -4039,12 +4039,25 @@ class PyTorchModelEngine(ModelEngine):
                     )
 
     def _get_all_rank_num_tokens_and_spec_counts(
-        self, attn_metadata: AttentionMetadata, spec_counts: Tuple[int, ...]
+        self, attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata
     ) -> Tuple[Optional[List[int]], Optional[List[List[int]]]]:
         """Exchange the attention and speculative per-rank counts in a single
-        collective instead of one collective each."""
+        collective instead of one collective each.
+
+        The spec token count is derived via ``SpecMetadata.dp_num_tokens``
+        because this collective runs *before* ``spec_metadata.prepare()``
+        rewrites ``num_tokens`` into the same shape (the attention count it
+        shares the collective with is consumed earlier, by padding selection).
+        Both read the same fields, so callers must have set
+        ``spec_metadata.num_tokens``, ``num_generations`` and ``seq_lens`` for
+        this batch before calling this. ``num_generations`` counts every
+        generation request, CUDA-graph dummies included.
+        """
         if not self.enable_attention_dp:
             return None, None
+        spec_counts = (spec_metadata.dp_num_tokens(),
+                       len(spec_metadata.seq_lens),
+                       spec_metadata.num_generations)
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
             # two exchanges separate.
@@ -4705,15 +4718,22 @@ class PyTorchModelEngine(ModelEngine):
         # Handle padding for piecewise CUDA graphs
         attn_metadata.padded_num_tokens = None
 
+        # Set the per-batch counts before the attention-DP allgather below:
+        # the allgather and prepare() must derive the DP token count from the
+        # same fields (see SpecMetadata.dp_num_tokens). seq_lens is carried
+        # over from the previous full prepare -- this path only runs when the
+        # request set is unchanged.
+        if spec_metadata is not None:
+            spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.num_generations = attn_metadata.num_generations
+
         # Handle attention DP
         spec_all_rank_counts = None
         if enable_attention_dp:
             if spec_metadata is not None:
                 (attn_metadata.all_rank_num_tokens, spec_all_rank_counts
                  ) = self._get_all_rank_num_tokens_and_spec_counts(
-                     attn_metadata,
-                     (total_num_tokens, len(spec_metadata.seq_lens),
-                      attn_metadata.num_generations))
+                     attn_metadata, spec_metadata)
             else:
                 attn_metadata.all_rank_num_tokens = \
                     get_all_rank_num_tokens(
@@ -4728,7 +4748,6 @@ class PyTorchModelEngine(ModelEngine):
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
 
-            spec_metadata.num_tokens = total_num_tokens
             spec_metadata.prepare()
 
             # Handle distributed spec metadata
@@ -6412,12 +6431,23 @@ class PyTorchModelEngine(ModelEngine):
             maybe_graph=maybe_graph,
             use_lora_graph=use_lora_graph)
 
+        if spec_metadata is not None:
+            # Set the per-batch counts here, before the attention-DP allgather
+            # below: the allgather and prepare() must derive the DP token count
+            # from the same fields (see SpecMetadata.dp_num_tokens). Use
+            # scheduled_requests.num_generation_requests -- the same-named
+            # local above excludes CUDA-graph dummies and would not match the
+            # count prepare() uses.
+            spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.num_generations = \
+                scheduled_requests.num_generation_requests
+            spec_metadata.seq_lens = sequence_lengths
+
         spec_all_rank_counts = None
         if spec_metadata is not None and self.enable_attention_dp:
             (attn_all_rank_num_tokens, spec_all_rank_counts
              ) = self._get_all_rank_num_tokens_and_spec_counts(
-                 attn_metadata, (total_num_tokens, len(sequence_lengths),
-                                 len(scheduled_requests.generation_requests)))
+                 attn_metadata, spec_metadata)
         else:
             attn_all_rank_num_tokens = get_all_rank_num_tokens(
                 attn_metadata,
@@ -6496,10 +6526,8 @@ class PyTorchModelEngine(ModelEngine):
                                                                 total_draft_lens]
             spec_metadata.request_ids = request_ids
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
-            spec_metadata.num_generations = len(
-                scheduled_requests.generation_requests)
-            spec_metadata.num_tokens = total_num_tokens
-            spec_metadata.seq_lens = sequence_lengths
+            # num_generations / num_tokens / seq_lens are set above, before the
+            # attention-DP allgather that must agree with prepare().
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
             if context_prompt_lookahead is not None:

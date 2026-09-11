@@ -22,6 +22,20 @@ _BLOCK_SPARSE_Q_TILE_SIZES = (8, 16, 32, 64, 128)
 _BLOCK_SPARSE_MAX_HEADS_Q_PER_KV = 32
 
 
+def _validate_contiguous_route_mode(
+    sparse_format: object,
+    use_proxy_routes: object,
+) -> None:
+    """Validate the two public continuous-route axes before device work."""
+
+    if not isinstance(sparse_format, str):
+        raise TypeError("sparse_format must be 'bsr' or 'bitmask'")
+    if sparse_format not in ("bsr", "bitmask"):
+        raise ValueError("sparse_format must be 'bsr' or 'bitmask'")
+    if type(use_proxy_routes) is not bool:
+        raise TypeError("use_proxy_routes must be a bool")
+
+
 def _validate_sparse_q_block_size(value: object) -> int:
     """Return a positive semantic Q block size representable by the ABI."""
 
@@ -110,6 +124,17 @@ def _block_sparse_kv_atom_size(kv_block_size: int) -> int:
     )
 
 
+def _block_sparse_proxy_summary_geometry(
+    seq_len_kv: int,
+    kv_block_size: int,
+) -> tuple[int, int]:
+    """Return the summary count and final summary's represented-token mass."""
+
+    num_summaries = (seq_len_kv + kv_block_size - 1) // kv_block_size
+    tail_mass = seq_len_kv - (num_summaries - 1) * kv_block_size
+    return num_summaries, tail_mass
+
+
 def _prepared_kv_routes_are_block_aligned(
     kv_block_size: int,
     kv_route_size: int,
@@ -117,3 +142,24 @@ def _prepared_kv_routes_are_block_aligned(
     """Return whether each prepared route stays within one semantic BSR block."""
 
     return _validate_sparse_kv_block_size(kv_block_size) % kv_route_size == 0
+
+
+def _block_sparse_contiguous_kv_copy_geometry(
+    *,
+    kv_block_size: int,
+    kv_route_size: int,
+) -> tuple[int, int, bool]:
+    """Return source-independent primary/atom TensorMap geometry.
+
+    Exact and proxy routes address different logical matrices, but a route's
+    physical copy shape depends only on its semantic block and physical route
+    sizes. Coarse routes prefer KV128 copies and keep a KV64 descriptor only
+    when KV256 staging or runtime adjacency requires it.
+    """
+
+    atom_size = _block_sparse_kv_atom_size(kv_block_size)
+    primary_box_size = 2 * atom_size if atom_size == 64 else atom_size
+    needs_aux_atom = atom_size == 64 and (
+        kv_route_size == 256 or kv_block_size % kv_route_size != 0
+    )
+    return primary_box_size, atom_size, needs_aux_atom

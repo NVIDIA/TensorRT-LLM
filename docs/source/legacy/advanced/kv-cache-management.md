@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (kv-cache-management)=
 
 # KV Cache Management: Pools, Blocks, and Events
@@ -71,5 +75,3 @@ The `KVCacheEventManager` is responsible for tracking and reporting significant 
 
 **In summary:**
 An "event" is any significant change in the lifecycle or state of a KV cache block or pool, tracked for monitoring, debugging, or optimization purposes.
-
----
