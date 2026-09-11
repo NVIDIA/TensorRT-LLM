@@ -545,3 +545,39 @@ Key test files:
 - Do not treat KV-cache semantics as a small implementation detail.
 - Do not bypass MLA's context dispatcher for chunked or cached-KV cases.
 - Do not duplicate RoPE handling before checking the fused path.
+
+## 8. Experimental Eager Scratch Reclamation
+
+Set `TRTLLM_EAGER_WORKSPACE_SHRINK=1` before constructing the PyTorch model
+engine to enable delayed reclamation of fallback FMHA eager scratch. It is
+disabled by default. The engine freezes the eager workspace capacity after
+successful warmup as a minimum capacity; skipped warmup does not enable it.
+
+The native attention sizing point reports required bytes into a CPU scalar,
+taking the maximum across all attention calls in one model forward. Reading
+this report does not synchronize the GPU. After three completed forwards
+whose requirements are strictly below capacity, the engine replaces the
+workspace with a buffer sized to the larger of the warmup floor and the
+maximum requirement in those three forwards. Growth or an exact-capacity
+requirement resets the counter. Failed forwards reset the counter; forwards
+with no reported requirement do not advance it.
+
+Reclamation drops the old Tensor before allocating its replacement, because
+shrinking a Tensor with `resize_` alone retains its storage. Released storage
+returns to the PyTorch caching allocator, not necessarily to the CUDA driver;
+`memory_allocated()` may fall without a corresponding fall in `memory_reserved()`
+or `nvidia-smi` usage. Stream ordering can delay when released storage becomes
+reusable. This policy does not bound peak demand or prevent an allocation-time
+OOM, and alternating large/small traffic can add allocator and host overhead.
+
+CUDA graph workspace is never reclaimed. The initial integration also excludes
+speculative decoding, context parallelism, encoder-decoder, sparse attention,
+compiled models, and breakable CUDA graphs. Reclamation is disabled if serving
+changes CUDA streams or enables multi-stream execution. The current consumer
+stream is recorded on the Tensor before use to protect pending GPU work.
+
+Only fallback FMHA currently declares its workspace reclaimable. If another
+FMHA backend uses the eager workspace, that metadata becomes non-reclaimable,
+including when this happens during warmup. A new backend must prove that its
+workspace contains no state retained between forwards and report every scratch
+requirement before opting in; partial reports are not sufficient.

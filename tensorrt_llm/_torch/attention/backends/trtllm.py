@@ -102,6 +102,11 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
+    # Host-only maximum written by native sizing during one eager forward.
+    workspace_required_bytes: Optional[torch.Tensor] = field(default=None,
+                                                             init=False,
+                                                             repr=False)
+    workspace_reclaimable: bool = field(default=True, init=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -2079,6 +2084,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
+        if not metadata.is_cuda_graph and not fmha.supports_workspace_reclamation:
+            # Other backends can retain staged state in this storage. Once one
+            # has used it, never reclaim based on fallback-only sizing reports.
+            metadata.workspace_reclaimable = False
         fmha.forward(q, k, v, metadata, forward_args)
 
         if self.print_skip_softmax_stat:
