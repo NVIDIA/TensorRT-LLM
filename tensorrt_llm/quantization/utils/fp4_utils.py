@@ -10,6 +10,11 @@ FLOAT4_E2M1X2 = torch.uint8
 # (SF_VEC_SIZE in cpp/tensorrt_llm/kernels/quantization.h).
 NVFP4_SF_VEC_SIZE = 16
 
+# Scale block widths the weight-only (W4A16_NVFP4) dequantization path accepts.
+# The W4A4 NVFP4 GEMMs are hardware-bound to NVFP4_SF_VEC_SIZE; ModelOpt's
+# nvfp4_*_weight_only recipes may export 32-element blocks.
+W4A16_NVFP4_SF_VEC_SIZES = (16, 32)
+
 # For GEMM autotuning.
 # Taken from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h#L38
 # TODO: move to model config, tune for blackwell hardware
