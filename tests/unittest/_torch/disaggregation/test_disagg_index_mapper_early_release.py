@@ -72,15 +72,8 @@ class _FakeExecutor(PyExecutor):
     working as `_send_kv_async` internals evolve) but skips
     `PyExecutor.__init__` so no engine or distributed wiring is required."""
 
-    def __init__(
-        self,
-        kv_cache_manager,
-        async_transfer_manager,
-        kv_cache_transceiver,
-        kv_cache_manager_pair=None,
-    ):
+    def __init__(self, kv_cache_manager, async_transfer_manager, kv_cache_transceiver):
         self.kv_cache_manager = kv_cache_manager
-        self.kv_cache_manager_pair = kv_cache_manager_pair
         self.async_transfer_manager = async_transfer_manager
         self.kv_cache_transceiver = kv_cache_transceiver
         self.kv_connector_manager = None
@@ -97,35 +90,25 @@ class TestSendKvAsyncReleasesIndexSlot:
     transfer is started, which is where the production code actually lives
     (see py_executor._send_kv_async)."""
 
-    def _build(self, kv_cache_manager, kv_cache_manager_pair=None):
+    def _build(self, kv_cache_manager):
         resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
         transfer_manager = AsyncTransferManager(resource_manager)
         transceiver = MagicMock()
         transceiver.kv_transfer_timeout_ms = None
         transceiver.has_retired_send_session.return_value = False
-        return (
-            _FakeExecutor(
-                kv_cache_manager,
-                transfer_manager,
-                transceiver,
-                kv_cache_manager_pair,
-            ),
-            transfer_manager,
-        )
+        return _FakeExecutor(kv_cache_manager, transfer_manager, transceiver), transfer_manager
 
     def test_send_kv_async_calls_release_index_slot(self):
         """Verify release_index_slot is called for V2 managers."""
         kv_cache_manager = MagicMock()
         kv_cache_manager.store_blocks_for_reuse.return_value = 100
-        kv_cache_manager_pair = MagicMock()
 
-        executor, _ = self._build(kv_cache_manager, kv_cache_manager_pair)
+        executor, _ = self._build(kv_cache_manager)
         request = create_mock_request(42)
 
         PyExecutor._send_kv_async(executor, [request])
 
-        kv_cache_manager_pair.release_index_slot.assert_called_once_with(42)
-        kv_cache_manager.release_index_slot.assert_not_called()
+        kv_cache_manager.release_index_slot.assert_called_once_with(42)
 
     def test_send_kv_async_skips_release_for_v1_manager(self):
         """Verify _send_kv_async does not crash when kv_cache_manager lacks
@@ -144,20 +127,22 @@ class TestSendKvAsyncReleasesIndexSlot:
 
         assert 42 in transfer_manager.requests_in_transfer()
 
-    def test_release_called_once_per_request(self):
-        """If the same request passes through _send_kv_async once, release is
-        called exactly once (it's gated by `is_context_finished`, which is
-        reset after the first pass)."""
+    def test_repeated_send_releases_index_slot_once_per_request(self):
+        """A repeated _send_kv_async call does not release the slot twice."""
         kv_cache_manager = MagicMock()
         kv_cache_manager.store_blocks_for_reuse.return_value = 100
-        kv_cache_manager_pair = MagicMock()
 
-        executor, _ = self._build(kv_cache_manager, kv_cache_manager_pair)
+        executor, _ = self._build(kv_cache_manager)
         request = create_mock_request(42)
 
         PyExecutor._send_kv_async(executor, [request])
+        # A real request derives is_context_finished from state; start_transfer
+        # moved it to DISAGG_CONTEXT_TRANS_IN_PROGRESS, so mirror that reset on
+        # this lightweight mock before the repeated scheduling pass.
+        request.is_context_finished = False
+        PyExecutor._send_kv_async(executor, [request])
 
-        kv_cache_manager_pair.release_index_slot.assert_called_once_with(42)
+        kv_cache_manager.release_index_slot.assert_called_once_with(42)
 
 
 class TestIndexMapperSlotReuse:

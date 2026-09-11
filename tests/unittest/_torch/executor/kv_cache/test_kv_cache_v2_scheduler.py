@@ -1719,6 +1719,7 @@ class TestDisagg:
         out = sched.schedule_request(reqs, set())
 
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
+        assert target_mgr.prepare_disagg_gen_init.call_args_list == [call(reqs[0]), call(reqs[1])]
         target_mgr.suspend_request.assert_called_once_with(reqs[0])
         draft_mgr.suspend_request.assert_called_once_with(reqs[0])
 
@@ -1731,6 +1732,7 @@ class TestDisagg:
         out = sched.schedule_request([req], set())
 
         assert ids(out.fitting_disagg_gen_init_requests) == []
+        target_mgr.prepare_disagg_gen_init.assert_called_once_with(req)
         draft_mgr._prepare_draft_disagg_gen_init.assert_not_called()
         target_mgr.suspend_request.assert_not_called()
         draft_mgr.suspend_request.assert_not_called()

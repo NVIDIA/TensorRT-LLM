@@ -707,7 +707,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         don't participate in the forward pass token budget.
         """
         if not self.kv_cache_manager_pair.prepare_disagg_gen_init(req):
-            logger.debug("Joint KV admission failed for request %s", req.py_request_id)
+            logger.debug(f"Joint KV admission failed for request {req.py_request_id}")
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
 

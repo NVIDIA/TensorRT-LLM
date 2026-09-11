@@ -978,6 +978,21 @@ def test_kv_cache_manager_v2_pair_rolls_back_both_pools_on_draft_failure() -> No
     draft.suspend_request.assert_called_once_with(request)
 
 
+def test_kv_cache_manager_v2_pair_drops_draft_when_target_revert_drops_cache() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.revert_allocate_context.return_value = False
+    draft.revert_allocate_context.return_value = True
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert pair.revert_allocate_context(request) is False
+
+    target.revert_allocate_context.assert_called_once_with(request)
+    draft.revert_allocate_context.assert_called_once_with(request)
+    draft.free_resources.assert_called_once_with(request)
+
+
 def test_resource_manager_builds_one_shared_v2_pair() -> None:
     target = object.__new__(KVCacheManagerV2)
     target.is_draft = False
@@ -1009,6 +1024,21 @@ def test_resource_manager_refreshes_v2_pair_when_draft_is_registered() -> None:
     resource_manager.register_resource_manager(ResourceManagerType.DRAFT_KV_CACHE_MANAGER, draft)
 
     assert resource_manager.kv_cache_manager_pair is not target_only_pair
+    assert resource_manager.kv_cache_manager_pair.target is target
+    assert resource_manager.kv_cache_manager_pair.draft is draft
+
+
+def test_resource_manager_refreshes_v2_pair_when_target_is_registered() -> None:
+    target = object.__new__(KVCacheManagerV2)
+    target.is_draft = False
+    draft = object.__new__(KVCacheManagerV2)
+    draft.is_draft = True
+    resource_manager = ResourceManager({ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft})
+
+    assert resource_manager.kv_cache_manager_pair is None
+
+    resource_manager.register_resource_manager(ResourceManagerType.KV_CACHE_MANAGER, target)
+
     assert resource_manager.kv_cache_manager_pair.target is target
     assert resource_manager.kv_cache_manager_pair.draft is draft
 
