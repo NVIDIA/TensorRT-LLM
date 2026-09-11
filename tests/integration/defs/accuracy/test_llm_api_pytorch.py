@@ -3086,6 +3086,59 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(10800)
 @pytest.mark.skip_less_device_memory(100000)
+class TestKimiK3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K3"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(16)
+    # The 16-GPU K3 recipes are qualified on GB300 (one NVL72 domain) only.
+    # B300 also clears this memory gate but uses 8-GPU nodes; QA platform
+    # selection excludes that non-NVL72 topology.
+    @pytest.mark.skip_less_device_memory(200000)
+    def test_w4a16_mxfp4(self) -> None:
+        """Run GPQA Diamond on the K3 checkpoint with DEP16."""
+        max_seq_len = GPQADiamond.MAX_INPUT_LEN + GPQADiamond.MAX_OUTPUT_LEN
+        sampling_params = SamplingParams(
+            max_tokens=GPQADiamond.MAX_OUTPUT_LEN,
+            truncate_prompt_tokens=GPQADiamond.MAX_INPUT_LEN,
+        )
+
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=16,
+                moe_expert_parallel_size=16,
+                enable_attention_dp=True,
+                max_batch_size=32,
+                max_num_tokens=8192,
+                max_seq_len=max_seq_len,
+                trust_remote_code=True,
+                enable_chunked_prefill=True,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                  max_batch_size=32),
+                moe_config=MoeConfig(
+                    max_num_tokens=33024,
+                    use_low_precision_moe_combine=True,
+                ),
+                kv_cache_config=KvCacheConfig(
+                    free_gpu_memory_fraction=0.25,
+                    tokens_per_block=64,
+                    use_kv_cache_manager_v2=False,
+                ),
+        ) as llm:
+            # K3 stores its compressed-tensors quantization configuration in
+            # text_config, so the LLM-args reference matcher sees no quant algo.
+            assert llm.args.quant_config.quant_algo is None
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=sampling_params,
+                extra_evaluator_kwargs=dict(apply_chat_template=True),
+            )
+
+
+@pytest.mark.timeout(10800)
+@pytest.mark.skip_less_device_memory(100000)
 class TestKimiK2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Instruct"
