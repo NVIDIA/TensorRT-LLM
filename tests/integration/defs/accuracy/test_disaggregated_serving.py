@@ -88,7 +88,8 @@ def has_nvlink():
         result = subprocess.run(['nvidia-smi', 'nvlink', '-s'],
                                 capture_output=True,
                                 text=True,
-                                check=False)
+                                check=False,
+                                timeout=60)
 
         # Check if the command executed successfully
         if result.returncode != 0:
