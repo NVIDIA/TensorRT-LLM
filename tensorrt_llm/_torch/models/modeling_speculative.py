@@ -461,6 +461,13 @@ def confident_prefix_length(confidence_logits: torch.Tensor, *, block_size: int,
 
 
 class Eagle3Attention(Attention):
+    # Target families whose attention applies RoPE in the interleaved (GPT-J)
+    # layout rather than the half-split (NeoX) one. A drafter that rotates q/k
+    # differently than the target it was trained against stays numerically
+    # valid but positionally scrambled, pinning acceptance length near the 1.0
+    # floor. Keyed on the target's model_type, stamped onto the draft config as
+    # target_model_type by SpecDecOneEngineForCausalLM.
+    NON_NEOX_TARGET_MODEL_TYPES = ("llama4_text", "llama4")
 
     def __init__(
         self,
@@ -470,6 +477,8 @@ class Eagle3Attention(Attention):
     ):
         config = model_config.pretrained_config
         self._next_layer_regular = next_layer_regular
+        is_neox = getattr(config, "target_model_type",
+                          None) not in self.NON_NEOX_TARGET_MODEL_TYPES
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -477,8 +486,10 @@ class Eagle3Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
+                type=PositionEmbeddingType.rope_gpt_neox
+                if is_neox else PositionEmbeddingType.rope_gptj,
                 rope=RopeParams.from_config(config),
+                is_neox=is_neox,
             ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
@@ -1634,6 +1645,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                     model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
+                    # The drafter must rotate q/k like the target; its own
+                    # config cannot express which family it was trained
+                    # against (see Eagle3Attention.NON_NEOX_TARGET_MODEL_TYPES).
+                    self.draft_config.pretrained_config.target_model_type = (
+                        model_config.pretrained_config.model_type)
 
                 elif spec_config.uses_external_draft_model:
                     self.draft_config = ModelConfig.from_pretrained(
