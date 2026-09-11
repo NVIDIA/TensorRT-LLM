@@ -574,13 +574,12 @@ void initRequestBindings(nb::module_& m)
             self.getLookaheadConfig(), self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(),
             self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(), self.getClientId(),
             self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
-            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getCrossAttentionMask(),
-            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams(), self.getDisaggRequestId(),
-            self.getCacheSalt());
+            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getGuidedDecodingParams(),
+            self.getDisaggRequestId(), self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 32)
+        if (state.size() != 30)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -613,9 +612,8 @@ void initRequestBindings(nb::module_& m)
             nb::cast<tle::PriorityType>(state[22]), nb::cast<tle::RequestType>(state[23]),
             nb::cast<std::optional<tle::ContextPhaseParams>>(state[24]),
             nb::cast<std::optional<tle::Tensor>>(state[25]), nb::cast<std::optional<SizeType32>>(state[26]),
-            nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<tle::Tensor>>(state[28]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[29]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[30]), nb::cast<std::optional<std::string>>(state[31]));
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[27]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[28]), nb::cast<std::optional<std::string>>(state[29]));
     };
 
     // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
@@ -660,7 +658,6 @@ void initRequestBindings(nb::module_& m)
                 bool return_all_generated_tokens, tle::PriorityType priority, tle::RequestType type,
                 std::optional<tle::ContextPhaseParams> context_phase_params,
                 std::optional<tle::Tensor> encoder_input_features, std::optional<tle::SizeType32> encoder_output_length,
-                std::optional<tle::Tensor> cross_attention_mask, std::optional<tle::Tensor> skip_cross_attn_blocks,
                 std::optional<tle::GuidedDecodingParams> guided_decoding_params,
                 std::optional<tle::SizeType32> language_adapter_uid,
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
@@ -674,7 +671,6 @@ void initRequestBindings(nb::module_& m)
                     std::move(logits_post_processor_name), std::move(logits_post_processor),
                     std::move(encoder_input_token_ids), client_id, return_all_generated_tokens, priority, type,
                     std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
-                    std::move(cross_attention_mask), std::move(skip_cross_attn_blocks),
                     std::move(guided_decoding_params), language_adapter_uid, allotted_time_ms, disagg_request_id,
                     std::move(cache_salt));
             },
@@ -707,8 +703,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("context_phase_params") = nb::none(),
         nb::arg("encoder_input_features") = nb::none(),
         nb::arg("encoder_output_length") = nb::none(),
-        nb::arg("cross_attention_mask") = nb::none(),
-        nb::arg("skip_cross_attn_blocks") = nb::none(),
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
@@ -747,9 +741,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("request_type", &tle::Request::getRequestType, &tle::Request::setRequestType)
         .def_prop_rw(
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
-        .def_prop_rw("cross_attention_mask", &tle::Request::getCrossAttentionMask, &tle::Request::setCrossAttentionMask)
-        .def_prop_rw(
-            "skip_cross_attn_blocks", &tle::Request::getSkipCrossAttnBlocks, &tle::Request::setSkipCrossAttnBlocks)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
