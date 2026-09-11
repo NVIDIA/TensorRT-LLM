@@ -1553,19 +1553,17 @@ class PersistentDenseGemmKernel:
         c_ptr: cute.Pointer,
         a_stride_m: cutlass.Int32,
         a_stride_batch: cutlass.Int32,
+        b_stride_n: cutlass.Int32,
+        b_stride_batch: cutlass.Int32,
         c_stride_m: cutlass.Int32,
         c_stride_batch: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        """Like ``wrapper_strided`` but also builds C from a raw pointer with
-        explicit M / batch strides (N stride = 1). Lets the epilogue write into
-        a column slice of a wider buffer, e.g. the first ``n`` columns of a
-        ``[batch, m, n + extra]`` tensor, and sidesteps DLPack for output
-        dtypes it does not carry (FP8). The C element type is taken from
-        ``c_ptr``, so an FP8 pointer gives an FP32-accumulate -> FP8 store at
-        unit scale (no ``fp8_scale``; see ``wrapper_strided_fp8_quantized`` for
-        the scaled variant).
+        """``wrapper_strided`` with C also built from a raw pointer plus explicit
+        (M, batch) strides; the N stride is 1. The C element type comes from
+        ``c_ptr`` (e.g. FP8, which DLPack cannot carry), and C may be a column
+        slice of a wider buffer.
         """
         a_tensor = cute.make_tensor(
             a_ptr,
@@ -1576,9 +1574,9 @@ class PersistentDenseGemmKernel:
         )
         b_tensor = cute.make_tensor(
             b_ptr,
-            layout=cute.make_ordered_layout(
+            layout=cute.make_layout(
                 (n, k, batch_size),
-                order=(1, 0, 2),
+                stride=(b_stride_n, 1, b_stride_batch),
             ),
         )
         c_tensor = cute.make_tensor(
