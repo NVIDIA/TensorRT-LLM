@@ -149,11 +149,9 @@ modes.
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
-* With one-model speculative decoding, positive Min-P requires
-  `advanced_sampling_mode: fused` in the speculative decoding config (see
-  [Advanced sampling mode](#advanced-sampling-mode-speculative-decoding)). That mode's
-  fused kernel is the only one that applies `min_p`; under the other modes such a request
-  is rejected at admission rather than decoded without it.
+* Positive Min-P is supported with one-model speculative decoding under the default
+  `advanced_sampling_mode: full`; the `no_*` specializations reject such requests at
+  admission (see [Advanced sampling mode](#advanced-sampling-mode-speculative-decoding)).
 
 * Occurrence penalties are supported: `repetition_penalty`, `presence_penalty` and
   `frequency_penalty` discourage (or encourage) the model from reusing tokens it has
@@ -225,28 +223,18 @@ speculative config) lets you skip those redundant kernels for a fixed deploy
 config. The output is identical to `FULL` whenever the skipped filter is already
 disabled, so this is a lossless throughput optimization for advanced use cases:
 
-| Mode | `top_k` kernel | `top_p` kernel | `min_p` |
+| Mode | `top_k` kernel | `top_p` kernel | `min_p` kernel |
 |---|---|---|---|
-| `full` (default) | applied | applied | not supported |
-| `no_topk` | **skipped** | applied | not supported |
-| `no_topp` | applied | **skipped** | not supported |
-| `no_topk_no_topp` | **skipped** | **skipped** | not supported |
-| `fused` | per row | per row | **supported** |
+| `full` (default) | applied | applied | applied |
+| `no_topk` | **skipped** | applied | **rejected** |
+| `no_topp` | applied | **skipped** | **rejected** |
+| `no_topk_no_topp` | **skipped** | **skipped** | **rejected** |
 
-`fused` works differently from the other four. Those each name one *combination* of
-enabled filters, chosen for the whole deployment, so every additional sampling parameter
-doubles the number of modes. `fused` instead runs a single fused kernel that takes
-`temperature`, `min_p`, `top_k` and `top_p` together as per-request tensors and decides
-**per row, on device**, which of them to do any work for. A row that leaves a filter at its
-neutral value (`top_k = 0`, `top_p = 1`, `min_p = 0`) does not pay for it.
-
-Two consequences:
-
-* It is the only mode that supports `min_p`, because it is the only one whose kernel has a
-  `min_p` input.
-* It suits deployments whose requests are *heterogeneous* — a batch mixing filtered and
-  unfiltered requests — which a per-deploy mode cannot express: `full` would pay for every
-  filter on every row, and the `no_*` modes would disable a filter some requests wanted.
+`full` applies all three in one fused kernel, which is why it is the only mode that takes
+`min_p`; the others have no `min_p` input, so such a request is **rejected at admission**
+rather than skipped like a disabled `top_k` or `top_p`. That kernel also skips a filter a
+request left at its neutral value, so the `no_*` modes save work only for requests that
+wanted the filter anyway.
 
 Notes:
 
@@ -261,8 +249,6 @@ Notes:
   sampling batches without a special case.
 * `advanced_sampling_mode` is a deploy-time choice; it is *not* part of the CUDA
   graph key, so it adds no extra warmup graphs.
-* `fused` is lossless in the same sense as the others: it reproduces the standard
-  sampler's distribution, applying `min_p` first, then `top_k`, then `top_p`.
 
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig

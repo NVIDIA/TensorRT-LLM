@@ -1880,34 +1880,33 @@ class CalibConfig(StrictBaseModel):
 class AdvancedSamplingMode(StrEnum):
     """Deploy-time specialization of the one-model advanced sampler.
 
-    FULL    - per-row tensor top_k/top_p (default; mixed per-request sampling).
+    FULL    - per-row tensor top_k/top_p/min_p in one fused kernel (default; mixed
+              per-request sampling). The only mode that accepts min_p.
     NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
     NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
     NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
-    FUSED - applies temperature, min_p, top_k and top_p in one kernel.
     """
     FULL = "full"
     NO_TOPK = "no_topk"
     NO_TOPP = "no_topp"
     NO_TOPK_NO_TOPP = "no_topk_no_topp"
-    FUSED = "fused"
 
     @property
     def skips_top_k(self) -> bool:
-        """Whether this mode disables the top_k filter."""
+        """Single source of truth: does this mode disable the top_k filter?"""
         return self in (AdvancedSamplingMode.NO_TOPK,
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
 
     @property
     def skips_top_p(self) -> bool:
-        """Whether this mode disables the top_p filter."""
+        """Single source of truth: does this mode disable the top_p filter?"""
         return self in (AdvancedSamplingMode.NO_TOPP,
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
 
     @property
     def is_fused(self) -> bool:
-        """Whether this mode routes to the fused sampling kernel."""
-        return self is AdvancedSamplingMode.FUSED
+        """Whether this mode runs the fused kernel, and so accepts min_p."""
+        return self is AdvancedSamplingMode.FULL
 
 
 class _MTPDraftCheckpointType(StrEnum):
@@ -2006,11 +2005,9 @@ class DecodingBaseConfig(StrictBaseModel):
         default=AdvancedSamplingMode.FULL,
         description=
         "Deploy-time specialization of the one-model advanced sampler that skips disabled "
-        "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
-        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both. FUSED: one fused kernel for "
-        "temperature/min_p/top_k/top_p that skips per row rather than per deploy; it is "
-        "the only mode that supports min_p, which is otherwise rejected at admission."
-    )
+        "filter kernels. FULL (default): per-row top_k/top_p/min_p in one fused kernel, the "
+        "only mode accepting min_p. NO_TOPK: skip top_k. NO_TOPP: skip top_p. "
+        "NO_TOPK_NO_TOPP: skip both.")
 
     enable_penalty: bool = Field(
         default=False,

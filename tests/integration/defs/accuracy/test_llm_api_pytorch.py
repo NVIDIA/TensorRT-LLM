@@ -535,29 +535,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             )
 
     @skip_pre_hopper
-    def test_eagle3_one_model_min_p_requires_fused_mode(self):
-        """Positive min_p requires the fused sampling mode."""
-        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
-        with LLM(model=self.MODEL_PATH,
-                 max_batch_size=1,
-                 max_seq_len=1024,
-                 disable_overlap_scheduler=True,
-                 cuda_graph_config=None,
-                 kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                               dtype="auto"),
-                 speculative_config=Eagle3DecodingConfig(
-                     max_draft_len=4,
-                     speculative_model=eagle_model_dir,
-                     eagle3_one_model=True,
-                     use_rejection_sampling=True,
-                 )) as llm:
-            with pytest.raises(Exception, match="min_p requires"):
-                llm.generate(["The capital of France is"],
-                             SamplingParams(temperature=0.8,
-                                            min_p=0.05,
-                                            max_tokens=8))
-
-    @skip_pre_hopper
     def test_eagle3_sa(self):
         """Accuracy test for EAGLE3 One-Model + Suffix Automaton speculative decoding."""
         pytorch_config = dict(

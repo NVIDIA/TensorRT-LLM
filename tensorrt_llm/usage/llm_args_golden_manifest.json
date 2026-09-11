@@ -1855,8 +1855,7 @@
         "full",
         "no_topk",
         "no_topp",
-        "no_topk_no_topp",
-        "fused"
+        "no_topk_no_topp"
       ],
       "annotation": "<enum 'AdvancedSamplingMode'>",
       "converter": "",

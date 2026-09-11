@@ -19,28 +19,25 @@ mode resolution, a CUDA check that NO_TOPK yields the same distribution as FULL
 when top_k is disabled, and native greedy handling (greedy rows return argmax).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as su
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from tensorrt_llm._torch.speculative.utils import get_spec_metadata
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DecodingBaseConfig, MTPDecodingConfig
 
 
 def test_enum_skip_properties():
     """Enum members + the skip properties (single source of truth for filter skipping)."""
     M = AdvancedSamplingMode
-    assert [m.value for m in M] == ["full", "no_topk", "no_topp", "no_topk_no_topp", "fused"]
+    assert [m.value for m in M] == ["full", "no_topk", "no_topp", "no_topk_no_topp"]
     assert (M.FULL.skips_top_k, M.FULL.skips_top_p) == (False, False)
     assert (M.NO_TOPK.skips_top_k, M.NO_TOPK.skips_top_p) == (True, False)
     assert (M.NO_TOPP.skips_top_k, M.NO_TOPP.skips_top_p) == (False, True)
     assert (M.NO_TOPK_NO_TOPP.skips_top_k, M.NO_TOPK_NO_TOPP.skips_top_p) == (True, True)
-    assert (M.FUSED.skips_top_k, M.FUSED.skips_top_p) == (False, False)
-
-
-def test_only_fused_is_fused():
-    M = AdvancedSamplingMode
-    assert [m for m in M if m.is_fused] == [M.FUSED]
 
 
 def test_advanced_sampling_mode_on_base_config():
@@ -51,7 +48,7 @@ def test_advanced_sampling_mode_on_base_config():
 
 def test_all_modes_construct_regardless_of_rejection():
     """Every mode constructs with or without rejection sampling (no config gating)."""
-    for mode in ("full", "no_topk", "no_topp", "no_topk_no_topp", "fused"):
+    for mode in ("full", "no_topk", "no_topp", "no_topk_no_topp"):
         for rej in (False, True):
             cfg = MTPDecodingConfig(
                 max_draft_len=1, advanced_sampling_mode=mode, use_rejection_sampling=rej
@@ -161,6 +158,19 @@ def test_advanced_mode_accepted_on_all_spec_paths():
         ),
     )
     assert args.speculative_config.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK
+
+
+@pytest.mark.parametrize("mode", list(AdvancedSamplingMode))
+def test_metadata_carries_the_configured_sampling_mode(mode):
+    """Losing the assignment is silent: admission reads the mode off the config, while the
+    buffer fill and the dispatcher read it off the metadata."""
+    metadata = get_spec_metadata(
+        MTPDecodingConfig(num_nextn_predict_layers=1, advanced_sampling_mode=mode),
+        SimpleNamespace(num_hidden_layers=32, hidden_size=128, vocab_size=1024, torch_dtype=None),
+        max_num_requests=4,
+        max_num_tokens=64,
+    )
+    assert metadata.advanced_sampling_mode == mode
 
 
 if __name__ == "__main__":

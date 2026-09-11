@@ -186,12 +186,7 @@ def test_min_p_matches_reference(min_p):
 
 
 def test_min_p_one_keeps_only_the_argmax():
-    """min_p == 1.0 is documented explicit-greedy: only p == p_max survives.
-
-    Continuous logits never tie, so p_max is reached once and the support is a single
-    index. ``test_min_p_one_keeps_every_tied_maximum`` covers the case this cannot
-    reach.
-    """
+    """min_p == 1.0 is documented explicit-greedy: only p == p_max survives."""
     dev = "cuda"
     torch.manual_seed(0)
     logits = torch.randn(8, 4096, device=dev) * 3.0
@@ -208,22 +203,15 @@ def test_min_p_one_keeps_only_the_argmax():
 def test_min_p_one_keeps_every_tied_maximum():
     """Tied maxima all survive min_p == 1.0; the filter is ``w >= minP``, not argmax.
 
-    The neighbouring random-logit test only ever observes one survivor because
-    continuous logits do not tie, so it cannot distinguish "keep p == p_max" from
-    "keep the single argmax". Exact ties separate them, and the documented filter
-    keeps every one of them with the mass split evenly.
-
-    Production never reaches this: the one-model path classifies min_p == 1.0 as
-    explicit greedy before the batch is scanned, so a tie is broken there rather than
-    here. This pins the contract for callers that invoke the op directly.
+    The neighbouring test uses ``torch.randn``, which never ties, so its single-survivor
+    assertion cannot tell the two apart.
     """
     dev = "cuda"
     rows, vocab, ties = 4, 1024, 3
     torch.manual_seed(0)
     logits = torch.randn(rows, vocab, device=dev) * 3.0
     tie_idx = torch.stack([torch.randperm(vocab, device=dev)[:ties] for _ in range(rows)])
-    # One bit-identical value per tied slot, so the scaled logits cancel to exactly 0
-    # at every tie and each w comes out exactly 1.0.
+    # One bit-identical value per slot, so every tie scales to exactly w == 1.0.
     logits.scatter_(1, tie_idx, logits.max().item() + 1.0)
     temps, top_ks, top_ps, min_ps = _params(rows, device=dev, min_p=1.0)
 

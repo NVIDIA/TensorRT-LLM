@@ -307,20 +307,20 @@ def _populate_meta(mode, draft_len=1):
 @unittest.skipUnless(torch.cuda.is_available(), "populate allocates CUDA buffers")
 class TestMinPBufferFillIsGatedOnFused(unittest.TestCase):
     def test_fused_fills_the_min_p_buffers(self):
-        meta = _populate_meta(AdvancedSamplingMode.FUSED)
+        meta = _populate_meta(AdvancedSamplingMode.FULL)
         SpecMetadata.populate_sampling_params_for_one_model(
             meta, [_request(temperature=1.0, min_p=0.25)]
         )
         self.assertAlmostEqual(meta.request_min_ps[0].item(), 0.25, places=6)
         self.assertAlmostEqual(meta.min_ps[0].item(), 0.25, places=6)
 
-    def test_full_leaves_them_at_the_disable_sentinel(self):
-        # A min_p request cannot reach populate under FULL -- validate_request rejects it
-        # -- so the buffers must stay at the 0.0 they were allocated with, and the fill
-        # must not run.
-        meta = _populate_meta(AdvancedSamplingMode.FULL)
+    def test_flashinfer_modes_leave_them_at_the_disable_sentinel(self):
+        # A min_p request cannot reach populate under a NO_* mode -- validate_request
+        # rejects it -- so even when one is handed straight to populate the buffers must
+        # stay at the 0.0 they were allocated with, and the fill must not run.
+        meta = _populate_meta(AdvancedSamplingMode.NO_TOPK)
         SpecMetadata.populate_sampling_params_for_one_model(
-            meta, [_request(temperature=1.0, top_p=0.9)]
+            meta, [_request(temperature=1.0, top_p=0.9, min_p=0.25)]
         )
         self.assertEqual(meta.request_min_ps[0].item(), 0.0)
         self.assertEqual(meta.min_ps[0].item(), 0.0)
@@ -379,7 +379,7 @@ class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
         return len(owners)
 
     def test_mixed_context_and_generation_batch(self):
-        meta = _populate_meta(AdvancedSamplingMode.FUSED, draft_len=self.DRAFT_LEN)
+        meta = _populate_meta(AdvancedSamplingMode.FULL, draft_len=self.DRAFT_LEN)
         min_ps = [0.1, 0.2, 0.3]
         top_ps = [0.7, 0.8, 0.9]
         requests = [
@@ -399,7 +399,7 @@ class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
         alone, min_p would keep the previous, shorter layout and every token after the
         transition would read its neighbour's filter.
         """
-        meta = _populate_meta(AdvancedSamplingMode.FUSED, draft_len=self.DRAFT_LEN)
+        meta = _populate_meta(AdvancedSamplingMode.FULL, draft_len=self.DRAFT_LEN)
         min_ps = [0.1, 0.2]
         top_ps = [0.7, 0.8]
 
@@ -419,7 +419,7 @@ class TestMinPExpandsWithTheSameLayoutAsTopP(unittest.TestCase):
 
     def test_transition_invalidates_only_the_expanded_signature(self):
         """The refill decision itself, stated directly rather than through the buffers."""
-        meta = _populate_meta(AdvancedSamplingMode.FUSED, draft_len=self.DRAFT_LEN)
+        meta = _populate_meta(AdvancedSamplingMode.FULL, draft_len=self.DRAFT_LEN)
         as_context = [_context_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
         as_generation = [_request(temperature=1.0, min_p=0.1, top_p=0.7, slot=0)]
 
