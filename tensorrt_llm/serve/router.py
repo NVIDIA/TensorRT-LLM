@@ -342,6 +342,15 @@ class Router(ABC):
         self._server_role = server_role
         self._lock = asyncio.Lock()
         self._monitor_task = None
+        # Wall-clock of the last poll that completed without error, used by
+        # ``monitoring_is_stale()``. ``None`` means monitoring was never
+        # started (a static server list), which is not staleness.
+        self._last_successful_poll: Optional[float] = None
+        # When the monitor task was created. Stands in for
+        # ``_last_successful_poll`` until the first poll lands, so a monitor
+        # whose every poll has failed still ages into staleness instead of
+        # holding the initial server list healthy forever.
+        self._monitor_started_at: Optional[float] = None
         self._session = None
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
@@ -377,6 +386,37 @@ class Router(ABC):
     @property
     def num_prepared_servers(self) -> int:
         return len(self._prepared_ready_servers)
+
+    def monitoring_is_stale(self, max_age_secs: float) -> bool:
+        """Whether metadata-driven monitoring has stopped keeping up.
+
+        True when the monitor task has ended, or when no poll has completed
+        within ``max_age_secs``. Both mean ``servers`` is no longer a
+        statement about the cluster, so a readiness probe must not trust it.
+
+        Before the first poll lands, the monitor's own start time is the
+        reference point. Otherwise a monitor whose every poll has failed since
+        startup would never age into staleness, and readiness would keep
+        trusting the initial server list -- the same fail-open this is meant
+        to close, just entered from startup rather than from a later death.
+
+        Always False when monitoring was never started -- a static server list
+        has no monitor to go stale, and its list is correct by construction.
+        """
+        if self._monitor_task is None:
+            return False
+        if self._monitor_task.done():
+            return True
+        # Explicit None checks throughout: 0.0 is a legitimate
+        # ``time.monotonic()`` value, and `or` would silently discard it.
+        reference = self._last_successful_poll
+        if reference is None:
+            reference = self._monitor_started_at
+        if reference is None:
+            # Task exists but was not created by ``start_server_monitoring()``.
+            # Nothing to measure against; do not invent staleness.
+            return False
+        return (time.monotonic() - reference) > max_age_secs
 
     @property
     def prepared_servers(self) -> set[str]:
@@ -502,6 +542,10 @@ class Router(ABC):
 
         logger.info(
             f"Starting server monitoring for {self._server_role} servers")
+        # Set before the task exists so staleness has a reference point from
+        # the very first poll onwards, including the polls that fail.
+        self._monitor_started_at = time.monotonic()
+        self._last_successful_poll = None
         self._monitor_task = asyncio.create_task(
             self._monitor_servers(poll_interval))
 
@@ -532,10 +576,15 @@ class Router(ABC):
                 role_specific_servers = self._filter_servers_by_role(
                     live_servers, server_key_map)
 
-                # Use filtered servers if available
+                # Use filtered servers if available. An empty list is a valid
+                # state -- every worker of this role is gone -- and must be
+                # published so readiness reflects it. Asserting here instead
+                # would kill the loop and leave a stale, healthy-looking list.
                 final_servers = role_specific_servers
-
-                assert final_servers, f"No {self._server_role} servers available"
+                if not final_servers:
+                    logger.warning(
+                        f"No live {self._server_role} servers; publishing an "
+                        "empty server list for this role")
 
                 # Update server list
                 async with self._lock:
@@ -562,17 +611,33 @@ class Router(ABC):
                         logger.debug(
                             f"No change in {self._server_role} server list: {len(self._servers)} servers"
                         )
-            except Exception as e:
-                logger.error(f"Error in server monitoring: {e}")
+                self._last_successful_poll = time.monotonic()
+            except asyncio.CancelledError:
                 raise
+            except Exception as e:
+                # Keep polling. Re-raising ends the loop, and a monitor that is
+                # no longer running leaves ``self._servers`` frozen on its last
+                # value -- which readiness would then read as healthy forever.
+                # ``_last_successful_poll`` is deliberately not updated, so
+                # ``monitoring_is_stale()`` starts reporting the gap.
+                logger.error(f"Error in server monitoring: {e}")
 
             # Wait before next poll
             await asyncio.sleep(poll_interval)
 
-    def _filter_servers_by_role(self, servers, server_key_map):
-        """Filter servers by role (context or generation)"""
+    def _filter_servers_by_role(self, servers: List[str],
+                                server_key_map: Dict[str, str]) -> List[str]:
+        """Filter servers by role (context or generation)
+
+        Returns an empty list when no server of this role is live. That is a
+        legitimate observation, not an error: callers such as a readiness
+        probe need to be able to see "this role has no workers left". Raising
+        here instead would kill the monitor loop and freeze ``self._servers``
+        on its last known-good value, which reports the role as healthy
+        forever.
+        """
         if not servers:
-            raise RuntimeError("No servers available")
+            return []
 
         filtered_servers = []
         # Invert to get {url: key} for lookup
