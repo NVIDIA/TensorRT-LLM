@@ -393,6 +393,17 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
         }
 
 
+def _chat_template_kwargs_with_effort(request: ChatCompletionRequest) -> dict:
+    """Surface an explicitly requested reasoning effort to chat templates."""
+    kwargs = dict(request.chat_template_kwargs or {})
+    if "reasoning_effort" in request.model_fields_set:
+        effort = getattr(request.reasoning_effort, "value",
+                         request.reasoning_effort)
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
+    return kwargs
+
+
 def _configure_parser_special_token_decoding(
         sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
         tool_parser_name: Optional[str], has_tools: bool) -> None:
@@ -2214,7 +2225,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
+                    chat_template_kwargs=_chat_template_kwargs_with_effort(
+                        request),
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
@@ -2734,7 +2746,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
+                    chat_template_kwargs=_chat_template_kwargs_with_effort(
+                        request),
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
