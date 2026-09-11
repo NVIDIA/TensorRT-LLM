@@ -630,6 +630,51 @@ def test_selfsampling_dispatch_is_pure_and_total():
             assert r["block"] >= 128 and r["grid"][0] >= 1
 
 
+def test_selfsampling_route_4k_8k_register_rungs():
+    """4K < n <= 8K (n4 in (1024, 2048]) dispatches to two one-wave register
+    rungs: wide rows BLK=1024 x VPT=2 with 2*NB bins, 148 < b <= 296 BLK=512 x
+    VPT=4 x MINB=2 with NB bins; b > 296 keeps the main slab and both band
+    edges keep their previous plans. Every register plan carries QC == QUADC
+    and the kernel pin IMGOFF == NBH. CPU-only."""
+    for k in (512, 1024, 2048):
+        for n in (4100, 6144, 8192, 8195):
+            npad = (n + 63) // 64 * 64
+            for b in (1, 64, 148):
+                r = ss_host.route(b, n, npad, k)
+                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == (1024, 2, 1), (b, n, k, r)
+                assert r["tpl"][7] == 2 * ss_host.NB
+            for b in (149, 160, 256, 296):
+                r = ss_host.route(b, n, npad, k)
+                assert r["kernel"] == "reg" and tuple(r["tpl"][:3]) == (512, 4, 2), (b, n, k, r)
+                assert r["tpl"][7] == ss_host.NB
+            assert ss_host.route(297, n, npad, k)["kernel"] == "main"
+        # band edges: n4 == 1024 keeps the n4 <= 1024 rungs, n4 == 2049 the VPT=4 plan
+        lo = ss_host.route(64, 4099, 4160, k)
+        assert lo["kernel"] == ("regimg" if k == 512 else "reg") and tuple(lo["tpl"][:3]) == (
+            1024,
+            1,
+            2,
+        )
+        assert tuple(ss_host.route(160, 4099, 4160, k)["tpl"][:3]) == (512, 2, 4)
+        hi = ss_host.route(64, 8196, 8256, k)
+        assert hi["kernel"] == "reg" and tuple(hi["tpl"][:3]) == (1024, 4, 1)
+        assert ss_host.route(160, 8196, 8256, k)["kernel"] == "main"
+    for k in (512, 1024, 2048):
+        for b in (1, 148, 149, 296, 297, 1024):
+            for n in range(k + 1, 16385, 97):
+                npad = (n + 63) // 64 * 64
+                r = ss_host.route(b, n, npad, k)
+                if r["kernel"] in ("reg", "regimg"):
+                    assert r["rt"]["QC"] == ss_host.QUADC, (b, n, k)
+                    assert r["rt"]["IMGOFF"] == r["tpl"][7], (
+                        b,
+                        n,
+                        k,
+                        r["rt"]["IMGOFF"],
+                        r["tpl"][7],
+                    )
+
+
 def test_selfsampling_topk_varlen_rejects_non_fp32():
     """Engine-level dtype contract: bf16/fp16 logits must raise a clear
     error (the dispatch seam falls through before this; direct callers get
@@ -869,6 +914,113 @@ def test_selfsampling_varlen_reg_cuda_graph():
     out.fill_(-7)
     with torch.cuda.graph(g):
         ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
+    for _ in range(2):
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
+        assert torch.equal(got, ref_v)
+
+
+@pytest.mark.parametrize(
+    "rows,n,top_k",
+    [
+        (64, 8192, 512),  # wide rung (1024,2,1)
+        (148, 4100, 2048),  # wide rung, DEG tuple, band floor
+        (160, 8195, 512),  # mid rung (512,4,2), band ceiling
+        (256, 6144, 1024),  # mid rung, KPT=2
+        (296, 8192, 2048),  # mid rung, one full wave, DEG tuple (n <= 4k+64), k > BLK
+    ],
+    ids=["wide_b64_k512", "wide_b148_k2048", "mid_b160_k512", "mid_b256_k1024", "mid_b296_k2048"],
+)
+def test_selfsampling_varlen_4k_8k_rungs_exact(rows, n, top_k):
+    """The 4K < n <= 8K register rungs under the hint-free varlen engine on a
+    heterogeneous batch: full rows, mid-length rows, a short row (n <= k), a
+    two-valued row (boundary tie class of thousands -> the crossing-bin count
+    saturates, non-quad refine) and a heavy-tailed row (first-k bracket misses
+    the k-th value -> QC = QUADC routes it to the key-space narrowing)."""
+    npad = (n + 63) // 64 * 64
+    want = (1024, 2, 1) if rows <= 148 else (512, 4, 2)
+    plan = ss_host.route(rows, n, npad, top_k)
+    assert plan["kernel"] == "reg" and tuple(plan["tpl"][:3]) == want, plan["tpl"]
+    gen = torch.Generator(device=_DEV).manual_seed(rows + n)
+    logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+    kv = [n - (i % 7) * 3 for i in range(rows)]
+    kv[1] = n // 2
+    kv[2] = max(top_k - 5, 1)  # short row: identity head + -1 tail
+    logits[3, : kv[3]] = torch.randint(0, 2, (kv[3],), generator=gen, device=_DEV).float()
+    cauchy = torch.randn((kv[4],), generator=gen, device=_DEV) / torch.randn(
+        (kv[4],), generator=gen, device=_DEV
+    )
+    logits[4, : kv[4]] = cauchy.clamp(-1e30, 1e30)
+    for r in range(rows):
+        logits[r, kv[r] :] = 3e38  # poison beyond each row's own length
+    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv_lens, out, next_n=1, compress_ratio=1, max_seq_len=n)
+    torch.cuda.synchronize()
+    key = (rows, npad, top_k, n, 1, 1)
+    assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
+    ref = _reference_varlen_indices(logits, kv_lens, 1, 1, top_k)
+    for r in range(rows):
+        row = logits[r]
+        got = row[out[r].long().clamp_min(0)].sort().values
+        want_v = row[ref[r].long().clamp_min(0)].sort().values
+        assert torch.equal(got, want_v), f"row {r} value multiset mismatch"
+        assert torch.equal(out[r] < 0, ref[r] < 0), f"row {r} pad mask mismatch"
+
+
+def test_selfsampling_varlen_mid_rung_mtp_cr4():
+    """The 148 < b <= 296 register rung under the production DSv4 window
+    contract: compress_ratio=4, next_n=4 (40 requests x 4 rows), per-row n
+    derived from KV tokens, with a short request and a zero-window request."""
+    k, msl_c, cr, nn = 512, 8192, 4, 4
+    rows = 160
+    npad = msl_c
+    plan = ss_host.route(rows, msl_c, npad, k)
+    assert plan["kernel"] == "reg" and tuple(plan["tpl"][:3]) == (512, 4, 2), plan["tpl"]
+    torch.manual_seed(23)
+    lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
+    kv_list = [msl_c * cr - (i % 5) * 7 for i in range(rows // nn)]
+    kv_list[1] = (k - 3) * cr  # short rows: identity head + -1 tail
+    kv_list[2] = nn - 1  # zero-window request: every row all -1
+    kv_list[3] = msl_c * cr // 2
+    kv = torch.tensor(kv_list, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    key = (rows, npad, k, msl_c, nn, cr)
+    assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
+    ref = _reference_varlen_indices(lg, kv, nn, cr, k)
+    for r in range(rows):
+        if (ref[r] >= 0).any():
+            row = lg[r]
+            got = row[out[r].long().clamp_min(0)].sort().values
+            want_v = row[ref[r].long().clamp_min(0)].sort().values
+            assert torch.equal(got, want_v), f"row {r} value multiset mismatch"
+            assert torch.equal(out[r] < 0, ref[r] < 0), f"row {r} pad mask mismatch"
+        else:
+            assert torch.equal(out[r], ref[r]), f"row {r} expected all -1"
+
+
+def test_selfsampling_varlen_mid_rung_cuda_graph():
+    """The 148 < b <= 296 register rung must be CUDA-graph capturable: warmed
+    engine, capture one launch, replay twice, tie-aware exact each time."""
+    k, n, rows = 512, 8192, 160
+    torch.manual_seed(19)
+    lg = torch.randn(rows, n, dtype=torch.float32, device=_DEV)
+    kv = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=1, max_seq_len=n)
+    torch.cuda.synchronize()
+    key = (rows, n, k, n, 1, 1)
+    assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
+    assert tuple(ss_host.route(rows, n, n, k)["tpl"][:3]) == (512, 4, 2)
+    g = torch.cuda.CUDAGraph()
+    out.fill_(-7)
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=1, max_seq_len=n)
     ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
     for _ in range(2):
         out.fill_(-7)
@@ -1297,6 +1449,21 @@ def test_prefill_warmup_idempotent_and_no_rejit():
     finally:
         dev.get_compiled = orig
     assert calls["n"] == 0, f"warmup missed keys: {calls['n']} live compiles"
+    # the reachable engine set for this k above the k-th column: one tier-0 key
+    # per bucket where a <= 148-row launch keeps the BLK=1024 plan at either
+    # bucket edge, plus the bucket-free tier-1 and tier-2 keys — and nothing else
+    # (buckets <= k belong to identity-only launches other tests make directly;
+    # production never requests them: scores.shape[1] <= top_k takes the radix path)
+    lo = ss_host._prefill_bucket(k + 1)
+    want = {(1, k, 0), (2, k, 0)}
+    bk = lo
+    while bk <= 32768:
+        for n_env in (bk // 2 + 1, bk):
+            if ss_host._prefill_tier(1, n_env, k) == 0:
+                want.add((0, k, bk))
+        bk <<= 1
+    have = {kk for kk in ss_host._PREFILL_CACHE if kk[1] == k and (kk[0] != 0 or kk[2] >= lo)}
+    assert have == want, (have, want)
     # the capture-time readiness query agrees with the cache: warmed shape
     # ready, an unwarmed k (4 is valid but never compiled) not ready
     assert ss_host.prefill_ready(lg, out)
@@ -1322,3 +1489,64 @@ def test_prefill_capture_no_host_sync():
     g.replay()
     torch.cuda.synchronize()
     _check_prefill_exact(lg, out, rs, re, k)
+
+
+def test_prefill_small_envelope_tier0_uses_sampled_plan():
+    """<= 148-row prefill launches whose envelope lies above the tier-1 BLK=512
+    plan's pair-sample gate (4096 for k <= 1024, 8192 for k > 1024) by the
+    margin and at most 16384 must take that engine: the BLK=1024 tier-0 plan's
+    compile-time gate is n > 16384, so under such an envelope every row would
+    run the unsampled path. Tier selection is CPU-only; the launches below check
+    the (tier, k, bucket) key each envelope creates, prefill_ready's agreement
+    with it, and exactness on causal-ramp tail rows (ks = 0) and on a
+    prefix-cache-hit window with a misaligned start (ks % 4 = lead) for every
+    production K."""
+    for rows in (1, 75, 148):
+        for k in (512, 1024):
+            for n_env in (1024, 2048, 4096, 4352):
+                assert ss_host._prefill_tier(rows, n_env, k) == 0
+            for n_env in (4353, 5000, 8192, 16384):
+                assert ss_host._prefill_tier(rows, n_env, k) == 1
+            assert (
+                ss_host._prefill_tier(rows, 16385, k) == 0
+                and ss_host._prefill_tier(rows, 32768, k) == 0
+            )
+        for n_env in (4099, 8192, 8448):
+            assert ss_host._prefill_tier(rows, n_env, 2048) == 0
+        for n_env in (8449, 12288, 16384):
+            assert ss_host._prefill_tier(rows, n_env, 2048) == 1
+        assert ss_host._prefill_tier(rows, 32768, 2048) == 0
+    for rows in (149, 296):
+        assert (
+            ss_host._prefill_tier(rows, 4099, 512) == 1
+            and ss_host._prefill_tier(rows, 32768, 512) == 1
+        )
+    assert (
+        ss_host._prefill_tier(297, 8192, 512) == 2 and ss_host._prefill_tier(297, 32768, 2048) == 2
+    )
+    rows = 64
+    for k in (512, 1024, 2048):
+        for n in (4099, 8192, 16384, 32768):
+            tier = ss_host._prefill_tier(rows, n, k)
+            assert tier == (
+                1 if ss_host._prefill_scpb_tier1(k) + ss_host._PREFILL_T1_MARGIN < n <= 16384 else 0
+            )
+            ks = [0] * rows
+            ke = list(range(n - rows + 1, n + 1))
+            lg, rs, re = _make_prefill_case(rows, n, ks, ke, top_k=k, seed=n + k)
+            out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+            ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
+            torch.cuda.synchronize()
+            bucket = ss_host._prefill_bucket(n)
+            assert ss_host._prefill_cache_key(tier, k, bucket) in ss_host._PREFILL_CACHE
+            assert ss_host.prefill_ready(lg, out, max_row_len=n)
+            _check_prefill_exact(lg, out, rs, re, k)
+        # prefix-cache-hit window on the small-envelope tier-1 engine: ks % 4 == 1
+        n = 8192
+        ks = [4 * 100 + 1] * rows
+        ke = list(range(n - rows + 1, n + 1))
+        lg, rs, re = _make_prefill_case(rows, n, ks, ke, top_k=k, seed=7 * k)
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
+        torch.cuda.synchronize()
+        _check_prefill_exact(lg, out, rs, re, k)

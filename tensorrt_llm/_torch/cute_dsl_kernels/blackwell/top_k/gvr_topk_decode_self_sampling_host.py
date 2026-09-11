@@ -101,14 +101,18 @@ C-semantics notes encoded here:
 
 # ---- dispatch constants (must match the device kernels) ---------------------
 NB = 1024  # register-path histogram bins
-QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths)
+QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths, every register plan)
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 
 def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
-    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc."""
+    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
+
+    Deviations from the CUDA reference (self-sampling only): the 4K < n <= 8K
+    register rungs, QC = QUADC for every register plan, NB bins for the
+    not-wide register plans up to n4 <= 2048."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     wide = b <= 148
@@ -116,12 +120,18 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    QC = 1024 if b > 148 else QUADC
+    # QC = QUADC for every register plan: the O(mc^2) rank loop is taken only
+    # for mc <= QC, so a wider gate lets one row whose first-k bracket misses
+    # the k-th value stall the whole one-wave launch. Rows with mc <= QUADC
+    # take the same branch under either gate.
+    QC = QUADC
     CURE = not (n < 2 * k and b > 148)
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
-    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 1024 and not wide)) else NB
+    # NB bins for the not-wide register plans up to n4 <= 2048 (incl. the
+    # (512, 4, 2) rung below) so IMGOFF == NBH holds at every reg site.
+    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
     IMGOFF = NBSEL
     smem_reg = (NBSEL + 2 * CMP) * 4
 
@@ -215,6 +225,16 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
                 "smem": smc,
                 "ws": False,
             }
+
+    # 4K < n <= 8K (n4 in (1024, 2048]): one-wave register rungs. Wide rows:
+    # BLK=1024 x VPT=2 covers n4 <= 2048 exactly (the VPT=4 plan below carries
+    # two empty float4 slots per thread). 148 < b <= 296: two BLK=512 CTAs per
+    # SM is one wave up to 296 rows; b > 296 keeps the main slab.
+    if n4 <= 2048:
+        if wide:
+            return _reg(1024, 2, 1, 2 * NB)
+        if b <= 296:
+            return _reg(512, 4, 2, NB)
 
     if n4 <= 4096 and wide:
         return _reg(1024, 4, 1, 2 * NB)
@@ -406,12 +426,14 @@ if __name__ == "__main__":
         (64, 4096, 4096, 1024),  # reg   wide but DEGE (n<=4k+64)
         (8, 65536, 65536, 1024),  # reg_clus (vsel=2, cs=8; b<=15 no veto)
         (16, 131072, 131072, 512),  # main  cs=8 veto fall-through -> SPLIT slab, tshg=True
+        (64, 8192, 8192, 512),  # reg   wide 4K<n<=8K rung (1024,2,1)
+        (256, 8192, 8192, 1024),  # reg   148<b<=296, 4K<n<=8K rung (512,4,2)
         (64, 16384, 16384, 1024),  # reg   wide 4k fallback (1024,4,1)
         (64, 262144, 262144, 1024),  # clus  R=2 shallow cluster split
         (1, 1048576, 1048576, 1024),  # main  deep slab SPLIT R=148
         (20, 262144, 262144, 2048),  # main  k>1024 split (no useclus)
         (512, 131072, 131072, 1024),  # main  b>296 BLK=256
-        (256, 6144, 6144, 2048),  # main  small_dense sample gate
+        (512, 6144, 6144, 2048),  # main  small_dense sample gate (b > 296)
         (256, 262144, 262144, 2048),  # main  KBIG-domain (k>1024), BLK=512 KPT=4
     ]
     for shp in smoke:
@@ -685,10 +707,26 @@ _VARLEN_CACHE = {}
 _PREFILL_CACHE = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
 _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
+# The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
+# gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
+# path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
+# 8192 for k > 1024); <= 148-row launches take it when the envelope is above
+# that gate by a margin (just above the gate the freshly sampling BLK=512 plan
+# is slower than the unsampled BLK=1024 plan for b >= 32) and at most 16384
+# (above that the BLK=1024 plan samples too and is the better slab).
+_PREFILL_T1_MARGIN = 256
+_PREFILL_T1_MAX = 16384
 
 
-def _prefill_tier(rows: int) -> int:
-    return 0 if rows <= 148 else 1 if rows <= 296 else 2
+def _prefill_scpb_tier1(k: int) -> int:
+    return 8192 if k > 1024 else 4096
+
+
+def _prefill_tier(rows: int, n_env: int, k: int) -> int:
+    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
+    if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
+        tier = 1
+    return tier
 
 
 def _prefill_bucket(n_env: int) -> int:
@@ -1571,7 +1609,7 @@ def run_prefill(
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
-        tier = _prefill_tier(r1 - r0)
+        tier = _prefill_tier(r1 - r0, n_env, k)
         lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
         if lc is None:
             if _is_capturing():
@@ -1588,18 +1626,24 @@ def run_prefill(
     return
 
 
-def prefill_ready(logits: torch.Tensor, indices: torch.Tensor) -> bool:
-    """True iff ``run_prefill(logits, ..., indices)`` would launch without
-    compiling — the same (tier, k, envelope bucket) keys it looks up, so a
-    caller can route around the engine under CUDA graph capture. Host-only."""
+def prefill_ready(
+    logits: torch.Tensor, indices: torch.Tensor, max_row_len: int | None = None
+) -> bool:
+    """True iff ``run_prefill(logits, ..., indices, max_row_len)`` would launch
+    without compiling — the same (tier, k, envelope bucket) keys it looks up, so
+    a caller can route around the engine under CUDA graph capture. Host-only.
+    Pass the same ``max_row_len`` as the ``run_prefill`` call (the envelope
+    bucket, and with it the tier, is derived from it)."""
     num_rows = logits.shape[0]
     if num_rows == 0:
         return True
     k = indices.shape[1]
     npad = logits.stride(0)
-    n_bucket = _prefill_bucket(min(max(logits.shape[1], 1), max(npad, 1)))
+    n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
+    n_env = min(max(n_env, 1), max(npad, 1))
+    n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
-        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0)
+        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
         if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
             return False
     return True
@@ -1765,9 +1809,11 @@ def warmup_prefill(
     num_rows_list: Sequence[int] = (1, 149, 297),
     row_stride: int | None = None,
 ) -> None:
-    """Compile the prefill engine set before serving (<=6 per k): the tier-0 arm
-    walks the pow2 envelope buckets up to 32768, tiers 1/2 need one launch each.
-    ``max_cols`` is the compressed max column count; idempotent per done-key."""
+    """Compile every prefill engine ``run_prefill`` can request before serving:
+    the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
+    (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
+    one launch each. ``max_cols`` is the compressed max column count;
+    idempotent per done-key."""
     dev = torch.cuda.current_device()
     k = int(top_k)
     max_cols = int(max_cols)
@@ -1780,26 +1826,26 @@ def warmup_prefill(
         b <<= 1
     if not buckets:
         buckets = [hi]
-    keys = {}  # cache_key -> (tier, bucket) representative for the launch
+    keys = {}  # cache_key -> (tier, bucket, envelope) representative for the launch
     for rows in num_rows_list:
-        tier = _prefill_tier(int(rows))
-        bset = buckets if tier == 0 else buckets[:1]
-        for bk in bset:
-            keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk))
+        for bk in buckets:
+            for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
+                tier = _prefill_tier(int(rows), n_env, k)
+                keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk, n_env))
     done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
-    for tier, bk in keys.values():
+    for tier, bk, n_env in keys.values():
         rows = _PREFILL_TIER_ROWS[tier]
         stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
         if stride < bk or stride % 4:
             stride = (max(stride, bk) + 256 + 255) // 256 * 256
         logits = torch.zeros((rows, stride), dtype=torch.float32, device=dev)
         ks = torch.zeros((rows,), dtype=torch.int32, device=dev)
-        ke = torch.full((rows,), bk, dtype=torch.int32, device=dev)
+        ke = torch.full((rows,), n_env, dtype=torch.int32, device=dev)
         out = torch.empty((rows, k), dtype=torch.int32, device=dev)
-        run_prefill(logits[:, :bk], ks, ke, out, max_row_len=bk)
+        run_prefill(logits[:, :bk], ks, ke, out, max_row_len=n_env)
         del logits, ks, ke, out
     torch.cuda.synchronize()
     with _PREFILL_WARMUP_LOCK:
