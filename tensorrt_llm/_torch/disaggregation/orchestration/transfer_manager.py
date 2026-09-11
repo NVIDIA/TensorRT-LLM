@@ -25,7 +25,7 @@ class AsyncTransferManager:
     """
 
     class RequestTransferMetadata:
-        def __init__(self, block_id: Optional[int]):
+        def __init__(self, block_id: Optional[list[int]]):
             self.block_id = block_id
             self.counter = 0
 
@@ -118,22 +118,21 @@ class AsyncTransferManager:
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
-            if (
-                disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
-                and self.should_store_blocks
-                and request.is_context_only_request
-            ):
-                mapping = getattr(self.kv_cache_manager, "mapping", None)
-                disagg_diagnostics.emit_event(
-                    "ctx_source_unpinned",
-                    side="ctx",
-                    request_id=get_unique_rid(request),
-                    local_request_id=request.py_request_id,
-                    rank=getattr(mapping, "rank", None),
-                    source_kv_reuse_pinned=False,
-                    state=request.state.name,
-                    block_reuse_id=transfer_metadata.block_id,
-                )
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    if self.should_store_blocks and request.is_context_only_request:
+                        assert transfer_metadata.block_id is not None
+                        mapping = getattr(self.kv_cache_manager, "mapping", None)
+                        disagg_diagnostics.emit_event(
+                            "ctx_source_unpinned",
+                            side="ctx",
+                            request_id=get_unique_rid(request),
+                            local_request_id=request.py_request_id,
+                            rank=getattr(mapping, "rank", None),
+                            source_kv_reuse_pinned=False,
+                            state=request.state.name,
+                            source_kv_reuse_block_count=len(transfer_metadata.block_id),
+                        )
 
             return True
 
