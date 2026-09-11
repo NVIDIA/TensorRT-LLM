@@ -391,8 +391,13 @@ void SharedPageLock::releasePageIndex()
 {
     int oldBaseIndex
         = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
-    // Mirrors Python assertion: old base index must match this page's slot ID.
-    TLLM_CHECK_DEBUG(oldBaseIndex == slotIdToPageIndexValue(page()->slotId()));
+    // Mirrors Python assertion: old base index must match this page's slot ID -- except for SSM
+    // pages, which are locked with kBadBlockOrdinal because they have no per-block index slot.
+    // updateBasePageIndex() tracks nothing for those and reports kBadPageIndex, so comparing
+    // against the page's slot would fail for every SSM page (_page.py SharedPageLock.unlock()
+    // carries the same exemption; the port dropped it).
+    TLLM_CHECK_DEBUG(oldBaseIndex
+        == (mUser.ordinal == kBadBlockOrdinal ? kBadPageIndex.value() : slotIdToPageIndexValue(page()->slotId())));
     (void) oldBaseIndex;
 }
 
