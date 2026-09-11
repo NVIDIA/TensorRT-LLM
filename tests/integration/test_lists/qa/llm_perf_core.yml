@@ -14,8 +14,6 @@ llm_perf_core:
 # 9: H100, B200, B300, RTX6000-Server test cases
 # 10: B200, B300, RTX6000-Server test cases
 # 11: RTX-6000 Server test cases
-# 12: Qwen3.8 MAX NVFP4, B300/GB300 with >=8 GPUs and >260 GiB per GPU
-# 13: Qwen3.8 Flash-Next FP8/NVFP4, SM100/103 with >=145000 MiB per GPU
 # ===============================================================================
 
 
@@ -202,6 +200,13 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] #min_latency
   - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4] #max_throughput
+  # Qwen3.8 Flash-Next single-GPU FP8/TRTLLM and NVFP4/CUTEDSL with MTP3.
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:5-con:1-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:5-con:1-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1] TIMEOUT(180)
 
 
 # 7: B200, B300 test cases
@@ -277,6 +282,10 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT (120)
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
+  # Qwen3.8 MAX NVFP4 TP8 with MTP3 on B300/GB300.
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:1-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:1-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:1-tp:8-gpus:8] TIMEOUT(180)
 
 
 # 9: H100, B200, B300, RTX6000-Server test cases
@@ -334,49 +343,3 @@ llm_perf_core:
   # 2000-token decode of each request; does not fit the 60min default here.
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:8-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:8-tp:8-gpus:8]
-
-
-# 12: Qwen3.8 MAX (2.4T-A95B), NVFP4 TP8 + MTP3.
-# GB300 accuracy recipe; concurrency 1/8/32 also validated on B300 SM103.
-# Sources: https://github.com/NVIDIA/TensorRT-LLM/pull/18071
-# docs/source/deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.md
-# The curated FP8 recipe needs TP16; this is the accuracy-tested NVFP4 TP8 recipe.
-# Keep ISL+OSL below its 8192 max_seq_len. Concurrency points are regression
-# workloads, not a reproduction of the blog's rack-scale Pareto curve.
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 8
-      compute_capability:
-        gte: 10.3
-        lte: 10.3
-      gpu_memory:
-        gt: 266240
-  tests:
-  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:1-tp:8-gpus:8] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:1-tp:8-gpus:8] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:1-tp:8-gpus:8] TIMEOUT(180)
-
-
-# 13: Qwen3.8 Flash-Next single-GPU FP8/TRTLLM and NVFP4/CUTEDSL + MTP3.
-# Source: https://github.com/NVIDIA/TensorRT-LLM/pull/18585
-# PLE host offload requires >=96 GiB (FP8) / >=128 GiB (NVFP4) host RAM;
-# test_perf.py checks this and sets TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1.
-# Blog context (not an exact reproduction of the GB300 NVL72 benchmark):
-# https://developer.nvidia.com/blog/experiment-with-qwen3-8-flash-next-on-nvidia-gb300-nvl72-for-agentic-coding/
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-      compute_capability:
-        gte: 10.0
-        lte: 10.3
-      gpu_memory:
-        gte: 145000
-  tests:
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:5-con:1-ep:1] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp-serve-pytorch-float8-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:5-con:1-ep:1] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1] TIMEOUT(180)
