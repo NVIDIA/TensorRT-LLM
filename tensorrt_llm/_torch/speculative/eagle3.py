@@ -656,8 +656,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+    def _prepare_attn_metadata_for_spec_dec(self,
+                                            attn_metadata: AttentionMetadata,
+                                            *extra_fields: str) -> None:
+        super()._prepare_attn_metadata_for_spec_dec(attn_metadata,
+                                                    *extra_fields)
         batch_size = attn_metadata.num_seqs
 
         # Save spec-dec params that the drafting loop will overwrite.
@@ -684,7 +687,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         else:
             self._saved_generation_lengths = None
 
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+    def _restore_attn_metadata_from_spec_dec(
+            self, attn_metadata: AttentionMetadata) -> None:
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
         if self._saved_packed_mask is not None:
             batch_size = self._saved_packed_mask.shape[0]
