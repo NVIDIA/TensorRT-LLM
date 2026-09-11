@@ -314,6 +314,7 @@ class TestDeepseekV4CacheManager:
         spec_config: object | None = None,
         indexer_k_dtype: str | None = None,
         enable_swa_scratch_reuse: bool = True,
+        enable_block_reuse: bool = False,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
         """Helper to create a DeepseekV4CacheManager for testing."""
 
@@ -332,7 +333,7 @@ class TestDeepseekV4CacheManager:
         if max_input_len is None:
             max_input_len = max_seq_len
         kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
+            enable_block_reuse=enable_block_reuse,
             max_tokens=max_seq_len * max_batch_size,
             event_buffer_max_size=0,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
@@ -1772,6 +1773,24 @@ class TestDeepseekV4CacheManager:
 
         try:
             assert cache_manager._max_draft_len + 1 == 8
+            assert cache_manager.incremental_hca_enabled
+        finally:
+            cache_manager.shutdown()
+
+    def test_incremental_hca_supports_block_reuse(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_HCA_INCREMENTAL_SUMMARY", "1")
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[128],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            enable_block_reuse=True,
+        )
+
+        try:
+            assert cache_manager.enable_block_reuse
             assert cache_manager.incremental_hca_enabled
         finally:
             cache_manager.shutdown()

@@ -404,14 +404,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 PageIndexMode.SHARED,
             )
 
+        # Endpoint summaries are deterministic prefix state and can be reused.
+        # Partial-page reuse remains safe because the cache manager uses
+        # copy-on-write before a continued request appends a new endpoint.
         self.incremental_hca_enabled = (
             128 in pp_compress_ratios
-            # Incremental prefill/decode stores endpoint summaries instead of
-            # raw token state, so those pages cannot be shared with a request
-            # that expects the legacy raw layout.
-            and not kv_cache_config.enable_block_reuse
             and os.environ.get("TRTLLM_HCA_INCREMENTAL_SUMMARY", "0") == "1"
         )
+        if self.incremental_hca_enabled:
+            logger.info_once(
+                "Enabled incremental HCA compressor summaries "
+                f"(block reuse={kv_cache_config.enable_block_reuse})",
+                key="incremental_hca_enabled",
+            )
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         layer_semantics = self._manager_layer_id_to_layer_attn.get((layer_id, role))
