@@ -282,7 +282,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT (120)
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
-  # Qwen3.8 MAX NVFP4 TP8 with MTP3 on B300/GB300.
+  # Qwen3.8 MAX NVFP4 TP8 with MTP3 on 8-GPU B300 systems.
   - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:1-tp:8-gpus:8] TIMEOUT(180)
   - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:1-tp:8-gpus:8] TIMEOUT(180)
   - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:1-tp:8-gpus:8] TIMEOUT(180)
