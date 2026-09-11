@@ -268,7 +268,7 @@ def test_flux_accuracy_against_golden(request, tmp_path, case, _visual_gen_lpips
 
 
 def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run the FLUX.1 example with the supported single-GPU NVFP4 config."""
+    """Run the FLUX.1 example end-to-end on engine defaults."""
     model_path = _lpips_model_path("FLUX.1-dev")
     _skip_if_missing(model_path, "FLUX.1-dev checkpoint", is_dir=True)
 
@@ -276,11 +276,7 @@ def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "flux1_output.png")
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux1.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "flux1-dev-fp4-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -288,8 +284,6 @@ def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--output_path",
             output_path,
         ],
@@ -298,7 +292,7 @@ def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
 
 
 def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run the FLUX.2 example with the supported single-GPU NVFP4 config."""
+    """Run the FLUX.2 example end-to-end on engine defaults."""
     model_path = _lpips_model_path("FLUX.2-dev")
     _skip_if_missing(model_path, "FLUX.2-dev checkpoint", is_dir=True)
 
@@ -306,11 +300,7 @@ def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "flux2_output.png")
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux2.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "flux2-dev-fp4-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -318,8 +308,6 @@ def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--output_path",
             output_path,
         ],
@@ -341,9 +329,6 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "flux2_reference_image_output.png")
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux2.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "flux2-dev-fp4-1gpu.yaml"
-    )
 
     venv_check_call(
         llm_venv,
@@ -351,8 +336,6 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--image",
             str(reference_path),
             "--height",

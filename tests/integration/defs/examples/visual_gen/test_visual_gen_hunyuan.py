@@ -130,11 +130,10 @@ def test_hunyuan_t2v_lpips_against_golden(request, _visual_gen_deps, tmp_path):
 
 
 def test_hunyuan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/hunyuan_t2v.py with the FP8 config end-to-end.
+    """Run examples/visual_gen/models/hunyuan_t2v.py end-to-end on defaults.
 
-    Validates that the HunyuanVideo 1.5 example script and
-    ``configs/hunyuan-t2v-fp8-1gpu.yaml`` work together as documented in the
-    README, at the example's own 480p defaults.
+    Validates that the HunyuanVideo 1.5 example script runs as documented, at the
+    example's own 480p defaults.
     """
     model_path = _lpips_model_path(HUNYUAN_T2V_MODEL_SUBPATH)
     _skip_if_missing(model_path, "HunyuanVideo 1.5 480p T2V checkpoint", is_dir=True)
@@ -146,11 +145,7 @@ def test_hunyuan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
         os.remove(output_path)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "hunyuan_t2v.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "hunyuan-t2v-fp8-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -158,8 +153,6 @@ def test_hunyuan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--output_path",
             output_path,
         ],

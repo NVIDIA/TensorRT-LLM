@@ -17,7 +17,6 @@
 
 Usage:
     python wan_i2v.py
-    python wan_i2v.py --visual_gen_args ../configs/wan2.2-i2v-fp4-1gpu.yaml
 """
 
 import argparse

@@ -17,7 +17,6 @@
 
 Usage:
     python flux2.py
-    python flux2.py --visual_gen_args ../configs/flux2-dev-fp4-1gpu.yaml
     python flux2.py --image subject.png
     python flux2.py --image subject.png --image style.png
 """

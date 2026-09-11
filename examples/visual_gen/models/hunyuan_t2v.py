@@ -20,7 +20,6 @@ supported for this model.
 
 Usage:
     python hunyuan_t2v.py
-    python hunyuan_t2v.py --visual_gen_args ../configs/hunyuan-t2v-fp8-1gpu.yaml
 """
 
 import argparse

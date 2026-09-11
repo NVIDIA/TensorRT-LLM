@@ -17,7 +17,6 @@
 
 Usage:
     python flux1.py
-    python flux1.py --visual_gen_args ../configs/flux1-dev-fp4-1gpu.yaml
 """
 
 import argparse

@@ -16,9 +16,6 @@
 
 Usage:
     python qwen_image_edit.py --image input.png --prompt "Make the image look like a watercolor painting"
-    python qwen_image_edit.py \
-        --visual_gen_args ../configs/qwen-image-edit-2511-fp8-1gpu.yaml \
-        --image input.png
 """
 
 import argparse

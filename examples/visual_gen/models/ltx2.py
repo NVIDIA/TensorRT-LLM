@@ -17,7 +17,6 @@
 
 Usage:
     python ltx2.py
-    python ltx2.py --visual_gen_args ../configs/ltx2-1gpu.yaml
     # Force two-stage on a checkpoint lacking the aux files:
     python ltx2.py --spatial_upsampler_path <upsampler.safetensors> \
         --distilled_lora_path <distilled-lora.safetensors>
