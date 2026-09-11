@@ -63,7 +63,6 @@ import tempfile
 import time
 from typing import Any
 
-import cv2
 import lpips
 import numpy as np
 import torch
@@ -491,6 +490,11 @@ def _decode_video_to_lpips_batch(
 ) -> torch.Tensor:
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found for LPIPS comparison: {video_path}")
+
+    # Imported on demand: OpenCV is not a TRT-LLM requirement (only the CI job scripts
+    # install it) and this module needs it solely to decode video, so a module-scope
+    # import would make image-only scoring runs depend on it too.
+    import cv2
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
