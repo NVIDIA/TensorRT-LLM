@@ -1626,14 +1626,11 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
     asyncio.run(drive())
 
 
-# Plain parametrize (not the `llama_model_root` indirect fixture) so the
-# test ID picks up the `[TinyLlama-1.1B-Chat-v1.0]` suffix that matches
-# the other disagg tests, without forcing LLM_MODELS_ROOT / NFS access —
-# trtllm-serve resolves the HuggingFace id directly.
-@pytest.mark.parametrize("llama_model_root", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_python_transceiver_host_offload(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
-        llama_model_root):  # noqa: ARG001 — used only for the parametrize label
+        llama_model_root):
     """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
 
     See `_verify_python_transceiver_under_host_offload` for what this
@@ -1641,10 +1638,6 @@ def test_disaggregated_python_transceiver_host_offload(
     ctx-side `host_cache_size` and a deliberately tight primary pool so
     that prefix reuse is forced through an offload+onboard cycle before
     each KV transfer.
-
-    Model resolution: trtllm-serve loads the HuggingFace id from the
-    config's `model:` field (TinyLlama/TinyLlama-1.1B-Chat-v1.0) via
-    huggingface_hub on first use. No LLM_MODELS_ROOT / NFS dependency.
     """
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
