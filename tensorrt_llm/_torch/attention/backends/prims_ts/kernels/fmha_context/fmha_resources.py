@@ -359,6 +359,9 @@ class FmhaConfig:
     # Paired D128 reads page IDs directly from the page table in its load task.
     # ------------------------------------------------------------------
     use_paged_kv: bool = False
+    # The caller guarantees that request-invalid rows in every active final V
+    # page contain zero. This lets consumers omit the defensive post-TMA clear.
+    paged_v_tail_is_zero: bool = False
     # D256 uses a single Q/KV instance and can issue the final O TMA store
     # from one correction warp after the four-warp correction group has
     # staged O.  This frees the standalone epilogue warp for scheduling.
@@ -463,10 +466,11 @@ class FmhaConfig:
     def needs_paged_v_tail_clear(self) -> bool:
         """Whether paged V tiles can contain request-invalid rows.
 
-        Only exact-full causal grids omit the clear.  Requiring complete Q
-        work tiles also excludes a padded final query-paired domain.
+        A caller-owned zero-tail contract makes the clear redundant. Otherwise,
+        only exact-full causal grids omit it. Requiring complete Q work tiles
+        also excludes a padded final query-paired domain.
         """
-        if not self.use_paged_kv:
+        if not self.use_paged_kv or self.paged_v_tail_is_zero:
             return False
         q_work_tile_m = self.q_tile_m * self.work_tile_q_seq_tiles
         return not (

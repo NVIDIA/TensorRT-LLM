@@ -35,6 +35,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     """
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
     from .msa_sparse_gqa import MsaSparseGqaFmha
+    from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
 
     return {
         "triton_custom_mask": TritonCustomMaskFmha,
@@ -42,6 +43,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "msa_sparse_gqa": MsaSparseGqaFmha,
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
         "prims_ts": PrimsTSFmha,
+        "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }

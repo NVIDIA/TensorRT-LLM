@@ -1817,7 +1817,10 @@ def _qsa_merge_splitk_kernel(
     partial_output,
     partial_lse,
     output,
+    output_gate,
     num_rows,
+    gate_stride_row: tl.constexpr,
+    gate_stride_head: tl.constexpr,
     output_stride_row: tl.constexpr,
     output_stride_head: tl.constexpr,
     output_stride_dim: tl.constexpr,
@@ -1826,6 +1829,7 @@ def _qsa_merge_splitk_kernel(
     BLOCK_SPLITS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     USE_PDL: tl.constexpr,
+    FUSE_OUTPUT_GATE: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -1853,6 +1857,14 @@ def _qsa_merge_splitk_kernel(
     )
     merged = tl.sum(partials * weights[:, None], axis=0)
     merged = tl.where(denominator > 0, merged / denominator, 0.0)
+    if FUSE_OUTPUT_GATE:
+        # Preserve the existing merge-then-gate contract by rounding the
+        # attention result to its output dtype before applying the FP32 gate.
+        attention = merged.to(output.dtype.element_ty).to(tl.float32)
+        gate = tl.load(
+            output_gate + row * gate_stride_row + head * gate_stride_head + dim_offsets
+        ).to(tl.float32)
+        merged = attention * tl.sigmoid(gate)
     tl.store(
         output
         + row * output_stride_row
@@ -1860,6 +1872,69 @@ def _qsa_merge_splitk_kernel(
         + dim_offsets * output_stride_dim,
         merged,
     )
+
+
+def _qsa_splitk_launch_config(
+    rows: int,
+    num_kv_heads: int,
+    selected_width: int,
+) -> tuple[int, int, int]:
+    base_programs = rows * num_kv_heads
+    if base_programs <= 4:
+        block_n, target_splits, num_warps = 16, 64, 4
+    elif base_programs < 32:
+        block_n, target_splits, num_warps = 16, 32, 4
+    elif base_programs <= 256:
+        block_n, target_splits, num_warps = 64, 8, 2
+    elif base_programs <= 512:
+        block_n, target_splits, num_warps = 64, 4, 2
+    else:
+        block_n, target_splits, num_warps = 64, 1, 2
+
+    num_tiles = triton.cdiv(selected_width, block_n)
+    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+    return block_n, min(max_useful_splits, target_splits), num_warps
+
+
+def qsa_supports_head_dims(head_dim: int, index_head_dim: int) -> bool:
+    """Whether the QSA Triton kernels can serve these head dimensions.
+
+    Every QSA kernel walks its head dimension with ``tl.arange``, which Triton
+    requires to be a power of two.
+    """
+    return all(dim > 0 and dim & (dim - 1) == 0 for dim in (head_dim, index_head_dim))
+
+
+def can_fuse_qsa_splitk_output_gate(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    selected_tokens: torch.Tensor,
+    output_gate: torch.Tensor,
+) -> bool:
+    """Return whether the split-K merge can consume an attention output gate."""
+    if q.ndim != 3 or selected_tokens.ndim != 2 or selected_tokens.shape[1] <= 0:
+        return False
+    rows, num_q_heads, head_dim = q.shape
+    if selected_tokens.shape[0] != rows or k_cache.ndim != 4:
+        return False
+    if not output_gate.is_cuda or output_gate.device != q.device or output_gate.dtype != q.dtype:
+        return False
+    if output_gate.stride(-1) != 1:
+        return False
+    if output_gate.ndim == 3:
+        if output_gate.shape != q.shape:
+            return False
+    elif output_gate.ndim == 2:
+        if output_gate.shape != (rows, num_q_heads * head_dim):
+            return False
+    else:
+        return False
+    _, num_splits, _ = _qsa_splitk_launch_config(
+        rows,
+        k_cache.shape[1],
+        selected_tokens.shape[1],
+    )
+    return num_splits > 1
 
 
 def triton_qsa_paged_sparse_gqa(
@@ -1874,6 +1949,7 @@ def triton_qsa_paged_sparse_gqa(
     softmax_scale: float,
     query_positions: torch.Tensor | None = None,
     compress_ratio: int | None = None,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run fused sparse GQA directly over the HND paged K/V cache."""
     if q.ndim != 3:
@@ -1922,6 +1998,13 @@ def triton_qsa_paged_sparse_gqa(
     output = torch.empty_like(q)
     if rows == 0:
         return output
+    if output_gate is not None and not can_fuse_qsa_splitk_output_gate(
+        q,
+        k_cache,
+        selected_tokens,
+        output_gate,
+    ):
+        raise ValueError("QSA output-gate fusion requires a compatible split-K merge")
 
     if (query_positions is None) != (compress_ratio is None):
         raise ValueError("QSA causal-prefix bounds require positions and compression ratio")
@@ -1986,20 +2069,12 @@ def triton_qsa_paged_sparse_gqa(
         )
         return output
 
-    if base_programs <= 4:
-        block_n, target_splits, num_warps = 16, 64, 4
-    elif base_programs < 32:
-        block_n, target_splits, num_warps = 16, 32, 4
-    elif base_programs <= 256:
-        block_n, target_splits, num_warps = 64, 8, 2
-    elif base_programs <= 512:
-        block_n, target_splits, num_warps = 64, 4, 2
-    else:
-        block_n, target_splits, num_warps = 64, 1, 2
-
+    block_n, num_splits, num_warps = _qsa_splitk_launch_config(
+        rows,
+        num_kv_heads,
+        selected_tokens.shape[1],
+    )
     num_tiles = triton.cdiv(selected_tokens.shape[1], block_n)
-    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
-    num_splits = min(max_useful_splits, target_splits)
     use_pdl = num_splits > 1 and _qsa_pdl_enabled(rows)
     if num_splits == 1:
         partial_output = output
@@ -2064,11 +2139,21 @@ def triton_qsa_paged_sparse_gqa(
     )
     if num_splits == 1:
         return output
+    gate = output if output_gate is None else output_gate
+    if output_gate is not None and output_gate.ndim == 3:
+        gate_stride_row = output_gate.stride(0)
+        gate_stride_head = output_gate.stride(1)
+    else:
+        gate_stride_row = gate.stride(0)
+        gate_stride_head = head_dim
     _qsa_merge_splitk_kernel[(rows, num_q_heads)](
         partial_output,
         partial_lse,
         output,
+        gate,
         rows,
+        gate_stride_row,
+        gate_stride_head,
         output.stride(0),
         output.stride(1),
         output.stride(2),
@@ -2077,6 +2162,7 @@ def triton_qsa_paged_sparse_gqa(
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
         HEAD_DIM=head_dim,
         USE_PDL=use_pdl,
+        FUSE_OUTPUT_GATE=output_gate is not None,
         num_warps=2,
         num_stages=1,
         launch_pdl=use_pdl,
@@ -2085,6 +2171,8 @@ def triton_qsa_paged_sparse_gqa(
 
 
 __all__ = [
+    "can_fuse_qsa_splitk_output_gate",
+    "qsa_supports_head_dims",
     "triton_qsa_decode_pre_indexer",
     "triton_qsa_paged_index_scores",
     "triton_qsa_paged_kv_store",

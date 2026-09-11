@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+from collections.abc import Mapping as AbcMapping
 from typing import List, Optional, Sequence
 
 import torch
@@ -254,6 +255,46 @@ def resolve_ssm_cache_dtype(config):
             getattr(candidate_config, "mamba_ssm_cache_dtype", None))
         if coerced is not None:
             return coerced
+    return None
+
+
+def resolve_vocab_size(config) -> Optional[int]:
+    """Return the language model's vocabulary size, or None if absent.
+
+    Multimodal wrappers keep the language model's fields on a nested config
+    and leave ``vocab_size`` unset at the top level, so reading
+    ``config.vocab_size`` on them yields None. The nested attribute name
+    differs per family: ``llm_config`` for Nemotron-H Omni, ``text_config``
+    for the Kimi K3 / Qwen composite configs, ``language_config`` for
+    HyperCLOVAX, which holds a plain dict rather than a config object.
+
+    The top-level read comes first because a composite config may carry both
+    a top-level ``vocab_size`` and a nested one; the top-level value is what
+    the cache key generator has always been given, and lowering it would let
+    synthetic multimodal ids collide with real token ids.
+    """
+    vocab_size = getattr(config, "vocab_size", None)
+    if vocab_size is not None:
+        return vocab_size
+    # ``get_text_config`` covers ``text_config``, ``text_encoder``, ``decoder``
+    # and ``generator``, plus per-model overrides that install their own. It
+    # does not know ``llm_config`` or ``language_config``, so the loop below
+    # stays. Not every config here is an HF one, hence the callable check.
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        vocab_size = getattr(get_text_config(), "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
+    for attr in ("llm_config", "text_config", "language_config"):
+        inner = getattr(config, attr, None)
+        if inner is None:
+            continue
+        if isinstance(inner, AbcMapping):
+            vocab_size = inner.get("vocab_size")
+        else:
+            vocab_size = getattr(inner, "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
     return None
 
 

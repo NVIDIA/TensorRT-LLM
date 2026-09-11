@@ -173,15 +173,15 @@ def get_cached_cuda_event_type():
     backend = KV_CACHE_MANAGER_V2_BACKEND
     if backend == "cpp":
         try:
-            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
         except ImportError:
             from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
-                CachedCudaEvent,
+                _introspection,
             )
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
 
     if find_spec("kv_cache_manager_v2") is not None:
         from kv_cache_manager_v2._utils import CachedCudaEvent
@@ -1007,7 +1007,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(
             self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
         )
-        with self.assertRaisesRegex(ValueError, "already been dropped"):
+        with self.assertRaisesRegex(RuntimeError, "already been dropped"):
             long_handle.drop()
 
     @requires_python_backend

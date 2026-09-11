@@ -1308,7 +1308,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Skywork model support
 - Add example for multimodal models (BLIP with OPT or T5, LlaVA)
 
-Refer to the {ref}`support-matrix-software` section for a list of supported models.
+Refer to the {ref}`support-matrix` section for a list of supported models.
 
 * API
   - Add a set of LLM APIs for end-to-end generation tasks (see examples/llm-api/README.md)

@@ -37,7 +37,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FLASHINFER", "FA4", "CUTEDSL")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
 
     Returns:
         Diffusion attention backend class
@@ -53,8 +53,11 @@ def get_visual_gen_attention_backend(
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL kernels. create_attention selects dense/SkipSoftmax FMHA or VSA
                       from AttentionConfig.sparse_attention_config.
+        - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
+                   selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).
     """
     # Lazy imports to avoid circular dependency
+    from .cudnn import CuDNNAttention
     from .cute_dsl import CuTeDSLAttention
     from .flash_attn4 import FlashAttn4Attention
     from .flashinfer import FlashInferAttention
@@ -73,6 +76,8 @@ def get_visual_gen_attention_backend(
         return FlashAttn4Attention
     elif backend_name == "CUTEDSL":
         return CuTeDSLAttention
+    elif backend_name == "CUDNN":
+        return CuDNNAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
@@ -99,7 +104,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "FLASHINFER", "FA4", "CUTEDSL")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -121,7 +126,8 @@ def create_attention(
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 
-    # Forward the validated quantization recipe to TRTLLM, FlashInfer, or the dense CuTe DSL FMHA backend.
+    # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
+    # FMHA backend.
     if attention_config is not None and attention_config.quant_attention_config is not None:
         kwargs["quant_attention_config"] = attention_config.quant_attention_config
     if backend.upper() == "TRTLLM":
