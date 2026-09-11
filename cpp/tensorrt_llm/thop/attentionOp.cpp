@@ -1188,7 +1188,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
     bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
-    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold)
+    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold,
+    std::optional<torch::Tensor> workspace_required_bytes)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1457,6 +1458,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens,
         max_blocks_per_sequence, ctx_total_kv_len, maxCrossKvLength);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
+
+    if (workspace_required_bytes.has_value())
+    {
+        auto const& report = workspace_required_bytes.value();
+        TLLM_CHECK_WITH_INFO(report.device().is_cpu() && report.scalar_type() == torch::kInt64 && report.numel() == 1
+                && report.is_contiguous(),
+            "workspace_required_bytes must be a contiguous CPU int64 Tensor with one element");
+        auto* required = report.data_ptr<int64_t>();
+        *required = std::max(*required, workspace_size);
+    }
 
     torch::Tensor workspace;
     if (workspace_.has_value())
