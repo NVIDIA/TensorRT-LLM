@@ -915,11 +915,9 @@ def test_cute_kernel_matches_reference_on_multi_block_with_approximation():
         pytest.skip("no Sol-Attn kernel for this device")
 
     torch.manual_seed(0)
-    S, H, D, block = 256, 2, 128, 64  # batch of 1 is added with t[None] below
-    nb = S // block
+    S, H, D, block = 256, 2, 128, 64  # 4 KV blocks; batch of 1
     dev = torch.device("cuda")
     q, k, v = (torch.randn(1, S, H, D, device=dev, dtype=torch.bfloat16) for _ in range(3))
-    del nb  # routing granularity is decided inside the reference
     scale = D**-0.5
     tau = 2.0
 
