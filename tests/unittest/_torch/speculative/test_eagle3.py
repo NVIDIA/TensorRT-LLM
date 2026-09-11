@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import json
-import os
 import tempfile
 import unittest
 from contextlib import contextmanager

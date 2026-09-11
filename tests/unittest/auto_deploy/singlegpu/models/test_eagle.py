@@ -33,7 +33,6 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
 )
 
 __extra_import_path__ = ["~/examples/auto_deploy"]
-from build_and_run_ad import ExperimentConfig, main
 from test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"

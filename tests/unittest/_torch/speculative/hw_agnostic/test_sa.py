@@ -1,8 +1,9 @@
+import os
+import sys
 import unittest
 
 import pytest
 import torch
-from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAutomatonManager
