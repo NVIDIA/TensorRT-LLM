@@ -271,6 +271,7 @@ class TestTelemetryGroup:
             ],
             check=False,
             env=os.environ.copy(),
+            timeout=60,
         )
         assert child.returncode == 0
 
