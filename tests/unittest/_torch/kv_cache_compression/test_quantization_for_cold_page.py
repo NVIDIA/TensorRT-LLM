@@ -34,13 +34,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 pytestmark = pytest.mark.cpu_only
 
 
-def _manager(scale_checkpoint_path=None):
+def _manager(scale_checkpoint_path=None, *, model_type="qwen3"):
     config = ColdPageQuantizationCompressionConfig(
         scale_checkpoint_path=(
             str(scale_checkpoint_path) if scale_checkpoint_path is not None else None
         )
     )
-    return Nvfp4ColdPageQuantizationCompression(config)
+    return Nvfp4ColdPageQuantizationCompression(
+        config,
+        pretrained_config=SimpleNamespace(model_type=model_type),
+    )
 
 
 def _factory_model_engine(
@@ -52,7 +55,7 @@ def _factory_model_engine(
         model=SimpleNamespace(
             model_config=SimpleNamespace(
                 quant_config=active_kv_quant,
-                pretrained_config=object(),
+                pretrained_config=SimpleNamespace(model_type="qwen3"),
             )
         ),
     )
@@ -770,6 +773,26 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
     assert metadata.cold_page_bytes == 176
 
 
+@pytest.mark.parametrize("model_type", ("qwen3", "kimi_k3"))
+def test_non_deepseek_model_skips_deepseek_v4_layout_builder(model_type: str) -> None:
+    native, _ = _native()
+    manager = _manager(model_type=model_type)
+
+    with (
+        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
+        patch.object(manager, "_build_deepseek_v4_layer_layouts") as build_deepseek_v4_layouts,
+    ):
+        manager.create_cold_page_codec(
+            _cache_config((0, "attention")),
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(128,),
+        )
+
+    build_deepseek_v4_layouts.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("runtime_dtype", "element_bytes", "cold_page_bytes"),
     [
@@ -790,7 +813,7 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
     cache_config = _deepseek_v4_csa_cache_config(first_layer_id=7, element_bytes=element_bytes)
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager().create_cold_page_codec(
+        _manager(model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=runtime_dtype,
             pp_layers=(10,),
@@ -842,7 +865,7 @@ def test_deepseek_v4_csa_uses_model_layer_k_scale(tmp_path) -> None:
     cache_config = _deepseek_v4_csa_cache_config(num_model_layers=2)
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager(tmp_path).create_cold_page_codec(
+        _manager(tmp_path, model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(10, 20),
@@ -885,7 +908,7 @@ def test_deepseek_v4_csa_rejects_v_only_model_layer_scale(tmp_path) -> None:
         patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
         pytest.raises(ValueError, match="require a K scale"),
     ):
-        _manager(tmp_path).create_cold_page_codec(
+        _manager(tmp_path, model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(10,),
@@ -900,7 +923,7 @@ def test_deepseek_v4_draft_csa_uses_identity_scale(tmp_path) -> None:
     cache_config = _deepseek_v4_csa_cache_config()
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager(tmp_path).create_cold_page_codec(
+        _manager(tmp_path, model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(10,),
@@ -922,7 +945,7 @@ def test_deepseek_v4_layout_requires_one_swa_anchor_per_model_layer(pp_layers) -
         patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
         pytest.raises(ValueError, match="model-layer"),
     ):
-        _manager().create_cold_page_codec(
+        _manager(model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=pp_layers,
@@ -983,7 +1006,7 @@ def test_deepseek_v4_csa_and_colocated_hca_cache_are_provider_owned() -> None:
     )
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager().create_cold_page_codec(
+        _manager(model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(10, 11, 12),
@@ -1022,7 +1045,7 @@ def test_deepseek_v4_hca_without_csa_uses_lossless_fallback() -> None:
     )
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
-        _manager().create_cold_page_codec(
+        _manager(model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(),
@@ -1056,7 +1079,7 @@ def test_deepseek_v4_fp8_footer_scale_layout_fails_before_codec_creation() -> No
         patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
         pytest.raises(NotImplementedError, match="fp8_ds_mla footer-scale"),
     ):
-        _manager().create_cold_page_codec(
+        _manager(model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.FP8,
             pp_layers=(10,),
@@ -1090,7 +1113,7 @@ def test_deepseek_v4_unknown_or_mixed_roles_fail_closed(roles: tuple[str, ...]) 
         patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
         pytest.raises(NotImplementedError, match="Unsupported DeepSeek-V4 cold-page roles"),
     ):
-        _manager().create_cold_page_codec(
+        _manager(model_type="deepseek_v4").create_cold_page_codec(
             cache_config,
             runtime_dtype=DataType.BF16,
             pp_layers=(0,),
@@ -1223,14 +1246,14 @@ def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> No
         )
 
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
-    assert isinstance(
-        util_mod.create_kv_cache_compression_manager(
-            ColdPageQuantizationCompressionConfig(),
-            model_engine=_factory_model_engine(),
-            kv_cache_config=SimpleNamespace(enable_block_reuse=False),
-        ),
-        Nvfp4ColdPageQuantizationCompression,
+    model_engine = _factory_model_engine()
+    manager = util_mod.create_kv_cache_compression_manager(
+        ColdPageQuantizationCompressionConfig(),
+        model_engine=model_engine,
+        kv_cache_config=SimpleNamespace(enable_block_reuse=False),
     )
+    assert isinstance(manager, Nvfp4ColdPageQuantizationCompression)
+    assert manager.pretrained_config is model_engine.model.model_config.pretrained_config
 
 
 def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch) -> None:

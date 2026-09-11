@@ -388,7 +388,10 @@ class TestDeepseekV4CacheManager:
         return cache_manager, sparse_attn_config
 
     def test_nvfp4_cold_page_codec_accepts_real_csa_hca_lifecycle(self):
-        provider = Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig())
+        provider = Nvfp4ColdPageQuantizationCompression(
+            ColdPageQuantizationCompressionConfig(),
+            pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+        )
         with patch.object(
             native_kvcc,
             "create_python_cold_page_codec",
@@ -438,7 +441,10 @@ class TestDeepseekV4CacheManager:
         prompt_len = 64 * self.tokens_per_block
         pressure_len = 65 * self.tokens_per_block
         compress_ratios = [4, 128]
-        provider = Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompressionConfig())
+        provider = Nvfp4ColdPageQuantizationCompression(
+            ColdPageQuantizationCompressionConfig(),
+            pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+        )
         requests: list[LlmRequest] = []
 
         with (

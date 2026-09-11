@@ -21,6 +21,8 @@ from ...pyexecutor.resource_manager import DataType
 from .quantization_for_cold_page import ColdPageQuantizationCompression
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
@@ -184,8 +186,13 @@ def _load_modelopt_nvfp4_scales(
 class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
     """NVFP4 layout, calibration metadata, and CUDA dispatch."""
 
-    def __init__(self, config: "ColdPageQuantizationCompressionConfig") -> None:
-        super().__init__(config)
+    def __init__(
+        self,
+        config: "ColdPageQuantizationCompressionConfig",
+        *,
+        pretrained_config: "PretrainedConfig",
+    ) -> None:
+        super().__init__(config, pretrained_config=pretrained_config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
 
     def _build_deepseek_v4_layer_layouts(
@@ -346,13 +353,15 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 f"Attention KV, not {runtime_dtype}"
             )
 
-        deepseek_v4_layouts = self._build_deepseek_v4_layer_layouts(
-            cache_config,
-            attention_layers=attention_layers,
-            pp_layers=pp_layers,
-            runtime_type=runtime_type if runtime_type is not None else 0,
-            is_draft=is_draft,
-        )
+        deepseek_v4_layouts = {}
+        if self.pretrained_config.model_type == "deepseek_v4":
+            deepseek_v4_layouts = self._build_deepseek_v4_layer_layouts(
+                cache_config,
+                attention_layers=attention_layers,
+                pp_layers=pp_layers,
+                runtime_type=runtime_type if runtime_type is not None else 0,
+                is_draft=is_draft,
+            )
 
         layer_layouts = []
         for layer in attention_layers:
