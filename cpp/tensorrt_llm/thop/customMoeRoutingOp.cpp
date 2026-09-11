@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/customMoeRoutingKernels.h"
+#include "tensorrt_llm/kernels/moe/routing/customMoeRoutingKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 namespace th = torch;

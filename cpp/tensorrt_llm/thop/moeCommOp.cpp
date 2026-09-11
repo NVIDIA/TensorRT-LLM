@@ -16,8 +16,8 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
-#include "tensorrt_llm/kernels/moePrepareKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/fusedMoeCommKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moePrepareKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 

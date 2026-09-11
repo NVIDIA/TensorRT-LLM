@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/megaMoePrepareKernel.h"
+#include "tensorrt_llm/kernels/moe/communication/megaMoePrepareKernel.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>

@@ -17,7 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceCommon.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceCommon.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
