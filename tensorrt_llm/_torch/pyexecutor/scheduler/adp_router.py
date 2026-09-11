@@ -818,13 +818,6 @@ class ConversationAwareADPRouter(ADPRouter):
     the same ``conversation_id`` returns to that rank, keeping the conversation's
     KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
     back to the same ``new_conv_placement`` policy.
-
-    ``least_tokens`` chooses the least active prompt-token load, including
-    requests assigned earlier in the same call. Ties use active request count,
-    then the rotating rank cursor.
-    Explicit first-turn hints, sticky returns, and sequence caps are unchanged.
-    This estimates active work, not cached KV residency, and keeps no token
-    history. The placement strategy must be identical on every DP rank.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of

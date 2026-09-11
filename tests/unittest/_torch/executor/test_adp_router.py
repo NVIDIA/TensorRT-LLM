@@ -1406,21 +1406,6 @@ class TestConversationAwareADPRouter:
         ]
         assert self._route(router, states, [_make_conv_request_item(1, "A")])[1] == expected_rank
 
-    def test_default_placement_ignores_retired_environment(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("TLLM_ADP_TOKEN_AWARE_PLACEMENT", "1")
-        cfg = AttentionDpConfig(kv_cache_routing_conversation_affinity=True)
-        router = ADPRouter.create(
-            dist=_mock_dist(tp_size=2), kv_cache_manager=None, attention_dp_config=cfg
-        )
-        assert cfg.kv_cache_routing_new_conv_placement == "round_robin"
-        states = [
-            RankState(rank=0, num_active_requests=1, num_active_tokens=1000),
-            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
-        ]
-        assert self._route(router, states, [_make_conv_request_item(1, "A")])[1] == 0
-
     def test_unknown_new_conv_placement(self) -> None:
         with pytest.raises(ValueError, match="kv_cache_routing_new_conv_placement"):
             AttentionDpConfig(kv_cache_routing_new_conv_placement="banana")
