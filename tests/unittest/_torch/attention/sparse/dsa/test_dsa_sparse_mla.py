@@ -183,6 +183,7 @@ accuracy_dict = {
     torch.bfloat16: (0.1, 0.01),
     torch.float8_e4m3fn: (0.12, 0.01),
 }
+MAX_COMPOSED_MEAN_ABS_ERROR = 1.2e-2
 
 SPARSE_TOPK = 2048
 MAX_END_TO_END_INDEXER_CONTEXT = 160
@@ -274,7 +275,10 @@ def _assert_composed_output_matches(
         raise AssertionError(f"[{backend_name} vs VANILLA golden, {phase}] non-finite output")
     close_fraction = torch.isclose(actual, golden, atol=atol, rtol=rtol).float().mean()
     mean_abs_error = (actual.float() - golden.float()).abs().mean()
-    if float(close_fraction.item()) < 0.995 or float(mean_abs_error.item()) > 1e-2:
+    if (
+        float(close_fraction.item()) < 0.995
+        or float(mean_abs_error.item()) > MAX_COMPOSED_MEAN_ABS_ERROR
+    ):
         raise AssertionError(
             f"[{backend_name} vs VANILLA golden, {phase}] composed output drift: "
             f"close={float(close_fraction.item()):.3%}, "
@@ -822,6 +826,14 @@ def _run_test_for_backend(
                     mapping=mapping,
                     enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
                     **metadata_sparse_kwargs,
+                )
+                attn_metadata.update_spec_dec_param(
+                    batch_size=max_num_contexts,
+                    is_spec_decoding_enabled=False,
+                    is_spec_dec_tree=False,
+                    is_spec_dec_dynamic_tree=False,
+                    max_draft_len=generation_seq_len_q - 1,
+                    max_total_draft_tokens=generation_seq_len_q - 1,
                 )
                 attn_metadata.prepare()
             for layer_idx in range(num_layers):

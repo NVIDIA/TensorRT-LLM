@@ -297,6 +297,7 @@ def test_vanilla_q_projection_does_not_dispatch_linear_forward():
     indexer.head_dim = 4
     indexer.rope_dim = 2
     indexer.use_fp4 = False
+    indexer._indexer_bf16 = False
     indexer.weight_scale_factor = 1.0
     indexer.wq_b = torch.nn.Linear(2, 4, bias=False)
     indexer.k_norm = torch.nn.Identity()
@@ -2123,7 +2124,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)
-    kv_fp8, _ = DSAVanillaIndexer.quantize_fp8(kv, (0,))
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,))
     logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)  # -> [seq_len, seq_len_kv]
 
     # Basic sanity checks
@@ -2168,7 +2169,7 @@ def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
-    kv_fp8, _ = DSAVanillaIndexer.quantize_fp8(kv, (0,), use_ue8m0=False)
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,), use_ue8m0=False)
 
     logits = deep_gemm.fp8_mqa_logits(
         q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
