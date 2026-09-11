@@ -143,6 +143,9 @@ public:
     public:
         // Attention packed mask input (used by context FMHA).
         uint32_t const* attention_packed_mask = nullptr;
+        // Per-query inclusive left and right KV-token bounds.
+        int32_t const* variable_window_token_starts = nullptr;
+        int32_t const* variable_window_token_ends = nullptr;
         int32_t batch_size = 0;
         float2 const* mrope_rotary_cos_sin = nullptr;
 
@@ -441,6 +444,11 @@ public:
         return mEnableContextFMHA && mEnableXQA && !needsUlyssesPostprocess;
     }
 
+    [[nodiscard]] bool supportsVariableWindow() const
+    {
+        return mUseVariableWindow && mEnableContextFMHA;
+    }
+
     [[nodiscard]] int32_t* multiBlockSemaphores() const
     {
         return mMultiBlockSemaphores.get();
@@ -503,6 +511,7 @@ public:
     size_t mChunkPrefillBufferBatchSize = 1;
     bool mDenseContextFMHA = false;
     bool mHasFullAttentionMask = false;
+    bool mUseVariableWindow = false;
     bool mIsSpecDecodingEnabled = false;
     bool mUseSpecDecoding = false;
     bool mIsSpecDecTree = true;
@@ -583,13 +592,13 @@ public:
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mMaxSeqLen, mMaxNumRequests, mQKVBiasEnabled,
             mCrossAttention, mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput,
             mFP8ContextMLA, mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,
-            mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen, mForcePrepareSpecDecTreeMask, mIsMLAEnabled,
-            mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention, mUseTllmGenSparseAttentionPaged,
-            mUseTllmGenSparseAttention, mUseNvfp4MlaKvCache, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,
-            mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank,
-            mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
-            mSkipAttn, mFuseFp4Quant, mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores,
+            mUseVariableWindow, mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree,
+            mSpecDecodingIsGenerationLengthVariable, mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen,
+            mForcePrepareSpecDecTreeMask, mIsMLAEnabled, mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention,
+            mUseTllmGenSparseAttentionPaged, mUseTllmGenSparseAttention, mUseNvfp4MlaKvCache, mMLAParams.data(),
+            mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank,
+            mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode,
+            mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant, mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores,
             mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold, mSageAttnNumEltsPerBlkQ,
             mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);

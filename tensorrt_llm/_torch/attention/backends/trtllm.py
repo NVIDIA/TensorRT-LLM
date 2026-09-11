@@ -50,6 +50,7 @@ from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
+_VARIABLE_WINDOW_SUPPORTED_SMS = frozenset((100, 103))
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -1699,6 +1700,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.quant_mode,
             use_paged_context_fmha,
             is_mla_enable,
+        )
+
+    def _is_variable_window_kernel_available(
+        self,
+        *,
+        dtype: torch.dtype,
+        tokens_per_block: Optional[int],
+        use_paged_context_fmha: bool,
+    ) -> bool:
+        if get_sm_version() not in _VARIABLE_WINDOW_SUPPORTED_SMS:
+            return False
+        return torch.ops.trtllm.attention_supports_variable_window(
+            dtype,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            tokens_per_block,
+            self.quant_mode,
+            use_paged_context_fmha,
         )
 
     def create_output(self, q, *, is_quantize_output: bool,

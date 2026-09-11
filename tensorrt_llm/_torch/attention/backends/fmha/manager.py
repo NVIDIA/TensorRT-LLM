@@ -133,6 +133,7 @@ class _FmhaCacheKey(NamedTuple):
     generation_batch_size: int
     generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
+    has_variable_window: bool
     use_spec_decoding: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
@@ -371,6 +372,7 @@ class FmhaManager:
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
+            has_variable_window=forward_args.variable_window_token_starts is not None,
             use_spec_decoding=metadata.use_spec_decoding,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,

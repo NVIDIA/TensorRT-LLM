@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <torch/extension.h>
 #include <tuple>
 #include <type_traits>
@@ -384,9 +385,10 @@ public:
         torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
         int32_t const num_sparse_topk, std::optional<torch::Tensor> sparse_attn_kv_lens,
         std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
-        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
-        std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> variable_window_token_starts,
+        std::optional<torch::Tensor> variable_window_token_ends, std::optional<torch::Tensor> fmha_scheduler_counter,
+        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+        std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias,
@@ -458,9 +460,10 @@ public:
         torch::optional<torch::Tensor> sparse_attn_offsets, int64_t const sparse_attn_indices_block_size,
         int32_t const num_sparse_topk, std::optional<torch::Tensor> sparse_attn_kv_lens,
         std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
-        std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
-        std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
-        std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+        std::optional<torch::Tensor> variable_window_token_starts,
+        std::optional<torch::Tensor> variable_window_token_ends, std::optional<torch::Tensor> fmha_scheduler_counter,
+        std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
+        std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
@@ -956,6 +959,11 @@ public:
                     cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
             }
+            if (variable_window_token_starts.has_value())
+            {
+                enqueue_params.variable_window_token_starts = variable_window_token_starts->data_ptr<int32_t>();
+                enqueue_params.variable_window_token_ends = variable_window_token_ends->data_ptr<int32_t>();
+            }
             // Pass V's actual token stride so the FMHA runner handles both
             // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
             // kv.split() view) correctly.
@@ -1188,7 +1196,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
     bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
-    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold)
+    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
+    std::optional<torch::Tensor> variable_window_token_starts, std::optional<torch::Tensor> variable_window_token_ends,
+    double skip_correction_threshold)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1324,6 +1334,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
     op->mCrossAttention = is_cross;
+    TORCH_CHECK(variable_window_token_starts.has_value() == variable_window_token_ends.has_value(),
+        "variable_window_token_starts and variable_window_token_ends must be provided together");
+    op->mUseVariableWindow = variable_window_token_starts.has_value();
 
     op->mAttentionChunkSize = attention_chunk_size;
     op->mSkipSoftmaxThresholdScaleFactorPrefill
@@ -1440,6 +1453,30 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         TLLM_CHECK(request_types[idx] == RequestType::kGENERATION);
     }
 
+    auto const validateVariableWindowTensor
+        = [num_ctx_tokens, qDevice = qkv_or_q.device()](torch::Tensor const& tensor, char const* name)
+    {
+        TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+        TORCH_CHECK(tensor.device() == qDevice, name, " must be on the same device as qkv_or_q (expected ", qDevice,
+            ", got ", tensor.device(), ")");
+        TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Int, name, " must have int32 dtype");
+        TORCH_CHECK(tensor.dim() == 1, name, " must be one-dimensional");
+        TORCH_CHECK(tensor.numel() == num_ctx_tokens, name, " must have one element per packed context query token (",
+            num_ctx_tokens, "), got ", tensor.numel());
+    };
+    if (variable_window_token_starts.has_value())
+    {
+        auto const smVersion = tensorrt_llm::common::getSMVersion();
+        TORCH_CHECK(smVersion == 100 || smVersion == 103,
+            "variable-window attention requires an SM100 or SM103 GPU, got SM", smVersion);
+        TORCH_CHECK(num_contexts > 0, "variable-window attention requires a context phase");
+        validateVariableWindowTensor(variable_window_token_starts.value(), "variable_window_token_starts");
+        validateVariableWindowTensor(variable_window_token_ends.value(), "variable_window_token_ends");
+        TORCH_CHECK(op->supportsVariableWindow(),
+            "variable-window attention requires a supported context FMHA kernel configuration");
+    }
+
     int32_t const max_attention_window_size
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
     int32_t const max_blocks_per_sequence
@@ -1491,10 +1528,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
-            num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps);
+            num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, variable_window_token_starts,
+            variable_window_token_ends, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
+            flash_mla_tile_scheduler_metadata, flash_mla_num_splits, trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr,
+            is_cross, cross_kv, relative_attention_bias, quant_scale_qkv, dsv4_inv_rope_cos_sin_cache,
+            enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1514,10 +1552,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
-            num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
-            mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion,
+            num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens,
+            /*variable_window_token_starts=*/std::nullopt, /*variable_window_token_ends=*/std::nullopt,
+            fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits, trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv,
+            relative_attention_bias, quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion,
             // Context-only here; generation gets the fusion from mla_rope_generation.
             /*kv_norm_weight=*/std::nullopt, kv_norm_eps);
     }
@@ -1572,6 +1611,43 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     }
 
     return op->supportsNvFp4Output();
+}
+
+bool attention_supports_variable_window(c10::ScalarType const dtype, int64_t const num_heads,
+    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
+    int64_t const quant_mode, bool const use_paged_context_fmha)
+{
+    auto const smVersion = tensorrt_llm::common::getSMVersion();
+    if (smVersion != 100 && smVersion != 103)
+    {
+        return false;
+    }
+
+    auto op = std::make_shared<AttentionOp>();
+    op->mType = tensorrt_llm::runtime::TorchUtils::dataType(dtype);
+    op->mNumHeads = num_heads;
+    op->mNumKVHeads = num_kv_heads;
+    op->mHeadSize = head_size;
+    op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
+    op->mFP8ContextFMHA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mKVCacheQuantMode.hasFp4KvCache();
+    op->mUseKVCache = true;
+    op->mPagedKVCache = true;
+    op->mTokensPerBlock = tokens_per_block.value_or(0);
+    op->mPagedContextFMHA = use_paged_context_fmha;
+    op->mUseVariableWindow = true;
+
+    auto cache_key = op->data();
+    using CacheKey = decltype(cache_key);
+    static std::unordered_map<CacheKey, bool, OpCustomHash<CacheKey>> op_cache;
+    static std::mutex op_cache_mutex;
+    std::lock_guard<std::mutex> const lock(op_cache_mutex);
+    if (auto it = op_cache.find(cache_key); it != op_cache.end())
+    {
+        return it->second;
+    }
+
+    op->initialize();
+    return op_cache.emplace(std::move(cache_key), op->supportsVariableWindow()).first->second;
 }
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
@@ -1743,4 +1819,5 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
+    m.def("attention_supports_variable_window", &tensorrt_llm::torch_ext::attention_supports_variable_window);
 }

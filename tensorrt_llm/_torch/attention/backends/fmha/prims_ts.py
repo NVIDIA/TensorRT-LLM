@@ -254,6 +254,11 @@ class PrimsTSFmha(PhasedFmha):
             return False, "attention sinks are not supported."
         if fwd.attention_mask_data is not None:
             return False, "custom attention masks are not supported."
+        if (
+            fwd.variable_window_token_starts is not None
+            or fwd.variable_window_token_ends is not None
+        ):
+            return False, "variable-window attention is not supported by this adapter."
         if fwd.enable_dsv4_epilogue_fusion:
             return False, "DSv4 epilogue fusion is not supported."
         if (

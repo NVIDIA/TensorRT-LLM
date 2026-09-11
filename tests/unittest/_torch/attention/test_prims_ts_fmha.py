@@ -151,6 +151,7 @@ def _support_result(
     num_kv_cache_pools: int = 1,
     use_kv_cache_v2: bool = False,
     enable_swa_scratch_reuse: bool = False,
+    has_variable_window: bool = False,
     phase: FmhaPhase | None = None,
 ) -> tuple[bool, str]:
     attn = _Attention(
@@ -185,6 +186,10 @@ def _support_result(
         relative_attention_bias=torch.empty(1) if has_relative_attention_bias else None,
         is_fused_qkv=is_fused_qkv,
     )
+    if has_variable_window:
+        bounds = torch.zeros(4, dtype=torch.int32)
+        forward_args.variable_window_token_starts = bounds
+        forward_args.variable_window_token_ends = bounds
     if has_sparse_runtime_metadata:
         forward_args.sparse_runtime_params.sparse_kv_indices = torch.empty(1)
     if attention_input_type == AttentionInputType.context_only:
@@ -310,6 +315,16 @@ def test_phase_support_check_preserves_whole_request_semantics(phase: FmhaPhase)
 
     assert not supported
     assert "context head dimension" in reason
+
+
+def test_variable_window_is_rejected_with_reason() -> None:
+    supported, reason = _support_result(
+        attention_input_type=AttentionInputType.context_only,
+        has_variable_window=True,
+    )
+
+    assert not supported
+    assert "variable-window attention" in reason
 
 
 def test_is_supported_accepts_and_forwards_phase_keyword(

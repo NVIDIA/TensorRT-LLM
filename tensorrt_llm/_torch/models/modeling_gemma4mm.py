@@ -933,6 +933,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     def get_language_model_extra_forward_kwargs(
         self,
         *,
+        attn_metadata: Any,
         raw_input_ids: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         mm_inputs: PreparedLlmInputs,
@@ -944,7 +945,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         """Build Gemma4-specific language-model forward arguments."""
         del position_ids, forward_kwargs
         mm_token_type_ids = None
-        if raw_input_ids is not None and mm_inputs.input_ids is None:
+        if (
+            attn_metadata.num_contexts > 0
+            and raw_input_ids is not None
+            and mm_inputs.input_ids is None
+        ):
             mm_token_type_ids = torch.zeros_like(raw_input_ids, dtype=torch.long)
             mm_token_type_ids[raw_input_ids == self.image_token_ids[0]] = 1
             if self.video_token_ids is not None:
