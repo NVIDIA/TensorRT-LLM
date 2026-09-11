@@ -31,8 +31,8 @@ std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset()
     return offset;
 }
 
-template <typename TTensor, typename TStream>
-runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool const forNextIteration)
+template <typename TTensor>
+runtime::SizeType32 GenericLlmRequest<TTensor>::getBeamWidthByIter(bool const forNextIteration)
 {
     runtime::SizeType32 beamWidth = mSamplingConfig.getBeamWidth(); // For non-Variable-Beam-Width-Search
     auto const beamWidthArray = mSamplingConfig.getBeamWidthArray();
