@@ -15,16 +15,16 @@
  */
 
 #if defined(USING_OSS_CUTLASS_MOE_GEMM)
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
 #else
 #include "moe_gemm_kernels.h"
 #include "moe_kernels.h"
 #endif
 // Always include the public header for moe_gemm_kernels.h
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_grouped_gemm.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_problem_builder.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_slot_expand.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_grouped_gemm.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_problem_builder.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_slot_expand.h"
 
 #include "cutlass/gemm_coord.h"
 

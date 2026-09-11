@@ -48,20 +48,20 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include "../include/moe_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cuh"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
+#include "tensorrt_llm/kernels/moe/cutlass/moe_kernels.cuh"
 #include "tensorrt_llm/kernels/moe_utils.cuh"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/deep_gemm/scheduler.cuh"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_pointer_expand.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_util_kernels.h"
 // NOTE: the grouped-GEMM dispatch (cudaGraph(SplitK)GroupedGemm,
 // launchMoeLoraProblemBuilder) is not called here. Those wrappers pull in
 // libtorch via at::Tensor, and this file is archived into libmoe_gemm_src.a,

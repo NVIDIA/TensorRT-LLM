@@ -24,7 +24,7 @@ namespace kernels::cutlass_kernels
 {
 
 // IMPORTANT: Keep the same order of activation functions in this enum and the activation functions in
-// cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu::doActivationKernel().
+// cpp/tensorrt_llm/kernels/moe/cutlass/moe_kernels.cu::doActivationKernel().
 enum class ActivationType
 {
     InvalidType = 0,

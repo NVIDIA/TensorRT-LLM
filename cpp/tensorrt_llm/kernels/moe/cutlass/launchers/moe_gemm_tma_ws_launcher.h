@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include "../../include/moe_gemm_kernels.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN

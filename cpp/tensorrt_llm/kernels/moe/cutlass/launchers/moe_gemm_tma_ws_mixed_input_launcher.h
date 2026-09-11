@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "../../include/moe_gemm_kernels.h"
 #include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
 #include <cuda_runtime_api.h>
 
 TRTLLM_NAMESPACE_BEGIN

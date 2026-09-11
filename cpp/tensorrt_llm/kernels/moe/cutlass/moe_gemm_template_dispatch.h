@@ -60,13 +60,13 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
-#include "../include/moe_gemm_kernels.h"
 #include "./launchers/fused_moe_gemm_launcher_sm80.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
 #include "./launchers/moe_gemm_tma_ws_mixed_input_launcher.h"
 #include "./moe_gemm_template_dispatch_tma_ws.h"
 #include "./moe_gemm_template_dispatch_tma_ws_mixed_dtype.h"
 #include "./moe_tma_warp_specialized_traits.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>

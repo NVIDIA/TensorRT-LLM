@@ -24,7 +24,7 @@
 #include <numeric>
 
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
 #include <tensorrt_llm/kernels/quantization.h>
 #else
 #include "moe_kernels.h"

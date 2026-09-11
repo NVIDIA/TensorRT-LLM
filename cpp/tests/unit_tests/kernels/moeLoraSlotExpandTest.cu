@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_slot_expand.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_slot_expand.h"
 
 #include <cstdint>
 #include <gtest/gtest.h>
