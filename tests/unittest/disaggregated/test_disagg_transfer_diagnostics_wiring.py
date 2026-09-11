@@ -1061,10 +1061,16 @@ def test_ctx_settlement_continues_when_diagnostic_emission_fails(
     transceiver._dp_rank = 0
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emitted_events = []
 
     def fail_after_ctx_release(_event: str, **_kwargs) -> None:
-        assert transceiver._send_sessions == {}
-        assert transceiver._send_reqs == {}
+        emitted_events.append(
+            (
+                _event,
+                tuple(transceiver._send_sessions),
+                tuple(transceiver._send_reqs),
+            )
+        )
         raise RuntimeError("diagnostics failed")
 
     monkeypatch.setattr(diagnostics, "emit_event", fail_after_ctx_release)
@@ -1073,6 +1079,7 @@ def test_ctx_settlement_continues_when_diagnostic_emission_fails(
 
     assert status.completed_request_ids == [request_id]
     assert status.error_request_ids == []
+    assert emitted_events == [("ctx_transfer_settled", (), ())]
     transceiver._retire_send_session.assert_called_once_with(
         request_id,
         outcome="completed",
@@ -1163,10 +1170,16 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     transceiver._dist = SimpleNamespace(rank=1)
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emitted_events = []
 
     def fail_after_gen_release(_event: str, **_kwargs) -> None:
-        assert transceiver._recv_sessions == {}
-        assert transceiver._recv_reqs == {}
+        emitted_events.append(
+            (
+                _event,
+                tuple(transceiver._recv_sessions),
+                tuple(transceiver._recv_reqs),
+            )
+        )
         raise RuntimeError("diagnostics failed")
 
     monkeypatch.setattr(diagnostics, "emit_event", fail_after_gen_release)
@@ -1176,6 +1189,7 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     assert status.completed_request_ids == [request_id]
     assert status.error_request_ids == []
     assert status.cancelled_requests == []
+    assert emitted_events == [("gen_transfer_settled", (), ())]
     request.set_kv_cache_size.assert_called_once_with(0)
     transceiver._close_session_or_raise.assert_called_once_with(
         session,
