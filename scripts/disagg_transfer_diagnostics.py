@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import fileinput
 import json
+import math
 import statistics
 import sys
 from bisect import bisect_left
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 DIAGNOSTICS_LOG_PREFIX = "[DISAGG_TRANSFER_DIAG] "
+_SUPPORTED_SCHEMA_VERSION = 1
 _GEN_KV_ADMISSION_EVENT = "gen_kv_admission_result"
 _TIMELINE_FIELDS = (
     "event",
@@ -48,15 +50,17 @@ _TIMELINE_FIELDS = (
     "worker_queue_index",
     "transfer_entries",
     "ownership_enabled",
-    "block_reuse_id",
+    "source_kv_reuse_block_count",
     "state",
     "reason",
     "timeout_ms",
+    "timeout_expected",
     "timeout_owner",
     "timer_start_monotonic_ns",
     "elapsed_ms",
     "cancellation_requested",
     "session_status",
+    "session_found",
     "resources_drained",
     "transfer_bytes",
     "expected_receivers",
@@ -93,6 +97,85 @@ Event = dict[str, object]
 ClockDomain = tuple[str, int]
 Participant = tuple[str | None, str | None, int | None, int | None]
 
+_STRING_FIELDS = frozenset(
+    {
+        "event",
+        "host",
+        "instance",
+        "legacy_budget_outcome",
+        "outcome",
+        "peer_instance",
+        "policy",
+        "reason",
+        "session_status",
+        "side",
+        "state",
+        "timeout_owner",
+    }
+)
+_IDENTIFIER_FIELDS = frozenset({"request_id", "local_request_id"})
+_NONNEGATIVE_INTEGER_FIELDS = frozenset(
+    {
+        "active_transfer_blocks",
+        "admitted_transfer_blocks",
+        "capacity_block_equivalent",
+        "capacity_tokens",
+        "cp_rank",
+        "decode_requests",
+        "dp_rank",
+        "dropped_events",
+        "expected_receivers",
+        "expected_writers",
+        "history_tokens",
+        "index_free_slots",
+        "init_requests",
+        "kv_admitted_this_iteration",
+        "kv_pool_free_blocks",
+        "kv_pool_max_blocks",
+        "kv_pool_used_blocks",
+        "legacy_active_transfer_blocks",
+        "legacy_admitted_transfer_blocks",
+        "monotonic_ns",
+        "peer_rank",
+        "pid",
+        "pp_rank",
+        "prompt_tokens",
+        "rank",
+        "receiver_slice_id",
+        "request_blocks",
+        "slice_id",
+        "source_kv_reuse_block_count",
+        "timer_start_monotonic_ns",
+        "timeout_ms",
+        "tokens_per_block",
+        "tp_rank",
+        "transfer_block_budget",
+        "transfer_bytes",
+        "transfer_entries",
+        "transfers_complete",
+        "transfers_in_progress",
+        "wall_ns",
+        "worker_queue_index",
+    }
+)
+_NONNEGATIVE_NUMBER_FIELDS = frozenset({"elapsed_ms"})
+_BOOLEAN_FIELDS = frozenset(
+    {
+        "cache_present",
+        "cancellation_requested",
+        "is_last_slice",
+        "legacy_limited_by_budget",
+        "ownership_enabled",
+        "resources_drained",
+        "session_found",
+        "source_kv_request_owned",
+        "source_kv_reuse_pinned",
+        "timeout_expected",
+    }
+)
+_MAX_TIMESTAMP_NS = (1 << 63) - 1
+_MAX_IDENTIFIER = (1 << 64) - 1
+
 
 @dataclass(frozen=True)
 class _ParsedEvent:
@@ -108,6 +191,63 @@ class ParseResult:
     total_lines: int
     ignored_lines: int
     malformed_diagnostic_lines: int
+
+
+def _is_diagnostic_scalar(value: object) -> bool:
+    return (
+        value is None
+        or isinstance(value, (str, int, bool))
+        or (isinstance(value, float) and math.isfinite(value))
+    )
+
+
+def _has_valid_field_types(record: Event) -> bool:
+    """Reject records that cannot conform to the runtime's scalar schema."""
+    if not all(_is_diagnostic_scalar(value) for value in record.values()):
+        return False
+    schema_version = record.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != _SUPPORTED_SCHEMA_VERSION
+    ):
+        return False
+    for field in _IDENTIFIER_FIELDS:
+        value = record.get(field)
+        if value is not None and (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= _MAX_IDENTIFIER
+        ):
+            return False
+    for field in _NONNEGATIVE_INTEGER_FIELDS:
+        value = record.get(field)
+        if value is not None and (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= _MAX_TIMESTAMP_NS
+        ):
+            return False
+    for field in _NONNEGATIVE_NUMBER_FIELDS:
+        value = record.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            return False
+        if isinstance(value, int):
+            if value > _MAX_TIMESTAMP_NS:
+                return False
+        elif not math.isfinite(value):
+            return False
+    for field in _STRING_FIELDS:
+        value = record.get(field)
+        if value is not None and not isinstance(value, str):
+            return False
+    for field in _BOOLEAN_FIELDS:
+        value = record.get(field)
+        if value is not None and not isinstance(value, bool):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -158,6 +298,12 @@ _PHASES = (
     _Phase(
         "ctx_worker_queue_wait",
         "ctx_transfer_queued",
+        "ctx_worker_dequeued",
+        correlation_fields=("slice_id", "peer_rank"),
+    ),
+    _Phase(
+        "ctx_worker_preparation",
+        "ctx_worker_dequeued",
         "ctx_backend_submit_start",
         correlation_fields=("slice_id", "peer_rank"),
     ),
@@ -199,6 +345,7 @@ _PHASES = (
         "ctx_send_ready",
         "transfer_timeout_started",
         correlation_fields=("side",),
+        start_fields=(("timeout_expected", True),),
         end_fields=(("side", "ctx"),),
     ),
     _Phase(
@@ -206,6 +353,7 @@ _PHASES = (
         "gen_receive_start",
         "transfer_timeout_started",
         correlation_fields=("side",),
+        start_fields=(("timeout_expected", True),),
         end_fields=(("side", "gen"),),
     ),
     _Phase(
@@ -213,6 +361,7 @@ _PHASES = (
         "transfer_timeout_started",
         "transfer_timeout_observed",
         correlation_fields=("side", "timeout_owner"),
+        report_unmatched=False,
     ),
 )
 
@@ -234,10 +383,14 @@ def parse_lines(lines: Iterable[str]) -> ParseResult:
         payload = line[marker + len(DIAGNOSTICS_LOG_PREFIX) :].strip()
         try:
             record = json.loads(payload)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             malformed_lines += 1
             continue
-        if not isinstance(record, dict) or not isinstance(record.get("event"), str):
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("event"), str)
+            or not _has_valid_field_types(record)
+        ):
             malformed_lines += 1
             continue
         events.append(_ParsedEvent(record=record, line_number=line_number))
@@ -264,7 +417,7 @@ def _monotonic_ns(record: Event) -> int | None:
         if record.get("event") == "transfer_timeout_started"
         else record.get("monotonic_ns")
     )
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_TIMESTAMP_NS:
         return value
     return None
 
@@ -360,10 +513,13 @@ def _derive_phase(
         for event in boundaries:
             domain = _clock_domain(event.record)
             timestamp = _monotonic_ns(event.record)
-            if domain is not None and timestamp is not None:
-                result.append(
-                    (domain, _correlation(event.record, phase.correlation_fields), timestamp)
-                )
+            correlation = _correlation(event.record, phase.correlation_fields)
+            if (
+                domain is not None
+                and timestamp is not None
+                and all(value is not None for value in correlation)
+            ):
+                result.append((domain, correlation, timestamp))
         return result
 
     timed_starts = timed(starts)
@@ -468,7 +624,7 @@ def _derive_phase(
     if not starts or not ends:
         reason = "missing_start" if not starts else "missing_end"
     elif len(timed_starts) != len(starts) or len(timed_ends) != len(ends):
-        reason = "invalid_clock_metadata"
+        return [], unmeasured
     elif start_domains.isdisjoint(end_domains):
         reason = "clock_domain_mismatch"
     else:
@@ -513,11 +669,13 @@ def _missing_boundaries(events: list[_ParsedEvent]) -> list[str]:
         expected.update(("gen_request_data_sent", "gen_transfer_settled"))
     if _has_event(events, "gen_request_data_sent"):
         expected.add("gen_writer_result_received")
-    if _has_event(
-        events,
-        "gen_writer_result_received",
-        outcomes=frozenset({"success"}),
-        required_fields=(("is_last_slice", True),),
+    writer_results = [
+        event for event in events if event.record.get("event") == "gen_writer_result_received"
+    ]
+    if (
+        writer_results
+        and all(event.record.get("outcome") == "success" for event in writer_results)
+        and any(event.record.get("is_last_slice") is True for event in writer_results)
     ):
         expected.add("gen_destination_complete")
     if _has_event(events, "gen_transfer_settled", outcomes=frozenset({"completed"})):
@@ -534,6 +692,8 @@ def _missing_boundaries(events: list[_ParsedEvent]) -> list[str]:
             )
         )
     if _has_event(events, "ctx_transfer_queued"):
+        expected.add("ctx_worker_dequeued")
+    if _has_event(events, "ctx_worker_dequeued"):
         expected.add("ctx_backend_submit_start")
     if _has_event(events, "ctx_backend_submit_start"):
         expected.add("ctx_backend_submitted")
@@ -683,7 +843,10 @@ def _transfer_settled_to_next_decision(events: list[_ParsedEvent]) -> list[dict[
         key = domain, rank
         if event.record.get("event") == "gen_kv_pool_snapshot":
             decisions[key].append(timestamp)
-        elif event.record.get("event") == "gen_transfer_settled":
+        elif (
+            event.record.get("event") == "gen_transfer_settled"
+            and event.record.get("resources_drained") is True
+        ):
             settled_events[key].append(timestamp)
 
     result = []
@@ -753,8 +916,8 @@ def analyze(parse_result: ParseResult) -> dict[str, object]:
                 "is clock-sync-sensitive and no wall-clock deltas are derived."
             ),
             "gen_transfer_settled_to_next_scheduler_decision": (
-                "A same-domain proxy for release-to-next-admission opportunity; "
-                "gen_transfer_settled precedes final session close and state transition."
+                "A same-domain measure from successful transceiver session retirement "
+                "to the next admission opportunity."
             ),
         },
         "summary": {
