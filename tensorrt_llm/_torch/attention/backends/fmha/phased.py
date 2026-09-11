@@ -112,16 +112,6 @@ class PhasedFmha(Fmha):
         )
         return total_num_blocks
 
-    def get_fp8_context_fmha(
-        self,
-        q: torch.Tensor,
-        output: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        is_gen_only: bool,
-    ) -> bool:
-        return False
-
     def _build_params(
         self,
         q: torch.Tensor,
@@ -130,8 +120,6 @@ class PhasedFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
-        *,
-        fp8_context_fmha: bool,
     ) -> FmhaParams:
         """Build the common Python parameters used for sizing and execution."""
         attn = self.attn
@@ -142,11 +130,12 @@ class PhasedFmha(Fmha):
         num_tokens = q.size(0)
         is_gen_only = forward_args.attention_input_type == AttentionInputType.generation_only
         out_head_size = self.generation_out_head_size if is_gen_only else self.context_out_head_size
+        effective_beam_width = metadata.effective_beam_width
         attention_window_size = forward_args.attention_window_size
         cache_indirection = metadata.cache_indirection
         max_attention_window_size = (
             attention_window_size
-            if metadata.beam_width == 1
+            if effective_beam_width == 1
             else (
                 cache_indirection.size(2)
                 if cache_indirection is not None
@@ -171,7 +160,14 @@ class PhasedFmha(Fmha):
             qkv_or_q=q,
             k=k,
             v=v,
-            output=output.view(num_tokens, attn.num_heads, out_head_size),
+            # NVFP4 stores two logical output values in each uint8 element. Its
+            # physical buffer therefore cannot be viewed as the logical 3-D shape;
+            # the native fallback consumes the packed buffer directly.
+            output=(
+                output
+                if output.dtype == torch.uint8
+                else output.view(num_tokens, attn.num_heads, out_head_size)
+            ),
             sequence_length=metadata.kv_lens_cuda_runtime,
             context_lengths=metadata.prompt_lens_cuda_runtime,
             host_past_key_value_lengths=metadata.kv_lens_runtime,
@@ -185,7 +181,6 @@ class PhasedFmha(Fmha):
             q_scaling=attn.q_scaling,
             quant_mode=attn.quant_mode,
             position_embedding_type=attn.position_embedding_type,
-            mask_type=forward_args.mask_type,
             predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
             attention_chunk_size=attn.attention_chunk_size,
             has_fp8_kv_cache=bool(getattr(attn, "has_fp8_kv_cache", False)),
@@ -221,7 +216,7 @@ class PhasedFmha(Fmha):
             num_sparse_topk=metadata.num_sparse_topk or 0,
             use_paged_context_fmha=metadata.use_paged_context_fmha,
             paged_context_fmha=metadata.use_paged_context_fmha,
-            beam_width=metadata.beam_width,
+            beam_width=effective_beam_width,
             max_num_requests=metadata.max_num_requests,
             max_num_sequences=metadata.max_num_sequences or metadata.max_num_requests,
             max_context_length=metadata.max_context_length,
@@ -235,7 +230,6 @@ class PhasedFmha(Fmha):
             max_attention_window_size=max_attention_window_size,
             cyclic_attention_window_size=attention_window_size,
             tokens_per_block=tokens_per_block,
-            fp8_context_fmha=fp8_context_fmha,
             kv_factor=self.kv_factor,
             total_num_blocks=self._get_total_num_blocks(metadata),
             kv_pool=kv_pool,
@@ -280,7 +274,6 @@ class PhasedFmha(Fmha):
                 f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attention_input_type}."
             )
 
-        fp8_context_fmha = self.get_fp8_context_fmha(q, output, metadata, forward_args, is_gen_only)
         params = self._build_params(
             q,
             k,
@@ -288,7 +281,6 @@ class PhasedFmha(Fmha):
             metadata,
             forward_args,
             workspace,
-            fp8_context_fmha=fp8_context_fmha,
         )
         self.prepare_workspace(params, metadata)
 
@@ -379,7 +371,7 @@ class PhasedFmha(Fmha):
             params.token_offset = token_offset
             params.input_seq_length = input_seq_length
             params.num_seqs = num_seqs
-            params.num_requests = num_seqs // metadata.beam_width
+            params.num_requests = num_seqs // params.beam_width
             params.total_kv_len = int(host_total_kv_lens[1])
             params.spec_decoding_position_offsets_for_cpp = position_offsets_for_cpp
             if attn.is_mla_enable:

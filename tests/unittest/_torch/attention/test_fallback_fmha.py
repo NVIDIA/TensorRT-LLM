@@ -26,15 +26,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.fmha.fallback import (
     FallbackFmha,
     _set_context_workspace_shape,
 )
-from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaParams
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaParams, StaticAttentionConfig
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
 
 @pytest.mark.parametrize(
@@ -162,3 +164,35 @@ def test_prepare_workspace_keeps_scheduler_and_multi_ctas_counters_separate(monk
     assert allocations == [(None, params.qkv_or_q.device, 8, 4)]
     assert params.fwd.fmha_scheduler_counter is scheduler_counter
     assert params.multi_ctas_kv_counter is multi_ctas_kv_counter
+
+
+def test_attention_op_cache_separates_static_configurations(monkeypatch):
+    class FakeStaticConfig(str):
+        def to_thop_config(self):
+            return str(self)
+
+    created = []
+
+    class AttentionOp:
+        def __init__(self, config):
+            self.config = config
+            created.append(config)
+
+    monkeypatch.setattr(
+        StaticAttentionConfig,
+        "from_params",
+        classmethod(lambda cls, params, **kwargs: params),
+    )
+    monkeypatch.setattr(trtllm_backend, "thop", SimpleNamespace(AttentionOp=AttentionOp))
+    owner = SimpleNamespace(_attention_ops={}, skip_correction_threshold=0.0)
+    causal = FakeStaticConfig("causal")
+    full = FakeStaticConfig("full")
+
+    causal_op = TrtllmAttention.attention_op(owner, causal)
+
+    assert TrtllmAttention.attention_op(owner, causal) is causal_op
+    assert TrtllmAttention.attention_op(owner, full) is not causal_op
+    assert created == ["causal", "full"]
+
+    TrtllmAttention.release(owner)
+    assert owner._attention_ops == {}
