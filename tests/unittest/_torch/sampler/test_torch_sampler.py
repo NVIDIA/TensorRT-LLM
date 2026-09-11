@@ -981,6 +981,47 @@ class TestFinishReasons:
         assert requests[1].get_tokens(0)[-1] == 7
         assert requests[2].get_tokens(0) == [2, 0]
 
+    # 13 and 17 are the two stop words; 99 is neither, and pins that the check
+    # stays selective rather than finishing on any token.
+    @pytest.mark.parametrize("new_token, expect_finished", [(13, True), (17, True), (99, False)])
+    def test_single_step_greedy_honors_every_single_token_stop_word(
+        self, new_token: int, expect_finished: bool
+    ):
+        """Each single-token stop word must stop generation, not just the first.
+
+        The harmony / GPT-OSS serving path passes two of them (``<|return|>``
+        and ``<|call|>``); matching only ``py_stop_words_list[0]`` let a tool
+        call run on past ``<|call|>`` into fabricated content (nvbugs/6751484).
+        """
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        request = LlmRequest(
+            request_id=0,
+            seq_slot=0,
+            input_tokens=[2, 0],
+            # Ample budget, so LENGTH cannot fire and mask a missed stop word.
+            max_new_tokens=10,
+            end_id=2,
+            stop_words_list=[[13], [17]],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        state = SampleStateTorch(
+            requests=[request],
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=torch.tensor([new_token], dtype=torch.int32),
+                finish_reasons=None,
+                first_finish_reasons=None,
+                single_step_greedy=True,
+            ),
+        )
+
+        sampler.update_requests(state)
+
+        assert request.is_finished == expect_finished
+
     class RequestCase:
         MAX_NEW_TOKENS = 10
         MAX_NUM_SEQUENCES = 128
