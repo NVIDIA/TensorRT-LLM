@@ -33,8 +33,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import (check_device_contain, get_device_count,
-                        get_host_total_memory, llm_models_root, trt_environment)
+from ..conftest import get_device_count, llm_models_root, trt_environment
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
@@ -1489,18 +1488,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def get_commands(self):
         num_gpus = self._config.num_gpus
-
-        if self._config.model_name == "qwen3.8_max_fp4_mtp":
-            if not check_device_contain(["B300", "GB300"]):
-                pytest.skip("Qwen3.8 MAX NVFP4 TP8 requires B300 or GB300")
-        if self._config.model_name.startswith("qwen3.8_flash_next_"):
-            required_memory_gib = (96
-                                   if "fp8" in self._config.model_name else 128)
-            host_memory_mib = get_host_total_memory()
-            if host_memory_mib < required_memory_gib * 1024:
-                pytest.skip(
-                    f"Flash-Next PLE offload requires {required_memory_gib} GiB "
-                    f"host memory, got {host_memory_mib} MiB")
 
         if is_windows() and num_gpus > 1:
             pytest.skip(
