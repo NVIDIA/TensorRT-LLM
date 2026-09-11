@@ -141,11 +141,13 @@ def test_integrator_tool_records_authoritative_verdict(tmp_path):
             "measured_value": 111.0,
             "required_gain_pct": 7.4,
             "best_candidate_id": "opt-001",
+            "has_native_changes": True,
         },
     )
     entry = progress_module.latest_entry(path, "integrator")
     assert entry["decision"] == "APPROVE"
     assert entry["included_item_ids"] == ["opt-001", "opt-002"]
+    assert entry["has_native_changes"] is True
 
 
 def test_summary_tool_handlers_stamp_loop_position(tmp_path):
@@ -194,6 +196,7 @@ def test_evaluator_tool_requires_and_records_structured_fields(tmp_path):
     schema = append.input_schema
     assert sorted(schema["required"]) == sorted(
         ["summary", "decision", "reason_category", "measured_gain_pct", "measured_value"]
+        + ["has_native_changes"]
     )
     assert schema["properties"]["decision"]["enum"] == ["APPROVE", "REJECT", "PUSH_BACK"]
     assert schema["properties"]["reason_category"]["enum"] == [
@@ -211,6 +214,7 @@ def test_evaluator_tool_requires_and_records_structured_fields(tmp_path):
             "reason_category": "none",
             "measured_gain_pct": 8.4,
             "measured_value": 1298.7,
+            "has_native_changes": False,
         },
     )
     (entry,) = progress_module.read_progress(path)["optimization"]
@@ -219,6 +223,7 @@ def test_evaluator_tool_requires_and_records_structured_fields(tmp_path):
     assert entry["reason_category"] == "none"
     assert entry["measured_gain_pct"] == pytest.approx(8.4)
     assert entry["measured_value"] == pytest.approx(1298.7)
+    assert entry["has_native_changes"] is False
     assert entry["round"] == 1
     assert entry["attempt"] == 2
     assert entry["item_id"] == "opt-001"
@@ -275,6 +280,7 @@ def test_evaluator_and_qa_tools_record_optional_curve(tmp_path):
             "reason_category": "none",
             "measured_gain_pct": 3.24,
             "measured_value": 1234.5,
+            "has_native_changes": False,
             "curve": curve,
         },
     )
