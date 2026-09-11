@@ -1130,8 +1130,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     # so only the one-model path is covered here.
     @parametrize_with_ids("overlap_scheduler", [True, False])
     # Dual TP4 120B-model startup (weights + Eagle3 draft checkpoint loaded
-    # on both ctx and gen servers) plus a full, unmocked GSM8K eval routinely
-    # exceeds the default test timeout before evaluation even starts.
+    # on both ctx and gen servers) plus a full, unmocked GSM8K eval (1319
+    # samples, up to 8192 output tokens each) needs the 90-minute timeout.
+    # Without an explicit max_workers, launch_disaggregated_llm's default of
+    # 16 client threads badly underutilizes the servers' much larger
+    # max_batch_size, so the eval was throughput-bound on client concurrency
+    # rather than on the servers -- 128 workers (matching other full-eval
+    # disagg tests in this file) lets the eval actually finish in that time.
     @pytest.mark.timeout(5400)
     def test_eagle3(self, overlap_scheduler, mocker):
         # Eagle3 disagg coverage kept on GPT-OSS; Qwen3.5 has no Eagle3 draft
@@ -1189,8 +1194,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
             model_name = "GPT-OSS/120B-MXFP4"
             run_accuracy_test(
                 llm,
