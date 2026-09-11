@@ -23,6 +23,7 @@ from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
 from ..nccl_window_graph import (nccl_window_graph_capture,
                                  release_nccl_window_graph_owner)
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -737,12 +738,20 @@ class CUDAGraphRunner:
             # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
-            for _ in range(self.WARMUP_STEPS):
-                output = forward_fn(capture_inputs)
+            def run_warmup():
+                result = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
                 _restore_spec_decode_capture_state(attn_metadata,
                                                    saved_kv_lens_cuda)
+                return result
+
+            for _ in range(self.WARMUP_STEPS):
+                if self.is_warmup_only:
+                    output = run_warmup()
+                else:
+                    with discard_nccl_window_tensor_outputs(capture_inputs):
+                        run_warmup()
 
             if self.is_warmup_only:
                 return output
@@ -2104,7 +2113,11 @@ class EncoderCUDAGraphRunner:
             # The warmup pass must not build a graph; its caller consumes the
             # eager output directly.
             for _ in range(self.WARMUP_STEPS):
-                output = forward_fn(capture_inputs)
+                if self.is_warmup_only:
+                    output = forward_fn(capture_inputs)
+                else:
+                    with discard_nccl_window_tensor_outputs(capture_inputs):
+                        forward_fn(capture_inputs)
 
             if self.is_warmup_only:
                 return output
@@ -2118,9 +2131,10 @@ class EncoderCUDAGraphRunner:
                                            graph_pool,
                                            stream=self._get_capture_stream(),
                                            capture_error_mode="thread_local"):
-                if capture_h2d is not None:
-                    capture_h2d()
-                output = forward_fn(capture_inputs)
+                with discard_nccl_window_tensor_outputs(capture_inputs):
+                    if capture_h2d is not None:
+                        capture_h2d()
+                    output = forward_fn(capture_inputs)
 
         if self._contains_nested_tensor(output):
             raise TypeError(
