@@ -16,8 +16,8 @@
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllCftManager.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftManager.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tensorrt_llm/thop/thUtils.h"

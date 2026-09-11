@@ -26,7 +26,7 @@
 
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 #include "tensorrt_llm/runtime/cudaStream.h"

@@ -19,9 +19,9 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/vec_dtypes.cuh"
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllCftSupport.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/kernels/cudaAsyncOps.cuh"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cerrno>
 #include <cooperative_groups.h>
