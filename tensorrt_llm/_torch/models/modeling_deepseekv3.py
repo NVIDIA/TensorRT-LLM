@@ -392,8 +392,13 @@ class DeepseekV3WeightLoader:
                 mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
-                    dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
-                        names[-1])
+                    # Match this checkpoint layer, not the bare projection name.
+                    # An excluded BF16 layer needs no FP8 scale tensor, even when
+                    # another layer (or a user wildcard) enables dequantization.
+                    dequant_kv_b_proj = (
+                        self.model_config.quant_config.
+                        is_module_excluded_from_quantization(name) and
+                        weights[f"{name}.weight"].dtype == torch.float8_e4m3fn)
                     if dequant_kv_b_proj:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
                             name)

@@ -615,6 +615,22 @@ class ModelConfig(Generic[TConfig]):
                     config.pre_quant_scale = layer_cfg['pre_quant_scale']
                 mixed_quant_configs[layer] = config
             layer_quant_config = mixed_quant_configs
+
+            # FP8 block boundaries may cross MLA head boundaries. Exclude only
+            # the FP8 projections named in the checkpoint: a global wildcard
+            # would overwrite other layers' explicit mixed-precision recipes.
+            fp8_mla_projections = [
+                name for name, cfg in mixed_quant_configs.items()
+                if cfg.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                and name.endswith((".self_attn.kv_b_proj",
+                                   ".self_attn.k_b_proj", ".eh_proj"))
+            ]
+            if fp8_mla_projections:
+                existing = list(quant_config.exclude_modules or [])
+                quant_config.exclude_modules = existing + [
+                    name for name in fp8_mla_projections if
+                    not quant_config.is_module_excluded_from_quantization(name)
+                ]
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
