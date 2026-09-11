@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Requires bindings built from this checkout; no workspace sizing mocks."""
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -14,13 +15,13 @@ from tensorrt_llm.bindings.internal import thop
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
 def test_native_workspace_report_is_requirement_not_capacity() -> None:
-    if get_sm_version() != 90:
-        pytest.skip("The regression explicitly exercises Hopper fallback FMHA")
+    if get_sm_version() < 80:
+        pytest.skip("Fallback FMHA regression requires SM80 or newer")
     case = BackendCase(
-        num_heads=32,
-        num_kv_heads=8,
+        num_heads=8,
+        num_kv_heads=2,
         head_dim=128,
-        seq_lens=[64, 64],
+        seq_lens=[16, 16],
         num_cached_tokens=[0, 0],
         num_contexts=2,
         dtype="bfloat16",
@@ -50,7 +51,10 @@ def test_native_workspace_report_is_requirement_not_capacity() -> None:
 
     with torch.inference_mode():
         golden = run_backend(case, "VANILLA", inputs, kv_dtype=case.kv_torch_dtype, kv_layout="NHD")
-        with patch.object(thop, "attention", side_effect=attention_with_report):
+        with (
+            patch.dict(os.environ, {"TLLM_FMHA_LIBS": "fallback"}),
+            patch.object(thop, "attention", side_effect=attention_with_report),
+        ):
             output = run_backend(
                 case, "TRTLLM", inputs, kv_dtype=case.kv_torch_dtype, kv_layout="HND"
             )

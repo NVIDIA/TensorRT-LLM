@@ -3,17 +3,18 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
 _ENGINE_MODULE = "tensorrt_llm._torch.pyexecutor.model_engine"
+pytestmark = pytest.mark.cpu_only
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA GPU required")
 class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = object.__new__(PyTorchModelEngine)
@@ -25,19 +26,15 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine._torch_compile_backend = None
         self.engine.breakable_cuda_graph_runner = None
         self.engine._is_warmup = False
-        self.metadata = TrtllmAttentionMetadata(max_num_requests=2, max_num_tokens=128)
-        self.metadata.workspace = torch.empty(4096, dtype=torch.uint8, device="cuda")
+        self.metadata = object.__new__(TrtllmAttentionMetadata)
+        self.metadata.workspace = torch.empty(4096, dtype=torch.uint8)
         self.engine.attn_metadata = self.metadata
         self.engine.model = SimpleNamespace(
-            model_config=SimpleNamespace(extra_attrs={}), forward=self.model_forward
+            model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
-
-    def model_forward(self, **kwargs: object) -> int:
-        for _ in range(80):
-            report = self.metadata.workspace_required_bytes
-            if report is not None:
-                report.fill_(4096)
-        return 42
+        reclaimer_patch = patch(f"{_ENGINE_MODULE}.EagerWorkspaceReclaimer", autospec=True)
+        self.reclaimer_class = reclaimer_patch.start()
+        self.addCleanup(reclaimer_patch.stop)
 
     def freeze(self) -> None:
         with patch.object(self.engine, "_is_encoder_decoder_model", return_value=False):
@@ -50,27 +47,30 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         ):
             return self.engine.model_forward(attn_metadata=self.metadata)
 
-    def test_counts_whole_model_and_bypasses_warmup(self) -> None:
+    def test_forward_scope_and_warmup_bypass(self) -> None:
         self.freeze()
-        self.metadata.workspace.resize_(16384)
+        self.reclaimer_class.assert_called_once_with(self.metadata)
+        scope = self.reclaimer_class.return_value.forward
         self.engine._is_warmup = True
-        for _ in range(4):
-            self.assertEqual(self.call(), 42)
-        self.assertEqual(self.engine._eager_workspace_reclaimer.policy.remaining, 3)
+        self.assertEqual(self.call(), 42)
+        scope.assert_not_called()
         self.engine._is_warmup = False
-        for remaining in (2, 1, 3):
-            self.assertEqual(self.call(), 42)
-            self.assertEqual(self.engine._eager_workspace_reclaimer.policy.remaining, remaining)
-        self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 4096)
+
+        def forward(**kwargs: object) -> int:
+            scope.return_value.__enter__.assert_called_once()
+            return 42
+
+        self.engine.model.forward.side_effect = forward
+        self.assertEqual(self.call(), 42)
+        scope.assert_called_once_with(self.metadata)
+        scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
     def test_disabled_flag_leaves_workspace_alone(self) -> None:
         self.engine._eager_workspace_shrink_enabled = False
         self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
-        self.metadata.workspace.resize_(16384)
-        for _ in range(4):
-            self.call()
-        self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
+        self.assertEqual(self.call(), 42)
+        self.reclaimer_class.assert_not_called()
 
     def test_unsupported_modes_do_not_create_reclaimer(self) -> None:
         for name, value in [
@@ -91,7 +91,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.metadata.workspace_reclaimable = True
-        self.metadata.workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
+        self.metadata.workspace = torch.empty(0, dtype=torch.uint8)
         self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
 

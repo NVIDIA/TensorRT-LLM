@@ -548,36 +548,26 @@ Key test files:
 
 ## 8. Experimental Eager Scratch Reclamation
 
-Set `TRTLLM_EAGER_WORKSPACE_SHRINK=1` before constructing the PyTorch model
-engine to enable delayed reclamation of fallback FMHA eager scratch. It is
-disabled by default. The engine freezes the eager workspace capacity after
-successful warmup as a minimum capacity; skipped warmup does not enable it.
+Enable with `TRTLLM_EAGER_WORKSPACE_SHRINK=1` before engine construction
+(default: off). Successful warmup freezes the minimum eager capacity.
 
-The native attention sizing point reports required bytes into a CPU scalar,
-taking the maximum across all attention calls in one model forward. Reading
-this report does not synchronize the GPU. After three completed forwards
-whose requirements are strictly below capacity, the engine replaces the
-workspace with a buffer sized to the larger of the warmup floor and the
-maximum requirement in those three forwards. Growth or an exact-capacity
-requirement resets the counter. Failed forwards reset the counter; forwards
-with no reported requirement do not advance it.
+- Native sizing reports the maximum required bytes across one model forward
+  into a CPU scalar, without GPU synchronization. Three underfilled forwards
+  trigger replacement with `max(warmup floor, window maximum requirement)`.
+  Growth, exact-capacity demand, or failure resets the counter; no report
+  leaves it unchanged.
+- Drop the old Tensor before replacement: `resize_` alone retains storage.
+  Memory returns to PyTorch's allocator, not necessarily the driver; stream
+  ordering may delay reuse. This does not prevent peak OOM and can add
+  allocation overhead with alternating large/small requests.
+- CUDA graph storage is untouched. Speculative decoding, CP, encoder-decoder,
+  sparse, compiled, breakable-graph, and multi-stream modes are excluded;
+  changing the serving stream disables reclamation.
+- Only fallback FMHA opts in. Any other eager FMHA use, including warmup,
+  disables reclamation for that metadata. Opting in requires pure scratch
+  with no cross-forward state and complete requirement reporting.
 
-Reclamation drops the old Tensor before allocating its replacement, because
-shrinking a Tensor with `resize_` alone retains its storage. Released storage
-returns to the PyTorch caching allocator, not necessarily to the CUDA driver;
-`memory_allocated()` may fall without a corresponding fall in `memory_reserved()`
-or `nvidia-smi` usage. Stream ordering can delay when released storage becomes
-reusable. This policy does not bound peak demand or prevent an allocation-time
-OOM, and alternating large/small traffic can add allocator and host overhead.
-
-CUDA graph workspace is never reclaimed. The initial integration also excludes
-speculative decoding, context parallelism, encoder-decoder, sparse attention,
-compiled models, and breakable CUDA graphs. Reclamation is disabled if serving
-changes CUDA streams or enables multi-stream execution. The current consumer
-stream is recorded on the Tensor before use to protect pending GPU work.
-
-Only fallback FMHA currently declares its workspace reclaimable. If another
-FMHA backend uses the eager workspace, that metadata becomes non-reclaimable,
-including when this happens during warmup. A new backend must prove that its
-workspace contains no state retained between forwards and report every scratch
-requirement before opting in; partial reports are not sufficient.
+Tests: policy, ownership branches, and engine wiring run on CPU (CUDA calls
+are mocked). Only allocator/async-lifetime and native FMHA tests need a GPU;
+prefer one available lower-cost supported card. Native FMHA requires SM80+
+and matching rebuilt bindings, not specifically H100/H200.
