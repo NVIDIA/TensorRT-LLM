@@ -607,7 +607,6 @@ public:
     /// @param samplingConfig The sampling configuration
     /// @param outputConfig The output configuration
     /// @param endId The end token id
-    /// @param padId The pad token id
     /// @param positionIds The input position ids
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
@@ -647,7 +646,7 @@ public:
     /// requests with the same salt. The string is also surfaced in KV cache events. Defaults to std::nullopt.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
-        std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
+        std::optional<SizeType32> const& endId = std::nullopt,
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
@@ -691,7 +690,6 @@ public:
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
     [[nodiscard]] OutputConfig getOutputConfig() const;
     [[nodiscard]] std::optional<SizeType32> getEndId() const;
-    [[nodiscard]] std::optional<SizeType32> getPadId() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getPositionIds() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
@@ -726,7 +724,6 @@ public:
     void setSamplingConfig(SamplingConfig const& config);
     void setOutputConfig(OutputConfig const& outputConfig);
     void setEndId(SizeType32 endId);
-    void setPadId(SizeType32 padId);
     void setPositionIds(std::vector<SizeType32> const& positionIds);
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
