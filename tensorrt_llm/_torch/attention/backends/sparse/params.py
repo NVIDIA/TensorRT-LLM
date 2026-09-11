@@ -15,9 +15,27 @@
 """Shared sparse attention parameter types."""
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Protocol, runtime_checkable
 
 import torch
+
+
+@runtime_checkable
+class MTPIndexShareMetadata(Protocol):
+    """Draft-loop state a sparse backend exposes so MTP can share one selection.
+
+    The three calls are used together for one draft loop, so a backend that
+    implements only some of them cannot serve the reuse at all.
+    """
+
+    def set_in_mtp_draft_loop(self, active: bool) -> None:
+        """Mark whether a draft loop is running."""
+
+    def set_mtp_num_accepted(self, num_accepted: Optional[torch.Tensor]) -> None:
+        """Supply the per-request accepted counts used to pick the capture row."""
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Ask the indexer to reuse its captured selection instead of scoring."""
 
 
 def use_self_sampling_gvr(

@@ -5811,30 +5811,28 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    **guided_decoding_args)
 
     def _run_evals(
-        self,
-        model_path: str,
-        tensor_parallel_size: int,
-        moe_backend: str,
-        max_draft_len: Optional[int],
-        expected_quant_algo: Optional[QuantAlgo],
-        monkeypatch: pytest.MonkeyPatch,
-        mocker,
-        moe_expert_parallel_size: int = 1,
-        enable_attention_dp: bool = False,
-        cover_guided_decoding: bool = False,
-        enable_block_reuse: bool = False,
-        sparse_attention_config: Optional[QSASparseAttentionConfig] = None
-    ) -> None:
+            self,
+            model_path: str,
+            tensor_parallel_size: int,
+            moe_backend: str,
+            max_draft_len: Optional[int],
+            expected_quant_algo: Optional[QuantAlgo],
+            monkeypatch: pytest.MonkeyPatch,
+            mocker,
+            moe_expert_parallel_size: int = 1,
+            enable_attention_dp: bool = False,
+            cover_guided_decoding: bool = False,
+            enable_block_reuse: bool = False,
+            sparse_attention_config: Optional[QSASparseAttentionConfig] = None,
+            acceptance_length_key: Optional[str] = None) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
         monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
 
-        check_acceptance_length = (
-            expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-            and tensor_parallel_size == 4 and moe_backend == "TRTLLM"
-            and max_draft_len == 3 and moe_expert_parallel_size == 4
-            and enable_attention_dp and not enable_block_reuse)
+        # A case opts into the acceptance-length guard by naming its own entry
+        # in references/acceptance_length.yaml.
+        check_acceptance_length = acceptance_length_key is not None
         with self._build_llm(
                 model_path,
                 tensor_parallel_size,
@@ -5856,8 +5854,7 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
             if check_acceptance_length:
                 assert_acceptance_length_for_llm(
-                    "TestQwen3_8_Flash_Next::"
-                    "test_fp8_adp4_mtp3_trtllm_ple_offload",
+                    f"TestQwen3_8_Flash_Next::{acceptance_length_key}",
                     llm,
                 )
             task = MMLU(self.MODEL_NAME)
@@ -5889,15 +5886,17 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                                               monkeypatch: pytest.MonkeyPatch,
                                               mocker) -> None:
         """Block-FP8 on four GPUs with attention DP, MTP3 and PLE offload."""
-        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
-                        tensor_parallel_size=4,
-                        moe_backend="TRTLLM",
-                        max_draft_len=3,
-                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
-                        monkeypatch=monkeypatch,
-                        mocker=mocker,
-                        moe_expert_parallel_size=4,
-                        enable_attention_dp=True)
+        self._run_evals(
+            f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+            tensor_parallel_size=4,
+            moe_backend="TRTLLM",
+            max_draft_len=3,
+            expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+            monkeypatch=monkeypatch,
+            mocker=mocker,
+            moe_expert_parallel_size=4,
+            enable_attention_dp=True,
+            acceptance_length_key="test_fp8_adp4_mtp3_trtllm_ple_offload")
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -5931,20 +5930,25 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                                                 mocker) -> None:
         """NVFP4 on four GPUs with attention DP, MTP3 and PLE offload.
 
-        Blackwell-only, so the GVR Top-K prerequisites hold; this is the case
-        that keeps the heuristic indexer selection under accuracy guard.
+        Blackwell-only, so the GVR Top-K prerequisites hold. This is the case
+        that keeps both indexer options under accuracy guard: the heuristic
+        Top-K, and the draft loop reusing one selection. It is also the only
+        one of the two ADP4/MTP3 cases that CI currently runs -- the block-FP8
+        one is waived under nvbugs/6767938.
         """
-        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
-                        tensor_parallel_size=4,
-                        moe_backend="TRTLLM",
-                        max_draft_len=3,
-                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
-                        monkeypatch=monkeypatch,
-                        mocker=mocker,
-                        moe_expert_parallel_size=4,
-                        enable_attention_dp=True,
-                        sparse_attention_config=QSASparseAttentionConfig(
-                            enable_heuristic_topk=True))
+        self._run_evals(
+            f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+            tensor_parallel_size=4,
+            moe_backend="TRTLLM",
+            max_draft_len=3,
+            expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+            monkeypatch=monkeypatch,
+            mocker=mocker,
+            moe_expert_parallel_size=4,
+            enable_attention_dp=True,
+            sparse_attention_config=QSASparseAttentionConfig(
+                enable_heuristic_topk=True, index_share_for_mtp_iteration=True),
+            acceptance_length_key="test_nvfp4_adp4_mtp3_trtllm_ple_offload")
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
