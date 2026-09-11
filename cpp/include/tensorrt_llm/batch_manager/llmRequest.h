@@ -30,7 +30,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <list>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -92,7 +91,7 @@ class ContextProgress;
 // other.
 std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset();
 
-template <typename TTensor, typename TStream = runtime::BufferManager::CudaStreamPtr>
+template <typename TTensor>
 class GenericLlmRequest
 {
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
