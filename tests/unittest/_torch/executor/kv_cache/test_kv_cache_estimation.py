@@ -631,7 +631,9 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
             tokens_per_block=64,
             max_seq_len=4096,
             max_batch_size=3,
-            kv_cache_config=KvCacheConfig(max_attention_window=[2048, 2048, 4096]),
+            kv_cache_config=KvCacheConfig(
+                max_attention_window=[2048, 2048, 4096], enable_swa_scratch_reuse=False
+            ),
         )
     )
     scratch_size_per_token = CacheCost.from_raw(
@@ -641,8 +643,9 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
             tokens_per_block=64,
             max_seq_len=4096,
             max_batch_size=3,
-            kv_cache_config=KvCacheConfig(max_attention_window=[2048, 2048, 4096]),
-            enable_swa_scratch_reuse=True,
+            kv_cache_config=KvCacheConfig(
+                max_attention_window=[2048, 2048, 4096], enable_swa_scratch_reuse=True
+            ),
         )
     )
 

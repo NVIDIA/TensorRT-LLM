@@ -4370,7 +4370,11 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_sizes,
             attention_windows,
             tokens_per_block,
-            scratch=bool(kwargs.get("enable_swa_scratch_reuse", False)),
+            scratch=(
+                kv_cache_config is not None
+                and kv_cache_config.enable_swa_scratch_reuse
+                and not is_draft
+            ),
             generation_capacity_headroom=generation_capacity_headroom,
         )
         # The affine slope covers all tokens; context additionally retains SWA
@@ -4383,6 +4387,8 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_sizes, attention_windows, tokens_per_block
         )
         if is_draft and fixed_cost > 0 and bytes_per_slot is not None:
+            # Without a config, all windows are full attention, so no SWA slot exists.
+            assert kv_cache_config is not None
             # The affine intercept is the configured quota needed to preserve
             # the fixed usable capacity at V2's resume watermark. Keep the
             # allocator's page rounding inside the manager estimator rather
