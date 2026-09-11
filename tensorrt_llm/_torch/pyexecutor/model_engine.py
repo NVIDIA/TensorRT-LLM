@@ -905,7 +905,8 @@ class PyTorchModelEngine(ModelEngine):
             model=self.model,
             mapping=self.mapping,
             graph_config=(self.cuda_graph_config if isinstance(
-                self.cuda_graph_config, EncodeCudaGraphConfig) else None),
+                self.cuda_graph_config, EncodeCudaGraphConfig) else
+                          self.llm_args.encoder_cuda_graph_config),
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
@@ -1374,7 +1375,10 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = (resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
                             if resource_manager is not None else None)
-        if self._runner is not None and kv_cache_manager is None:
+        if self._runner is not None and not self._is_encoder_decoder_model():
+            assert kv_cache_manager is None, (
+                "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
+            )
             self._runner.warmup(resource_manager)
             self._runner.capture_graphs(resource_manager)
             return
@@ -6393,7 +6397,10 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = (resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
                             if resource_manager is not None else None)
-        if self._runner is not None and kv_cache_manager is None:
+        if self._runner is not None and not self._is_encoder_decoder_model():
+            assert kv_cache_manager is None, (
+                "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
+            )
             return self._runner.forward(
                 scheduled_requests,
                 resource_manager=resource_manager,

@@ -65,6 +65,26 @@ def test_feature_encoder_padding_rejects_excessive_extra_work() -> None:
         inputs = {"seq_lens": [fixed_seq_len] * batch_size}
         with runner.pad_batch(inputs, batch_size) as padded:
             assert padded["seq_lens"] == expected_sequence_lengths
+        assert padded["seq_lens"] == expected_sequence_lengths
+        assert inputs["seq_lens"] == [fixed_seq_len] * batch_size
+
+
+def test_token_encoder_padding_survives_context_exit_without_mutating_inputs() -> None:
+    runner = EncoderCUDAGraphRunner.__new__(EncoderCUDAGraphRunner)
+    runner.enabled = True
+    runner.padding_enabled = True
+    runner.is_encoder_decoder = False
+    runner.feature_mode = False
+    runner.capture_keys = frozenset()
+    runner.supported_batch_sizes = [2]
+    runner.max_supported_num_tokens = 4
+    inputs = {"input_ids": [11, 12], "seq_lens": [2]}
+
+    with runner.pad_batch(inputs, 1) as padded:
+        assert padded["seq_lens"] == [2, 1]
+
+    assert padded["seq_lens"] == [2, 1]
+    assert inputs["seq_lens"] == [2]
 
 
 def test_captured_feature_metadata_avoids_eager_metadata_build() -> None:

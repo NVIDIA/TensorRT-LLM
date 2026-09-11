@@ -4,7 +4,7 @@
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -28,7 +28,11 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    EncodeCudaGraphConfig,
+    PrefillCudaGraphBackend,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -175,6 +179,48 @@ def test_model_engine_initializes_runner_by_family(
     initializer.assert_called_once_with(runner_type)
 
 
+@pytest.mark.parametrize("cuda_graph_config", [None, CudaGraphConfig()])
+def test_encoder_runner_initialization_preserves_encoder_graph_config_fallback(
+    cuda_graph_config: CudaGraphConfig | None,
+) -> None:
+    encoder_graph_config = EncodeCudaGraphConfig(
+        batch_sizes=[1],
+        num_tokens=[16],
+        seq_lens=[16],
+    )
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = object()
+    engine.mapping = object()
+    engine.cuda_graph_config = cuda_graph_config
+    engine.llm_args = SimpleNamespace(
+        encoder_cuda_graph_config=encoder_graph_config,
+        enable_autotuner=False,
+    )
+    engine.batch_size = 4
+    engine.max_num_tokens = 16
+    engine.max_seq_len = 16
+    engine.max_beam_width = 1
+    engine.without_logits = False
+    engine.attn_backend = _AttentionBackend
+    engine.attn_runtime_features = AttentionRuntimeFeatures()
+    engine.is_draft_model = False
+    deps = object()
+    engine._create_runner_deps = Mock(return_value=deps)
+    runner_config = object()
+    expected_runner = object()
+    runner_type = Mock(return_value=expected_runner)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.model_engine.EncoderRunnerConfig.create",
+        return_value=runner_config,
+    ) as create_config:
+        actual = engine._initialize_encoder_runner(runner_type)
+
+    assert actual is expected_runner
+    assert create_config.call_args.kwargs["graph_config"] is encoder_graph_config
+    runner_type.assert_called_once_with(engine.model, deps, runner_config)
+
+
 def test_model_engine_rejects_unregistered_runner_family() -> None:
     class UnregisteredRunner:
         pass
@@ -228,6 +274,22 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         gather_context_logits=False,
         token_type_ids=model_input,
     )
+
+
+def test_model_engine_rejects_kv_manager_with_no_kv_cache_runner() -> None:
+    runner = Mock(spec=NoKVCacheRunner)
+    engine, resource_manager = _model_engine_with_runner(
+        runner,
+        kv_cache_manager=object(),
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="no-KV-cache runner was initialized, but a KV cache manager was allocated",
+    ):
+        engine.forward(ScheduledRequests(), resource_manager)
+
+    runner.forward.assert_not_called()
 
 
 def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:

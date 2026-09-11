@@ -335,7 +335,9 @@ class EncoderMixin:
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
             mapping=self._deps.mapping,
-            cache_indirection=None,
+            cache_indirection=(
+                None if self._encoder_config.is_encoder_decoder else self._deps.cache_indirection
+            ),
             kv_cache_manager=None,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             num_heads_per_kv=num_heads_per_kv,

@@ -17,7 +17,10 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderRunner,
     EncoderRunnerConfig,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunnerConfig
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
+    EncoderDecoderRunner,
+    EncoderDecoderRunnerConfig,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig
 
@@ -129,6 +132,70 @@ def test_encoder_only_incomplete_graph_config_warns_and_stays_eager() -> None:
     assert not config.cuda_graph_enabled
     assert warning.call_count == 1
     assert "stays eager" in warning.call_args.args[0]
+
+
+def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None:
+    cache_indirection = object()
+    metadata = SimpleNamespace(
+        block_ids_per_seq=object(),
+        kv_block_ids_per_seq=object(),
+    )
+    runner = object.__new__(EncoderRunner)
+    runner._model = SimpleNamespace(model_config=object())
+    runner._config = SimpleNamespace(
+        max_batch_size=4,
+        max_num_tokens=16,
+        max_beam_width=2,
+        attention_backend=TrtllmAttention,
+        attention_runtime_features=AttentionRuntimeFeatures(),
+    )
+    runner._deps = SimpleNamespace(
+        mapping=object(),
+        cache_indirection=cache_indirection,
+    )
+    runner._encoder_config = SimpleNamespace(is_encoder_decoder=False)
+
+    with patch.object(
+        encoder_module,
+        "build_attention_metadata",
+        return_value=metadata,
+    ) as build_metadata:
+        actual = runner._create_attention_metadata()
+
+    assert actual is metadata
+    assert build_metadata.call_args.kwargs["cache_indirection"] is cache_indirection
+    assert metadata.block_ids_per_seq is None
+    assert metadata.kv_block_ids_per_seq is None
+
+
+def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() -> None:
+    metadata = SimpleNamespace(
+        block_ids_per_seq=object(),
+        kv_block_ids_per_seq=object(),
+    )
+    runner = object.__new__(EncoderDecoderRunner)
+    runner._model = SimpleNamespace(model_config=object())
+    runner._config = SimpleNamespace(
+        max_batch_size=4,
+        max_num_tokens=16,
+        max_beam_width=2,
+        attention_backend=TrtllmAttention,
+        attention_runtime_features=AttentionRuntimeFeatures(),
+    )
+    runner._deps = SimpleNamespace(
+        mapping=object(),
+        cache_indirection=object(),
+    )
+    runner._encoder_config = SimpleNamespace(is_encoder_decoder=True)
+
+    with patch.object(
+        encoder_module,
+        "build_attention_metadata",
+        return_value=metadata,
+    ) as build_metadata:
+        runner._create_attention_metadata()
+
+    assert build_metadata.call_args.kwargs["cache_indirection"] is None
 
 
 def test_encoder_runner_collects_scheduled_inputs_without_losing_request_boundaries() -> None:
