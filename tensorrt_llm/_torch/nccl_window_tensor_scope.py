@@ -14,10 +14,11 @@
 # limitations under the License.
 
 import sys
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from types import TracebackType
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -98,6 +99,14 @@ class _NCCLWindowTensorScope:
 
 def nccl_window_tensor_scope(inputs: Any) -> _NCCLWindowTensorScope:
     return _NCCLWindowTensorScope(inputs)
+
+
+@contextmanager
+def discard_nccl_window_tensor_outputs(inputs: Any) -> Iterator[None]:
+    """Release window tensors produced while preserving borrowed inputs."""
+    with nccl_window_tensor_scope(inputs) as scope:
+        scope.escape(inputs)
+        yield
 
 
 def install_eager_nccl_window_tensor_scopes(
