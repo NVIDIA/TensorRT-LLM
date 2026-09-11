@@ -1094,3 +1094,80 @@ def test_fused_cat_fp4_dsv32_prefill_shape(num_tokens, n_heads):
     packed_ref, scale_ref = torch.ops.trtllm.fused_cat_fp4(q_pe.contiguous(), q_nope.contiguous())
     assert torch.equal(packed, packed_ref)
     assert torch.equal(scale, scale_ref)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_requests,num_topk,block_size,stride_factor,layer_id",
+    [
+        # Vectorized (int4) path: contiguous rows, num_topk % 4 == 0, row count
+        # not a multiple of the 4 rows per block -> exercises the tail block.
+        (7, 3, 2048, 32, 2496, 5),
+        (13, 4, 1024, 32, 32, 0),
+        (1, 1, 4, 32, 32, 0),
+        # Production shape: GLM 5.2 prefill (16k rows would be slow in the
+        # Python reference; 256 rows cover >64 blocks of 4 rows).
+        (256, 8, 2048, 32, 2496, 77),
+        # Decode shapes: below the 512-row switch the row is split across
+        # gridDim.y blocks (one row per block). 1 / 2 / 16 rows x 2048.
+        (1, 1, 2048, 32, 2496, 3),
+        (2, 2, 2048, 32, 2496, 0),
+        (16, 8, 2048, 32, 2496, 77),
+        # Around the switch between the two vectorized launches.
+        (511, 8, 2048, 32, 2496, 1),
+        (600, 8, 2048, 32, 2496, 1),
+        # Fallback (scalar) path: num_topk not a multiple of 4.
+        (9, 2, 130, 64, 192, 1),
+        (5, 2, 2049, 32, 32, 0),
+    ],
+)
+def test_convert_req_index_to_global_vectorized_paths(
+    num_tokens, num_requests, num_topk, block_size, stride_factor, layer_id
+):
+    """The remap kernel has an int4 fast path (rows*num_topk % 4 == 0,
+    contiguous, 16B-aligned) and a scalar fallback; both must match the
+    reference exactly, including -1 for negative tokens, out-of-range blocks
+    and padding block-table entries."""
+    device = torch.device("cuda")
+    torch.manual_seed(1234 + num_tokens * 7 + num_topk)
+    max_blocks_per_req = 64
+    req_id = torch.randint(0, num_requests, (num_tokens,), dtype=torch.int32, device=device)
+    block_table = torch.randint(0, 5000, (num_requests, max_blocks_per_req), dtype=torch.int32, device=device)
+    block_table[:, 48:] = -1  # padding entries
+    # Token positions spanning valid, padding and out-of-range blocks.
+    token_indices = torch.randint(
+        0, max_blocks_per_req * block_size + 3 * block_size, (num_tokens, num_topk), dtype=torch.int32, device=device
+    )
+    token_indices[torch.rand(num_tokens, num_topk, device=device) < 0.15] = -1
+
+    cpp_out = torch.ops.trtllm.convert_req_index_to_global(
+        req_id, block_table, token_indices, block_size, num_topk, stride_factor, layer_id
+    )
+    ref_out = _reference_convert_req_index_to_global(
+        req_id, block_table, token_indices, block_size, stride_factor, layer_id
+    )
+    assert torch.equal(cpp_out, ref_out), (
+        f"Mismatch at {(cpp_out != ref_out).nonzero(as_tuple=False)[:3].tolist()}"
+    )
+    # Output is a fresh tensor of the same shape/dtype; input untouched.
+    assert cpp_out.shape == token_indices.shape and cpp_out.dtype == torch.int32
+
+
+def test_convert_req_index_to_global_layer_offset_is_additive():
+    """global(layer) == global(0) + layer * block_size wherever valid: the
+    invariant that lets the per-layer remap be hoisted in the future."""
+    device = torch.device("cuda")
+    torch.manual_seed(5)
+    num_tokens, num_topk, block_size, stride_factor = 8, 512, 32, 2496
+    req_id = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    block_table = torch.arange(1, 65, dtype=torch.int32, device=device).view(1, 64)
+    token_indices = torch.randint(0, 64 * block_size, (num_tokens, num_topk), dtype=torch.int32, device=device)
+    token_indices[:, ::7] = -1
+    out0 = torch.ops.trtllm.convert_req_index_to_global(
+        req_id, block_table, token_indices, block_size, num_topk, stride_factor, 0
+    )
+    out5 = torch.ops.trtllm.convert_req_index_to_global(
+        req_id, block_table, token_indices, block_size, num_topk, stride_factor, 5
+    )
+    valid = out0 >= 0
+    assert torch.equal(valid, out5 >= 0)
+    assert torch.equal(out5[valid], out0[valid] + 5 * block_size)
