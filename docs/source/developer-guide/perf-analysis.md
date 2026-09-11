@@ -88,7 +88,7 @@ For the per-mode specifics, see `parse_profile_range` in
 
 ### Visualize the PyTorch profiler results
 
-Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+Use `chrome://tracing/` to inspect the saved profile.
 
 
 ## Examples
@@ -128,7 +128,7 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
 
 The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight Systems application to open it.
 
-The PyTorch profiler results will be saved to `trace.json`. Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+The PyTorch profiler results will be saved to `trace.json`. Use `chrome://tracing/` to inspect the saved profile.
 
 ## MoE Expert Load Balance Analysis (Perfect Router)
 

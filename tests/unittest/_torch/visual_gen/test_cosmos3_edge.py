@@ -15,11 +15,13 @@ Override checkpoint:
 """
 
 import gc
+import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import PIL.Image
 import pytest
 import torch
 from diffusers import UniPCMultistepScheduler
@@ -27,11 +29,21 @@ from diffusers import UniPCMultistepScheduler
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+    ACTION_MODE_FORWARD_DYNAMICS,
+    ACTION_MODE_INVERSE_DYNAMICS,
+    ACTION_MODE_POLICY,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
+    COSMOS3_ACTION_PARAMS,
     COSMOS3_EDGE_T2I_PARAMS,
     COSMOS3_EDGE_VIDEO_PARAMS,
+    COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
+    COSMOS3_POLICY_SAMPLING_PARAMS,
+    COSMOS3_T2I_PARAMS,
+    resolve_checkpoint_policy_defaults,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
@@ -238,6 +250,19 @@ class TestArchRecipe:
     def test_qwen3_resolves_without_backbone_type(self):
         cfg = SimpleNamespace(hidden_act="silu", qk_norm_for_text=True)
         assert resolve_arch_recipe(cfg) is QWEN3_RECIPE
+
+    def test_edge_export_resolves_from_complete_signature_without_backbone_type(self, monkeypatch):
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 as tf_module
+
+        warnings = []
+        monkeypatch.setattr(tf_module.logger, "warning", warnings.append)
+        cfg = _reduced_edge_config()
+        cfg.backbone_type = None
+        assert resolve_arch_recipe(cfg) is NEMOTRON_DENSE_RECIPE
+        assert warnings == [
+            "Cosmos3 config omits backbone_type; inferred "
+            f"{COSMOS3_EDGE_BACKBONE_TYPE!r} from the config signature."
+        ]
 
     def test_unknown_backbone_raises(self):
         cfg = _reduced_edge_config()
@@ -761,6 +786,34 @@ def _bare_pipeline(family: str) -> Cosmos3OmniMoTPipeline:
     return pipeline
 
 
+class TestEdgePolicyReferenceInput:
+    def test_encoded_image_bytes_reach_action_preprocessing_as_rgb(self):
+        """L1: worker-side PNG decoding preserves the Policy input pixels."""
+        source = PIL.Image.new("RGB", (7, 5), (11, 22, 33))
+        encoded = io.BytesIO()
+        source.save(encoded, format="PNG")
+
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        seen = {}
+        expected = object()
+
+        def record_image(image, target_h, target_w):
+            seen["image"] = image
+            seen["target"] = (target_h, target_w)
+            return expected
+
+        pipeline._preprocess_action_image = record_image
+
+        actual = pipeline._preprocess_action_first_frame(
+            encoded.getvalue(), None, target_h=544, target_w=736
+        )
+
+        assert actual is expected
+        assert seen["target"] == (544, 736)
+        assert seen["image"].mode == "RGB"
+        np.testing.assert_array_equal(np.asarray(seen["image"]), np.asarray(source))
+
+
 class TestEdgeDefaults:
     def test_generation_defaults_matrix(self):
         edge_video = COSMOS3_GENERATION_DEFAULTS[(NEMOTRON_DENSE_RECIPE.name, "video")]
@@ -800,7 +853,170 @@ class TestEdgeDefaults:
         assert qwen3.default_warmup_num_frames == [189]
 
     def test_hf_id_registered(self):
-        assert "nvidia/Cosmos3-Edge" in PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"].hf_ids
+        hf_ids = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"].hf_ids
+        assert "nvidia/Cosmos3-Edge" in hf_ids
+        assert "nvidia/Cosmos3-Edge-Policy-DROID" in hf_ids
+
+    def test_policy_manifest_overrides_policy_sampling_only(self):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+
+        policy = pipeline._mode_params("video", action_mode=ACTION_MODE_POLICY)
+
+        assert policy["num_inference_steps"] == 4
+        assert policy["guidance_scale"] == 3.0
+        assert policy["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
+        resolved_policy = pipeline._resolve_generation_params(
+            "video",
+            action_mode=ACTION_MODE_POLICY,
+            num_inference_steps=None,
+            guidance_scale=None,
+            guidance_interval=None,
+        )
+        assert resolved_policy == {
+            "num_inference_steps": 4,
+            "guidance_scale": 3.0,
+            "guidance_interval": COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"],
+        }
+        assert (
+            pipeline._mode_params("video", action_mode=ACTION_MODE_FORWARD_DYNAMICS)
+            is COSMOS3_ACTION_PARAMS
+        )
+        assert (
+            pipeline._mode_params("video", action_mode=ACTION_MODE_INVERSE_DYNAMICS)
+            is COSMOS3_ACTION_PARAMS
+        )
+        for action_mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS):
+            resolved = pipeline._resolve_generation_params(
+                "video",
+                action_mode=action_mode,
+                num_inference_steps=None,
+                guidance_scale=None,
+                guidance_interval=None,
+            )
+            assert resolved == {
+                "num_inference_steps": 30,
+                "guidance_scale": 1.0,
+                "guidance_interval": None,
+            }
+        assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
+
+    @pytest.mark.parametrize(
+        "action_mode",
+        [
+            ACTION_MODE_POLICY,
+            ACTION_MODE_FORWARD_DYNAMICS,
+            ACTION_MODE_INVERSE_DYNAMICS,
+        ],
+    )
+    def test_default_negative_prompt_is_policy_specific(self, action_mode):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        tokenized_prompts = []
+
+        def record_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            tokenized_prompts.append(text)
+            empty = torch.empty((1, 0), dtype=torch.long)
+            return empty, empty
+
+        pipeline._tokenize_prompt = record_prompt
+        request = SimpleNamespace(
+            action_mode=action_mode,
+            do_action=True,
+            is_t2i=False,
+            output_type="video",
+            max_sequence_length=128,
+            use_system_prompt=False,
+        )
+
+        pipeline._tokenize_request_prompts(
+            request,
+            ["move the robot"],
+            None,
+            use_duration_template=False,
+            use_resolution_template=False,
+        )
+
+        expected_negative_prompt = (
+            ""
+            if action_mode == ACTION_MODE_POLICY
+            else pipeline_module.default_negative_prompt("video")
+        )
+        assert tokenized_prompts == ["move the robot", expected_negative_prompt]
+
+    def test_policy_manifest_sampling_does_not_cross_domain_override(self, monkeypatch):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        pipeline.action_gen = True
+        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+        monkeypatch.setattr(pipeline, "_scheduler_for", lambda *args, **kwargs: object())
+        monkeypatch.setattr(pipeline_module, "action_reference_size", lambda **kwargs: (480, 640))
+
+        request = pipeline._resolve_request(
+            image=None,
+            height=None,
+            width=None,
+            num_frames=None,
+            num_inference_steps=None,
+            guidance_scale=None,
+            max_sequence_length=None,
+            frame_rate=None,
+            use_system_prompt=None,
+            enable_audio=False,
+            output_type="video",
+            video=None,
+            flow_shift=None,
+            action_mode=ACTION_MODE_POLICY,
+            domain_name="bridge_orig_lerobot",
+            domain_id=None,
+            raw_action_dim=None,
+            action_chunk_size=None,
+            use_state=None,
+            action_resolution=None,
+            action_fps=None,
+            transfer_config=None,
+        )
+
+        assert request.num_inference_steps == COSMOS3_ACTION_PARAMS["num_inference_steps"]
+        assert request.guidance_scale == COSMOS3_ACTION_PARAMS["guidance_scale"]
+        assert request.guidance_interval is None
+        assert request.domain_name == "bridge_orig_lerobot"
+        assert request.action_chunk_size == 16
+        assert request.frame_rate == 5.0
+
+    def test_guidance_interval_resolves_for_visual_and_audio_modes(self) -> None:
+        pipeline = _bare_pipeline(QWEN3_RECIPE.name)
+
+        # Audio is an extra stream on a video request and therefore shares the
+        # video request's resolved CFG interval.
+        video_and_audio = pipeline._resolve_generation_params("video", guidance_interval=None)
+        image = pipeline._resolve_generation_params("image", guidance_interval=None)
+
+        assert video_and_audio["guidance_interval"] is None
+        assert image["guidance_interval"] == COSMOS3_T2I_PARAMS["guidance_interval"]
+
+    def test_policy_manifest_declares_policy_as_the_action_mode_default(self):
+        pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
+        pipeline.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+
+        assert pipeline.extra_param_specs["action_mode"].default == ACTION_MODE_POLICY
+        assert COSMOS3_EXTRA_SPECS["action_mode"].default is None
 
     def test_none_params_resolve_from_edge_tables(self):
         pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
@@ -1110,10 +1326,265 @@ class TestEnvelopeAdvisory:
         assert records == []
 
 
+_POLICY_PARITY_VIDEO_SHAPE = (9, 4, 6)
+_POLICY_PARITY_ACTION_LENGTH = 33
+_POLICY_PARITY_ACTION_DIM = 64
+_POLICY_PARITY_RAW_ACTION_DIM = 8
+_POLICY_PARITY_DOMAIN_ID = 8
+_POLICY_PARITY_FPS = 15.0
+_POLICY_PARITY_RAW_TIMESTEP = 999.0
+
+
+def _policy_parity_inputs() -> dict[str, object]:
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+        compute_mrope_position_ids_action,
+        compute_mrope_position_ids_text,
+        compute_mrope_position_ids_vision,
+    )
+
+    cfg = _reduced_qwen3_config(action_dim=_POLICY_PARITY_ACTION_DIM)
+    generator = torch.Generator().manual_seed(2026)
+    latent_t, latent_h, latent_w = _POLICY_PARITY_VIDEO_SHAPE
+    video = torch.randn(
+        (1, cfg.latent_channel, latent_t, latent_h, latent_w),
+        generator=generator,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+    action = torch.zeros(
+        (_POLICY_PARITY_ACTION_LENGTH, _POLICY_PARITY_ACTION_DIM), dtype=torch.bfloat16
+    )
+    action[0, :_POLICY_PARITY_RAW_ACTION_DIM] = torch.linspace(
+        -1.0, 1.0, _POLICY_PARITY_RAW_ACTION_DIM, dtype=torch.bfloat16
+    )
+    action[1:, :_POLICY_PARITY_RAW_ACTION_DIM] = torch.randn(
+        (_POLICY_PARITY_ACTION_LENGTH - 1, _POLICY_PARITY_RAW_ACTION_DIM),
+        generator=generator,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+
+    input_ids = torch.tensor([3, 5, 7, 11, 13], dtype=torch.long)
+    und_len = len(input_ids)
+    patch_size = cfg.latent_patch_size
+    patch_h = (latent_h + patch_size - 1) // patch_size
+    patch_w = (latent_w + patch_size - 1) // patch_size
+    frame_token_stride = patch_h * patch_w
+    num_vision_tokens = latent_t * frame_token_stride
+
+    text_mrope_ids, next_offset = compute_mrope_position_ids_text(und_len, temporal_offset=0)
+    media_offset = next_offset + cfg.unified_3d_mrope_temporal_modality_margin
+    vision_mrope_ids, _ = compute_mrope_position_ids_vision(
+        latent_t,
+        patch_h,
+        patch_w,
+        temporal_offset=media_offset,
+        fps=_POLICY_PARITY_FPS,
+        base_fps=float(cfg.base_fps),
+        temporal_compression_factor=cfg.temporal_compression_factor,
+        enable_fps_modulation=cfg.enable_fps_modulation,
+    )
+    action_mrope_ids, _ = compute_mrope_position_ids_action(
+        _POLICY_PARITY_ACTION_LENGTH,
+        temporal_offset=media_offset,
+        action_fps=_POLICY_PARITY_FPS,
+        base_fps=float(cfg.base_fps),
+        base_temporal_compression_factor=cfg.temporal_compression_factor,
+        enable_fps_modulation=cfg.enable_fps_modulation,
+        start_frame_offset=0,
+    )
+
+    vision_start = und_len
+    vision_noisy_frame_indexes = torch.arange(1, latent_t, dtype=torch.long)
+    vision_mse_loss_indexes = torch.cat(
+        [
+            torch.arange(
+                vision_start + frame * frame_token_stride,
+                vision_start + (frame + 1) * frame_token_stride,
+                dtype=torch.long,
+            )
+            for frame in range(1, latent_t)
+        ]
+    )
+    action_start = vision_start + num_vision_tokens
+    action_sequence_indexes = torch.arange(
+        action_start,
+        action_start + _POLICY_PARITY_ACTION_LENGTH,
+        dtype=torch.long,
+    )
+    action_noisy_frame_indexes = torch.arange(1, _POLICY_PARITY_ACTION_LENGTH, dtype=torch.long)
+
+    return {
+        "video": video,
+        "action": action,
+        "input_ids": input_ids,
+        "text_indexes": torch.arange(und_len, dtype=torch.long),
+        "position_ids": torch.cat([text_mrope_ids, vision_mrope_ids, action_mrope_ids], dim=1),
+        "und_len": und_len,
+        "sequence_length": action_start + _POLICY_PARITY_ACTION_LENGTH,
+        "vision_token_shapes": [(latent_t, patch_h, patch_w)],
+        "vision_sequence_indexes": torch.arange(
+            vision_start, vision_start + num_vision_tokens, dtype=torch.long
+        ),
+        "vision_mse_loss_indexes": vision_mse_loss_indexes,
+        "vision_timesteps": torch.full(
+            (len(vision_mse_loss_indexes),), _POLICY_PARITY_RAW_TIMESTEP
+        ),
+        "vision_noisy_frame_indexes": [vision_noisy_frame_indexes],
+        "action_token_shapes": [(_POLICY_PARITY_ACTION_LENGTH, 1, 1)],
+        "action_sequence_indexes": action_sequence_indexes,
+        "action_mse_loss_indexes": action_sequence_indexes[action_noisy_frame_indexes],
+        "action_timesteps": torch.full(
+            (len(action_noisy_frame_indexes),), _POLICY_PARITY_RAW_TIMESTEP
+        ),
+        "action_noisy_frame_indexes": [action_noisy_frame_indexes],
+        "action_domain_ids": [torch.tensor(_POLICY_PARITY_DOMAIN_ID, dtype=torch.long)],
+    }
+
+
+def _policy_parity_to_device(value):
+    if isinstance(value, torch.Tensor):
+        return value.to(DEVICE)
+    if isinstance(value, list):
+        return [_policy_parity_to_device(item) for item in value]
+    return value
+
+
+def _policy_parity_models():
+    from diffusers.models.transformers.transformer_cosmos3 import Cosmos3OmniTransformer
+
+    cfg = _reduced_qwen3_config(action_dim=_POLICY_PARITY_ACTION_DIM)
+    torch.manual_seed(2026)
+    reference = Cosmos3OmniTransformer(
+        attention_bias=cfg.attention_bias,
+        attention_dropout=cfg.attention_dropout,
+        dtype="bfloat16",
+        head_dim=cfg.head_dim,
+        hidden_size=cfg.hidden_size,
+        intermediate_size=cfg.intermediate_size,
+        base_fps=cfg.base_fps,
+        enable_fps_modulation=cfg.enable_fps_modulation,
+        latent_channel=cfg.latent_channel,
+        unified_3d_mrope_reset_spatial_ids=cfg.unified_3d_mrope_reset_spatial_ids,
+        unified_3d_mrope_temporal_modality_margin=(cfg.unified_3d_mrope_temporal_modality_margin),
+        latent_patch_size=cfg.latent_patch_size,
+        num_attention_heads=cfg.num_attention_heads,
+        num_hidden_layers=cfg.num_hidden_layers,
+        num_key_value_heads=cfg.num_key_value_heads,
+        patch_latent_dim=cfg.patch_latent_dim,
+        rms_norm_eps=cfg.rms_norm_eps,
+        rope_scaling=cfg.rope_scaling,
+        rope_theta=cfg.rope_theta,
+        action_dim=cfg.action_dim,
+        action_gen=cfg.action_gen,
+        num_embodiment_domains=cfg.num_embodiment_domains,
+        timestep_scale=cfg.timestep_scale,
+        vocab_size=cfg.vocab_size,
+    ).eval()
+    weights = {name: value.detach().clone() for name, value in reference.state_dict().items()}
+
+    actual = Cosmos3VFMTransformer(
+        _reduced_qwen3_model_config(action_dim=_POLICY_PARITY_ACTION_DIM)
+    ).eval()
+    actual.load_weights(weights)
+    actual.post_load_weights()
+    reference.to(DEVICE)
+    # Both production paths retain the sinusoidal timestep MLP in FP32 and
+    # downcast only its emitted embedding before adding it to BF16 tokens.
+    # Cast parameters selectively to avoid Diffusers' warning about a blanket
+    # ``to(torch.bfloat16)`` changing that intentional FP32 island.
+    for name, parameter in reference.named_parameters():
+        if not name.startswith("time_embedder."):
+            parameter.data = parameter.data.to(torch.bfloat16)
+    return reference, actual.to(DEVICE)
+
+
+def _policy_reference_forward(transformer, inputs: dict[str, object]):
+    inputs = {key: _policy_parity_to_device(value) for key, value in inputs.items()}
+    with torch.inference_mode():
+        video_out, _, action_out = transformer(
+            input_ids=inputs["input_ids"],
+            text_indexes=inputs["text_indexes"],
+            position_ids=inputs["position_ids"],
+            und_len=inputs["und_len"],
+            sequence_length=inputs["sequence_length"],
+            vision_tokens=[inputs["video"]],
+            vision_token_shapes=inputs["vision_token_shapes"],
+            vision_sequence_indexes=inputs["vision_sequence_indexes"],
+            vision_mse_loss_indexes=inputs["vision_mse_loss_indexes"],
+            vision_timesteps=inputs["vision_timesteps"],
+            vision_noisy_frame_indexes=inputs["vision_noisy_frame_indexes"],
+            action_tokens=[inputs["action"]],
+            action_token_shapes=inputs["action_token_shapes"],
+            action_sequence_indexes=inputs["action_sequence_indexes"],
+            action_mse_loss_indexes=inputs["action_mse_loss_indexes"],
+            action_timesteps=inputs["action_timesteps"],
+            action_noisy_frame_indexes=inputs["action_noisy_frame_indexes"],
+            action_domain_ids=inputs["action_domain_ids"],
+        )
+    return video_out[0], action_out[0]
+
+
+def _policy_trt_forward(transformer, inputs: dict[str, object], action: torch.Tensor):
+    latent_t, _, _ = _POLICY_PARITY_VIDEO_SHAPE
+    input_ids = inputs["input_ids"].unsqueeze(0).to(DEVICE)
+    text_mask = torch.ones_like(input_ids)
+    video_noisy_mask = torch.ones((1, 1, latent_t, 1, 1), dtype=torch.bfloat16, device=DEVICE)
+    video_noisy_mask[:, :, 0] = 0
+    action_noisy_mask = torch.ones(
+        (1, _POLICY_PARITY_ACTION_LENGTH, 1), dtype=torch.bfloat16, device=DEVICE
+    )
+    action_noisy_mask[:, 0] = 0
+    raw_timestep = torch.tensor([_POLICY_PARITY_RAW_TIMESTEP], device=DEVICE)
+
+    transformer.reset_cache()
+    with torch.inference_mode():
+        output = transformer(
+            hidden_states=inputs["video"].to(DEVICE),
+            timestep=raw_timestep / 1000.0,
+            raw_timestep=raw_timestep,
+            text_ids=input_ids,
+            text_mask=text_mask,
+            video_shape=_POLICY_PARITY_VIDEO_SHAPE,
+            fps=_POLICY_PARITY_FPS,
+            noisy_frame_mask=video_noisy_mask,
+            action_latents=action.unsqueeze(0).to(DEVICE),
+            action_domain_ids=torch.tensor(
+                [_POLICY_PARITY_DOMAIN_ID], dtype=torch.long, device=DEVICE
+            ),
+            action_noisy_mask=action_noisy_mask,
+            action_start_frame_offset=0,
+            action_fps=_POLICY_PARITY_FPS,
+        )
+    return (
+        output.video[0] * video_noisy_mask[0],
+        output.action[0] * action_noisy_mask[0],
+    )
+
+
+def _policy_parity_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    import torch.nn.functional as F
+
+    actual = actual.float().reshape(-1)
+    expected = expected.float().reshape(-1)
+    assert actual.shape == expected.shape
+    reference_norm = torch.linalg.vector_norm(expected)
+    assert reference_norm > 0
+    abs_error = (actual - expected).abs()
+    return {
+        "relative_l2": float(torch.linalg.vector_norm(actual - expected) / reference_norm),
+        "cosine": float(F.cosine_similarity(actual.unsqueeze(0), expected.unsqueeze(0))),
+        "max_abs": float(abs_error.max()),
+        "p99_abs": float(torch.quantile(abs_error, 0.99)),
+        "reference_max_abs": float(expected.abs().max()),
+    }
+
+
 class TestDiffusersParity:
-    """Per-step velocity parity against diffusers main (first release with the
-    Edge classes). Runs in a subprocess because diffusers main cannot be
-    imported next to the pinned diffusers; gated on DIFFUSERS_MAIN_PATH."""
+    """Per-step velocity parity against Diffusers.
+
+    Edge checkpoint parity uses the first Diffusers revision with the Edge
+    classes and remains an explicitly gated diagnostic. Policy action parity
+    below is checkpoint-free and runs against the pinned Diffusers package.
+    """
 
     def test_per_step_velocity_parity(self):
         import re
@@ -1141,6 +1612,57 @@ class TestDiffusersParity:
         # bf16 accumulation band across 28 layers with differing attention
         # backends; observed 0.007 / 0.016 on B200.
         assert all(rel < 0.05 for rel in rels), result.stdout
+
+    def test_policy_droid_joint_transformer_parity(self):
+        """L2: DROID-layout action DiT step vs pinned Diffusers.
+
+        The emitted tensors are one-step BF16 video and action velocities. The
+        model-specific behavior is a clean state row followed by 32 noisy
+        actions, with domain-selected input/output heads. The trusted reference
+        is pinned Diffusers 0.39.0 with identical synthetic weights and packed
+        inputs. This is transparent T1; its tolerance covers reduction
+        reordering between SDPA and TRT-LLM's vanilla attention backend.
+
+        Pinned Diffusers predates the Nemotron-dense Edge backbone, so this pair
+        deliberately exercises the shared action machinery on the Qwen3 recipe.
+        The Edge-only norm, MLP and generator K-normalization forks have focused
+        tests above.
+        """
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        inputs = _policy_parity_inputs()
+        reference, actual = _policy_parity_models()
+        expected_video, expected_action = _policy_reference_forward(reference, inputs)
+        actual_video, actual_action = _policy_trt_forward(actual, inputs, inputs["action"])
+        report = {
+            "video": _policy_parity_stats(actual_video, expected_video),
+            "action": _policy_parity_stats(actual_action, expected_action),
+        }
+
+        for modality in ("video", "action"):
+            stats = report[modality]
+            assert stats["relative_l2"] < 0.01, report
+            assert stats["cosine"] > 0.9999, report
+            assert stats["max_abs"] < 0.01 * stats["reference_max_abs"] + 1e-3, report
+            assert stats["p99_abs"] < 0.01 * stats["reference_max_abs"] + 1e-3, report
+
+        # Feature-active assertion: removing the clean state row must change
+        # the predicted DROID action chunk by more than BF16 rounding noise.
+        zero_state_action = inputs["action"].clone()
+        zero_state_action[0] = 0
+        _, zero_state_output = _policy_trt_forward(actual, inputs, zero_state_action)
+        noisy_action = actual_action[1:, :_POLICY_PARITY_RAW_ACTION_DIM].float()
+        state_delta = noisy_action - zero_state_output[1:, :_POLICY_PARITY_RAW_ACTION_DIM].float()
+        state_effect_relative_l2 = float(
+            torch.linalg.vector_norm(state_delta) / torch.linalg.vector_norm(noisy_action)
+        )
+        assert state_effect_relative_l2 > 0.001, {
+            **report,
+            "state_effect_relative_l2": state_effect_relative_l2,
+            "state_effect_max_abs": float(state_delta.abs().max()),
+        }
+        assert state_delta.abs().max() > 0.01
 
 
 # Recorded from diffusers main 2919c5096 (`Cosmos3OmniPipeline.tokenize_prompt`

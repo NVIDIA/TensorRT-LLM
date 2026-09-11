@@ -14,8 +14,7 @@ import transformers
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, ExecutorConfig,
-                                 KvCacheRetentionConfig)
+                                 ContextChunkingPolicy, KvCacheRetentionConfig)
 # yapf: enable
 from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
@@ -28,10 +27,9 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
 from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
                        DraftTargetDecodingConfig, Eagle3DecodingConfig,
                        EagleDecodingConfig, EncodeCudaGraphConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MTPDecodingConfig,
-                       NGramDecodingConfig, SchedulerConfig, TorchLlmArgs,
-                       UserProvidedDecodingConfig, _ModelWrapper,
+                       KvCacheConfig, KVEventsConfig, LlmArgs,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchLlmArgs, UserProvidedDecodingConfig, _ModelWrapper,
                        _ParallelConfig, update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
 # yapf: enable
@@ -485,11 +483,8 @@ __all__ = [
     '_ParallelConfig',
     '_ModelWrapper',
     'BatchingType',
-    'ExecutorConfig',
     'SchedulerConfig',
     'KvCacheRetentionConfig',
-    'LookaheadDecodingConfig',
-    'MedusaDecodingConfig',
     'MTPDecodingConfig',
     'NGramDecodingConfig',
     'DraftTargetDecodingConfig',
@@ -502,6 +497,7 @@ __all__ = [
     'DecodeCudaGraphConfig',
     'EncodeCudaGraphConfig',
     'KvCacheConfig',
+    'KVEventsConfig',
     'CachedModelLoader',
     'EagleDecodingConfig',
     'Eagle3DecodingConfig',

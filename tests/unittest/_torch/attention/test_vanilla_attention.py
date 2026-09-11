@@ -8,12 +8,13 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (VanillaAttention,
-                                                   VanillaAttentionMetadata)
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.backends import (VanillaAttention,
+                                                    VanillaAttentionMetadata)
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig

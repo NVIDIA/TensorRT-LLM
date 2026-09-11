@@ -32,14 +32,18 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
-    get_sm_version,
-    is_sm_100f,
     llm_models_root,
     skip_post_blackwell_ultra,
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    VideoMME,
+    VoxPopuli,
+    assert_acceptance_length_for_llm,
+)
 
 
 class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
@@ -121,117 +125,7 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
             )
 
 
-@skip_pre_hopper
-class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-27b-it"
-    # Note: This has only the LLM part quantized. Vision part is in bfloat16.
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
-    MAX_NUM_TOKENS = 12800
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<end_of_turn>"
-    )
-
-    # Gemma3 VLM needs KV cache reuse disabled for custom mask support.
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        free_gpu_memory_fraction=0.4,
-        dtype="fp8",
-    )
-
-    def _make_llm(self, model_path: str):
-        # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
-        return LLM(
-            model_path,
-            max_batch_size=16,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            max_seq_len=8704,  # 8192 + 512.
-            kv_cache_config=self.kv_cache_config,
-            attn_backend="FLASHINFER",
-            enable_chunked_prefill=False,
-        )
-
-    def test_fp8_prequantized(self):
-        # Blackwell FP8 numerics differ from Hopper at the cubin level
-        # (~5pt drop on MMMU). Route to a Blackwell-calibrated reference
-        # rather than relaxing the Hopper one.
-        extra_acc_spec = "sm100_fp8" if get_sm_version() >= 100 else None
-        with self._make_llm(self.MODEL_PATH) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(
-                llm,
-                extra_acc_spec=extra_acc_spec,
-                sampling_params=self.sampling_params,
-            )
-
-    @skip_pre_blackwell
-    def test_nvfp4_prequantized(self):
-        model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-FP4"
-        with self._make_llm(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
-@skip_pre_hopper
-class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-12b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-12b-it"
-    MAX_NUM_TOKENS = 12800
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<end_of_turn>"
-    )
-
-    # Gemma3 VLM needs KV cache reuse disabled for custom mask support.
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        free_gpu_memory_fraction=0.6,
-    )
-
-    kv_cache_config_fp8 = kv_cache_config.model_copy(update={"dtype": "fp8"})
-
-    def _make_llm(self, model_path: str, kv_cache_config: KvCacheConfig = None):
-        # Gemma3 VLM needs FlashInfer attention backend for custom mask support.
-        if kv_cache_config is None:
-            kv_cache_config = self.kv_cache_config
-        return LLM(
-            model_path,
-            max_batch_size=16,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            max_seq_len=8704,  # 8192 + 512.
-            kv_cache_config=kv_cache_config,
-            attn_backend="FLASHINFER",
-            enable_chunked_prefill=False,
-        )
-
-    def test_auto_dtype(self):
-        with self._make_llm(self.MODEL_PATH) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-    def test_fp8_prequantized(self):
-        model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp8"
-        with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-    @skip_pre_blackwell
-    def test_nvfp4_prequantized(self):
-        model_path = f"{llm_models_root()}/gemma/gemma-3-12b-it-fp4"
-        with self._make_llm(model_path, self.kv_cache_config_fp8) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
-@pytest.mark.skipif(
-    not is_sm_100f(),
-    reason="Gemma4 shared-KV MTP requires FlashInfer trtllm-gen on the SM100 family",
-)
+@pytest.mark.skip_device_not_contain(["B200", "GB10"])
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
@@ -265,6 +159,28 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 mtp_eagle_one_model=True,
                 speculative_model=self.MTP_MODEL_PATH,
             ),
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+            assert_acceptance_length_for_llm(
+                "TestGemma4_26B_A4B::test_nvfp4",
+                llm,
+            )
+
+    def test_nvfp4_no_mtp(self):
+        # Same checkpoint without MTP drafting.
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
@@ -457,6 +373,77 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(28800)
+class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
+    """MMMU accuracy for the composite Qwen4-Exp vision + text model."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MAX_NUM_TOKENS = 8192
+    MAX_BATCH_SIZE = 16
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    # The chat template thinks by default at `reasoning_effort=xhigh`, which does
+    # not fit in MMMU's 512-token budget: the trace would be truncated before the
+    # answer and the score would measure truncation rather than the model.
+    # `enable_thinking=False` makes the template prefill an empty
+    # `<think></think>` block, so the model answers directly and the run stays
+    # reproducible.
+    EXTRA_EVALUATOR_KWARGS: ClassVar[dict] = dict(
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.5,
+        enable_block_reuse=False,
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+
+    def _run_mmmu(
+        self, model_path: str, moe_backend: str, expected_quant_algo: QuantAlgo, monkeypatch
+    ) -> None:
+        """Evaluate MMMU on one GPU with MTP3 and the PLE table on the host."""
+        monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
+
+        with LLM(
+            model_path,
+            trust_remote_code=True,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            enable_chunked_prefill=True,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            kv_cache_config=self.kv_cache_config,
+            cuda_graph_config=CudaGraphConfig(
+                max_batch_size=self.MAX_BATCH_SIZE, enable_padding=True
+            ),
+            moe_config=MoeConfig(backend=moe_backend),
+            speculative_config=MTPDecodingConfig(max_draft_len=3),
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == expected_quant_algo
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @pytest.mark.skip_less_device_memory(105000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_mtp3_trtllm_ple_offload(self, monkeypatch) -> None:
+        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_mmmu(
+            f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+            "TRTLLM",
+            QuantAlgo.MIXED_PRECISION,
+            monkeypatch,
+        )
 
 
 class TestKimiK25(LlmapiAccuracyTestHarness):
@@ -766,22 +753,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                         )
                     },
                 ),
-                marks=(
-                    skip_pre_hopper,
-                    # Note: marking as `xfail` so the test still runs in CI, and we can observe
-                    # whether its flakiness is still relevant on main.
-                    (
-                        pytest.mark.xfail(
-                            reason="https://nvbugs/6581049",
-                            raises=pytest.RaisesExc(
-                                AssertionError,
-                                match=r"Expected accuracy >= threshold, but got",
-                            ),
-                        )
-                        if pytest.version_tuple >= (8, 4)
-                        else pytest.mark.xfail(reason="https://nvbugs/6581049")
-                    ),
-                ),
+                marks=(skip_pre_hopper,),
                 id="fp8_mmmu_encoder_cuda_graph",
             ),
             pytest.param(

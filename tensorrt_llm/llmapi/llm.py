@@ -57,7 +57,9 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
+from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+                       TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
+                       validate_token_encoder_bucket_config)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -402,6 +404,9 @@ class BaseLLM:
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
                 ['_mpi_session', 'backend'])
+            if issubclass(llm_args_cls, TorchLlmArgs):
+                # Values are vetted by TorchLlmArgs._drop_removed_args.
+                valid_keys |= TORCH_LLMARGS_REMOVED_ARGS
             for key in kwargs:
                 if key not in valid_keys:
                     raise ValueError(
@@ -1696,6 +1701,57 @@ class BaseLLM:
         return ModelLoader.load_hf_model_config(
             self.args.model, trust_remote_code=self.args.trust_remote_code)
 
+    @set_api_status("prototype")
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start iteration-scoped profiling of the backend engine.
+
+        Mirrors the ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``
+        environment-variable behaviour but can be triggered at runtime (for
+        example via the ``trtllm-serve`` ``/start_profile`` HTTP endpoint).
+        Only supported when running the PyTorch / AutoDeploy backend; on the
+        TensorRT backend this is a no-op.
+
+        See ``PyExecutor.start_profile`` for full argument semantics.
+
+        Args:
+            output_dir (str, optional): Directory where chrome traces are
+                written. If ``None``, falls back to the
+                ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
+                to ``/tmp``. Defaults to None.
+            num_steps (int, optional): Number of engine iterations to
+                capture. When set, the engine stops the window automatically
+                and ``stop_profile`` does not need to be called. When
+                ``None``, profiling runs until ``stop_profile`` is called.
+                Defaults to None.
+            start_step (int): Additional iterations to skip before profiling actually begins, relative to the current iteration counter. Defaults to 0.
+            activities (List[str], optional): Subset of
+                ``["CPU", "GPU", "CUDA_PROFILER"]`` selecting which profiler
+                activities to record. When ``CUDA_PROFILER`` is the only
+                entry, ``torch.profiler`` is not started so only
+                ``cudaProfilerStart``/``cudaProfilerStop`` brackets run,
+                which is suitable for nsys capture. Defaults to None, which
+                resolves to ``["CPU", "GPU"]``.
+        """
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot start profiling.")
+        return self._executor.start_profile(output_dir=output_dir,
+                                            num_steps=num_steps,
+                                            start_step=start_step,
+                                            activities=activities)
+
+    @set_api_status("prototype")
+    def stop_profile(self) -> None:
+        """Stop any in-progress runtime profiling."""
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot stop profiling.")
+        return self._executor.stop_profile()
+
     @set_api_status("beta")
     def shutdown(self) -> None:
         try:
@@ -1884,6 +1940,45 @@ class _TorchLLM(BaseLLM):
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
 
+    def _reject_token_encoder_config_without_buckets(self) -> None:
+        """Reject a bucket-less token-encoder config before weights load.
+
+        `PyTorchModelEngine.__init__` asks the instantiated model and keeps the
+        last word; this asks the class its architecture resolves to. It defers
+        wherever that class might not be the one the engine builds, so it can
+        only reject earlier, never differently. A model that installs
+        `encoder_graph_spec` at construction instead of declaring it on the
+        class would be misjudged here; no in-tree model does.
+        """
+        config = self.args.encoder_cuda_graph_config
+        # `checkpoint_loader`, a non-HF `checkpoint_format` and `model_kwargs`
+        # all feed `checkpoint_loader.load_config()`, which is where the engine
+        # gets its class from, so the on-disk architecture may not be the one
+        # it builds. Decoder-only models are left to the engine too: its
+        # "consumes packed tokens" wording would only confuse there.
+        if (config is None or not self._is_encoder_decoder_model()
+                or self.args.model_kwargs is not None
+                or self.args.checkpoint_loader is not None
+                or self.args.checkpoint_format not in (None, "HF")):
+            return
+        bucket_config_error = validate_token_encoder_bucket_config(
+            config.num_tokens, config.seq_lens)
+        if bucket_config_error is None:
+            return
+        architectures = getattr(self._hf_model_config, "architectures",
+                                None) if self._hf_model_config else None
+        if not architectures:
+            return
+        # Local: resolving an architecture imports its model module, which the
+        # client process otherwise never loads.
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+        model_cls = get_registered_model_class(architectures[0])
+        # Unresolved, or a feature encoder that derives both dimensions itself.
+        if model_cls is None or hasattr(model_cls, "encoder_graph_spec"):
+            return
+        raise ValueError(bucket_config_error)
+
     def _build_model(self):
         super()._build_model()
         assert self._engine_dir is None
@@ -1892,6 +1987,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
         )
@@ -1947,7 +2043,6 @@ class _TorchLLM(BaseLLM):
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
             self._engine_dir,
-            executor_config=None,
             batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
@@ -1967,14 +2062,13 @@ class _TorchLLM(BaseLLM):
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that only arguments supported by the PyTorch backend are passed.
         """
-        torchllm_fields = set(TorchLlmArgs.model_fields.keys())
+        # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
+        accepted_keys = (set(TorchLlmArgs.model_fields.keys())
+                         | TORCH_LLMARGS_REMOVED_ARGS
+                         | {'_mpi_session', 'backend'})
 
         # Check if any arguments not supported by the PyTorch backend are passed.
-        unsupported_args = [
-            key for key in kwargs
-            if key not in torchllm_fields and key not in ('_mpi_session',
-                                                          'backend')
-        ]
+        unsupported_args = [key for key in kwargs if key not in accepted_keys]
 
         if unsupported_args:
             raise ValueError(

@@ -21,9 +21,9 @@ Covers the SiTU cubin integration behavior:
 * the fused path fails loudly without loaded weights (no silent
   random-weight fallback).
 
-The NVFP4 half of SiTU lives here too, on both FP4 backends: CUTLASS takes
-SiTU as an ``ActivationType``, TRTLLM-Gen as an out-of-band
-``trtllm_gen_activation_type`` served by the fused
+The NVFP4 half of SiTU lives here too, on both FP4 backends. Both take it as
+one ``SiTuActivation`` carrier; they differ only in what serves it -- CUTLASS
+an ``ActivationType`` its kernels branch on, TRTLLM-Gen the fused
 ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins. Tests that apply to both are
 parametrized over ``moe_backend`` rather than duplicated.
 """
@@ -208,6 +208,7 @@ def test_communication_factory_accepts_model_selected_method(monkeypatch):
         dp_size=16,
         moe_tp_size=1,
         moe_ep_size=16,
+        has_cp_helix=lambda: False,
     )
     model_config = SimpleNamespace(
         mapping=mapping,
@@ -339,7 +340,9 @@ def test_fused_forward_launches_situ_kernel(fmt):
     env["TLLM_BATCHED_GEMM_PRINT_NAME"] = "1"
     env["TLLM_LOG_LEVEL"] = "INFO"
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    unittest_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
+    # The child process imports ``_torch.moe.kimi_k3_ref_moe``, so the root it
+    # needs on PYTHONPATH is tests/unittest, not the repo's tests/ directory.
+    unittest_root = os.path.abspath(os.path.join(this_dir, "..", ".."))
     env["PYTHONPATH"] = os.pathsep.join([this_dir, unittest_root, env.get("PYTHONPATH", "")])
     result = subprocess.run(
         [sys.executable, "-c", _LAUNCH_EVIDENCE_SCRIPTS[fmt]],
@@ -607,6 +610,89 @@ def test_kimi_k3_moe_auto_backend_defaults_to_trtllm(architecture):
     assert ModelConfig.resolve_moe_backend("AUTO", architecture) == "TRTLLM"
 
 
+@situ_supported
+def test_kimi_k3_trtllm_accepts_nvfp4_routed_experts():
+    """The model-level format guard must admit TRTLLM-Gen's NVFP4 SiTu cubins."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEMethod
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        moe_backend="TRTLLM",
+        quant_config_dict={"layers.0.mlp.experts": nvfp4},
+    )
+    cfg = _K3Config(
+        routed_expert_hidden_size=512,
+        latent_moe_use_norm=True,
+        num_shared_experts=1,
+    )
+
+    runtime = KimiK3MoERuntime(model_config, cfg, layer_idx=0)
+
+    assert runtime.expert_ckpt_spec is modeling_kimi_linear._K3_EXPERT_CKPT_SPECS[QuantAlgo.NVFP4]
+    assert isinstance(
+        runtime.routed_experts.backend._get_quant_method(),
+        NVFP4TRTLLMGenFusedMoEMethod,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The K3 model layer and TRTLLMGenFusedMoE both have to know which routed-expert
+# formats trtllm-gen has a fused SiTu FC1 cubin for. They disagreed once: the
+# model's copy was written when MXFP4 was the only drop (#17865) and #17940 then
+# shipped the NVFP4 cubins and updated only the backend, so for a week an NVFP4
+# K3 checkpoint raised at construction on a path that the kernels supported.
+#
+# It survived because every other SiTu test calls ``create_moe`` directly and so
+# never reaches the model-layer guard -- the kernel path was green throughout.
+# These two tests enter through the guard instead.
+# ---------------------------------------------------------------------------
+
+
+def test_kimi_k3_trtllm_situ_admits_every_backend_supported_quant():
+    """The model must not narrow what the backend says it can serve.
+
+    Asserting agreement rather than a literal set is the point: a new fused
+    SiTu cubin family should require no edit here, and removing one should
+    fail loudly rather than leave a stale allow-list behind.
+    """
+    from tensorrt_llm._torch.moe.fused_moe import TRTLLMGenFusedMoE
+
+    supported = TRTLLMGenFusedMoE.situ_supported_quant_algos()
+    assert QuantAlgo.NVFP4 in supported, (
+        "trtllm-gen has shipped group-16 Bmm_E2m1_E2m1E2m1_..._siTuGlu_* cubins "
+        "since #17940; if this fails the backend regressed, not the model."
+    )
+    for algo in supported:
+        KimiK3MoERuntime._check_trtllm_situ_quant("TRTLLM", algo)
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.W4A16_MXFP4, None])
+def test_kimi_k3_trtllm_situ_rejects_quant_without_fused_cubin(quant_algo):
+    """...and must still reject the formats that have no fused SiTu cubin.
+
+    ``resolve_moe_backend`` sends every K3 architecture to TRTLLM, including
+    the generic FP8_BLOCK_SCALES fallback, so this rejection is reachable
+    without anyone asking for TRTLLM by name. It has to name the fix.
+    """
+    from tensorrt_llm._torch.moe.fused_moe import TRTLLMGenFusedMoE
+
+    assert quant_algo not in TRTLLMGenFusedMoE.situ_supported_quant_algos()
+    with pytest.raises(ValueError, match="fused SiTu cubins exist only for"):
+        KimiK3MoERuntime._check_trtllm_situ_quant("TRTLLM", quant_algo)
+
+    # Any other backend owns its own SiTu translation and is not this guard's
+    # business -- gating it here is how CUTLASS would get blocked by a
+    # trtllm-gen cubin inventory.
+    KimiK3MoERuntime._check_trtllm_situ_quant("CUTLASS", quant_algo)
+
+
 # ---------------------------------------------------------------------------
 # MoE tensor-parallel shard parity (ConfigurableMoE / TRTLLM-Gen, GPU).
 #
@@ -622,6 +708,121 @@ _TP_HIDDEN = 3584
 _TP_INTERMEDIATE = 3072
 _TP_EXPERTS = 8
 _TP_TOPK = 2
+
+
+def test_tp16_mxfp4_logical_shard_is_padded_locally():
+    """TP16 owns 192 logical values but stores a 256-wide kernel tile."""
+    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
+
+    method = object.__new__(W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod)
+    module = SimpleNamespace(
+        intermediate_size=_TP_INTERMEDIATE,
+        intermediate_size_per_partition=_TP_INTERMEDIATE // 16,
+        tp_size=16,
+        tp_rank=15,
+    )
+    assert method._uses_logical_tp_sharding(module)
+
+    # w1/w3 keep intermediate values on rows; each uint8 stores two hidden
+    # values, which does not change the intermediate slice width.
+    fc1 = (
+        torch.arange(_TP_INTERMEDIATE * 2, dtype=torch.int64)
+        .reshape(_TP_INTERMEDIATE, 2)
+        .to(torch.uint8)
+    )
+    fc1_shard = method._load_logical_tp_shard(
+        module, fc1, torch.Size((256, 2)), 0, 1, torch.device("cpu")
+    )
+    assert torch.equal(fc1_shard[:192], fc1[-192:])
+    assert torch.count_nonzero(fc1_shard[192:]) == 0
+
+    # w2 packs two intermediate values per byte; its 192-value logical shard
+    # is therefore 96 bytes and the 256-value destination is 128 bytes.
+    fc2 = (
+        torch.arange(2 * (_TP_INTERMEDIATE // 2), dtype=torch.int64)
+        .reshape(2, _TP_INTERMEDIATE // 2)
+        .to(torch.uint8)
+    )
+    fc2_shard = method._load_logical_tp_shard(
+        module, fc2, torch.Size((2, 128)), 1, 2, torch.device("cpu")
+    )
+    assert torch.equal(fc2_shard[:, :96], fc2[:, -96:])
+    assert torch.count_nonzero(fc2_shard[:, 96:]) == 0
+
+    # One uint8 scale covers 32 intermediate values: 6 logical scale bytes
+    # per rank, padded to 8 for the physical 256-value tile.
+    fc2_scale = (
+        torch.arange(2 * (_TP_INTERMEDIATE // 32), dtype=torch.int64)
+        .reshape(2, _TP_INTERMEDIATE // 32)
+        .to(torch.uint8)
+    )
+    fc2_scale_shard = method._load_logical_tp_shard(
+        module, fc2_scale, torch.Size((2, 8)), 1, 32, torch.device("cpu")
+    )
+    assert torch.equal(fc2_scale_shard[:, :6], fc2_scale[:, -6:])
+    assert torch.count_nonzero(fc2_scale_shard[:, 6:]) == 0
+
+
+def test_tp16_nvfp4_logical_shard_is_padded_locally():
+    """NVFP4 preserves 192 logical values in a 256-wide kernel tile."""
+    from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEMethod
+
+    method = object.__new__(NVFP4TRTLLMGenFusedMoEMethod)
+    method.weight_alignment, method.input_hidden_alignment = method.resolve_alignments(
+        _TP_HIDDEN, _TP_INTERMEDIATE // 16
+    )
+    module = SimpleNamespace(
+        intermediate_size=_TP_INTERMEDIATE,
+        intermediate_size_per_partition=_TP_INTERMEDIATE // 16,
+        tp_size=16,
+        tp_rank=15,
+    )
+    assert method.weight_alignment == 128
+    assert method._uses_logical_tp_sharding(module)
+
+    # W1/W3 use the intermediate dimension directly. Their hidden dimension
+    # is packed separately and does not change the 192-row logical slice.
+    fc1 = (
+        torch.arange(_TP_INTERMEDIATE * 2, dtype=torch.int64)
+        .reshape(_TP_INTERMEDIATE, 2)
+        .to(torch.uint8)
+    )
+    fc1_shard = method._load_logical_tp_shard(
+        module, fc1, torch.Size((256, 2)), 0, 1, torch.device("cpu")
+    )
+    assert torch.equal(fc1_shard[:192], fc1[-192:])
+    assert torch.count_nonzero(fc1_shard[192:]) == 0
+
+    # W2 packs two FP4 values per uint8, so 192 logical values occupy 96
+    # bytes and the padded 256-value destination occupies 128 bytes.
+    fc2 = (
+        torch.arange(2 * (_TP_INTERMEDIATE // 2), dtype=torch.int64)
+        .reshape(2, _TP_INTERMEDIATE // 2)
+        .to(torch.uint8)
+    )
+    fc2_shard = method._load_logical_tp_shard(
+        module, fc2, torch.Size((2, 128)), 1, 2, torch.device("cpu")
+    )
+    assert torch.equal(fc2_shard[:, :96], fc2[:, -96:])
+    assert torch.count_nonzero(fc2_shard[:, 96:]) == 0
+
+    # One NVFP4 scale covers 16 values: 12 logical groups per rank, padded
+    # to 16 scale entries for the physical 256-value tile.
+    fc2_scale = (
+        torch.arange(2 * (_TP_INTERMEDIATE // _NVFP4_GROUP_SIZE), dtype=torch.int64)
+        .reshape(2, _TP_INTERMEDIATE // _NVFP4_GROUP_SIZE)
+        .to(torch.uint8)
+    )
+    fc2_scale_shard = method._load_logical_tp_shard(
+        module,
+        fc2_scale,
+        torch.Size((2, 16)),
+        1,
+        _NVFP4_GROUP_SIZE,
+        torch.device("cpu"),
+    )
+    assert torch.equal(fc2_scale_shard[:, :12], fc2_scale[:, -12:])
+    assert torch.count_nonzero(fc2_scale_shard[:, 12:]) == 0
 
 
 def _make_packed_expert_bank(num_experts, intermediate, hidden, seed=101):
@@ -682,7 +883,7 @@ def _make_routed_moe(
     """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, create_moe
+    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     pretrained_config = PretrainedConfig()
@@ -712,30 +913,10 @@ def _make_routed_moe(
         ),
         layer_idx=0,
         communication_method=None,
+        # Mirror KimiK3MoERuntime exactly: one activation for every backend,
+        # naming the two soft-caps rather than the ABI registers they land in.
+        activation=SiTuActivation(gate_softcap=4.0, linear_softcap=25.0),
     )
-    if moe_backend == "TRTLLM":
-        moe_kwargs.update(
-            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-            trtllm_gen_activation_alpha=4.0,
-            trtllm_gen_activation_beta=25.0,
-        )
-    elif moe_backend == "CUTLASS":
-        # Mirror KimiK3MoERuntime exactly: CUTLASS is the one backend that
-        # takes SiTU as an ActivationType (the others carry it out of band),
-        # and that choice decides the FC1 weight geometry.
-        from tensorrt_llm._torch.utils import ActivationType
-
-        moe_kwargs.update(
-            activation_type=ActivationType.SiTu,
-            swiglu_alpha=torch.full((num_experts,), 4.0, dtype=torch.float32, device="cuda"),
-            swiglu_beta=torch.full((num_experts,), 25.0, dtype=torch.float32, device="cuda"),
-        )
-    else:
-        moe_kwargs.update(
-            activation="situ",
-            situ_beta=4.0,
-            situ_linear_beta=25.0,
-        )
     moe = create_moe(**moe_kwargs).cuda()
     assert isinstance(moe, ConfigurableMoE)
     return moe
@@ -757,6 +938,8 @@ def _load_bank(moe, bank, tp_size=1, tp_rank=0):
                 expert_size_per_partition=backend.expert_size_per_partition,
                 initial_local_expert_ids=backend.initial_local_expert_ids,
                 scaling_vector_size=backend.scaling_vector_size,
+                intermediate_size=_TP_INTERMEDIATE,
+                intermediate_size_per_partition=_TP_INTERMEDIATE // tp_size,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 w3_w1_weight=backend.w3_w1_weight,
@@ -797,7 +980,7 @@ def _load_bank(moe, bank, tp_size=1, tp_rank=0):
 
 
 @situ_supported
-@pytest.mark.parametrize("tp_size", [2, 8], ids=lambda n: f"tp{n}")
+@pytest.mark.parametrize("tp_size", [2, 8, 16], ids=lambda n: f"tp{n}")
 def test_tp_shard_loader_matches_manual_slice(tp_size):
     """The stock shard loaders must equal a manual contiguous slice.
 
@@ -828,6 +1011,9 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
             }
             for e in bank
         ]
+        # The TP16 destination is physically padded from 192 to 256. Loading
+        # the logical slice through a tp1 module exercises the same padding
+        # and transform while providing an ownership-independent reference.
         via_manual = _make_routed_moe(ipp, gate, num_experts=num_experts)
         _load_bank(via_manual, manual_bank)
 
@@ -958,6 +1144,78 @@ nvfp4_moe_supported = pytest.mark.skipif(
 )
 
 
+@nvfp4_moe_supported
+def test_tp16_nvfp4_padded_loaders_preserve_rank_ownership():
+    """All four NVFP4 loaders slice rank 15 before adding a zero tail."""
+    from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEMethod
+
+    method = object.__new__(NVFP4TRTLLMGenFusedMoEMethod)
+    method.weight_alignment, method.input_hidden_alignment = method.resolve_alignments(
+        _TP_HIDDEN, _TP_INTERMEDIATE // 16
+    )
+    module = SimpleNamespace(
+        intermediate_size=_TP_INTERMEDIATE,
+        intermediate_size_per_partition=_TP_INTERMEDIATE // 16,
+        is_gated_activation=True,
+        scaling_vector_size=_NVFP4_GROUP_SIZE,
+        tp_size=16,
+        tp_rank=15,
+    )
+    device = torch.device("cuda")
+
+    w1 = (
+        torch.arange(_TP_INTERMEDIATE * 2, dtype=torch.int64)
+        .reshape(_TP_INTERMEDIATE, 2)
+        .to(torch.uint8)
+    )
+    w3 = (w1 + 37).to(torch.uint8)
+    w3_w1_dst = torch.full((512, 2), 0xFF, dtype=torch.uint8, device=device)
+    method.load_expert_w3_w1_weight(module, w1, w3, w3_w1_dst)
+    w3_dst, w1_dst = w3_w1_dst.chunk(2, dim=0)
+    assert torch.equal(w3_dst[:192].cpu(), w3[-192:])
+    assert torch.equal(w1_dst[:192].cpu(), w1[-192:])
+    assert torch.count_nonzero(w3_dst[192:]) == 0
+    assert torch.count_nonzero(w1_dst[192:]) == 0
+
+    w2 = (
+        torch.arange(2 * (_TP_INTERMEDIATE // 2), dtype=torch.int64)
+        .reshape(2, _TP_INTERMEDIATE // 2)
+        .to(torch.uint8)
+    )
+    w2_dst = torch.full((2, 128), 0xFF, dtype=torch.uint8, device=device)
+    method.load_expert_w2_weight(module, w2, w2_dst)
+    assert torch.equal(w2_dst[:, :96].cpu(), w2[:, -96:])
+    assert torch.count_nonzero(w2_dst[:, 96:]) == 0
+
+    w1_sf = (
+        torch.arange(_TP_INTERMEDIATE * 2, dtype=torch.float32)
+        .reshape(_TP_INTERMEDIATE, 2)
+        .remainder(16)
+        .div(8)
+        .to(torch.float8_e4m3fn)
+    )
+    w3_sf = (w1_sf.float() + 0.25).to(torch.float8_e4m3fn)
+    w3_w1_sf_dst = torch.full((512, 2), 1.0, dtype=torch.float8_e4m3fn, device=device)
+    method.load_expert_w3_w1_weight_scale_nvfp4(module, w1_sf, w3_sf, w3_w1_sf_dst)
+    w3_sf_dst, w1_sf_dst = w3_w1_sf_dst.chunk(2, dim=0)
+    assert torch.equal(w3_sf_dst[:192].float().cpu(), w3_sf[-192:].float())
+    assert torch.equal(w1_sf_dst[:192].float().cpu(), w1_sf[-192:].float())
+    assert torch.count_nonzero(w3_sf_dst[192:].float()) == 0
+    assert torch.count_nonzero(w1_sf_dst[192:].float()) == 0
+
+    w2_sf = (
+        torch.arange(2 * (_TP_INTERMEDIATE // _NVFP4_GROUP_SIZE), dtype=torch.float32)
+        .reshape(2, _TP_INTERMEDIATE // _NVFP4_GROUP_SIZE)
+        .remainder(16)
+        .div(8)
+        .to(torch.float8_e4m3fn)
+    )
+    w2_sf_dst = torch.full((2, 16), 1.0, dtype=torch.float8_e4m3fn, device=device)
+    method.load_expert_w2_weight_scale_nvfp4(module, w2_sf, w2_sf_dst)
+    assert torch.equal(w2_sf_dst[:, :12].float().cpu(), w2_sf[:, -12:].float())
+    assert torch.count_nonzero(w2_sf_dst[:, 12:].float()) == 0
+
+
 def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
     """Random NVFP4 tensors in ``nvidia/Kimi-K3-NVFP4`` checkpoint layout."""
     gen = torch.Generator().manual_seed(seed)
@@ -996,8 +1254,8 @@ def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):
 def _make_nvfp4_moe(gate, num_experts=_TP_EXPERTS, moe_backend="CUTLASS"):
     """NVFP4 + SiTU routed MoE on either FP4 backend.
 
-    CUTLASS takes SiTU as an ``ActivationType``; TRTLLM-Gen carries it out of
-    band as ``trtllm_gen_activation_type`` and serves it with the fused
+    Both take the same ``SiTuActivation`` carrier; CUTLASS serves it as an
+    ``ActivationType`` its kernels branch on, TRTLLM-Gen with the fused
     ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` FC1 cubins (group-16 block scales).
     ``_make_routed_moe`` already mirrors both of KimiK3MoERuntime's branches,
     so the backend is the only variable.

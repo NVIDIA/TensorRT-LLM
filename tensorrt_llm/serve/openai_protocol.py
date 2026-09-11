@@ -47,8 +47,9 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
-                      field_validator, model_validator)
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
+                      NonNegativeInt, PositiveInt, field_validator,
+                      model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -61,6 +62,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.visual_gen.params import MediaRole
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
@@ -1939,7 +1941,7 @@ class ImageEditRequest(OpenAIBaseModel):
         description=
         "Optional edit mask. Currently accepted for compatibility but unsupported.",
     )
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["url", "b64_json", "path"] = "url"
     output_format: Literal["png", "webp", "jpeg"] = Field(
         default="png",
         validation_alias=AliasChoices("output_format", "format"),
@@ -2011,6 +2013,35 @@ class ImageGenerationResponse(OpenAIBaseModel):
     size: Optional[str] = None
 
 
+class MediaReferenceItem(OpenAIBaseModel):
+    """One media reference (image / video / audio) for conditioning (mirrors ``MediaRef``).
+
+    ``format`` declares how to read ``content``; it is required, so no wire form
+    is ever guessed. The request field it sits in (``image_reference`` /
+    ``video_reference`` / ``audio_reference``) fixes the modality. ``role`` is
+    required only when it is ambiguous — a model with more than one required role
+    for that modality; a single role, or a single required role (e.g. i2v
+    first_frame), is inferred.
+    """
+
+    content: str = Field(
+        description="The reference payload, in the form declared by ``format``."
+    )
+    format: Literal["path", "url", "base64"] = Field(description=(
+        "Wire form of ``content``: ``path`` (a file readable by the server; a "
+        "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
+        "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
+        "also accepted). Raw bytes reach the server as a multipart upload, "
+        "which carries no ``format`` of its own. Distinct from the top-level "
+        "``format``, which selects the *output* encoding."))
+    role: Optional[MediaRole] = Field(
+        default=None,
+        description="Which conditioning slot this reference fills. Required only "
+        "when the target model accepts this modality in more than one slot; omit "
+        "it when the model leaves no ambiguity.",
+    )
+
+
 class VideoGenerationRequest(OpenAIBaseModel):
     """Video generation request (extended API).
 
@@ -2034,14 +2065,46 @@ class VideoGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
+    image_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Image reference(s) conditioning generation (e.g. image-to-video "
+             "first frame). Send a ``{content, format, role}`` object or a list "
+             "of them, where ``format`` is ``path`` / ``url`` / ``base64``; or "
+             "upload a single image file via multipart, whose form is implied. "
+             "PNG or JPEG only — HEIF/AVIF are not supported."),
+        )
+    video_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Video reference(s) conditioning generation (video-to-video). Send "
+             "a ``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single video file "
+             "via multipart, whose form is implied. MP4 or AVI, with H.264 the "
+             "tested codec and others best-effort."),
+        )
+    audio_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Audio reference(s) conditioning generation. Send a "
+             "``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single audio "
+             "file via multipart, whose form is implied. Accepted only by "
+             "models that declare an audio reference slot."),
+        )
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description=(
-            "Optional image or video reference that guides generation. PNG or "
-            "JPEG images condition image-to-video; MP4 or AVI video conditions "
-            "video-to-video, with H.264 the tested codec and others "
-            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
-            "base64 bytes; multipart requests upload the file."),
+        description=
+        ("Deprecated. A single image or video reference, routed by content "
+         "signature to image-to-video or video-to-video. A JSON request carries "
+         "base64 bytes; a multipart request uploads the file. Kept for backward "
+         "compatibility; prefer the typed ``image_reference`` / "
+         "``video_reference`` fields, which take precedence — this field is "
+         "ignored whenever a typed ``image_reference`` or ``video_reference`` "
+         "is provided."),
     )
 
     # Resolution
@@ -2169,9 +2232,9 @@ class VideoJob(OpenAIBaseModel):
         description=
         "Server-side paths for n>1 (internal; excluded from the wire).")
     # exclude=True internal timings, never on the wire (status/list
-    # model_dump() stays status-only). ``request_started`` is a
-    # ``perf_counter()`` stamped at the POST handler; the background task
-    # computes ``total`` from it and stores the header timings
+    # model_dump() stays status-only). ``request_started`` carries the
+    # steady-clock ``server_arrival_time``; the background task computes
+    # ``total`` from it and stores the header timings
     # (``generation``/``denoise``/``total``) in ``timing_metrics`` so
     # ``/content`` emits the same Server-Timing header as the sync route.
     request_started: Optional[float] = Field(default=None, exclude=True)
@@ -2195,3 +2258,31 @@ class VideoJobList(OpenAIBaseModel):
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
 UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
+
+ProfileActivity = Literal["CPU", "GPU", "CUDA_PROFILER"]
+
+
+class StartProfileRequest(OpenAIBaseModel):
+    """Request body for the POST /start_profile endpoint."""
+    output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory where chrome traces are written. Defaults "
+        "to the TLLM_TORCH_PROFILER_DIR environment variable, "
+        "then /tmp.")
+    num_steps: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of iterations to profile. Must be >= 1 if "
+        "provided; if omitted, profiling runs until /stop_profile is "
+        "called. ``num_steps == 0`` is rejected because the profile "
+        "window would never close — the stop iteration would equal the "
+        "start iteration, profile_step() would discard the stop marker "
+        "as stale, and the window would run forever.")
+    start_step: NonNegativeInt = Field(
+        default=0,
+        description="Skip this many iterations before profiling begins. "
+        "Must be >= 0.")
+    activities: List[ProfileActivity] = Field(
+        default_factory=lambda: ["CPU", "GPU"],
+        description="Which activities to trace. Supported values: "
+        "'CPU', 'GPU', 'CUDA_PROFILER'. Unknown values are rejected at "
+        "schema validation time.")

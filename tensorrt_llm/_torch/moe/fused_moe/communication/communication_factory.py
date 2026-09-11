@@ -127,6 +127,12 @@ class CommunicationFactory:
         """
         # Extract parameters from model_config
         mapping = model_config.mapping
+        if mapping.has_cp_helix():
+            raise ValueError(
+                "MoE communication requires Helix context-parallel ranks to be "
+                "repurposed through Mapping.repurpose_helix_cp_to_tp() before "
+                "strategy selection"
+            )
         if hidden_size is None:
             hidden_size = model_config.pretrained_config.hidden_size
         act_dtype = model_config.torch_dtype

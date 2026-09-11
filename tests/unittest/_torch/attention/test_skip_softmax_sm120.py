@@ -29,8 +29,8 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 
@@ -75,13 +75,16 @@ def _run_context(
 ) -> tuple:
     """Build a TRTLLM attention layer + no-cache context metadata and run a
     packed-QKV causal prefill. Mirrors ``test_attention_no_cache``."""
-    AttentionCls = get_attention_backend("TRTLLM")
+    sparse_params = (
+        sparse_attention_config.to_sparse_params() if sparse_attention_config is not None else None
+    )
+    AttentionCls = get_attention_backend("TRTLLM", sparse_params=sparse_params)
     layer = AttentionCls(
         layer_idx=0,
         num_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv_heads,
-        sparse_attention_config=sparse_attention_config,
+        sparse_params=sparse_params,
     )
 
     metadata = AttentionCls.Metadata(

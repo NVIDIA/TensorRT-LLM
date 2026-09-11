@@ -295,17 +295,20 @@ def issue_dynamic_block_scaled_mma_tile(
                     _nvvm_raw.Tcgen05MMAScaleVecSize.X4,
                 }
             else:
+                # CUTLASS DSL 4.8 renamed the tcgen05.mma.block_scale operands
+                # and split Tcgen05MMAScaleVecSize into a 1X/2X/4X selector and
+                # Tcgen05MMABlockScale.
                 nvvm_args = {
-                    "mma_kind":
+                    "kind":
                     _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,
                     "cta_group":
                     _nvvm_raw.CTAGroupKind.CTA_2 if mma_tiler_mnk[0] == 256 else
                     _nvvm_raw.CTAGroupKind.CTA_1,
-                    "d":
+                    "matrix_d":
                     operand_d_ptr,
-                    "a":
+                    "matrix_a":
                     operand_a,
-                    "b":
+                    "matrix_b":
                     operand_b,
                     "idesc":
                     idesc.ir_value(),
@@ -315,7 +318,7 @@ def issue_dynamic_block_scaled_mma_tile(
                     operand_sfa_ptr,
                     "scale_b":
                     operand_sfb_ptr,
-                    "scale_vec_size":
-                    _nvvm_raw.Tcgen05MMAScaleVecSize.BLOCK16,
+                    "block_scale":
+                    _nvvm_raw.Tcgen05MMABlockScale.BLOCK16,
                 }
             nvvm.tcgen05_mma_block_scale(**nvvm_args)

@@ -31,10 +31,11 @@ rationale and high-level architecture diagrams, see the
 TensorRT LLM's sparse attention algorithms fall into two categories.
 
 - **Framework-level**: the algorithm runs a *prediction* step that emits
-  sparse indices, which are then consumed by a shared `AttentionOp` to
-  produce sparse KV cache updates and/or sparse attention computation.
-  Examples: **RocketKV** (page-level, MQA/GQA), **DSA** (token-level,
-  MLA).
+  sparse indices. A hook-based implementation can pass those indices to the
+  shared `AttentionOp`, while a dedicated backend can own prediction and
+  sparse computation end to end. Examples: **RocketKV** (token-level prompt
+  eviction plus page-level MHA/MQA/GQA decode selection), **DSA**
+  (token-level MLA), and **MiniMax-M3** (block-level GQA).
 - **Kernel-level**: sparsity is implemented entirely inside the
   attention kernel — there is no external prediction or gather step.
   The kernel decides what to skip from runtime values such as Softmax
@@ -55,7 +56,7 @@ Sparse attention has two configuration layers.
   VisualGen. They are the Python/YAML surface and may also merge data
   from checkpoint `config.json`.
 - **Lowered sparse params** live under
-  `tensorrt_llm/_torch/attention_backend/sparse/`. They are backend-owned
+  `tensorrt_llm/_torch/attention/backends/sparse/`. They are backend-owned
   runtime objects consumed by attention implementations and metadata
   builders.
 
@@ -87,22 +88,24 @@ params.
 Framework-level sparse attention primarily targets approaches that
 leverage **token/sequence sparsity** — for many queries only a small
 fraction of historical tokens meaningfully contribute to the output,
-and the framework exploits that in a GPU-friendly, structured way.
-The attention operator provides unified APIs for both **sparse
-computation** and **sparse KV cache**, so algorithm authors only need
-to identify the important query/key pairs; everything else (KV cache
-layout, kernel dispatch, page alignment) is handled by the framework.
+and the framework exploits that in a GPU-friendly, structured way. On
+the shared `AttentionOp` integration path, the operator provides APIs
+for both **sparse computation** and **sparse KV cache** and owns KV-cache
+layout conversion, kernel dispatch, and page alignment. An algorithm
+with a dedicated attention implementation can instead perform those
+steps in its backend while still using the common sparse config,
+metadata, cache-manager, and registry framework.
 
-It is built around three layers:
+The shared `AttentionOp` path is built around three layers:
 
 - **Prediction module** — generates `sparse_kv_indices` (which KV
   tokens to keep in cache) and `sparse_attn_indices` (which KV pages or
   tokens to attend to during compute).
 - **`AttentionOp`** — consumes those indices via pre/post kernels and
   drives the core attention kernels. The op already understands
-  page-level sparsity for MQA/GQA in the generation phase, token-level
-  sparsity for MLA in both phases, and token-level KV compression in
-  the context phase for MQA/GQA.
+  page-level sparsity for MHA/MQA/GQA in the generation phase,
+  token-level MQA/GQA and MLA sparsity in both phases, and token-level
+  KV compression in the context phase for MHA/MQA/GQA.
 - **Auxiliary memory subsystem** — manages any extra pools (KT cache,
   indexer K cache, …) alongside the main KV cache.
 
@@ -113,50 +116,86 @@ It is built around three layers:
 </div>
 <p align="center"><sub><em>Figure 1: Framework support for sparse attention in TensorRT LLM.</em></sub></p>
 
-Architecturally, each sparse attention algorithm subclasses the shared
-`AttentionBackend` and supplies its own `sparse_kv_predict` /
-`sparse_attn_predict` implementations. Different attention layers
-within a single model can use different backends, so a model can mix
-sparse attention strategies layer by layer. The shared `AttentionOp`
-performs the actual computation and is not modified by individual
-algorithms.
+Hook-based `TrtllmAttention` implementations supply `sparse_kv_predict` /
+`sparse_attn_predict` and reuse the shared `AttentionOp` stack. Algorithms that
+select whole KV blocks instead supply `block_sparse_attn_predict`; their routes
+bypass `AttentionOp` and run on the generic block-sparse FMHA described in the
+[feature guide](../features/sparse-attention.md#block-sparse-mha-mqa-gqa). RocketKV's
+`VanillaAttention` implementation instead uses per-request Python hooks. A
+dedicated backend can implement sparse computation directly; MiniMax-M3's
+default Triton backend follows this model. Different attention layers within a
+model can use different backends, so sparse strategies can be mixed layer by
+layer.
 
 The current capability matrix is:
 
 | Attention type | Context phase | Generation phase |
 |---|---|---|
-| MQA / MHA / GQA | sparse KV cache | sparse computation (page-level) |
+| MQA / GQA | sparse KV cache and sparse computation (token-level) | sparse computation (token- or page-level) |
+| MHA | sparse KV cache | sparse computation (page-level) |
 | MLA | sparse computation (token-level) | sparse computation (token-level) |
+| Block-sparse MHA / MQA / GQA | sparse computation (block-level, contiguous Q/K/V without a KV cache) | sparse computation (block-level, paged) |
 
-Context-phase sparse computation for MQA/GQA and dynamic generation-phase
-KV eviction are tracked as future work.
+Dynamic generation-phase KV eviction is tracked as future work.
 
 ### Prediction hooks
 
-`AttentionBackend` exposes two prediction methods that algorithm-specific
-subclasses override:
+`TrtllmAttention`-based sparse backends expose three prediction methods that
+algorithm-specific subclasses override:
 
 ```python
 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, forward_args)
 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(q, k, metadata, forward_args)
+block_sparse_inputs = self.block_sparse_attn_predict(q, k, v, metadata, forward_args)
 ```
 
-`hooks.py` writes these results to `SparseRuntimeParams`. SkipSoftmax writes
-its thresholds to the same runtime interface consumed by `AttentionOp`.
-`AttentionForwardArgs.sparse_backend_args` carries algorithm inputs from the
-module to the backend, while `sparse_runtime_params` carries lowered inputs
-from the backend to `AttentionOp`.
+`prepare_sparse_runtime_params` in `sparse/hooks.py` runs all three hooks once
+per call regardless of whether the backend carries `SparseParams`, applies the
+SkipSoftmax threshold schedule when the backend carries `SkipSoftmaxParams`,
+and returns a new per-call `SparseRuntimeParams` built from the caller's
+`AttentionForwardArgs.sparse_runtime_params` plus the hook results. The core
+forward assigns the returned carrier back to that field before FMHA dispatch.
+Backends that need runtime state outside the three hooks (DSA's auxiliary pool
+pointer, DeepSeek-V4's per-token KV lengths) write it into the caller's carrier
+before or inside their hooks, and `prepare_sparse_runtime_params` carries those
+fields over.
+`AttentionForwardArgs.sparse_backend_args` carries
+algorithm inputs from the module to the backend, while
+`AttentionForwardArgs.sparse_runtime_params` carries the complete lowered state
+from the backend through FMHA dispatch to `AttentionOp`.
+
+`SparseRuntimeParams.block_sparse_inputs` is the nested carrier for optional,
+algorithm-neutral `BlockSparseForwardInputs`. `Fmha.is_supported()` rejects a
+request that carries routes for every library that does not declare
+`supports_block_sparse_inputs`, so a dense kernel never silently ignores them;
+the selected block-sparse FMHA then validates and consumes the field. `AttentionForwardArgs` defaults
+the field to an empty `SparseRuntimeParams()`; the core forward always
+overwrites it with the carrier prepared for the current call.
+
+`block_sparse_attn_predict` runs even when the backend has no `SparseParams`.
+Its default implementation hands through
+`SparseBackendForwardArgs.block_sparse_inputs`, so an attention module that
+predicts routes before the core forward only needs to place the complete
+payload in `sparse_backend_args`. Algorithms that predict inside the backend
+override the hook, read `metadata` for the batch layout and `forward_args` for
+per-call state such as `timestep`, and return `None` for dense phases.
+
+The core contract owns this runtime transport and general block-sparse FMHA
+execution. Algorithm integrations own their prediction policy, effective Q/K/V
+preparation, and any post-processing around the normal core forward.
 
 Different KV heads are allowed to emit different sparse index sets; Q
 heads that map to the same KV head share the KV head's sparse pattern.
 
 Algorithm implementations live under
-`tensorrt_llm/_torch/attention_backend/sparse/`:
+`tensorrt_llm/_torch/attention/backends/sparse/`:
 
 - `rocket/` — RocketKV backend, metadata, cache manager, parameters, and kernels.
 - `dsa/` — DSA backend, indexer, metadata, cache manager, parameters, custom ops, and kernels.
 - `deepseek_v4/` — DeepSeek-V4 backend, indexer, metadata, cache manager,
   parameters, module hooks, and index conversion kernels.
+- `minimax_m3/` — MiniMax-M3 Triton and packaged block-sparse backends,
+  indexer implementations, metadata, and `KVCacheManagerV2` integration.
 - `skip_softmax/` — SkipSoftmax parameter parsing and runtime scheduler.
 - `hooks.py` — typed MLA/Attention module adapters and common backend
   prediction orchestration.
@@ -171,13 +210,17 @@ Algorithm implementations live under
 </div>
 <p align="center"><sub><em>Figure 2: Sparse attention operator workflow in TensorRT LLM.</em></sub></p>
 
-For MQA/GQA, the op runs `gatherKvPageOffsetsKernel` before the
-generation-phase attention kernel. It takes the (potentially unordered
-or finer-grained) sparse indices and maps them to ordered, page-aligned
-KV cache offsets, also producing an updated per-head effective KV
-length. The downstream attention kernel reads only those pages. Today
-MQA/GQA sparse computation is supported at **block (page) granularity**
-in the generation phase only.
+For page-sparse MHA/MQA/GQA, the op runs `gatherKvPageOffsetsKernel`
+before the generation-phase attention kernel. It takes the (potentially
+unordered or finer-grained) sparse indices and maps them to ordered,
+page-aligned KV cache offsets, also producing an updated per-head
+effective KV length. The downstream attention kernel reads only those
+pages.
+
+Token-sparse MQA/GQA uses physical KV-cache token indices directly. It
+supports packed context and generation computation, including a linear
+sequence of draft tokens. Query heads in the same KV group share the KV
+head's per-query token list.
 
 After context attention, `updateSparseKvCacheAfterFmha` post-processes
 the KV cache: it selects the important KV tokens and rewrites the
@@ -190,8 +233,9 @@ For sparse MLA, the kernel consumes token-level indices directly, so
 `gatherKvPageOffsetsKernel` is bypassed — both context and generation
 phases are supported at token granularity. The sparse MLA path
 currently expects **global** KV cache pool addresses with token-level
-offsets, not request-local logical positions. Sparse KV cache for MLA
-is not yet supported.
+offsets, not request-local logical positions. MLA does not support the shared
+`sparse_kv_indices` in-place compaction path. DeepSeek-V4's model-native
+compressed-history pools use a separate cache path.
 
 ### Auxiliary memory pools
 
@@ -215,9 +259,11 @@ still reuse blocks.
 
 ## Adding a new framework-level algorithm
 
-The four steps below cover what the runtime needs in order to dispatch a
-new algorithm end-to-end. The order matches the natural development
-flow — config first, then prediction, then memory, then registration.
+The four steps below describe the hook-based `AttentionOp` integration
+path. A dedicated backend reuses the configuration, auxiliary-memory,
+and registration steps but owns its prediction and sparse computation
+contracts. The order matches the natural development flow — config
+first, then prediction, then memory, then registration.
 
 ### 1. Configuration class
 
@@ -237,10 +283,11 @@ the bottom of the file.
 
 ### 2. Prediction module
 
-Create a new backend class inheriting from `TrtllmAttention` (or
-`VanillaAttention` if appropriate) in
-`tensorrt_llm/_torch/attention_backend/sparse/`. Override one or both
-prediction methods.
+Create a new backend class inheriting from `TrtllmAttention` in
+`tensorrt_llm/_torch/attention/backends/sparse/`. Override one or more of the
+three prediction methods. A `VanillaAttention` implementation instead overrides
+`_single_request_sparse_kv_predict` and
+`_single_request_sparse_attn_predict` with its per-request Python contract.
 
 **`sparse_kv_predict(self, q, k, metadata, forward_args)`**
 
@@ -258,17 +305,35 @@ prediction methods.
 
 **`sparse_attn_predict(self, q, k, metadata, forward_args)`**
 
-- **Behavior**: return the sparse indices used by the generation-phase
-  attention computation.
+- **Behavior**: return the sparse indices used by attention computation in
+  the context phase, generation phase, or both, as supported by the backend.
 - **Outputs**:
-  - `sparse_attn_indices`: shape `(nHeads, nBlocks)` — block indices on
-    the KV sequence dimension. Block size is set by the algorithm via
-    `sparse_attn_indices_block_size` (arbitrary value supported).
-  - `sparse_attn_offsets`: shape `(nBatch + 1)` — same semantics as
-    above.
-- **Constraint**: today only **page-level** granularity is supported
-  for MQA/GQA sparse computation, and the generation-phase path uses
-  TRTLLM-GEN kernels (NVIDIA Blackwell SM 100+).
+  - `sparse_attn_indices`: backend-specific sparse token or block indices.
+    Token-sparse MQA/GQA uses shape
+    `(nKvHeads, nQueryTokens, topK)` with physical KV-pool token indices
+    and no offsets. Page-sparse attention uses request-local block indices;
+    the algorithm declares their block size through
+    `sparse_attn_indices_block_size`.
+  - `sparse_attn_offsets`: optional and backend-specific. RocketKV uses
+    `(numGenerations + 1)` request boundaries for its flattened page
+    selections. Token-sparse MQA/GQA and DSA leave it unset. DeepSeek-V4
+    uses the field for secondary compressed-pool indices.
+- **Constraint**: token-sparse MQA/GQA and page-sparse MHA/MQA/GQA use
+  different index layouts. Match the selected kernel contract; do not
+  pass request-local block indices to the physical-token path.
+
+**`block_sparse_attn_predict(self, q, k, v, metadata, forward_args)`**
+
+- **Behavior**: return the `BlockSparseForwardInputs` consumed by the
+  general block-sparse FMHA, or `None` for a dense call.
+- **Outputs**: block geometry plus exactly one route representation
+  (BSR `block_indptr`/`block_indices` or a packed `exact_block_bits`
+  bitmask), optional K/V summaries for proxy routes, and optional
+  `kv_valid_bits` masking ragged KV tails.
+- **Default**: hands through `SparseBackendForwardArgs.block_sparse_inputs`,
+  so modules that predict before the core forward do not override it.
+  Override it to predict inside the backend from the flattened Q/K/V,
+  the batch layout in `metadata`, and per-call state in `forward_args`.
 
 Prediction is on the critical path and can dominate latency in
 low-latency scenarios. Plan for custom kernels (Triton or CUDA) rather
@@ -295,10 +360,10 @@ If the algorithm needs extra tensors beyond the main KV cache:
 
 ### 4. Registration and dispatch
 
-- Register the new config + backend in
-  `tensorrt_llm/_torch/attention_backend/sparse/registry.py` and
-  `tensorrt_llm/_torch/pyexecutor/_util.py` so the runtime routes
-  requests to your backend when the config is present.
+- Register the new config and backend in
+  `tensorrt_llm/_torch/attention/backends/sparse/registry.py`. Update executor
+  wiring only when the algorithm requires behavior beyond the registry's
+  generic dispatch.
 - If the algorithm customizes module-layer behavior, implement and register a
   concrete `MLASparseHooks` or `AttentionSparseHooks` adapter from the
   algorithm's `module.py`.
@@ -316,9 +381,10 @@ framework wiring is:
 - A new config subclass with its own `algorithm` discriminator.
 - A lowered `SparseParams` object that carries the resolved kernel
   settings.
-- A switch inside the attention backend (e.g.,
-  `_torch/attention_backend/trtllm_gen.py`) that reads the lowered params
-  and enables the kernel-side fast path.
+- A switch inside the attention backend, such as
+  `_torch/attention/backends/trtllm.py` or an implementation under
+  `_torch/attention/backends/fmha/`, that reads the lowered params and enables
+  the kernel-side fast path.
 
 Skip Softmax Attention follows this pattern — see the
 [BLASST tech blog](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)
@@ -326,8 +392,6 @@ for the kernel-side specifics.
 
 ## Roadmap
 
-- **Sparse computation in context phase for MQA/MHA/GQA** — extend
-  framework coverage to context-phase sparse compute.
 - **Dynamic eviction in generation phase** — exploring block-level
   eviction as a compromise that keeps KV cache flexibility manageable.
 - **Unified auxiliary memory management** — let custom auxiliary pools

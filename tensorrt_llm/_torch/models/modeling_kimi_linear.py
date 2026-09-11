@@ -107,20 +107,20 @@ from ..._utils import is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
+from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..moe.fused_moe import ConfigurableMoE, create_moe
-from ..moe.fused_moe.interface import _compute_ep_partition
+from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
-from ..utils import ActivationType, ActType_TrtllmGen
+from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -1067,7 +1067,7 @@ class KimiK3MoERuntime(nn.Module):
         model_config: ModelConfig,
         cfg,
         layer_idx: int,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1118,105 +1118,29 @@ class KimiK3MoERuntime(nn.Module):
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,
+            aux_stream_dict=aux_stream_dict,
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
+            activation=SiTuActivation(
+                gate_softcap=situ_beta,
+                linear_softcap=situ_linear_beta,
+            ),
+            # A MegaMoE request that silently degraded to CUTLASS would be
+            # benchmarked as if it were MegaMoE, and the decline is easy to
+            # trigger (EP-only, own token / top-k limits). Fail in the resolver
+            # instead, which reports the rejection trail.
+            allow_backend_degradation=routed_moe_model_config.moe_backend
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
         )
-        # trtllm-gen ships SiTu cubins for exactly one dtype combination
-        # (``Bmm_MxE4m3_MxE2m1MxE4m3`` = MXFP8 act x MXFP4 weight) and has no
-        # standalone SiTu activation kernel to fall back on, so a non-MXFP4
-        # routed-expert format cannot be served here. Fail with the fix rather
-        # than with a cubin lookup error deep inside the runner. Checked against
-        # the resolved backend, not the K3 architecture branch, because the
-        # generic FP8_BLOCK_SCALES fallback in ``resolve_moe_backend`` can also
-        # land on TRTLLM.
-        if (
-            routed_moe_model_config.moe_backend == "TRTLLM"
-            and routed_quant_config.quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8
-        ):
-            raise ValueError(
-                f"Kimi K3 routed experts are quantized as "
-                f"{routed_quant_config.quant_algo}, which the TRTLLM "
-                "(trtllm-gen) MoE backend cannot serve: its SiTu activation "
-                "exists only for W4A8_MXFP4_MXFP8. Set moe_config.backend to "
-                "CUTLASS or MEGAMOE_CUTEDSL."
-            )
+        self._check_trtllm_situ_quant(
+            routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
+        )
 
-        if routed_moe_model_config.moe_backend == "CUTLASS":
-            # Size the per-expert SiTU constants with the same ceil/floor
-            # partition the MoE backend uses for ``expert_size_per_partition``.
-            # A plain ``num_experts // ep_size`` is one element short on the
-            # first ``num_experts % ep_size`` ranks, which trips the
-            # ``swiglu_alpha must have num_experts_on_rank elements`` check in
-            # moeOp.cpp. K3's 384 experts divide evenly at EP8/EP16, so the
-            # mismatch is latent there but real for any uneven split.
-            local_num_experts, _, _ = _compute_ep_partition(
-                self.num_experts,
-                routed_moe_model_config.mapping.moe_ep_size,
-                routed_moe_model_config.mapping.moe_ep_rank,
-            )
-            device = torch.device("cuda", torch.cuda.current_device())
-            self.routed_situ_alpha = torch.full(
-                (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
-            )
-            self.routed_situ_beta = torch.full(
-                (local_num_experts,),
-                situ_linear_beta,
-                dtype=torch.float32,
-                device=device,
-            )
-            routed_moe_kwargs.update(
-                activation_type=ActivationType.SiTu,
-                swiglu_alpha=self.routed_situ_alpha,
-                swiglu_beta=self.routed_situ_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "TRTLLM":
-            routed_moe_kwargs.update(
-                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-                # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=situ_beta,
-                trtllm_gen_activation_beta=situ_linear_beta,
-            )
-        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            routed_moe_kwargs.update(
-                activation="situ",
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
-        # SiTU from the pretrained config in ``_resolve_activation_config``
-        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
-        # present), and ``create_moe`` currently rejects the explicit
-        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
-        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
-        # Unifying that plumbing is tracked in TRTLLM-15649.
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            from ..moe.fused_moe.mega_moe import MegaMoEDeepGemm
-
-            if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
-        if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
-            from ..moe.fused_moe.mega_moe import MegaMoECuteDsl
-
-            # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
-            # create_moe silently falls back when a backend declines the
-            # config, and for MegaMoE the decline is easy to trigger (it is
-            # EP-only and has its own token/top-k limits), so an explicit
-            # request that quietly became CUTLASS would be measured as if it
-            # were MegaMoE.
-            if not isinstance(self.routed_experts.backend, MegaMoECuteDsl):
-                raise RuntimeError(
-                    "Kimi K3 explicitly requested MEGAMOE_CUTEDSL, but the "
-                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
-                )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -1269,9 +1193,9 @@ class KimiK3MoERuntime(nn.Module):
         )
         # Side stream (+ fork/join events) for overlapping shared-expert
         # compute with the routed chain. Only engaged when multi-stream is
-        # active (CUDA graphs on) and aux_stream is set; otherwise both run in
-        # order on the default stream.
-        self.aux_stream = aux_stream
+        # active (CUDA graphs on); otherwise both run in order on the default
+        # stream.
+        self.shared_expert_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.routed_expert_down_proj = nn.Linear(
@@ -1346,6 +1270,44 @@ class KimiK3MoERuntime(nn.Module):
             _K3_DEFAULT_ROUTED_QUANT_ALGO,
         )
         return QuantConfig(quant_algo=_K3_DEFAULT_ROUTED_QUANT_ALGO)
+
+    @staticmethod
+    def _check_trtllm_situ_quant(moe_backend: str, quant_algo: Optional[QuantAlgo]) -> None:
+        """Reject a routed-expert format trtllm-gen has no fused SiTu cubin for.
+
+        trtllm-gen has fused SiTu FC1 cubins for two input formats and no
+        standalone SiTu activation kernel, so anything else has to die here
+        rather than in a cubin lookup deep inside the runner. Checked against
+        the resolved backend, not the K3 architecture branch, because the
+        generic FP8_BLOCK_SCALES fallback in ``resolve_moe_backend`` can also
+        land on TRTLLM.
+
+        The admitted set is read off the backend rather than restated here,
+        because restating it is what broke. This guard was written in #17865
+        when MXFP4 was the only fused SiTu drop; #17940 then added the NVFP4
+        (group-16 ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*``) cubins and updated
+        ``TRTLLMGenFusedMoE``'s set without touching this copy. For the week
+        in between, an NVFP4 K3 checkpoint could not start at all -- and not
+        only when TRTLLM was asked for by name, because
+        ``ModelConfig.resolve_moe_backend`` sends every K3 architecture to
+        TRTLLM, so the default AUTO configuration hit this raise too. The unit
+        tests did not catch it: they call ``create_moe`` directly and never
+        reach this guard, so the kernel path stayed green while the model path
+        was closed.
+
+        A staticmethod, not an inline block, so that the invariant is
+        reachable from a test without constructing the whole runtime.
+        """
+        situ_supported = TRTLLMGenFusedMoE.situ_supported_quant_algos()
+        if moe_backend != "TRTLLM" or quant_algo in situ_supported:
+            return
+        supported = ", ".join(sorted(algo.name for algo in situ_supported))
+        raise ValueError(
+            f"Kimi K3 routed experts are quantized as {quant_algo}, which the "
+            "TRTLLM (trtllm-gen) MoE backend cannot serve: fused SiTu cubins "
+            f"exist only for {supported}. Set moe_config.backend to CUTLASS "
+            "or MEGAMOE_CUTEDSL."
+        )
 
     @staticmethod
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
@@ -1468,7 +1430,7 @@ class KimiK3MoERuntime(nn.Module):
             lambda: self.shared_experts(identity),
             self.moe_main_event,
             self.moe_shared_event,
-            self.aux_stream,
+            self.shared_expert_stream,
             disable_on_compile=True,
         )
         if self._use_combined_all_reduce:
@@ -1498,6 +1460,7 @@ class KimiMLARuntime(nn.Module):
         cfg: "PretrainedConfig",
         layer_idx: int,
         model_config: ModelConfig,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         mapping_with_cp: Optional[Mapping] = None,
     ) -> None:
         super().__init__()
@@ -1542,13 +1505,15 @@ class KimiMLARuntime(nn.Module):
             use_output_gate=cfg.mla_use_output_gate,
             max_position_embeddings=max_positions,
             model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
             mapping_with_cp=mapping_with_cp,
         )
 
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
-        out = self.mixer(hidden_states, attn_metadata)
+        # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
+        out = self.mixer(None, hidden_states, attn_metadata)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -1567,7 +1532,7 @@ class KimiLinearDecoderLayer(nn.Module):
         model_config: ModelConfig,
         cfg,
         layer_idx: int,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1585,7 +1550,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 layer_idx,
                 mapping=model_config.mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
-                aux_stream=aux_stream,
+                aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                model_config=model_config,
             )
         else:
             # Forward only the KV-cache quantization to the MLA attention
@@ -1606,6 +1572,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 cfg,
                 layer_idx,
                 model_config=mla_model_config,
+                aux_stream_dict=aux_stream_dict,
                 # CP original stashed by _setup_helix_mappings; None outside helix.
                 mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
             )
@@ -1616,7 +1583,7 @@ class KimiLinearDecoderLayer(nn.Module):
             and layer_idx % getattr(cfg, "moe_layer_freq", 1) == 0
         )
         if self.is_moe:
-            self.block_sparse_moe = KimiK3MoERuntime(model_config, cfg, layer_idx, aux_stream)
+            self.block_sparse_moe = KimiK3MoERuntime(model_config, cfg, layer_idx, aux_stream_dict)
         else:
             situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
             situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
@@ -1769,16 +1736,21 @@ class KimiLinearModel(DecoderModel):
         self._text_cfg = cfg
         dtype = torch.bfloat16
 
-        # One side stream shared across all layers. KDA overlaps its small
-        # forget-gate projection chain with qkvg during decode and verify;
-        # MoE overlaps shared-expert compute and its optional TP reduction
-        # with the routed dispatch/expert/combine chain.
-        self.aux_stream = torch.cuda.Stream()
+        # Attention and MoE phases are sequential, so their branch-overlap
+        # roles share one stream; MoE-internal overlap roles remain separate.
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        self.aux_stream_dict = {
+            AuxStreamType.Attention: aux_stream_list[0],
+            AuxStreamType.MoeShared: aux_stream_list[0],
+            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
+            AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
+        }
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
             [
-                KimiLinearDecoderLayer(model_config, cfg, layer_idx, self.aux_stream)
+                KimiLinearDecoderLayer(model_config, cfg, layer_idx, self.aux_stream_dict)
                 for layer_idx in range(cfg.num_hidden_layers)
             ]
         )
@@ -1809,13 +1781,6 @@ class KimiLinearModel(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
-
-        num_tokens = attn_metadata.num_tokens
-        assert hidden_states.shape[0] == num_tokens, (
-            f"Kimi K3 does not support padded batches "
-            f"(got {hidden_states.shape[0]} rows, metadata says {num_tokens} "
-            "tokens); disable CUDA graphs and the overlap scheduler."
-        )
 
         block_residual = hidden_states.new_empty(
             self.num_attn_res_snapshots,
@@ -1985,6 +1950,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     text backbone by the multimodal ``KimiK3ForConditionalGeneration`` wrapper
     (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
     architecture is registered by that wrapper, not here."""
+
+    mamba_metadata_cls = KimiK3MambaMetadata
 
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)

@@ -22,6 +22,12 @@ TensorRT LLM
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
 
+* [09/02] Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.md)
+
+* [08/20] Evaluating Agentic Serving with Trace Replay and Job-Level Metrics
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.md)
+
 * [07/17] DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md)
 
@@ -312,7 +318,9 @@ deployment, and not linked to users. The data we collect includes:
 - Ingress point (e.g., LLM API, CLI, serve command)
 - Deployment duration (via periodic heartbeats)
 - GPU SKUs, count, memory, and CUDA version
-- Model architecture class name (e.g., `LlamaForCausalLM`)
+- Public model architecture class name (e.g., `LlamaForCausalLM`); architectures
+  outside the checked-in public allowlist are sent only as a deterministic
+  SHA-256 hash, never as the original free-form name
 - Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
 - System information (OS platform, Python version, CPU architecture, CPU count)
 - TRT-LLM version and backend

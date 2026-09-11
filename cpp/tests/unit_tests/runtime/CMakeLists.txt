@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -15,24 +15,16 @@
 
 add_gtest(bufferManagerTest bufferManagerTest.cpp)
 add_gtest(cudaMemPoolTest cudaMemPoolTest.cpp)
-add_gtest(decodingLayerWorkspaceTest decodingLayerWorkspaceTest.cpp)
 add_gtest(gdrcopyTest gdrcopyTest.cpp)
-add_gtest(gptDecoderBatchedTest gptDecoderBatchedTest.cpp)
-add_gtest(gptDecoderTest gptDecoderTest.cpp)
 add_gtest(hostAccessibleDeviceAllocatorTest
           hostAccessibleDeviceAllocatorTest.cu)
 add_gtest(iBufferTest iBufferTest.cpp)
 add_gtest(ipcNvlsMemoryTest ipcNvlsMemoryTest.cpp)
 add_gtest(iTensorTest iTensorTest.cpp)
 add_gtest(loraCacheTest loraCacheTest.cpp)
-add_gtest(loraManagerTest loraManagerTest.cpp)
 add_gtest(loraUtilsTest loraUtilsTest.cpp)
-add_gtest(medusaModuleTest medusaModuleTest.cpp)
 add_gtest(moeLoadBalancerTest moeLoadBalancerTest.cpp)
 add_gtest(runtimeMpiUtilsTest mpiUtilsTest.cpp)
-add_gtest(runtimeKernelTest runtimeKernelTest.cpp)
-add_gtest(samplingConfigTest samplingConfigTest.cpp)
-add_gtest(samplingTest samplingTest.cpp)
 add_gtest(localizationTest localizationTest.cu)
 add_gtest(localityDomainPublicConfigTest localityDomainPublicConfigTest.cpp)
 add_gtest(sanitizerTest sanitizerTest.cpp)

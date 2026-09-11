@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::executor
 {
@@ -286,7 +285,7 @@ void SamplingConfig::setBeamWidthArray(OptVec<SizeType32> const& beamWidthArray)
 // Checkers
 SizeType32 SamplingConfig::checkBeamWidth(SizeType32 beamWidth)
 {
-    TLLM_CHECK(beamWidth > 0 && beamWidth <= static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidth));
+    TLLM_CHECK(beamWidth > 0 && beamWidth <= kMaxBeamWidth);
     return beamWidth;
 }
 
@@ -436,10 +435,10 @@ std::pair<OptVec<SizeType32> const&, SizeType32 const> const SamplingConfig::che
     if (beamWidthArray.has_value())
     {
         auto array = beamWidthArray.value();
-        TLLM_CHECK(array.size() <= static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength));
+        TLLM_CHECK(static_cast<SizeType32>(array.size()) <= kMaxBeamWidthArrayLength);
         for (auto const& bm : array)
         {
-            TLLM_CHECK(bm > 0 && bm < static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidth));
+            TLLM_CHECK(bm > 0 && bm < kMaxBeamWidth);
             maxBeamWidth = std::max(maxBeamWidth, bm);
         }
     }

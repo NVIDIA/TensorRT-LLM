@@ -1,110 +1,8 @@
-meta-llama/Meta-Llama-3-8B-Instruct:
-  - accuracy: 67.74
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 63.47
-meta-llama/Llama-3.1-8B:
-  - accuracy: 66.06
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 63.16
-  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
-    accuracy: 65.55
-  - quant_algo: MIXED_PRECISION
-    extra_acc_spec: autoq_format=int4_awq,fp8,w4a8_awq;auto_quantize_bits=5.8
-    accuracy: 64.99
-meta-llama/Llama-3.1-8B-Instruct:
-  - accuracy: 68.17
-  - spec_dec_algo: Eagle
-    accuracy: 68.20
-  - spec_dec_algo: Eagle3
-    accuracy: 68.20
-  - spec_dec_algo: NGram
-    accuracy: 68.17
-  - quant_algo: FP8
-    accuracy: 67.93
-  - quant_algo: FP8
-    extra_acc_spec: temperature=0.8,top_p=0.95
-    accuracy: 64.62
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 67.87
-  - quant_algo: FP8
-    kv_cache_quant_algo: NVFP4
-    accuracy: 66.45
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 65.11
-meta-llama/Llama-3.2-1B:
-  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
-    accuracy: 32.72
-  - quant_algo: W8A8_SQ_PER_CHANNEL
-    accuracy: 32.07
-  - quant_algo: W4A16_AWQ
-    accuracy: 30.56
-  - quant_algo: W4A16_AWQ
-    kv_cache_quant_algo: INT8
-    accuracy: 31.29
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 31.02
-  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
-    accuracy: 33.97
-  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
-    extra_acc_spec: meta_recipe
-    accuracy: 33.87
-  - extra_acc_spec: max_attention_window_size=960
-    accuracy: 32.82
-meta-llama/Llama-3.2-3B:
-  - accuracy: 57.92
-  - spec_dec_algo: Eagle3
-    accuracy: 57.92
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 60.60
-meta-llama/Llama-3.3-70B-Instruct:
-  - accuracy: 81.31
-  - spec_dec_algo: Eagle3
-    accuracy: 81.31
-  - quant_algo: FP8
-    spec_dec_algo: Eagle
-    accuracy: 81.31
-  - quant_algo: FP8
-    spec_dec_algo: Eagle3
-    accuracy: 81.31
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 78.78
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 80.40
-  - quant_algo: FP8
-    accuracy: 80.40
-meta-llama/Llama-4-Scout-17B-16E-Instruct:
-  - accuracy: 80.00
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 79.60
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 78.58
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 81.7
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 81.1
-google/gemma-2-9b-it:
-  - accuracy: 73.05
-google/gemma-3-1b-it:
-  - accuracy: 39.0
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 37.5
-google/gemma-3-27b-it:
-  - accuracy: 77.80
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 76.80
 google/gemma-4-26B-A4B-it:
   - accuracy: 71.296
 google/gemma-3n-E2B-it:
@@ -228,12 +126,20 @@ Qwen3/Qwen3-235B-A22B:
     accuracy: 85.5
 Qwen3/Qwen3-Next-80B-A3B-Instruct:
   - accuracy: 86.03
+Qwen/Qwen3.8-Flash-Next:
+  - accuracy: 87.82
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 87.91
+  - quant_algo: MIXED_PRECISION
+    accuracy: 87.50
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: MTP
+    accuracy: 87.57
 Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.0
-MiniMaxAI/MiniMax-M2:
-  - accuracy: 83.82
 MiniMaxAI/MiniMax-M3:
   - accuracy: 85
 MiniMaxAI/MiniMax-M3-MXFP8:
@@ -256,26 +162,7 @@ moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 89.67
-nvidia/Llama-3_3-Nemotron-Super-49B-v1:
-  - accuracy: 79.43
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 79.26
-nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
-  - accuracy: 57.97
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 57.12
-bigcode/starcoder2-7b:
-  - accuracy: 41.35
-  - quant_algo: FP8
-    accuracy: 41.35
 # TODO: update once https://nvbugs/5393849 is fixed.
-nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
-  - accuracy: 83.70
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 83.36
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 66.35
   - quant_algo: FP8

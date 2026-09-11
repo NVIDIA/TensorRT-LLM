@@ -72,6 +72,11 @@ class MoEExecutionContractMixin:
         """
         return False
 
+    @property
+    def uses_locality_domain(self) -> bool:
+        """True when this impl runs partitioned across locality domains."""
+        return False
+
     def validate_configurable_moe(self, moe: "torch.nn.Module") -> None:
         """Backend-specific validation hook called by ``ConfigurableMoE``.
 
