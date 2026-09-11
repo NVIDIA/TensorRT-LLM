@@ -186,7 +186,12 @@ def test_min_p_matches_reference(min_p):
 
 
 def test_min_p_one_keeps_only_the_argmax():
-    """min_p == 1.0 is documented explicit-greedy: only p == p_max survives."""
+    """min_p == 1.0 is documented explicit-greedy: only p == p_max survives.
+
+    Continuous logits never tie, so p_max is reached once and the support is a single
+    index. ``test_min_p_one_keeps_every_tied_maximum`` covers the case this cannot
+    reach.
+    """
     dev = "cuda"
     torch.manual_seed(0)
     logits = torch.randn(8, 4096, device=dev) * 3.0
@@ -198,6 +203,48 @@ def test_min_p_one_keeps_only_the_argmax():
         probs.max(-1).values, torch.ones(8, device=dev), atol=1e-5, rtol=1e-5
     )
     assert (probs > 0).sum(-1).max().item() == 1
+
+
+def test_min_p_one_keeps_every_tied_maximum():
+    """Tied maxima all survive min_p == 1.0; the filter is ``w >= minP``, not argmax.
+
+    The neighbouring random-logit test only ever observes one survivor because
+    continuous logits do not tie, so it cannot distinguish "keep p == p_max" from
+    "keep the single argmax". Exact ties separate them, and the documented filter
+    keeps every one of them with the mass split evenly.
+
+    Production never reaches this: the one-model path classifies min_p == 1.0 as
+    explicit greedy before the batch is scanned, so a tie is broken there rather than
+    here. This pins the contract for callers that invoke the op directly.
+    """
+    dev = "cuda"
+    rows, vocab, ties = 4, 1024, 3
+    torch.manual_seed(0)
+    logits = torch.randn(rows, vocab, device=dev) * 3.0
+    tie_idx = torch.stack([torch.randperm(vocab, device=dev)[:ties] for _ in range(rows)])
+    # One bit-identical value per tied slot, so the scaled logits cancel to exactly 0
+    # at every tie and each w comes out exactly 1.0.
+    logits.scatter_(1, tie_idx, logits.max().item() + 1.0)
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, min_p=1.0)
+
+    probs = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)
+
+    expected = torch.zeros_like(probs)
+    expected.scatter_(1, tie_idx, 1.0 / ties)
+    torch.testing.assert_close(probs, expected, atol=1e-5, rtol=1e-5)
+    assert torch.equal(
+        (probs > 0).sum(-1), torch.full((rows,), ties, device=dev, dtype=torch.int64)
+    )
+
+    # The token path must stay inside that support rather than collapsing to one index.
+    seen = torch.zeros(rows, vocab, device=dev, dtype=torch.bool)
+    for step in range(16):
+        seed, offset = _rng(rows, dev, offset=step)
+        tokens, _ = fused.fused_sample_from_logits_with_probs(
+            logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+        )
+        seen.scatter_(1, tokens.long().unsqueeze(-1), True)
+    assert not (seen & (expected == 0)).any(), "sampled a token outside the tie set"
 
 
 @pytest.mark.parametrize(
