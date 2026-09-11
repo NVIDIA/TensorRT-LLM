@@ -137,6 +137,56 @@ def test_cuda_graph_padding_dummy_slot_count_tracks_reachable_draft_lengths():
     assert _get_num_cuda_graph_padding_dummy_slots(repeated, 64) == 3
 
 
+def test_plain_v2_draft_reserves_every_persistent_dummy_slot() -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    class RecordingDraftKVCacheManagerV2(KVCacheManagerV2):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    pretrained_config = SimpleNamespace(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=2,
+        vocab_size=32000,
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=pretrained_config,
+        quant_config=None,
+    )
+    spec_config = MTPDecodingConfig(
+        max_draft_len=4,
+        draft_len_schedule={4: 4, 8: 2, 32: 1},
+    )
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingDraftKVCacheManagerV2,
+        mapping=Mapping(
+            world_size=1,
+            tp_size=1,
+            pp_size=1,
+            enable_attention_dp=True,
+        ),
+        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=32,
+        spec_config=spec_config,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=True,
+        is_disagg=True,
+    )
+
+    assert captured_kwargs["num_reserved_index_slots"] == 4
+
+
 def _hybrid_model_config():
     config = SimpleNamespace(
         architectures=["Qwen3_5MoeForCausalLM"],
