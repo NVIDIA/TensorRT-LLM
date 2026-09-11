@@ -92,6 +92,16 @@ def dflash_allocated_ctx_limit(
     negative placeholder to 0, i.e. another request's block. That is a silent
     cross-request write, not an out-of-range fault, so the room has to be left
     here rather than caught downstream.
+
+    How tight this is depends on the V2 backend, and only one of the two keeps
+    the information. ``copyBatchBlockOffsetsToDeviceKernel``
+    (kvCacheManagerV2Utils.cu) writes ``0`` for ``BAD_PAGE_INDEX``, so under the
+    default ``cpp`` backend every row counts full and this degenerates to the
+    block-table-width bound upstream already applied -- correct, just not
+    per-request. The ``python`` backend propagates ``BAD_PAGE_INDEX`` through
+    ``_copy_swa_block_offsets_with_scratch``, and there the bound is real.
+    Sized from the counts either way so the tight case needs no second code
+    path; do not read a per-request guarantee into it on ``cpp``.
     """
     return (block_counts * page_size - block_size).clamp(min=0)
 
@@ -287,8 +297,8 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_page_table = None
         self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
         self._ctx_block_indptr = None
-        # Pages the manager has actually handed this request, per batch row.
-        # Recovered from the negative placeholders before _refresh clamps them.
+        # Pages the manager handed this request, per batch row. Saturates at
+        # the table width on the default backend -- dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
         self._ctx_pool_idx = 0
         self._ctx_block_divisor = 1  # encoded offset -> raw pool block index
@@ -519,9 +529,8 @@ class DFlashWorker(SpecWorkerBase):
         # clone(): .to() is a no-op for an int64 source, and the in-place ops
         # below would then edit attn_metadata's own tensor.
         encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
-        # Count the placeholders BEFORE the clamp below erases them. Unlike the
-        # private arena, whose slots each owned a fixed page range, a write past
-        # a request's allocation lands in whatever block 0 belongs to.
+        # Before the clamp erases the placeholders. Informative only on the
+        # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
         self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
         decoded = encoded.clamp_(min=0).div_(self._ctx_block_divisor, rounding_mode="floor")
         self._ctx_block_tables[:num_seqs].copy_(decoded.to(torch.int32))
@@ -884,8 +893,8 @@ class DFlashWorker(SpecWorkerBase):
         offset = 0
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
-        # it has to fit that row's allocation as well as the arena's length.
-        # One sync for the whole loop, which already pays one per request.
+        # it must fit that row's allocation as well as the arena's length.
+        # One sync for a loop that already pays one per request.
         ctx_alloc = (
             (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
             if self._ctx_block_tables is not None
@@ -1355,11 +1364,9 @@ class DFlashWorker(SpecWorkerBase):
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
                 if self._ctx_block_tables is not None:
-                    # Bound by what the manager allocated for THIS request, not
-                    # by the table width: the masked entries below are still
-                    # written (fixed-size, for graph safety), and every page
-                    # past the allocation is a placeholder that _refresh clamped
-                    # to 0 -- i.e. another request's block.
+                    # Bound by what the manager handed THIS request: the masked
+                    # entries below are still written (fixed-size, for graph
+                    # safety) and a placeholder page resolves to another's.
                     gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
                     col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
                 else:
