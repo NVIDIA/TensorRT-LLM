@@ -274,7 +274,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         ) = self._schedule_loop(active_requests, inflight_request_ids)
 
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            self._emit_disagg_kv_pool_snapshot(active_requests, disagg_candidates)
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                self._emit_disagg_kv_pool_snapshot(active_requests, disagg_candidates)
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -299,7 +300,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
             return
 
-        try:
+        with disagg_diagnostics.suppress_diagnostic_errors():
             init_requests = sum(
                 request.is_disagg_generation_init_state for request in active_requests
             )
@@ -337,9 +338,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 pp_rank=mapping.pp_rank,
                 cp_rank=mapping.cp_rank,
             )
-        except Exception:
-            # Diagnostics must not affect scheduler progress.
-            return
 
     # ---- Main scheduling loop ----
 
@@ -758,29 +756,33 @@ class KVCacheV2Scheduler(RequestScheduler):
         # would also require draft KV transfer and history_length=prompt_len.
         prepared = self.kv_cache_manager.prepare_disagg_gen_init(req)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
-            capacity_tokens = getattr(kv_cache, "capacity", None)
-            history_tokens = getattr(kv_cache, "history_length", None)
-            capacity_block_equivalent = (
-                (capacity_tokens + self.tokens_per_block - 1) // self.tokens_per_block
-                if capacity_tokens is not None and self.tokens_per_block > 0
-                else None
-            )
-            disagg_diagnostics.emit_event(
-                "gen_kv_admission_result",
-                side="gen",
-                request_id=get_unique_rid(req),
-                local_request_id=req.py_request_id,
-                rank=self.kv_cache_manager.mapping.rank,
-                outcome="admitted" if prepared else "deferred",
-                reason=None if prepared else "kv_or_index_capacity",
-                prompt_tokens=req.prompt_len,
-                tokens_per_block=self.tokens_per_block,
-                cache_present=kv_cache is not None,
-                capacity_tokens=capacity_tokens,
-                history_tokens=history_tokens,
-                capacity_block_equivalent=capacity_block_equivalent,
-            )
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
+                capacity_tokens = getattr(kv_cache, "capacity", None)
+                history_tokens = getattr(kv_cache, "history_length", None)
+                capacity_block_equivalent = (
+                    (capacity_tokens + self.tokens_per_block - 1) // self.tokens_per_block
+                    if capacity_tokens is not None and self.tokens_per_block > 0
+                    else None
+                )
+                prompt_tokens = getattr(req, "total_input_len_cp", None)
+                if prompt_tokens is None:
+                    prompt_tokens = req.prompt_len
+                disagg_diagnostics.emit_event(
+                    "gen_kv_admission_result",
+                    side="gen",
+                    request_id=get_unique_rid(req),
+                    local_request_id=req.py_request_id,
+                    rank=self.kv_cache_manager.mapping.rank,
+                    outcome="admitted" if prepared else "deferred",
+                    reason=None if prepared else "kv_or_index_capacity",
+                    prompt_tokens=prompt_tokens,
+                    tokens_per_block=self.tokens_per_block,
+                    cache_present=kv_cache is not None,
+                    capacity_tokens=capacity_tokens,
+                    history_tokens=history_tokens,
+                    capacity_block_equivalent=capacity_block_equivalent,
+                )
         if not prepared:
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0

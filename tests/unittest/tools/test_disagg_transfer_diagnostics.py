@@ -99,6 +99,154 @@ def test_noisy_logs_are_counted_and_grouped_by_canonical_request() -> None:
     }
 
 
+def test_semantically_malformed_correlation_fields_are_quarantined() -> None:
+    lines = [
+        _event("ctx_transfer_queued", 1, 1, side="ctx", slice_id={}),
+        _event("ctx_transfer_queued", 2, 2, side="ctx", peer_rank=[]),
+        _event("ctx_transfer_queued", 3, 3, side="ctx", slice_id=True),
+        _event("ctx_transfer_queued", 4, 4, side="ctx", slice_id=0, peer_rank=1),
+    ]
+
+    result = analyze_lines(lines)
+
+    assert result["summary"] == {
+        "total_lines": 4,
+        "ignored_lines": 0,
+        "malformed_diagnostic_lines": 3,
+        "parsed_events": 1,
+        "events_without_request_id": 0,
+        "request_count": 1,
+    }
+    assert result["requests"][0]["request_id"] == 4
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        '{"event":"gen_ingress","request_id":NaN}',
+        '{"event":"gen_ingress","request_id":Infinity}',
+        '{"event":"gen_ingress","request_id":18446744073709551616}',
+        '{"event":"gen_ingress","request_id":' + "1" * 5_000 + "}",
+    ),
+)
+def test_non_finite_and_oversized_json_numbers_are_quarantined(payload: str) -> None:
+    result = analyze_lines([f"{DIAGNOSTICS_LOG_PREFIX}{payload}\n"])
+
+    assert result["summary"] == {
+        "total_lines": 1,
+        "ignored_lines": 0,
+        "malformed_diagnostic_lines": 1,
+        "parsed_events": 0,
+        "events_without_request_id": 0,
+        "request_count": 0,
+    }
+
+
+def test_excessively_nested_json_is_quarantined() -> None:
+    nested = "[" * 2_000 + "0" + "]" * 2_000
+    payload = f'{{"event":"gen_ingress","detail":{nested}}}'
+
+    result = analyze_lines([f"{DIAGNOSTICS_LOG_PREFIX}{payload}\n"])
+
+    assert result["summary"]["malformed_diagnostic_lines"] == 1
+    assert result["summary"]["parsed_events"] == 0
+
+
+@pytest.mark.parametrize("field", ("is_last_slice", "session_found"))
+def test_numeric_boolean_field_is_quarantined(field: str) -> None:
+    line = _event(
+        "gen_writer_result_received",
+        7,
+        1,
+        outcome="success",
+        **{field: 1},
+    )
+
+    result = analyze_lines([line])
+
+    assert result["summary"]["malformed_diagnostic_lines"] == 1
+    assert result["summary"]["parsed_events"] == 0
+
+
+@pytest.mark.parametrize("schema_version", (None, "1", True, 0, 2))
+def test_unsupported_schema_version_is_quarantined(schema_version: object) -> None:
+    line = _event("gen_ingress", 5, 1)
+    record = json.loads(line.split(DIAGNOSTICS_LOG_PREFIX, 1)[1])
+    if schema_version is None:
+        record.pop("schema_version")
+    else:
+        record["schema_version"] = schema_version
+
+    result = analyze_lines([f"{DIAGNOSTICS_LOG_PREFIX}{json.dumps(record)}\n"])
+
+    assert result["summary"]["malformed_diagnostic_lines"] == 1
+    assert result["summary"]["parsed_events"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("pid", -5),
+        ("slice_id", -1),
+        ("rank", "0"),
+        ("source_kv_reuse_block_count", True),
+        ("outcome", 7),
+        ("elapsed_ms", -0.5),
+        ("elapsed_ms", int("9" * 400)),
+        ("monotonic_ns", 1 << 63),
+    ),
+)
+def test_invalid_known_field_is_quarantined(field: str, value: object) -> None:
+    line = _event("ctx_transfer_settled", 5, 1, side="ctx", outcome="completed")
+    record = json.loads(line.split(DIAGNOSTICS_LOG_PREFIX, 1)[1])
+    record[field] = value
+
+    result = analyze_lines([f"{DIAGNOSTICS_LOG_PREFIX}{json.dumps(record)}\n"])
+
+    assert result["summary"]["malformed_diagnostic_lines"] == 1
+    assert result["summary"]["parsed_events"] == 0
+
+
+def test_missing_fanout_correlation_is_unmeasured() -> None:
+    result = analyze_lines(
+        [
+            _event("ctx_transfer_queued", 6, 1, side="ctx"),
+            _event("ctx_worker_dequeued", 6, 2, side="ctx"),
+        ]
+    )
+
+    request = _request(result, 6)
+    assert all(duration["phase"] != "ctx_worker_queue_wait" for duration in request["durations"])
+    assert any(
+        phase["phase"] == "ctx_worker_queue_wait" and phase["reason"] == "invalid_clock_metadata"
+        for phase in request["unmeasured_phases"]
+    )
+
+
+def test_single_pair_invalid_metadata_is_reported_once() -> None:
+    result = analyze_lines(
+        [
+            _event("gen_request_data_sent", 8, 1),
+            _event("gen_writer_result_received", 8, 2, outcome="success"),
+        ]
+    )
+
+    invalid = [
+        phase
+        for phase in _request(result, 8)["unmeasured_phases"]
+        if phase["phase"] == "gen_writer_first_response"
+        and phase["reason"] == "invalid_clock_metadata"
+    ]
+    assert invalid == [
+        {
+            "phase": "gen_writer_first_response",
+            "reason": "invalid_clock_metadata",
+            "start_count": 1,
+            "end_count": 1,
+        }
+    ]
+
+
 def test_aggregate_kv_pool_snapshots_keep_headroom_fields() -> None:
     result = analyze_lines(
         [
@@ -151,9 +299,31 @@ def test_aggregate_kv_pool_snapshots_keep_headroom_fields() -> None:
 def test_gen_transfer_settled_uses_the_next_same_rank_scheduler_decision() -> None:
     result = analyze_lines(
         [
-            _event("gen_transfer_settled", 70, 10_000_000, rank=0, outcome="completed"),
+            _event(
+                "gen_transfer_settled",
+                70,
+                10_000_000,
+                rank=0,
+                outcome="completed",
+                resources_drained=True,
+            ),
             _event("gen_kv_pool_snapshot", None, 16_000_000, rank=0),
-            _event("gen_transfer_settled", 71, 20_000_000, rank=0, outcome="completed"),
+            _event(
+                "gen_transfer_settled",
+                71,
+                20_000_000,
+                rank=0,
+                outcome="completed",
+                resources_drained=True,
+            ),
+            _event(
+                "gen_transfer_settled",
+                72,
+                21_000_000,
+                rank=0,
+                outcome="failed",
+                resources_drained=False,
+            ),
             _event("gen_kv_pool_snapshot", None, 25_000_000, rank=1),
         ]
     )
@@ -320,6 +490,24 @@ def test_fanout_boundaries_are_correlated_by_slice_and_peer() -> None:
     assert by_peer == {0: 3.0, 1: 5.0}
 
 
+def test_writer_timeline_preserves_late_session_evidence() -> None:
+    result = analyze_lines(
+        [
+            _event(
+                "gen_writer_result_received",
+                43,
+                4_000_000,
+                slice_id=0,
+                peer_rank=2,
+                session_found=False,
+            ),
+        ]
+    )
+
+    timeline = _request(result, 43)["timeline"]
+    assert timeline[0]["session_found"] is False
+
+
 def test_writer_first_response_reports_an_unmatched_fanout_peer() -> None:
     result = analyze_lines(
         [
@@ -427,10 +615,47 @@ def test_failed_writer_result_does_not_expect_destination_completion() -> None:
     assert all(duration["phase"] != "gen_destination_drain" for duration in request["durations"])
 
 
+def test_mixed_writer_results_do_not_expect_destination_completion() -> None:
+    result = analyze_lines(
+        [
+            _event("gen_request_data_sent", 57, 1_000_000, slice_id=0, peer_rank=3),
+            _event("gen_request_data_sent", 57, 1_500_000, slice_id=0, peer_rank=4),
+            _event(
+                "gen_writer_result_received",
+                57,
+                4_000_000,
+                slice_id=0,
+                peer_rank=3,
+                outcome="success",
+                is_last_slice=True,
+            ),
+            _event(
+                "gen_writer_result_received",
+                57,
+                5_000_000,
+                slice_id=0,
+                peer_rank=4,
+                outcome="failed",
+                is_last_slice=True,
+            ),
+        ]
+    )
+
+    request = _request(result, 57)
+    assert "gen_destination_complete" not in request["missing_boundaries"]
+    assert all(duration["phase"] != "gen_destination_drain" for duration in request["durations"])
+
+
 def test_timeout_phases_use_the_endpoint_local_monotonic_clock() -> None:
     result = analyze_lines(
         [
-            _event("ctx_send_ready", 77, 1_000_000, side="ctx"),
+            _event(
+                "ctx_send_ready",
+                77,
+                1_000_000,
+                side="ctx",
+                timeout_expected=True,
+            ),
             _event(
                 "transfer_timeout_started",
                 77,
@@ -467,6 +692,54 @@ def test_timeout_phases_use_the_endpoint_local_monotonic_clock() -> None:
     assert timeout_start["state"] == "DISAGG_CONTEXT_TRANS_IN_PROGRESS"
 
 
+def test_healthy_or_inapplicable_timeout_phases_are_not_reported_missing() -> None:
+    result = analyze_lines(
+        [
+            _event(
+                "ctx_send_ready",
+                78,
+                1_000_000,
+                side="ctx",
+                timeout_expected=True,
+            ),
+            _event(
+                "transfer_timeout_started",
+                78,
+                2_000_000,
+                side="ctx",
+                timeout_owner="pyexecutor",
+            ),
+            _event(
+                "gen_receive_start",
+                79,
+                3_000_000,
+                timeout_expected=False,
+            ),
+            _event(
+                "ctx_send_ready",
+                80,
+                4_000_000,
+                side="ctx",
+                timeout_expected=False,
+            ),
+        ]
+    )
+
+    healthy = _request(result, 78)
+    assert all(
+        phase["phase"] != "transfer_timeout_window" for phase in healthy["unmeasured_phases"]
+    )
+    sync_gen = _request(result, 79)
+    assert all(
+        phase["phase"] != "gen_receive_to_timeout_start" for phase in sync_gen["unmeasured_phases"]
+    )
+    timeout_disabled_ctx = _request(result, 80)
+    assert all(
+        phase["phase"] != "ctx_send_to_timeout_start"
+        for phase in timeout_disabled_ctx["unmeasured_phases"]
+    )
+
+
 def test_ctx_worker_queue_wait_is_correlated_per_slice_and_peer() -> None:
     result = analyze_lines(
         [
@@ -489,6 +762,14 @@ def test_ctx_worker_queue_wait_is_correlated_per_slice_and_peer() -> None:
                 peer_rank=1,
                 receiver_slice_id=2,
                 is_last_slice=True,
+            ),
+            _event(
+                "ctx_worker_dequeued",
+                88,
+                7_000_000,
+                side="ctx",
+                slice_id=1,
+                peer_rank=0,
             ),
             _event(
                 "ctx_backend_submit_start",
@@ -523,8 +804,15 @@ def test_ctx_worker_queue_wait_is_correlated_per_slice_and_peer() -> None:
         for duration in request["durations"]
         if duration["phase"] == "ctx_worker_queue_wait"
     )
-    assert queue_wait["duration_ms"] == 9.0
+    assert queue_wait["duration_ms"] == 5.0
     assert queue_wait["correlation"] == {"slice_id": 1, "peer_rank": 0}
+    preparation = next(
+        duration
+        for duration in request["durations"]
+        if duration["phase"] == "ctx_worker_preparation"
+    )
+    assert preparation["duration_ms"] == 4.0
+    assert preparation["correlation"] == {"slice_id": 1, "peer_rank": 0}
     assert {
         "phase": "ctx_worker_queue_wait",
         "reason": "missing_end",
