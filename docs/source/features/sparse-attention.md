@@ -148,6 +148,53 @@ Backend developers can use
 [`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
 as an executable integration example.
 
+<a id="block-sparse-mha-mqa-gqa"></a>
+
+### Block-sparse MHA/MQA/GQA
+
+The generic block-sparse path executes attention over KV blocks that a sparse
+algorithm selects for each KV head. The algorithm hands its routes to the core
+forward through the `block_sparse_attn_predict` hook as
+`BlockSparseForwardInputs`: canonical BSR (`block_indptr` plus `block_indices`)
+or a packed block bitmask, optionally with K/V block summaries so unselected
+blocks contribute a proxy instead of being dropped. Only the block-sparse FMHA
+library declares `supports_block_sparse_inputs`, so a request that carries
+routes is never served by a dense kernel. Both the contiguous prefill path,
+used by diffusion models that keep no KV cache, and the paged generation path
+are provided by the vendored PrimTS kernels.
+
+This is an attention capability, not a standalone public
+`SparseAttentionConfig` algorithm. A user-facing algorithm must also provide
+the selector, metadata, and backend integration.
+
+| Parameter | Contiguous prefill | Paged generation |
+|---|---|---|
+| GPU architecture | SM100 and SM103 | SM100 and SM103 |
+| Compute phase | Prefill with separate Q/K/V and no KV cache | Generation with a fixed per-request query length |
+| Attention type | MHA, MQA, and GQA | MHA, MQA, and GQA |
+| Head counts | Q heads must be divisible by KV heads; no other discrete limit | Q heads must be divisible by KV heads; no other discrete limit |
+| Q heads per KV head | Any divisor of the Q head count | Any divisor of the Q head count |
+| Head dimensions | Q/K/V: `128` | Q/K/V: `128` |
+| Input dtype | BF16 or FP16 | BF16 or FP16 |
+| Input layout | Separate Q `[tokens, q_heads, 128]` and K/V `[tokens, kv_heads, 128]` | Fused QKV |
+| Output dtype | Model dtype | Model dtype |
+| KV-cache dtype | No KV cache | Model dtype |
+| KV-cache layout | No KV cache | Paged HND cache; page size `64` or `128` |
+| Sparse granularity | Q blocks of `q_block_size` tokens by KV blocks of `8`, `16`, `32`, or a positive multiple of `64` tokens, selected per KV head | KV blocks of a positive multiple of `64` tokens, selected per KV head |
+| Sparse routes | BSR or packed bitmask; optional K/V block summaries (proxy routes); optional packed `kv_valid_bits` for ragged KV tails | BSR; live per-request KV lengths and page tables |
+| Attention semantics | Dense or causal self-attention; proxy routes require dense | Causal self-attention |
+
+Routes are validated against the kernel's static profile on every call, and an
+unsupported request raises instead of degrading to dense attention. A paged
+request needs a page that holds at least one 64-token route fragment, which is
+why page sizes below `64` are rejected.
+
+Backend developers can use
+[`test_prims_ts_block_sparse.py`](../../../tests/unittest/_torch/attention/sparse/test_prims_ts_block_sparse.py)
+as an executable integration example; it covers MHA, GQA, and MQA head
+topologies, both model dtypes, KV block sizes `64` and `128`, page sizes `64`
+and `128`, proxy routes, token-validity masks, and CUDA Graph replay.
+
 <a id="framework-level-sparse-attention"></a>
 
 ## Supported Algorithms

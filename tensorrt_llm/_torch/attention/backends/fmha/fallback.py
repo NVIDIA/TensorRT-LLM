@@ -40,10 +40,11 @@ if TYPE_CHECKING:
 _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
     {
         "sparse_backend_args",  # consumed by sparse prediction before the attention op
+        "block_sparse_inputs",  # consumed by the selected block-sparse FMHA
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
-        "timestep",  # used to populate skip-softmax params in ``TrtllmAttention.forward``
+        "timestep",  # consumed by sparse prediction before FMHA dispatch
     }
 )
 
@@ -81,9 +82,11 @@ class FallbackFmha(Fmha):
         del k, v, phase
         if q is not None and q.dtype == torch.float8_e4m3fn:
             return False
-        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
-            forward_args.update_kv_cache or metadata.is_cross
-        )
+        if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
+            return False
+        if not forward_args.update_kv_cache and not metadata.is_cross:
+            return False
+        return True
 
     def forward(
         self,
@@ -218,7 +221,7 @@ class FallbackFmha(Fmha):
                 forward_args.sparse_runtime_params.sparse_attn_indices_block_size
             ),
             sparse_attn_kv_lens=forward_args.sparse_runtime_params.sparse_attn_kv_lens,
-            aux_kv_cache_pool_ptr=(forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr),
+            aux_kv_cache_pool_ptr=forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr,
             skip_softmax_threshold_scale_factor_prefill=(
                 forward_args.sparse_runtime_params.threshold_scale_factor_prefill
             ),
