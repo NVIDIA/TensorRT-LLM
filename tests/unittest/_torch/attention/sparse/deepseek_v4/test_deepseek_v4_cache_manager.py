@@ -488,6 +488,19 @@ class TestDeepseekV4CacheManager:
                     dtype=binding_to_torch_dtype(dtype),
                     compressor_dtype=binding_to_torch_dtype(DataType.FLOAT),
                 )
+                expected_csa, _ = expected[0, DeepseekV4AttentionType.COMPRESS]
+                nope_values = torch.linspace(
+                    -1.0,
+                    1.0,
+                    448,
+                    dtype=torch.float32,
+                    device=expected_csa.device,
+                ).expand(expected_csa.size(0), -1)
+                if dtype == DataType.FP8:
+                    nope_values = nope_values.to(torch.float8_e4m3fn).view(torch.uint8)
+                else:
+                    nope_values = nope_values.to(expected_csa.dtype)
+                expected_csa[:, :448] = nope_values
                 assert cache_manager.prepare_context(first)
                 assert cache_manager.resize_context(first, first.context_chunk_size)
                 self._write_request_prefill(first, prompt_len, cache_manager, expected)
@@ -533,6 +546,18 @@ class TestDeepseekV4CacheManager:
                 )
                 expected_csa, _ = expected[0, DeepseekV4AttentionType.COMPRESS]
                 actual_csa, _ = actual[0, DeepseekV4AttentionType.COMPRESS]
+                expected_nope = expected_csa[:, :448]
+                actual_nope = actual_csa[:, :448]
+                assert not torch.equal(actual_nope, expected_nope)
+                if dtype == DataType.FP8:
+                    expected_nope = expected_nope.view(torch.float8_e4m3fn)
+                    actual_nope = actual_nope.view(torch.float8_e4m3fn)
+                torch.testing.assert_close(
+                    actual_nope.float(),
+                    expected_nope.float(),
+                    rtol=0.25,
+                    atol=0.02,
+                )
                 assert torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
 
                 expected_indexer = expected[0, DeepseekV4AttentionType.INDEXER_COMPRESS]
