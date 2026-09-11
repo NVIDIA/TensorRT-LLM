@@ -41,7 +41,7 @@ CBTS = THIS.parent.parent
 sys.path.insert(0, str(CBTS))
 sys.path.insert(0, str(CBTS / "coverage_selection"))
 
-from qualname_map import qualnames_for_lines  # noqa: E402
+from python_change_analysis import qualnames_for_lines  # noqa: E402
 from rules._helpers import iter_diff_post_line_numbers  # noqa: E402
 from selector import CoverageSelector  # noqa: E402
 from touch_db import TouchDB, canon, stage_family  # noqa: E402
