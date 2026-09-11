@@ -68,6 +68,7 @@ class DSAMetadataParams(SparseMetadataParams):
     mtp_index_share: bool = False
     use_self_sampling_topk: bool = True
     use_gvr_emission: bool = False
+    use_gvr_prescore: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,9 @@ class DSAParams(SparseParams):
     # Emission block-skip for the temporal-hint engine; only meaningful with
     # enable_heuristic_topk=True and use_self_sampling_topk=False on FP4.
     use_gvr_emission: bool = False
+    # Prescore tier on top of emission (FP4 only): sound seed lines from
+    # re-scoring the previous step's top-k, single-band candidate list.
+    use_gvr_prescore: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True

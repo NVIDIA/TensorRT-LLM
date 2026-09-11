@@ -227,6 +227,26 @@ def test_use_gvr_emission_defaults_off():
     assert sparse_config.to_sparse_metadata_params().use_gvr_emission is False
 
 
+@pytest.mark.parametrize("use_gvr_prescore", [False, True])
+def test_use_gvr_prescore_threads_to_params(use_gvr_prescore):
+    """The prescore-tier flag threads from the sparse-attention config into both
+    DSAParams and DSAMetadataParams and defaults off; the runtime indexer gate
+    additionally requires use_gvr_emission (temporal-hint path, FP4, paged-MQA)."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=128,
+        index_topk=512,
+        indexer_k_dtype="fp4",
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=False,
+        use_gvr_emission=True,
+        use_gvr_prescore=use_gvr_prescore,
+    )
+    assert sparse_config.to_sparse_params().use_gvr_prescore is use_gvr_prescore
+    assert sparse_config.to_sparse_metadata_params().use_gvr_prescore is use_gvr_prescore
+    assert DeepSeekV4SparseAttentionConfig(index_topk=512).use_gvr_prescore is False
+
+
 @pytest.mark.parametrize(
     "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,should_warmup",
     [
@@ -1305,7 +1325,7 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         cache_manager.shutdown()
 
 
-def create_indexer(sparse_attn_config, layer_idx=0):
+def create_indexer(sparse_attn_config, layer_idx=0, compress_ratio=1):
     """Helper to create an Indexer for testing."""
     # Create RopeParams
     rope_params = RopeParams(
@@ -1349,6 +1369,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             sparse_params=sparse_params,
             dtype=torch.bfloat16,
             layer_idx=layer_idx,
+            compress_ratio=compress_ratio,
         )
 
     return indexer
@@ -4734,3 +4755,216 @@ def test_topk_indices_buffer_cuda_graph():
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size,compress_ratio", [(2, 1), (16, 1), (2, 4), (8, 4)])
+def test_indexer_decode_gvr_prescore_chained_fp4(batch_size, compress_ratio):
+    """Chained-decode glue test for the GVR prescore tier on the FP4 indexer cache.
+
+    use_gvr_emission + use_gvr_prescore route the decode step through the
+    block-scaled prescore kernel (sound seed lines from re-scoring the prior plus
+    the newest positions on the current query), the FP4 emitter's single-band
+    candidate list and the list consumer, whose epilogue mirrors its indices and
+    neighbour flags into the caller-owned prior. Engine-static compressed length
+    >= PRESCORE_LIST_MIN_N plans the list tier (the cr=4 case sits in the band
+    only the prescore opens). Every step is checked value-exactly against the
+    FP4 logits reference.
+    """
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_emission import (
+        LIST_SEG_A,
+        LIST_WIDTH,
+    )
+
+    torch.manual_seed(7)
+    random.seed(7)
+
+    heads, head_dim = 64, 128
+    pe_dim = head_dim // 2
+    # compress_ratio 4 (DeepSeek-V4): lengths below are raw tokens, the indexer
+    # sees // 4 compressed positions
+    block_size = 64 if compress_ratio == 1 else 128
+    index_topk = 1024
+    steps = 4
+    kv0 = 65664 if compress_ratio == 1 else 4 * 32832
+    max_model_len = kv0 + 4 * steps + 1024
+    layer_idx = 0
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1,
+        index_topk=index_topk,
+        indexer_k_dtype="fp4",
+    )
+    sparse_attn_config.index_n_heads = heads
+    sparse_attn_config.use_cute_dsl_topk = True
+    sparse_attn_config.use_cute_dsl_paged_mqa_logits = True
+    # the GVR (heuristic) decode Top-K is the emission consumer
+    sparse_attn_config.enable_heuristic_topk = True
+    # temporal-hint engine with the prescore tier (the self-sampling default
+    # keeps no cross-step state and never arms emission)
+    sparse_attn_config.use_self_sampling_topk = False
+    sparse_attn_config.use_gvr_emission = True
+    sparse_attn_config.use_gvr_prescore = True
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx, compress_ratio=compress_ratio)
+    if not (indexer.use_cute_dsl_topk and indexer.use_cute_dsl_paged_mqa_logits):
+        pytest.skip("CuTe DSL not available")
+    assert indexer.use_gvr_emission and indexer.use_gvr_prescore
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), kv0, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=(kv_lens + steps).tolist(),
+        is_gen=False,
+        prepare_resource=True,
+    )
+    local_layer = cache_manager.layer_offsets[layer_idx]
+    # caller-owned GVR prior (metadata-resident in the engine): one buffer
+    # carried across the per-step metadata objects below
+    prior = torch.zeros(
+        (cache_manager.num_local_layers, batch_size, index_topk), device="cuda", dtype=torch.int32
+    )
+
+    total_context_tokens = kv_lens.sum().item()
+    k_context_bf16 = torch.randn(
+        (total_context_tokens // compress_ratio, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k_context_fp4, k_context_scale = torch.ops.trtllm.fused_cat_fp4(
+        k_context_bf16[:, :pe_dim].contiguous(), k_context_bf16[:, pe_dim:].contiguous()
+    )
+    metadata_context = _create_mock_metadata(
+        request_ids=request_ids,
+        batch_size=batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=kv_lens.clone(),
+        kv_lens=kv_lens.clone(),
+        num_cached_tokens=[0] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=total_context_tokens,
+        num_tokens=total_context_tokens,
+        index_topk=index_topk,
+        indexer_head_dim=head_dim,
+        compress_ratio=compress_ratio,
+    )
+    Indexer.prepare(metadata_context)
+    indexer._update_k_cache(k_context_fp4, k_context_scale, metadata_context)
+
+    # correlated per-step queries: high prev->cur top-k overlap so warm
+    # steps have a tight sound bound and admit through the list
+    q_base = torch.randn((batch_size, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    w_base = torch.randn((batch_size, heads), device="cuda", dtype=torch.float32)
+    hidden_states = torch.randn((batch_size, 4096), device="cuda", dtype=torch.bfloat16)
+    seq_lens = torch.ones((batch_size,), dtype=torch.int32)
+    cur_lens = kv_lens.clone()
+
+    def make_meta(lens):
+        m = _create_mock_metadata(
+            request_ids=request_ids,
+            batch_size=batch_size,
+            num_contexts=0,
+            num_generations=batch_size,
+            seq_lens=seq_lens.clone(),
+            kv_lens=lens.clone(),
+            num_cached_tokens=(lens - 1).tolist(),
+            cache_manager=cache_manager,
+            num_ctx_tokens=0,
+            num_tokens=batch_size,
+            index_topk=index_topk,
+            indexer_head_dim=head_dim,
+            use_cute_dsl_paged_mqa_logits=True,
+            compress_ratio=compress_ratio,
+        )
+        m.max_num_sequences = batch_size
+        m.gvr_prior_indices = prior
+        for name, val in (
+            ("kv_lens_row_reorder", None),
+            ("in_mtp_draft_loop", False),
+            ("indexer_skip_topk", False),
+            ("shared_topk_indices", None),
+            ("cuda_graph_buffers", None),
+        ):
+            if not hasattr(m, name):
+                setattr(m, name, val)
+        Indexer.prepare(m)
+        return m
+
+    for step in range(steps):
+        cur_lens += compress_ratio  # one new compressed position per step
+        torch.manual_seed(100 + step)
+        q_bf16 = (q_base + 0.15 * torch.randn_like(q_base)).view(-1, head_dim)
+        q_fp4_flat, q_scale_flat = torch.ops.trtllm.fused_cat_fp4(
+            q_bf16[:, :pe_dim].contiguous(), q_bf16[:, pe_dim:].contiguous()
+        )
+        q_fp4 = q_fp4_flat.view(batch_size, heads, pe_dim)
+        q_scale = q_scale_flat.view(batch_size, heads, 1)
+        w = w_base + 0.15 * torch.randn_like(w_base)
+        k_new_bf16 = torch.randn((batch_size, head_dim), device="cuda", dtype=torch.bfloat16)
+        k_fp4, k_scale = torch.ops.trtllm.fused_cat_fp4(
+            k_new_bf16[:, :pe_dim].contiguous(), k_new_bf16[:, pe_dim:].contiguous()
+        )
+
+        meta = make_meta(cur_lens)
+        indexer._update_k_cache(k_fp4, k_scale, meta)
+        out_custom = indexer.sparse_attn_indexer(
+            meta, hidden_states, q_fp4, k_fp4, k_scale, w, q_scale=q_scale
+        )[:batch_size].clone()
+        indexer.maybe_join_prev_topk_copy()
+        torch.cuda.synchronize()
+
+        tk = indexer.top_k
+        assert tk._gvr_emission_route is not None and tk._gvr_emission_route.tier == "list"
+        assert tk._gvr_prescore_step
+        st = tk._gvr_emission_state
+        # the recent-window sample makes even the cold step's line finite
+        # (the window alone is a sub-multiset of the row); the single-band
+        # emitter must have claimed candidates
+        assert torch.isfinite(st.seed_row[:batch_size, 0]).all()
+        # soundness and list admission: the emitter's exact count of entries at
+        # or above t0 covers K, the claim window overflowed nowhere and fits the
+        # C segment - exactly the consumer's single-band admission predicate
+        n0_exact = st.seed_row[:batch_size, 3]
+        claimed = st.cand_ctl[:batch_size, 0]
+        assert bool((n0_exact >= index_topk).all()), n0_exact
+        assert bool((claimed >= index_topk).all()) and bool(
+            (st.cand_ctl[:batch_size, 1] == 0).all()
+        )
+        assert bool((claimed <= LIST_WIDTH - 2 * LIST_SEG_A).all())
+        # the consumer epilogue (and the host write-back) leave the prior equal
+        # to this step's selection; the neighbour flags were written
+        assert torch.equal(
+            prior[local_layer, :batch_size].sort(-1).values, out_custom.sort(-1).values
+        )
+
+        # reference: the same scoring op directly (identical logits), then
+        # exact top-k value-set comparison - tie-proof and stronger than
+        # index-set similarity
+        n_pad = meta.get_indexer_max_seq_len()
+        logits_ref = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+            q_fp4.view(batch_size, 1, heads, pe_dim).view(torch.uint8),
+            q_scale.view(batch_size, 1, heads),
+            meta.kv_cache_manager.get_indexer_k_cache_buffers(layer_idx),
+            w,
+            meta.gen_indexer_kv_lens_cuda_runtime,
+            meta.indexer_k_cache_block_offsets[:batch_size],
+            meta.scheduler_metadata_buffer,
+            n_pad,
+        ).float()
+        for b in range(batch_size):
+            row = logits_ref[b, : cur_lens[b].item() // compress_ratio]
+            ref_vals = torch.topk(row, index_topk).values.sort(descending=True).values
+            sel_vals = row[out_custom[b].long()].sort(descending=True).values
+            assert torch.equal(sel_vals, ref_vals), (
+                f"step {step} row {b}: custom top-k NOT exact vs reference"
+            )
+        # fused prescore: the scorer derived the lines from the histogram
+        # (finite lines above), the consumer reset the histogram after the
+        # scorer read it; the next prescore accumulates onto zeros
+        assert int(st.ps_hist[:batch_size].abs().sum().item()) == 0, (
+            f"step {step}: prescore histogram not reset by the top-k"
+        )

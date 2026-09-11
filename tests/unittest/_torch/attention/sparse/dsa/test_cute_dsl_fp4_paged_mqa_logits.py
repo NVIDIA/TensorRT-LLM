@@ -19,6 +19,7 @@ Stage 0 rollout: only fp32/fp32 + num_epi_subtiles=1 are active. Other
 dtype combinations and subtile values are list-commented for later stages.
 """
 
+import math
 from typing import Tuple
 
 import pytest
@@ -1045,7 +1046,12 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
     )
     torch.cuda.synchronize()
     lf = logits.float()
-    torch.testing.assert_close(lf, lf0, atol=0.0, rtol=0.0)
+    # the logits buffer is a persistent arena: only [0, ctx) of each row is
+    # written, the tail keeps whatever earlier launches left there
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        assert not torch.isnan(lf[row, :ctx]).any(), f"NaN logits: row={row} ctx={ctx}"
+        torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
 
     pairs = cand.view(num_rows, cap, 2)
     vals_bits = pairs[..., 0]
@@ -1754,3 +1760,401 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
             assert cap_mode == "tight", f"unexpected void {tag}"
     if cap_mode == "tight":
         assert int(cand_ctl[:, 1].sum()) > 0, "tight caps never voided"
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("avg_ctx", [4096, 4224])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+def test_cute_dsl_fp4_paged_mqa_logits_cand_single_band(batch_size, next_n, avg_ctx, phys_block_kv):
+    """cand_single_band (prescore tier): every hit at or above t0 lands in
+    segment C through the claim window, segments A/B stay untouched, the
+    exact count of >= t0 entries is published in packed seed-row col 3 and
+    n1/n2 keep the exact per-line counts; the live C entries are exactly the
+    >= t0 set. Invariants recomputed from the kernel's own logits."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLFP4PagedMQALogitsRunner
+
+    torch.manual_seed(29)
+    torch.cuda.manual_seed(29)
+    num_heads, head_dim = 64, 128
+    max_model_len = max(avg_ctx * 2, 2048)
+    device = "cuda"
+    context_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = int(num_blocks_per_seq.sum().item()) + batch_size * 2
+    max_blocks_per_seq = int(num_blocks_per_seq.max().item())
+    block_table = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device)
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    off = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[off : off + n_blks]
+        off += n_blks
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    remove_online_sf_transpose = phys_block_kv == 128
+    kv_fused, _ = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
+    DG_METADATA_BLOCK_KV = 64
+    num_sms = deep_gemm.get_num_sms()
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
+    )
+    aligned_max_ctx = align(max_model_len, 256)
+    nb_pad = aligned_max_ctx // 128
+    num_rows = batch_size * next_n
+    nan = float("nan")
+    block_max = torch.full((num_rows, nb_pad * 4), nan, dtype=torch.float32, device=device)
+    common = dict(
+        num_epi_subtiles=1,
+        epi_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        remove_online_sf_transpose=remove_online_sf_transpose,
+    )
+    logits0, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        emit_block_meta=True,
+        emit_hit_stats=False,
+        block_max_out=block_max,
+        **common,
+    )
+    torch.cuda.synchronize()
+    lf0 = logits0.float()
+    # prescore-shaped lines: t0 near the top-K boundary, placeholders above
+    seed_row = torch.zeros((num_rows, 8), dtype=torch.float32, device=device)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        vals = lf0[row, :ctx]
+        t0 = torch.quantile(vals, 0.85)
+        spread = vals.max() - t0
+        seed_row[row, 0] = t0
+        seed_row[row, 1] = t0 + 0.25 * spread
+        seed_row[row, 2] = t0 + 0.5 * spread
+    segA, capC = 2048, 4096
+    W = 2 * segA + capC
+    cand_vals = torch.full((num_rows, W), nan, dtype=torch.float32, device=device)
+    cand_idx = torch.full((num_rows, W), -7, dtype=torch.int32, device=device)
+    cand_ctl = torch.zeros((num_rows, 4), dtype=torch.int32, device=device)
+    cand_cur = torch.zeros((num_rows, 4), dtype=torch.int32, device=device)
+    block_max.fill_(nan)
+    logits, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        emit_block_meta=True,
+        emit_hit_stats=False,
+        block_max_out=block_max,
+        emit_seed_counts=True,
+        seed_thr=seed_row,
+        emit_cand_bucketed=True,
+        accept_cap=segA,
+        cand_out=cand_vals,
+        cand_idx_out=cand_idx,
+        cand_ctl_out=cand_ctl,
+        cand_cur_out=cand_cur,
+        cand_single_band=True,
+        **common,
+    )
+    torch.cuda.synchronize()
+    lf = logits.float()
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        t0, t1, t2 = (float(seed_row[row, j]) for j in range(3))
+        v = lf[row, :ctx]
+        n0_ref = int((v >= t0).sum())
+        n1_ref = int((v >= t1).sum())
+        n2_ref = int((v >= t2).sum())
+        n0c, voidc, n1c, n2c = (int(cand_ctl[row, j]) for j in range(4))
+        tag = f"row={row} refs=({n0_ref},{n1_ref},{n2_ref}) ctl=({n0c},{voidc},{n1c},{n2c})"
+        assert voidc == 0, f"void {tag}"
+        assert n1c == n1_ref and n2c == n2_ref, f"n1/n2 mismatch {tag}"
+        # exact >= t0 count published for the consumer's admission (col 3)
+        assert int(seed_row[row, 3].item()) == n0_ref, f"exact n0 {tag} got {seed_row[row, 3]}"
+        assert n0c == n0_ref, f"exact claims: claimed must equal the >= t0 count {tag}"
+        # A/B segments never written under the single band
+        assert torch.isnan(cand_vals[row, : 2 * segA]).all(), f"A/B vals touched {tag}"
+        assert (cand_idx[row, : 2 * segA] == -7).all(), f"A/B idx touched {tag}"
+        assert int(cand_cur[row, 0]) == 0 and int(cand_cur[row, 1]) == 0, f"A/B cursors {tag}"
+        # C: live entries == the >= t0 set, pads carry the finite sentinel
+        pc = cand_idx[row, 2 * segA : 2 * segA + n0c]
+        vc = cand_vals[row, 2 * segA : 2 * segA + n0c]
+        live = pc >= 0
+        assert (vc[live] >= t0).all(), f"C vals {tag}"
+        assert (vc[~live] <= -3e38).all(), f"C pads {tag}"
+        assert (pc[live] < ctx).all(), f"C idx range {tag}"
+        torch.testing.assert_close(lf[row, pc[live].long()], vc[live], atol=0.0, rtol=0.0)
+        assert pc[live].unique().numel() == int(live.sum()) == n0_ref, f"coverage {tag}"
+        print(f"[single_band] ctx={ctx} exact={n0_ref} claimed={n0c} pads={n0c - n0_ref}")
+
+
+def _ps_hist_words(vals: torch.Tensor) -> torch.Tensor:
+    """The prescore's row histogram of a sample of scores (the binning of
+    the FP4 prescore epilogue): 4096 16-bit magnitude-window bins packed two
+    per int32 word, negative scores mirrored below the zero bin."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_prescore_fp4 import (
+        MAG_BASE,
+        MAG_BINS,
+        MAG_SHIFT,
+    )
+
+    u = vals.float().contiguous().view(torch.int32).to(torch.int64)
+    mag = (((u & 0x7FFFFFFF) >> MAG_SHIFT) - MAG_BASE).clamp(0, MAG_BINS - 1)
+    dig = torch.where(u < 0, MAG_BINS - 1 - mag, MAG_BINS + mag)
+    counts = torch.bincount(dig, minlength=2 * MAG_BINS)
+    assert int(counts.max()) < 65536
+    words = counts[0::2] + (counts[1::2] << 16)
+    words = torch.where(words >= 2**31, words - 2**32, words)
+    return words.to(torch.int32)
+
+
+def _ps_lines_ref(words: torch.Tensor, top_k: int):
+    """The scorer's _derive_lines (the seed lines from a row histogram) in torch,
+    float32 arithmetic: lower edge of the bin holding the K-th sample minus a
+    relative slack, then the spread to the top bin's upper edge."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_prescore_fp4 import (
+        MAG_BASE,
+        MAG_BINS,
+        MAG_SHIFT,
+    )
+
+    w = words.to(torch.int64).cpu() & 0xFFFFFFFF
+    c = torch.stack([w & 0xFFFF, w >> 16], 1).reshape(-1)
+    total = int(c.sum())
+    nzb = torch.nonzero(c).flatten()
+    tb = max(int(nzb.max()) if nzb.numel() else -1, 0)
+    from_top = torch.flip(torch.cumsum(torch.flip(c, [0]), 0), [0])
+    d = int(torch.nonzero(from_top >= top_k).max()) if total >= top_k else 0
+
+    def f32(x):
+        return torch.tensor(x, dtype=torch.float32)
+
+    def edge(m):
+        return torch.tensor([m << MAG_SHIFT], dtype=torch.int32).view(torch.float32)[0]
+
+    kth, vmx = f32(0.0), f32(0.0)
+    if d >= MAG_BINS:
+        if d - MAG_BINS > 0:
+            kth = edge(d - MAG_BINS + MAG_BASE)
+    else:
+        kth = f32(0.0) - edge(MAG_BINS - 1 - d + 1 + MAG_BASE)
+    if total < top_k or d <= 0:
+        kth = f32(float("-inf"))
+    if tb >= MAG_BINS:
+        vmx = edge(tb - MAG_BINS + 1 + MAG_BASE)
+    elif MAG_BINS - 1 - tb > 0:
+        vmx = f32(0.0) - edge(MAG_BINS - 1 - tb + MAG_BASE)
+    akth = torch.maximum(kth, f32(0.0) - kth)
+    t0 = kth - (akth * f32(1.0 / 4096.0) + f32(1e-6))
+    spread = torch.maximum(vmx - t0, f32(4e-4))
+    if not bool(torch.isfinite(t0)):
+        return (float("inf"),) * 3
+    return float(t0), float(t0 + f32(0.25) * spread), float(t0 + f32(0.5) * spread)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("top_k", [1024, 2048])
+@pytest.mark.parametrize("avg_ctx", [8192])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+def test_cute_dsl_fp4_paged_mqa_logits_derive_lines(batch_size, top_k, avg_ctx, phys_block_kv):
+    """derive_lines (fused prescore): the scorer reads the prescore's row
+    histogram, derives the seed lines itself (the prescore finalize's
+    arithmetic, reproduced in torch), publishes them into the seed row and
+    emits exactly the single-band list a scorer handed those lines emits.
+    Rows whose sample holds fewer than K entries get +inf lines and an
+    empty list; the histogram itself is left untouched."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLFP4PagedMQALogitsRunner
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_prescore_fp4 import HIST_WORDS
+
+    torch.manual_seed(31)
+    torch.cuda.manual_seed(31)
+    num_heads, head_dim, next_n = 64, 128, 1
+    max_model_len = max(avg_ctx * 2, 2048)
+    device = "cuda"
+    context_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = int(num_blocks_per_seq.sum().item()) + batch_size * 2
+    max_blocks_per_seq = int(num_blocks_per_seq.max().item())
+    block_table = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device)
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    off = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[off : off + n_blks]
+        off += n_blks
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    remove_online_sf_transpose = phys_block_kv == 128
+    kv_fused, _ = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
+    num_sms = deep_gemm.get_num_sms()
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens.unsqueeze(-1), 64, num_sms)
+    nb_pad = align(max_model_len, 256) // 128
+    num_rows = batch_size * next_n
+    nan = float("nan")
+    block_max = torch.full((num_rows, nb_pad * 4), nan, dtype=torch.float32, device=device)
+    common = dict(
+        num_epi_subtiles=1,
+        epi_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        remove_online_sf_transpose=remove_online_sf_transpose,
+    )
+    logits0, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        emit_block_meta=True,
+        emit_hit_stats=False,
+        block_max_out=block_max,
+        **common,
+    )
+    torch.cuda.synchronize()
+    lf0 = logits0.float()
+    # the prescore's sample is a sub-multiset of the row (distinct positions):
+    # its top 3K plus the newest 1024 positions; row 0 of a multi-row case
+    # samples K-1 positions
+    ps_hist = torch.zeros((num_rows, HIST_WORDS), dtype=torch.int32, device=device)
+    for row in range(num_rows):
+        ctx = int(context_lens[row].item())
+        v = lf0[row, :ctx]
+        if row == 0 and num_rows > 1:
+            pos = torch.randperm(ctx, device=device)[: top_k - 1]
+        else:
+            pos = torch.cat(
+                [
+                    torch.topk(v, min(3 * top_k, ctx)).indices,
+                    torch.arange(ctx - 1024, ctx, device=device),
+                ]
+            ).unique()
+        ps_hist[row] = _ps_hist_words(v[pos])
+    ps_hist_before = ps_hist.clone()
+    ref = [_ps_lines_ref(ps_hist[row], top_k) for row in range(num_rows)]
+
+    segA, capC = 2048, 4096 + 4 * top_k
+    W = 2 * segA + capC
+
+    def buffers():
+        return (
+            torch.zeros((num_rows, 8), dtype=torch.float32, device=device),
+            torch.full((num_rows, W), nan, dtype=torch.float32, device=device),
+            torch.full((num_rows, W), -7, dtype=torch.int32, device=device),
+            torch.zeros((num_rows, 4), dtype=torch.int32, device=device),
+            torch.zeros((num_rows, 4), dtype=torch.int32, device=device),
+        )
+
+    def run(seed_row, cand_vals, cand_idx, cand_ctl, cand_cur, **extra):
+        block_max.fill_(nan)
+        logits, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+            q_fp4,
+            sf_q,
+            kv_fused,
+            weights,
+            context_lens,
+            block_table,
+            schedule_meta,
+            max_model_len,
+            emit_block_meta=True,
+            emit_hit_stats=False,
+            block_max_out=block_max,
+            emit_seed_counts=True,
+            seed_thr=seed_row,
+            emit_cand_bucketed=True,
+            accept_cap=segA,
+            cand_out=cand_vals,
+            cand_idx_out=cand_idx,
+            cand_ctl_out=cand_ctl,
+            cand_cur_out=cand_cur,
+            cand_single_band=True,
+            **extra,
+            **common,
+        )
+        torch.cuda.synchronize()
+        return logits.float()
+
+    # A: lines derived in-kernel from the histogram (seed row lines start at 0)
+    seed_a, vals_a, idx_a, ctl_a, cur_a = buffers()
+    lf = run(seed_a, vals_a, idx_a, ctl_a, cur_a, ps_hist=ps_hist, lines_top_k=top_k)
+    assert torch.equal(ps_hist, ps_hist_before), "the scorer must not modify the histogram"
+    published = seed_a[:, :3].clone()
+    for row in range(num_rows):
+        ctx = int(context_lens[row].item())
+        v = lf[row, :ctx]
+        l0, l1, l2 = (float(published[row, j]) for j in range(3))
+        r0, r1, r2 = ref[row]
+        tag = f"row={row} K={top_k} published=({l0},{l1},{l2}) ref=({r0},{r1},{r2})"
+        n0c, voidc, n1c, n2c = (int(ctl_a[row, j]) for j in range(4))
+        assert voidc == 0, f"void {tag}"
+        if row == 0 and num_rows > 1:
+            assert l0 == l1 == l2 == float("inf") and r0 == float("inf"), f"short sample {tag}"
+            assert n0c == 0 and int(seed_a[row, 3].item()) == 0, f"short sample emitted {tag}"
+            continue
+        assert all(map(math.isfinite, (l0, l1, l2, r0, r1, r2))), tag
+        (
+            torch.testing.assert_close(
+                published[row].cpu(), torch.tensor([r0, r1, r2]), rtol=2e-6, atol=0.0
+            ),
+            tag,
+        )
+        # sound: t0 never above the row's true K-th score
+        assert l0 <= float(torch.topk(v, top_k).values[-1]), f"unsound t0 {tag}"
+        n0_ref = int((v >= l0).sum())
+        n1_ref = int((v >= l1).sum())
+        n2_ref = int((v >= l2).sum())
+        assert n0_ref >= top_k, tag
+        assert int(seed_a[row, 3].item()) == n0_ref and n0c == n0_ref, f"exact n0 {tag}"
+        assert n1c == n1_ref and n2c == n2_ref, f"n1/n2 {tag}"
+        pc = idx_a[row, 2 * segA : 2 * segA + n0c]
+        assert (pc >= 0).all() and (pc < ctx).all(), f"C idx range {tag}"
+        assert torch.equal(pc.sort().values, torch.nonzero(v >= l0).flatten().int()), f"C set {tag}"
+        torch.testing.assert_close(
+            lf[row, pc.long()], vals_a[row, 2 * segA : 2 * segA + n0c], atol=0.0, rtol=0.0
+        )
+        print(f"[derive_lines] ctx={ctx} K={top_k} t0={l0:.6g} n0={n0c} n1={n1c} n2={n2c}")
+
+    # B: the same lines handed over the seed row (today's chain) must emit
+    # the same counts and the same candidate set
+    seed_b, vals_b, idx_b, ctl_b, cur_b = buffers()
+    seed_b[:, :3] = published
+    run(seed_b, vals_b, idx_b, ctl_b, cur_b)
+    assert torch.equal(ctl_a, ctl_b), (ctl_a, ctl_b)
+    assert torch.equal(seed_a[:, 3:6], seed_b[:, 3:6])
+    for row in range(num_rows):
+        n0 = int(ctl_a[row, 0])
+        assert torch.equal(
+            idx_a[row, 2 * segA : 2 * segA + n0].sort().values,
+            idx_b[row, 2 * segA : 2 * segA + n0].sort().values,
+        ), f"row {row}: derived-line list differs from the seed-row list"

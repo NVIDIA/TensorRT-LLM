@@ -783,6 +783,13 @@ class Indexer(nn.Module):
             and self.use_cute_dsl_paged_mqa_logits
             and self.use_fp4
         )
+        # Prescore tier (opt-in on top of emission; FP4 indexer cache only):
+        # sound seed lines from re-scoring the previous step's top-k on the
+        # current query, single-band candidate emission, list consumer (see
+        # gvr_emission).
+        self.use_gvr_prescore = (
+            sparse_params.use_gvr_prescore and self.use_gvr_emission and self.use_fp4
+        )
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
@@ -1774,11 +1781,30 @@ class Indexer(nn.Module):
                     # routes the Top-K through order_row, which excludes them
                     and metadata.kv_lens_row_reorder is None
                 ):
+                    gvr_prescore = None
+                    if self.use_gvr_prescore:
+                        # FP4 q as packed bytes + per-head packed UE8M0 scales
+                        # (next_n == 1 here); compressed lengths and the
+                        # paged K pool are the scorer's own inputs
+                        gvr_prescore = dict(
+                            q=q_decode.view(torch.uint8),
+                            q_sf=q_scale[token_offset : token_offset + num_gen_tokens, ...].view(
+                                num_generations, self.n_heads
+                            ),
+                            k_cache=k_cache,
+                            weights=weights_decode,
+                            block_table=block_table,
+                            kv_lens=dsl_context_lens,
+                            head_dim=self.head_dim,
+                            tokens_per_block=k_cache.shape[1],
+                            record_bytes=k_cache.shape[-1],
+                        )
                     gvr_emit_kwargs = self.top_k.prepare_gvr_emission(
                         num_generations,
                         indexer_max_seq_len,
                         torch.cuda.get_device_properties(q_decode.device).multi_processor_count,
                         gvr_prior_indices,
+                        prescore=gvr_prescore,
                     )
                 if self.use_fp4:
                     # FP4 DSL signature splits DG's (q, sf_q) tuple into two

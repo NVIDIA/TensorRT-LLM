@@ -1018,6 +1018,7 @@ class ModelConfig(Generic[TConfig]):
                 enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                 use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
                 use_gvr_emission = sparse_attention_config.use_gvr_emission
+                use_gvr_prescore = sparse_attention_config.use_gvr_prescore
                 indexer_k_dtype = sparse_attention_config.indexer_k_dtype
             else:
                 index_n_heads = pretrained_config.index_n_heads
@@ -1033,6 +1034,7 @@ class ModelConfig(Generic[TConfig]):
                 enable_heuristic_topk = False
                 use_self_sampling_topk = True
                 use_gvr_emission = False
+                use_gvr_prescore = False
                 default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
                 )
                 indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
@@ -1051,6 +1053,7 @@ class ModelConfig(Generic[TConfig]):
             indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
             indexer_config['use_self_sampling_topk'] = use_self_sampling_topk
             indexer_config['use_gvr_emission'] = use_gvr_emission
+            indexer_config['use_gvr_prescore'] = use_gvr_prescore
             indexer_config['indexer_k_dtype'] = indexer_k_dtype
             return indexer_config
 
@@ -1090,6 +1093,7 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
                         use_gvr_emission = sparse_attention_config.use_gvr_emission
+                        use_gvr_prescore = sparse_attention_config.use_gvr_prescore
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
@@ -1104,6 +1108,7 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = False
                         use_self_sampling_topk = True
                         use_gvr_emission = False
+                        use_gvr_prescore = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
                     kwargs[
@@ -1122,6 +1127,7 @@ class ModelConfig(Generic[TConfig]):
                             enable_heuristic_topk=enable_heuristic_topk,
                             use_self_sampling_topk=use_self_sampling_topk,
                             use_gvr_emission=use_gvr_emission,
+                            use_gvr_prescore=use_gvr_prescore,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)
