@@ -51,6 +51,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo, is_modelopt_quant_config,
     read_modelopt_quant_config, warn_if_inline_diverges)
+from tensorrt_llm.quantization.utils.fp4_utils import (NVFP4_SF_VEC_SIZE,
+                                                       W4A16_NVFP4_SF_VEC_SIZES)
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -537,6 +539,36 @@ class ModelConfig(Generic[TConfig]):
             moe_backend)
 
     @staticmethod
+    def _validate_nvfp4_group_size(quant_config: QuantConfig,
+                                   layer_name: Optional[str] = None) -> None:
+        """Reject NVFP4-family ``group_size`` values no kernel can consume.
+
+        ModelOpt records the scale block width in ``quantization.group_size``.
+        The W4A4 NVFP4 GEMMs are hardware-bound to 16-element blocks, while the
+        weight-only W4A16_NVFP4 path dequantizes in software and also accepts
+        the 32-element blocks that ModelOpt's ``nvfp4_*_weight_only`` recipes
+        may export. Any other width would only surface as a scale-shape
+        mismatch deep inside weight loading, so fail here with the value.
+        """
+        group_size = quant_config.group_size
+        if group_size is None:
+            return
+        if quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+            supported = W4A16_NVFP4_SF_VEC_SIZES
+        elif quant_config.quant_algo in (QuantAlgo.NVFP4, QuantAlgo.NVFP4_ARC):
+            supported = (NVFP4_SF_VEC_SIZE, )
+        else:
+            return
+        if group_size not in supported:
+            where = f" for layer '{layer_name}'" if layer_name else ""
+            raise ValueError(
+                f"hf_quant_config.json declares group_size={group_size}{where} "
+                f"with quant_algo={quant_config.quant_algo.name}, but "
+                f"TensorRT-LLM supports {'/'.join(map(str, supported))}-element "
+                "NVFP4 scale blocks for this algorithm (32-element blocks are "
+                "only supported by the weight-only W4A16_NVFP4 path).")
+
+    @staticmethod
     def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
                                      moe_backend):
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
@@ -608,6 +640,7 @@ class ModelConfig(Generic[TConfig]):
                 config.quant_algo = QuantAlgo(
                     canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
+                ModelConfig._validate_nvfp4_group_size(config, layer)
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:
                     config.has_zero_point = layer_cfg['has_zero_point']
@@ -618,6 +651,7 @@ class ModelConfig(Generic[TConfig]):
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
+        ModelConfig._validate_nvfp4_group_size(quant_config)
 
         if (moe_backend == 'TRTLLM'
                 and quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES

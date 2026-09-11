@@ -238,6 +238,38 @@ def test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior(
     assert config.quant_algo == expected_algo
 
 
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int) -> None:
+    """32-element weight-only scale blocks cannot feed the W4A4 NVFP4 GEMMs, so
+    the SM100/103 promotion must leave dense MLP, expert and lm_head entries on
+    the W4A16 dequantization path."""
+    cfg = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            "model.language_model.layers.0.mlp.gate_proj": cfg,
+            "model.language_model.layers.1.mlp.experts": cfg,
+            "lm_head": cfg,
+        },
+    )
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        return_value=sm_version,
+    ):
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=True)
+
+    assert set(model_config.quant_config_dict) == {
+        "model.layers.0.mlp.mlp.gate_proj",
+        "model.layers.1.mlp.experts",
+        "lm_head",
+    }
+    assert all(
+        config.quant_algo == QuantAlgo.W4A16_NVFP4 and config.group_size == 32
+        for config in model_config.quant_config_dict.values()
+    )
+
+
 def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
     name = "model.language_model.layers.0.mlp.gate_proj"
     model_config = SimpleNamespace(

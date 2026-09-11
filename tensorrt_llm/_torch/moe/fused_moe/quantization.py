@@ -28,7 +28,8 @@ from torch import nn
 from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import (TensorParallelMode,
-                                                load_weight_shard)
+                                                load_weight_shard,
+                                                nvfp4_scaling_vector_size)
 from tensorrt_llm._torch.utils import (ActivationType,
                                        replace_parameter_and_save_metadata,
                                        swizzle_sf, unswizzle_sf)
@@ -2348,6 +2349,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                        block_scales_vec_size,
                        scaling_vector_size=16,
                        bias_dtype: Optional[torch.dtype] = None):
+        declared_scaling_vector_size = nvfp4_scaling_vector_size(
+            getattr(module, "quant_config", None))
+        if declared_scaling_vector_size != scaling_vector_size:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports {scaling_vector_size}-element "
+                "NVFP4 scale blocks, but the checkpoint declares group_size="
+                f"{declared_scaling_vector_size}; wider blocks are only "
+                "supported by the dense W4A16_NVFP4 Linear path.")
         from ...locality_domain_utils import get_current_locality_domain
         is_locality_domain_weights = get_current_locality_domain() is not None
         locality_domain_factor = 2 if is_locality_domain_weights else 1
