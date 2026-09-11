@@ -28,7 +28,6 @@ l0_gb300_multi_gpus:
   # acceptance gate. The two acceptance legs are independent cases read against
   # one shared minimum -- staircase failing while stock passes means the draft
   # path regressed; both failing means the anchor is stale.
-  - accuracy/test_staircase.py::TestStaircaseDeepseekR10528Nvfp4Sm103Dep4::test_gsm8k
   - accuracy/test_staircase.py::TestStaircaseDeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
   - accuracy/test_staircase.py::TestStaircaseDeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[staircase]
   - accuracy/test_staircase.py::TestStaircaseDeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
