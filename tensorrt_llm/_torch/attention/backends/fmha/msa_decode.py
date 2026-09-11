@@ -12,6 +12,11 @@ Both need a uniform query length across the generation rows and a geometry they
 support, and neither has a fallback: prepare() settles the query length per
 step as metadata.msa_decode_span, and ensure_msa_available and
 _validate_decode_kernel_support settle the geometry once per run.
+
+Every import of the kernels below is function-local. This module is on the
+import path of every attention.backends.trtllm import, and the minimax_m3
+package init reaches msa_backend, which subclasses TrtllmAttention, so a
+module-scope import here would close a cycle.
 """
 
 from __future__ import annotations
@@ -21,13 +26,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..sparse.minimax_m3.kernels.msa_utils import is_msa_layer, msa_paged_kv, write_msa_phase_kv
-from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
-    DenseDecodeWorkspaceLayout,
-    dense_decode_workspace_layout,
-    minimax_m3_trtllm_gen_dense_decode,
-    split_dense_decode_workspace,
-)
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
@@ -37,6 +35,8 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+
+    from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import DenseDecodeWorkspaceLayout
 
 
 class MsaDecodeFmha(PhasedFmha):
@@ -55,6 +55,8 @@ class MsaDecodeFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        from ..sparse.minimax_m3.kernels.msa_utils import is_msa_layer
+
         return is_msa_layer(attn)
 
     def _is_supported(
@@ -102,6 +104,10 @@ class MsaDecodeFmha(PhasedFmha):
         mid-capture would allocate behind the recorded kernels, so it is
         refused.
         """
+        from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
+            dense_decode_workspace_layout,
+        )
+
         # The manager has the pool: _validate_decode_kernel_support refused the
         # run without it, so no phase would have reached here.
         kv_pool, _ = metadata.kv_cache_manager.get_kv_subpage_pool(self.attn.layer_idx, "HND")
@@ -127,6 +133,8 @@ class MsaDecodeFmha(PhasedFmha):
         self._dense_layout = layout
 
     def run_generation(self, params: FmhaParams) -> None:
+        from ..sparse.minimax_m3.kernels.msa_utils import write_msa_phase_kv
+
         metadata = params.meta
         span = metadata.msa_decode_span
         # Both kernels below map a query token to its request through the span,
@@ -167,8 +175,9 @@ class MsaDecodeFmha(PhasedFmha):
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> None:
-        # Function-local: this module is on the import path of every
-        # attention.backends.trtllm import, and the kernel pulls in Triton.
+        # This kernel also pulls in Triton, a second reason to keep it out of
+        # module scope.
+        from ..sparse.minimax_m3.kernels.msa_utils import msa_paged_kv
         from ..sparse.minimax_m3.kernels.triton_sparse_decode import minimax_m3_sparse_attn_decode
 
         attn = params.attn
@@ -206,6 +215,11 @@ class MsaDecodeFmha(PhasedFmha):
         than through that library, which cannot address M3's pool. See the
         trtllm_gen_dense_decode module docstring for why.
         """
+        from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
+            minimax_m3_trtllm_gen_dense_decode,
+            split_dense_decode_workspace,
+        )
+
         attn = params.attn
         metadata = params.meta
         head_dim = attn.head_dim

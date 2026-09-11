@@ -12,6 +12,11 @@ It serves the context phase alone. fmha_sm100 schedules a generation row like
 a context row, and a mixed batch cannot split the two apart (see
 _mixed_batch_split in fmha_sm100/api.py), so the generation phase is
 MsaDecodeFmha's outright.
+
+Every import of the kernels below is function-local. This module is on the
+import path of every attention.backends.trtllm import, and the minimax_m3
+package init reaches msa_backend, which subclasses TrtllmAttention, so a
+module-scope import here would close a cycle.
 """
 
 from __future__ import annotations
@@ -20,13 +25,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..sparse.minimax_m3.kernels.msa_utils import (
-    MSA_REQUIRED_HEAD_DIM,
-    is_msa_layer,
-    msa_paged_kv,
-    require_msa_module,
-    write_msa_phase_kv,
-)
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
@@ -50,7 +48,7 @@ def run_msa_sparse_gqa(
     kv_lens_cpu: Optional[torch.Tensor] = None,
     qo_offset_cpu: Optional[torch.Tensor] = None,
     causal: bool = True,
-    head_dim: int = MSA_REQUIRED_HEAD_DIM,
+    head_dim: Optional[int] = None,
     plan: Optional[tuple] = None,
     out: Optional[torch.Tensor] = None,
     use_fp8: bool = False,
@@ -61,11 +59,16 @@ def run_msa_sparse_gqa(
     if None, dense mode attending all pages in `kv_indices`.
     `plan`: prebuilt execution plan; if None, built inline from the CPU length
     tensors (the prebuilt plan for a step prepare() staged, inline for a test).
+    `head_dim`: defaults to the only head dimension the kernel supports.
     `out`: destination buffer the kernel writes in place.
     `use_fp8`: FP8 KV cache. The caller must pass FP8 `q` to match the FP8 paged
     K/V, since the kernel variant shares one dtype across q/k/v. Also selects the
     FP8 AOT kernels for an inline sparse-prefill plan.
     """
+    from ..sparse.minimax_m3.kernels.msa_utils import MSA_REQUIRED_HEAD_DIM, require_msa_module
+
+    if head_dim is None:
+        head_dim = MSA_REQUIRED_HEAD_DIM
     fmha_sm100 = require_msa_module()
 
     if q.dim() != 3:
@@ -136,6 +139,8 @@ def run_msa_prefill_gqa(
     `num_rows` are its batch rows, which narrow the host length tensors an
     inline plan would read.
     """
+    from ..sparse.minimax_m3.kernels.msa_utils import msa_paged_kv
+
     head_dim = attn.head_dim
     num_tokens = int(q.shape[0])
     if num_tokens == 0:
@@ -195,6 +200,8 @@ class MsaPrefillFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        from ..sparse.minimax_m3.kernels.msa_utils import is_msa_layer
+
         return is_msa_layer(attn)
 
     def _is_supported(
@@ -215,6 +222,8 @@ class MsaPrefillFmha(PhasedFmha):
         return phase is FmhaPhase.CONTEXT
 
     def run_context(self, params: FmhaParams) -> None:
+        from ..sparse.minimax_m3.kernels.msa_utils import write_msa_phase_kv
+
         metadata = params.meta
         write_msa_phase_kv(
             params.attn,

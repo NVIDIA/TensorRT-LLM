@@ -20,8 +20,6 @@ from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
-from .msa_decode import MsaDecodeFmha
-from .msa_prefill import MsaPrefillFmha
 from .prims_ts import PrimsTSFmha
 from .triton_custom_mask import TritonCustomMaskFmha
 
@@ -36,6 +34,8 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     without an import cycle.
     """
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
+    from .msa_decode import MsaDecodeFmha
+    from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
 
     return {
