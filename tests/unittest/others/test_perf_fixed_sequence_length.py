@@ -97,7 +97,6 @@ def test_variable_dataset_does_not_infer_sequence_length(
         ("bench", "pytorch", {}, 2500),
         ("serve", "", {}, 2500),
         ("bench", "", {}, None),
-        ("bench", "_autodeploy", {}, None),
         ("bench", "pytorch", {"kv_cache_config": None}, 2500),
         ("bench", "pytorch", {"max_seq_len": 2048}, 2048),
     ],

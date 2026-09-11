@@ -53,7 +53,6 @@ def discover_custom_ops(namespaces):
 @pytest.fixture(scope="module", autouse=True)
 def custom_ops():
     """Discover custom ops in the codebase."""
-    # "auto_deploy" custom ops are not checked here.
     custom_op_namespaces = ("trtllm",)
 
     return discover_custom_ops(custom_op_namespaces)

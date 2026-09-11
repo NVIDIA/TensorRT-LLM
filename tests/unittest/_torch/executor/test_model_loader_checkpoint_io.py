@@ -62,7 +62,6 @@ def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
     requested: Literal["auto", "rank_striped_read_ahead"],
 ) -> None:
     loader = _construct_checkpoint_loader(
-        "pytorch",
         None,
         "HF",
         checkpoint_io_policy=requested,
@@ -94,7 +93,6 @@ def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
     checkpoint_format = options.pop("checkpoint_format", "HF")
 
     loader = _construct_checkpoint_loader(
-        "pytorch",
         None,
         checkpoint_format,
         checkpoint_io_policy="rank_striped_read_ahead",
@@ -120,7 +118,6 @@ def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
 
     loader = _construct_checkpoint_loader(
-        "pytorch",
         provided_loader,
         "HF",
         checkpoint_io_policy="rank_striped_read_ahead",
@@ -154,7 +151,6 @@ def test_auto_selects_native_for_incompatible_config_without_warning(
     monkeypatch.setattr(model_loader_module.logger, "info", info)
 
     loader = _construct_checkpoint_loader(
-        "pytorch",
         None,
         "MX",
         checkpoint_io_policy="auto",
@@ -171,7 +167,6 @@ def test_static_native_selection_skips_rank_striped_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loader = _construct_checkpoint_loader(
-        "pytorch",
         None,
         "HF",
         checkpoint_io_policy="rank_striped_read_ahead",
@@ -201,7 +196,7 @@ def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
         modeling_utils, "get_checkpoint_weight_loader", lambda _format: _CustomWeightLoader
     )
 
-    loader = _construct_checkpoint_loader("pytorch", None, "HF")
+    loader = _construct_checkpoint_loader(None, "HF")
     assert isinstance(loader.weight_loader, _CustomWeightLoader)
     mapping = Mapping()
     with loader.open_weight_session("/checkpoint", mapping=mapping) as weights:
@@ -211,7 +206,6 @@ def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
     warning = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
     fallback_loader = _construct_checkpoint_loader(
-        "pytorch",
         None,
         "HF",
         checkpoint_io_policy="rank_striped_read_ahead",
@@ -236,7 +230,6 @@ def test_construct_checkpoint_loader_detects_custom_hf_wrapper(
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
 
     loader = _construct_checkpoint_loader(
-        "pytorch",
         None,
         "HF",
         checkpoint_io_policy="rank_striped_read_ahead",

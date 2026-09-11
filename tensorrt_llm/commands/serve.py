@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import contextlib
@@ -162,7 +176,7 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
                              "Must be a class or an async function.")
 
 
-def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
+def is_non_default_or_required(param_name, value, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
@@ -198,12 +212,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    if backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy.llm_args import \
-            LlmArgs as AutoDeployLlmArgs
-        llm_args_class = AutoDeployLlmArgs
-    else:
-        llm_args_class = TorchLlmArgs
+    llm_args_class = TorchLlmArgs
 
     field_info = llm_args_class.model_fields.get(param_name)
     if not field_info:
@@ -349,7 +358,7 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
+        if is_non_default_or_required(param, value, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
@@ -698,12 +707,6 @@ def launch_server(
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
             llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -993,11 +996,9 @@ def launch_visual_gen_server(
                   status="beta")
 @stability_option(
     "--backend",
-    type=click.Choice(["pytorch", "_autodeploy"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend. "
-    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
-    "in a future release; please use the 'pytorch' backend instead.",
+    help="The backend to use to serve the model. Default is pytorch backend.",
     status="deprecated")
 @stability_option(
     "--generation-config",
@@ -1336,13 +1337,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
-
-    if backend == "_autodeploy":
-        logger.warning(
-            "The '_autodeploy' backend is deprecated and will be discontinued in a "
-            "future release. No new features or models will be added. Please migrate "
-            "to the 'pytorch' backend. See "
-            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
 
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")

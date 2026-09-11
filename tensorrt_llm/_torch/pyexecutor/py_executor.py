@@ -5719,13 +5719,7 @@ class PyExecutor:
                 and self.kv_cache_transceiver.pipeline_transfer_enabled
                 and disagg_params is not None and request.llm_request_type
                 == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY):
-            runtime_features = getattr(self.model_engine,
-                                       "attn_runtime_features", None)
-            enable_chunked_prefill = (getattr(
-                runtime_features,
-                "chunked_prefill") if runtime_features is not None else getattr(
-                    self.model_engine, "_enable_chunked_prefill", False))
-            if not enable_chunked_prefill:
+            if not self.model_engine.attn_runtime_features.chunked_prefill:
                 raise ValueError(
                     "enable_chunked_prefill is required when enable_pipelined_transfer is set."
                 )

@@ -227,7 +227,6 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
-  - unittest/auto_deploy/standalone/test_standalone_package.py::TestStandalonePackage::test_run_unit_tests
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]

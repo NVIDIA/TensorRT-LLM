@@ -19,7 +19,7 @@
 #   Top-K                     			  @NVIDIA/trt-llm-topk-devs
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
 #   Scaffolding              			  @WeiHaocheng @dc3671
-#   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
+#   Self-managed: Triton backend, Dynamo.  Governance/legal: unchanged.
 #
 # New handles (trt-llm-devs / doc / agent / runtime / models / perf / moe / kernels / multi-gpu-ci-review)
 # must be created & populated before activation (unknown owner blocks merge).
@@ -389,17 +389,6 @@
 # ===== SCAFFOLDING =====
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
-
-# ===== SELF-MANAGED =====
-/docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
-/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/scripts/check_auto_deploy_imports.py @NVIDIA/trt-llm-torch-autodeploy-devs
-/scripts/check_model_registry.py @NVIDIA/trt-llm-torch-autodeploy-devs
-/tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
-/tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/unittest/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

@@ -81,7 +81,7 @@ All published functionality in the Release Notes has been fully tested and verif
     - **Scaffolding:** Added benchmark support for scaffolding examples.
 - **Documentation**
   - **Deployment Guides:** Added comprehensive deployment guides for GPT-OSS, DeepSeek-R1, and VDR 1.0.
-  - **Feature Documentation:** Created new documentation for KV Cache Connector, LoRA feature usage, and AutoDeploy.
+  - **Feature Documentation:** Created new documentation for KV Cache Connector and LoRA feature usage.
   - **Tech Blogs:** Published blogs on "[Combining Guided Decoding and Speculative Decoding](./blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)" and "[ADP Balance Strategy](./blogs/tech_blog/blog10_ADP_Balance_Strategy.md)".
   - **Quick Start:** Refined Quick Start guides with new links to ModelOpt checkpoints and updated installation steps (Linux/Windows).
   - **API Reference:** Enhanced LLM API documentation by explicitly labeling stable vs. unstable APIs.
@@ -362,7 +362,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - The dependent NCCL version is updated to 2.27.5.
 
 ### API Changes
-- Set _AutoDeployLlmArgs as primary config object
 - Removed decoder request from decoder interface
 - Enhanced the torch_compile_config in llm args
 - Removed the redundant use_kv_cache field from PytorchConfig
@@ -445,7 +444,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### API Changes
 - [BREAKING CHANGE] Enable scheduling overlap by default
 - Remove deprecated GptSession/V1 from TRT workflow
-- Set _AutoDeployLlmArgs as primary config object
 - Allow overriding CLI arguments with YAML file in trtllm-serve
 - Introduced multimodal embedding field in LlmRequest
 
@@ -496,10 +494,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
     - Added support for enabling MTP with CUDA graph padding.
     - Added initial EAGLE-3 implementation.
     - Added support for FP8 MLA on NVIDIA Hopper and Blackwell GPUs.
-  - **AutoDeploy for PyTorch workflow**.
-    - The AutoDeploy for PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch.auto_deploy`.
-    - AutoDeploy provides an automated path from off-the-shelf models to optimized deployment in the TensorRT-LLM runtime.
-    - Check out `examples/auto_deploy/README.md` for more details.
   - LLM API
     - [BREAKING CHANGE] Added dynamic logits processor support, and deprecated static logits processor.
     - Added batched logits processor support.

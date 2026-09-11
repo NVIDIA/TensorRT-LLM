@@ -16,7 +16,7 @@ import gc
 import math
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import pytest
 import scipy
@@ -25,7 +25,6 @@ import yaml
 
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -298,7 +297,7 @@ class AccuracyTask:
                                        self.HIGHER_IS_BETTER))
 
     def evaluate(self,
-                 llm: Union[PyTorchLLM, AutoDeployLLM],
+                 llm: PyTorchLLM,
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
