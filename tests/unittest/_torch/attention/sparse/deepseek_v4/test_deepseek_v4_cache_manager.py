@@ -21,8 +21,8 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -40,6 +40,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_q
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal import kv_cache_compression as native_kvcc
@@ -1937,13 +1938,7 @@ class TestDeepseekV4CacheManager:
         spec_config = SimpleNamespace(
             max_draft_len=7,
             max_total_draft_tokens=7,
-            spec_dec_mode=SimpleNamespace(
-                is_eagle3_one_model=lambda: False,
-                is_mtp_eagle_one_model=lambda: False,
-                is_mtp_one_model=lambda: False,
-                is_mtp_vanilla=lambda: False,
-                use_one_engine=lambda: True,
-            ),
+            spec_dec_mode=SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL,
         )
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,

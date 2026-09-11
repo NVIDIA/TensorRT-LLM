@@ -602,9 +602,15 @@ def run_client_tests(example_dir,
                         "Using `asyncio` in Python"
                     ]
                 elif "qwen3_32b_fp8" in test_desc:
+                    # https://nvbugs/6566734: the greedy completion of the raw
+                    # asyncio prompt is near-tied between answering the question
+                    # and continuing it; both are valid non-garbage outputs.
                     expected_strings = [
                         "The capital of Germany is Berlin",
-                        "Asyncio in Python is a library"
+                        [
+                            "Asyncio in Python is a library",
+                            "I have read that it is used for asynchronous programming"
+                        ]
                     ]
                 else:
                     expected_strings = [
@@ -1070,7 +1076,7 @@ def run_disaggregated_test(example_dir,
             test_desc,
             num_iters,
             run_env,
-            300,  # timeout
+            server_start_timeout,  # timeout
             prompt_file,
             extra_endpoints_test,
             server_url,
@@ -3048,7 +3054,8 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            "gpt_oss_120b_harmony",
                            env=env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=600)
 
 
 @skip_pre_hopper

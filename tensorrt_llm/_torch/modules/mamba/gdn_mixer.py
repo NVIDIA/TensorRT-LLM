@@ -28,7 +28,7 @@ from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...attention_backend import AttentionMetadata
+from ...attention.backends import AttentionMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -847,23 +847,29 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if is_target_verify and num_decode_tokens > 0:
             attn_out_prefill = None
             if num_prefill_tokens > 0:
-                recurrent_state_p = ssm_states[state_indices_p]
                 output_p = output[:, :num_prefill_tokens, :, :] if output is not None else None
-                attn_out_prefill, last_recurrent_state = chunk_gated_delta_rule(
+                # Same indexed, in-place state I/O as the non-verify prefill path
+                # below: read each request's initial state from its pool slot and
+                # write the final state back to it inside the kernel, instead of
+                # gathering a [num_prefill, H, V, K] copy and scattering it back.
+                # Preconditions match that path: fresh slots were zeroed in
+                # forward_core, and prefill slots never alias the decode slots
+                # verified in the same step.
+                attn_out_prefill, _ = chunk_gated_delta_rule(
                     q=query_p,
                     k=key_p,
                     v=value_p,
                     g=g_p,
                     beta=beta_p,
-                    initial_state=recurrent_state_p,
-                    output_final_state=True,
+                    initial_state=ssm_states,
+                    initial_state_indices=state_indices_p,
+                    inplace_indexed_state_update=True,
+                    output_final_state=False,
                     cu_seqlens=query_start_loc_long[: num_prefill + 1],
                     head_first=False,
                     use_qk_l2norm_in_kernel=False,
                     output=output_p,
                 )
-                last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-                ssm_states[state_indices_p] = last_recurrent_state
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
             query_d = query_d.reshape(

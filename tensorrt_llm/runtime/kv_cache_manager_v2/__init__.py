@@ -22,6 +22,10 @@ from typing import NamedTuple, Optional, Union
 
 _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
+#: Name of the active backend ("cpp" or "python"). Exposed so callers can gate
+#: Python-only extension points, such as duck-typed event sinks, on the selection.
+BACKEND = _BACKEND
+
 if _BACKEND == "python":
     from . import rawref  # noqa: F401
     from ._block_radix_tree import (  # noqa: F401
@@ -190,6 +194,7 @@ else:
         layers: object = None
         max_util_for_resume: float = 0.97
         enable_partial_reuse: bool = True
+        reuse_match_backoff: int = 0
         constraints: object = None
         typical_step: object = None
         initial_pool_ratio: object = None
@@ -292,6 +297,7 @@ else:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
+    "BACKEND",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",

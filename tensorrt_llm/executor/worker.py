@@ -13,7 +13,6 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
-from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -38,13 +37,18 @@ __all__ = [
 # touches the PyTorch model zoo should not pay for it.
 _MODELING_UTILS_MODULE = "tensorrt_llm._torch.models.modeling_utils"
 
+# Probed (not imported) in shutdown() so a non-MegaMoE run does not pull in
+# the MoE stack just to release an empty cache. Must stay in sync with the
+# real module path -- a mismatch silently degrades the release to a no-op.
+_MEGA_MOE_DEEPGEMM_MODULE = (
+    "tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm")
+
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -56,7 +60,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
     ) -> None:
         super().__init__(
             engine=engine,
-            executor_config=executor_config,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -125,19 +128,25 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.engine.shutdown()
             self.engine = None
 
-            if self.llm_args is not None:
-                assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
-                if (self.llm_args.backend == "pytorch"
-                        and hasattr(self, "checkpoint_loader")
-                        and self.checkpoint_loader is not None):
-                    self.checkpoint_loader.cleanup()
-                    self.checkpoint_loader = None
-            else:
-                if hasattr(
-                        self._executor_config, "checkpoint_loader"
-                ) and self._executor_config.checkpoint_loader is not None:
-                    self._executor_config.checkpoint_loader.cleanup()
-                    self._executor_config.checkpoint_loader = None
+            if (self.llm_args.backend == "pytorch"
+                    and hasattr(self, "checkpoint_loader")
+                    and self.checkpoint_loader is not None):
+                self.checkpoint_loader.cleanup()
+                self.checkpoint_loader = None
+
+        # MegaMoE's NVLink symmetric-memory activation workspaces are
+        # rendezvoused over the EP group, so they must go before the
+        # destroy_process_group() below. Never let a failure here escape:
+        # doing_shutdown is already set, so a retry would no-op, and skipping
+        # the teardown below would leave NCCL communicators alive -- turning a
+        # MegaMoE-only failure into a worker teardown hang.
+        mega_moe = sys.modules.get(_MEGA_MOE_DEEPGEMM_MODULE)
+        if mega_moe is not None:
+            try:
+                mega_moe.release_symm_buffer_cache()
+            except Exception as e:
+                logger.error(
+                    f"Failed to release MegaMoE symm buffers on shutdown: {e}")
 
         # Destroy torch distributed process groups so that NCCL communicators
         # are torn down cleanly before MPI session shutdown and process exit.
@@ -179,7 +188,6 @@ def worker_main(
     engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
-    executor_config: Optional[tllm.ExecutorConfig] = None,
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
@@ -374,7 +382,6 @@ def worker_main(
     try:
         worker: GenerationExecutorWorker = worker_cls(
             engine,
-            executor_config,
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,

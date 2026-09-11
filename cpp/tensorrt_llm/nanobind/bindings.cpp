@@ -20,7 +20,6 @@
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_vector.h>
 #include <nanobind/stl/chrono.h>
-#include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
@@ -50,13 +49,13 @@
 #include "tensorrt_llm/nanobind/testing/kvCacheManagerTestUtilBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
+#include "tensorrt_llm/nanobind/visual_gen/coordinatorWatchdog.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
@@ -135,6 +134,13 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
+
+    mInternal.def("start_coordinator_watchdog", &tensorrt_llm::nanobind::visual_gen::startCoordinatorWatchdog,
+        nb::arg("coordinator_pid"), "Terminate this process when its coordinator exits.");
+    mInternalTesting.def("start_coordinator_watchdog_with_pidfd_error",
+        &tensorrt_llm::nanobind::visual_gen::testing::startCoordinatorWatchdogWithPidfdError,
+        nb::arg("coordinator_pid"), nb::arg("pidfd_error_code"),
+        "Test coordinator supervision when pidfd_open returns an error.");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
@@ -384,101 +390,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
             nb::arg("pipeline_parallelism") = nb::none(), nb::arg("context_parallelism") = nb::none(),
             nb::arg("device_ids") = nb::none(), nb::arg("enable_attention_dp") = false);
 
-    auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> nb::tuple
-    {
-        return nb::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
-            config.presencePenalty, config.frequencyPenalty, config.promptIgnoreLength, config.topK, config.topP,
-            config.randomSeed, config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate,
-            config.lengthPenalty, config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences,
-            config.minP, config.beamWidthArray);
-    };
-    auto SamplingConfigSetState = [](tr::SamplingConfig& self, nb::tuple t)
-    {
-        if (t.size() != 20)
-        {
-            throw std::runtime_error("Invalid SamplingConfig state!");
-        }
-
-        tr::SamplingConfig config;
-        config.beamWidth = nb::cast<SizeType32>(t[0]);
-        config.temperature = nb::cast<OptVec<float>>(t[1]);
-        config.minLength = nb::cast<OptVec<SizeType32>>(t[2]);
-        config.repetitionPenalty = nb::cast<OptVec<float>>(t[3]);
-        config.presencePenalty = nb::cast<OptVec<float>>(t[4]);
-        config.frequencyPenalty = nb::cast<OptVec<float>>(t[5]);
-        config.promptIgnoreLength = nb::cast<OptVec<SizeType32>>(t[6]);
-        config.topK = nb::cast<OptVec<SizeType32>>(t[7]);
-        config.topP = nb::cast<OptVec<float>>(t[8]);
-        config.randomSeed = nb::cast<OptVec<uint64_t>>(t[9]);
-        config.topPDecay = nb::cast<OptVec<float>>(t[10]);
-        config.topPMin = nb::cast<OptVec<float>>(t[11]);
-        config.topPResetIds = nb::cast<OptVec<TokenIdType>>(t[12]);
-        config.beamSearchDiversityRate = nb::cast<OptVec<float>>(t[13]);
-        config.lengthPenalty = nb::cast<OptVec<float>>(t[14]);
-        config.earlyStopping = nb::cast<OptVec<SizeType32>>(t[15]);
-        config.noRepeatNgramSize = nb::cast<OptVec<SizeType32>>(t[16]);
-        config.numReturnSequences = nb::cast<SizeType32>(t[17]);
-        config.minP = nb::cast<OptVec<float>>(t[18]);
-        config.beamWidthArray = nb::cast<OptVec<std::vector<SizeType32>>>(t[19]);
-
-        new (&self) tr::SamplingConfig(config);
-    };
-
-    nb::class_<tr::SamplingConfig>(m, "SamplingConfig")
-        .def(nb::init<SizeType32>(), nb::arg("beam_width") = 1)
-        .def(nb::init<tle::SamplingConfig, std::optional<tle::ExternalDraftTokensConfig>>(),
-            nb::arg("executor_sample_config"), nb::arg("external_draft_tokens_config") = std::nullopt)
-        .def_rw("beam_width", &tr::SamplingConfig::beamWidth)
-        .def_rw("temperature", &tr::SamplingConfig::temperature)
-        .def_rw("min_length", &tr::SamplingConfig::minLength)
-        .def_rw("repetition_penalty", &tr::SamplingConfig::repetitionPenalty)
-        .def_rw("presence_penalty", &tr::SamplingConfig::presencePenalty)
-        .def_rw("frequency_penalty", &tr::SamplingConfig::frequencyPenalty)
-        .def_rw("prompt_ignore_length", &tr::SamplingConfig::promptIgnoreLength)
-        .def_rw("top_k", &tr::SamplingConfig::topK)
-        .def_rw("top_p", &tr::SamplingConfig::topP)
-        .def_rw("random_seed", &tr::SamplingConfig::randomSeed)
-        .def_rw("top_p_decay", &tr::SamplingConfig::topPDecay)
-        .def_rw("top_p_min", &tr::SamplingConfig::topPMin)
-        .def_rw("top_p_reset_ids", &tr::SamplingConfig::topPResetIds)
-        .def_rw("beam_search_diversity_rate", &tr::SamplingConfig::beamSearchDiversityRate)
-        .def_rw("length_penalty", &tr::SamplingConfig::lengthPenalty)
-        .def_rw("early_stopping", &tr::SamplingConfig::earlyStopping)
-        .def_rw("no_repeat_ngram_size", &tr::SamplingConfig::noRepeatNgramSize)
-        .def_rw("num_return_sequences", &tr::SamplingConfig::numReturnSequences)
-        .def_rw("min_p", &tr::SamplingConfig::minP)
-        .def_rw("beam_width_array", &tr::SamplingConfig::beamWidthArray)
-        .def_rw("normalize_log_probs", &tr::SamplingConfig::normalizeLogProbs)
-        .def("__getstate__", SamplingConfigGetState)
-        .def("__setstate__", SamplingConfigSetState)
-        .def("__eq__", &tr::SamplingConfig::operator==);
-
-    nb::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
-        .def(nb::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
-                 tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
-            nb::arg("name"), nb::arg("version"), nb::arg("precision"), nb::arg("tensor_parallelism"),
-            nb::arg("pipeline_parallelism"), nb::arg("context_parallelism"), nb::arg("gpus_per_node"),
-            nb::arg("model_config"), nb::arg("runtime_defaults") = nb::none())
-        .def_static("parse", nb::overload_cast<std::string const&>(&tr::GptJsonConfig::parse), nb::arg("json"))
-        .def_static(
-            "parse_file", nb::overload_cast<std::filesystem::path const&>(&tr::GptJsonConfig::parse), nb::arg("path"))
-        .def_prop_ro("model_config", &tr::GptJsonConfig::getModelConfig)
-        .def_prop_ro("name", &tr::GptJsonConfig::getName)
-        .def_prop_ro("version", &tr::GptJsonConfig::getVersion)
-        .def_prop_ro("precision", &tr::GptJsonConfig::getPrecision)
-        .def_prop_ro("tensor_parallelism", &tr::GptJsonConfig::getTensorParallelism)
-        .def_prop_ro("pipeline_parallelism", &tr::GptJsonConfig::getPipelineParallelism)
-        .def_prop_ro("context_parallelism", &tr::GptJsonConfig::getContextParallelism)
-        .def_prop_ro("gpus_per_node", &tr::GptJsonConfig::getGpusPerNode)
-        .def_prop_ro("world_size", &tr::GptJsonConfig::getWorldSize)
-        .def_prop_ro("runtime_defaults", &tr::GptJsonConfig::getRuntimeDefaults)
-        .def("engine_filename",
-            nb::overload_cast<tr::WorldConfig const&, std::string const&>(
-                &tr::GptJsonConfig::engineFilename, nb::const_),
-            nb::arg("world_config"), nb::arg("model"))
-        .def("engine_filename",
-            nb::overload_cast<tr::WorldConfig const&>(&tr::GptJsonConfig::engineFilename, nb::const_),
-            nb::arg("world_config"));
+    // `tensorrt_llm.bindings.SamplingConfig` used to be a distinct runtime type that wrapped
+    // every executor sampling parameter in a one-element vector for the batched C++ decoder.
+    // That decoder is gone and LlmRequest now holds an executor::SamplingConfig directly, so
+    // the name is kept as an alias to avoid breaking `from tensorrt_llm.bindings import SamplingConfig`.
+    m.attr("SamplingConfig") = mExecutor.attr("SamplingConfig");
 
     nb::enum_<tb::LlmRequestState>(m, "LlmRequestState")
         .value("UNKNOWN", tb::LlmRequestState::kUNKNOWN)

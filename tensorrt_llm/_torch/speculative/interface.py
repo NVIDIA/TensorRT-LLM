@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Protocol, Type
 
 import torch
 from packaging.version import Version
@@ -28,9 +28,9 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
-from ..attention_backend.interface import AttentionMetadata
-from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
-                                        TrtllmAttentionMetadata)
+from ..attention.backends.interface import AttentionMetadata
+from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
+                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -132,6 +132,36 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
             and spec_config.draft_is_embedded_in_target):
         return False
     return spec_config._allow_separate_draft_kv_cache
+
+
+def draft_prompt_lookahead(spec_config) -> Optional[int]:
+    """Prompt tokens past position ``i`` that a one-model draft consumes at ``i``:
+    Eagle reads the shift-by-1 input ids, vanilla MTP chains ``D`` layers.
+
+    Read by the context-chunk tail token (``_prepare_context_input_ids``) and by a
+    separate draft pool's ``reuse_match_backoff``. ``None`` = span not established.
+    """
+    if spec_config is None:
+        return None
+    spec_mode = spec_config.spec_dec_mode
+    if not spec_mode.use_one_engine():
+        # Two-model drafting runs the draft as its own engine over its own
+        # request view, so nothing here is shifted against the target prompt.
+        return None
+    if spec_mode.is_mtp_vanilla():
+        # Known limitation: an internal chunk lacks target_hidden[i + k], so reuse
+        # can attach draft KV an unchunked prefill would not produce. Acceptance only.
+        return spec_config.max_draft_len
+    if spec_mode.is_eagle_one_model():
+        return 1
+    if spec_mode.is_pard():
+        # PARDWorker feeds the drafter input_ids[:num_ctx_tokens] verbatim, so
+        # its draft state at i is a function of tokens [0, i] like the target's.
+        return 0
+    # Unestablished elsewhere: DraftTargetOneModel likely shifts by 1 but is
+    # unvalidated; DFlash/DSpark build context draft K/V from projected target
+    # hidden states into worker-owned buffers, which block reuse cannot restore.
+    return None
 
 
 def prepare_attn_metadata_for_draft_replay(attn_metadata,
@@ -301,6 +331,10 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
+    def is_eagle_one_model(self):
+        """Whether MTP-Eagle or EAGLE3 uses the unified one-model worker."""
+        return self.is_mtp_eagle_one_model() or self.is_eagle3_one_model()
 
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
@@ -1036,6 +1070,25 @@ class SpecMetadata:
         self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
         self.draft_probs[slots, :draft_len, 0] = 1.0
 
+    def dp_num_tokens(self) -> int:
+        """Return the attention-DP token count for the current batch.
+
+        Some modes publish a count that differs from the scheduled
+        ``num_tokens`` (the draft-verification positions are excluded). Both
+        consumers read it from here so they cannot drift apart:
+        ``prepare()``, which rewrites ``self.num_tokens`` into this shape, and
+        the attention-DP allgather in ``model_engine``, which runs *before*
+        ``prepare()``. The allgathered value is what overrides
+        ``attn_metadata.all_rank_num_tokens`` on the step-0 draft forward,
+        which is why each mode's convention is load-bearing.
+
+        Contract: reads ``self.num_tokens`` and ``self.num_generations``, so
+        both must already be set for this batch, and it must be called before
+        ``prepare()`` rewrites ``num_tokens`` -- it is not idempotent for the
+        modes that subtract. The base metadata keeps the count as-is.
+        """
+        return self.num_tokens
+
     def prepare(self):
         """
         Hook to be called before the forward step of the model.
@@ -1100,10 +1153,6 @@ class SpecMetadata:
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
-        def _first_or_none(values):
-            """Return the first sampling parameter value when present."""
-            return values[0] if values is not None and len(values) > 0 else None
-
         def _normalize_request_sampling_params(
             *,
             temperature: Optional[float],
@@ -1147,9 +1196,9 @@ class SpecMetadata:
 
         for request in requests:
             sampling_config = request.sampling_config
-            temp_val = _first_or_none(sampling_config.temperature)
-            tk_val = _first_or_none(sampling_config.top_k)
-            tp_val = _first_or_none(sampling_config.top_p)
+            temp_val = sampling_config.temperature
+            tk_val = sampling_config.top_k
+            tp_val = sampling_config.top_p
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
@@ -1428,6 +1477,22 @@ class SpecMetadata:
         self._sampling_params_signature[1] = None
 
 
+class AuxiliarySpeculativeStateHandler(Protocol):
+    """Model-side state that verification writes once per draft token.
+
+    Only some draft tokens are accepted. The commit keeps the state written
+    for the accepted ones and undoes the rest.
+    """
+
+    def commit_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        ...
+
+
 class SpecWorkerBase(nn.Module, ABC):
     """
     Base class for speculative decoding workers.
@@ -1459,6 +1524,26 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        self._auxiliary_state_handlers: list[
+            AuxiliarySpeculativeStateHandler] = []
+
+    def register_auxiliary_state_handler(
+            self, handler: AuxiliarySpeculativeStateHandler) -> None:
+        """Register one model-owned state handler without re-parenting the module."""
+        if not any(registered is handler
+                   for registered in self._auxiliary_state_handlers):
+            self._auxiliary_state_handlers.append(handler)
+
+    def commit_auxiliary_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        """Promote registered model-side states using accepted token counts."""
+        for handler in self._auxiliary_state_handlers:
+            handler.commit_speculative_states(num_accepted_tokens,
+                                              state_indices, num_contexts)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -2644,7 +2729,8 @@ class SpecWorkerBase(nn.Module, ABC):
     ):
         """
         Prepare context input IDs for draft model forward.
-        Shifts input IDs left by 1 and places the first accepted token at gather positions.
+        Shifts input IDs left by 1 (``draft_prompt_lookahead == 1``), leaving one
+        hole per request at the chunk's last position.
 
         Args:
             input_ids: Original input IDs tensor
@@ -2702,7 +2788,7 @@ class SpecWorkerBase(nn.Module, ABC):
             yield attn_metadata
             return
 
-        from ..attention_backend.flashinfer import FlashInferAttentionMetadata
+        from ..attention.backends.flashinfer import FlashInferAttentionMetadata
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
             yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
             return

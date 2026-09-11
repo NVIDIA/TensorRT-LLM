@@ -19,7 +19,6 @@ import datetime
 import json
 import os
 import random
-import sys
 import time
 from typing import List, Optional, Union
 
@@ -29,11 +28,11 @@ import torch
 import transformers
 
 from tensorrt_llm import LLM
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
-                                 LookaheadDecodingConfig, RequestOutput,
-                                 SADecodingConfig)
+                                 RequestOutput, SADecodingConfig)
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
@@ -46,7 +45,6 @@ from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, altered_env
@@ -509,7 +507,7 @@ def test_generate_with_stop_words():
 @force_ampere
 @pytest.mark.part0
 @pytest.mark.parametrize("model_path", [
-    get_model_path('gemma/gemma-3-1b-it'),
+    get_model_path(qwen3_tokenizer_model_name),
 ])
 def test_generate_with_detokenization_stop_words(model_path):
     llm = LLM(
@@ -524,16 +522,25 @@ def test_generate_with_detokenization_stop_words(model_path):
     }]
 
     formatted_prompt = llm.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False)
 
     detokenization_prompts = [formatted_prompt]
 
-    # Test case 1: Stop word "How" should be detected after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello there!"],
-                     sampling_params=SamplingParams(stop="How", max_tokens=10),
-                     finish_reasons=['stop'],
-                     stop_reasons=["How"])
+    # Test case 1: Stop word "How" should be detected after detokenization.
+    # Use an exact text match (rather than llm_check_output's fuzzy
+    # similarity check) to confirm the stop string is actually stripped from
+    # the output, not merely close enough to pass a SequenceMatcher ratio.
+    outputs = llm.generate(detokenization_prompts,
+                           sampling_params=SamplingParams(stop="How",
+                                                          max_tokens=10))
+    out = outputs[0].outputs[0]
+    assert out.finish_reason == 'stop'
+    assert out.stop_reason == "How"
+    assert out.text == "Hello there!", \
+        f"Stop string 'How' must not be retained in output text, got: {out.text!r}"
 
     # Test case 2: Stop word "there" should be detected after detokenization
     llm_check_output(llm,
@@ -562,7 +569,7 @@ def test_generate_with_detokenization_stop_words(model_path):
 @force_ampere
 @pytest.mark.part0
 @pytest.mark.parametrize("model_path", [
-    get_model_path('gemma/gemma-3-1b-it'),
+    get_model_path(qwen3_tokenizer_model_name),
 ])
 def test_generate_with_detokenization_stop_words_streaming(model_path):
     llm = LLM(
@@ -577,18 +584,46 @@ def test_generate_with_detokenization_stop_words_streaming(model_path):
     }]
 
     formatted_prompt = llm.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False)
 
     sampling_params = SamplingParams(stop="How", max_tokens=10)
 
+    # NOTE: without tracking `found_stop` and asserting on it after the loop,
+    # this test can silently pass if generate_async yields no outputs at all
+    # or never reaches a terminal finish_reason.
+    found_stop = False
     for output in llm.generate_async(formatted_prompt,
                                      sampling_params=sampling_params,
                                      streaming=True):
         if output.outputs[0].finish_reason == 'stop':
             assert output.outputs[0].stop_reason == "How"
+            assert output.outputs[0].text == "Hello there!"
+            found_stop = True
             break
         elif output.outputs[0].finish_reason == 'length':
             assert False, f"Expected to find stop word 'How' but reached max_tokens. Generated: {output.outputs[0].text}"
+        elif output.outputs[0].finish_reason not in (None, ''):
+            assert False, f"Unexpected finish_reason: {output.outputs[0].finish_reason}"
+
+    assert found_stop, "Expected to observe finish_reason='stop' with stop_reason='How', but no such output was produced"
+
+    # Test case: unmatched stop string should not trigger early stopping
+    sampling_params_no_match = SamplingParams(stop="XYZ", max_tokens=10)
+    found_length = False
+    for output in llm.generate_async(formatted_prompt,
+                                     sampling_params=sampling_params_no_match,
+                                     streaming=True):
+        if output.outputs[0].finish_reason == 'length':
+            assert output.outputs[0].stop_reason is None
+            found_length = True
+            break
+        elif output.outputs[0].finish_reason not in (None, ''):
+            assert False, f"Unexpected finish_reason: {output.outputs[0].finish_reason}"
+
+    assert found_length, "Expected to observe finish_reason='length' with stop_reason=None, but no such output was produced"
 
 
 @force_ampere
@@ -648,19 +683,6 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
         **llm_kwargs)
-
-
-@force_ampere
-def test_executor_lookahead_decoding_config():
-    lookahead_config = LookaheadDecodingConfig(max_window_size=10,
-                                               max_ngram_size=9,
-                                               max_verification_set_size=8)
-    sampling_params = SamplingParams(max_tokens=3,
-                                     lookahead_config=lookahead_config)
-
-    assert sampling_params.lookahead_config.max_window_size == 10
-    assert sampling_params.lookahead_config.max_ngram_size == 9
-    assert sampling_params.lookahead_config.max_verification_set_size == 8
 
 
 def test_executor_results_cleanup():
@@ -1428,6 +1450,7 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
         server.metrics_collector = None
         server._collect_perf_metrics = False
         server._input_proc_executor = None
+        server._adjusted_steady_clock = AdjustedSteadyClock()
 
         request = CompletionRequest(model="test-model",
                                     prompt=["A", "B"],
