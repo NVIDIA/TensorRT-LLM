@@ -869,6 +869,7 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     attn = TrtllmAttention.__new__(TrtllmAttention)
     attn.is_mla_enable = False
     attn.skip_correction_threshold = 0.0
+    attn._attention_ops = {}
     metadata = _make_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))

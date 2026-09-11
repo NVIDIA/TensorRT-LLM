@@ -255,9 +255,9 @@ def test_nested_python_args_are_lowered_once(monkeypatch) -> None:
     assert native.fwd.sparse_runtime_params.sparse_kv_indices == "sparse-indices"
     assert native.fwd.sparse_runtime_params.threshold_scale_factor_prefill == 0.25
     assert native.fwd.sparse_runtime_params.threshold_scale_factor_decode == 0.5
-    # Derived rather than declared, so it has no field on either side.
+    # The mask type is derived from the public attention-mask representation.
     assert native.mask_type == AttentionMaskType.causal
-    assert native.beam_width == 1
+    assert native.beam_width == 4
 
 
 def test_nested_none_does_not_replace_native_value(monkeypatch) -> None:

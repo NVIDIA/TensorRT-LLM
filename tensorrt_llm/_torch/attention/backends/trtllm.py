@@ -1893,7 +1893,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         # Testing only: ``mla_rope_generation`` normally rotates q_pe, appends the
         # new latent to the paged cache, and fills the trtllm-gen scheduler
-        # sequence buffers (cumulative q/kv seqlens). When the
+        # buffers (cumulative q/kv seqlens + the FMHA scheduler counter). When the
         # harness sets ``skip_mla_rope_generation`` it feeds a pre-RoPE'd fused_q,
         # so we skip only the RoPE and do the append + scheduler init here: the
         # generation FMHA only reads the cache, and the fallback path needs the
@@ -1917,6 +1917,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cu_kv[1:] = torch.cumsum(gen_kv_lens, dim=0).to(torch.int32)
             forward_args.cu_q_seqlens = cu_q
             forward_args.cu_kv_seqlens = cu_kv
+            if forward_args.fmha_scheduler_counter is None:
+                forward_args.fmha_scheduler_counter = torch.zeros(
+                    1, dtype=torch.uint32, device=q.device)
+            else:
+                forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
             from ...pyexecutor.kv_cache.mamba_cache_manager import \
                 BaseMambaCacheManager

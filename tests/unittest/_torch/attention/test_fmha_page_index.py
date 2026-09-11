@@ -283,6 +283,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
     fmha._enable_pdl = False
     fmha._multi_processor_count = 1
     fmha._multi_ctas_kv_counter = torch.empty(0, dtype=torch.int32)
+    fmha._attn_ref = lambda: attn
 
     FlashInferTrtllmGenFmha.run_generation(fmha, params)
 
