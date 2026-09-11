@@ -271,9 +271,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
 
             tokens_per_page = int(cache_config.tokens_per_block)
             if tokens_per_page % 4 != 0:
-                raise ValueError(
-                    "DeepSeek-V4 CSA Page geometry must divide tokens_per_block by 4"
-                )
+                raise ValueError("DeepSeek-V4 CSA Page geometry must divide tokens_per_block by 4")
             tokens_per_page //= 4
 
             element_bytes = 1 if runtime_type == 2 else 2
