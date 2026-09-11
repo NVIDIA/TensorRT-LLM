@@ -33,4 +33,4 @@ measured: []
 - **Accuracy risk:** lossy (FP4/FP8 block-scale GEMM). Mitigations: fp32 routing reduction + tanh, PDL off for fc1. NVFP4 weights use a distinct loader (`is_trtllm_nvfp4`) so weight layout must match.
 - **Verify:** MMLU / task accuracy vs CUTLASS baseline (commit adds `mmlu_llmapi.py` hooks, extends `test_moe.py`); grouped-GEMM kernel time drops in nsys.
 - **Rollback:** `moe_backend='CUTLASS'`. Trigger: accuracy regression beyond tolerance, or a dtype/shape lacking a trtllm-gen cubin.
-- **Prior art:** PR #3387. Files: `_torch/modules/fused_moe.py` (`is_trtllm`/`forward_trtllmgen`), `_torch/model_config.py` (`moe_backend`), `cpp/.../trtllmGenKernels/blockScaleMoe/{runner.cu,gemmList.h,RoutingKernel.cu}`, `thop/fp4BlockScaleMoe.cpp`. Owning skill: **trtllm-moe-develop**; cubins: **kernel-cute-specialist**.
+- **Prior art:** PR #3387. Files: `_torch/modules/fused_moe.py` (`is_trtllm`/`forward_trtllmgen`), `_torch/model_config.py` (`moe_backend`), `cpp/.../kernels/moe/trtllmGen/{runner.cu,gemmList.h,RoutingKernel.cu}`, `thop/moe/fp4BlockScaleMoe.cpp`. Owning skill: **trtllm-moe-develop**; cubins: **kernel-cute-specialist**.

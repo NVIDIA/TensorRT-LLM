@@ -337,7 +337,7 @@ def should_skip_trtllm(
     # - MiniMax2 (sigmoid activation, bias-added selection, scaled sum-normalize)
     # - Llama4 (requires top_k=1)
     # - Renormalize / RenormalizeNaive / Default (softmax-based)
-    # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu
+    # See: cpp/tensorrt_llm/kernels/moe/trtllmGen/runner.cu
     if routing_method_cls is not None:
         from tensorrt_llm._torch.moe.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
