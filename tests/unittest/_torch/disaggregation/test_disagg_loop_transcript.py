@@ -326,6 +326,8 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
     executor.enable_attention_dp = True
     executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
     executor.dist.tp_allgather_int64.return_value = Mock(any=lambda: False)
+    # The real error vote iterates the gathered votes; echo this rank's twice.
+    executor.dist.tp_allgather.side_effect = lambda obj: [obj, obj]
     executor.kv_cache_transceiver = transceiver
     del executor._disagg_coordinator
     if transceiver is not None:

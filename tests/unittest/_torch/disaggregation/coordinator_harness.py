@@ -94,7 +94,6 @@ class CoordinatorHarness:
             dist if dist is not None else Mock(rank=0, tp_size=tp_size, world_size=world_size)
         )
         self.delegates = Mock()
-        self.delegates.requests_in_error_state.return_value = []
         self.coordinator = DisaggTransferCoordinator(
             transceiver=self.transceiver,
             transfer_manager=self.transfers,

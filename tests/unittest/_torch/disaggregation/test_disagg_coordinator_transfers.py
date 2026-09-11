@@ -174,8 +174,9 @@ def test_fast_completion_without_a_response_terminates_immediately() -> None:
 
 
 def test_failed_send_releases_its_claim_but_leaves_the_request_to_the_error_path() -> None:
-    """The transfer ends (blocks unpinned) but the request stays active so the
-    rank-synchronized error pass can respond; nothing is terminated here."""
+    """The transfer ends (blocks unpinned) and the still-active request is
+    handed to the executor's error path as a context failure; the reap itself
+    terminates nothing."""
     h = _Harness()
     req = _Request(1)
     h.active.append(req)
@@ -189,7 +190,7 @@ def test_failed_send_releases_its_claim_but_leaves_the_request_to_the_error_path
     assert not h.in_transfer(req)
     assert h.effects.terminated == []
     assert h.effects.staged_responses == []
-    h.delegates.check_transfer_errors.assert_called_once_with("context requests")
+    assert h.effects.failed == [("Error in kv cache transfer for context requests", [req], False)]
 
 
 def test_failure_reported_after_release_is_kept_for_the_synced_error_pass() -> None:
@@ -274,6 +275,7 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
         _Request(1, is_context_only_request=False),
         _Request(2, is_context_only_request=False),
     )
+    h.active.extend([remote, user])
     h.registry.canceled = [2]
     h.transceiver.request_and_receive_async(remote)
     h.transceiver.request_and_receive_async(user)
@@ -284,17 +286,22 @@ def test_remote_cancellation_of_a_receive_fails_the_request_unless_the_user_canc
 
     assert remote.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert user.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-    h.delegates.check_transfer_errors.assert_called_once_with("generation requests")
+    assert h.effects.failed == [
+        ("Error in kv cache transfer for generation requests", [remote], False)
+    ]
 
 
 def test_gen_reap_leaves_error_handling_to_the_consensus_path_under_inflight_cancel(
     inflight_cancel,
 ) -> None:
     h = _Harness(supports_inflight_cancellation=True)
+    h.active.append(
+        _Request(1, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR)
+    )
 
     h.coordinator.reap_gen_receives(0)
 
-    h.delegates.check_transfer_errors.assert_not_called()
+    assert h.effects.failed == []
 
 
 # -- timeouts ----------------------------------------------------------------
@@ -486,7 +493,7 @@ def test_peer_rank_timeout_decision_is_mirrored_locally(inflight_cancel, clock) 
 def test_generation_error_consensus_fails_only_when_some_rank_needs_it(inflight_cancel) -> None:
     h = _Harness(supports_inflight_cancellation=True, tp_size=2)
     error_req = _Request(1, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR)
-    h.delegates.requests_in_error_state.return_value = [error_req]
+    h.active.append(error_req)
     h.dist.tp_allgather.return_value = [[], []]  # no timed-out receives on any rank
 
     h.dist.tp_allreduce.return_value = 0

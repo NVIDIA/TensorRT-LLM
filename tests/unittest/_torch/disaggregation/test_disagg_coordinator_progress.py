@@ -102,7 +102,6 @@ def test_generation_error_flush_is_entered_by_the_rank_without_errors_too(
         1, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR
     )
     ranks[0].active.append(error_req)
-    ranks[0].delegates.requests_in_error_state.return_value = [error_req]
 
     group.run(lambda rank: ranks[rank].coordinator.poll_gen_transfers())
 
