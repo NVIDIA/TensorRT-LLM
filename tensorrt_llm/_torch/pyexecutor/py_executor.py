@@ -3593,8 +3593,6 @@ class PyExecutor:
                 revert_deferred_gen_init=self.
                 _revert_deferred_disagg_gen_init_alloc,
                 receive_gen_init=self._prepare_disagg_gen_init,
-                poll_progress_when_idle=self.
-                _check_disagg_transfer_progress_when_idle,
                 prepare_transmission_completed=self.
                 _prepare_disagg_gen_transmission_complete,
                 check_transfer_errors=self._check_cache_transfer_errors,
@@ -3728,26 +3726,6 @@ class PyExecutor:
         if self._dist_size(self.dist, "tp_size") > 1:
             return self.dist.tp_allgather(local_status)
         return [local_status]
-
-    def _check_disagg_transfer_progress_when_idle(self) -> None:
-        """Reap completed context KV transfers so their blocks can be freed.
-
-        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
-        must not enter the context status collective here. A single-rank
-        worker cannot diverge and polls only while a send is in flight.
-        """
-        uses_synchronous_gen_transfer = (
-            not self._uses_async_disagg_gen_transfer()
-            and not self._is_disagg_gen_only_no_context_benchmark())
-        should_poll_synchronous_context_status = (
-            uses_synchronous_gen_transfer
-            and self._dist_size(self.dist, "world_size") == 1
-            and self.async_transfer_manager.has_any_inflight_requests())
-        if (uses_synchronous_gen_transfer
-                and not should_poll_synchronous_context_status):
-            return
-
-        self.disagg.reap_context_sends(0)
 
     def _pp_ring_is_drained(self) -> bool:
         """Return whether no microbatch is queued or awaiting handling."""

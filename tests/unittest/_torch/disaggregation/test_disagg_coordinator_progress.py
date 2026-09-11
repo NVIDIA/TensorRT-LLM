@@ -19,6 +19,13 @@ from tensorrt_llm.bindings import LlmRequestState
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(autouse=True)
+def _async_transfer_mode(monkeypatch) -> None:
+    """Asynchronous generation transfers unless a test sets a mode knob itself."""
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+
+
 def _ranks(group: FakeDistGroup, **kwargs) -> list:
     return [CoordinatorHarness(dist=group.rank(rank), **kwargs) for rank in range(group.world_size)]
 
@@ -116,3 +123,86 @@ def test_timeout_check_is_rank_local(clock) -> None:
 
     assert all(req.py_kv_transfer_timed_out for req in requests)
     assert [h.dist.calls for h in ranks] == [[], []]
+
+
+# -- idle progress poll ------------------------------------------------------
+
+
+_CONTEXT_POLL = "check_context_transfer_status:0"
+
+
+def test_idle_poll_reaps_context_sends_and_leaves_gen_status_to_the_loop_head() -> None:
+    """The loop head already polls generation status every iteration. The
+    context poll is a consensus inside the transceiver and rank-symmetric, so
+    no dist collective gates it, whatever the model-parallel layout."""
+    h = CoordinatorHarness(dist=FakeDistGroup(world_size=16, tp_size=4).rank(0))
+
+    h.coordinator.poll_progress_when_idle()
+
+    assert h.transceiver.call_log == [_CONTEXT_POLL]
+    assert h.dist.calls == []
+
+
+def test_gen_only_benchmark_still_reaps_context_sends_when_idle(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
+    h = CoordinatorHarness(dist=FakeDistGroup(world_size=4, tp_size=4).rank(0))
+
+    h.coordinator.poll_progress_when_idle()
+
+    assert h.transceiver.call_log == [_CONTEXT_POLL]
+    assert h.dist.calls == []
+
+
+def test_sync_transfers_skip_the_idle_poll_on_a_multi_rank_worker(monkeypatch) -> None:
+    """A synchronous GEN receive blocks rank-locally, so a multi-rank worker
+    must not enter the context status collective from the idle path, even
+    with a send in flight."""
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    h = CoordinatorHarness(dist=FakeDistGroup(world_size=4, tp_size=4).rank(0))
+    h.send(TransferRequest(1))
+    sent = list(h.transceiver.call_log)
+
+    h.coordinator.poll_progress_when_idle()
+
+    assert h.transceiver.call_log == sent
+    assert h.dist.calls == []
+
+
+@pytest.mark.parametrize("send_in_flight", [False, True])
+def test_sync_transfers_on_a_single_rank_poll_only_while_a_send_is_in_flight(
+    monkeypatch, send_in_flight: bool
+) -> None:
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    h = CoordinatorHarness()
+    if send_in_flight:
+        h.send(TransferRequest(1))
+    before = list(h.transceiver.call_log)
+
+    h.coordinator.poll_progress_when_idle()
+
+    assert h.transceiver.call_log == before + ([_CONTEXT_POLL] if send_in_flight else [])
+
+
+def test_async_idle_poll_is_entered_by_every_rank_regardless_of_local_sends() -> None:
+    """A rank with nothing in flight enters the context status poll too; the
+    consensus is inside the transceiver and needs no dist collective."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _ranks(group)
+    ranks[1].send(TransferRequest(1))
+
+    group.run(lambda rank: ranks[rank].coordinator.poll_progress_when_idle())
+
+    assert [h.transceiver.call_log.count(_CONTEXT_POLL) for h in ranks] == [1, 1]
+    assert [h.dist.calls for h in ranks] == [[], []]
+
+
+def test_sync_idle_poll_is_skipped_by_every_rank_of_a_multi_rank_worker(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _ranks(group)
+    ranks[1].send(TransferRequest(1))
+    logs = [list(h.transceiver.call_log) for h in ranks]
+
+    group.run(lambda rank: ranks[rank].coordinator.poll_progress_when_idle())
+
+    assert [h.transceiver.call_log for h in ranks] == logs

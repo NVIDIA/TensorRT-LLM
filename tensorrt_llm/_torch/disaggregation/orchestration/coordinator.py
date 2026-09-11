@@ -60,7 +60,6 @@ class DisaggLoopDelegates:
     admit: Callable[[List[LlmRequest]], Tuple[List[LlmRequest], bool]]
     revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
     receive_gen_init: Callable[[List[LlmRequest]], None]
-    poll_progress_when_idle: Callable[[], None]
     prepare_transmission_completed: Callable[["ScheduledRequests"], None]
     # Rank-local transfer error handling; reached from the reaps. CS-3.
     check_transfer_errors: Callable[[str], None]
@@ -194,8 +193,24 @@ class DisaggTransferCoordinator:
         self._d.receive_gen_init(admitted)
 
     def poll_progress_when_idle(self) -> None:
-        """Reap completed context sends; rank-symmetric."""
-        self._d.poll_progress_when_idle()
+        """Reap completed context KV transfers so their blocks can be freed.
+
+        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
+        must not enter the context status collective here. A single-rank
+        worker cannot diverge and polls only while a send is in flight.
+        """
+        uses_synchronous_gen_transfer = (
+            not uses_async_gen_transfer() and not is_gen_only_no_context_benchmark()
+        )
+        should_poll_synchronous_context_status = (
+            uses_synchronous_gen_transfer
+            and self._dist.world_size == 1
+            and self._transfers.has_any_inflight_requests()
+        )
+        if uses_synchronous_gen_transfer and not should_poll_synchronous_context_status:
+            return
+
+        self.reap_context_sends(0)
 
     # -- batch execution -----------------------------------------------------
 
@@ -561,6 +576,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         return fitting_gen_init, False
 
     def poll_gen_transfers(self) -> None:
+        return None
+
+    def poll_progress_when_idle(self) -> None:
         return None
 
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:

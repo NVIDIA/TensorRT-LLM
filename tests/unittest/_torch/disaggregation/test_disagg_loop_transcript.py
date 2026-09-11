@@ -10,8 +10,9 @@ coordinator; a changed sequence is a review signal, not necessarily a bug.
 
 Rank symmetry is checked only in the narrow form that fits one process: the
 first and a non-first PP rank must issue the same collective-sensitive calls in
-the same order during an idle iteration. Real multi-rank blocking semantics are
-covered elsewhere (Gloo tests; FakeDist arrives with CS-2). Regular disagg PP
+the same order during an idle iteration. Rank skew inside the coordinator is
+covered by the FakeDist tests (test_disagg_coordinator_progress.py); real
+multi-process blocking semantics only by multi-GPU E2E. Regular disagg PP
 termination advances from executed-batch handling; a recompute-pause fallback
 can call the same termination handler from an idle iteration. Neither path is
 covered here (nothing is pending in these iterations); both belong to the
@@ -47,9 +48,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 
 pytestmark = pytest.mark.cpu_only
 
-# Coordinator entry points whose delegates run a rank-consensus collective.
-# Derived from the delegate targets in PyExecutor._build_disagg_coordinator;
-# update alongside them.
+# Coordinator entry points that run a rank-consensus collective, in the
+# coordinator itself or in a delegate. Maintained by hand as entry points move.
 _COLLECTIVE_COORDINATOR_CALLS = {
     "handle_errors_synced",  # dist.allreduce / tp_allgather under ADP
     "prepare_context_schedulable",  # transceiver.prepare_context_requests consensus
@@ -113,6 +113,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.kv_cache_transceiver = Mock()
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.has_any_inflight_requests.return_value = False
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
     executor.kv_connector_manager = None
 
     executor.device_id = 0
