@@ -6072,21 +6072,25 @@ class PyExecutor:
 
         self.active_requests.extend(validated_requests)
         if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            for request in validated_requests:
-                if not request.is_disagg_generation_init_state:
-                    continue
-                disagg_diagnostics.emit_event(
-                    "gen_ingress",
-                    side="gen",
-                    request_id=get_unique_rid(request),
-                    local_request_id=request.py_request_id,
-                    rank=self.global_rank,
-                    prompt_tokens=request.prompt_len,
-                    state=request.state.name,
-                    tp_rank=self.dist.tp_rank,
-                    pp_rank=self.dist.pp_rank,
-                    cp_rank=self.dist.cp_rank,
-                )
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for request in validated_requests:
+                    if not request.is_disagg_generation_init_state:
+                        continue
+                    prompt_tokens = getattr(request, "total_input_len_cp", None)
+                    if prompt_tokens is None:
+                        prompt_tokens = request.prompt_len
+                    disagg_diagnostics.emit_event(
+                        "gen_ingress",
+                        side="gen",
+                        request_id=get_unique_rid(request),
+                        local_request_id=request.py_request_id,
+                        rank=self.global_rank,
+                        prompt_tokens=prompt_tokens,
+                        state=request.state.name,
+                        tp_rank=self.dist.tp_rank,
+                        pp_rank=self.dist.pp_rank,
+                        cp_rank=self.dist.cp_rank,
+                    )
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -7259,17 +7263,21 @@ class PyExecutor:
 
             self._maybe_prepend_logprobs_and_logits(req, beam_width)
             if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                disagg_diagnostics.emit_event(
-                    "gen_decode_ready",
-                    side="gen",
-                    request_id=get_unique_rid(req),
-                    local_request_id=req.py_request_id,
-                    rank=self.global_rank,
-                    prompt_tokens=req.prompt_len,
-                    tp_rank=self.dist.tp_rank,
-                    pp_rank=self.dist.pp_rank,
-                    cp_rank=self.dist.cp_rank,
-                )
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    prompt_tokens = getattr(req, "total_input_len_cp", None)
+                    if prompt_tokens is None:
+                        prompt_tokens = req.prompt_len
+                    disagg_diagnostics.emit_event(
+                        "gen_decode_ready",
+                        side="gen",
+                        request_id=get_unique_rid(req),
+                        local_request_id=req.py_request_id,
+                        rank=self.global_rank,
+                        prompt_tokens=prompt_tokens,
+                        tp_rank=self.dist.tp_rank,
+                        pp_rank=self.dist.pp_rank,
+                        cp_rank=self.dist.cp_rank,
+                    )
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
@@ -8013,21 +8021,22 @@ class PyExecutor:
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
         self.resource_manager.free_resources(request)
-        if (disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
-                and request.is_context_only_request):
-            disagg_diagnostics.emit_event(
-                "ctx_source_kv_released",
-                side="ctx",
-                request_id=get_unique_rid(request),
-                local_request_id=request.py_request_id,
-                rank=self.global_rank,
-                prompt_tokens=request.prompt_len,
-                state=request.state.name,
-                source_kv_request_owned=False,
-                tp_rank=self.dist.tp_rank,
-                pp_rank=self.dist.pp_rank,
-                cp_rank=self.dist.cp_rank,
-            )
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if request.is_context_only_request:
+                    disagg_diagnostics.emit_event(
+                        "ctx_source_kv_released",
+                        side="ctx",
+                        request_id=get_unique_rid(request),
+                        local_request_id=request.py_request_id,
+                        rank=self.global_rank,
+                        prompt_tokens=request.prompt_len,
+                        state=request.state.name,
+                        source_kv_request_owned=False,
+                        tp_rank=self.dist.tp_rank,
+                        pp_rank=self.dist.pp_rank,
+                        cp_rank=self.dist.cp_rank,
+                    )
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
 

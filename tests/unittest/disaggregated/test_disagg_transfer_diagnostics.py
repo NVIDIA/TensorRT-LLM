@@ -26,6 +26,17 @@ from tensorrt_llm._torch.disaggregation import diagnostics
 pytestmark = pytest.mark.cpu_only
 
 
+def test_suppress_diagnostic_errors_does_not_interrupt_request_progress() -> None:
+    progress = []
+
+    with diagnostics.suppress_diagnostic_errors():
+        progress.append("diagnostic_started")
+        raise RuntimeError("diagnostic preparation failed")
+
+    progress.append("request_progressed")
+    assert progress == ["diagnostic_started", "request_progressed"]
+
+
 def test_disabled_emit_event_does_no_diagnostic_work(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
 
@@ -49,6 +60,45 @@ def test_disabled_emit_event_does_no_diagnostic_work(monkeypatch: pytest.MonkeyP
     unexpected_call.assert_not_called()
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork support")
+def test_forked_child_replaces_inherited_diagnostic_sink() -> None:
+    diagnostics._reset_diagnostic_sink_for_tests()
+    parent_pid = os.getpid()
+    parent_sink = diagnostics._get_sink(parent_pid)
+    read_fd, write_fd = os.pipe()
+
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            reset_in_child = diagnostics._sink is None
+            child_sink = diagnostics._get_sink(os.getpid())
+            result = (
+                reset_in_child
+                and child_sink is not parent_sink
+                and child_sink.pid == os.getpid()
+                and child_sink._thread.is_alive()
+            )
+            diagnostics._reset_diagnostic_sink_for_tests()
+            os.write(write_fd, b"ok" if result else b"failed")
+        except BaseException as error:
+            os.write(write_fd, f"error: {error!r}".encode())
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+
+    os.close(write_fd)
+    try:
+        child_result = os.read(read_fd, 4096)
+        _, status = os.waitpid(child_pid, 0)
+    finally:
+        os.close(read_fd)
+        diagnostics._reset_diagnostic_sink_for_tests()
+
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert child_result == b"ok"
+
+
 def test_enabled_emit_event_records_request_and_rank_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -57,12 +107,17 @@ def test_enabled_emit_event_records_request_and_rank_context(
     monkeypatch.setattr(diagnostics, "_host_identity", lambda: "node-a")
     request_thread_id = threading.get_ident()
     writes = []
+
+    def write(fd: int, data: bytes) -> int:
+        writes.append((threading.get_ident(), fd, data))
+        return len(data)
+
     monkeypatch.setattr(
         diagnostics,
         "os",
         SimpleNamespace(
             getpid=lambda: 321,
-            write=lambda fd, data: writes.append((threading.get_ident(), fd, data)),
+            write=write,
         ),
     )
     monkeypatch.setattr(
@@ -132,12 +187,17 @@ def test_enabled_emit_event_accepts_executor_rank_context(monkeypatch: pytest.Mo
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
     monkeypatch.setattr(diagnostics, "_host_identity", lambda: "node-b")
     writes = []
+
+    def write(fd: int, data: bytes) -> int:
+        writes.append((fd, data))
+        return len(data)
+
     monkeypatch.setattr(
         diagnostics,
         "os",
         SimpleNamespace(
             getpid=lambda: 654,
-            write=lambda fd, data: writes.append((fd, data)),
+            write=write,
         ),
     )
     monkeypatch.setattr(
@@ -165,6 +225,46 @@ def test_enabled_emit_event_accepts_executor_rank_context(monkeypatch: pytest.Mo
     assert "slice_id" not in payload
     assert "peer_rank" not in payload
     diagnostics._reset_diagnostic_sink_for_tests()
+
+
+def test_sink_write_completes_partial_stdout_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = {"event": "partial_write", "request_id": 42}
+    expected = (
+        f"{diagnostics.DIAGNOSTICS_LOG_PREFIX}"
+        f"{json.dumps(record, separators=(',', ':'), sort_keys=True)}\n"
+    ).encode("utf-8")
+    accepted_chunks = []
+    calls = []
+
+    def write(fd: int, data: bytes) -> int:
+        calls.append((fd, data))
+        written = min(7, len(data))
+        accepted_chunks.append(data[:written])
+        return written
+
+    monkeypatch.setattr(diagnostics, "os", SimpleNamespace(write=write))
+
+    diagnostics._AsyncDiagnosticSink._write(record)
+
+    assert len(calls) > 2
+    assert all(fd == 1 for fd, _ in calls)
+    assert [data for _, data in calls] == [
+        expected[offset:] for offset in range(0, len(expected), 7)
+    ]
+    assert b"".join(accepted_chunks) == expected
+
+
+def test_sink_write_rejects_zero_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        diagnostics,
+        "os",
+        SimpleNamespace(write=lambda _fd, _data: 0),
+    )
+
+    with pytest.raises(OSError, match="made no progress"):
+        diagnostics._AsyncDiagnosticSink._write({"event": "no_progress"})
 
 
 def test_async_sink_failure_does_not_stop_later_diagnostic_writes(
@@ -199,9 +299,84 @@ def test_async_sink_failure_does_not_stop_later_diagnostic_writes(
     diagnostics.emit_event("gen_decode_ready", side="gen", request_id=43)
     diagnostics._flush_diagnostic_sink_for_tests()
 
-    assert len(writes) == 2
-    assert b'"request_id":43' in writes[1][1]
+    assert len(writes) == 3
+    dropped = json.loads(
+        writes[1][1].decode("utf-8").removeprefix(diagnostics.DIAGNOSTICS_LOG_PREFIX)
+    )
+    assert dropped["event"] == "diagnostics_events_dropped"
+    assert dropped["dropped_events"] == 1
+    assert b'"request_id":43' in writes[2][1]
     diagnostics._reset_diagnostic_sink_for_tests()
+
+
+def test_drop_record_failure_preserves_loss_count_and_current_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = []
+    failed_once = False
+
+    def write(record) -> None:
+        nonlocal failed_once
+        records.append(record.copy())
+        if record.get("event") == "diagnostics_events_dropped" and not failed_once:
+            failed_once = True
+            raise OSError("transient diagnostic sink failure")
+
+    monkeypatch.setattr(diagnostics._AsyncDiagnosticSink, "_write", staticmethod(write))
+    sink = diagnostics._AsyncDiagnosticSink(os.getpid())
+    try:
+        sink._record_dropped(3)
+        sink.submit({"event": "first"})
+        sink.submit({"event": "second"})
+        sink.flush()
+    finally:
+        sink.close()
+
+    assert [record["event"] for record in records] == [
+        "diagnostics_events_dropped",
+        "first",
+        "diagnostics_events_dropped",
+        "second",
+    ]
+    assert records[0]["dropped_events"] == records[2]["dropped_events"] == 3
+
+
+def test_bounded_close_accounts_for_abandoned_queued_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "_DIAGNOSTIC_SHUTDOWN_TIMEOUT_S", 0.01)
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    records = []
+
+    def write(record) -> None:
+        if record.get("event") == "first":
+            writer_started.set()
+            assert release_writer.wait(timeout=1.0)
+        records.append(record.copy())
+
+    monkeypatch.setattr(diagnostics._AsyncDiagnosticSink, "_write", staticmethod(write))
+    sink = diagnostics._AsyncDiagnosticSink(os.getpid())
+    try:
+        sink.submit({"event": "first"})
+        assert writer_started.wait(timeout=1.0)
+        sink.submit({"event": "second"})
+        sink.submit({"event": "third"})
+
+        sink.close()
+        assert sink._thread.is_alive()
+        release_writer.set()
+        sink._thread.join(timeout=1.0)
+    finally:
+        release_writer.set()
+        sink.close()
+
+    assert not sink._thread.is_alive()
+    assert [record["event"] for record in records] == [
+        "first",
+        "diagnostics_events_dropped",
+    ]
+    assert records[-1]["dropped_events"] == 2
 
 
 def test_sink_creation_failure_does_not_affect_request_progress(
@@ -280,6 +455,34 @@ def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(
     scheduler.tokens_per_block = 32
 
     action, tokens = scheduler._try_schedule_disagg_gen_init(_OpaqueRequest(), None)
+
+    assert action is ScheduleAction.SCHEDULED
+    assert tokens == 0
+
+
+def test_scheduler_kv_admission_continues_when_diagnostic_inspection_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+        KVCacheV2Scheduler,
+        ScheduleAction,
+    )
+
+    class _KVCacheManager:
+        def prepare_disagg_gen_init(self, _request) -> bool:
+            return True
+
+        @property
+        def kv_cache_map(self):
+            raise RuntimeError("diagnostic KV inspection failed")
+
+    request = SimpleNamespace(py_request_id=17)
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler.kv_cache_manager = _KVCacheManager()
+    scheduler.tokens_per_block = 32
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+
+    action, tokens = scheduler._try_schedule_disagg_gen_init(request, None)
 
     assert action is ScheduleAction.SCHEDULED
     assert tokens == 0
