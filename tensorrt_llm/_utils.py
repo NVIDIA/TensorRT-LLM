@@ -828,6 +828,10 @@ class QuantModeWrapper:
         self.objs = objs
 
     def __getattr__(self, name):
+        # Missing Python protocol hooks must not be forwarded as quantization
+        # queries: reducing __deepcopy__ results turns the wrapper into an int.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
 
         def method_wrapper(*args, **kwargs):
             result = False
