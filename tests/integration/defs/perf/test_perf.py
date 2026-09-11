@@ -1494,12 +1494,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if not check_device_contain(["B300", "GB300"]):
                 pytest.skip("Qwen3.8 MAX NVFP4 TP8 requires B300 or GB300")
         if self._config.model_name.startswith("qwen3.8_flash_next_"):
-            required_memory_mb = (98304 if "fp8" in self._config.model_name else
-                                  131072)
-            if get_host_total_memory() < required_memory_mb:
+            required_memory_gib = (96
+                                   if "fp8" in self._config.model_name else 128)
+            host_memory_mib = get_host_total_memory()
+            if host_memory_mib < required_memory_gib * 1024:
                 pytest.skip(
-                    f"Flash-Next PLE offload requires {required_memory_mb} MiB host memory"
-                )
+                    f"Flash-Next PLE offload requires {required_memory_gib} GiB "
+                    f"host memory, got {host_memory_mib} MiB")
 
         if is_windows() and num_gpus > 1:
             pytest.skip(
