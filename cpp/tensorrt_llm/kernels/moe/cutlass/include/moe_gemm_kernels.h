@@ -30,7 +30,7 @@
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
-#include "./common.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/common.h"
 
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>

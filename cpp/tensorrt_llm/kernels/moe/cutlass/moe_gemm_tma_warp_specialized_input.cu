@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "../include/moe_gemm_kernels.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
 
 #include "cutlass/cutlass.h"
 

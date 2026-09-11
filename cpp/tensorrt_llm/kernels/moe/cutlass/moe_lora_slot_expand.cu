@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_slot_expand.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_slot_expand.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"

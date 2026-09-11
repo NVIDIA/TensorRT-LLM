@@ -16,7 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 

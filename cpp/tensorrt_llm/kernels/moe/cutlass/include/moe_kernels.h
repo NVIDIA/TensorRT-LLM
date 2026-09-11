@@ -21,7 +21,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_grouped_gemm.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_grouped_gemm.h"
 #include <cstdint>
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>

@@ -160,9 +160,12 @@ endfunction()
 file(GLOB_RECURSE MIXED_SRC_CPP fpA_intB_gemm/*.cpp)
 file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
 
-# Get the sources for MOE Grouped GEMM launchers
-file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
-file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
+# Get the sources for MOE Grouped GEMM launchers. They live in the MoE domain
+# directory; the targets stay here, next to the CUTLASS instantiation generator
+# and the helpers (process_target, add_instantiations) they use.
+set(MOE_CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../moe/cutlass)
+file(GLOB_RECURSE GROUPED_SRC_CPP ${MOE_CUTLASS_DIR}/*.cpp)
+file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 
 # Get the sources for FP8 Rowwise GEMM launchers
 file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
@@ -181,7 +184,6 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
@@ -239,7 +241,7 @@ if(USING_OSS_CUTLASS_FP4_GEMM)
 endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+  file(GLOB MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/*.cu")
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
