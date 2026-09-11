@@ -337,11 +337,6 @@ class SamplingParams:
         default_factory=tuple, init=False, repr=False
     )
 
-    # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
-    # Can be deprecated after migration to PyTorch backend.
-    _context_logits_auto_enabled: bool = False
-    _generation_logits_auto_enabled: bool = False
-
     # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
     _return_log_probs: bool = False
 
@@ -576,11 +571,11 @@ class SamplingParams:
 
     @property
     def _need_return_context_logits(self) -> bool:
-        return self.return_context_logits and not self._context_logits_auto_enabled
+        return self.return_context_logits
 
     @property
     def _need_return_generation_logits(self) -> bool:
-        return self.return_generation_logits and not self._generation_logits_auto_enabled
+        return self.return_generation_logits
 
     def _setup(
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False

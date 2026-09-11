@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import contextlib
@@ -162,7 +176,7 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
                              "Must be a class or an async function.")
 
 
-def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
+def is_non_default_or_required(param_name, value, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
@@ -344,7 +358,7 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
+        if is_non_default_or_required(param, value, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict

@@ -353,7 +353,6 @@ _SUPPORTED_CHECKPOINT_IO_POLICIES = (
 
 
 def _resolve_checkpoint_io_policy(
-    backend: str,
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
     load_format: LoadFormat | str,
@@ -369,9 +368,7 @@ def _resolve_checkpoint_io_policy(
         return _NATIVE_CHECKPOINT_IO_POLICY, None
 
     reason = None
-    if backend != "pytorch":
-        reason = "rank-striped read-ahead requires the PyTorch backend"
-    elif checkpoint_loader is not None:
+    if checkpoint_loader is not None:
         reason = "an explicit checkpoint loader was provided"
     elif checkpoint_format != "HF":
         reason = ("rank-striped read-ahead requires checkpoint_format='HF' "
@@ -414,7 +411,6 @@ def _resolve_checkpoint_io_policy(
 
 
 def _construct_checkpoint_loader(
-    backend: str,
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
     *,
@@ -422,11 +418,10 @@ def _construct_checkpoint_loader(
     checkpoint_io_policy: str = "native",
     load_format: LoadFormat | str = LoadFormat.AUTO,
     partial_model_loading: bool = False,
-) -> Optional[BaseCheckpointLoader]:
+) -> BaseCheckpointLoader:
     requested_checkpoint_io_policy = checkpoint_io_policy
     checkpoint_io_policy, selection_fallback_reason = \
         _resolve_checkpoint_io_policy(
-            backend,
             checkpoint_loader,
             checkpoint_format,
             load_format,

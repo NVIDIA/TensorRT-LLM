@@ -956,13 +956,6 @@ public:
                     cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
             }
-            // Pass V's actual token stride so the FMHA runner handles both
-            // contiguous and non-contiguous V layouts (PyTorch backend
-            // kv.split() view) correctly.
-            if (v_ptr != nullptr && v.has_value())
-            {
-                enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
-            }
             if (is_cross && cross_kv.has_value())
             {
                 auto const& cross_kv_tensor = cross_kv.value();

@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import atexit
-import json
 import os
 import socket
 import threading
@@ -1481,15 +1480,6 @@ class BaseLLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-        # auto enable context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-        if self.args.backend != "pytorch":
-            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                sampling_params.return_context_logits = True
-                sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
-                sampling_params.return_generation_logits = True
-                sampling_params._generation_logits_auto_enabled = True
-
         if sampling_params._stream_interval is None:
             sampling_params._stream_interval = getattr(self.args,
                                                        "stream_interval", 1)
@@ -1557,67 +1547,14 @@ class BaseLLM:
     def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
-        if self.args.backend == "pytorch":
-            # Check prompt length against max_num_tokens to filter illegal requests.
-            # Skip check for gen-only requests
-            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
-                max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
-                    raise RequestError(
-                        f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
-                        f"max_num_tokens ({max_num_tokens})")
-            return
-
-        build_config = self.args.build_config
-
-        built_engine_cfg_file = Path(self.args.model) / 'config.json'
-        with open(built_engine_cfg_file) as f:
-            built_engine_cfg = json.load(f)
-        max_seq_len = built_engine_cfg['build_config'][
-            'max_seq_len'] if 'build_config' in built_engine_cfg else build_config.max_seq_len
-        # TODO: Remove this check and left the request verification to cpp runtime
-
-        if (not self.args.enable_chunked_prefill) and (
-                prompt_len / self.args.parallel_config.cp_size +
-            (sampling_params.max_tokens or 0) > max_seq_len):
-            raise ValueError(
-                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
-                f"max_seq_len ({max_seq_len})")
-
-        if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
-            if sampling_params.n == sampling_params.best_of:
-                raise ValueError(
-                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
-                )
-            else:
-                raise ValueError(
-                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
-                )
-
-        max_batch_size = self.args.max_batch_size
-        if max_batch_size is None:
-            max_batch_size = build_config.max_batch_size
-        if not sampling_params.use_beam_search and sampling_params.best_of > max_batch_size:
-            if sampling_params.n == sampling_params.best_of:
-                raise ValueError(
-                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
-                )
-            else:
-                raise ValueError(
-                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
-                )
-
-        if sampling_params.prompt_logprobs and not build_config.gather_context_logits:
-            raise ValueError(
-                f"`sampling_params's prompt_logprobs={sampling_params.prompt_logprobs}` requires `gather_context_logits=True` "
-                f"in the `BuildConfig` when constructing the LLM. "
-                f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
-            )
-
-        if sampling_params.logprobs is not None and not self.args.gather_generation_logits:
-            raise ValueError(
-                f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
-                f"to be passed explicitly to the `LLM()` constructor.")
+        # Check prompt length against max_num_tokens to filter illegal requests.
+        # Skip check for gen-only requests.
+        if not self.args.enable_chunked_prefill and not is_gen_only:
+            max_num_tokens = self.args.max_num_tokens
+            if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
+                raise RequestError(
+                    f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
+                    f"max_num_tokens ({max_num_tokens})")
 
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,

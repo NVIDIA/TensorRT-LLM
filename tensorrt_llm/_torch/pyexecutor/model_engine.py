@@ -436,7 +436,6 @@ class PyTorchModelEngine(ModelEngine):
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
-                llm_args.backend,
                 llm_args.checkpoint_loader,
                 llm_args.checkpoint_format,
                 mx_config=llm_args.mx_config,

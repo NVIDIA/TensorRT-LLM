@@ -603,7 +603,6 @@ def test_construct_checkpoint_loader_passes_mx_config():
     )
 
     checkpoint_loader = model_loader_mod._construct_checkpoint_loader(
-        "pytorch",
         None,
         "MX",
         mx_config=mx_config,

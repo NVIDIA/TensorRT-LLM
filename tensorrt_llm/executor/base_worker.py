@@ -187,7 +187,6 @@ class BaseWorker(GenerationExecutor):
                     _construct_checkpoint_loader
                 partial_model_loading = self.llm_args.is_partial_model_loading
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend,
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,

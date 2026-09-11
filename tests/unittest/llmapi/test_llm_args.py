@@ -2989,35 +2989,27 @@ class TestServeDefaults:
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
-        assert is_non_default_or_required("model", "test-model", "pytorch",
-                                          set())
-        assert is_non_default_or_required("backend", "pytorch", "pytorch",
-                                          set())
-        assert is_non_default_or_required("tokenizer", "test-tokenizer",
-                                          "pytorch", set())
+        assert is_non_default_or_required("model", "test-model", set())
+        assert is_non_default_or_required("backend", "pytorch", set())
+        assert is_non_default_or_required("tokenizer", "test-tokenizer", set())
 
         # Test None values
-        assert not is_non_default_or_required("max_batch_size", None, "pytorch",
-                                              set())
+        assert not is_non_default_or_required("max_batch_size", None, set())
 
         # Test default values (should return False)
-        assert not is_non_default_or_required("tensor_parallel_size", 1,
-                                              "pytorch", set())
+        assert not is_non_default_or_required("tensor_parallel_size", 1, set())
         assert not is_non_default_or_required("pipeline_parallel_size", 1,
-                                              "pytorch", set())
+                                              set())
 
         # Test non-default values (should return True)
-        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch",
-                                          set())
-        assert is_non_default_or_required("max_batch_size", 128, "pytorch",
-                                          set())
+        assert is_non_default_or_required("tensor_parallel_size", 4, set())
+        assert is_non_default_or_required("max_batch_size", 128, set())
 
         # Test explicit CLI source overrides the default-equals-value check
-        assert is_non_default_or_required("tensor_parallel_size", 1, "pytorch",
+        assert is_non_default_or_required("tensor_parallel_size", 1,
                                           {"tensor_parallel_size"})
         # Test CLI-derived field (--free_gpu_memory_fraction -> kv_cache_config)
         assert is_non_default_or_required("kv_cache_config", KvCacheConfig(),
-                                          "pytorch",
                                           {"free_gpu_memory_fraction"})
 
 

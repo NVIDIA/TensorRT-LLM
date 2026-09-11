@@ -631,6 +631,29 @@ def test_pipelined_transfer_requires_gen_first_flow():
         PyExecutor._validate_request(executor, request)
 
 
+def test_pipelined_transfer_requires_chunked_prefill():
+    """Pipelined context transfer requires chunked prefill."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+    executor.model_engine = SimpleNamespace(
+        attn_runtime_features=SimpleNamespace(chunked_prefill=False)
+    )
+
+    request = MagicMock()
+    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+    request.py_disaggregated_params = SimpleNamespace(
+        schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="enable_chunked_prefill is required when enable_pipelined_transfer is set",
+    ):
+        PyExecutor._validate_request(executor, request)
+
+
 def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
     """Context workers require all layers on one pipeline rank."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor

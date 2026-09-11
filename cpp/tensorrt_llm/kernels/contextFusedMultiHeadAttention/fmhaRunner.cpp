@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -190,12 +190,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Tensor K is contiguous.
             mKernelParams.k_stride_in_bytes
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
-            if (runnerParams.vStrideInBytes > 0)
-            {
-                // Caller provided the actual V stride (supports both contiguous and non-contiguous V).
-                mKernelParams.v_stride_in_bytes = runnerParams.vStrideInBytes;
-            }
-            else if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
+            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
                 // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
                 // headSizeV).
