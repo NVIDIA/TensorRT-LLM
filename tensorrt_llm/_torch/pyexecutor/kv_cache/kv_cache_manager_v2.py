@@ -2996,6 +2996,29 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.stop_committing()
         return kv_cache
 
+    def _draft_pool_diagnostic(self) -> str:
+        """Draft-pool occupancy, for the resize-failure messages below.
+
+        The draft manager mirrors the target's tokens but is sized from its own
+        byte budget, and the capacity scheduler admits on the TARGET pool alone
+        (`scheduler_v2` touches `draft_kv_cache_manager` only to suspend/free).
+        A draft pool smaller in tokens than the target therefore cannot
+        backpressure -- it can only raise, and the raise kills every rank. When
+        that happens the first question is always "how big was the draft pool
+        and how full was it", so answer it in the message rather than leaving
+        it to post-hoc arithmetic over the budget-split log line.
+
+        Best-effort: never let a diagnostic mask the failure it describes.
+        """
+        try:
+            live = sum(c.capacity for c in self.kv_cache_map.values())
+            return (
+                f" [draft pool: {len(self.kv_cache_map)} live caches holding "
+                f"{live} tokens, gpu_max_tokens={self._gpu_max_tokens}]"
+            )
+        except Exception:  # noqa: BLE001 - diagnostic only
+            return ""
+
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
 
@@ -3039,6 +3062,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Draft KV cache context resize failed for request "
                         f"{req.py_request_id}: could not resize to {capacity} tokens"
+                        f"{self._draft_pool_diagnostic()}"
                     )
 
             for req in scheduled_batch.generation_requests:
@@ -3061,6 +3085,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
+                        f"{self._draft_pool_diagnostic()}"
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:

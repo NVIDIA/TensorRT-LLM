@@ -811,7 +811,10 @@ class KvCacheCreator:
             # (e.g. EAGLE3: config says 1, runtime uses 4).
             # For PP, draft layers are only on the last rank (see
             # get_pp_layers), so only that rank should include draft cost.
-            effective_draft_config = self._get_effective_draft_config()
+            # _get_draft_kv_model_config(), not _get_effective_draft_config():
+            # the cost charged here must be the cost of the pool that
+            # _create_one_model_draft_kv_cache_manager actually allocates.
+            effective_draft_config = self._get_draft_kv_model_config()
             draft_kv_cache_config = self._get_one_model_draft_kv_cache_config(
                 kv_cache_config, self._max_seq_len)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
@@ -1556,6 +1559,51 @@ class KvCacheCreator:
         # layers as well.
         return self._model_engine.model.model_config
 
+    def _get_draft_kv_model_config(self) -> ModelConfig:
+        """The draft ModelConfig describing the KV pool as it is ALLOCATED.
+
+        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8
+        KV algo onto every loaded model, including an external drafter. The
+        drafter stores and reads its pool in its weights dtype (DFlash
+        validates a bf16 pool and otherwise falls back to the max_seq_len-dense
+        private arena, which OOMs at long context), so the pool dtype must
+        follow the drafter, not the target.
+
+        Every consumer that reasons about draft KV bytes must go through here.
+        Construction and the target/draft budget split reading different dtypes
+        is not cosmetic: the split then charges the draft fp8 bytes for a pool
+        allocated bf16, so the draft manager receives exactly HALF the tokens
+        the target gets. Because the capacity scheduler admits on the target
+        pool alone, the draft pool cannot backpressure -- it can only raise
+        "Draft KV cache context resize failed" out of
+        ``KVCacheManagerV2._prepare_draft_resources``, which is fatal to every
+        rank, as soon as resident context passes ~50% of target utilization.
+        """
+        effective_draft_config = self._get_effective_draft_config()
+        if not self._speculative_config.spec_dec_mode.is_external_drafter():
+            return effective_draft_config
+        quant_config = getattr(effective_draft_config, "quant_config", None)
+        if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
+        ):
+            return effective_draft_config
+        logger.info(
+            "External drafter KV pool keeps the drafter dtype; dropping "
+            "the fp8 KV quant algo inherited from the target.")
+        neutral_quant = copy.copy(quant_config)
+        neutral_quant.kv_cache_quant_algo = None
+        # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
+        # and the copy carries the already-computed caches, so BOTH must be
+        # dropped for the mutation to take. Leaving layer_quant_mode stale
+        # silently no-ops the `draft_kv_config.dtype -> "auto"` guard in
+        # _create_one_model_draft_kv_cache_manager, which reads it.
+        neutral_quant.__dict__.pop("quant_mode", None)
+        neutral_quant.__dict__.pop("layer_quant_mode", None)
+        effective_draft_config = copy.copy(effective_draft_config)
+        effective_draft_config._frozen = False
+        effective_draft_config.quant_config = neutral_quant
+        effective_draft_config._frozen = True
+        return effective_draft_config
+
     def _get_num_draft_layers(self) -> int:
         """Return the actual number of draft KV cache layers.
 
@@ -1612,8 +1660,11 @@ class KvCacheCreator:
         spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
 
         # Get the effective draft config (explicit draft_config if available,
-        # otherwise fall back to target model config for MTP).
-        effective_draft_config = self._get_effective_draft_config()
+        # otherwise fall back to target model config for MTP), with the
+        # target's inherited fp8 KV algo dropped for an external drafter. The
+        # budget split in _get_kv_size_per_token resolves it through the SAME
+        # helper, so the bytes/token it charges match the pool allocated here.
+        effective_draft_config = self._get_draft_kv_model_config()
 
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
