@@ -24,7 +24,7 @@
   "diffusers_version": "0.39.0",
   "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
   "tensorrt_llm_version": "1.3.0rc26",
-  "tensorrt_llm_commit": "c6f98058c84f0516b3aa59103e619fab28c52af5",
+  "tensorrt_llm_commit": "40bea2424f5aae8ea5dc55d6009b546e5d9b5211",
   "sha256": "258a153648ab7581d305e33bbe9209e67318a1d4580ce18f1f94e73640c906a5",
   "copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
   "enable_fullgraph": false,
