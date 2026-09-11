@@ -15,7 +15,7 @@ A simple inference example with TinyLlama using the LLM API:
     :linenos:
 ```
 
-For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this [README](../../../examples/llm-api/README.md).
+For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this [README](source:examples/llm-api/README.md).
 
 ## Model Input
 

@@ -35,7 +35,7 @@ The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Trans
 - [Serving with trtllm-serve](#serving-with-trtllm-serve)  
 - [Quality Evaluation](#quality-evaluation)  
 - [Conclusion](#conclusion)  
-- [Picking the Right Configuration](#picking-the-right-configuration)  
+- [Picking the Right Configuration](#picking-the-performant-configuration)  
 - [Limitations and Future Work](#limitations-and-future-work)  
 - [References](#references)
 - [Acknowledgement](#acknowledgement)
@@ -398,7 +398,7 @@ The script spawns `trtllm-serve` across all allocated ranks in the background, p
 
 We validate the implementation in two ways - **correctness** checks that every parallel configuration reproduces a single-GPU reference forward of the transformer, and **quality** compares full decoded video against a single-GPU reference across many prompts.
 
-#### Distributed correctness
+### Distributed correctness
 
 A single-node (4- and 8-GPU) parity harness ([`test_wan_transformer_parallel.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py)) runs a BF16 `WanTransformer3DModel` forward (reduced layers, FA4) under each parallel configuration and compares it against an unsharded single-GPU reference on identical weights and seeded inputs.
 

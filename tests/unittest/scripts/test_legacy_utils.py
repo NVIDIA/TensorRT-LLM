@@ -312,6 +312,7 @@ class TestArgparseCLI:
             [sys.executable, str(SCRIPT_PATH), "--help"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         assert result.returncode == 0
         assert "usage:" in result.stdout.lower() or "usage:" in result.stderr.lower()
@@ -322,6 +323,7 @@ class TestArgparseCLI:
             [sys.executable, str(SCRIPT_PATH), "--bogus"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         assert result.returncode == 2
 

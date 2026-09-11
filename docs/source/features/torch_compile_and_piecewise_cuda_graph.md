@@ -6,7 +6,7 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
 
 ## Table of Contents
 
-- [Torch Compile & Piecewise CUDA Graph](#torch-compile--piecewise-cuda-graph)
+- [Torch Compile & Prefill CUDA Graph](#torch-compile--prefill-cuda-graph)
   - [Table of Contents](#table-of-contents)
   - [Usage](#usage)
   - [Tips for Piecewise CUDA Graph](#tips-for-piecewise-cuda-graph)
