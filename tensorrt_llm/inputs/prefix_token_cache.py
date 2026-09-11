@@ -39,6 +39,9 @@ __all__ = [
 ]
 
 ENABLE_ENV_VAR = "TLLM_PREFIX_TOKEN_CACHE"
+# Log the hit rate every this many cache-eligible requests, so an operator can
+# see whether the cache is doing anything without reading its counters.
+LOG_EVERY_REQUESTS = 1000
 
 
 def prefix_cache_enabled() -> bool:
@@ -129,7 +132,7 @@ class PrefixTokenCache:
         self._total_chars = 0
         self._next_id = 0
         self.disabled = False
-        # Counters for tests.
+        # Counters, reported by periodic log lines and read by tests.
         self.hits = 0
         self.misses = 0
         self.resync_failures = 0
@@ -142,8 +145,20 @@ class PrefixTokenCache:
             return self._encode(tokenizer, text)
         except Exception as e:
             self.disabled = True
-            logger.warning(f"Disabling the prefix token cache after an error: {e!r}")
+            logger.warning(
+                f"Disabling the prefix token cache after an error: {e!r} ({self.summary()})"
+            )
             return self._tokenize(tokenizer, text)[0]
+
+    def summary(self) -> str:
+        """One-line hit-rate and occupancy summary. Caller need not hold the lock."""
+        total = self.hits + self.misses
+        rate = self.hits / total if total else 0.0
+        return (
+            f"{self.hits}/{total} hits ({rate:.1%}), "
+            f"{self.resync_failures} resync fallbacks, "
+            f"{len(self._entries)} entries, {self._total_chars} cached chars"
+        )
 
     def _encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         found = self._lookup(text)
@@ -174,6 +189,10 @@ class PrefixTokenCache:
                 self._remove(found[0])
             if split_token > 0 and tail_index >= 0:
                 self._insert(text, ids, split_token, base_char + tail_offsets[tail_index][0])
+            report = (self.hits + self.misses) % LOG_EVERY_REQUESTS == 0
+            summary = self.summary() if report else None
+        if summary is not None:
+            logger.info(f"Prefix token cache: {summary}")
         return ids
 
     @staticmethod
@@ -246,4 +265,6 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
             "which the prefix token cache needs for offset mappings; disabling it."
         )
         return None
-    return PrefixTokenCache(PrefixTokenCacheConfig.from_env())
+    config = PrefixTokenCacheConfig.from_env()
+    logger.info(f"Prefix token cache enabled: {config}")
+    return PrefixTokenCache(config)
