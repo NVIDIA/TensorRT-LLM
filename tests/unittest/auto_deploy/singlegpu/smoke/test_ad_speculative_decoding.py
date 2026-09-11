@@ -18,6 +18,10 @@ from _model_test_utils import get_small_model_config
 
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
+
 
 def test_super_mtp_smoke():
     """Test one-model MTP/Eagle runtime with a tiny Nemotron SuperV3 target."""
