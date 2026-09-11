@@ -16,7 +16,8 @@ full.
 
 Off by default; enable with ``TLLM_PREFIX_TOKEN_CACHE=1``. Each
 ``DefaultInputProcessor`` owns its own cache, so cached ids are never shared
-across tokenizers.
+across tokenizers. Environment variables, eligibility rules, and measured
+effect are documented in ``docs/source/deployment-guide/prefix-tokenization-cache.md``.
 """
 
 from __future__ import annotations
