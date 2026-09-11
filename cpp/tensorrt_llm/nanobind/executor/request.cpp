@@ -16,14 +16,11 @@
  */
 
 #include "request.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -35,10 +32,10 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
-#include <sstream>
 
 #include <cstring>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 namespace nb = nanobind;
