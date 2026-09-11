@@ -3,6 +3,7 @@
 
 import base64
 import gc
+import os
 from typing import Optional
 
 import torch
@@ -36,12 +37,53 @@ class WorkerExtension:
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
 
+    @staticmethod
+    def _refit_modules(model: torch.nn.Module):
+        """Yield each module once, skipping torch.compile wrappers.
+
+        ``torch.compile`` leaves an ``OptimizedModule`` in the tree, and that
+        wrapper forwards unknown attributes to ``_orig_mod``. A plain
+        ``model.modules()`` walk therefore reaches every compiled submodule
+        TWICE -- once through the wrapper, once as itself -- and fires each
+        refit hook twice. Any non-idempotent weight transform is then applied
+        twice and the weights are scrambled in place.
+
+        This is defence in depth, not the fix for the Qwen3.5 397B refit
+        corruption -- that one was the compile wrapper renaming parameter paths
+        so ``load_weights`` matched nothing, handled by
+        ``unwrap_compiled_model_for_refit``. Double invocation was never
+        observed on that model (the wrapped scope owns none of these hooks), but
+        it does occur for any model whose wrapped scope does own one.
+
+        Deduplicating here makes refit correct regardless of whether a compile
+        wrapper happens to be installed, so it does not depend on the caller
+        unwrapping first.
+        """
+        # Opt-out so the dedup can be isolated from the other refit fixes when
+        # bisecting; the dedup is correct regardless, so it defaults on.
+        if os.environ.get("TLLM_REFIT_DEDUP_MODULES", "1") == "0":
+            yield from model.modules()
+            return
+        seen = set()
+        for module in model.modules():
+            # ``_orig_mod`` is the marker for a torch.compile wrapper and is a
+            # real attribute on it, so this does not go through the forwarding
+            # __getattr__ that causes the problem. Keyed on the attribute rather
+            # than on the class name so it survives renames and subclasses.
+            # The wrapped module is visited on its own in this same walk.
+            if getattr(module, "_orig_mod", None) is not None:
+                continue
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            yield module
+
     def begin_weight_update(self) -> None:
         """Prepare modules and captures for refit."""
         model_engine = self.engine.model_engine
-        model_engine.release_piecewise_cuda_graphs_for_refit()
+        model_engine.unwrap_compiled_model_for_refit()
         model_engine.model_loader.begin_update_weights()
-        for module in model_engine.model.modules():
+        for module in self._refit_modules(model_engine.model):
             if hasattr(module, "pre_reload_weights") and not getattr(
                 module, "_weights_removed", False
             ):
@@ -51,7 +93,7 @@ class WorkerExtension:
         """Finalize runtime caches and captures after refit."""
         self.engine.reset_prefix_cache()
         torch.cuda.synchronize()
-        self.engine.model_engine.recapture_piecewise_cuda_graphs_after_refit(
+        self.engine.model_engine.restore_compiled_model_after_refit(
             self.engine.resource_manager
         )
 
@@ -60,7 +102,9 @@ class WorkerExtension:
         model_engine = self.engine.model_engine
         model = model_engine.model
         model_engine.model_loader.finalize_update_weights()
-        for module in model.modules():
+        # _refit_modules, not model.modules(): a torch.compile wrapper in the
+        # tree would otherwise make every hook below fire twice per module.
+        for module in self._refit_modules(model):
             if hasattr(module, "process_weights_after_loading") and not getattr(
                 module, "_weights_removed", False
             ):
