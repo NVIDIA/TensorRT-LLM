@@ -258,6 +258,41 @@ def qsa_sparse_gqa_reference(
     return output.to(q.dtype).reshape(rows, num_q_heads, head_dim)
 
 
+def _capture_mtp_shared_topk(
+    metadata: "QSAAttentionMetadata",
+    indices: torch.Tensor,
+    visible_blocks: torch.Tensor,
+) -> None:
+    """Stash the selection the draft loop will reuse, one row per request.
+
+    The row kept for each request is its last accepted one, so the reuse starts
+    from the ranking the target actually committed to.
+    """
+    shared = metadata.qsa_shared_topk_indices
+    if shared is None:
+        return
+    num_seqs = metadata.num_seqs
+    num_rows = indices.shape[0]
+    if num_seqs <= 0 or num_rows <= 0:
+        return
+
+    # Requests contribute different row counts, so each one's rows are located
+    # from its own start offset. This is the same packing the reuse kernel
+    # reads back through ``request_indices``.
+    seq_lens = metadata.seq_lens_cuda[:num_seqs].to(torch.int64)
+    row_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    num_accepted = metadata.qsa_mtp_num_accepted
+    if num_accepted is None:
+        offsets = seq_lens - 1
+    else:
+        offsets = torch.minimum(num_accepted[:num_seqs].to(torch.int64) - 1, seq_lens - 1)
+    rows = (row_starts + offsets).clamp_(0, num_rows - 1)
+
+    shared[:num_seqs].copy_(indices.index_select(0, rows))
+    metadata.qsa_shared_topk_visible_blocks[:num_seqs].copy_(visible_blocks.index_select(0, rows))
+    metadata.qsa_shared_topk_captured = True
+
+
 def select_qsa_tokens(
     q: torch.Tensor,
     compressed_keys: torch.Tensor,
@@ -332,14 +367,44 @@ def select_qsa_paged_tokens(
     top_k_row_starts: torch.Tensor | None = None,
     visible_blocks: torch.Tensor | None = None,
     context_rows: bool = False,
+    mtp_index_share: bool = False,
 ) -> torch.Tensor:
     """Select tokens with packed, fixed-width paged scoring.
 
     ``context_rows`` marks the caller that packs many consecutive query rows
     per request; scoring can then share one gather of compressed keys across a
     tile of rows.
+
+    ``mtp_index_share`` lets one MTP iteration score once: the draft-extend
+    pass stores each request's last accepted selection and the draft decode
+    steps rebuild their rows from it without running the indexer at all.
     """
-    from .kernels import triton_qsa_paged_index_scores
+    from .kernels import triton_qsa_mtp_reuse_topk, triton_qsa_paged_index_scores
+
+    if visible_blocks is None:
+        visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
+
+    if (
+        mtp_index_share
+        and metadata.qsa_indexer_skip_topk
+        and metadata.qsa_shared_topk_captured
+        and top_k_output is not None
+        and q.is_cuda
+    ):
+        indices = triton_qsa_mtp_reuse_topk(
+            shared_indices=metadata.qsa_shared_topk_indices,
+            shared_visible_blocks=metadata.qsa_shared_topk_visible_blocks,
+            request_indices=request_indices,
+            visible_blocks=visible_blocks,
+            output=top_k_output[: q.shape[0]],
+        )
+        return expand_qsa_block_indices(
+            indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio=params.compress_ratio,
+            token_topk=params.token_topk,
+        )
 
     logits = triton_qsa_paged_index_scores(
         q=q,
@@ -359,8 +424,6 @@ def select_qsa_paged_tokens(
         if top_k_output is None or top_k_row_starts is None:
             raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
         indices = top_k_output[: q.shape[0]]
-        if visible_blocks is None:
-            visible_blocks = ((query_positions + 1) // params.compress_ratio).to(torch.int32)
         # QSA always has explicit per-row compressed-block bounds, including
         # generation and speculative rows. Use TopK's row-range API rather
         # than its request-grouped decode API; this is a layout choice, not a
@@ -391,6 +454,8 @@ def select_qsa_paged_tokens(
                 (0, params.block_topk - width),
                 value=-1,
             )
+    if mtp_index_share:
+        _capture_mtp_shared_topk(metadata, indices, visible_blocks)
     return expand_qsa_block_indices(
         indices,
         query_positions,
@@ -582,6 +647,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 top_k_output=attn_metadata.qsa_topk_indices,
                 top_k_row_starts=attn_metadata.qsa_topk_row_starts,
                 visible_blocks=attn_metadata.qsa_visible_blocks[:num_tokens],
+                mtp_index_share=(params.mtp_index_share and attn_metadata.qsa_in_mtp_draft_loop),
             )
             fuse_output_gate = False
             if output_gate is not None:

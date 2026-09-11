@@ -89,6 +89,37 @@ def test_qsa_config_forwards_heuristic_topk_opt_in() -> None:
     )
 
 
+def test_qsa_config_resolves_mtp_index_share_from_user_then_checkpoint() -> None:
+    """The draft-loop reuse is a serving knob the checkpoint can also default."""
+    base = dict(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    plain = SimpleNamespace(**base)
+    from_checkpoint = SimpleNamespace(**base, index_share_for_mtp_iteration=True)
+
+    assert not QSASparseAttentionConfig().to_sparse_params(pretrained_config=plain).mtp_index_share
+    assert (
+        QSASparseAttentionConfig()
+        .to_sparse_params(pretrained_config=from_checkpoint)
+        .mtp_index_share
+    )
+    # An explicit user value wins over the checkpoint default in both directions.
+    assert (
+        QSASparseAttentionConfig(index_share_for_mtp_iteration=True)
+        .to_sparse_params(pretrained_config=plain)
+        .mtp_index_share
+    )
+    assert (
+        not QSASparseAttentionConfig(index_share_for_mtp_iteration=False)
+        .to_sparse_params(pretrained_config=from_checkpoint)
+        .mtp_index_share
+    )
+
+
 def test_qsa_config_rejects_missing_checkpoint_geometry() -> None:
     with pytest.raises(ValueError, match="indexer_budget"):
         QSASparseAttentionConfig().to_sparse_params(pretrained_config=SimpleNamespace())

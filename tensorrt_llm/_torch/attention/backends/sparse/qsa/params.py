@@ -39,6 +39,8 @@ class QSASparseParams(SparseParams):
     seq_len_threshold: int | None = None
     # Opt in to the Guess-Verify-Refine Top-K instead of the exact radix one.
     enable_heuristic_topk: bool = False
+    # Reuse one indexer selection across the MTP draft loop.
+    mtp_index_share: bool = False
 
     def __post_init__(self) -> None:
         values = {
@@ -91,6 +93,8 @@ class QSASparseMetadataParams(SparseMetadataParams):
     token_topk: int
     # Number of consecutive original tokens represented by one indexed group.
     compress_ratio: int
+    # Reuse one indexer selection across the MTP draft loop.
+    mtp_index_share: bool = False
 
     def __post_init__(self) -> None:
         _validate_selection_geometry(self.token_topk, self.compress_ratio)
