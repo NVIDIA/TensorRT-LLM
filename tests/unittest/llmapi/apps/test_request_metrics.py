@@ -32,6 +32,8 @@ from tensorrt_llm.serve.perf_metrics import (
 )
 from tensorrt_llm.serve.scripts.time_breakdown import RequestDataParser
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _record(status="complete"):
     return {
