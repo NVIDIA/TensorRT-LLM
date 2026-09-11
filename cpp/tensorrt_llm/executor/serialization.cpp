@@ -841,7 +841,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto multimodalEmbedding = su::deserialize<std::optional<Tensor>>(is);
     auto mRopeConfig = su::deserialize<std::optional<MropeConfig>>(is);
     auto loraConfig = su::deserialize<std::optional<LoraConfig>>(is);
-    auto lookaheadConfig = su::deserialize<std::optional<LookaheadDecodingConfig>>(is);
     auto kvCacheRetentionConfig = su::deserialize<std::optional<KvCacheRetentionConfig>>(is);
     auto logitsPostProcessorName = su::deserialize<std::optional<std::string>>(is);
     auto encoderInputTokenIds = su::deserialize<std::optional<VecTokens>>(is);
@@ -864,8 +863,8 @@ Request Serialization::deserializeRequest(std::istream& is)
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
-        std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
-        std::nullopt, std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
+        std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName), std::nullopt,
+        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
