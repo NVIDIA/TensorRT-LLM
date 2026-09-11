@@ -59,6 +59,7 @@ from ...utils import ActivationType, is_gated_activation
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    div_full_f32,
     fmin,
     gelu_tanh_f32,
     griddepcontrol_launch_dependents,
@@ -402,6 +403,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         indexer_scale_tensor: Optional[cute.Tensor] = None,
         position_ids_tensor: Optional[cute.Tensor] = None,
         cos_sin_cache_tensor: Optional[cute.Tensor] = None,
+        raw_sfc_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation with SwiGLU fusion in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -426,6 +428,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                 (m, n_out, l) and M-stride 0 (broadcast over rows). Added as
                 ``alpha * acc + bias`` before the activation. Only consumed by the
                 non-gated GELU path; None (default) leaves all paths unchanged.
+            raw_sfc_tensor (Optional[cute.Tensor]): Raw scale factor tensor for C (deferred FP4 quantization)
 
         Raises:
             TypeError: If input data types are incompatible with the MMA instruction.
@@ -456,7 +459,10 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         sfb_tensor = cute.make_tensor(sfb_tensor.iterator, sfb_layout)
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
-        self.generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
+        self.generate_deferred_sfc = raw_sfc_tensor is not None
+        self.generate_sfc = (
+            sfc_tensor is not None and norm_const_tensor is not None
+        ) or self.generate_deferred_sfc
         if cutlass.const_expr(
             self.indexer_q_fusion
             and (
@@ -471,7 +477,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                 "indexer_q_fusion requires FP4 C, SFC generation, contiguous "
                 "output scales, position IDs, and a cos/sin cache"
             )
-        if cutlass.const_expr(self.generate_sfc):
+        if cutlass.const_expr(self.generate_sfc and not self.generate_deferred_sfc):
             sfc_layout = blockscaled_utils.tile_atom_to_shape_SF(c_tensor.shape, self.sf_vec_size)
             sfc_tensor = cute.make_tensor(sfc_tensor.iterator, sfc_layout)
 
@@ -662,6 +668,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
             self.tile_sched_params,
             epilogue_op,
             alpha,
+            raw_sfc_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -706,6 +713,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
+        mRawSF: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation
@@ -1419,7 +1427,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                 epi_tidx, tma_atom_c, tCgC, epi_tile, sC
             )
 
-            if cutlass.const_expr(self.generate_sfc):
+            if cutlass.const_expr(self.generate_sfc and not self.generate_deferred_sfc):
                 norm_const = norm_const_tensor[0]
                 # (EPI_TILE_M, EPI_TILE_N, RestM, RestN, RestL)
                 gSFC_mnl = cute.local_tile(mSFC_mnl, epi_tile, (None, None, None))
@@ -1505,7 +1513,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
 
-                if cutlass.const_expr(self.generate_sfc):
+                if cutlass.const_expr(self.generate_sfc and not self.generate_deferred_sfc):
                     # (T2R, T2R_M, T2R_N, RestM, RestN)
                     tCgSFC_mn = tCgSFC_mnl[
                         (
@@ -1657,7 +1665,64 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                                         tCompute[pair_idx * 2 + 1] = cosine * y + sine * x
                             tCompute.store(tCompute.load().to(cutlass.BFloat16).to(cutlass.Float32))
 
-                    if cutlass.const_expr(self.generate_sfc):
+                    if cutlass.const_expr(self.generate_deferred_sfc):
+                        #
+                        # Deferred dynamic SFC path:
+                        # 1. Compute per-vector absolute max from post-activation result
+                        # 2. Derive raw scale = gmax * (1/6) and oscale = div_full_f32(6.0, gmax)
+                        # 3. Store raw scale directly to mRawSF
+                        # 4. Scale accumulator elements by oscale and store quantized Float4E2M1FN to C
+                        #
+                        tTR_rAcc_frg = cute.logical_divide(
+                            tCompute, cute.make_layout(self.sf_vec_size)
+                        )
+                        acc_frg = tTR_rAcc_frg.load()
+                        acc_frg = epilogue_op(acc_frg)
+
+                        # Apply element-wise absolute value using math.absf (supports vectors)
+                        abs_acc_frg_ir = math.absf(acc_frg.ir_value())
+                        abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
+
+                        subtile_m = real_subtile_idx // self.epi_tile_cnt[1]
+                        subtile_n = real_subtile_idx % self.epi_tile_cnt[1]
+                        zero_f32 = cutlass.Float32(0.0)
+
+                        for vi in cutlass.range_constexpr(abs_acc_frg.shape[1]):
+                            coord = tTR_cC[vi * self.sf_vec_size]
+                            row = (
+                                cur_tile_coord[0] * self.cta_tile_shape_mnk_c[0]
+                                + subtile_m * self.epi_tile[0]
+                                + coord[0]
+                            )
+                            col = (
+                                cur_tile_coord[1] * self.cta_tile_shape_mnk_c[1]
+                                + subtile_n * self.epi_tile[1]
+                                + coord[1]
+                            )
+                            col_block = col // self.sf_vec_size
+                            gmax = abs_acc_frg[None, vi].reduce(
+                                cute.ReductionOp.MAX,
+                                zero_f32,
+                                0,
+                            )
+                            if gmax > zero_f32:
+                                raw = gmax * cutlass.Float32(1.0 / 6.0)
+                                oscale = div_full_f32(cutlass.Float32(6.0), gmax)
+                            else:
+                                raw = zero_f32
+                                oscale = zero_f32
+
+                            if row < mRawSF.shape[0]:
+                                if col_block < mRawSF.shape[1]:
+                                    mRawSF[row, col_block, cur_tile_coord[2]] = raw
+
+                            vec = tTR_rAcc_frg[None, vi]
+                            for ei in cutlass.range_constexpr(self.sf_vec_size):
+                                vec[ei] = vec[ei] * oscale
+
+                        acc_vec = tiled_copy_r2s.retile(tCompute).load()
+                        tRS_rC.store(acc_vec.to(self.c_dtype))
+                    elif cutlass.const_expr(self.generate_sfc):
                         #
                         # Quantization path for Float4E2M1FN output:
                         # 1. Compute per-vector absolute max from SwiGLU result
@@ -2966,6 +3031,98 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
             sfc_tensor=sfc_tensor,
             norm_const_tensor=norm_const_tensor,
             bias_tensor=bias_tensor,
+        )
+
+    @cute.jit
+    def wrapper_deferred_fp4out(
+        self,
+        m: cutlass.Int64,
+        n: cutlass.Int64,
+        k: cutlass.Int64,
+        sf_m: cutlass.Int64,
+        sf_n: cutlass.Int64,
+        sf_k: cutlass.Int64,
+        l: cutlass.Constexpr,  # noqa: E741
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        raw_sf_ptr: cute.Pointer,
+        alpha_tensor: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        current_stream: cuda.CUstream,
+        bias_ptr: Optional[cute.Pointer] = None,
+    ):
+        """Wrapper for deferred FP4 output mode with raw block scale emission.
+
+        Produces scale-invariant Float4E2M1FN output and raw FP32 per-16 block
+        scales for deferred finalization via nvfp4_sfc_finalize.
+        """
+        # m, k, l
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
+        )
+        # n, k, l
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_ordered_layout(
+                (n, k, l),
+                order=(1, 0, 2),
+            ),
+        )
+        # Gated (SwiGLU) halves output N; non-gated keeps full N. — FP4 output
+        n_out = n // 2 if self.is_gated else n
+        c_tensor = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_ordered_layout(
+                (m, n_out, l),
+                order=(1, 0, 2),
+            ),
+        )
+        # SFA/SFB layouts (same as wrapper)
+        sfa_tensor = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, sf_m, 4, sf_k, l),
+                order=(2, 1, 4, 0, 3, 5),
+            ),
+        )
+        sfb_tensor = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (32, 4, sf_n, 4, sf_k, l),
+                order=(2, 1, 4, 0, 3, 5),
+            ),
+        )
+        # Raw SFC layout: [m, n_out // sf_vec_size, l] row-major contiguous
+        raw_sfc_tensor = cute.make_tensor(
+            raw_sf_ptr,
+            layout=cute.make_ordered_layout(
+                (m, n_out // self.sf_vec_size, l),
+                order=(1, 0, 2),
+            ),
+        )
+        # Optional per-N bias broadcast over M (and L): stride 0 on M/L, 1 on N.
+        bias_tensor = None
+        if cutlass.const_expr(bias_ptr is not None):
+            bias_tensor = cute.make_tensor(
+                bias_ptr,
+                layout=cute.make_layout((m, n_out, l), stride=(0, 1, 0)),
+            )
+
+        self(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            c_tensor,
+            alpha_tensor,
+            max_active_clusters,
+            current_stream,
+            bias_tensor=bias_tensor,
+            raw_sfc_tensor=raw_sfc_tensor,
         )
 
 

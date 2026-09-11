@@ -468,6 +468,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
+    try:
+        from ..cute_dsl_kernels.blackwell.norm_producer import \
+            nvfp4_sfc_finalize
+    except Exception:
+        nvfp4_sfc_finalize = None
 
     @functools.cache
     def _get_full_device_max_active_clusters(device_id: int,
@@ -2329,6 +2334,348 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 dtype=input_scale.dtype,
                                 device=input_scale.device)
         return fp4_output, output_sf
+
+    class CuteDSLNVFP4GeluDeferredFP4OutBlackwellRunner(
+            CuteDSLNVFP4SwigluFP4OutBlackwellRunner):
+        """Non-gated GELU(tanh) variant with deferred dynamic FP4 scale finalization."""
+        kernel_cache = dict()
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            super().__init__(use_tvm_ffi, activation_type=ActivationType.Gelu)
+
+        def unique_id(self):
+            return (self.use_tvm_ffi, 'gelu_deferred_fp4out')
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple]:
+            a, b, a_sf, b_sf, alpha = inputs[:5]
+            m, k, n = a.shape[0], a.shape[1] * 2, b.shape[0]
+            if m < 128:
+                return []
+            sf_vec_size = 16
+            mma_tiler_mn_candidates = [(128, 128), (128, 256), (256, 128),
+                                       (256, 256)]
+            cluster_shape_mn_candidates = [(1, 1), (2, 1), (1, 2), (2, 2)]
+            use_prefetch_candidates = [True, False]
+
+            valid_tactics = []
+            for mma_tiler_mn in mma_tiler_mn_candidates:
+                for cluster_shape_mn in cluster_shape_mn_candidates:
+                    for use_prefetch in use_prefetch_candidates:
+                        if self.__class__.kernel_class.can_implement(
+                                ab_dtype=cutlass.Float4E2M1FN,
+                                sf_dtype=cutlass.Float8E4M3FN,
+                                sf_vec_size=sf_vec_size,
+                                c_dtype=cutlass.Float4E2M1FN,
+                                mma_tiler_mn=mma_tiler_mn,
+                                cluster_shape_mn=cluster_shape_mn,
+                                m=m,
+                                n=n,
+                                k=k,
+                                l=1,
+                                a_major="k",
+                                b_major="k",
+                                c_major="n",
+                        ):
+                            valid_tactics.append(
+                                (mma_tiler_mn, cluster_shape_mn, use_prefetch))
+
+            return valid_tactics
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+            **kwargs,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            sf_vec_size = 16
+
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn, use_prefetch = tactic
+            else:
+                mma_tiler_mn, cluster_shape_mn, use_prefetch = [
+                    (128, 128),
+                    (1, 1),
+                    False,
+                ]
+
+            bias_tensor = inputs[5] if len(inputs) > 5 else None
+            (a_tensor, b_tensor, a_sf_tensor, b_sf_tensor,
+             alpha_tensor) = inputs[:5]
+            m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
+            n_out = n
+
+            if bias_tensor is not None:
+                if bias_tensor.numel() != n_out:
+                    raise ValueError(
+                        f"CuteDSL GELU Deferred FP4Out: bias must have {n_out} elements "
+                        f"(n_out), got {bias_tensor.numel()}")
+                bias_tensor = bias_tensor.contiguous()
+
+            cta_m = mma_tiler_mn[0] * cluster_shape_mn[0]
+            padded_m = pad_up(m, cta_m)
+
+            c_tensor = torch.empty(padded_m,
+                                   n_out // 2,
+                                   dtype=a_tensor.dtype,
+                                   device="cuda")
+            raw_sf_tensor = torch.empty(padded_m,
+                                        n_out // sf_vec_size,
+                                        dtype=torch.float32,
+                                        device="cuda")
+
+            real_k = k * 2
+            sf_m = pad_up(m, 128)
+            sf_k = pad_up(real_k // sf_vec_size, 4)
+            sf_n = pad_up(n, 128)
+
+            expected_a_sf_size = sf_m * sf_k
+            expected_b_sf_size = sf_n * sf_k
+
+            if a_sf_tensor.numel() != expected_a_sf_size:
+                raise ValueError(
+                    f"CuteDSL GELU Deferred FP4Out: act scale factor size mismatch. "
+                    f"Expected {expected_a_sf_size}, got {a_sf_tensor.numel()}")
+            if b_sf_tensor.numel() != expected_b_sf_size:
+                raise ValueError(
+                    f"CuteDSL GELU Deferred FP4Out: weight scale factor size mismatch. "
+                    f"Expected {expected_b_sf_size}, got {b_sf_tensor.numel()}")
+
+            a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
+            b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
+
+            kernel_m = m
+            kernel_n = n
+
+            has_bias = bias_tensor is not None
+            if has_bias:
+                if bias_tensor.dtype == torch.bfloat16:
+                    bias_cute_dtype = cutlass.BFloat16
+                elif bias_tensor.dtype == torch.float32:
+                    bias_cute_dtype = cutlass.Float32
+                else:
+                    raise ValueError(
+                        f"CuteDSL GELU Deferred FP4Out: bias must be bf16 or fp32, "
+                        f"got {bias_tensor.dtype}")
+
+            bias_key = bias_tensor.dtype if has_bias else None
+            cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn,
+                         use_prefetch, self.use_tvm_ffi, 'deferred_fp4out',
+                         bias_key)
+            if cache_key not in self.__class__.kernel_cache:
+                a_ptr = self.make_cute_dsl_global_pointer(
+                    a_tensor, cutlass.Float4E2M1FN, 32)
+                b_ptr = self.make_cute_dsl_global_pointer(
+                    b_tensor, cutlass.Float4E2M1FN, 32)
+                a_sf_ptr = self.make_cute_dsl_global_pointer(
+                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                b_sf_ptr = self.make_cute_dsl_global_pointer(
+                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                c_ptr = self.make_cute_dsl_global_pointer(
+                    c_tensor, cutlass.Float4E2M1FN, 32)
+                raw_sf_ptr = self.make_cute_dsl_global_pointer(
+                    raw_sf_tensor, cutlass.Float32, 4)
+                bias_ptr = self.make_cute_dsl_global_pointer(
+                    bias_tensor, bias_cute_dtype, 4) if has_bias else None
+                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+                if self.use_tvm_ffi:
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+                else:
+                    torch_stream = torch.cuda.current_stream()
+                    stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                gemm = self.__class__.kernel_class(
+                    sf_vec_size,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    True,  # vectorized_f32
+                    use_prefetch,
+                    activation_type=self.activation_type,
+                )
+                hardware_info = cutlass.utils.HardwareInfo()
+                max_active_clusters = hardware_info.get_max_active_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                compile_args = [
+                    gemm.wrapper_deferred_fp4out,
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    sf_k // 4,
+                    1,  # batch
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    raw_sf_ptr,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                ]
+                if has_bias:
+                    compile_args.append(bias_ptr)
+
+                compiled_gemm = cute.compile(
+                    *compile_args,
+                    options="--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            # Launch kernel
+            if self.use_tvm_ffi:
+                tvm_args = [
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    sf_k // 4,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    a_sf_tensor.data_ptr(),
+                    b_sf_tensor.data_ptr(),
+                    c_tensor.data_ptr(),
+                    raw_sf_tensor.data_ptr(),
+                    alpha_tensor,
+                ]
+                if has_bias:
+                    tvm_args.append(bias_tensor.data_ptr())
+                compiled_gemm(*tvm_args)
+            else:
+                a_ptr = self.make_cute_dsl_global_pointer(
+                    a_tensor, cutlass.Float4E2M1FN, 32)
+                b_ptr = self.make_cute_dsl_global_pointer(
+                    b_tensor, cutlass.Float4E2M1FN, 32)
+                a_sf_ptr = self.make_cute_dsl_global_pointer(
+                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                b_sf_ptr = self.make_cute_dsl_global_pointer(
+                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                c_ptr = self.make_cute_dsl_global_pointer(
+                    c_tensor, cutlass.Float4E2M1FN, 32)
+                raw_sf_ptr = self.make_cute_dsl_global_pointer(
+                    raw_sf_tensor, cutlass.Float32, 4)
+                bias_ptr = self.make_cute_dsl_global_pointer(
+                    bias_tensor, bias_cute_dtype, 4) if has_bias else None
+                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                call_args = [
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    sf_m // 128,
+                    sf_n // 128,
+                    sf_k // 4,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    raw_sf_ptr,
+                    alpha_cute_tensor,
+                    stream,
+                ]
+                if has_bias:
+                    call_args.append(bias_ptr)
+                compiled_gemm(*call_args)
+
+            c_tensor = c_tensor[:m]
+            raw_sf_tensor = raw_sf_tensor[:m]
+            return c_tensor, raw_sf_tensor
+
+    # a/b: fp4, scale: fp8, output: fp4 + raw sf (deferred), fused non-gated GELU(tanh)
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell",
+        mutates_args=(),
+        device_types="cuda")
+    def cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CuteDSL NVFP4 dense GEMM + non-gated GELU(tanh) with deferred FP4 scale finalization.
+
+        Emits scale-invariant packed Float4E2M1FN output C [m, n] and raw FP32 per-16
+        block scales raw_sf [m, n // 16] for subsequent finalization via
+        trtllm::nvfp4_sfc_finalize.
+
+        Args:
+            input: Activation tensor [m, k] in FP4 format (packed)
+            weight: Weight tensor [n, k] in FP4 format (packed). n = intermediate_size.
+            input_scale: Activation scale factors
+            weight_scale: Weight scale factors
+            alpha: GEMM scaling factor
+            bias: Optional per-N bias vector [n] (bf16/fp32, NOT quantized),
+                broadcast over M and added before GELU. None (default) -> no bias.
+            use_tvm_ffi: Whether to use TVM-FFI.
+
+        Returns:
+            Tuple of (fp4_output, raw_sf):
+                fp4_output: [m, n//2] in FP4 packed format
+                raw_sf: [m, n//16] raw block scales (fp32)
+        """
+        if (sm_version := get_sm_version()) not in (100, 103):
+            raise ValueError(
+                f"CuteDSL NVFP4 GELU Deferred FP4Out requires SM 100 or SM 103, "
+                f"but got SM {sm_version}.")
+
+        tuner = AutoTuner.get()
+
+        runner = CuteDSLNVFP4GeluDeferredFP4OutBlackwellRunner(use_tvm_ffi)
+        inputs = [input, weight, input_scale, weight_scale, alpha]
+        if bias is not None:
+            inputs.append(bias)
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+
+        return runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_tvm_ffi: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        n = mat_b.shape[-2]
+        n_out = n  # non-gated: output keeps full N
+        sf_vec_size = 16
+        # FP4 output packed: [m, n_out // 2]
+        fp4_shape = list(mat_a.shape)
+        fp4_shape[-1] = n_out // 2
+        fp4_output = mat_a.new_empty(fp4_shape)
+        # Raw scale factors: [m, n_out // 16] float32
+        raw_shape = list(mat_a.shape)
+        raw_shape[-1] = n_out // sf_vec_size
+        raw_sf = mat_a.new_empty(raw_shape, dtype=torch.float32)
+        return fp4_output, raw_sf
 
     class Sm100BlockScaledContiguousGroupedGemmRunner(TunableRunner):
         kernel_class = Sm100BlockScaledContiguousGroupedGemmKernel

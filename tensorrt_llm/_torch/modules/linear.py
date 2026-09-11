@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import enum
@@ -1504,6 +1507,13 @@ class NVFP4LinearMethod(LinearMethodBase):
             Tuple of (act_fp4, act_sf, alpha) - quantized activation, per-block scales, and alpha
         """
         if isinstance(input, Fp4QuantizedTensor):
+            if input.reciprocal_scale is not None:
+                if module.pre_quant_scale is not None:
+                    raise RuntimeError(
+                        "Received pre-quantized FP4 input with reciprocal_scale for a layer with pre_quant_scale."
+                    )
+                alpha = input.reciprocal_scale * module.weight_scale_2
+                return input.fp4_tensor, input.scaling_factor, alpha
             # Input is already quantized - this should not happen if pre_quant_scale exists
             if module.pre_quant_scale is not None or module.force_dynamic_quantization:
                 raise RuntimeError(
@@ -1560,20 +1570,13 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input.fp4_tensor.reshape(-1, input.fp4_tensor.shape[-1]),
                 input.scaling_factor,
                 input.is_sf_swizzled,
+                unquantized_hidden_states=input.unquantized_hidden_states,
+                reciprocal_scale=input.reciprocal_scale,
             )
         elif not isinstance(input,
                             (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
-        elif isinstance(input,
-                        Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
-            original_shape = input.fp4_tensor.shape
-            input = Fp4QuantizedTensor(
-                fp4_tensor=input.fp4_tensor.reshape(-1,
-                                                    input.fp4_tensor.shape[-1]),
-                scaling_factor=input.scaling_factor,
-                is_sf_swizzled=input.is_sf_swizzled,
-            )
 
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
 
@@ -4143,6 +4146,18 @@ def is_static_nvfp4_input_eligible(linear) -> bool:
             and not getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "input_scale", None) is not None
             and getattr(linear, "pre_quant_scale", None) is None)
+
+
+def is_dynamic_nvfp4_input_eligible(linear) -> bool:
+    """Whether `linear` consumes a dynamic NVFP4 input carrying reciprocal_scale,
+    making it eligible to receive pre-quantized input from a deferred scale producer."""
+    if linear is None:
+        return False
+    return (getattr(linear, "has_nvfp4_activation_quantization", False)
+            and (getattr(linear, "force_dynamic_quantization", False)
+                 or getattr(linear, "input_scale", None) is None)
+            and getattr(linear, "pre_quant_scale", None) is None
+            and getattr(linear, "weight_scale_2", None) is not None)
 
 
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):

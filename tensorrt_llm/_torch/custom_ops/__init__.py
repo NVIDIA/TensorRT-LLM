@@ -63,13 +63,20 @@ if IS_FLASHINFER_AVAILABLE:
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from .cute_dsl_custom_ops import (
+        cute_dsl_nvfp4_dense_gemm_gelu_blackwell,
+        cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell,
+        cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell,
         cute_dsl_nvfp4_dense_gemm_swiglu_blackwell,
         cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell,
-        cute_dsl_nvfp4_gemm_blackwell)
+        cute_dsl_nvfp4_gemm_blackwell, nvfp4_sfc_finalize)
     __all__ += [
         'cute_dsl_nvfp4_gemm_blackwell',
         'cute_dsl_nvfp4_dense_gemm_swiglu_blackwell',
         'cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell',
+        'cute_dsl_nvfp4_dense_gemm_gelu_blackwell',
+        'cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell',
+        'cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell',
+        'nvfp4_sfc_finalize',
     ]
 
     # MegaMoE NVFP4 op probes a strict superset of IS_CUTLASS_DSL_AVAILABLE
