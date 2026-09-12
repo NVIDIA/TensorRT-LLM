@@ -161,6 +161,50 @@ def test_slurm_blocks_are_task_scoped():
     assert "test_command.md" not in slurm.plan_drafter
 
 
+# Flags that this checkout's scripts/build_wheel.py does not define. Passing
+# any of them fails the whole command with `unrecognized arguments` before
+# anything builds, and the agent — correctly — reports a blocker and stalls
+# rather than guessing a replacement. They reached the prompt by being copied
+# verbatim from another project's bootstrap recipe.
+_REMOVED_BUILD_WHEEL_FLAGS = ("--trt_root", "--benchmarks ", "--benchmarks\n")
+
+
+def test_bootstrap_carries_no_removed_build_wheel_flags():
+    """A stale flag here stalls a run for hours before anyone sees why."""
+    slurm = build_staircase_prompts(include_slurm_environment=True)
+    for role in ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa"):
+        prompt = getattr(slurm, role)
+        for flag in _REMOVED_BUILD_WHEEL_FLAGS:
+            # The prompt may *name* a removed flag to warn against it; what it
+            # must not do is put one inside the command block it tells the
+            # agent to run.
+            for line in prompt.splitlines():
+                if line.lstrip().startswith("python3 ./scripts/build_wheel.py"):
+                    assert flag.strip() not in line, f"{role}: {flag!r} in {line!r}"
+
+
+def test_bootstrap_states_the_build_wheel_invariants():
+    """The three non-obvious ones, each of which has already cost a run."""
+    coder = _flat(build_staircase_prompts(include_slurm_environment=True).coder)
+    # Architecture pin: without it the build targets every arch and never finishes.
+    assert '-a "103-real"' in coder
+    # ccache on shared scratch is what makes the rebuild incremental.
+    assert "CCACHE_DIR" in coder
+    # The idle-GPU watchdog kills a CPU-bound build unless the GPUs look busy.
+    assert "idle-GPU watchdog" in coder
+    # PYTHONPATH ahead of site-packages is what makes the checkout the thing
+    # that gets imported — the reason a rebuild is needed at all.
+    assert "PYTHONPATH" in coder
+    assert "resolve to the checkout you edited" in coder
+
+
+def test_bootstrap_distinguishes_python_only_from_native_change():
+    """Rebuilding on every Python edit wastes an hour; skipping one on a new op breaks import."""
+    coder = _flat(build_staircase_prompts(include_slurm_environment=True).coder)
+    assert "Python-only change" in coder and "no rebuild" in coder
+    assert "New or changed C++/CUDA/header/CMake" in coder
+
+
 def test_importing_the_package_spawns_no_backend_session():
     """Importing this package must not pull in another workflow's prompts.
 

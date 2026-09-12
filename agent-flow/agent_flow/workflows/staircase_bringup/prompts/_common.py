@@ -632,40 +632,91 @@ fall back to a local non-Slurm run when `task.yaml` contains
 `slurm-environment`. If any value is unusable at runtime, flag it as a
 blocker for the human in the loop instead of guessing.
 
-Every fresh container session that will run TensorRT-LLM code (tests, builds,
-benchmarks, eval) must run inside the container after changing directory to
-the mounted TensorRT-LLM checkout path from `task.yaml`:
+### Running a command: the checkout is what must be imported
+
+Every command that exercises TensorRT-LLM runs inside the container, from the
+mounted checkout, with that checkout ahead of the container's own installed
+package:
 
 ```bash
 cd <trtllm_repo_path>
-./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --skip_building_wheel -f --nvtx --use_ccache
-pip install -e .[devel]
-curl -fsSL https://claude.ai/install.sh | bash
-pip install claude-agent-sdk
+export VENV=<trtllm_repo_path>/.venv-3.12
+export PATH="$VENV/bin:$PATH"
+export PYTHONPATH=<trtllm_repo_path>:${PYTHONPATH:-}
+export TRTLLM_STAIRCASE=require
 ```
 
-- `--skip_building_wheel -f --use_ccache` performs an in-place native build
-  whose object cache survives across container sessions; the bootstrap is
-  still required every fresh container because the editable
-  `pip install -e .[devel]` and the `claude-agent-sdk` install live inside the
-  container's site-packages.
-- Staircase is pure Python inside the installed package, so a native rebuild
-  is not normally needed after the bootstrap — but **what the tests import
-  must be the editable install**, not a stale wheel left in site-packages. A
-  gate run against a stale package is not pass evidence, and it fails in the
-  most confusing possible way: the code you edited is not the code that ran.
-- Wrap the bootstrap inside the same SLURM container invocation (typically
-  `srun --partition=<slurm_partition> --container-image=<docker_image>
-  --container-mounts=<trtllm_repo_path>:<trtllm_repo_path>,...`) that runs
-  your command, so the test executes in the session that was just
-  bootstrapped. A bare command on the login node, one inside a container that
-  did not mount the source checkout, one that mounted it at a different path,
-  or one that skipped the bootstrap is not valid pass evidence.
-- The bootstrap's TRT root (`/usr/local/tensorrt`) and `claude-agent-sdk`
-  install are fixed project conventions; do not parameterize or swap them
-  based on per-task assumptions.
+`PYTHONPATH` ahead of site-packages is what makes `import tensorrt_llm`
+resolve to the checkout you edited rather than the image's copy — which is
+the whole point, since your staircase code lives in the checkout. The venv
+must be first on `PATH` because the multi-rank launcher calls a bare
+`python3` for the leader and the workers.
+
+There is no `pip install -e .` step and nothing to install into the
+container: the image already carries the dependencies, and the checkout
+carries the code.
+
+### Rebuilding: required whenever you add or change a native op
+
+**The checkout's `tensorrt_llm/libs/*.so` and `tensorrt_llm/*.so` are part of
+what `PYTHONPATH` points at.** A catalog entry wraps `torch.ops.trtllm.<op>`,
+and that symbol only exists if a built library in the checkout exports it. So:
+
+- **Python-only change** (target `modeling.py` / `weights.py`, a wrapper whose
+  op already exists) — no rebuild. `PYTHONPATH` picks it up immediately.
+- **New or changed C++/CUDA/header/CMake** — rebuild before any run, or
+  `import tensorrt_llm` raises before your test gets a chance to fail
+  honestly. This checkout has already hit exactly that: a Python tree
+  referencing `trtllm::silu_and_mul_fp8_quantize_1x128_packed_ue8m0` with no
+  built library exporting it.
+
+The rebuild command for this checkout:
+
+```bash
+export HOME=<scratch>/compile_home
+export CCACHE_DIR=<scratch>/.ccache_trtllm
+export CCACHE_MAXSIZE=50G
+cd <trtllm_repo_path>
+python3 ./scripts/build_wheel.py --use_ccache -G Ninja -a "103-real" --nvtx
+```
+
+Three things about it that are not guesses and must not be "improved":
+
+- `-a "103-real"` targets this machine's architecture only. Dropping it
+  builds every architecture and turns a ~1 hour incremental build into
+  something that will not finish inside a normal time limit.
+- `CCACHE_DIR` on shared scratch is what makes the build incremental across
+  container sessions. Without it every rebuild is a full one. `HOME` is
+  redirected for the same reason — the default would put the cache somewhere
+  that does not survive.
+- **The build is CPU-bound, and this cluster's idle-GPU watchdog kills jobs
+  whose GPUs sit at 0% utilization for about ten minutes.** Keep the
+  allocated GPUs nominally busy for the duration (a background loop doing a
+  small matmul on each device is enough) or the build is killed partway with
+  no useful error.
+
+`--trt_root` and `--benchmarks` **do not exist** in this checkout's
+`build_wheel.py` and passing them fails the whole command with `unrecognized
+arguments` before anything builds. Read `scripts/build_wheel.py --help`
+rather than carrying flags over from another project's recipe.
+
+### General rules
+
+- Wrap the command in the same `srun` container invocation that runs your
+  test, so it executes in the session you just set up: `srun
+  --partition=<slurm_partition> --container-image=<docker_image>
+  --container-mounts=<trtllm_repo_path>:<trtllm_repo_path>:rw,...`. A bare
+  command on the login node, one in a container that did not mount the
+  checkout, or one that mounted it at a different path is not pass evidence.
 - **Export `TRTLLM_STAIRCASE=require` inside the `srun` invocation**, before
   the ranks start — not in a wrapper shell that only the driver sees.
+- Above world size 1, `TLLM_WORKER_USE_SINGLE_PROCESS` does not apply (it is
+  read only at world size 1) and the LLM API falls back to `MPI_Comm_spawn`,
+  which **wedges** under srun/pyxis here. Use one srun task per rank plus
+  `trtllm-llmapi-launch`, which builds the MPI session from the existing
+  allocation instead of spawning into it.
+- The repo root carries working `staircase_*.sbatch` examples for the gate,
+  smoke, and rebuild shapes. Read one before writing a new command.
 """
 
 TEST_COMMAND_CACHE = """\
