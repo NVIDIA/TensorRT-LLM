@@ -32,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -129,11 +130,14 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
     // would pass having never had two probes in flight at once -- which is the whole point.
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
-    std::vector<std::thread> threads;
-    threads.reserve(kNumThreads);
+    std::vector<std::future<void>> workers;
+    workers.reserve(kNumThreads);
     for (int threadIndex = 0; threadIndex < kNumThreads; ++threadIndex)
     {
-        threads.emplace_back(
+        // std::async, not std::thread: probeReuse() can throw, and an exception escaping a thread
+        // body terminates the process, taking every other test in the binary with it. get() below
+        // rethrows it on this thread, where gtest reports it as an ordinary failure.
+        workers.push_back(std::async(std::launch::async,
             [&manager, &tokens, &nonZeroMatches, &ready, &go, threadIndex]
             {
                 ready.fetch_add(1, std::memory_order_relaxed);
@@ -152,7 +156,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
                         nonZeroMatches.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
-            });
+            }));
     }
 
     auto const readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
@@ -160,14 +164,14 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
     {
         std::this_thread::yield();
     }
-    // EXPECT, not ASSERT: the workers are joinable, and returning here would terminate. Release
-    // unconditionally either way, so nobody waits on a barrier that never opens.
+    // EXPECT, not ASSERT: returning here would block in ~future until every worker reached its own
+    // deadline. Release unconditionally either way, so nobody waits on a barrier that never opens.
     EXPECT_EQ(ready.load(), kNumThreads) << "not every prober reached the start barrier";
     go.store(true, std::memory_order_release);
 
-    for (auto& thread : threads)
+    for (auto& worker : workers)
     {
-        thread.join();
+        worker.get(); // joins, and rethrows whatever the worker threw
     }
 
     EXPECT_EQ(nonZeroMatches.load(), 0);
@@ -193,7 +197,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
     // stream of shared acquisitions could in principle starve the writer; without the deadline the
     // writer's next exclusive call would block forever and hang CI instead of failing.
     auto const proberDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-    std::thread prober(
+    auto prober = std::async(std::launch::async,
         [&]
         {
             while (!stop.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < proberDeadline)
@@ -211,7 +215,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
     {
         std::this_thread::yield();
     }
-    // EXPECT, not ASSERT: `prober` is joinable, and returning here would terminate on its destructor.
+    // EXPECT, not ASSERT: returning here would block in ~future until the prober's own deadline.
     bool const proberRan = probeCount.load(std::memory_order_relaxed) > 0;
     EXPECT_TRUE(proberRan) << "prober never ran";
 
@@ -235,7 +239,7 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
     }
 
     stop.store(true, std::memory_order_relaxed);
-    prober.join();
+    prober.get(); // joins, and rethrows whatever the prober threw
 
     if (proberRan)
     {
