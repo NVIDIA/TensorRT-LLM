@@ -807,6 +807,8 @@ class FlashinferOpBackend(MoEOpBackend):
                 activation_type=self.cvt_activation_type(gated_act_type),
                 output=output,
                 tune_max_num_tokens=tune_max_num_tokens,
+                valid_hidden_size=valid_hidden_size,
+                valid_intermediate_size=valid_intermediate_size,
             )
         else:
             packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
@@ -845,6 +847,8 @@ class FlashinferOpBackend(MoEOpBackend):
                 activation_type=self.cvt_activation_type(gated_act_type),
                 output=output,
                 tune_max_num_tokens=tune_max_num_tokens,
+                valid_hidden_size=valid_hidden_size,
+                valid_intermediate_size=valid_intermediate_size,
             )
         if not do_finalize:
             if outputs[2].dim() != 2:
