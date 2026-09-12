@@ -71,27 +71,30 @@ The following is a table of supported models for the PyTorch backend:
 ## Model-Feature Support Matrix (Key Models)
 
 Note: Support for other models may vary. Features marked "N/A" are not applicable to the model architecture.
+This matrix covers language-only requests, including the text-decoder path of multimodal architectures. The multimodal
+matrix below independently covers requests with actual image, video, or audio input, so a feature can have different
+statuses for the same architecture in the two matrices.
 
-| Model Architecture/Feature       | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | Speculative Decoding [^18] | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding |
-| -------------------------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | -------------------------- | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
-| `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | MTP                        | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
-| `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
-| `GlmMoeDsaForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | No               | Yes            | N/A                      | Yes                   | Yes             |
-| `DeepseekV4ForCausalLM` [^11]    | Yes               | Yes        | Yes                        | Untested              | Yes             | MTP                        | Yes           | Yes              | Untested       | Yes                      | Untested              | Yes             |
-| `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | MTP                        | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes [^16]       |
-| `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear, Dynamic)  | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
-| `Qwen3NextForCausalLM` [^3]      | Yes               | Yes        | Yes                        | Untested              | Yes             | No                         | Yes           | Yes              | No             | No                       | Untested              | Yes             |
-| `Qwen3_5MoeForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Untested         | Yes            | N/A                      | Untested              | Yes             |
-| `Qwen4ExpForCausalLM`            | Yes               | Yes        | Yes                        | No                    | Yes             | MTP                        | Yes           | Untested         | No             | N/A                      | Yes                   | Yes             |
-| `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear, Dynamic)  | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
-| `GptOssForCausalLM`              | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear), DFlash   | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
-| `KimiK3ForConditionalGeneration` [^15] [^17] | Yes               | Yes        | Yes                        | Yes                   | Yes             | DSpark                     | Yes           | No               | Yes            | N/A                      | Yes                   | Yes             |
-| `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No                         | Yes           | Untested         | Untested       | N/A                      | Untested              | Yes             |
-| `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes              | Yes            | N/A                      | Untested              | Yes             |
-| `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | MTP                        | Yes           | Untested         | No             | Yes                      | Untested              | Yes             |
-| `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested                   | No                    | Yes             | No                         | Yes           | Untested         | No             | Yes                      | Untested              | Yes             |
-| `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | Untested         | Untested       | Yes                      | Untested              | Yes             |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No                         | Yes           | Untested         | No             | N/A                      | Untested              | Yes             |
+| Model Architecture/Feature       | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | Speculative Decoding [^18] | Torch Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding |
+| -------------------------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | -------------------------- | ------------- | -------------- | ------------------------ | --------------------- | --------------- |
+| `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | MTP                        | Yes           | Yes [^2]       | N/A                      | Yes                   | Yes             |
+| `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `GlmMoeDsaForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `DeepseekV4ForCausalLM` [^11]    | Yes               | Yes        | Yes                        | Untested              | Yes             | MTP                        | Yes           | Yes            | Yes                      | Yes                   | Yes             |
+| `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | MTP                        | Yes           | Yes            | N/A                      | Yes                   | Yes [^16]       |
+| `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear, Dynamic)  | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `Qwen3NextForCausalLM` [^3]      | Yes               | Yes        | Yes                        | Untested              | Yes             | No                         | Yes           | Yes [^19]      | No                       | Yes                   | Yes             |
+| `Qwen3_5MoeForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `Qwen4ExpForCausalLM`            | Yes               | Yes        | Yes                        | No                    | Yes             | MTP                        | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear, Dynamic)  | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `GptOssForCausalLM`              | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear), DFlash   | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `KimiK3ForConditionalGeneration` [^15] [^17] | Yes               | Yes        | Yes                        | Yes                   | Yes             | DSpark                     | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No                         | Yes           | Yes            | N/A                      | No [^20]              | Yes             |
+| `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes            | N/A                      | Yes                   | Yes             |
+| `Gemma4ForConditionalGeneration` | Yes                | Yes        | Yes                        | No                    | Yes             | MTP                        | Yes           | No             | Yes                      | Yes                   | Yes             |
+| `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Yes                        | No                    | Yes             | No                         | Yes           | No             | Yes                      | Yes                   | Yes             |
+| `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | No             | Yes                      | Yes                   | Yes             |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No                         | Yes           | No             | N/A                      | Yes                   | Yes             |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120/SM121 and in BF16/FP8 KV cache dtype.
@@ -110,6 +113,8 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^16]: Guided decoding for `Glm4MoeForCausalLM` is currently supported only with the `xgrammar` backend; `llguidance` is not working.
 [^17]: Kimi K3 has no MTP or EAGLE-3 head, and its DSpark checkpoints are not compatible with plain `DFlash`.
 [^18]: NGram and standalone Suffix Automaton (SA) use model-free drafting on the PyTorch backend, so they are not listed in individual entries. This does not imply universal end-to-end support: compatibility depends on each model's multi-token verification and cache-management paths and may be untested or explicitly restricted.
+[^19]: KV cache reuse for hybrid recurrent-attention models requires an explicit recurrent-state snapshot policy, such as `kv_cache_config.mamba_state_config.periodic_snapshot_interval`; the model default disables reuse when no snapshot policy is configured.
+[^20]: Logits post processors are not supported by the AutoDeploy `ADEngine` used for `Glm4MoeLiteForCausalLM`.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -131,30 +136,33 @@ complete encoder input must fit in the iteration token budget.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
-| Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality  |
-| ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | ---------------- | -------------- | --------------------- | ------------------------- | --------- |
-| `Exaone4_5_ForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | No                        | L + I + V |
-| `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | Yes              | N/A            | Yes                   | No                        | L + I     |
-| `Gemma4ForConditionalGeneration`     | Untested          | Yes        | Yes             | Yes           | Untested         | No             | Untested              | No                        | L + I + V + A [^9] |
-| `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested        | Yes           | Untested         | No             | Untested              | No                        | L + I + A |
-| `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes              | Yes            | Yes                   | No                        | L + I     |
-| `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I + V |
-| `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I     |
-| `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | Yes              | No             | Yes                   | No                        | L + I     |
-| `MiniCPMV4_6ForConditionalGeneration` [^14] | Yes               | Untested   | Untested        | Yes           | Untested         | Untested       | Untested              | No                        | L + I + V |
-| `Mistral3ForConditionalGeneration`   | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | No                        | L + I     |
-| `NemotronH_Nano_VL_V2`               | Yes               | Yes        | Yes             | Yes           | Yes              | N/A            | Yes                   | Yes                       | L + I + V + A [^10] |
-| `Phi4MMForCausalLM`                  | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | No                        | L + I + A |
-| `Qwen2VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | No                        | L + I + V |
-| `Qwen2_5_VLForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
-| `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
-| `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
-| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested         | Untested       | Untested              | Untested                  | L + I     |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | Untested         | No             | Untested              | Untested                  | L + I + V |
-| `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Untested              | Untested                  | L + I + V |
-| `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
-| `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
-| `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested         | Untested       | Yes                   | No                        | L + I     |
+Entries in this matrix require a request with at least one listed non-language modality; language-only test evidence is
+not used to mark a feature as supported here.
+
+| Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality  |
+| ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | -------------- | --------------------- | ------------------------- | --------- |
+| `Exaone4_5_ForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
+| `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | N/A            | Yes                   | No                        | L + I     |
+| `Gemma4ForConditionalGeneration`     | Yes                | Yes        | Yes             | Yes           | No             | Yes                   | No                        | L + I + V + A [^9] |
+| `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Untested        | Yes           | No             | Yes                   | No                        | L + I + A |
+| `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes            | Yes                   | No                        | L + I     |
+| `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I + V |
+| `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I     |
+| `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I     |
+| `MiniCPMV4_6ForConditionalGeneration` [^14] | Yes               | Untested   | Untested        | Yes           | Untested       | Untested              | No                        | L + I + V |
+| `Mistral3ForConditionalGeneration`   | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I     |
+| `NemotronH_Nano_VL_V2`               | Yes               | Yes        | Yes             | Yes           | N/A            | Yes                   | Yes                       | L + I + V + A [^10] |
+| `Phi4MMForCausalLM`                  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + A |
+| `Qwen2VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
+| `Qwen2_5_VLForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
+| `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
+| `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
+| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested       | Yes                   | Untested                  | L + I     |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | No             | Yes                   | Untested                  | L + I + V |
+| `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | L + I + V |
+| `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
+| `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
+| `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested       | Yes                   | No                        | L + I     |
 
 Note:
 - L: Language

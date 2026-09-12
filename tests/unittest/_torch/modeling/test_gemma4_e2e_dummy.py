@@ -48,7 +48,7 @@ _GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
 
 # Imported after the module-level skip guard so that collecting this module on
 # a machine without LLM_MODELS_ROOT does not pull in the runtime import.
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
+from tensorrt_llm.llmapi import LLM, CudaGraphConfig, KvCacheConfig, SamplingParams  # noqa: E402
 
 # These dummy models are tiny, but the default KV-cache fraction sizes the pool
 # to most of the (very large B200) device memory, leaving nothing for the other
@@ -202,6 +202,8 @@ def test_e2e_text_26b_dummy():
             load_format="dummy",
             attn_backend="FLASHINFER",
             dtype="bfloat16",
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(),
             kv_cache_config=_KV_CACHE_CONFIG,
         )
         with llm:
@@ -348,6 +350,8 @@ def test_e2e_multimodal_26b_dummy():
             load_format="dummy",
             attn_backend="FLASHINFER",
             dtype="bfloat16",
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(),
             kv_cache_config=_KV_CACHE_CONFIG,
         )
         with llm:

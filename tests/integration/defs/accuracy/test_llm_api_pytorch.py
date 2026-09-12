@@ -52,6 +52,7 @@ from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             LongBenchV1, LongBenchV2, assert_acceptance_length,
                             assert_acceptance_length_for_llm,
                             assert_guided_decoding_regex,
+                            assert_kv_cache_reuse_for_llm,
                             compute_acceptance_length)
 
 
@@ -1446,8 +1447,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if quant_dtype == "none" and fp8kv:
             pytest.skip("only fp8 and nvfp4 support fp8 kv cache")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=kv_cache_reuse)
+        assert_reuse = (quant_dtype == "none" and kv_cache_reuse
+                        and overlap_scheduler)
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=kv_cache_reuse,
+            # ADP pads an idle rank with a short dummy request; don't commit
+            # that partial block while asserting exact reused-block counts.
+            **({
+                "enable_partial_reuse": False
+            } if assert_reuse else {}),
+        )
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler, )
         if quant_dtype == "fp8" and is_sm_100f():
             pytorch_config["moe_config"] = MoeConfig(backend="DEEPGEMM")
@@ -1471,6 +1481,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             elif quant_dtype == "nvfp4":
                 assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            if assert_reuse:
+                assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 255)
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -5132,6 +5145,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
+
+            # One active configuration is sufficient to verify a direct hit;
+            # the remaining variants retain their existing accuracy coverage.
+            if not v2_kv_cache and one_model:
+                assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 255)
 
             # GSM8K
             task = GSM8K(model_name)
