@@ -54,6 +54,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     TxSessionBase,
     WaitResult,
+    resolve_transfer_rid,
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
@@ -474,7 +475,8 @@ class SendTaskBase:
         self._exception: Optional[Exception] = None
         self.lock = threading.Lock()
         self._params = params
-        self._unique_rid: Optional[int] = params.disagg_request_id
+        # Same key the sessions register under; see resolve_transfer_rid().
+        self._unique_rid: Optional[int] = resolve_transfer_rid(params)
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_lock = threading.Lock()
         self._physical_operations: dict[int, _PhysicalOperation] = {}
@@ -1953,15 +1955,7 @@ class TxSession(TxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
-        params = self._base_args.params
-        if params.disagg_request_id is not None:
-            return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
-        if params.ctx_request_id is not None:
-            return params.ctx_request_id
-        return self.request_id
+        return resolve_transfer_rid(self._base_args.params, self.request_id)
 
     @property
     def status(self) -> SessionStatus:
@@ -2544,11 +2538,8 @@ class Receiver(ReceiverBase):
         self_ri = self._registrar.self_rank_info
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
         # Some requests arrive with ctx_request_id None while disagg_request_id
-        # is set; disagg_request_id is the receive-session key, so fall back to
-        # it instead of failing here (nvbugs/6482576).
-        sender_req_id = task._params.ctx_request_id
-        if sender_req_id is None:
-            sender_req_id = task._params.disagg_request_id
+        # is set (nvbugs/6482576); resolve_transfer_rid falls back for us.
+        sender_req_id = resolve_transfer_rid(task._params)
         if sender_req_id is None:
             # Not an assert: must survive python -O so a None id never reaches
             # RecvReqInfo.sender_req_id / the wire.
@@ -3030,15 +3021,7 @@ class RxSession(RxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
-        params = self._base_args.params
-        if params.disagg_request_id is not None:
-            return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
-        if params.ctx_request_id is not None:
-            return params.ctx_request_id
-        return self.request_id
+        return resolve_transfer_rid(self._base_args.params, self.request_id)
 
     @contextmanager
     def _ownership_evidence_guard(self) -> Iterator[None]:

@@ -607,7 +607,7 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
                 llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
             )
             gen_req.py_disaggregated_params = DisaggregatedParams(
-                ctx_request_id=ctx_rid,
+                ctx_request_id=unique_rid,
                 ctx_dp_rank=_ctx_ranks(req_idx)[0] if enable_attention_dp else 0,
                 ctx_info_endpoint=ctx_endpoint,
                 disagg_request_id=unique_rid,

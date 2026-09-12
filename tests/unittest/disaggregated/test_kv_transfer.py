@@ -942,7 +942,7 @@ def add_and_verify_request(
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=ctx_dp_rank,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
@@ -1412,7 +1412,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=0,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=0,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
@@ -1840,7 +1840,7 @@ def test_session_has_transferring_tasks_false():
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
         disagg_request_id=unique_rid,
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         schedule_style=1,
     )
 
@@ -1907,7 +1907,7 @@ def test_incompatible_peer_fails_only_affected_requests():
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         )
         req.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=request_id,
+            ctx_request_id=rid,
             ctx_dp_rank=0,
             ctx_info_endpoint=bad_endpoint,
             disagg_request_id=rid,
