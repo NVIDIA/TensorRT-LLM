@@ -23,6 +23,51 @@ Toggling the CUDA profiler runtime API on and off:
   * Results in smaller files to post-process (for metric extraction or similar).
 
 
+## Lightweight KV cache pool logging
+
+With KV Cache Manager V2, set `TLLM_KV_POOL_LOG_INTERVAL=50` and enable
+`print_iter_log` to append GPU and host pool-group utilization every 50 iterations:
+
+```bash
+TLLM_KV_POOL_LOG_INTERVAL=50 TLLM_PROFILE_LOG_RANKS=0 \
+trtllm-serve <model> --config config.yaml
+```
+
+```yaml
+# config.yaml (alongside your model's other serving options)
+print_iter_log: true
+enable_iter_perf_stats: false
+```
+
+The interval defaults to `0` (disabled). Set it to `1` for every iteration during
+short diagnostic runs. `TLLM_PROFILE_LOG_RANKS` selects the logging ranks, as for
+the existing iteration log. The first sampled iteration also logs each tier's
+mapping from pool-group IDs to lifecycle (layer-group) IDs. For example, sampled
+iteration lines include:
+
+```text
+kv_cache_util = 0.600, kv_cache_gpu_pool_util = [0:0.900;1:0.500], kv_cache_host_pool_util = [0:0.250],
+```
+
+GPU and host pool-group IDs are independent: GPU pool `0` need not correspond to
+host pool `0`, and the two tiers may have different numbers of groups. Host pools
+are selected by tier type; disk capacity is not included. A missing host tier or
+a pool with zero capacity is reported as `N/A`.
+
+Utilization is `1 - (free + evictable) / total`, measured in slots within each
+pool group. The existing `kv_cache_util` remains the aggregate across GPU groups,
+weighted by slot count, not bytes. These values describe capacity that is not
+immediately reclaimable, not total GPU/host memory usage.
+
+This diagnostic reads CPU-side capacity counters without enabling iteration
+statistics, resetting their deltas, or adding CUDA synchronization or cross-rank
+communication. It reuses the GPU snapshot for the aggregate and pool values and
+reads host counters only on sampled iterations. Other iterations omit the pool
+fields rather than repeating old samples. Sampling can miss short-lived peaks;
+formatting and log output still incur some CPU and I/O cost. Legacy cache
+managers keep the existing aggregate-only log.
+
+
 ## Coordinating with NVIDIA Nsight Systems Launch
 
 Consult the Nsight Systems User Guide for full overview of options.

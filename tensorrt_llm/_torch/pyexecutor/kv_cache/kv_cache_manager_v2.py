@@ -58,6 +58,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     CacheLevel,
+    CacheTier,
     CacheTierConfig,
     CuError,
     DataRole,
@@ -3640,6 +3641,45 @@ class KVCacheManagerV2(BaseResourceManager):
                 iter_unaligned_snapshot_hits=snapshot_delta.iter_unaligned_snapshot_hits,
             ),
         )
+
+    def get_kv_cache_utilization(
+        self, include_pool_details: bool = False
+    ) -> tuple[float | None, dict[str, list[float | None]]]:
+        """Read capacity counters without collecting or resetting iteration statistics.
+
+        GPU and host pool-group IDs belong to separate namespaces. Host capacity is
+        queried only when pool details are requested; disk tiers are not included.
+        """
+        gpu_stats = self._get_storage_statistics(GPU_LEVEL)
+        total = sum(stat.total for stat in gpu_stats)
+        available = sum(stat.available for stat in gpu_stats)
+        gpu_utilization = 1.0 - available / total if total else None
+        pool_utilization: dict[str, list[float | None]] = {}
+        if include_pool_details:
+            pool_utilization["gpu"] = [
+                1.0 - stat.available / stat.total if stat.total else None for stat in gpu_stats
+            ]
+            for level, tier in enumerate(self.impl.cache_tier_list):
+                if tier == CacheTier.HOST_MEM:
+                    pool_utilization["host"] = [
+                        1.0 - stat.available / stat.total if stat.total else None
+                        for stat in self._get_storage_statistics(CacheLevel(level))
+                    ]
+        return gpu_utilization, pool_utilization
+
+    def get_kv_cache_pool_mapping(self) -> dict[str, dict[int, list[int]]]:
+        """Map tier-local pool-group IDs to lifecycle (layer-group) IDs for log diagnostics."""
+        mapping: dict[str, dict[int, list[int]]] = {}
+        for level, tier in enumerate(self.impl.cache_tier_list):
+            if tier not in (CacheTier.GPU_MEM, CacheTier.HOST_MEM):
+                continue
+            groups: dict[int, list[int]] = defaultdict(list)
+            for life_cycle_id, pool_group_id in enumerate(
+                _introspection.life_cycle_pool_group_indices(self.impl, CacheLevel(level))
+            ):
+                groups[int(pool_group_id)].append(life_cycle_id)
+            mapping["gpu" if tier == CacheTier.GPU_MEM else "host"] = dict(groups)
+        return mapping
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()

@@ -62,6 +62,7 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_glo
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+KV_POOL_LOG_INTERVAL_ENV_VAR_NAME = "TLLM_KV_POOL_LOG_INTERVAL"
 
 
 @functools.cache
@@ -115,6 +116,7 @@ class PyExecutorProfileManager:
 
     def __init__(self, executor: "PyExecutor") -> None:  # noqa: F821
         self._executor_ref = weakref.ref(executor)
+        self._kv_pool_mapping_logged = False
 
     # ---- helpers ---------------------------------------------------
 
@@ -579,6 +581,52 @@ class PyExecutorProfileManager:
             )
         return cancelled_pending_start
 
+    def _kv_cache_log_fields(self, pool_log_interval: int) -> tuple[str, str]:
+        """Format capacity snapshots on the executor thread, after log/rank filtering."""
+        executor = self._executor
+        manager = executor.kv_cache_manager
+        kv_util_str = "N/A"
+        pool_fields = ""
+        if manager is None:
+            return kv_util_str, pool_fields
+
+        get_utilization = (
+            getattr(manager, "get_kv_cache_utilization", None) if pool_log_interval else None
+        )
+        if get_utilization is None:
+            kv_stats = manager.get_kv_cache_stats()
+            if kv_stats.max_num_blocks > 0:
+                kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
+            return kv_util_str, pool_fields
+
+        sample_pools = executor.iter_counter % pool_log_interval == 0
+        utilization, pools = get_utilization(include_pool_details=sample_pools)
+        if utilization is not None:
+            kv_util_str = f"{utilization:.3f}"
+        if sample_pools:
+            if not self._kv_pool_mapping_logged:
+                logger.info(
+                    f"KV cache pool groups [global_rank={executor.global_rank}, "
+                    f"rank={executor.dist.rank}]: "
+                    f"pool_group_id -> lifecycle_ids = {manager.get_kv_cache_pool_mapping()}"
+                )
+                self._kv_pool_mapping_logged = True
+            for tier in ("gpu", "host"):
+                values = pools.get(tier)
+                if values is None:
+                    formatted = "N/A"
+                else:
+                    formatted = (
+                        "["
+                        + ";".join(
+                            f"{pool_id}:{value:.3f}" if value is not None else f"{pool_id}:N/A"
+                            for pool_id, value in enumerate(values)
+                        )
+                        + "]"
+                    )
+                pool_fields += f"kv_cache_{tier}_pool_util = {formatted}, "
+        return kv_util_str, pool_fields
+
     # ---- per-iteration driver (executor thread) --------------------
 
     @contextmanager
@@ -648,6 +696,10 @@ class PyExecutorProfileManager:
         else:
             log_all_ranks = False
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
+
+        pool_log_interval = int(os.environ.get(KV_POOL_LOG_INTERVAL_ENV_VAR_NAME, "0"))
+        if pool_log_interval < 0:
+            raise ValueError(f"{KV_POOL_LOG_INTERVAL_ENV_VAR_NAME} must be non-negative")
 
         calibrator = get_calibrator()
 
@@ -737,13 +789,7 @@ class PyExecutorProfileManager:
                         prev_device_step_time_str = "N/A"  # first iteration
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
-                    kv_util_str = "N/A"
-                    if executor.kv_cache_manager is not None:
-                        kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
-                        if kv_stats.max_num_blocks > 0:
-                            kv_util_str = (
-                                f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
-                            )
+                    kv_util_str, kv_pool_fields = self._kv_cache_log_fields(pool_log_interval)
                     import datetime
 
                     formatted_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -755,6 +801,7 @@ class PyExecutorProfileManager:
                         f"adp_dummy_ctx_tokens = {executor._iter_adp_dummy_ctx_tokens}, "
                         f"adp_dummy_gen_tokens = {executor._iter_adp_dummy_gen_tokens}, "
                         f"kv_cache_util = {kv_util_str}, "
+                        f"{kv_pool_fields}"
                         f"currank_total_requests = {executor.num_fetch_requests_cur_rank}/"
                         f"{executor.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "
