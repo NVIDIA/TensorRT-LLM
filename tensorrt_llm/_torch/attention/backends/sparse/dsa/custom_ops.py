@@ -150,3 +150,72 @@ def _mla_dsa_attn_inplace_fake(
 
 
 maybe_bcg_mla_dsa_attn_inplace = eager_on_graph(mla_dsa_attn_inplace)
+
+
+_FUSED_TOPK_NCOMP_MIN = 8192
+_FUSED_TOPK_NCOMP_MAX = 262144  # 1M-token context at compress ratio 4
+
+
+@torch.library.custom_op(
+    "trtllm::dsa_fused_indexer_topk_decode",
+    mutates_args=("indices", "values"),
+)
+def dsa_fused_indexer_topk_decode(
+    q_fp4: torch.Tensor,
+    sf_q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Fused DSv4 decode indexer + exact top-K; logits never reach GMEM.
+
+    q_fp4 [B, 1, 64, 64] u8 (packed fp4), sf_q [B, 1, 64] i32,
+    kv_cache = planar indexer K-cache pages [num_blocks, 32, 1, 68] u8,
+    weights [B, 64] f32 (signed), context_lens [B] i32,
+    block_table [B, max_blocks] i32 with max_blocks * 32 on the validated
+    grid (pad with dummy page ids; entries past context_lens are never
+    dereferenced). K = indices.shape[1]; values receive the fp16-rounded
+    selected scores.
+    """
+    assert q_fp4.shape[1] == 1, (
+        f"dsa_fused_indexer_topk_decode: one query per sequence only (got {q_fp4.shape[1]}); "
+        "MTP drafts (next_n > 1) take the unfused path."
+    )
+    n_comp = block_table.shape[1] * 32
+    assert n_comp % 128 == 0 and _FUSED_TOPK_NCOMP_MIN <= n_comp <= _FUSED_TOPK_NCOMP_MAX, (
+        f"dsa_fused_indexer_topk_decode: block_table width {n_comp} tokens "
+        f"is outside the validated range [{_FUSED_TOPK_NCOMP_MIN}, {_FUSED_TOPK_NCOMP_MAX}] "
+        "(multiple of 128); pad the block table (or route longer contexts to the unfused path)."
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        fused_indexer_topk_nospill as _kernel,
+    )
+
+    _kernel.run(
+        q_fp4,
+        sf_q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        None,
+        indices,
+        values,
+    )
+
+
+@dsa_fused_indexer_topk_decode.register_fake
+def _dsa_fused_indexer_topk_decode_fake(
+    q_fp4: torch.Tensor,
+    sf_q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Model the in-place indices/values mutation for fake propagation."""
