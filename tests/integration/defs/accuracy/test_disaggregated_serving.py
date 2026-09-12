@@ -478,6 +478,7 @@ def launch_disaggregated_llm(
                 kwargs.update(
                     max_tokens=sampling_params.max_tokens,
                     n=sampling_params.n,
+                    best_of=sampling_params.best_of,
                     # NB: 'LLM' (cf. SamplingParams) and OpenAI API
                     #     defaults differ (top_p=0 vs. top_p=1).
                     # FIXME: Because 'LLM' does not permit expressly setting
@@ -583,7 +584,11 @@ def run_parallel_test(model_name: str,
                       test_sets: List[LlmapiAccuracyTestHarness],
                       ctx_model: str = None,
                       gen_model: str = None,
-                      cache_transceiver_backend: str = "DEFAULT"):
+                      cache_transceiver_backend: str = "DEFAULT",
+                      trust_remote_code: bool = False,
+                      quant_algo: str = None,
+                      kv_cache_quant_algo: str = None,
+                      max_batch_size: int = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -615,6 +620,12 @@ def run_parallel_test(model_name: str,
             "max_tokens_in_buffer": 4096
         }
     }
+    if max_batch_size is not None:
+        ctx_server_config["max_batch_size"] = max_batch_size
+        gen_server_config["max_batch_size"] = max_batch_size
+    if trust_remote_code:
+        ctx_server_config["trust_remote_code"] = True
+        gen_server_config["trust_remote_code"] = True
 
     # No need to generate URLs - workers will register via service discovery
     disaggregated_server_config = {
@@ -633,6 +644,10 @@ def run_parallel_test(model_name: str,
                                   model_path,
                                   ctx_model=ctx_model,
                                   gen_model=gen_model) as llm:
+        if quant_algo is not None:
+            llm.args.quant_config.quant_algo = quant_algo
+        if kv_cache_quant_algo is not None:
+            llm.args.quant_config.kv_cache_quant_algo = kv_cache_quant_algo
         run_accuracy_test(llm, model_name, test_sets)
 
 
@@ -981,7 +996,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
-@skip_pre_blackwell
+@skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     extra_evaluator_kwargs = {
@@ -991,6 +1006,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
+    # Class relaxed to skip_pre_hopper so test_eagle3 can run on H100; this
+    # pre-existing case stays Blackwell-only as before.
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("block_reuse", [False, True])
     def test_auto_dtype(self, block_reuse, mocker):
@@ -1047,6 +1065,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 test_sets=["GSM8K"],
                 extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
+    # Class relaxed to skip_pre_hopper so test_eagle3 can run on H100; this
+    # pre-existing case stays Blackwell-only as before.
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
                              ids=["cache_mgr_v1", "cache_mgr_v2"])
@@ -1098,6 +1119,86 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            run_accuracy_test(
+                llm,
+                model_name,
+                test_sets=["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
+
+    @pytest.mark.skip_less_device(8)
+    # Two-model eagle3 (eagle3_one_model=False) is being removed (#18721),
+    # so only the one-model path is covered here.
+    @parametrize_with_ids("overlap_scheduler", [True, False])
+    # Dual TP4 120B-model startup (weights + Eagle3 draft checkpoint loaded
+    # on both ctx and gen servers) plus a full, unmocked GSM8K eval (1319
+    # samples, up to 8192 output tokens each) needs the 90-minute timeout.
+    # Without an explicit max_workers, launch_disaggregated_llm's default of
+    # 16 client threads badly underutilizes the servers' much larger
+    # max_batch_size, so the eval was throughput-bound on client concurrency
+    # rather than on the servers -- 128 workers (matching other full-eval
+    # disagg tests in this file) lets the eval actually finish in that time.
+    @pytest.mark.timeout(5400)
+    def test_eagle3(self, overlap_scheduler, mocker):
+        # Eagle3 disagg coverage kept on GPT-OSS; Qwen3.5 has no Eagle3 draft
+        # checkpoint yet, so it cannot replace the Llama-3.1-8B Eagle3 case.
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+        speculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 3,
+            "speculative_model":
+            f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
+            "eagle3_one_model": True
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 4,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": True,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "speculative_config": speculative_decoding_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 4,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cuda_graph_config": None,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
             model_name = "GPT-OSS/120B-MXFP4"
             run_accuracy_test(
                 llm,
@@ -1529,6 +1630,151 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  ctx_instances=1,
                                  gen_instances=1,
                                  cache_transceiver_backend="NIXL")
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_hopper
+class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
+    # Restores disagg coverage removed by the Llama-3.1-8B prune (mismatched
+    # block reuse, asymmetric PP/TP) with a small model. Eagle3 coverage
+    # stays on GPT-OSS until a Qwen3.5 Eagle3 draft checkpoint lands. Beam
+    # search coverage moved to TestGPTOSS20B: Qwen3.5 is a hybrid-linear
+    # model that always prefers KVCacheManagerV2
+    # (Qwen3_5ForCausalLM.get_preferred_kv_cache_manager_version), and V2
+    # hybrid Mamba cache managers reject max_beam_width > 1 with no V1
+    # fallback (_util.py's _validate_or_fallback_kv_cache_manager_v2).
+    MODEL_NAME = "Qwen/Qwen3.5-4B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+
+    @pytest.mark.skip_less_device(2)
+    def test_mismatched_block_reuse(self, mocker):
+        mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "enable_block_reuse": True
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            # MODEL_PATH is the FP8 block-scales checkpoint; the gsm8k.yaml
+            # reference for this quant_algo differs from the unquantized one.
+            llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(4)
+    def test_ctx_pp_gen_tp_asymmetric(self, mocker):
+        # Replaces the waived TestQwen3_30B_A3B::test_mixed_ctx_gen_model
+        # asymmetric PP/TP configuration with a smaller model.
+        mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
+        return run_parallel_test(
+            self.MODEL_NAME,
+            self.MODEL_PATH,
+            ctx_pp=2,
+            ctx_tp=1,
+            gen_pp=1,
+            gen_tp=2,
+            ctx_instances=1,
+            gen_instances=1,
+            test_sets=[GSM8K],
+            cache_transceiver_backend="NIXL",
+            trust_remote_code=True,
+            quant_algo="FP8_BLOCK_SCALES",
+            kv_cache_quant_algo="FP8",
+            # Qwen3.5 is a hybrid-Mamba model: the V2
+            # cache manager's live-state quota scales
+            # with max_batch_size * pp_size, so the
+            # default max_batch_size=2048 combined with
+            # ctx_pp=2 overflows the KV cache quota.
+            # Other Qwen3.5-4B tests cap this at 32
+            # (see test_llm_api_pytorch.py).
+            max_batch_size=32)
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_hopper
+class TestGPTOSS20B(LlmapiAccuracyTestHarness):
+    # Beam-search disagg coverage: GPT-OSS is not a hybrid-Mamba model, so
+    # (unlike Qwen3.5, see TestQwen3_5_4B) it never hits the hybrid-linear
+    # max_beam_width > 1 rejection in
+    # _util.py's _validate_or_fallback_kv_cache_manager_v2. That gate still
+    # rejects KVCacheManagerV2 with max_beam_width > 1 in general, so V2 is
+    # disabled explicitly below.
+    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
+
+    @pytest.mark.skip_less_device(2)
+    def test_beam_search(self):
+        max_beam_width = 2
+        kv_cache_config = {"use_kv_cache_manager_v2": False}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_beam_width": max_beam_width,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_beam_width": max_beam_width,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        sampling_params = SamplingParams(best_of=max_beam_width,
+                                         n=1,
+                                         temperature=0.0,
+                                         use_beam_search=True,
+                                         max_tokens=64)
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            output = llm.generate_async(
+                "The capital of France is",
+                sampling_params=sampling_params).result()
+            assert len(output.outputs) == 1
+            assert output.outputs[0].text
 
 
 @pytest.mark.timeout(10800)
