@@ -15,8 +15,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.05-py3
-ARG TRITON_BASE_TAG=26.05-py3
+ARG BASE_TAG=26.08-py3
+ARG TRITON_BASE_TAG=26.08-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -130,6 +130,13 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
         bash /opt/docker/common/install_mooncake.sh; \
     fi && \
     bash /opt/docker/common/install_ci.sh
+
+# Allow MPI/PRTE to run as root inside the container (inherited by rubin-release
+# since it uses this image as DEVEL_IMAGE).
+ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 \
+    PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
