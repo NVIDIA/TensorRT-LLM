@@ -1,0 +1,56 @@
+# Example brief for the staircase-bringup workflow. Copy this file to
+# `task.yaml`, fill in your paths and target triple, then run:
+#
+#     python -m agent_flow.workflows.staircase_bringup.cli \
+#         --task path/to/your/task.yaml \
+#         --workspace workspace/<ckpt>-<arch>-<parallel> \
+#         --replan-on-qa
+#
+# Required: the three source paths and the target triple. The workflow
+# refuses to start if a path is missing or the triple is malformed.
+
+reference_code_path: /path/to/transformers/src/transformers/models/<name>/modeling_<name>.py
+checkpoint_path:     /path/to/checkpoints/<ModelName>-<Variant>
+trtllm_repo_path:    /path/to/TensorRT-LLM
+
+# The target's identity. This decides where the target is written —
+#   tensorrt_llm/_torch/staircase/models/<family>/targets/<checkpoint>/<arch>/<parallel>
+# — and how many GPUs the run claims (the trailing integer of `parallel`).
+#
+# `parallel` is one of tp<N>, tep<N>, dep<N>. "single" is not a spelling: a
+# topology segment always carries its rank count. Every gate is
+# topology-blind, so a wrong segment here yields a run that passes smoke and
+# accuracy at the wrong topology while the directory name lies.
+target:
+  family:     deepseek_v3
+  checkpoint: r1_0528_nvfp4
+  arch:       sm_103
+  parallel:   dep4
+
+# Optional but strongly recommended: the release criterion's anchor, and
+# where it came from. An anchor is never invented — cite the accuracy-suite
+# entry, the model card, or the stock-trtllm measurement it was read from.
+# Omit this section only when the plan is expected to establish the anchor
+# itself, and expect the run to stop and ask if it cannot.
+accuracy_anchor:
+  benchmark: mmlu
+  score:     95.07
+  tol:       5.0
+  source:    "tests/integration/defs/accuracy/references/mmlu.yaml @ <commit>"
+
+# Optional: pass/fail bars QA verifies at runtime. Outcome-bound items only.
+# The project-level mechanisms (closed vocabulary, receipt freshness,
+# certified column, gate margin, identity triple) are added automatically —
+# you do not need to restate them here.
+completion_criteria:
+  - "MMLU measured under TRTLLM_STAIRCASE=require is within tol of the anchor"
+
+# Optional: free-form guidance for the PlanDrafter and Coder. Not a QA gate.
+implements_tips:
+  - "The fp8 latent KV pool is documented under _torch/staircase/docs/models/"
+
+# Optional: include only when launching from a Slurm login node and GPU
+# validation must run through Slurm.
+# slurm-environment:
+#   slurm_partition: <partition>
+#   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
