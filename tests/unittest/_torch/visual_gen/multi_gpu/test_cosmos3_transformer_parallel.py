@@ -23,30 +23,23 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
-        COSMOS3_EDGE_BACKBONE_TYPE,
-        Cosmos3VFMTransformer,
-    )
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-    # Module-level configs below reference this; every test skips in this
-    # branch, but the definitions still have to import cleanly.
-    COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    COSMOS3_EDGE_BACKBONE_TYPE,
+    Cosmos3VFMTransformer,
+)
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
 # LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
-# attn2d tests skip cleanly when the kernels are not built (e.g. non-Blackwell CI).
+# attn2d tests fail loudly when the kernels are missing on their Blackwell runner —
+# a build/dependency problem, not a reason to skip.
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
@@ -55,7 +48,7 @@ try:
         _flash_attn_combine as _fa_combine,
     )
 
-    _ATTN2D_AVAILABLE = MODULES_AVAILABLE and _fa4_fwd is not None and _fa_combine is not None
+    _ATTN2D_AVAILABLE = _fa4_fwd is not None and _fa_combine is not None
 except ImportError:
     _ATTN2D_AVAILABLE = False
 
@@ -212,8 +205,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
@@ -822,62 +813,50 @@ def _logic_cosmos3_attn2d_ulysses_vs_single_gpu(rank, world_size):
 class TestCosmos3TransformerParallel:
     """Cosmos3 TP / Ulysses / CFG parity vs single-GPU (synthetic weights, no checkpoint)."""
 
-    def _skip_if_unavailable(self):
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
-
     def test_tp2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_tp_vs_single_gpu)
 
     def test_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
 
     def test_edge_tp2_vs_single_gpu(self):
         """Edge's non-gated relu² MLP shards without the gate_up fusion the
         Qwen recipe uses, so column/row splitting takes a different path."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_tp_vs_single_gpu)
 
     def test_edge_ulysses2_vs_single_gpu(self):
         """Edge under sequence sharding: no und Q/K norm, and the reasoner's
         keys are normed only where the generator consumes them."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_ulysses_vs_single_gpu)
 
     def test_ulysses2_audio_vs_single_gpu(self):
         """Ulysses parity with the audio modality on: video + audio tokens are
         sharded together across the sequence dimension."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_audio_vs_single_gpu)
 
     def test_ulysses2_action_vs_single_gpu(self):
         """Ulysses parity with action tokens appended to the GEN sequence."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_action_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_tp2_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_tp_ulysses_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_cfg2_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_cfg_ulysses_vs_single_gpu)
 
     def test_attn2d_2x1_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_attn2d_2x1_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_attn2d_ulysses_vs_single_gpu)
 
 

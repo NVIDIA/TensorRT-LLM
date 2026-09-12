@@ -9,28 +9,16 @@ and from our port, loads the same slice of the real Qwen-Image
 ``transformer`` state_dict into both, runs them on identical inputs, and
 asserts cosine similarity above a per-module threshold.
 
-Tests are skipped automatically unless ``QWEN_IMAGE_CKPT`` points to a
-local Qwen-Image checkpoint.
+The parity tests fail loudly if the Qwen-Image checkpoint is missing;
+stage ``qwen-image`` under ``LLM_MODELS_ROOT`` to run them.
 """
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 import torch
-
-_CKPT_ENV = "QWEN_IMAGE_CKPT"
-
-
-def _ckpt_path() -> Path | None:
-    ckpt = os.environ.get(_CKPT_ENV)
-    if not ckpt:
-        return None
-    path = Path(ckpt)
-    if not (path / "transformer" / "config.json").is_file():
-        return None
-    return path
+from utils.llm_data import get_checkpoint
 
 
 def _load_transformer_state_dict(ckpt: Path) -> dict[str, torch.Tensor]:
@@ -48,15 +36,6 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
 
 
-requires_ckpt = pytest.mark.skipif(
-    _ckpt_path() is None,
-    reason=(
-        f"Qwen-Image checkpoint not found at {_CKPT_ENV}. "
-        "Set QWEN_IMAGE_CKPT to a local Qwen/Qwen-Image checkpoint "
-        "to enable parity tests."
-    ),
-)
-
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required for BF16 parity tests.",
@@ -65,15 +44,13 @@ requires_cuda = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def transformer_state_dict() -> dict[str, torch.Tensor]:
-    ckpt = _ckpt_path()
-    assert ckpt is not None
+    ckpt = Path(get_checkpoint("qwen-image"))
     return _load_transformer_state_dict(ckpt)
 
 
 @pytest.fixture(scope="module")
 def transformer_config() -> dict:
-    ckpt = _ckpt_path()
-    assert ckpt is not None
+    ckpt = Path(get_checkpoint("qwen-image"))
     return json.loads((ckpt / "transformer" / "config.json").read_text())
 
 
@@ -82,7 +59,6 @@ def transformer_config() -> dict:
 # ===========================================================================
 
 
-@requires_ckpt
 @requires_cuda
 @pytest.mark.parametrize("timestep_value", [0.001, 0.25, 0.5, 0.99])
 def test_qwen_timestep_proj_embedding_parity(transformer_state_dict, timestep_value):
@@ -196,7 +172,6 @@ def test_apply_rotary_emb_qwen_parity():
 # ===========================================================================
 
 
-@requires_ckpt
 @requires_cuda
 def test_pre_post_block_modules_parity(transformer_state_dict, transformer_config):
     """img_in, txt_in, txt_norm, norm_out, proj_out parity vs diffusers.
@@ -302,7 +277,6 @@ def test_pre_post_block_modules_parity(transformer_state_dict, transformer_confi
 # ===========================================================================
 
 
-@requires_ckpt
 @requires_cuda
 def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer_config):
     """One ``QwenImageTransformerBlock`` must match diffusers cos >= 0.999.
@@ -417,7 +391,6 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
 # ===========================================================================
 
 
-@requires_ckpt
 @requires_cuda
 @pytest.mark.slow
 def test_qwen_image_transformer_full_parity(transformer_state_dict, transformer_config):

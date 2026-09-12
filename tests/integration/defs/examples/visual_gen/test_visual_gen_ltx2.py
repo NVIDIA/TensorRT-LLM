@@ -35,16 +35,15 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _fixed_nvfp4_quantization_backend,
     _golden_media_path,
     _lpips_deterministic_algorithms,
-    _lpips_model_path,
     _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
     _run_reusable_video_lpips_eval,
     _run_single_device_feature_generator,
     _save_lpips_video_mp4,
-    _skip_if_missing,
     _validate_single_feature_config,
     _visual_gen_output_path,
 )
+from test_common.llm_data import get_checkpoint
 
 LTX2_LPIPS_NUM_FRAMES = 49
 LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
@@ -128,20 +127,19 @@ def _ltx2_lpips_text_encoder_path():
     for candidate in candidates:
         if os.path.isdir(candidate):
             return candidate
-    return candidates[0]
+    raise FileNotFoundError(
+        f"LTX-2 text encoder not found under any of: {candidates}. "
+        f"Stage '{LTX2_TEXT_ENCODER_SUBPATH}' under LLM_MODELS_ROOT to run this test."
+    )
 
 
 def _generate_ltx2_feature_video(case, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
-    checkpoint_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
+    checkpoint_path = get_checkpoint("LTX-2/ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
-    spatial_upsampler_path = _lpips_model_path("LTX-2", "ltx-2-spatial-upscaler-x2-1.0.safetensors")
-    distilled_lora_path = _lpips_model_path("LTX-2", "ltx-2-19b-distilled-lora-384.safetensors")
-    _skip_if_missing(checkpoint_path, "LTX-2 checkpoint")
-    _skip_if_missing(text_encoder_path, "LTX-2 text encoder", is_dir=True)
-    _skip_if_missing(spatial_upsampler_path, "LTX-2 spatial upsampler")
-    _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
+    spatial_upsampler_path = get_checkpoint("LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors")
+    distilled_lora_path = get_checkpoint("LTX-2/ltx-2-19b-distilled-lora-384.safetensors")
     _disable_inductor_compile_worker_quiesce()
     pipeline = None
     with (
@@ -231,14 +229,10 @@ def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
-    checkpoint_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
+    checkpoint_path = get_checkpoint("LTX-2/ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
-    spatial_upsampler_path = _lpips_model_path("LTX-2", "ltx-2-spatial-upscaler-x2-1.0.safetensors")
-    distilled_lora_path = _lpips_model_path("LTX-2", "ltx-2-19b-distilled-lora-384.safetensors")
-    _skip_if_missing(checkpoint_path, "LTX-2 checkpoint")
-    _skip_if_missing(text_encoder_path, "LTX-2 text encoder", is_dir=True)
-    _skip_if_missing(spatial_upsampler_path, "LTX-2 spatial upsampler")
-    _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
+    spatial_upsampler_path = get_checkpoint("LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors")
+    distilled_lora_path = get_checkpoint("LTX-2/ltx-2-19b-distilled-lora-384.safetensors")
     _disable_inductor_compile_worker_quiesce()
 
     # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
@@ -286,15 +280,10 @@ def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
         TorchCompileConfig,
     )
 
-    scratch_space = conftest.llm_models_root()
-    checkpoint_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
+    checkpoint_path = get_checkpoint(LTX2_MODEL_CHECKPOINT_PATH)
     text_encoder_path = _ltx2_lpips_text_encoder_path()
-    spatial_upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
-    distilled_lora_path = os.path.join(scratch_space, LTX2_DISTILLED_LORA_SUBPATH)
-    _skip_if_missing(checkpoint_path, "LTX-2 checkpoint")
-    _skip_if_missing(text_encoder_path, "LTX-2 text encoder", is_dir=True)
-    _skip_if_missing(spatial_upsampler_path, "LTX-2 spatial upsampler")
-    _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
+    spatial_upsampler_path = get_checkpoint(LTX2_UPSAMPLER_SUBPATH)
+    distilled_lora_path = get_checkpoint(LTX2_DISTILLED_LORA_SUBPATH)
     _disable_inductor_compile_worker_quiesce()
 
     visual_gen_args = VisualGenArgs(
@@ -435,10 +424,8 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     ``--text_encoder_path`` because the shared YAML intentionally omits it to keep
     the config model-path-agnostic.
     """
-    model_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
-    _skip_if_missing(model_path, "LTX-2 checkpoint")
+    model_path = get_checkpoint("LTX-2/ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
-    _skip_if_missing(text_encoder_path, "LTX-2 text encoder (gemma-3-12b-it)", is_dir=True)
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "ltx2_example")
     os.makedirs(out_dir, exist_ok=True)

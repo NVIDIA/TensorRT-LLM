@@ -14,10 +14,6 @@ Model tested:
 
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py -v -s
-
-Override checkpoint path:
-    DIFFUSION_MODEL_PATH_WAN22_TI2V_5B=/path/to/wan22_ti2v_5b \\
-        pytest tests/unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py -v -s
 """
 
 import importlib
@@ -27,7 +23,6 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
 from contextlib import ExitStack
-from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -37,6 +32,7 @@ import torch.nn.functional as F
 from diffusers import WanImageToVideoPipeline as HFWanImageToVideoPipeline
 from diffusers import WanPipeline as HFWanPipeline
 from PIL import Image
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import (
@@ -53,32 +49,7 @@ def _cleanup_mpi_env():
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
-# ============================================================================
-# Path helpers
-# ============================================================================
-
-
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path if set in env, assert when it's set but not a valid path."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-WAN22_TI2V_5B_PATH = _checkpoint(
-    "DIFFUSION_MODEL_PATH_WAN22_TI2V_5B",
-    "Wan2.2-TI2V-5B-Diffusers",
-)
+WAN22_TI2V_5B_SUBDIR = "Wan2.2-TI2V-5B-Diffusers"
 
 # ============================================================================
 # Test constants
@@ -109,8 +80,6 @@ def _make_test_image(height: int, width: int) -> Image.Image:
 
 def _load_trtllm_pipeline(checkpoint_path: str):
     """Load TRTLLM WanPipeline without torch.compile or warmup."""
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
@@ -312,7 +281,7 @@ class TestWan22TI2V5B_T2V_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_pipeline_matches_hf(
-            checkpoint_path=WAN22_TI2V_5B_PATH,
+            checkpoint_path=get_checkpoint(WAN22_TI2V_5B_SUBDIR),
             mode="t2v",
             height=704,
             width=1280,
@@ -330,7 +299,7 @@ class TestWan22TI2V5B_I2V_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_pipeline_matches_hf(
-            checkpoint_path=WAN22_TI2V_5B_PATH,
+            checkpoint_path=get_checkpoint(WAN22_TI2V_5B_SUBDIR),
             mode="i2v",
             height=704,
             width=1280,
@@ -352,11 +321,8 @@ class TestWan22TI2V5BBatchGeneration:
     @pytest.fixture(scope="class")
     def wan22_ti2v_5b_full_pipeline(self):
         """Load full Wan 2.2 TI2V-5B pipeline (all components) for batch tests."""
-        if not WAN22_TI2V_5B_PATH or not os.path.exists(WAN22_TI2V_5B_PATH):
-            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH_WAN22_TI2V_5B.")
-
         args = VisualGenArgs(
-            model=WAN22_TI2V_5B_PATH,
+            model=get_checkpoint(WAN22_TI2V_5B_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
@@ -444,16 +410,13 @@ class TestWan22TI2V5BBatchGeneration:
 @pytest.mark.integration
 @pytest.mark.wan_t2v
 @pytest.mark.wan_i2v
-@pytest.mark.skipif(importlib.util.find_spec("cache_dit") is None, reason="cache_dit not installed")
 class TestWan22TI2V5BCombinedOptimizations:
     """FP8 + CacheDiT + TRTLLM attention combined on Wan 2.2 TI2V-5B (704x1280)."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_fp8_cache_dit_trtllm(self):
-        if not os.path.exists(WAN22_TI2V_5B_PATH):
-            pytest.skip(f"Checkpoint not found: {WAN22_TI2V_5B_PATH}")
         args = VisualGenArgs(
-            model=WAN22_TI2V_5B_PATH,
+            model=get_checkpoint(WAN22_TI2V_5B_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
             attention_config=AttentionConfig(backend="TRTLLM"),
