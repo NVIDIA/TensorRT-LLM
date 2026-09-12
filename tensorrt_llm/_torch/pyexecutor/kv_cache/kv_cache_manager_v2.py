@@ -1639,6 +1639,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
 
+        # Last: bind the publisher socket and start its thread only once every check
+        # above has passed. Constructing the manager is side-effect free, so a failure
+        # anywhere earlier -- including the rank-coordinated aborts, where this rank
+        # raises because a peer failed -- leaves nothing bound to clean up.
+        if isinstance(self.event_manager, StreamingKVCacheEventManager):
+            self.event_manager.start()
+            logger.info("Streaming KV event fast path reuses V2 radix block hashes")
+
     def _iter_guard_candidate_buffers(self) -> Iterable[Tuple[int, torch.Tensor]]:
         """Yield ``(layer_idx, buffer)`` pairs a guard page can be parked on.
 
@@ -1868,14 +1876,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"KVCacheManagerV2: TRTLLM_KV_FRESH_PAGE_FILL={self._fresh_page_fill} "
                     f"first fill covered {filled} pages for request {request_id}"
                 )
-
-        # Last: bind the publisher socket and start its thread only once every check
-        # above has passed. Constructing the manager is side-effect free, so a failure
-        # anywhere earlier -- including the rank-coordinated aborts, where this rank
-        # raises because a peer failed -- leaves nothing bound to clean up.
-        if isinstance(self.event_manager, StreamingKVCacheEventManager):
-            self.event_manager.start()
-            logger.info("Streaming KV event fast path reuses V2 radix block hashes")
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.

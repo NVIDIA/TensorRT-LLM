@@ -901,6 +901,8 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager._kv_reserve_draft_tokens = 4
     manager._effective_draft_len = Mock(return_value=2)
     manager.kv_compression_manages_history = False
+    # Fresh-page fill is off; the allocation path calls it unconditionally.
+    manager._fresh_page_fill = None
 
     assert manager.try_allocate_generation(request)
     assert kv_cache.resize.call_args_list[0].args == (105,)
