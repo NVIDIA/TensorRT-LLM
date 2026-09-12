@@ -405,7 +405,7 @@ def test_feed_forward_moe_wrappers_combine_routed_and_shared_lora() -> None:
 def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora() -> None:
     """The clamped path must preserve both projection adapter contributions."""
     hidden_states = torch.zeros(1, 2)
-    gate_up_lora = torch.tensor([[1.0, 1.0, 2.0, 2.0]])
+    gate_up_lora = torch.tensor([[10.0, 10.0, 2.0, 2.0]])
     down_lora = torch.full_like(hidden_states, 3.0)
 
     def forward_with_base(base_forward, lora_layers, x, params, layer_idx):
@@ -438,7 +438,7 @@ def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora() -> None:
             lora_params=_LORA_PARAMS_SENTINEL,
         )
 
-    expected = torch.full_like(hidden_states, torch.nn.functional.silu(torch.tensor(1.0)) * 2 + 3)
+    expected = torch.full_like(hidden_states, torch.nn.functional.silu(torch.tensor(5.0)) * 2 + 3)
     torch.testing.assert_close(output, expected)
 
 
