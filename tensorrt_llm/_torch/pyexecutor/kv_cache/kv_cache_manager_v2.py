@@ -3645,11 +3645,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_kv_cache_utilization(
         self, include_pool_details: bool = False
     ) -> tuple[float | None, dict[str, list[float | None]]]:
-        """Read capacity counters without collecting or resetting iteration statistics.
-
-        GPU and host pool-group IDs belong to separate namespaces. Host capacity is
-        queried only when pool details are requested; disk tiers are not included.
-        """
+        """Read GPU/host utilization without collecting iteration stats."""
         gpu_stats = self._get_storage_statistics(GPU_LEVEL)
         total = sum(stat.total for stat in gpu_stats)
         available = sum(stat.available for stat in gpu_stats)
@@ -3668,7 +3664,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return gpu_utilization, pool_utilization
 
     def get_kv_cache_pool_mapping(self) -> dict[str, dict[int, list[int]]]:
-        """Map tier-local pool-group IDs to lifecycle (layer-group) IDs for log diagnostics."""
+        """Map each tier's pool IDs to lifecycle IDs."""
         mapping: dict[str, dict[int, list[int]]] = {}
         for level, tier in enumerate(self.impl.cache_tier_list):
             if tier not in (CacheTier.GPU_MEM, CacheTier.HOST_MEM):

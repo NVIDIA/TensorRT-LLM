@@ -43,7 +43,7 @@ def _executor(manager):
 
 @pytest.mark.parametrize("include_pools", [False, True])
 def test_capacity_snapshot_uses_tier_local_pools_without_iteration_stats(include_pools):
-    # Two GPU groups share one host group. Disk must never be counted as host.
+    # GPU and host pool counts differ; exclude disk.
     manager = _manager(
         [CacheTier.GPU_MEM, CacheTier.HOST_MEM, CacheTier.DISK],
         {
@@ -174,6 +174,6 @@ def test_profile_loop_only_samples_on_logging_ranks(
     monkeypatch.setattr(profiling, "get_global_profiler", lambda: None)
     monkeypatch.setattr(profiling.logger, "info", Mock())
     with profiler.profile_step() as step:
-        step()  # Establish the first loop's timing events.
+        step()  # Initialize timing.
         step()
     assert manager._get_storage_statistics.call_count == expected_reads

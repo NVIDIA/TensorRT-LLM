@@ -582,7 +582,7 @@ class PyExecutorProfileManager:
         return cancelled_pending_start
 
     def _kv_cache_log_fields(self, pool_log_interval: int) -> tuple[str, str]:
-        """Format capacity snapshots on the executor thread, after log/rank filtering."""
+        """Format aggregate and sampled per-pool utilization."""
         executor = self._executor
         manager = executor.kv_cache_manager
         kv_util_str = "N/A"
