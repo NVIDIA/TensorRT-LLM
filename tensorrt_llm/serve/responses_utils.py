@@ -1508,6 +1508,29 @@ def _create_output_content(
         text_item = None
         reasoning_item = None
         tool_calls_item = []
+
+        # Reasoning first, then the answer, then any tool calls.
+        #
+        # `response.output` is ordered, and the model produced the reasoning
+        # before the answer it leads to. The streaming path emits the items in
+        # that order - reasoning done, then message done, then the function
+        # calls (see _generate_streaming_event) - so a snapshot that appended
+        # the message first contradicted the stream of the very same
+        # generation: a client replaying `output` read the answer before the
+        # reasoning that produced it, and one reconstructing a turn from the
+        # snapshot fed the model its own thinking as a follow-up to its reply.
+        if reasoning_text:
+            reasoning_item = ResponseReasoningItem(
+                id=f"rs_{_random_uuid()}",
+                summary=[],
+                type="reasoning",
+                content=[
+                    Content(text=reasoning_text.strip(), type="reasoning_text")
+                ],
+                status=None,
+            )
+            output_items.append(reasoning_item)
+
         # Check again after tool parsing to avoid empty text
         if text:
             output_text = ResponseOutputText(
@@ -1526,18 +1549,6 @@ def _create_output_content(
             )
 
             output_items.append(text_item)
-
-        if reasoning_text:
-            reasoning_item = ResponseReasoningItem(
-                id=f"rs_{_random_uuid()}",
-                summary=[],
-                type="reasoning",
-                content=[
-                    Content(text=reasoning_text.strip(), type="reasoning_text")
-                ],
-                status=None,
-            )
-            output_items.append(reasoning_item)
 
         if calls:
             custom_tool_names = _custom_tool_names(tools)

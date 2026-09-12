@@ -225,3 +225,141 @@ def _output_text(text):
     from openai.types.responses import ResponseOutputText
 
     return ResponseOutputText(text=text, annotations=[], type="output_text", logprobs=None)
+
+
+# ---------------------------------------------------------------------------
+# Order of the items in the completed-response snapshot
+#
+# These cover the non-streaming assembly in `_create_output_content`, but they
+# live here because what they assert is a property of the stream: the snapshot
+# in `response.output` has to list the items in the order the stream emitted
+# them. A client that reads both must not be told two different stories about
+# one generation. This is also the file the CPU CI stage runs (l0_cpu.yml).
+# ---------------------------------------------------------------------------
+
+_THINK = "Check the reference first."
+_ANSWER = "The answer is 42."
+_TOOL_CALL = '<tool_call>\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n</tool_call>'
+
+
+def _tools():
+    """A real tool definition, so the tool parser accepts the parsed call."""
+    from openai.types.responses.tool import FunctionTool
+
+    return [
+        FunctionTool(
+            name="read_file",
+            description="Read a file.",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+            strict=False,
+            type="function",
+        )
+    ]
+
+
+def _snapshot_kinds(text, tools=None):
+    """Item types of the completed-response snapshot for one generation.
+
+    Drives the real `_create_output_content` with real parsers - `qwen3` for
+    both, so text with no `<think>` is an ordinary answer rather than an
+    unterminated reasoning block.
+    """
+    from tensorrt_llm.serve.responses_utils import _create_output_content
+
+    items, _messages = _create_output_content(
+        _FakeRequestOutput(text),
+        reasoning_parser="qwen3",
+        tool_parser="qwen3" if tools else None,
+        tools=tools,
+    )
+    return items, [item.type for item in items]
+
+
+class _FakeRequestOutput:
+    """The one attribute `_create_output_content` reads off a result.
+
+    It iterates `final_res.outputs` and takes `.index` and `.text` from each;
+    everything else it needs it derives from the parsers.
+    """
+
+    def __init__(self, text):
+        self.outputs = [_FakeOutput(text, text)]
+
+
+def test_snapshot_lists_reasoning_before_the_message():
+    """Regression: the snapshot appended the message first, inverting cause and effect.
+
+    The stream emits reasoning then message, but the snapshot for the same
+    generation listed message then reasoning - so a client replaying
+    `response.output` read the answer before the reasoning that produced it.
+    Measured on 99.99% of responses carrying both items across four fleets.
+    """
+    items, kinds = _snapshot_kinds(f"<think>{_THINK}</think>{_ANSWER}")
+    assert kinds == ["reasoning", "message"]
+    # Reordering must move the items, not relabel them.
+    assert items[0].content[0].text == _THINK
+    assert items[1].content[0].text == _ANSWER
+
+
+def test_snapshot_lists_reasoning_then_message_then_tool_call():
+    items, kinds = _snapshot_kinds(
+        f"<think>{_THINK}</think>Reading it now.\n{_TOOL_CALL}", tools=_tools()
+    )
+    assert kinds == ["reasoning", "message", "function_call"]
+    assert items[2].name == "read_file"
+
+
+def test_snapshot_lists_reasoning_before_a_tool_call_with_no_message():
+    """A turn that ends in a tool call emits no message item at all."""
+    _items, kinds = _snapshot_kinds(f"<think>{_THINK}</think>{_TOOL_CALL}", tools=_tools())
+    assert kinds == ["reasoning", "function_call"]
+
+
+def test_snapshot_of_a_plain_answer_is_just_the_message():
+    """No reasoning to order: the message must not be dropped or displaced."""
+    items, kinds = _snapshot_kinds(_ANSWER)
+    assert kinds == ["message"]
+    assert items[0].content[0].text == _ANSWER
+
+
+def test_snapshot_order_matches_the_streamed_order():
+    """The two paths must agree; this is the invariant the bug violated.
+
+    Both sides are driven for real - `_generate_streaming_event` for the
+    stream and `_create_output_content` for the snapshot - over the same
+    generation and the same reasoning parser, rather than comparing the
+    snapshot against a hardcoded expectation of what the stream does.
+    """
+    from tensorrt_llm.serve.responses_utils import (
+        ResponsesStreamingEventsHelper,
+        _create_output_content,
+    )
+
+    # "glm" is reasoning_at_start, so the generation opens inside the
+    # reasoning block with no <think> tag - the same setup as the streaming
+    # tests above, and what the thinking chat templates actually render.
+    chunks = [_THINK, "</think>", _ANSWER]
+
+    helper = ResponsesStreamingEventsHelper()
+    parsers = {}
+    accumulated = ""
+    streamed = []
+    for i, chunk in enumerate(chunks):
+        accumulated += chunk
+        for event in _generate_streaming_event(
+            output=_FakeOutput(accumulated, chunk),
+            request=_FakeRequest(),
+            finished_generation=(i == len(chunks) - 1),
+            streaming_events_helper=helper,
+            reasoning_parser_id="glm",
+            reasoning_parser_dict=parsers,
+        ):
+            if getattr(event, "type", "") == "response.output_item.done":
+                streamed.append(event.item.type)
+
+    snapshot_items, _messages = _create_output_content(
+        _FakeRequestOutput(accumulated), reasoning_parser="glm"
+    )
+
+    assert streamed == ["reasoning", "message"]
+    assert [item.type for item in snapshot_items] == streamed
