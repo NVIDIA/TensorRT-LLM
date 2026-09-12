@@ -730,6 +730,27 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         """
         raise NotImplementedError
 
+    def get_deep_ep_nvfp4_dispatch_input_scale(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+    ) -> Optional[torch.Tensor]:
+        """Return a scale only when DeepEP can replace ``quantize_input``.
+
+        A backend must opt in by overriding this method and must return
+        ``None`` whenever its normal input path performs any work beyond
+        static BF16-to-NVFP4 quantization, such as activation scaling,
+        dynamic-scale updates, or hidden-dimension padding.
+
+        Args:
+            x: Input that would otherwise be passed to ``quantize_input``.
+
+        Returns:
+            The static NVFP4 input scale when fusion is equivalent, otherwise
+            ``None``.
+        """
+        del x
+        return None
+
     @abstractmethod
     def run_moe(
         self,
