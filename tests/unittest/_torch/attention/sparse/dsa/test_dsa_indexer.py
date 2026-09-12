@@ -23,6 +23,8 @@ This file tests:
 """
 
 import builtins
+import inspect
+import math
 import random
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -58,7 +60,13 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import use_self_sampling_gvr
+from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import (
+    DSAVanillaAttention,
+    DSAVanillaIndexer,
+    _TorchRotaryEmbedding,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
@@ -125,6 +133,681 @@ def _set_torch_top_k(indexer: Indexer) -> None:
         decode_implementation=TopKImplementation.TORCH,
         compress_ratio=indexer.compress_ratio,
     )
+
+
+@pytest.mark.parametrize("is_neox", [True, False])
+@pytest.mark.parametrize(
+    "q_shape,k_shape",
+    [
+        ((3, 2, 4), (3, 1, 4)),
+        ((3, 8), (3, 4)),
+    ],
+)
+def test_vanilla_rope_is_pure_torch(is_neox, q_shape, k_shape):
+    rotary_emb = _TorchRotaryEmbedding.__new__(_TorchRotaryEmbedding)
+    torch.nn.Module.__init__(rotary_emb)
+    rotary_emb.head_dim = 4
+    rotary_emb.is_neox = is_neox
+    rotary_emb.inverse = False
+    rotary_emb.rotary_cos_sin = torch.randn(4, 2, 2)
+
+    position_ids = torch.tensor([2, 0, 3], dtype=torch.int32)
+    targets = [torch.randn(q_shape), torch.randn(k_shape)]
+    expected = [
+        RotaryEmbedding.forward(
+            rotary_emb,
+            position_ids,
+            [target.reshape(position_ids.numel(), -1)],
+        )[0].reshape_as(target)
+        for target in targets
+    ]
+
+    with patch.object(
+        RotaryEmbedding,
+        "forward",
+        side_effect=AssertionError("Vanilla RoPE delegated to the fused dispatcher"),
+    ):
+        actual = rotary_emb(position_ids, targets)
+
+    for actual_target, expected_target in zip(actual, expected):
+        torch.testing.assert_close(actual_target, expected_target)
+
+
+def test_vanilla_generation_rope_matches_torch_reference():
+    attention = DSAVanillaAttention.__new__(DSAVanillaAttention)
+    attention.num_heads = 2
+    attention.kv_lora_rank = 3
+    attention.qk_nope_head_dim = 3
+    attention.qk_rope_head_dim = 4
+    attention.q_scaling = 2.0
+    attention._append_latent_cache = Mock()
+    attention.rotary_emb = _TorchRotaryEmbedding.__new__(_TorchRotaryEmbedding)
+    torch.nn.Module.__init__(attention.rotary_emb)
+    attention.rotary_emb.head_dim = attention.qk_rope_head_dim
+    attention.rotary_emb.is_neox = False
+    attention.rotary_emb.inverse = False
+    attention.rotary_emb.rotary_cos_sin = torch.randn(8, 2, 2)
+
+    positions = torch.tensor([3, 5], dtype=torch.int32)
+    attention._token_positions = MethodType(
+        lambda _self, metadata, seq_start, seq_end, device: positions.to(device),
+        attention,
+    )
+    metadata = SimpleNamespace(
+        num_contexts=0,
+        num_seqs=2,
+        seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([4, 6], dtype=torch.int32),
+        request_ids=[10, 11],
+        kv_cache_manager=SimpleNamespace(),
+    )
+    q_pe = torch.randn(2, attention.num_heads, attention.qk_rope_head_dim)
+    latent_cache = torch.randn(2, attention.kv_lora_rank + attention.qk_rope_head_dim)
+    fused_q = torch.randn(
+        2,
+        attention.num_heads * (attention.kv_lora_rank + attention.qk_rope_head_dim),
+    )
+    expected_fused_q = fused_q.clone()
+    original_latent = latent_cache.clone()
+    expected_cache_latent = latent_cache.clone()
+    expected_q_pe, expected_k_pe = attention.rotary_emb(
+        positions,
+        [q_pe.reshape(2, -1), expected_cache_latent[..., attention.kv_lora_rank :]],
+    )
+    expected_fused_q.view(2, attention.num_heads, -1)[..., attention.kv_lora_rank :] = (
+        expected_q_pe.view(2, attention.num_heads, attention.qk_rope_head_dim)
+    )
+    expected_cache_latent[..., attention.kv_lora_rank :] = expected_k_pe
+
+    cu_q_seqlens = torch.full((3,), -1, dtype=torch.int32)
+    cu_kv_seqlens = torch.full((3,), -1, dtype=torch.int32)
+    scheduler = torch.ones(1, dtype=torch.uint32)
+    bmm1_scale = torch.full((2,), float("nan"))
+    bmm2_scale = torch.full((1,), float("nan"))
+    quant_q_buffer = torch.empty_like(fused_q, dtype=torch.uint8)
+    attention.mla_rope_generation(
+        fused_q,
+        q_pe,
+        latent_cache,
+        metadata,
+        cu_q_seqlens,
+        cu_kv_seqlens,
+        scheduler,
+        bmm1_scale,
+        bmm2_scale,
+        quant_q_buffer,
+    )
+
+    torch.testing.assert_close(fused_q, expected_fused_q)
+    torch.testing.assert_close(latent_cache, original_latent)
+    torch.testing.assert_close(
+        quant_q_buffer.view(torch.float8_e4m3fn),
+        expected_fused_q.to(torch.float8_e4m3fn),
+    )
+    torch.testing.assert_close(cu_q_seqlens, torch.tensor([0, 2, 4], dtype=torch.int32))
+    torch.testing.assert_close(cu_kv_seqlens, torch.tensor([0, 4, 10], dtype=torch.int32))
+    assert scheduler.item() == 0
+    expected_bmm1_scale = 1.0 / (math.sqrt(7) * attention.q_scaling)
+    torch.testing.assert_close(
+        bmm1_scale,
+        torch.tensor([expected_bmm1_scale, expected_bmm1_scale * math.log2(math.e)]),
+    )
+    assert bmm2_scale.item() == 1.0
+    append_args = attention._append_latent_cache.call_args.args
+    assert append_args[0] is metadata
+    assert append_args[1:4] == ([10, 11], [1, 1], [3, 5])
+    assert append_args[4] is not latent_cache
+    torch.testing.assert_close(append_args[4], expected_cache_latent)
+
+
+def test_vanilla_quantization_uses_fused_kernel_amax_floor():
+    values = torch.zeros(1, 128)
+
+    _, fp8_scale = DSAVanillaIndexer.quantize_fp8(values, use_ue8m0=False)
+    torch.testing.assert_close(
+        fp8_scale,
+        torch.tensor(1e-12 / DSAVanillaIndexer._FP8_MAX),
+        rtol=1e-6,
+        atol=0,
+    )
+
+    _, fp4_scale = DSAVanillaIndexer.quantize_fp4(
+        values,
+        use_ue8m0=False,
+        gran_k=32,
+    )
+    torch.testing.assert_close(
+        fp4_scale,
+        torch.full((1, 4), 1e-12 / DSAVanillaIndexer._FP4_MAX),
+        rtol=1e-6,
+        atol=0,
+    )
+
+
+def test_vanilla_q_projection_does_not_dispatch_linear_forward():
+    class IdentityRope(torch.nn.Module):
+        def forward(self, position_ids, targets):
+            del position_ids
+            return targets
+
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.q_lora_rank = 2
+    indexer.n_heads = 1
+    indexer.head_dim = 4
+    indexer.rope_dim = 2
+    indexer.use_fp4 = False
+    indexer._indexer_bf16 = False
+    indexer.weight_scale_factor = 1.0
+    indexer.wq_b = torch.nn.Linear(2, 4, bias=False)
+    indexer.k_norm = torch.nn.Identity()
+    indexer.rotary_emb = IdentityRope()
+    indexer._fused_wk_wp_weight = torch.randn(5, 3)
+
+    with patch.object(
+        indexer.wq_b,
+        "forward",
+        side_effect=AssertionError("custom Linear.forward was dispatched"),
+    ):
+        q_fp8, k_fp8, k_scale, weights, q_scale = indexer.pre_indexer_proj(
+            torch.randn(2, 2),
+            torch.randn(2, 3),
+            torch.arange(2, dtype=torch.int32),
+        )
+
+    assert q_fp8.dtype == torch.float8_e4m3fn
+    assert k_fp8.dtype == torch.float8_e4m3fn
+    assert k_scale.dtype == torch.float32
+    assert weights.shape == (2, 1)
+    assert q_scale.dtype == torch.float32
+    assert q_scale.shape == (2, 1, 1)
+
+
+def test_vanilla_indexer_q_projection_supports_fp8_qdq_weight():
+    qr = torch.tensor([[0.25, -0.5, 0.75, -1.0]], dtype=torch.float32)
+    input_scale = torch.tensor(0.125)
+    weight_scale = torch.tensor(0.25)
+    weight = torch.tensor([[1.0, -2.0, 3.0, -4.0], [4.0, 3.0, -2.0, -1.0]], dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        force_dynamic_quantization=False,
+        in_features=4,
+        out_features=2,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    qdq_qr = DSAVanillaIndexer._qdq_fp8(qr, input_scale)
+    expected = torch.nn.functional.linear(qdq_qr, weight.float() * weight_scale)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_indexer_q_projection_uses_linear_dtype_for_prequantized_input():
+    input_scale = torch.tensor(0.125)
+    qr = torch.tensor([[2.0, -4.0, 6.0, -8.0]], dtype=torch.float8_e4m3fn)
+    weight_scale = torch.tensor(0.25)
+    weight = torch.tensor(
+        [[1.0, -2.0, 3.0, -4.0], [4.0, 3.0, -2.0, -1.0]],
+        dtype=torch.float8_e4m3fn,
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        force_dynamic_quantization=False,
+        in_features=4,
+        out_features=2,
+        dtype=torch.bfloat16,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    expected = torch.nn.functional.linear(
+        (qr.float() * input_scale).to(torch.bfloat16),
+        (weight.float() * weight_scale).to(torch.bfloat16),
+    )
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_indexer_q_projection_supports_fp8_block_weight():
+    qr = torch.linspace(-1.0, 1.0, 128).reshape(1, 128)
+    weight = torch.ones(129, 128, dtype=torch.float8_e4m3fn)
+    weight_scale = torch.tensor([[0.25], [0.5]], dtype=torch.float32)
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        in_features=128,
+        out_features=129,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr)
+    expanded_scale = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    expected = torch.nn.functional.linear(
+        qdq_qr,
+        weight.float() * expanded_scale[:129, :128],
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_indexer_q_projection_supports_nvfp4_weight():
+    in_features = 16
+    out_features = 2
+    packed_weight = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]] * out_features,
+        dtype=torch.uint8,
+    )
+    linear_scales = torch.tensor([[1.0], [2.0]], dtype=torch.float8_e4m3fn).view(torch.uint8)
+    interleaved_scales = torch.zeros(128 * 4, dtype=torch.uint8)
+    interleaved_scales[0] = linear_scales[0, 0]
+    interleaved_scales[16] = linear_scales[1, 0]
+    weight_scale_2 = torch.tensor(0.5)
+    linear = SimpleNamespace(
+        weight=packed_weight,
+        weight_scale=interleaved_scales,
+        weight_scale_2=weight_scale_2,
+        input_scale=None,
+        force_dynamic_quantization=False,
+        pre_quant_scale=None,
+        quant_method=SimpleNamespace(quantizes_nvfp4_activations=False),
+        scaling_vector_size=16,
+        in_features=in_features,
+        out_features=out_features,
+    )
+    qr = torch.arange(in_features, dtype=torch.float32).reshape(1, -1) / in_features
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    real_scales = linear_scales.view(torch.float8_e4m3fn).float() * weight_scale_2
+    dequant_weight = DSAVanillaIndexer.dequantize_fp4(packed_weight, real_scales, gran_k=16)
+    expected = torch.nn.functional.linear(qr, dequant_weight)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_nvfp4_activation_qdq_matches_rne_and_satfinite():
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    actual_codes = DSAVanillaIndexer._to_e2m1_rne(midpoints)
+    expected_codes = torch.tensor([0, 2, 2, 4, 4, 6, 6], dtype=torch.int8)
+    torch.testing.assert_close(actual_codes, expected_codes)
+
+    e4m3_values = torch.tensor([1.0625, 1.1875, 448.0, 449.0, 500.0])
+    actual_scales = DSAVanillaIndexer._round_to_e4m3_rne_satfinite(e4m3_values)
+    torch.testing.assert_close(actual_scales, torch.tensor([1.0, 1.25, 448.0, 448.0, 448.0]))
+
+
+def test_vanilla_indexer_q_projection_supports_nvfp4_activation_qdq():
+    in_features = 16
+    packed_weight = torch.full((1, in_features // 2), 0x22, dtype=torch.uint8)
+    linear_scale = torch.tensor([[1.0]], dtype=torch.float8_e4m3fn).view(torch.uint8)
+    interleaved_scales = torch.zeros(128 * 4, dtype=torch.uint8)
+    interleaved_scales[0] = linear_scale[0, 0]
+    linear = SimpleNamespace(
+        weight=packed_weight,
+        weight_scale=interleaved_scales,
+        weight_scale_2=torch.tensor(1.0),
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        pre_quant_scale=None,
+        quant_method=SimpleNamespace(quantizes_nvfp4_activations=True),
+        scaling_vector_size=16,
+        in_features=in_features,
+        out_features=1,
+    )
+    qr = torch.tensor([[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0] * 2], dtype=torch.float32)
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    # The RNE E2M1 values sum to 20 per eight inputs; the dequantized weight
+    # is all ones, so two repetitions produce 40.
+    torch.testing.assert_close(actual, torch.tensor([[40.0]]))
+
+
+@pytest.mark.parametrize(
+    "use_fp8_ds_mla,skip_rope,expected_rope_calls,expected_append",
+    [
+        pytest.param(False, False, 0, False, id="regular-rope-already-appended"),
+        pytest.param(False, True, 0, True, id="regular-pre-rotated"),
+        pytest.param(True, False, 1, True, id="fp8-ds-mla-deferred-rope"),
+        pytest.param(True, True, 0, True, id="fp8-ds-mla-pre-rotated"),
+    ],
+)
+def test_vanilla_generation_forward_respects_rope_and_cache_ownership(
+    use_fp8_ds_mla,
+    skip_rope,
+    expected_rope_calls,
+    expected_append,
+):
+    attention = DSAVanillaAttention.__new__(DSAVanillaAttention)
+    attention.layer_idx = 0
+    attention.use_fp8_ds_mla = use_fp8_ds_mla
+
+    q = torch.empty(1, 1)
+    latent_cache = torch.empty(1, 1)
+    q_pe = torch.empty(1, 1)
+    topk = torch.tensor([[0]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        multi_item_part_lens=None,
+        kv_cache_manager=SimpleNamespace(
+            use_fp8_ds_mla=use_fp8_ds_mla,
+            layer_offsets={0: 0},
+        ),
+        num_contexts=0,
+        num_seqs=1,
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        latent_cache=latent_cache,
+        q_pe=q_pe,
+        skip_mla_rope_generation=skip_rope,
+        sparse_backend_args=DSABackendForwardArgs(topk_indices=topk),
+    )
+    expected = torch.empty(1, 1)
+
+    with (
+        patch.object(attention, "_token_positions", return_value=torch.tensor([0])),
+        patch.object(attention, "_apply_mla_rope") as apply_rope,
+        patch.object(attention, "_select_local_topk", return_value=topk),
+        patch.object(attention, "_local_topk_to_global", return_value=topk),
+        patch.object(attention, "_forward_sparse", return_value=expected) as forward_sparse,
+    ):
+        actual = attention.forward(q, None, None, metadata, forward_args=forward_args)
+
+    assert actual is expected
+    assert apply_rope.call_count == expected_rope_calls
+    assert forward_sparse.call_args.kwargs["append_cache"] is expected_append
+
+
+def test_vanilla_fp4_cache_write_preserves_packed_scale_bytes():
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.layer_idx = 0
+    indexer.head_dim = 4
+    indexer.use_fp4 = True
+    cache = torch.zeros(32, dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(get_indexer_k_cache_buffers=lambda layer_idx: cache),
+        slot_mapping_fp8=torch.tensor([0, 2], dtype=torch.int64),
+        slot_mapping_scale=torch.tensor([8, 12], dtype=torch.int64),
+    )
+    packed_k = torch.tensor([[0x21, 0x43], [0x65, 0x07]], dtype=torch.uint8)
+    packed_scale = torch.tensor([[0x04030201], [0x08070605]], dtype=torch.int32)
+
+    indexer._update_k_cache(packed_k, packed_scale, metadata)
+
+    torch.testing.assert_close(cache[:4], packed_k.flatten())
+    torch.testing.assert_close(cache[8:16], packed_scale.view(torch.uint8).flatten())
+
+
+def test_vanilla_local_topk_uses_trtllm_pool_coordinates():
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            get_primary_pool_page_index_params=lambda layer_idx: (2, layer_idx)
+        ),
+        _ensure_pool_view_cached=Mock(),
+        _cached_tokens_per_block=64,
+        _cached_block_table_ctx=torch.tensor([[3, 7], [5, 9]], dtype=torch.int32),
+        _cached_block_table_gen=None,
+        _cached_req_idx_ctx=torch.tensor([0, 1], dtype=torch.int32),
+        _cached_req_idx_gen=None,
+    )
+    local_topk = torch.tensor([[0, 65, -1], [63, 64, 130]], dtype=torch.int32)
+
+    actual = DSAVanillaAttention._local_topk_to_global(
+        local_topk, metadata, layer_idx=1, is_generation=False
+    )
+
+    expected = torch.tensor([[448, 961, -1], [767, 1216, -1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+    metadata._ensure_pool_view_cached.assert_called_once_with()
+
+
+def test_vanilla_inline_scale_latent_round_trip():
+    latent = torch.randn(3, 576, dtype=torch.bfloat16)
+
+    packed = DSAVanillaAttention._pack_inline_scale_latent(latent, torch.bfloat16)
+    actual = DSAVanillaAttention._unpack_inline_scale_latent(packed)
+
+    assert packed.shape == (3, 328)
+    torch.testing.assert_close(actual[:, 512:], latent[:, 512:].float())
+    torch.testing.assert_close(actual[:, :512], latent[:, :512].float(), atol=0.05, rtol=0.05)
+
+
+def test_vanilla_paged_mqa_logits_supports_partial_last_block():
+    q = torch.ones(1, 1, 1, 1)
+    kv_cache = torch.arange(1, 9, dtype=torch.float32).view(2, 4, 1, 1)
+    weights = torch.ones(1, 1)
+
+    actual = DSAVanillaIndexer.paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        num_tokens=torch.tensor([6]),
+        num_kv_tokens=torch.tensor([6]),
+        block_tables=torch.tensor([[0, 1]]),
+        max_model_len=6,
+    )
+
+    torch.testing.assert_close(actual, torch.arange(1, 7, dtype=torch.float32).view(1, 6))
+
+
+def test_vanilla_quantized_paged_mqa_logits_supports_partial_last_block():
+    q = torch.ones(1, 1, 1, 1)
+    kv = torch.arange(1, 9, dtype=torch.float32).view(2, 4, 1)
+    kv_scales = torch.ones(2, 4)
+    weights = torch.ones(1, 1)
+
+    actual = DSAVanillaIndexer.paged_mqa_logits_quantized(
+        q,
+        kv,
+        kv_scales,
+        weights,
+        context_lens=torch.tensor([6]),
+        block_table=torch.tensor([[0, 1]]),
+        max_model_len=6,
+        block_kv=4,
+    )
+
+    torch.testing.assert_close(actual, torch.arange(1, 7, dtype=torch.float32).view(1, 6))
+
+
+def _make_vanilla_scoring_metadata(*, skip_context=False):
+    dense_topk = torch.tensor([[0, -1], [0, 1], [0, 1]], dtype=torch.int32)
+    return SimpleNamespace(
+        num_contexts=1,
+        num_generations=1,
+        num_seqs=2,
+        num_ctx_tokens=2,
+        num_tokens=3,
+        seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        seq_lens_cuda=torch.tensor([2, 1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([3, 3], dtype=torch.int32),
+        compress_ratios=[1],
+        skip_indexer_for_ctx_reqs=skip_context,
+        skip_indexer_for_gen_reqs=False,
+        topk_indices_buffer=dense_topk,
+        in_mtp_draft_loop=False,
+        indexer_skip_topk=False,
+        shared_topk_indices=None,
+        mtp_num_accepted=None,
+        cuda_graph_buffers={},
+        is_cuda_graph=False,
+        get_empty=Mock(
+            side_effect=lambda _, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"])
+        ),
+    )
+
+
+def _make_vanilla_scoring_indexer():
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.index_topk = 2
+    indexer.use_fp4 = False
+    indexer.mtp_index_share = False
+    indexer._gather_keys = MethodType(
+        lambda _self, metadata, seq_idx, kv_len: torch.tensor(
+            [[1.0], [3.0], [2.0]] if seq_idx == 0 else [[4.0], [1.0], [2.0]]
+        )[:kv_len],
+        indexer,
+    )
+    return indexer
+
+
+def test_vanilla_indexer_runs_context_scoring_pipeline():
+    indexer = _make_vanilla_scoring_indexer()
+    metadata = _make_vanilla_scoring_metadata()
+
+    actual = indexer.sparse_attn_indexer(
+        metadata,
+        hidden_states=torch.empty(2, 1),
+        q_fp8=torch.ones(2, 1, 1),
+        k_fp8=torch.empty(0),
+        k_scale=torch.empty(0),
+        weights=torch.ones(2, 1),
+        is_generation=False,
+    )
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([[1, 0], [1, 2]], dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    "is_generation,seq_len,kv_len,gathered_keys,expected",
+    [
+        pytest.param(
+            False,
+            5,
+            5,
+            [[3.0]],
+            [[-1, -1], [-1, -1], [-1, -1], [0, -1], [0, -1]],
+            id="context",
+        ),
+        pytest.param(
+            True,
+            4,
+            10,
+            [[1.0], [3.0]],
+            [[0, -1], [1, 0], [1, 0], [1, 0]],
+            id="generation-cached-prefix",
+        ),
+    ],
+)
+def test_vanilla_indexer_scores_compressed_coordinates(
+    is_generation,
+    seq_len,
+    kv_len,
+    gathered_keys,
+    expected,
+):
+    indexer = _make_vanilla_scoring_indexer()
+    metadata = _make_vanilla_scoring_metadata()
+    metadata.num_contexts = int(not is_generation)
+    metadata.num_generations = int(is_generation)
+    metadata.num_seqs = 1
+    metadata.num_ctx_tokens = 0 if is_generation else seq_len
+    metadata.num_tokens = seq_len
+    metadata.seq_lens = torch.tensor([seq_len], dtype=torch.int32)
+    metadata.seq_lens_cuda = metadata.seq_lens
+    metadata.kv_lens_cuda = torch.tensor([kv_len], dtype=torch.int32)
+    metadata.compress_ratios = [4]
+    gathered_keys = torch.tensor(gathered_keys)
+    indexer._gather_keys = Mock(return_value=gathered_keys)
+
+    actual = indexer.sparse_attn_indexer(
+        metadata,
+        hidden_states=torch.empty(seq_len, 1),
+        q_fp8=torch.ones(seq_len, 1, 1),
+        k_fp8=torch.empty(0),
+        k_scale=torch.empty(0),
+        weights=torch.ones(seq_len, 1),
+        is_generation=is_generation,
+    )
+
+    torch.testing.assert_close(actual, torch.tensor(expected, dtype=torch.int32))
+    indexer._gather_keys.assert_called_once_with(metadata, 0, gathered_keys.shape[0])
+
+
+def test_vanilla_indexer_uses_dense_topk_when_context_scoring_is_skipped():
+    indexer = _make_vanilla_scoring_indexer()
+    metadata = _make_vanilla_scoring_metadata(skip_context=True)
+    indexer._gather_keys = Mock(side_effect=AssertionError("indexer scoring was not skipped"))
+
+    actual = indexer.sparse_attn_indexer(
+        metadata,
+        hidden_states=torch.empty(2, 1),
+        q_fp8=torch.ones(2, 1, 1),
+        k_fp8=torch.empty(0),
+        k_scale=torch.empty(0),
+        weights=torch.ones(2, 1),
+        is_generation=False,
+    )
+
+    torch.testing.assert_close(actual, metadata.topk_indices_buffer[:2])
+
+
+def test_vanilla_indexer_reuses_mtp_topk_without_rescoring():
+    indexer = _make_vanilla_scoring_indexer()
+    indexer.mtp_index_share = True
+    indexer._gather_keys = Mock(side_effect=AssertionError("MTP TopK was not reused"))
+    metadata = _make_vanilla_scoring_metadata()
+    metadata.num_contexts = 0
+    metadata.num_generations = 2
+    metadata.num_ctx_tokens = 0
+    metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int32)
+    metadata.seq_lens_cuda = metadata.seq_lens
+    metadata.kv_lens_cuda = torch.tensor([3, 3], dtype=torch.int32)
+    metadata.num_tokens = 2
+    metadata.in_mtp_draft_loop = True
+    metadata.indexer_skip_topk = True
+    metadata.shared_topk_indices = torch.tensor([[2, 0], [1, 0]], dtype=torch.int32)
+
+    actual = indexer.sparse_attn_indexer(
+        metadata,
+        hidden_states=torch.empty(2, 1),
+        q_fp8=torch.ones(2, 1, 1),
+        k_fp8=torch.empty(0),
+        k_scale=torch.empty(0),
+        weights=torch.ones(2, 1),
+        is_generation=True,
+    )
+
+    torch.testing.assert_close(actual, metadata.shared_topk_indices)
+
+
+def test_vanilla_dsa_signatures_match_trtllm_dsa():
+    def parameter_contract(function):
+        return [
+            (name, parameter.kind, parameter.default)
+            for name, parameter in inspect.signature(function).parameters.items()
+        ]
+
+    for vanilla, trtllm in (
+        (DSAVanillaAttention.__init__, DSATrtllmAttention.__init__),
+        (DSAVanillaAttention.forward, DSATrtllmAttention.forward),
+        (DSAVanillaAttention.sparse_attn_predict, DSATrtllmAttention.sparse_attn_predict),
+        (DSAVanillaAttention.sparse_kv_predict, DSATrtllmAttention.sparse_kv_predict),
+        (
+            DSAVanillaAttention.mla_rope_append_paged_kv_assign_q,
+            DSATrtllmAttention.mla_rope_append_paged_kv_assign_q,
+        ),
+        (DSAVanillaAttention.mla_rope_generation, DSATrtllmAttention.mla_rope_generation),
+        (DSAVanillaIndexer.__init__, Indexer.__init__),
+        (DSAVanillaIndexer.sparse_attn_indexer, Indexer.sparse_attn_indexer),
+        (DSAVanillaIndexer.pre_indexer_proj, Indexer.pre_indexer_proj),
+        (DSAVanillaIndexer._update_k_cache, Indexer._update_k_cache),
+        (DSAVanillaIndexer.forward_from_projected, Indexer.forward_from_projected),
+        (DSAVanillaIndexer.forward, Indexer.forward),
+    ):
+        assert parameter_contract(vanilla) == parameter_contract(trtllm)
 
 
 @pytest.mark.parametrize("use_self_sampling", [True, False])
@@ -563,6 +1246,22 @@ def test_indexer_post_load_weights_caches_fused_weight():
     assert not hasattr(indexer, "_weights_transformed")
 
 
+def test_vanilla_indexer_caches_matching_fused_projection_weight():
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.wk = torch.nn.Linear(3, 2, bias=False)
+    indexer.weights_proj = torch.nn.Linear(3, 4, bias=False)
+    indexer.wk.weight.data.fill_(1.0)
+    indexer.weights_proj.weight.data.fill_(2.0)
+    indexer._fused_wk_wp_weight = None
+
+    indexer.cache_derived_state()
+
+    assert indexer._fused_wk_wp_weight.shape == (6, 3)
+    assert torch.equal(indexer._fused_wk_wp_weight[:2], indexer.wk.weight.data)
+    assert torch.equal(indexer._fused_wk_wp_weight[2:], indexer.weights_proj.weight.data)
+
+
 @skip_pre_hopper
 @pytest.mark.parametrize(
     "use_cute_dsl,enable_heuristic,expected_decode",
@@ -669,10 +1368,10 @@ def test_indexer_two_level_gvr_dispatch(
     ],
 )
 def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, expected_dtype):
-    """wk/weights_proj dtype follows TRTLLM_DSA_INDEXER_BF16.
+    """Production and Vanilla projection dtypes follow TRTLLM_DSA_INDEXER_BF16.
 
     Unset or "0" keeps the projection in fp32 (default); "1" runs it in the
-    model dtype. create_indexer builds the Indexer with dtype=torch.bfloat16.
+    model dtype. create_indexer builds both indexers with dtype=torch.bfloat16.
     """
     if flag_value is None:
         monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
@@ -689,11 +1388,15 @@ def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, exp
         "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
         return_value=100,
     ):
-        indexer = create_indexer(sparse_config)
+        indexers = [
+            create_indexer(sparse_config),
+            create_indexer(sparse_config, indexer_cls=DSAVanillaIndexer),
+        ]
 
-    assert indexer._indexer_bf16 is (flag_value == "1")
-    assert indexer.wk.dtype == expected_dtype
-    assert indexer.weights_proj.dtype == expected_dtype
+    for indexer in indexers:
+        assert indexer._indexer_bf16 is (flag_value == "1")
+        assert indexer.wk.dtype == expected_dtype
+        assert indexer.weights_proj.dtype == expected_dtype
 
 
 @pytest.mark.parametrize(
@@ -1305,7 +2008,7 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         cache_manager.shutdown()
 
 
-def create_indexer(sparse_attn_config, layer_idx=0):
+def create_indexer(sparse_attn_config, layer_idx=0, indexer_cls=Indexer):
     """Helper to create an Indexer for testing."""
     # Create RopeParams
     rope_params = RopeParams(
@@ -1333,15 +2036,18 @@ def create_indexer(sparse_attn_config, layer_idx=0):
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
-    with patch(
+    rope_cls = (
         "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.RotaryEmbedding"
-    ) as mock_rope:
+        if indexer_cls is Indexer
+        else "tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend._TorchRotaryEmbedding"
+    )
+    with patch(rope_cls) as mock_rope:
         # Create a mock instance with a simple forward method
         mock_rope_instance = Mock()
         mock_rope_instance.forward = Mock(side_effect=lambda pos_ids, tensors: tensors)
         mock_rope.return_value = mock_rope_instance
 
-        indexer = Indexer(
+        indexer = indexer_cls(
             quant_config=None,
             pos_embd_params=pos_embd_params,
             mla_params=mla_params,
@@ -1368,146 +2074,6 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-
-
-def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims, use_ue8m0=False):
-    """
-    Cast tensor to FP8 per custom dimensions.
-    For kv, we quantize along dimension 0 (sequence dimension).
-    """
-    excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
-    x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
-    sf = x_amax / 448.0
-    sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled, sf.squeeze()
-
-
-def _ref_fp8_paged_mqa_logits(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    num_tokens: torch.Tensor,
-    num_kv_tokens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-    compress_ratio: int = 1,
-):
-    """
-    Reference implementation of fp8_paged_mqa_logits (optimized version).
-
-    Args:
-        q: [batch_size, next_n, num_heads, head_dim]
-        kv_cache: [num_blocks, block_size, 1, head_dim]
-        weights: [batch_size * next_n, num_heads]
-        num_tokens: [batch_size]
-        num_kv_tokens: [batch_size]
-        block_tables: [batch_size, max_num_blocks]
-        max_model_len: Maximum sequence length
-        compress_ratio: Compression ratio for the KV cache
-
-    Returns:
-        logits: [batch_size * next_n, max_model_len]
-    """
-    batch_size, next_n, _, _ = q.size()
-    _, block_size, _, _ = kv_cache.size()
-
-    logits = torch.full(
-        [batch_size * next_n, max_model_len],
-        float("-inf"),
-        device=q.device,
-        dtype=torch.float32,
-    )
-
-    num_tokens_list = num_tokens.tolist()
-    num_kv_tokens_list = num_kv_tokens.tolist()
-
-    for i in range(batch_size):
-        num_token = num_tokens_list[i]
-        num_kv_token = num_kv_tokens_list[i]
-
-        # Query positions: [num_token - next_n, ..., num_token - 1]
-        q_offsets = torch.arange(num_token - next_n, num_token, device="cuda")
-
-        # Transpose weights for this sequence: [num_heads, next_n]
-        weight_slice = weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
-
-        # Process each block in the sequence
-        for block_rk in range(cdiv(num_kv_token, block_size)):
-            block_idx = block_tables[i][block_rk]
-            qx, kx = q[i], kv_cache[block_idx]
-
-            # Key positions in this block
-            k_offsets = torch.arange(
-                block_rk * block_size,
-                (block_rk + 1) * block_size,
-                device="cuda",
-            )
-
-            # Causal mask: k_pos < num_token AND k_pos < (q_pos + 1) // compress_ratio
-            k_mask = k_offsets[None, :] < num_kv_token
-            causal_mask = k_offsets[None, :] < (q_offsets[:, None] + 1) // compress_ratio
-            mask = k_mask & causal_mask
-
-            # Compute attention scores: [num_heads, next_n, block_size]
-            s = torch.where(
-                mask[None, :, :],
-                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(logits.dtype),
-                float("-inf"),
-            )
-
-            # Apply ReLU, multiply by weights, and sum over heads
-            s = torch.relu(s) * weight_slice[..., None]
-            s = s.sum(dim=0)  # [next_n, block_size]
-
-            # Write to output with additional causal mask
-            logits[
-                i * next_n : (i + 1) * next_n,
-                block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(causal_mask, s, float("-inf"))
-
-    return logits
-
-
-def _ref_fp8_mqa_logits(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-):
-    """
-    Reference implementation of fp8_mqa_logits.
-    out_ij = q[i, :, :] @ kv[j, :] # [num_heads]
-    out_ij = out_ij.relu() * weights[i, :]
-    out_ij = out_ij.sum()  # Scalar
-
-    Args:
-        q: [seq_len, num_heads, head_dim]
-        kv: [seq_len_kv, head_dim]
-        weights: [seq_len, num_heads]
-        cu_seqlen_ks: [seq_len]
-        cu_seqlen_ke: [seq_len]
-
-    Returns:
-        logits: [seq_len, seq_len_kv]
-    """
-
-    seq_len_kv = kv.shape[0]
-
-    k = kv
-    q = q.float()
-    k = k.float()
-
-    mask_lo = torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
-    mask_hi = torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
-    mask = mask_lo & mask_hi
-
-    score = torch.einsum("mhd,nd->hmn", q, k)
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float("-inf"))
-
-    return logits
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -1558,7 +2124,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)
-    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,))
     logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)  # -> [seq_len, seq_len_kv]
 
     # Basic sanity checks
@@ -1567,7 +2133,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     )
     assert logits.dtype == torch.float32, f"Expected dtype torch.float32, got {logits.dtype}"
 
-    ref_logits = _ref_fp8_mqa_logits(
+    ref_logits = DSAVanillaIndexer.mqa_logits(
         q=q,
         kv=kv,
         weights=weights,
@@ -1603,7 +2169,7 @@ def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
-    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,), use_ue8m0=False)
 
     logits = deep_gemm.fp8_mqa_logits(
         q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
@@ -2490,7 +3056,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_kv_lens.cuda()
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = DSAVanillaIndexer.paged_mqa_logits(
         q,
         kv_cache_bf16,
         weights,
@@ -2568,14 +3134,12 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
       bytes the kernel sees) so FP4 quantization noise cancels in the
       diff check.
     """
-    # Lazy import: cast_back_from_fp4 is a pure-Python helper in the
-    # kernel-layer FP4 test file. Pulling it in here avoids duplicating
-    # the ~50-line FP4 quant/dequant family. byte-for-byte equivalence
-    # between fused_cat_fp4 and per_token_cast_to_fp4(use_ue8m0=True,
-    # gran_k=32, use_packed_ue8m0=True) is asserted by
-    # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm, so
-    # cast_back_from_fp4 can decode fused_cat_fp4's outputs directly.
-    cast_back_from_fp4 = _load_cast_back_from_fp4()
+    # The golden reference owns the FP4 quant/dequant family. fused_cat_fp4
+    # is byte-for-byte equal to DeepGEMM's per_token_cast_to_fp4(use_ue8m0=True,
+    # gran_k=32, use_packed_ue8m0=True) -- asserted by
+    # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm -- so the
+    # reference dequantizer decodes fused_cat_fp4's output directly.
+    cast_back_from_fp4 = DSAVanillaIndexer.dequantize_fp4
     from tensorrt_llm._torch.attention.backends.sparse.dsa import _pick_dsl_expand
     from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits
 
@@ -2899,7 +3463,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_lens.cuda()
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = DSAVanillaIndexer.paged_mqa_logits(
         q_simulated.float(),
         kv_cache_sim,
         weights,

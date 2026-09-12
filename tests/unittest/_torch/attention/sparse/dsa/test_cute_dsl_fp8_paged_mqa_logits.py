@@ -19,86 +19,13 @@ Test CuTe DSL fp8_paged_mqa_logits kernel against C++ DeepGEMM reference.
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import DSAVanillaIndexer
 from tensorrt_llm._utils import get_sm_version
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
     reason=f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
 )
-
-
-def _ceil_to_ue8m0(x: torch.Tensor):
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
-
-
-def _ref_fp8_paged_mqa_logits(
-    q_fp8,
-    kv_fp8,
-    kv_scales,
-    weights,
-    context_lens,
-    block_table,
-    max_model_len,
-    block_kv,
-    epi_dtype=torch.float32,
-):
-    """Pure PyTorch reference for fp8_paged_mqa_logits.
-
-    Args:
-        q_fp8: [B, next_n, H, D] float8_e4m3fn
-        kv_fp8: [num_blocks, block_kv, D] float8_e4m3fn
-        kv_scales: [num_blocks, block_kv] float32
-        weights: [B*next_n, H] float32
-        context_lens: [B] int32
-        block_table: [B, max_blocks] int32
-        max_model_len: int
-        block_kv: int
-        epi_dtype: epilogue dtype — GEMM stays fp32, weighted sum + scale
-            use this dtype (torch.float32 or torch.float16)
-
-    Returns:
-        logits: [B*next_n, max_model_len] epi_dtype
-    """
-    B, next_n, H, D = q_fp8.shape
-    device = q_fp8.device
-
-    logits = torch.full((B * next_n, max_model_len), float("-inf"), device=device, dtype=epi_dtype)
-
-    q_f32 = q_fp8.float()
-
-    for b in range(B):
-        ctx_len = context_lens[b].item()
-        q_positions = torch.arange(ctx_len - next_n, ctx_len, device=device)
-
-        w = weights[b * next_n : (b + 1) * next_n, :].to(epi_dtype)
-
-        for blk_idx in range((ctx_len + block_kv - 1) // block_kv):
-            phys_blk = block_table[b, blk_idx].item()
-
-            k_f32 = kv_fp8[phys_blk].float()
-            scales = kv_scales[phys_blk].to(epi_dtype)
-
-            k_positions = torch.arange(blk_idx * block_kv, (blk_idx + 1) * block_kv, device=device)
-
-            mask = (k_positions[None, :] < ctx_len) & (k_positions[None, :] <= q_positions[:, None])
-
-            # GEMM in fp32
-            qk = torch.matmul(q_f32[b].permute(1, 0, 2), k_f32.T)  # [H, next_n, block_kv]
-            qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
-            qk = torch.relu(qk)
-
-            # Epilogue in epi_dtype
-            qk = qk.to(epi_dtype)
-            weighted = (w.T[:, :, None] * qk).sum(dim=0)  # [next_n, block_kv]
-            weighted = weighted * scales[None, :]
-
-            start_pos = blk_idx * block_kv
-            end_pos = start_pos + block_kv
-            logits[b * next_n : (b + 1) * next_n, start_pos:end_pos] = torch.where(
-                mask, weighted, torch.tensor(float("-inf"), device=device, dtype=epi_dtype)
-            )
-
-    return logits
 
 
 def _make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim):
@@ -198,7 +125,7 @@ def _generate_test_data(
 
         kv_bf16 = torch.randn(num_phys_blocks, block_kv, head_dim, device=device)
         kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
-        kv_scale = _ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
+        kv_scale = DSAVanillaIndexer.ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
         kv_fp8 = (kv_bf16 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
         weights = torch.randn(batch_size * next_n, num_heads, device=device, dtype=torch.float32)
@@ -274,7 +201,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(
         data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
     )
 
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = DSAVanillaIndexer.paged_mqa_logits_quantized(
         data["q_fp8"],
         data["kv_fp8"],
         data["kv_scales"],
@@ -387,7 +314,7 @@ def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
         data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
     )
 
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = DSAVanillaIndexer.paged_mqa_logits_quantized(
         data["q_fp8"],
         data["kv_fp8"],
         data["kv_scales"],
