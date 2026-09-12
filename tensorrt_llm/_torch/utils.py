@@ -86,7 +86,7 @@ class ActType_TrtllmGen(IntEnum):
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
-# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
         ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,

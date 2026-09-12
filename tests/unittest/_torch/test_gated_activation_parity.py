@@ -8,8 +8,7 @@ from pathlib import Path
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 
 _HEADER = (
-    Path(__file__).parents[3]
-    / "cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
+    Path(__file__).parents[3] / "cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
 )
 
 
