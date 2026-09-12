@@ -79,24 +79,32 @@ draft) are the reference-faithful, unit-validated I/O stages.
 
 import copy
 import json
+import math
 import os
 import re
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import PretrainedConfig
 
+from tensorrt_llm.functional import RopeEmbeddingUtils
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import is_sm_100f
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import AllReduceParams
-from ..modules.linear import Linear
+from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.config_utils import is_mla
 from ..speculative.interface import SpeculativeDecodingMode
 from ..utils import AuxStreamType
 from .modeling_deepseekv4 import (
@@ -111,11 +119,12 @@ from .modeling_deepseekv4 import (
 from .modeling_dflash import DFlashForCausalLM, resolve_dspark_head_config
 from .modeling_speculative import (
     DSparkConfidenceHead,
+    SpecDecOneEngineForCausalLM,
     build_markov_head,
     confident_prefix_length,
     dspark_markov_chain_logits,
 )
-from .modeling_utils import register_draft_model
+from .modeling_utils import DecoderModel, register_auto_model, register_draft_model
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from ..custom_ops.dspark_attention_custom_op import (
@@ -385,11 +394,21 @@ def _rmsnorm_rope_batched(
     apply_weight: bool = True,
     apply_rmsnorm: bool = True,
     inverse_rope: bool = False,
+    norm_dim: Optional[int] = None,
 ) -> torch.Tensor:
-    """Fuse DSpark RMSNorm and last-dimension RoPE when supported."""
+    """Fuse DSpark RMSNorm and last-dimension RoPE when supported.
+
+    ``norm_dim`` bounds the RMSNorm (and the weight) to a prefix of the row.
+    None means the whole row, which is DSpark's own convention. The other
+    supported value is ``t.shape[-1] - rope_head_dim``: DeepSeek-style MLA
+    normalizes the kv_lora_rank latent and leaves k_pe raw, and then ``weight``
+    spans only that latent.
+    """
     if IS_CUTLASS_DSL_AVAILABLE and is_sm_100f():
         freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
-        if is_fused_dspark_rmsnorm_rope_supported(t, weight, freqs_real, num_heads, rope_head_dim):
+        if is_fused_dspark_rmsnorm_rope_supported(
+            t, weight, freqs_real, num_heads, rope_head_dim, norm_dim
+        ):
             return cute_dsl_dspark_rmsnorm_rope(
                 t,
                 weight,
@@ -400,15 +419,19 @@ def _rmsnorm_rope_batched(
                 apply_weight,
                 apply_rmsnorm,
                 inverse_rope,
+                norm_dim,
             )
 
+    split_norm = norm_dim is not None and norm_dim != t.shape[-1]
+    head, tail = (t[..., :norm_dim], t[..., norm_dim:]) if split_norm else (t, None)
     if apply_rmsnorm:
         if apply_weight:
-            t = _rmsnorm(t, weight, eps)
+            head = _rmsnorm(head, weight, eps)
         else:
-            t = t * torch.rsqrt(t.square().mean(-1, keepdim=True) + eps)
+            head = head * torch.rsqrt(head.square().mean(-1, keepdim=True) + eps)
     elif apply_weight:
-        t = (t.float() * weight.float()).to(t.dtype)
+        head = (head.float() * weight.float()).to(head.dtype)
+    t = head if tail is None else torch.cat([head, tail], dim=-1)
     if rope_head_dim > 0:
         t = _rope_last_dims_batched(t, rope_head_dim, freqs_cis, inverse=inverse_rope)
     return t
@@ -1041,6 +1064,27 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
         return self.stage_id == self.num_stages - 1
 
 
+def _runtime_position_cap(model_config, pretrained_config, slack: int = 0) -> int:
+    """Positions a RoPE table must span: the served length, not the advertised one.
+
+    Both drafter families build a position table, and both were sized from the
+    checkpoint's max_position_embeddings. K3 advertises 1,048,576, which costs
+    ~256 MiB per rank as complex64 -- built via full-size fp32 cos/sin, so
+    ~768 MiB transient -- while the context cache is bounded by the runtime
+    max_seq_len. Only the table length is affected; YaRN's correction range is
+    computed from original_max_position_embeddings and does not move.
+    """
+    runtime = getattr(model_config, "max_seq_len", None)
+    return int(runtime or getattr(pretrained_config, "max_position_embeddings", 163840)) + slack
+
+
+# NOTE on slack: this is a construction-time cap only. A drafter driven by
+# DFlashWorker gets its real bound at runtime from dflash_position_ceiling
+# (published as _runtime_position_ceiling), because the engine raises
+# max_seq_len past model_config's value and never writes it back. The DSv4 site
+# keeps its own slack because it is not driven by that worker.
+
+
 class DSv4DSparkDraftModel(nn.Module):
     """The ``n_mtp_layers``-stage DSpark draft stacked on a DeepSeek-V4 target.
 
@@ -1155,9 +1199,7 @@ class DSv4DSparkDraftModel(nn.Module):
         # batched paths. It is built once per device and gathered/sliced by the
         # runtime decode positions, so the cache does not grow with sequence
         # length and the batched consuming op's shape remains static.
-        self._freqs_cap = (
-            int(getattr(config, "max_position_embeddings", 163840)) + self.block_size + 2
-        )
+        self._freqs_cap = _runtime_position_cap(model_config, config, self.block_size + 2)
         self._freqs_table_cache: Dict = {}
 
     def post_load_weights(self) -> None:
@@ -1946,6 +1988,303 @@ class DSv4DSparkForCausalLM(nn.Module):
 
 
 # ----------------------------------------------------------------------------
+# MLA-shaped standalone drafter backbone (Inferact/Kimi-K3-DSpark).
+#
+# A weight container, not a servable model: nothing here registers with the
+# attention backend or the KV cache manager, so the layers have no working
+# ``forward``. ``MLADSparkForCausalLM`` runs its own block decode over them.
+# Not a ``DeepseekV3`` subclass -- that carries MoE, a fused ``qkv_a_proj``
+# switch, quantization and KV-manager registration, none of which apply.
+# ----------------------------------------------------------------------------
+
+
+def _yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def build_dspark_mla_yarn_rope(
+    *,
+    dim: int,
+    base: float,
+    scaling_factor: float,
+    original_max_position_embeddings: int,
+    max_position_embeddings: int,
+    beta_fast: float = 32.0,
+    beta_slow: float = 1.0,
+    mscale: float = 1.0,
+    mscale_all_dim: float = 0.0,
+    device: str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """YaRN cos/sin tables for an MLA drafter's ``qk_rope_head_dim`` slice.
+
+    Repacks ``RopeEmbeddingUtils.create_sinusoidal_positions_yarn``, the same HF
+    DeepSeek-V2 transcription the drafters are distilled under. NOT reused:
+    ``RopeParams.create_rope_const_params()`` pins the fused MLA kernel's GPT-J
+    packing and hard-codes ``device='cuda'``.
+
+    ``duplicate_data=True`` though only the first half is read as a complex
+    pair: the util's two modes disagree by 1 ulp on 6 of 8224 entries, and the
+    duplicated one is what every measured drafter run used.
+
+    Returns ``(cos, sin)``, both ``[max_position_embeddings, dim]`` fp32, with
+    the frequency half duplicated so ``rotate_half`` applies.
+    """
+    # The util returns a flat numpy [pos][slot](cos, sin); split the pair.
+    _, packed = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+        num_pos=max_position_embeddings,
+        dim=dim,
+        base=base,
+        scaling_factor=scaling_factor,
+        original_max_position_embeddings=original_max_position_embeddings,
+        beta_fast=beta_fast,
+        beta_slow=beta_slow,
+        mscale=mscale,
+        mscale_all_dim=mscale_all_dim,
+        duplicate_data=True,
+    )
+    table = torch.from_numpy(packed).reshape(max_position_embeddings, dim, 2)
+    return (
+        table[..., 0].contiguous().to(device),
+        table[..., 1].contiguous().to(device),
+    )
+
+
+def build_dspark_mla_yarn_freqs_cis(*, device: str = "cuda", **kwargs) -> torch.Tensor:
+    """The same YaRN table as :func:`build_dspark_mla_yarn_rope`, adjacent-pair.
+
+    Returns ``[max_position_embeddings, dim // 2]`` complex64: the convention the
+    fused ``cute_dsl_dspark_rmsnorm_rope`` kernel consumes, where the last dim of
+    the rotated slice is read as (re, im) pairs.
+
+    HF DeepSeek de-interleaves and rotates halves instead, writing the same
+    values to lanes i and i + dim/2 rather than 2i and 2i+1. That permutation
+    cancels inside ``q_rope . k_rope``, so either convention works -- but every
+    producer of a rope slice must use the SAME one, and mixing them only shows
+    up as lower AL. ``mscale`` rides in the modulus, not the phase.
+    """
+    cos, sin = build_dspark_mla_yarn_rope(device=device, **kwargs)
+    half = cos.shape[-1] // 2
+    return torch.complex(cos[..., :half], sin[..., :half]).contiguous()
+
+
+def apply_dspark_mla_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate the trailing ``qk_rope_head_dim`` of ``x`` the HF DeepSeek way.
+
+    ``x`` is ``[..., dim]`` and ``cos``/``sin`` are ``[..., dim]`` already
+    gathered at the query positions. HF interleaves the rope slice, so it first
+    reshapes ``(d//2, 2) -> transpose -> (d,)`` and only then applies the
+    half-split ``rotate_half``; the net rotation is GPT-J style.
+
+    Equal to ``RotaryEmbedding.apply_rotary_pos_emb(..., is_neox=False)`` up to
+    an even/odd lane split of its output (checked exactly, max diff 0.0). Kept
+    separate because that helper unsqueezes cos/sin itself, so routing through
+    it would push a rank contract onto every caller for no numerical gain.
+    """
+    d = x.shape[-1]
+    x = x.reshape(*x.shape[:-1], d // 2, 2).transpose(-1, -2).reshape(*x.shape[:-1], d)
+    x1, x2 = x[..., : d // 2], x[..., d // 2 :]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return x * cos + rotated * sin
+
+
+class K3DsparkMLA(nn.Module):
+    """MLA projections for one drafter layer. No attention, no KV registration.
+
+    Head sharding follows :class:`~tensorrt_llm._torch.modules.mla.MLA`: the
+    low-rank ``*_a`` projections are replicated (every head reads the same
+    latent), ``q_b_proj`` / ``kv_b_proj`` are column-sharded by head and
+    ``o_proj`` is row-sharded. Under attention-DP ``tp_size`` collapses to 1,
+    which is also why the drafter's latent cache is unsharded.
+    """
+
+    def __init__(self, model_config, layer_idx: int):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.layer_idx = layer_idx
+        dtype = config.torch_dtype
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        # What the drafter's KV cache stores per token: one MLA latent, no V.
+        self.kv_cache_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+
+        mapping = model_config.mapping
+        if mapping.cp_size > 1:
+            # MLA's own module folds cp_size into the head split and the o_proj
+            # mapping; this drafter does not, and a silently wrong world_size
+            # would mis-shard the head projections.
+            raise NotImplementedError(
+                f"The MLA DSpark drafter does not support context parallelism "
+                f"(cp_size={mapping.cp_size})."
+            )
+        tp_size = mapping.tp_size
+        dp_size = 1
+        if mapping.enable_attention_dp:
+            dp_size = tp_size
+            tp_size = 1
+        if self.num_heads % tp_size != 0:
+            raise ValueError(
+                f"DSpark MLA drafter has {self.num_heads} heads, not divisible by tp_size {tp_size}."
+            )
+        self.num_heads_tp = self.num_heads // tp_size
+        attn_mapping = Mapping(
+            world_size=mapping.pp_size * dp_size * tp_size,
+            tp_size=tp_size,
+            pp_size=mapping.pp_size * dp_size,
+            rank=mapping.rank,
+            gpus_per_node=mapping.gpus_per_node,
+            enable_attention_dp=mapping.enable_attention_dp,
+        )
+        self.mapping = attn_mapping
+        # Row-parallel o_proj reduces only when the heads are actually split.
+        reduce_output = not mapping.enable_attention_dp and mapping.tp_size > 1
+
+        skip_init = model_config.skip_create_weights_in_init
+        self.q_a_proj = Linear(
+            self.hidden_size,
+            self.q_lora_rank,
+            bias=False,
+            dtype=dtype,
+            skip_create_weights_in_init=skip_init,
+        )
+        self.q_a_layernorm = RMSNorm(
+            hidden_size=self.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+        )
+        self.q_b_proj = Linear(
+            self.q_lora_rank,
+            self.num_heads * self.qk_head_dim,
+            bias=False,
+            dtype=dtype,
+            mapping=attn_mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            skip_create_weights_in_init=skip_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+        self.kv_a_proj_with_mqa = Linear(
+            self.hidden_size,
+            self.kv_cache_head_dim,
+            bias=False,
+            dtype=dtype,
+            skip_create_weights_in_init=skip_init,
+        )
+        self.kv_a_layernorm = RMSNorm(
+            hidden_size=self.kv_lora_rank, eps=config.rms_norm_eps, dtype=dtype
+        )
+        self.kv_b_proj = Linear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            dtype=dtype,
+            mapping=attn_mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            skip_create_weights_in_init=skip_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+        self.o_proj = Linear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            dtype=dtype,
+            mapping=attn_mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            reduce_output=reduce_output,
+            skip_create_weights_in_init=skip_init,
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "K3DsparkMLA holds the drafter's MLA weights for MLADSparkForCausalLM's "
+            "block decode; it has no standalone attention path."
+        )
+
+
+class K3DsparkDecoderLayer(DecoderLayer):
+    """One drafter layer: MLA projections + dense gated MLP + the two norms."""
+
+    def __init__(self, model_config, layer_idx: int):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.layer_idx = layer_idx
+        self.self_attn = K3DsparkMLA(model_config, layer_idx)
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            overridden_tp_size=1 if model_config.mapping.enable_attention_dp else None,
+            config=model_config,
+            layer_idx=layer_idx,
+        )
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "K3DsparkDecoderLayer is driven by MLADSparkForCausalLM.dflash_forward, "
+            "not by the generic decoder loop."
+        )
+
+
+class K3DsparkModel(DecoderModel):
+    def __init__(self, model_config):
+        super().__init__(model_config)
+        config = model_config.pretrained_config
+        # The drafter ships its own trained embedding rather than sharing the
+        # target's -- verified different weights on Inferact/Kimi-K3-DSpark --
+        # so this is loaded from the drafter checkpoint, not overwritten.
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
+        )
+        self.layers = nn.ModuleList(
+            [
+                K3DsparkDecoderLayer(model_config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "K3DsparkModel is a weight container for the DSpark block decode; "
+            "see MLADSparkForCausalLM.dflash_forward."
+        )
+
+
+@register_auto_model("K3DsparkForCausalLM")
+class K3DsparkForCausalLM(SpecDecOneEngineForCausalLM[K3DsparkModel, PretrainedConfig]):
+    """Registry entry for the MLA DSpark drafter checkpoint.
+
+    The name is the one ``DFlashForCausalLM.__init__`` derives from the
+    checkpoint's ``model_type`` ("k3_dspark"), but MLADSparkForCausalLM pins
+    ``architectures`` explicitly rather than relying on that derivation --
+    the Laguna precedent in ``modeling_dflash.py``.
+    """
+
+    def __init__(self, model_config):
+        super().__init__(K3DsparkModel(model_config), model_config)
+
+
+# ----------------------------------------------------------------------------
 # Standalone DSpark drafters.
 #
 # The other DSpark flavour: the drafter ships as its own checkpoint instead of
@@ -1968,36 +2307,102 @@ _DSPARK_HEAD_WEIGHT_ALIASES = {
 }
 
 
-class GQADSparkForCausalLM(DFlashForCausalLM):
-    """DSpark drafter on a GQA-shaped backbone, from a standalone checkpoint.
+_LN2 = math.log(2.0)
+# flashinfer sizes its own scratch from this; the MLA decode path is the only
+# consumer here and 256 MiB is what the DFlash TRTLLM buffers already reserve.
+_MLA_DECODE_WORKSPACE_BYTES = 256 * 1024 * 1024
 
-    Adds the DSpark head set on top of the DFlash block decode:
 
-      - the vanilla Markov intra-block logit bias, applied by ``DSparkWorker``
-        through :meth:`apply_markov_chain_logits`;
-      - the ``shift_label`` output convention (the hidden state at block slot j
-        predicts draft token j+1, so slot 0 holds the anchor token);
-      - the confidence head weights.
+class _MLABlockFixup(NamedTuple):
+    """Layer-invariant state for the MLA block-decode fixup.
+
+    The block's own latents are written into the pool at ``ctx_len + j``. Those
+    slots belong to this request -- the draft KV manager adds
+    ``max(draft_len, max_total_draft_tokens)`` tokens to every generation request
+    each step (resource_manager.py:1060) -- and the accepted tokens overwrite
+    them next step, so the write is transient. Same thing the GQA drafter's
+    TRTLLM backend does (modeling_dflash.py append_paged_kv_cache).
+
+    In-block causality then leaves query j seeing block keys 0..j, so only the
+    strict upper triangle needs fixing up. Every field depends on ctx_len, the
+    page table and the block geometry alone, so it is built once per forward.
+    """
+
+    pages: torch.Tensor  # [B, block] page holding each block position
+    offsets: torch.Tensor  # [B, block] offset of that position inside its page
+    valid: torch.Tensor  # [1, block, 1, block] strict upper triangle
+    page_tables_i32: torch.Tensor  # kernel operands, cast once
+    seq_lens_i32: torch.Tensor  # ctx_len + block_size
+
+
+def _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size) -> _MLABlockFixup:
+    """Where the block's latents go, and the upper-triangle mask, for all layers."""
+    device = ctx_len.device
+    pos = ctx_len.view(-1, 1) + torch.arange(block_size, device=device)
+    idx = torch.arange(block_size, device=device)
+    return _MLABlockFixup(
+        pages=page_tables.gather(1, pos // page_size),
+        offsets=pos % page_size,
+        valid=(idx.view(1, block_size) > idx.view(block_size, 1)).view(
+            1, block_size, 1, block_size
+        ),
+        page_tables_i32=page_tables.to(torch.int32),
+        seq_lens_i32=(ctx_len + block_size).to(torch.int32),
+    )
+
+
+def _resolve_dspark_mla_rope_params(pretrained_config, model_config=None, slack: int = 0) -> Dict:
+    """RoPE settings for an MLA drafter, from either HF spelling.
+
+    Transformers v5 checkpoints (TorchSpec) carry ``rope_parameters``; older
+    ones carry ``rope_scaling``. Only YaRN is accepted: both published MLA
+    drafters use it, and silently treating an unknown scaling as plain RoPE
+    would cost acceptance without an error.
+    """
+    scaling = (
+        getattr(pretrained_config, "rope_parameters", None)
+        or getattr(pretrained_config, "rope_scaling", None)
+        or {}
+    )
+    rope_type = scaling.get("rope_type") or scaling.get("type") or "default"
+    if rope_type != "yarn":
+        raise ValueError(
+            f"MLA DSpark drafter declares rope_type={rope_type!r}; only 'yarn' is "
+            "supported (the block decode builds its own YaRN table)."
+        )
+    theta = scaling.get("rope_theta") or getattr(pretrained_config, "rope_theta", 10000.0)
+    return {
+        "theta": float(theta),
+        "scaling_factor": float(scaling["factor"]),
+        "original_max_positions": int(scaling["original_max_position_embeddings"]),
+        # Table length, not YaRN math: the correction range below uses
+        # original_max_positions, so capping this at the served length is free.
+        # K3 advertises 1,048,576, which would build a ~256 MiB complex64 table
+        # per rank -- through full-size fp32 cos/sin, so ~768 MiB transient --
+        # for a drafter whose point is 5760 B/token instead of 20480.
+        "max_positions": _runtime_position_cap(model_config, pretrained_config, slack),
+        "beta_fast": float(scaling.get("beta_fast", 32.0)),
+        "beta_slow": float(scaling.get("beta_slow", 1.0)),
+        "mscale": float(scaling.get("mscale", 1.0)),
+        "mscale_all_dim": float(scaling.get("mscale_all_dim", 0.0)),
+    }
+
+
+class _DSparkHeadMixin:
+    """The DSpark head set, shared by the GQA and MLA drafter wrappers.
+
+    DSpark is DFlash plus three things, and only these three are common to both
+    backbone shapes: the vanilla Markov intra-block logit bias, the
+    ``shift_label`` slot convention (block slot j predicts draft token j+1, so
+    slot 0 holds the anchor) and the confidence head. The block decode itself
+    has nothing in common between the shapes, which is why this is a mixin and
+    not a base class.
 
     Confidence-scheduled verification is not implemented yet: ``confidence_proj``
     is loaded but unused, and drafting always proposes the full K tokens.
-
-    Named for the attention shape, not for a model: the backbone is whatever
-    the drafter config resolves to through the model registry, and the
-    inherited block decode works for every GQA family the DFlash drafters
-    already cover (qwen3, llama, gpt_oss, ...). A per-model subclass would be
-    empty. The GQA precondition is inherited, not introduced here -- see
-    ``DFlashForCausalLM._validate_gqa_shape``. An MLA-backboned drafter needs
-    its own block decode and becomes a sibling, ``MLADSparkForCausalLM``, not a
-    subclass of this.
-
-    Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
-        super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
-
-        cfg = draft_config.pretrained_config
+    def _init_dspark_heads(self, cfg) -> None:
         # Defaults on, unlike the DFlash base: the shift_label slot layout is
         # part of what DSpark *is*, and both published drafters set
         # block_size == max_draft_len, where the DFlash layout (slots 1..K)
@@ -2073,11 +2478,12 @@ class GQADSparkForCausalLM(DFlashForCausalLM):
             base_logits, first_prev_tokens, self.markov_w1, markov_w2, argmax_fn=argmax_fn
         )
 
-    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
-        """Take the DSpark head weights, then hand the rest to DFlash.
+    def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:
+        """Pull the head tensors out of ``weights`` and load them onto self.
 
         The head keys are pulled out before the backbone remap: left in, they
         would pick up a ``model.`` prefix and be dropped by partial loading.
+        Returns the remaining weights and the extracted head weights.
         """
         dspark_weights = {}
         consumed = set()
@@ -2121,7 +2527,549 @@ class GQADSparkForCausalLM(DFlashForCausalLM):
             self.confidence_proj_weight = dspark_weights["confidence_proj.weight"].to("cuda")
         if "confidence_proj.bias" in dspark_weights:
             self.confidence_proj_bias = dspark_weights["confidence_proj.bias"].to("cuda")
+        return weights, dspark_weights
+
+
+class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
+    """DSpark drafter on a GQA-shaped backbone, from a standalone checkpoint.
+
+    Adds the DSpark head set (see :class:`_DSparkHeadMixin`) on top of the
+    DFlash block decode.
+
+    Named for the attention shape, not for a model: the backbone is whatever
+    the drafter config resolves to through the model registry, and the
+    inherited block decode works for every GQA family the DFlash drafters
+    already cover (qwen3, llama, gpt_oss, ...). A per-model subclass would be
+    empty. The GQA precondition is inherited, not introduced here -- see
+    ``DFlashForCausalLM._validate_gqa_shape``. The MLA-backboned drafter is the
+    sibling :class:`MLADSparkForCausalLM`, not a subclass of this.
+
+    Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
+    """
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+        super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+        self._init_dspark_heads(draft_config.pretrained_config)
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Take the DSpark head weights, then hand the rest to DFlash."""
+        weights, _ = self._take_dspark_head_weights(weights)
         return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+
+
+class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
+    """DSpark drafter on an MLA-shaped backbone, from a standalone checkpoint.
+
+    Separate from the GQA class because DFlash's block decode splits a fused
+    ``qkv_proj`` by (num_heads, num_kv_heads, head_dim) and fuses per-head K/V
+    across layers, neither of which MLA has. It keeps the DFlash contract --
+    dual-source KV, non-causal block attention, one precomputed context cache.
+
+    The cache stores one ``kv_lora_rank + qk_rope_head_dim`` latent per token
+    per layer and no V, which is the point: 5 x 576 x 2B = 5760 B/token/rank
+    against the GQA drafter's 20480 under attention-DP, where KV heads are
+    unsharded.
+
+    Block attention runs on flashinfer's trtllm-gen absorbed-MLA paged decode
+    (``_mla_paged_attention``); the eager torch path stays only as the
+    reference, for builds without flashinfer and for the unpaged arena.
+    ``spec_config.attention_backend`` does NOT select between those two -- it
+    picks the *GQA* drafter's backend in the shared DFlash worker, and this
+    class overrides the attention entirely.
+
+    Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
+    """
+
+    # Attention is _mla_paged_attention, so neither worker backend applies and
+    # neither backend's shape checks bind -- the absorbed shape (64 heads : 1 KV
+    # head, head_dim 576) would fail both.
+    _uses_worker_attention_backend = False
+    # The whole point of the MLA drafter: its context KV comes out of the
+    # manager's pool (5760 B/token/rank) instead of an arena dense in
+    # max_seq_len that free_gpu_memory_fraction never bounds. Independent of the
+    # backend field, which is why either value of it works here.
+    _paged_ctx_cache = True
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+        cfg = draft_config.pretrained_config
+        # Pin the backbone instead of relying on the model_type-derived name
+        # (the Laguna precedent in modeling_dflash.py): the checkpoint labels
+        # itself "K3DSparkModel", which is registered nowhere.
+        cfg.architectures = ["K3DsparkForCausalLM"]
+        super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+        self._init_dspark_heads(cfg)
+
+        attn0 = self.model.layers[0].self_attn
+        self.qk_nope_head_dim = attn0.qk_nope_head_dim
+        self.qk_rope_head_dim = attn0.qk_rope_head_dim
+        self.kv_lora_rank = attn0.kv_lora_rank
+        self.v_head_dim = attn0.v_head_dim
+        # The cache contract the worker sizes its arena from. Config-derived, so
+        # it is published here rather than waiting for the lazy buffer build:
+        # one MLA latent per token per layer, no V half.
+        self._num_attn_layers = len(self.model.layers)
+        self._num_heads = attn0.num_heads_tp
+        self._num_kv_heads = 1
+        self._head_dim = attn0.kv_cache_head_dim
+        self._kv_factor = 1
+
+        # No slack: the lookahead lives in dflash_position_ceiling, which the
+        # worker publishes as _runtime_position_ceiling before any forward and
+        # _mla_freqs_cis builds the table from. This config-derived cap is only
+        # the fallback for direct construction, where no worker runs and the
+        # positions asked for are whatever the caller passes.
+        rope = _resolve_dspark_mla_rope_params(cfg, draft_config)
+        self._mla_rope_params = rope
+        self._mla_workspace = None
+        self._mla_freqs = None
+        self._mla_freqs_cap = None
+        self._mla_noop_weight = None
+        # HF DeepSeek folds YaRN's attention scaling into the softmax scale:
+        # softmax_scale = mscale^2 / sqrt(qk_nope + qk_rope). NOT 1/sqrt(576) --
+        # the absorbed product reproduces the 192-dim un-absorbed score.
+        mscale = _yarn_get_mscale(rope["scaling_factor"], rope["mscale_all_dim"])
+        self.softmax_scale = (mscale * mscale) / math.sqrt(
+            self.qk_nope_head_dim + self.qk_rope_head_dim
+        )
+
+    # -- shape / buffers ---------------------------------------------------
+
+    def _validate_gqa_shape(self):
+        """Replace the base's GQA precondition with the MLA one."""
+        layers = getattr(self.model, "layers", None)
+        if not layers:
+            return
+        attn0 = layers[0].self_attn
+        keys = (
+            "num_heads_tp",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "kv_lora_rank",
+            "v_head_dim",
+        )
+        base = tuple(getattr(attn0, k) for k in keys)
+        for idx, layer in enumerate(layers[1:], start=1):
+            attn = getattr(layer, "self_attn", None)
+            if attn is None or not hasattr(attn, "kv_a_proj_with_mqa"):
+                raise ValueError(
+                    f"MLA DSpark block decode needs self_attn.kv_a_proj_with_mqa on every "
+                    f"draft layer, but layer {idx} of {type(self.config).__name__} has none."
+                )
+            if tuple(getattr(attn, k) for k in keys) != base:
+                raise ValueError(
+                    "MLA DSpark fuses the latent projection across layers and needs one "
+                    f"uniform MLA shape, but layer {idx} differs from layer 0 "
+                    f"({dict(zip(keys, base))})."
+                )
+
+    def _init_rope(self):
+        """No shared RoPE cache: the MLA path rotates only the rope slice."""
+        self._rope_initialized = True
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _mla_decode_op():
+        """flashinfer's absorbed-MLA paged decode, or None when unavailable.
+
+        Loaded lazily so a build without flashinfer still runs the eager path.
+        """
+        try:
+            import flashinfer
+
+            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+        except (ImportError, AttributeError):
+            return None
+
+    def _mla_rope_noop_weight(self, like: torch.Tensor) -> torch.Tensor:
+        """Placeholder weight for a rope-only call; never read by the kernel."""
+        if self._mla_noop_weight is None:
+            self._mla_noop_weight = torch.ones(like.shape[-1], device=like.device, dtype=like.dtype)
+        return self._mla_noop_weight
+
+    def _mla_decode_workspace(self, device):
+        if self._mla_workspace is None:
+            self._mla_workspace = torch.zeros(
+                _MLA_DECODE_WORKSPACE_BYTES, dtype=torch.uint8, device=device
+            )
+        return self._mla_workspace
+
+    def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
+        """Absorbed-MLA block attention: paged kernel + a block-local fixup.
+
+        The kernel is causal across the query block and takes no mask (measured,
+        not assumed: it matches a causal reference to 1.6e-4 against 1.5e-2 for
+        full visibility). Its LSE is base 2 (also measured: exact against
+        ``log2(sum exp)``, 1.84 off against the natural log).
+
+        The block's own latents go into the pool first, at ``ctx_len + j``
+        (see _MLABlockFixup). With ``seq_lens = ctx_len + block_size`` the kernel
+        covers context AND block, and in-block causality leaves only the block's
+        strict upper triangle -- 8 keys, attended eagerly against ``blk_kv`` and
+        merged by log-sum-exp. The room those writes need is reserved by
+        ``dflash_allocated_ctx_limit``.
+
+        Returns the latent-space output ``[B, block, heads, kv_lora_rank]``.
+        """
+        decode = self._mla_decode_op()
+        batch, _, num_heads, _ = query.shape
+        device = query.device
+
+        # --- the block's own latents into the pool, then one causal pass ---
+        pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
+        pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_kv.reshape(
+            -1, blk_kv.shape[-1]
+        )
+        out_lower = torch.empty(
+            batch, block_size, num_heads, self.kv_lora_rank, dtype=query.dtype, device=device
+        )
+        lse_lower = torch.empty(batch * block_size, num_heads, dtype=torch.float32, device=device)
+        decode(
+            query,
+            layer_cache[:, 0],  # [pages, 1, page, head_dim]
+            self._mla_decode_workspace(device),
+            self.qk_nope_head_dim,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            fixup.page_tables_i32,
+            fixup.seq_lens_i32,
+            max_kv_len,
+            0,
+            out_lower,
+            self.softmax_scale,
+            1.0,
+            None,
+            None,
+            None,
+            backend="trtllm-gen",
+            is_var_seq=True,
+            uses_shared_paged_kv_idx=True,
+            lse=lse_lower,
+            return_lse=True,
+        )
+
+        # --- fixup: the block's strict upper triangle, the only thing the
+        # kernel's in-block causality hides once the block is in the pool ---
+        scores = torch.einsum("bshc,btc->bsht", query, blk_kv).float() * self.softmax_scale
+        scores = scores.masked_fill(~fixup.valid, float("-inf"))
+        lse_upper = scores.logsumexp(-1)
+        probs = torch.softmax(scores, dim=-1).nan_to_num_().to(blk_kv.dtype)
+        out_upper = torch.einsum("bsht,btc->bshc", probs, blk_kv[..., : self.kv_lora_rank])
+
+        # --- log-sum-exp merge (flash-decoding combine), kernel LSE is base 2 ---
+        # The weight pair collapses: w_u / (w_l + w_u) == sigmoid(lse_u - lse_l),
+        # so the merge is one sigmoid and one lerp instead of a peak subtraction,
+        # two exps and a division -- and it needs no explicit max for stability.
+        # The last query has an empty triangle, hence lse_upper -inf, sigmoid 0,
+        # pure kernel output.
+        lse_l = lse_lower.view(batch, block_size, num_heads).float() * _LN2
+        weight_upper = torch.sigmoid(lse_upper - lse_l).unsqueeze(-1)
+        merged = torch.lerp(out_lower.float(), out_upper.float(), weight_upper)
+        return merged.to(query.dtype)
+
+    def _mla_freqs_cis(self, device):
+        """Adjacent-pair YaRN table, cached. See build_dspark_mla_yarn_freqs_cis.
+
+        Sized from the ceiling the worker publishes once it knows the runtime
+        one (_runtime_position_ceiling, set in DFlashDrafter._lazy_init_ctx_buffers
+        before any forward), because that is the value ctx_len is clamped to and
+        it is strictly above model_config.max_seq_len whenever spec decoding is
+        on. The config-derived cap is the fallback for direct construction in
+        tests, where no worker runs.
+        """
+        rope = dict(self._mla_rope_params)
+        runtime_cap = self._runtime_position_ceiling
+        if runtime_cap is not None:
+            # Outright, not max(): the published ceiling is already
+            # min(runtime, max_position_embeddings) + lookahead, so it is
+            # both sufficient and the only thing that keeps the table small
+            # when max_seq_len is unset and the config cap is the
+            # checkpoint's advertised 1,048,576.
+            rope["max_positions"] = int(runtime_cap)
+        # Keyed on the cap, not just built once: _lazy_init_ctx_buffers
+        # re-publishes the ceiling when the KV-estimation probe manager is
+        # swapped for the real one, and drafter forwards do run during
+        # estimation. A table built short for a later, larger cap would index
+        # out of range on freqs[positions].
+        if self._mla_freqs is None or self._mla_freqs_cap != rope["max_positions"]:
+            self._mla_freqs = build_dspark_mla_yarn_freqs_cis(
+                dim=self.qk_rope_head_dim,
+                base=rope["theta"],
+                scaling_factor=rope["scaling_factor"],
+                original_max_position_embeddings=rope["original_max_positions"],
+                max_position_embeddings=rope["max_positions"],
+                beta_fast=rope["beta_fast"],
+                beta_slow=rope["beta_slow"],
+                mscale=rope["mscale"],
+                mscale_all_dim=rope["mscale_all_dim"],
+                device=device,
+            )
+            self._mla_freqs_cap = rope["max_positions"]
+        return self._mla_freqs
+
+    def _build_fused_kv_buffers(self) -> None:
+        """Stack the per-layer latent projection and its RMSNorm weight.
+
+        The MLA analogue of the base's fused K/V GEMM: one ``[L*576, hidden]``
+        weight, plus the ``[L, kv_lora_rank]`` layernorm scales applied after.
+        """
+        if self._fused_kv_weight is not None:
+            return
+        layers_attn = [layer.self_attn for layer in self.model.layers]
+        attn0 = layers_attn[0]
+        self._fused_kv_weight = torch.cat(
+            [a.kv_a_proj_with_mqa.weight for a in layers_attn], dim=0
+        ).contiguous()
+        self._fused_kv_bias = None
+        self._kv_a_norm_stacked = torch.stack([a.kv_a_layernorm.weight.data for a in layers_attn])
+        self._kv_a_norm_eps = attn0.kv_a_layernorm.variance_epsilon
+        self._input_ln_eps = None
+        self._has_qk_norm = False
+        self._use_fused_qk_norm_rope = False
+
+        # Split kv_b_proj into the absorption operands once. K absorbs into the
+        # query, V un-absorbs the attention output.
+        nh = attn0.num_heads_tp
+        for a in layers_attn:
+            w = a.kv_b_proj.weight.view(nh, self.qk_nope_head_dim + self.v_head_dim, -1)
+            a._k_b_proj = w[:, : self.qk_nope_head_dim].contiguous()
+            a._v_b_proj = w[:, self.qk_nope_head_dim :].contiguous()
+
+        logger.debug(
+            f"MLA DSpark: fused latent projection built for {self._num_attn_layers} layers "
+            f"(weight={tuple(self._fused_kv_weight.shape)}, head_dim={self._head_dim})"
+        )
+
+    # -- context cache -----------------------------------------------------
+
+    def precompute_context_kv(self, projected_hidden, positions):
+        """Post-norm / post-RoPE MLA latent for ALL drafter layers in one GEMM.
+
+        Returns ``(latent, None)``: ``[N, L, 1, kv_lora_rank + qk_rope_head_dim]``
+        and no V half, which is what ``_kv_factor == 1`` means to the worker.
+        """
+        if self._fused_kv_weight is None:
+            self._build_fused_kv_buffers()
+        n = projected_hidden.shape[0]
+        num_layers = self._num_attn_layers
+        weight_dtype = self._fused_kv_weight.dtype
+        if projected_hidden.dtype != weight_dtype:
+            projected_hidden = projected_hidden.to(weight_dtype)
+
+        latent = F.linear(projected_hidden, self._fused_kv_weight)
+        latent = latent.view(n, num_layers, self._head_dim)
+
+        # One fused RMSNorm+RoPE per layer, not one eager chain for all of them:
+        # the kernel takes a single norm weight per call and the layers do not
+        # share one. Same op the block path uses, so the two halves of an
+        # attention stay numerically consistent -- which is the point here, not
+        # speed (this runs per request, not per decode step).
+        freqs = self._mla_freqs_cis(latent.device)[positions.view(-1).long()]
+        out = torch.empty_like(latent)
+        for layer_idx in range(num_layers):
+            # 3D throughout: the eager fallback's rotary indexes [G, s, rd].
+            out[:, layer_idx] = _rmsnorm_rope_batched(
+                latent[:, layer_idx].unsqueeze(0).contiguous(),
+                self._kv_a_norm_stacked[layer_idx],
+                self._kv_a_norm_eps,
+                self.qk_rope_head_dim,
+                freqs.unsqueeze(0),
+                norm_dim=self.kv_lora_rank,
+            ).squeeze(0)
+        return out.unsqueeze(2).contiguous(), None
+
+    # -- block decode ------------------------------------------------------
+
+    def dflash_forward(
+        self,
+        noise_embedding,
+        query_positions,
+        num_ctx_per_req,
+        ctx_k_cache,
+        ctx_v_cache,
+        ctx_cache_batch_idx,
+        ctx_kv_cache=None,
+        ctx_page_table=None,
+    ):
+        """Eager absorbed-MLA block decode over the drafter's latent cache.
+
+        Args mirror the base: ``ctx_k_cache`` is
+        ``[pool_slots, L, max_ctx+block_size, 1, kv_cache_head_dim]`` and
+        ``ctx_v_cache`` is unused (``None``).
+        """
+        if self._fused_kv_weight is None:
+            self._build_fused_kv_buffers()
+
+        batch, block_size = noise_embedding.shape[0], noise_embedding.shape[1]
+        device = noise_embedding.device
+        num_heads = self._num_heads
+        latent_dim = self.kv_lora_rank
+
+        # [B, blk, rope/2] complex: one phase per draft position, shared by the
+        # query and the block latent of every layer.
+        blk_freqs = self._mla_freqs_cis(device)[query_positions.long()]
+
+        slots = ctx_cache_batch_idx.long()
+        # Context pages for this batch, resolved once: rows are batch positions
+        # when bound to the manager's per-request block table and slots on the
+        # private arena, which is exactly what ctx_cache_batch_idx already is.
+        page_tables = (
+            None if ctx_page_table is None else ctx_page_table.index_select(0, slots).long()
+        )
+
+        # Valid-key mask, shared by every layer: context slots below this
+        # request's length, then the whole block (DSpark is non-causal). Pages
+        # past a request's allocation hold another request's data, so the mask
+        # is what keeps them out -- not the block table.
+        page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
+        capacity = ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
+        # The paged kernel is the fast path; the eager gather stays as the
+        # reference and covers builds without flashinfer and the unpaged arena.
+        use_kernel = page_tables is not None and self._mla_decode_op() is not None
+        # Kernel path: index and mask operands are layer-invariant, so build
+        # them once here rather than five times inside the decode loop.
+        fixup = (
+            _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block_size, page_size)
+            if use_kernel
+            else None
+        )
+        logger.info_once(
+            "MLA DSpark block decode: "
+            + (
+                "trtllm-gen paged kernel, block in pool + upper-triangle fixup"
+                if use_kernel
+                else f"eager (paged={page_tables is not None}, "
+                f"flashinfer={self._mla_decode_op() is not None})"
+            ),
+            key="mla_dspark_block_decode_variant",
+        )
+        # Eager path only: dense key mask over the gathered context.
+        if not use_kernel:
+            ctx_valid = torch.arange(capacity, device=device).unsqueeze(0) < num_ctx_per_req[
+                :batch
+            ].view(-1, 1)
+            key_valid = torch.cat(
+                [ctx_valid, torch.ones(batch, block_size, dtype=torch.bool, device=device)], dim=1
+            )
+        hidden_states = noise_embedding
+        residual = None
+        for layer_idx, layer in enumerate(self.model.layers):
+            attn = layer.self_attn
+            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            if residual is None:
+                residual = hidden_states.clone()
+                hs_normed = layer.input_layernorm(hs_flat)
+            else:
+                res_flat = residual.reshape(-1, residual.shape[-1])
+                hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
+                residual = res_flat.reshape(batch, block_size, -1)
+
+            q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hs_normed)))
+            q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
+            # Rotate the trailing rope slice of every head in one kernel. No
+            # norm and no weight here -- q_a_layernorm already ran -- but the
+            # fused op still shape-checks the weight, hence the dummy.
+            q = _rmsnorm_rope_batched(
+                q,
+                self._mla_rope_noop_weight(q),
+                0.0,
+                self.qk_rope_head_dim,
+                blk_freqs,
+                num_heads=num_heads,
+                apply_weight=False,
+                apply_rmsnorm=False,
+            )
+            q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            # Absorb the nope half into latent space so the block attends the
+            # stored latent directly (MQA), instead of expanding it per head.
+            q_absorbed = torch.einsum("bshd,hdc->bshc", q_nope, attn._k_b_proj.to(q_nope.dtype))
+            query = torch.cat([q_absorbed, q_rope], dim=-1)
+
+            # The block's own latent comes from the draft hidden; the context's
+            # from the projected target hidden (precompute_context_kv). That
+            # dual-source split is the DFlash contract, not an MLA detail.
+            blk_latent = attn.kv_a_proj_with_mqa(hs_normed).view(batch, block_size, -1)
+            # RMSNorm over the latent, RoPE over k_pe, one kernel. norm_dim keeps
+            # k_pe out of the reduction, which is what DeepSeek-style MLA wants
+            # and what DSpark's own convention (whole row) does not do.
+            blk_kv = _rmsnorm_rope_batched(
+                blk_latent,
+                attn.kv_a_layernorm.weight,
+                attn.kv_a_layernorm.variance_epsilon,
+                self.qk_rope_head_dim,
+                blk_freqs,
+                norm_dim=latent_dim,
+            )
+            if use_kernel:
+                ctx_out = self._mla_paged_attention(
+                    query,
+                    blk_kv,
+                    ctx_kv_cache[layer_idx],
+                    fixup,
+                    block_size,
+                    capacity,
+                )
+            else:
+                if page_tables is None:
+                    ctx = ctx_k_cache[slots, layer_idx, :, 0, :]
+                else:
+                    # [pages, kv_factor=1, nkv=1, page, hd] -> gather this
+                    # batch's pages and flatten back to a per-request context.
+                    ctx = ctx_kv_cache[layer_idx][:, 0, 0][page_tables].reshape(batch, capacity, -1)
+                kv_full = torch.cat([ctx, blk_kv], dim=1)
+
+                scores = torch.einsum("bshc,btc->bsht", query, kv_full).float() * self.softmax_scale
+                scores = scores.masked_fill(~key_valid.view(batch, 1, 1, -1), float("-inf"))
+                probs = torch.softmax(scores, dim=-1).to(kv_full.dtype)
+                ctx_out = torch.einsum("bsht,btc->bshc", probs, kv_full[..., :latent_dim])
+            attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
+
+            hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
+            res_flat = residual.reshape(-1, residual.shape[-1])
+            hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+            hidden_out = layer.mlp(hidden_out)
+            hidden_states = hidden_out.reshape(batch, block_size, -1)
+            residual = res_flat.reshape(batch, block_size, -1)
+
+        hidden_states_out, _ = self.model.norm(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            residual.reshape(-1, residual.shape[-1]),
+        )
+        return hidden_states_out
+
+    # -- weights -----------------------------------------------------------
+
+    #: Only the head is shared. This drafter ships its own embed_tokens whose
+    #: values differ from the target's -- see load_weights_from_target_model --
+    #: so a checkpoint missing it must fail rather than run on random weights.
+    WEIGHTS_SHARED_WITH_TARGET = ("lm_head",)
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Take the DSpark heads, rename the TorchSpec spellings, then load.
+
+        The TorchSpec drafters name the capture projection ``context_proj`` /
+        ``context_norm`` and the final norm ``final_norm``, where the SpecForge
+        ones use ``fc`` / ``hidden_norm`` / ``norm``. Everything below that is
+        already HF-standard MLA.
+        """
+        weights, _ = self._take_dspark_head_weights(weights)
+        renames = {
+            "context_proj.weight": "fc.weight",
+            "context_norm.weight": "hidden_norm.weight",
+            "final_norm.weight": "norm.weight",
+        }
+        weights = {renames.get(k, k): v for k, v in weights.items()}
+        return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+
+    def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
+        """Share only ``lm_head``; the drafter has its own trained embedding.
+
+        Inferact/Kimi-K3-DSpark ships ``embed_tokens`` whose values differ from
+        the target's, so adopting the target's would feed the block decode
+        embeddings it was not distilled against -- silently, at some acceptance
+        cost. The GQA drafters ship no embedding and keep the base behavior.
+        """
+        self.draft_model_full.lm_head = target_model.lm_head
+        self.lm_head = target_model.lm_head
 
 
 def draft_is_embedded_in_target(model_config) -> bool:
@@ -2171,15 +3119,15 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             block_size=model_config.spec_config.block_size,
         )
 
-    # No per-model_type table here. ``DFlashForCausalLM.__init__`` already
-    # resolves the backbone from the drafter config through the model registry,
-    # so keying on model_type a second time would only duplicate that dispatch
-    # and force a new entry for every GQA family that already works. What the
-    # table really guarded was the block decode's GQA precondition, which is now
-    # checked where it belongs, in the DFlash base. An MLA-backboned drafter
-    # (e.g. Inferact/Kimi-K3-DSpark) fails that check with a clear message until
-    # ``MLADSparkForCausalLM`` lands as a sibling.
-    return GQADSparkForCausalLM(
+    # Dispatch on the attention shape, not on model_type: the block decode is
+    # what differs between the two wrappers, and everything below it
+    # (``DFlashForCausalLM.__init__``) already resolves the backbone through the
+    # model registry, so keying on model_type a second time would force a new
+    # entry for every GQA family that already works.
+    drafter_cls = (
+        MLADSparkForCausalLM if is_mla(draft_config.pretrained_config) else GQADSparkForCausalLM
+    )
+    return drafter_cls(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
     )
@@ -2192,6 +3140,13 @@ __all__ = [
     "DSv4DSparkForCausalLM",
     # Standalone flavour.
     "GQADSparkForCausalLM",
+    "MLADSparkForCausalLM",
+    # MLA drafter backbone (a weight container for the block decode).
+    "K3DsparkForCausalLM",
+    "K3DsparkModel",
+    "build_dspark_mla_yarn_rope",
+    "build_dspark_mla_yarn_freqs_cis",
+    "apply_dspark_mla_rope",
     "draft_is_embedded_in_target",
     "validate_dspark_eplb_layer_base",
     "validate_dspark_eplb_stage_layers",

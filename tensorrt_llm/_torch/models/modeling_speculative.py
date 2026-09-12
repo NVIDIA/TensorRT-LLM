@@ -1469,6 +1469,18 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
+        # Bounds the drafter's position tables. Without it the field stays
+        # None and they fall back to the checkpoint's advertised
+        # max_position_embeddings -- 1,048,576 for K3, a ~256 MiB complex64
+        # table per rank for a context the runtime bounds far below that.
+        #
+        # The user's value, NOT the engine's. py_executor_creator raises
+        # model_engine_max_seq_len past this and never writes it back, so a
+        # drafter that indexes absolute positions must read the raised value at
+        # runtime (DFlashDrafter publishes it as _runtime_position_ceiling)
+        # rather than have this line predict it -- reproducing that arithmetic
+        # here is what let the two drift apart in the first place.
+        max_seq_len=model_config.max_seq_len,
     )
     # Only the embedded DSpark draft shares the target's EPLB namespace (its
     # stages are target decoder blocks registered into the target's balancer).
