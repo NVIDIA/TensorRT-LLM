@@ -200,6 +200,23 @@ private:
     DynamicBitset mOccupiedMask;
 };
 
+//! Granularity a disk pool is sized in. Disk has no allocation unit to match,
+//! so this is just a rounding quantum.
+inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
+
+//! Unit a tier of the given size allocates and releases physical memory in,
+//! and therefore the quantum its pool sizes are rounded to.
+//!
+//! For GPU and host it scales with the tier: 2 MiB for small tiers, rising to
+//! 32 MiB, beyond which larger units measure no faster. A resize can give
+//! memory back only in whole units, so this trades that precision against the
+//! per-allocation cost.
+//!
+//! This is the policy. What a given StorageManager actually uses for a tier can
+//! differ -- see StorageManager::tierCommitUnit -- because every GPU level
+//! shares one allocator.
+[[nodiscard]] size_t tierAllocationGranularity(CacheTier tier, size_t quota);
+
 // ---------------------------------------------------------------------------
 // SlotPoolBase — abstract base for a single memory pool.
 // Mirrors _storage/_core.py::SlotPoolBase.
@@ -270,7 +287,10 @@ private:
 class HostSlotPool : public SlotPoolBase
 {
 public:
-    HostSlotPool(size_t slotSize, SlotCount numSlots);
+    //! vmSize is the address space reserved up front, and so the bound on every
+    //! later resize. Reserving it all at once is what keeps the base address
+    //! fixed, as it does for GpuSlotPool.
+    HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, size_t commitUnit);
 
     SlotCount numSlots() const noexcept override;
     void destroy() override;
@@ -279,12 +299,14 @@ public:
 
     size_t alignedSize(SlotCount numSlots) const noexcept;
 
-    [[nodiscard]] HostMem const* hostMem() const noexcept
-    {
-        return &mHostMem;
-    }
+    //! Blocks until `slot` is backed by physical memory.
+    //!
+    //! Rethrows the fill worker's exception if the fill failed.
+    void waitSlotUsable(SlotId slot) const;
 
 private:
+    //! Declared before mHostMem: alignedSize() reads it while building mHostMem.
+    size_t mCommitUnit;
     HostMem mHostMem;
 };
 
@@ -349,8 +371,8 @@ public:
         return mSlotAllocator;
     }
 
-    Slot allocate();
-    std::vector<Slot> allocateMultiple(SlotCount numSlots);
+    virtual Slot allocate();
+    virtual std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
     void destroy();
     void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
@@ -398,12 +420,31 @@ public:
         SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
 };
 
+//! Host pools are committed progressively on a background thread, so a slot may
+//! be handed out before its memory is backed. Both allocation entry points block
+//! until the slots they return are usable.
+//!
+//! The wait is cheap in the steady state: fresh slot ids ascend from zero and
+//! recycled slots are reused first, so the Nth fresh allocation waits only for
+//! the chunk containing it, and once the fill completes every wait is a single
+//! relaxed load.
 class HostPoolGroup : public PoolGroupBase
 {
 public:
-    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
+    //! groupVmSize is the address space each pool here may grow into.
+    //!
+    //! Pools are sized by slot-size ratio, so with more than one pool the group
+    //! can reserve more than groupVmSize in total. Host groups hold exactly one
+    //! pool today, which makes the two equal.
+    HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
+        size_t commitUnit = HostMem::kAlignment);
 
-    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
+    Slot allocate() override;
+    std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
+
+private:
+    //! Blocks until every pool backs the byte range ending just past `slot`.
+    void waitSlotUsable(SlotId slot) const;
 };
 
 class DiskPoolGroup : public PoolGroupBase
@@ -524,7 +565,16 @@ public:
 
     virtual size_t poolSizeGranularity() const noexcept
     {
-        return size_t{2} << 20;
+        return kDiskPoolSizeGranularity;
+    }
+
+    //! Largest quota this level may be resized to, when it has one.
+    //!
+    //! Unset means unbounded here: GPU and disk levels are limited by the
+    //! device and the filesystem rather than by a reservation made up front.
+    [[nodiscard]] virtual std::optional<size_t> maxQuota() const noexcept
+    {
+        return std::nullopt;
     }
 
     // Compute slot counts per pool group for a given ratio, min_slots, and optional quota.
@@ -575,8 +625,11 @@ private:
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
+    //! `commitUnit` is the granularity memory is allocated and released in; it
+    //! is also what pool sizes are quantized to.
     HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota = std::nullopt,
+        size_t commitUnit = HostMem::kAlignment);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -585,8 +638,19 @@ public:
 
     size_t poolSizeGranularity() const noexcept override
     {
-        return HostMem::kAlignment;
+        return mCommitUnit;
     }
+
+    //! Always set: an unset configured maxQuota resolves to the host memory the
+    //! OS reports, and the pools reserve against that resolved value.
+    [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
+    {
+        return mMaxQuota;
+    }
+
+private:
+    size_t mCommitUnit = HostMem::kAlignment;
+    size_t mMaxQuota = 0;
 };
 
 class DiskCacheLevelStorage : public CacheLevelStorage
@@ -610,8 +674,10 @@ private:
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
+//! `commitUnit` is the tier's allocation granularity, decided once from its
+//! quota and fixed for the tier's lifetime.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, size_t commitUnit = HostMem::kAlignment);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

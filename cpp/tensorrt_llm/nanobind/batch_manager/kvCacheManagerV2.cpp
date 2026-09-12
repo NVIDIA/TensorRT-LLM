@@ -1525,20 +1525,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(nb::init<size_t>(), nb::arg("quota"))
         .def_rw("quota", &kv::GpuCacheTierConfig::quota)
         .def_prop_ro("tier", &kv::GpuCacheTierConfig::tier)
-        .def("assert_valid", &kv::GpuCacheTierConfig::assertValid) DEF_COPY(kv::GpuCacheTierConfig);
+        .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t>(), nb::arg("quota"))
+        .def(nb::init<size_t, std::optional<size_t>>(), nb::arg("quota"), nb::arg("max_quota") = nb::none())
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
+        .def_rw("max_quota", &kv::HostCacheTierConfig::maxQuota)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
-        .def("assert_valid", &kv::HostCacheTierConfig::assertValid) DEF_COPY(kv::HostCacheTierConfig);
+        .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
         .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
-        .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
+        .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
         .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
