@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -151,6 +151,7 @@ class Attention(nn.Module):
         )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
+        self._metadata_state = attention_metadata_state
 
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
@@ -268,6 +269,9 @@ class Attention(nn.Module):
             use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
         )
+
+        # Checked post-wrap so this reflects self.attn as it's actually called.
+        self.supports_varlen = self.attn.supports_varlen()
 
     @staticmethod
     def _qualified_module_name(
@@ -541,7 +545,13 @@ class Attention(nn.Module):
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
         2. NHD backends (TRTLLM, UlyssesAttention, Attention2DAttention): [B, S, H*D] -> [B, S, H, D]
+
+        A third path (see ``_attn_impl_varlen_kv``) handles ragged K/V when the
+        caller passes ``cu_seqlens_kv``.
         """
+        if kwargs.get("cu_seqlens_kv") is not None:
+            return self._attn_impl_varlen_kv(q, k, v, **kwargs)
+
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
         batch_size = q.shape[0]
@@ -588,6 +598,91 @@ class Attention(nn.Module):
             return out.transpose(1, 2).flatten(2)
         else:
             return out.flatten(2)
+
+    @staticmethod
+    def _cu_seqlens_kv_and_max(
+        metadata_state: Optional[Dict[str, Any]],
+        kv_lens: Tuple[int, ...],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int]:
+        """Depends only on kv_lens (constant across layers/denoising steps),
+        not K/V content, so it's cached in the model-scoped metadata_state dict."""
+        cache_key = (kv_lens, device)
+        if metadata_state is not None:
+            cache = metadata_state.setdefault("varlen_kv_cache", {})
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        cu_list = [0]
+        for n in kv_lens:
+            cu_list.append(cu_list[-1] + n)
+        cu_seqlens_kv = torch.tensor(cu_list, dtype=torch.int32, device=device)
+        max_seqlen_kv = max(kv_lens)
+        result = (cu_seqlens_kv, max_seqlen_kv)
+
+        if metadata_state is not None:
+            cache[cache_key] = result
+        return result
+
+    @staticmethod
+    def pack_ragged_kv(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_lens: List[int],
+        metadata_state: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Slice each sample's true K/V rows out of padded [B, S, H*D] K/V
+        into [total_kv_tokens, H*D], plus cu_seqlens_kv/max_seqlen_kv for
+        _attn_impl_varlen_kv. kv_lens is a plain host-side list; a CUDA
+        tensor would force a sync on .tolist().
+        """
+        k_parts, v_parts = [], []
+        for i, n in enumerate(kv_lens):
+            k_parts.append(k[i, :n])
+            v_parts.append(v[i, :n])
+        k_ragged = torch.cat(k_parts, dim=0)
+        v_ragged = torch.cat(v_parts, dim=0)
+        cu_seqlens_kv, max_seqlen_kv = Attention._cu_seqlens_kv_and_max(
+            metadata_state, tuple(kv_lens), k.device
+        )
+        return k_ragged, v_ragged, cu_seqlens_kv, max_seqlen_kv
+
+    def _attn_impl_varlen_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Ragged K/V cross-attention: Q stays batched [B, S, H*D], K/V arrive
+        pre-packed as [total_kv_tokens, H_kv*D]."""
+        if not self.supports_varlen:
+            raise ValueError(
+                f"{type(self.attn).__name__} does not support varlen cross-attention "
+                "(cu_seqlens_kv); check `Attention.supports_varlen` before passing "
+                "ragged K/V, and fall back to the padded K/V path otherwise."
+            )
+
+        cu_seqlens_kv = kwargs.pop("cu_seqlens_kv")
+        max_seqlen_kv = kwargs.pop("max_seqlen_kv")
+
+        batch_size, seq_len_q = q.shape[0], q.shape[1]
+
+        q = q.reshape(batch_size, seq_len_q, self.local_num_attention_heads, self.head_dim)
+        k = k.reshape(-1, self.local_num_key_value_heads, self.head_dim)
+        v = v.reshape(-1, self.local_num_key_value_heads, self.head_dim)
+
+        kwargs.update(
+            {
+                "batch_size": batch_size,
+                "seq_len": seq_len_q,
+                "cu_seqlens_kv": cu_seqlens_kv,
+                "max_seqlen_kv": max_seqlen_kv,
+            }
+        )
+        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
+        return out.reshape(batch_size, seq_len_q, -1)
 
     def forward(
         self,

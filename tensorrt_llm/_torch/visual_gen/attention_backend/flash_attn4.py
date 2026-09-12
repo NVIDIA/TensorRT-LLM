@@ -141,13 +141,25 @@ class FlashAttn4Attention(AttentionBackend):
         v: torch.Tensor,
         causal: bool,
         seqused_k: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_k: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
+        """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse).
+
+        cu_seqlens_q/cu_seqlens_k switch the kernel into ragged mode: q/k/v are
+        then expected pre-packed as [total_tokens, H, D] instead of [B, S, H, D].
+        """
         # FA4's private forward API may append diagnostics that this backend does not consume.
         output, lse, *_ = _flash_attn_fwd(
             q,
             k,
             v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             seqused_k=seqused_k,
             softmax_scale=self.scale,
             causal=causal,
@@ -230,18 +242,47 @@ class FlashAttn4Attention(AttentionBackend):
         v: torch.Tensor,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_kv: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass returning both output and log-sum-exp (LSE).
 
         Returns:
-            output: [batch_size, seq_len, num_heads, head_dim]
-            lse:    [batch_size, num_heads, seq_len] — log-sum-exp per query position,
-                    always in float32. Used for numerically stable combination of
-                    partial attention results in Attention2D parallelism.
+            output: [batch_size, seq_len, num_heads, head_dim] if cu_seqlens_q is
+                unset, else [total_q_tokens, num_heads, head_dim].
+            lse:    [batch_size, num_heads, seq_len] if cu_seqlens_q is unset, else
+                [num_heads, total_q_tokens]. Callers combining LSE across ranks
+                need to handle both shapes.
         """
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
+
+        if cu_seqlens_kv is not None:
+            assert key_padding_mask is None, (
+                "cu_seqlens_kv (ragged varlen) and key_padding_mask (padded+mask) "
+                "are mutually exclusive attention modes"
+            )
+            assert max_seqlen_kv is not None, "cu_seqlens_kv requires max_seqlen_kv"
+            assert cu_seqlens_q is None or max_seqlen_q is not None, (
+                "cu_seqlens_q requires max_seqlen_q"
+            )
+            output, lse = self._fwd(
+                q,
+                k,
+                v,
+                is_causal,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_kv,
+            )
+            if output.dtype != origin_dtype:
+                output = output.to(origin_dtype)
+            return output, lse
+
         seqused_k = None
         if key_padding_mask is not None:
             assert not is_causal, "key_padding_mask is not supported with causal attention"
@@ -259,6 +300,10 @@ class FlashAttn4Attention(AttentionBackend):
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
         return output, lse
+
+    @classmethod
+    def supports_varlen(cls) -> bool:
+        return True
 
     @classmethod
     def support_lse(cls) -> bool:

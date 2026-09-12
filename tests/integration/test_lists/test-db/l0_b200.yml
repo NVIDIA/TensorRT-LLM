@@ -281,6 +281,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_cudnn.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
+  - unittest/_torch/visual_gen/test_varlen_attention.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py

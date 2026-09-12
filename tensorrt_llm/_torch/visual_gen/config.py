@@ -747,7 +747,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         attention_metadata_state = (
             create_attention_metadata_state()
-            if attention_cfg.backend in ("TRTLLM", "FLASHINFER")
+            if attention_cfg.backend in ("TRTLLM", "FLASHINFER", "FA4")
             else None
         )
 
