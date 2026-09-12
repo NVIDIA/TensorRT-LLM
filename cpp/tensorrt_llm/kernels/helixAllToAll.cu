@@ -294,6 +294,22 @@ __host__ __device__ __forceinline__ int computeProtoTransferSize(HelixFieldInfo 
 // Main All-to-All Kernel
 // ============================================================================
 
+//! Exchange one entry per peer rank over the MNNVL FIFOs, both directions in one
+//! launch.
+//!
+//! blockIdx.z picks the role: a block is either a sender or a receiver for one
+//! (peer, channel) pair. The sender stages an entry's fields into shared memory
+//! with TMA, packs them with LL128Proto and pushes the result into the peer's
+//! FIFO; the receiver pops, unpacks and writes out. Both walk their channel's
+//! entries strided by the channel count, entryIdx = channel, channel +
+//! runChannelCount, ...
+//!
+//! params.zeroKvMask, when non-null, marks entries this rank owns no KV for.
+//! They are rewritten in shared memory before packing -- see the sanitization
+//! block below -- which is why it costs no extra global traffic.
+//!
+//! \tparam ALLOW_VARIABLE_FIELD1 field 1 carries more than one (max, sum) pair
+//!         per entry, i.e. the fifo v1 layout where an entry is (token, head).
 template <bool ALLOW_VARIABLE_FIELD1>
 __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 {
@@ -397,6 +413,33 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             waitG2sAllFields(&allWarpSmemBar[group], &phaseParity);
             // note: we don't need to pack anything, fields are already packed in
             // shared memory
+
+            // Zero-local-KV sanitization: the entry is in shared memory and
+            // not yet packed, so overwriting it costs no global traffic.
+            if (params.zeroKvMask != nullptr && params.zeroKvMask[entryIdx / params.zeroKvMaskDivisor] != 0)
+            {
+                // field0Size is a multiple of 16 (the op checks it), so the
+                // int4 store never runs off the end of the field.
+                int const field0Size = getFieldSize(params.sendFields[0]);
+                for (int off = laneId * static_cast<int>(sizeof(int4)); off < field0Size;
+                     off += WARP_SIZE * static_cast<int>(sizeof(int4)))
+                {
+                    *reinterpret_cast<int4*>(shmem + off) = make_int4(0, 0, 0, 0);
+                }
+                if (laneId == 0)
+                {
+                    // Field 1 sits at getFieldSize(field 0), not at
+                    // align_up(..., 16) as computeTotalUnpackedSize computes;
+                    // they agree only because field 0 is 16-byte aligned.
+                    auto* stats = reinterpret_cast<float2*>(shmem + field0Size);
+                    int const statsCount = getFieldSize(params.sendFields[1]) / static_cast<int>(sizeof(float2));
+                    for (int i = 0; i < statsCount; ++i)
+                    {
+                        stats[i] = make_float2(-INFINITY, 0.F);
+                    }
+                }
+                __syncwarp();
+            }
 
             LL128Proto::protoPack(shmem, head, singlePacked128ByteCount, fifoEntry128ByteIndexBase, laneId);
 
