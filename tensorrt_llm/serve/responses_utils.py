@@ -11,13 +11,15 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
-from typing import Any, List, Literal, Optional, OrderedDict, Tuple, Union
+from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
+                    Union)
 
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
                                     ResponseCreatedEvent,
-                                    ResponseCustomToolCall,
+                                    ResponseCustomToolCall, ResponseErrorEvent,
+                                    ResponseFailedEvent,
                                     ResponseFunctionToolCall,
                                     ResponseInProgressEvent, ResponseOutputItem,
                                     ResponseOutputItemAddedEvent,
@@ -45,7 +47,8 @@ from transformers import AutoProcessor, PretrainedConfig
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.executor import GenerationResult
+from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
+                                   RequestError)
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
@@ -2844,6 +2847,216 @@ class ResponsesStreamingProcessor:
             raise RuntimeError("Failed to generate streaming events")
 
         return [self._send_event(event) for event in event_generator]
+
+    def get_stream_failed_events(self,
+                                 cause: str,
+                                 detail: str,
+                                 events_sent: int = 0) -> List[str]:
+        """The terminal events for a stream that stopped before completing.
+
+        Carries no generated content. The accumulated text lives only in the
+        deltas already on the wire and re-emitting it here would guess at
+        whether those deltas reached anyone; this says what happened, nothing
+        more.
+
+        ``events_sent`` is the number of frames that actually reached the
+        wire. Normally it equals this processor's own counter, because this
+        processor numbered every one of them. With postprocessing workers it
+        does not: the per-token events are built by a pickled copy of this
+        object in another process and only the opening two are numbered here,
+        so the local counter is short by the whole body of the turn. Taking
+        the larger of the two keeps the terminal events after everything the
+        client has already seen either way.
+        """
+        self.sequence_number = max(self.sequence_number, events_sent)
+        error_event = self._send_event(
+            ResponseErrorEvent(
+                type="error",
+                sequence_number=-1,
+                code=cause,
+                message=detail,
+                param=None,
+            ))
+        snapshot = ResponsesResponse.from_request(
+            request=self.request,
+            sampling_params=self.sampling_params,
+            model_name=self.model_name,
+            created_time=self.response_creation_time,
+            output=[],
+            status="failed",
+            usage=None,
+        ).model_dump()
+        # Set on the dump rather than on ResponsesResponse, whose `error` field
+        # is commented out. The event re-validates this dict against the SDK's
+        # Response, which does carry `error`, so the field reaches the wire
+        # without widening the local model - and without adding a key to the
+        # happy path's response.completed payload.
+        snapshot["error"] = {"code": "server_error", "message": detail}
+        failed_event = self._send_event(
+            ResponseFailedEvent(
+                type="response.failed",
+                sequence_number=-1,
+                response=snapshot,
+            ))
+        return [error_event, failed_event]
+
+
+# --------------------------------------------------------------------------
+# Abnormal stream termination
+# --------------------------------------------------------------------------
+
+# Why a stream stopped before `response.completed`. Recorded in the terminal
+# `error` event's `code` and passed to the guard's `on_termination` callback.
+# Telling a server-side fault apart from a client hangup is what decides
+# whether the accumulated text still existed in this process when the stream
+# died.
+STREAM_TERMINATION_CLIENT_DISCONNECT = "client_disconnect"
+STREAM_TERMINATION_ENGINE_ERROR = "engine_error"
+STREAM_TERMINATION_UPSTREAM_ERROR = "upstream_error"
+STREAM_TERMINATION_INTERNAL_ERROR = "internal_error"
+
+# The terminal event of a stream that ran to completion. Matched as a substring
+# because a relayed stream arrives as transport-sized chunks that may carry
+# several events, not as one frame per event. Kept in both encodings so the
+# scan never has to decode a relayed chunk just to look at it.
+_COMPLETED_EVENT_MARKER = "event: response.completed"
+_COMPLETED_EVENT_MARKER_BYTES = _COMPLETED_EVENT_MARKER.encode("utf-8")
+
+_SSE_EVENT_DELIMITER = "\n\n"
+_SSE_EVENT_DELIMITER_BYTES = _SSE_EVENT_DELIMITER.encode("utf-8")
+
+
+def classify_stream_termination(exc: BaseException) -> str:
+    """Attribute a stream-ending exception to a cause.
+
+    The distinction that matters is server-side fault vs client hangup. A
+    cancelled or closed generator means the consumer went away: on the
+    aggregated server that is the HTTP client, on the orchestrator it is the
+    client of the orchestrator. Everything else happened on this side of the
+    socket, and is split further only as far as the exception type can be
+    trusted to say - an engine error means generation itself failed, an
+    upstream transport error means the response this process was relaying was
+    cut, and anything else is a fault in this process's own code, where the
+    accumulated text was still in memory when the stream died.
+    """
+    if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+        return STREAM_TERMINATION_CLIENT_DISCONNECT
+    if isinstance(exc, (RequestError, EngineDeadError)):
+        return STREAM_TERMINATION_ENGINE_ERROR
+    # By module rather than by class: the HTTP client library is an
+    # implementation detail of the relay and importing it here would pull a
+    # transport dependency into the protocol layer.
+    if type(exc).__module__.split(".")[0] in ("aiohttp", "httpx", "httpcore"):
+        return STREAM_TERMINATION_UPSTREAM_ERROR
+    return STREAM_TERMINATION_INTERNAL_ERROR
+
+
+def describe_stream_termination(exc: BaseException) -> str:
+    text = str(exc)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def stream_error_event(cause: str, detail: str,
+                       events_sent: int) -> List[bytes]:
+    """A bare ``error`` event for a relay that cannot build a snapshot.
+
+    ``response.failed`` carries a whole ``Response``, which the disaggregated
+    orchestrator cannot assemble - it forwards bytes and never holds the
+    sampling parameters the snapshot is built from. ``error`` is flat, so it
+    needs only the number of events already forwarded to keep the sequence
+    contiguous. Bytes, because the relay it terminates is a byte stream.
+    """
+    event = ResponseErrorEvent(
+        type="error",
+        sequence_number=events_sent,
+        code=cause,
+        message=detail,
+        param=None,
+    )
+    return [(f"event: error\n"
+             f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")]
+
+
+def _count_frames(chunk: Any, carry: Any) -> Tuple[int, Any]:
+    """Count completed SSE events in ``chunk``, tolerating split delimiters.
+
+    The carry is the chunk's last byte/character: a transport read can land
+    between the two newlines that end an event, and without it that event is
+    never counted and every sequence number after it is one short.
+    """
+    if isinstance(chunk, bytes):
+        text = (carry or b"") + chunk
+        return text.count(_SSE_EVENT_DELIMITER_BYTES), text[-1:]
+    text = (carry or "") + chunk
+    return text.count(_SSE_EVENT_DELIMITER), text[-1:]
+
+
+async def guard_responses_stream(
+    stream: AsyncGenerator[Any, None],
+    terminal_events: Callable[[str, str, int], List[Any]],
+    on_termination: Optional[Callable[[str, str], None]] = None,
+) -> AsyncGenerator[Any, None]:
+    """Make a Responses stream say so when it stops before completing.
+
+    Without this such a stream simply ends: the generator raises, the ASGI
+    server abandons a half-written chunked body, and nothing in the bytes
+    distinguishes that from a stream still in flight. Everything the turn
+    produced survives only as deltas, because ``response.completed`` is the one
+    event that repeats the full text.
+
+    Frames are forwarded untouched and nothing is added once
+    ``response.completed`` has gone out, so a stream that completes normally is
+    byte-for-byte what it was.
+
+    The two abnormal endings are handled differently on purpose:
+
+    * A **fault on this side** yields the terminal events and then re-raises,
+      so the client gets bytes that explain the truncation and the server
+      still records an error rather than a clean finish.
+    * A **client hangup** yields nothing. There is nobody left to send to, and
+      a generator that yields while ``GeneratorExit`` is propagating raises
+      ``RuntimeError: async generator ignored GeneratorExit`` - trading a
+      diagnosable truncation for an undiagnosable one. The cause is still
+      reported through ``on_termination`` when a caller supplies one.
+    """
+    events_sent = 0
+    carry = None
+    completed = False
+    try:
+        async for chunk in stream:
+            if not completed:
+                frames, carry = _count_frames(chunk, carry)
+                events_sent += frames
+                completed = (_COMPLETED_EVENT_MARKER_BYTES in chunk
+                             if isinstance(chunk, bytes) else
+                             _COMPLETED_EVENT_MARKER in chunk)
+            yield chunk
+    except (asyncio.CancelledError, GeneratorExit) as exc:
+        if on_termination is not None:
+            on_termination(STREAM_TERMINATION_CLIENT_DISCONNECT,
+                           describe_stream_termination(exc))
+        raise
+    except Exception as exc:
+        cause = classify_stream_termination(exc)
+        detail = describe_stream_termination(exc)
+        if on_termination is not None:
+            on_termination(cause, detail)
+        if not completed:
+            logger.error("Responses stream terminated before completion "
+                         f"({cause}): {detail}")
+            # Built before yielding, and inside its own guard: this runs only
+            # when something has already gone wrong, and a failure here would
+            # replace the exception the caller needs to see with one about
+            # reporting it.
+            try:
+                frames = terminal_events(cause, detail, events_sent)
+            except Exception as report_error:  # noqa: BLE001
+                logger.error(
+                    f"Failed to build the terminal event: {report_error}")
+                frames = []
+            for frame in frames:
+                yield frame
+        raise
 
 
 async def process_streaming_events(

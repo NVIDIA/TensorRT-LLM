@@ -123,6 +123,7 @@ from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
+from tensorrt_llm.serve.responses_utils import guard_responses_stream
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -3281,8 +3282,13 @@ class OpenAIServer(_VideoRoutesMixin):
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             if request.stream:
-                return StreamingResponse(content=create_streaming_generator(
-                    promise, postproc_params),
+                # Ends a stream that stops before `response.completed` with
+                # an `error` event and a `response.failed` snapshot, so the
+                # client can tell a truncated turn from one still in flight.
+                return StreamingResponse(content=guard_responses_stream(
+                    create_streaming_generator(promise, postproc_params),
+                    streaming_processor.get_stream_failed_events,
+                ),
                                          media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)

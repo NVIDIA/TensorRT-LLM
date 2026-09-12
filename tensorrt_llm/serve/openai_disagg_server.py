@@ -68,7 +68,9 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds)
+                                                get_steady_clock_now_in_seconds,
+                                                guard_responses_stream,
+                                                stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -443,8 +445,26 @@ class OpenAIDisaggServer:
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
+                    stream = response_or_generator
+                    if isinstance(req, ResponsesRequest):
+                        # Only the Responses protocol: a stream that stops
+                        # before response.completed loses everything it
+                        # produced, because that event is the only place the
+                        # full text is repeated. The other protocols carry
+                        # their content entirely in deltas and end on a
+                        # sentinel, so a truncation there is already visible.
+                        #
+                        # A bare `error` event rather than the worker's
+                        # `response.failed`: this is a byte relay with no view
+                        # of the response being assembled. It does count the
+                        # events it forwarded, so the sequence number is exact
+                        # -- and it is zero for the failures that never
+                        # reached a worker at all, which otherwise end with
+                        # an entirely empty body.
+                        stream = guard_responses_stream(stream,
+                                                        stream_error_event)
                     return StreamingResponse(
-                        content=response_or_generator,
+                        content=stream,
                         media_type="text/event-stream")
                 return JSONResponse(content=response_or_generator.model_dump())
             except Exception as e:
