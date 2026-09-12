@@ -43,6 +43,50 @@ MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
+def _run_nccl_nvfp4_auxiliary_device_case(auxiliary: str, other_device: str,
+                                          dtype: torch.dtype,
+                                          fusion_op: AllReduceFusionOp) -> bool:
+    torch.cuda.set_device(0)
+    x = torch.full((8, 128), 0.25, dtype=dtype, device="cuda")
+    inputs = {
+        "residual": torch.full_like(x, 0.125),
+        "norm_weight": torch.ones(128, dtype=dtype, device=x.device),
+        "scale": torch.ones(1, dtype=torch.float32, device=x.device),
+    }
+    inputs[auxiliary] = inputs[auxiliary].to(other_device)
+    with pytest.raises(RuntimeError,
+                       match=f"{auxiliary} must be on the input device"):
+        torch.ops.tensorrt_llm.allreduce(x, inputs["residual"],
+                                         inputs["norm_weight"], inputs["scale"],
+                                         None, None, [tensorrt_llm.mpi_rank()],
+                                         AllReduceStrategy.NCCL, fusion_op,
+                                         1e-6, False)
+    # A device error must be reported before launching either local tail and
+    # leave the CUDA context usable for subsequent work.
+    torch.testing.assert_close(x + 1, torch.full_like(x, 1.25))
+    torch.cuda.synchronize()
+    return True
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [1], indirect=True)
+@pytest.mark.parametrize("auxiliary", ["residual", "norm_weight", "scale"])
+@pytest.mark.parametrize("other_device", ["cpu", "cuda:1"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fusion_op", [
+    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+    AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+])
+def test_nccl_nvfp4_auxiliary_device(mpi_pool_executor, auxiliary: str,
+                                     other_device: str, dtype: torch.dtype,
+                                     fusion_op: AllReduceFusionOp) -> None:
+    if other_device == "cuda:1" and torch.cuda.device_count() < 2:
+        pytest.skip("A second GPU is needed for the cross-GPU device check")
+    result = mpi_pool_executor.submit(_run_nccl_nvfp4_auxiliary_device_case,
+                                      auxiliary, other_device, dtype,
+                                      fusion_op).result()
+    assert result
+
+
 def fp8_quant(input, scale):
     finfo = torch.finfo(torch.float8_e4m3fn)
     inv_scale = scale.reciprocal()
