@@ -397,7 +397,7 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::
     // zero FP4 output. Both datacenter Blackwell (SM 10.x) and client Blackwell
     // (SM 12.x) provide the conversion operations used by the helper.
     int const sm = tensorrt_llm::common::getSMVersion();
-    TLLM_CHECK_WITH_INFO((sm >= 100 && sm < 110) || (sm >= 120 && sm < 130),
+    TLLM_CHECK_WITH_INFO(isRmsNormFp4QuantSupportedSm(sm),
         "residualRmsNormFp4Quant requires SM 10.x or SM 12.x (Blackwell); got SM %d. The fused NVFP4 epilogue is "
         "unsupported on this arch.",
         sm);
