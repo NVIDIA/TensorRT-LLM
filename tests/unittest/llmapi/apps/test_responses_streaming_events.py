@@ -134,9 +134,16 @@ def test_done_events_carry_the_open_item_id():
 
 
 class _FakeOutput:
-    """The three attributes _generate_streaming_event reads from an output."""
+    """The attributes the streaming path reads from a generation output.
 
-    def __init__(self, text_diff, index=0):
+    `text` is the whole generation so far and `text_diff` only the newest
+    chunk: the delta path parses the diff, while the done-event path re-parses
+    the accumulated text. Supplying only the diff makes the second one raise,
+    which is how the first version of this fake was wrong.
+    """
+
+    def __init__(self, text, text_diff, index=0):
+        self.text = text
         self.text_diff = text_diff
         self.index = index
 
@@ -153,9 +160,11 @@ def _stream(chunks):
     helper = ResponsesStreamingEventsHelper()
     parsers = {}
     reasoning, text = [], []
+    accumulated = ""
     for i, chunk in enumerate(chunks):
+        accumulated += chunk
         events = _generate_streaming_event(
-            output=_FakeOutput(chunk),
+            output=_FakeOutput(accumulated, chunk),
             request=_FakeRequest(),
             finished_generation=(i == len(chunks) - 1),
             streaming_events_helper=helper,
