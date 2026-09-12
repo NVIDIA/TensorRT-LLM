@@ -535,7 +535,16 @@ struct Compute
                 {
                     using Mma_tile = typename Traits_p::template Mma_tile<Cta_tile_o>;
                     fmha::Softmax_saver_tma<Cta_tile_o, Mma_tile> saver(params, head_info);
-                    saver.store(p_sum, p_max, sqrtf(params.d), q_step_idx * STEP_Q, valid_run);
+                    // p_max holds the raw BMM1 max, so export it with the same
+                    // scale the softmax used. scale_bmm1_ carries an extra
+                    // log2(e) when the base-2 exponent trick is on.
+                    float softmax_scale = reinterpret_cast<float const&>(softmax.scale_bmm1_);
+                    if constexpr (Kernel_traits::EXP2F_OPTIMIZATION)
+                    {
+                        constexpr float kLn2 = 0.693147180559945309417f; // 1 / log2(e)
+                        softmax_scale *= kLn2;
+                    }
+                    saver.store(p_sum, p_max, softmax_scale, q_step_idx * STEP_Q, valid_run);
                 }
             }
         }

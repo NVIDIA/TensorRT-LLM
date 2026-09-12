@@ -386,11 +386,164 @@ accuracy_dict = {
 }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("q_scaling", [1.0, 0.7713206],
+                         ids=lambda v: f"q_scaling={v}")
+def test_mla_context_softmax_stats_units(q_scaling):
+    """The context FMHA must export the softmax max and sum in the same units.
+
+    MLA chunked prefill merges chunks with exp(max_i - max) and the companion
+    sum, so a max that is off by a constant factor silently corrupts the merge.
+    The softmax scale is 1/(sqrt(head_dim) * q_scaling), so exporting the max
+    rescaled by 1/sqrt(head_dim) alone only shows up when q_scaling != 1 (YaRN
+    mscale, e.g. DeepSeek-V3 style MLA) -- hence the parametrization.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_heads = 8
+    qk_nope_head_dim, qk_rope_head_dim, v_head_dim = 128, 64, 128
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    kv_lora_rank = 512
+    context_sequence_lengths = [131]
+    kv_tokens_per_block = 32
+
+    AttentionCls = get_attention_backend("TRTLLM")
+    rope_config = RopeConfig(
+        hidden_size=num_heads * v_head_dim,
+        num_attention_heads=num_heads,
+        rope_scaling={
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 4.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn",
+        },
+        max_position_embeddings=8192,
+        rope_theta=10000.0,
+        qk_rope_head_dim=qk_rope_head_dim,
+        model_type="deepseek_v3",
+    )
+    attn = AttentionCls(
+        layer_idx=0,
+        num_heads=num_heads,
+        head_dim=qk_head_dim,
+        num_kv_heads=num_heads,
+        quant_config=None,
+        q_scaling=q_scaling,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams.from_config(rope_config),
+            is_neox=False,
+        ),
+        mla_params=MLAParams(
+            q_lora_rank=1536,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            qk_nope_head_dim=qk_nope_head_dim,
+            v_head_dim=v_head_dim,
+            predicted_tokens_per_seq=1,
+        ),
+    )
+
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    total_tokens = sum(context_sequence_lengths)
+    kv_cache_manager = KVCacheManager(
+        KvCacheConfig(max_tokens=1024, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=kv_lora_rank + qk_rope_head_dim,
+        tokens_per_block=kv_tokens_per_block,
+        max_seq_len=max(context_sequence_lengths),
+        max_batch_size=len(context_sequence_lengths),
+        mapping=mapping,
+        dtype=str_dtype_to_binding(torch_dtype_to_str(dtype)),
+    )
+    try:
+        for req_id, ctx_len in enumerate(context_sequence_lengths):
+            req = LlmRequest(
+                request_id=req_id,
+                max_new_tokens=1,
+                input_tokens=[1] * ctx_len,
+                sampling_config=SamplingConfig(
+                    SamplingParams()._get_sampling_config()),
+                is_streaming=False,
+            )
+            req.paged_kv_block_ids = []
+            kv_cache_manager.impl.add_sequence_batch([(req_id, ctx_len, 1)],
+                                                     [req])
+
+        attn_metadata = AttentionCls.Metadata(
+            seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
+            request_ids=list(range(len(context_sequence_lengths))),
+            max_num_requests=len(context_sequence_lengths),
+            num_contexts=len(context_sequence_lengths),
+            prompt_lens=context_sequence_lengths,
+            max_num_tokens=total_tokens,
+            kv_cache_manager=kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0 for _ in context_sequence_lengths],
+            ),
+            mapping=mapping,
+        )
+        attn_metadata.prepare()
+
+        torch.manual_seed(0)
+        q = torch.empty([total_tokens, num_heads * qk_head_dim],
+                        dtype=dtype,
+                        device=device).uniform_(-1, 1)
+        k = torch.empty([total_tokens, num_heads * qk_head_dim],
+                        dtype=dtype,
+                        device=device).uniform_(-1, 1)
+        v = torch.empty([total_tokens, num_heads * v_head_dim],
+                        dtype=dtype,
+                        device=device).uniform_(-1, 1)
+        stats = torch.zeros([total_tokens, num_heads, 2],
+                            dtype=torch.float,
+                            device=device)
+
+        # latent_cache=None keeps the op from applying RoPE and writing the KV
+        # cache, so the kernel attends over exactly the q/k handed in here.
+        attn.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            softmax_stats_tensor=stats,
+        )
+
+        # Reference: causal softmax statistics over the same inputs.
+        softmax_scale = 1.0 / (math.sqrt(qk_head_dim) * q_scaling)
+        qh = q.view(total_tokens, num_heads, qk_head_dim).float()
+        kh = k.view(total_tokens, num_heads, qk_head_dim).float()
+        logits = torch.einsum("qhd,khd->hqk", qh, kh) * softmax_scale
+        causal = torch.ones(total_tokens,
+                            total_tokens,
+                            dtype=torch.bool,
+                            device=device).tril()
+        logits = logits.masked_fill(~causal, float("-inf"))
+        ref_max = logits.max(dim=-1).values.transpose(0, 1)  # [tokens, heads]
+        ref_sum = (logits -
+                   ref_max.transpose(0, 1)[..., None]).exp().sum(-1).transpose(
+                       0, 1)
+
+        got_max, got_sum = stats[..., 0], stats[..., 1]
+        torch.testing.assert_close(got_max, ref_max, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(got_sum, ref_sum, rtol=2e-2, atol=2e-2)
+    finally:
+        kv_cache_manager.shutdown()
+
+
 @pytest.mark.parametrize(
     "sm_version,expected_path",
     [
-        (90, "cached_kv"),
-        (99, "cached_kv"),
+        (90, "chunked_prefill"),
+        (99, "chunked_prefill"),
         (100, "chunked_prefill"),
     ],
 )
