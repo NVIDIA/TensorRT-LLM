@@ -690,8 +690,13 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         if model_config is not None and self.layer_idx_str is not None:
             if "moe_layers" not in model_config.extra_attrs:
                 model_config.extra_attrs["moe_layers"] = {}
-            assert self.layer_idx_str not in model_config.extra_attrs["moe_layers"], \
-                f"Duplicate MoE layer for layer_idx={self.layer_idx_str}"
+            suffix = 0
+            # ``layer_idx`` is local to a model stack, while one-model
+            # speculative decoding shares this registry across target and
+            # draft modules. Preserve every module under a stable unique key.
+            while self.layer_idx_str in model_config.extra_attrs["moe_layers"]:
+                self.layer_idx_str = str(self.layer_idx) + f"_{suffix}"
+                suffix += 1
             model_config.extra_attrs["moe_layers"][
                 self.layer_idx_str] = weakref.ref(self)
             self.register_to_config = True

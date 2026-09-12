@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import copy
 import inspect
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
@@ -11,6 +12,7 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...functional import PositionEmbeddingType
 from ..attention.attention import Attention
@@ -1192,6 +1194,9 @@ class PARDForCausalLM(nn.Module):
         draft_config_no_spec = replace(draft_config,
                                        spec_config=None,
                                        lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -1445,6 +1450,75 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
+def _get_requested_draft_moe_backend(model_config: ModelConfig,
+                                     spec_config: object) -> str:
+    """Return the draft MoE backend request, preserving target inheritance."""
+    requested_backend = getattr(spec_config, "moe_backend", None)
+    return (model_config.moe_backend
+            if requested_backend is None else requested_backend)
+
+
+def _copy_model_config_with_moe_backend(
+        model_config: ModelConfig,
+        requested_moe_backend: str,
+        quant_config: Optional[QuantConfig] = None) -> ModelConfig:
+    """Copy a ModelConfig and resolve its MoE backend against its own weights."""
+    architectures = getattr(model_config.pretrained_config, "architectures",
+                            None) or []
+    architecture = architectures[0] if architectures else ""
+    resolved_moe_backend = ModelConfig.resolve_moe_backend(
+        requested_moe_backend,
+        architecture,
+        quant_config=(model_config.quant_config
+                      if quant_config is None else quant_config))
+    draft_config = copy.copy(model_config)
+    # ModelConfig is frozen after loading. Temporarily thaw only the isolated
+    # draft copy so the target config remains unchanged.
+    was_frozen = draft_config._frozen
+    draft_config._frozen = False
+    try:
+        draft_config.moe_backend = resolved_moe_backend
+    finally:
+        draft_config._frozen = was_frozen
+    return draft_config
+
+
+def _get_mtp_moe_quant_config(model_config: ModelConfig,
+                              layer_idx: int) -> QuantConfig:
+    """Return the routed-expert quant config for an embedded MTP layer.
+
+    The first constructed MTP layer represents all MTP layers when resolving
+    AUTO because they share one backend setting.
+    """
+    layer_quant_configs = model_config.quant_config_dict or {}
+    prefixes = [f"model.layers.{layer_idx}."]
+    num_hidden_layers = getattr(model_config.pretrained_config,
+                                "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+        prefixes.append(f"mtp.layers.{layer_idx - num_hidden_layers}.")
+
+    for prefix in prefixes:
+        quant_config = layer_quant_configs.get(f"{prefix}mlp.experts")
+        if quant_config is not None:
+            return quant_config
+    for prefix in prefixes:
+        for name, quant_config in layer_quant_configs.items():
+            if name.startswith(prefix) and ".experts" in name:
+                return quant_config
+    return model_config.quant_config
+
+
+def _enable_trtllm_moe_preload_for_draft(model: nn.Module,
+                                         moe_backend: str) -> None:
+    """Preserve TRTLLM-Gen's serial weight-loading order for draft-only use."""
+    preload_weight_modules = getattr(model, "preload_weight_modules", None)
+    if moe_backend != "TRTLLM" or preload_weight_modules is None:
+        return
+    for module_name in ("experts", "routing_method", "all_reduce"):
+        if module_name not in preload_weight_modules:
+            preload_weight_modules.append(module_name)
+
+
 def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     """`ModelConfig.from_pretrained` kwargs for a one-model external drafter.
 
@@ -1464,7 +1538,7 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     kwargs = dict(
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        moe_backend=model_config.moe_backend,
+        moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
         mapping=model_config.mapping,
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
@@ -1501,7 +1575,26 @@ def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
 @register_draft_model(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
 def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
     """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
-    return MTPForCausalLM(model_config,
+    mtp_model_config = model_config
+    requested_moe_backend = getattr(model_config.spec_config, "moe_backend",
+                                    None)
+    if requested_moe_backend is not None:
+        start_layer_idx = model_config.pretrained_config.num_hidden_layers
+        mtp_model_config = _copy_model_config_with_moe_backend(
+            model_config,
+            requested_moe_backend,
+            quant_config=_get_mtp_moe_quant_config(model_config,
+                                                   start_layer_idx))
+        model_type = model_config.pretrained_config.model_type
+        if (model_type in {"nemotron_h", "nemotron_h_puzzle"}
+                and mtp_model_config.moe_backend != model_config.moe_backend):
+            raise ValueError(
+                "Nemotron-H embedded MTP layers cannot use a different MoE "
+                "backend from the target model because their checkpoint "
+                "weight mapper uses one shared backend-dependent layout.")
+        _enable_trtllm_moe_preload_for_draft(model,
+                                             mtp_model_config.moe_backend)
+    return MTPForCausalLM(mtp_model_config,
                           model_config.pretrained_config.num_hidden_layers,
                           lm_head, model)
 
@@ -1604,6 +1697,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
+                requested_draft_moe_backend = _get_requested_draft_moe_backend(
+                    model_config, spec_config)
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
@@ -1611,18 +1706,28 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
                             mapping=model_config.mapping,
-                            moe_backend=model_config.moe_backend,
+                            moe_backend=requested_draft_moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_load_balancer=model_config.moe_load_balancer,
                             skip_create_weights_in_init=True,
                         )
+                        if getattr(spec_config, "moe_backend",
+                                   None) is not None:
+                            # Unlike ModelConfig.from_pretrained, the Mistral
+                            # loader does not resolve AUTO after loading quant
+                            # metadata. Resolve it against the draft config now,
+                            # before constructing any draft modules.
+                            self.draft_config = \
+                                _copy_model_config_with_moe_backend(
+                                    self.draft_config,
+                                    requested_draft_moe_backend)
                     elif spec_config.eagle3_model_arch == "llama3":
                         self.draft_config = ModelConfig.from_pretrained(
                             model_config.spec_config.speculative_model,
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
-                            moe_backend=model_config.moe_backend,
+                            moe_backend=requested_draft_moe_backend,
                             mapping=model_config.mapping,
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
@@ -1640,15 +1745,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config.speculative_model,
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
+                        moe_backend=requested_draft_moe_backend,
                         mapping=model_config.mapping,
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
-                    self.draft_config.extra_attrs = dict(
-                        model_config.extra_attrs)
+                    self.draft_config.extra_attrs = model_config.extra_attrs
                     self.draft_config.extra_attrs[
                         _SPECULATIVE_POSITION_HEADROOM] = (
                             2 * spec_config.tokens_per_gen_step)

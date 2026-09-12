@@ -1600,16 +1600,18 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
+                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+                      "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
-    backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
-        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
-        "MEGAMOE_CUTEDSL"] = Field(
-            default='AUTO',
-            description="MoE backend to use. "
-            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
-        )
+    backend: _MoeBackend = Field(
+        default='AUTO',
+        description="MoE backend to use. "
+        "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+    )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -1963,6 +1965,21 @@ class DecodingBaseConfig(StrictBaseModel):
         "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
         "target's embedded mtp.* weights.")
 
+    moe_backend: Optional[_MoeBackend] = Field(
+        default=None,
+        description=(
+            "MoE backend override for a neural draft model or embedded MTP "
+            "layers on the PyTorch backend. None inherits the target model's "
+            "backend. AUTO resolves from the draft checkpoint or embedded MTP "
+            "layer quantization, and a concrete backend applies only to the "
+            "draft model or layers. Resolution may fall back based on model, "
+            "quantization, and hardware support. Replacement-head MTP "
+            "checkpoints are unsupported because their independent "
+            "quantization metadata is not loaded. Nemotron-H embedded MTP "
+            "layers must inherit the target backend because their checkpoint "
+            "mapper uses a shared backend-dependent layout. Decoding methods "
+            "without a neural draft model ignore this option."))
+
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
@@ -2162,6 +2179,19 @@ class DecodingBaseConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    def _validate_moe_backend_compatibility(self,
+                                            *,
+                                            model_config_resolved: bool = False
+                                            ) -> None:
+        if (self.moe_backend is None or not model_config_resolved
+                or not self.uses_replacement_heads):
+            return
+        raise ValueError(
+            "speculative_config.moe_backend does not support replacement-head "
+            "MTP checkpoints because their independent quantization metadata "
+            "is not loaded. Leave moe_backend unset to inherit the target "
+            "backend, or use a full external draft-model checkpoint.")
 
     @property
     def uses_replacement_heads(self) -> bool:
@@ -6231,6 +6261,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            self.speculative_config._validate_moe_backend_compatibility()
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
