@@ -1447,12 +1447,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if quant_dtype == "none" and fp8kv:
             pytest.skip("only fp8 and nvfp4 support fp8 kv cache")
 
+        assert_reuse = (quant_dtype == "none" and kv_cache_reuse
+                        and overlap_scheduler)
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.6,
             enable_block_reuse=kv_cache_reuse,
-            # ADP pads an idle rank with a short dummy request. Do not commit
-            # that partial dummy block while exercising prefix reuse.
-            enable_partial_reuse=not kv_cache_reuse,
+            # ADP pads an idle rank with a short dummy request; don't commit
+            # that partial block while asserting exact reused-block counts.
+            **({
+                "enable_partial_reuse": False
+            } if assert_reuse else {}),
         )
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler, )
         if quant_dtype == "fp8" and is_sm_100f():
@@ -1478,7 +1482,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             elif quant_dtype == "nvfp4":
                 assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
 
-            if (quant_dtype == "none" and kv_cache_reuse and overlap_scheduler):
+            if assert_reuse:
                 assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 255)
 
             task = GSM8K(self.MODEL_NAME)
