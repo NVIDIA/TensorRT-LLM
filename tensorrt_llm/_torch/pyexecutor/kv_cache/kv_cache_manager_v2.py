@@ -4375,7 +4375,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.kv_factor,
                     self.tokens_per_block,
                     self.num_kv_heads_per_layer[layer_offset],
-                    self.head_dim // element_per_container,
+                    self.head_dim_per_layer[layer_offset] // element_per_container,
                 ]
             else:
                 shape = [
@@ -4383,7 +4383,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.kv_factor,
                     self.num_kv_heads_per_layer[layer_offset],
                     self.tokens_per_block,
-                    self.head_dim // element_per_container,
+                    self.head_dim_per_layer[layer_offset] // element_per_container,
                 ]
             addr_key = (
                 int(gpu_storage.slot_address(pg_idx, attr.pool_index, 0, locality_domain_id))
