@@ -151,7 +151,7 @@ class NVLinkOneSided(Communication):
     """
 
     # Constants from C++ (must match moeAlltoAllKernels.h)
-    MAX_RANKS = 128
+    MAX_RANKS = 256
     MAX_TOP_K = 8
     MAX_PAYLOADS = 8
 
@@ -306,6 +306,11 @@ class NVLinkOneSided(Communication):
 
         if self.mapping.world_size != self.ep_size:
             raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
+        # Check the kernel rank cap before allocating the (large) symmetric workspace.
+        if self.ep_size > self.MAX_RANKS:
+            raise RuntimeError(
+                f"NVLinkOneSided supports at most {self.MAX_RANKS} EP ranks, got ep_size={self.ep_size}."
+            )
 
         # Store needed parameters
         self.num_experts = num_slots
