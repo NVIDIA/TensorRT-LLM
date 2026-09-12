@@ -39,12 +39,12 @@ struct GpuCacheTierConfig
 {
     size_t quota = 0; // bytes
 
-    CacheTier tier() const noexcept
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::GPU_MEM;
     }
 
-    void assertValid() const
+    void validate() const
     {
         if (quota == 0)
             throw std::invalid_argument("GpuCacheTierConfig: quota must be > 0");
@@ -55,15 +55,27 @@ struct HostCacheTierConfig
 {
     size_t quota = 0; // bytes
 
-    CacheTier tier() const noexcept
+    //! Upper bound this tier may ever be resized to, in bytes.
+    //!
+    //! The address range is reserved once at this size so that growing the tier
+    //! only commits more of it and never moves the base address. Reserving costs
+    //! address space, not memory. A resize past this bound is rejected.
+    //!
+    //! Defaults to the host memory the OS reports, which no allocation can
+    //! exceed anyway.
+    std::optional<size_t> maxQuota;
+
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;
     }
 
-    void assertValid() const
+    void validate() const
     {
         if (quota == 0)
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
+        if (maxQuota.has_value() && *maxQuota < quota)
+            throw std::invalid_argument("HostCacheTierConfig: maxQuota must be >= quota");
     }
 };
 
@@ -72,12 +84,12 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
-    CacheTier tier() const noexcept
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;
     }
 
-    void assertValid() const;
+    void validate() const;
 };
 
 // Variant holding any tier config.

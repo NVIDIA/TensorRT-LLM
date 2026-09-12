@@ -49,7 +49,9 @@ MemoryOwner makeMemoryOwner(size_t size, StagingBufferMemory memory)
     TLLM_CHECK_WITH_INFO(size > 0, "Staging buffer size must be non-zero");
     switch (memory)
     {
-    case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<HostMem>, size};
+    // HostMem requires a multiple of its alignment; staging sizes are arbitrary.
+    case StagingBufferMemory::kPinnedHost:
+        return MemoryOwner{std::in_place_type<HostMem>, roundUp(size, HostMem::kAlignment)};
     case StagingBufferMemory::kDevice: return MemoryOwner{std::in_place_type<CudaUniqPtr>, allocateDeviceMemory(size)};
     default: throw std::invalid_argument("StagingBufferManager received an invalid memory kind");
     }

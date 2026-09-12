@@ -42,11 +42,6 @@ target_include_directories(
   kvCacheManagerV2ColdPageTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-add_gtest(kvCacheManagerV2ColdPageCopyTest
-          "kvCacheManagerV2ColdPageCopyTest.cu;kvCacheManagerV2PoisonCheck.cpp")
-target_include_directories(
-  kvCacheManagerV2ColdPageCopyTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(coldPageCodecTest coldPageCodecTest.cpp)
 target_include_directories(
   coldPageCodecTest PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
@@ -59,6 +54,12 @@ add_gtest(kvCacheManagerV2HostMemTest
           "kvCacheManagerV2HostMemTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2HostMemTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(
+  kvCacheManagerV2HostMemBackingTest
+  "kvCacheManagerV2HostMemBackingTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2HostMemBackingTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(
   kvCacheManagerV2StagingBufferTest
