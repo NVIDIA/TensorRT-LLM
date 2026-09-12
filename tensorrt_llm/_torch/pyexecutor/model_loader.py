@@ -887,9 +887,7 @@ class ModelLoader:
         load_format = self.llm_args.load_format
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
-        locality_domain_policy = getattr(config, "locality_domain_policy", None)
-        if load_format == LoadFormat.GMS and getattr(locality_domain_policy,
-                                                     "enabled", False):
+        if load_format == LoadFormat.GMS and config.locality_domain_policy.enabled:
             raise ValueError(
                 "LoadFormat.GMS is incompatible with locality domain localized weights. "
                 "GMS shares registered parameters, while locality domain execution "
@@ -1555,9 +1553,7 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
-        locality_domain_policy = getattr(model.model_config,
-                                         "locality_domain_policy", None)
-        if getattr(locality_domain_policy, "enabled", False):
+        if model.model_config.locality_domain_policy.enabled:
             enabled_features.add(
                 PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
@@ -1893,9 +1889,6 @@ class ModelLoader:
                 f"Could not read allreduce pre-allocation config from "
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
-        config.extra_attrs[
-            "locality_domain_policy"] = config.locality_domain_policy
-
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
