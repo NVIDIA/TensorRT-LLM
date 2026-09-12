@@ -116,16 +116,16 @@ from .trace_log_utils import log_mem_snapshot
 
 
 def _locality_domain_forkjoin_enabled(kv_cache_manager) -> bool:
-    """Whether to drive fork-join attention for *kv_cache_manager*.
+    """Whether to drive two-stream attention for *kv_cache_manager*.
 
     True iff the manager is :class:`KVCacheManagerV2` with
-    ``num_locality_domains > 1`` and ``LlmArgs.enable_locality_domains=True``.
+    ``num_locality_domains > 1`` and ``fork_join_attn`` set.
     """
     if not isinstance(kv_cache_manager, KVCacheManagerV2):
         return False
     if kv_cache_manager.num_locality_domains <= 1:
         return False
-    return getattr(kv_cache_manager, "fork_join_attn", False)
+    return kv_cache_manager.fork_join_attn
 
 
 def sort_generation_requests_by_locality_domain(
@@ -5492,14 +5492,7 @@ class PyTorchModelEngine(ModelEngine):
                 range(n_ctx),
                 key=lambda i: _ctx_requests[i].py_locality_domain_id)
             _ctx_requests = [_ctx_requests[i] for i in _ctx_perm]
-            # context_requests is a computed property -- reorder the underlying
-            # lists so downstream sees the sorted order.
-            scheduled_requests.context_requests_chunking = [
-                r for r in _ctx_requests if not r.is_last_context_chunk
-            ]
-            scheduled_requests.context_requests_last_chunk = [
-                r for r in _ctx_requests if r.is_last_context_chunk
-            ]
+            scheduled_requests.reset_context_requests(_ctx_requests)
 
         for request in _ctx_requests:
             request_ids.append(request.py_request_id)
