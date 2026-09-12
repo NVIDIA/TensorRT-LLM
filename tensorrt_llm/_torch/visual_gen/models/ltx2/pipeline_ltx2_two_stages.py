@@ -1107,6 +1107,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             self._current_lora_cuda_graph_state,
             lambda: self.transformer.active_topology,
         )
+        self.transformer.register_cuda_graph_extra_key_fns(runner)
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             "CUDA graph runner: wrapping LTX-2 two-stage transformer.forward "

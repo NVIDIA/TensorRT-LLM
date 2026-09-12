@@ -275,11 +275,15 @@ l0_b200:
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
-  - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
+  - unittest/_torch/visual_gen/test_attention_vsa.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
+  - unittest/_torch/visual_gen/sparse_attention/test_sol_predictor.py
+  - unittest/_torch/visual_gen/sparse_attention/test_sol_attention.py::test_real_b200_sol_backend_cuda_graph_matches_dense_reference
+  - unittest/_torch/visual_gen/sparse_attention/test_sol_attention.py::test_real_b200_sol_backend_mixed_proxy_cuda_graph_matches_reference
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_cudnn.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py

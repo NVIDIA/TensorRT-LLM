@@ -18,9 +18,12 @@ from tensorrt_llm.visual_gen.args import (
     ParallelConfig,
     QuantAttentionConfig,
     RuntimeLoRAConfig,
+    SkipSoftmaxAttentionConfig,
+    SolAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VAEConfig,
+    VideoSparseAttentionConfig,
     VisualGenArgs,
 )
 
@@ -100,6 +103,49 @@ class TestAttentionConfigQuantValidation:
                     qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
                 ),
             )
+
+    @pytest.mark.parametrize(
+        ("backend", "quant_config"),
+        [
+            (
+                "TRTLLM",
+                QuantAttentionConfig(
+                    qk_dtype="fp8",
+                    q_block_size=1,
+                    k_block_size=1,
+                    v_block_size=1,
+                ),
+            ),
+            (
+                "CUTEDSL",
+                QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
+            ),
+        ],
+    )
+    def test_vsa_and_quantization_are_mutually_exclusive(self, backend, quant_config):
+        with pytest.raises(
+            ValidationError, match="VSA and quant_attention_config are mutually exclusive"
+        ):
+            AttentionConfig(
+                backend=backend,
+                quant_attention_config=quant_config,
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            )
+
+    def test_skip_softmax_and_sage_quantization_can_be_combined(self):
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="int8",
+                q_block_size=1,
+                k_block_size=4,
+                v_block_size=1,
+            ),
+            sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+        )
+
+        assert attention.sparse_attention_config is not None
+        assert attention.sparse_attention_config.algorithm == "skip_softmax"
 
     @pytest.mark.parametrize(
         ("qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
@@ -464,6 +510,54 @@ class TestVisualGenArgsFromYaml:
         yaml_path.write_text("model: /tmp/model\nlinear:\n  type: default\n")
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             VisualGenArgs.from_yaml(yaml_path)
+
+    def test_from_yaml_rejects_sol_with_enabled_fullgraph(self, tmp_path):
+        yaml_path = tmp_path / "sol_fullgraph.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\n"
+            "attention_config:\n"
+            "  backend: TRTLLM\n"
+            "  sparse_attention_config:\n"
+            "    algorithm: sol_attn\n"
+            "torch_compile_config:\n"
+            "  enable: true\n"
+            "  enable_fullgraph: true\n"
+        )
+
+        with pytest.raises(ValidationError, match="SOL.*fullgraph"):
+            VisualGenArgs.from_yaml(yaml_path)
+
+
+class TestVisualGenArgsCrossFieldValidation:
+    def test_rejects_sol_with_enabled_fullgraph(self):
+        with pytest.raises(ValidationError, match="SOL.*fullgraph"):
+            VisualGenArgs(
+                model="/tmp/model",
+                attention_config=AttentionConfig(
+                    backend="TRTLLM",
+                    sparse_attention_config=SolAttentionConfig(),
+                ),
+                torch_compile_config=TorchCompileConfig(
+                    enable=True,
+                    enable_fullgraph=True,
+                ),
+            )
+
+    def test_allows_sol_fullgraph_field_when_torch_compile_disabled(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            attention_config=AttentionConfig(
+                backend="TRTLLM",
+                sparse_attention_config=SolAttentionConfig(),
+            ),
+            torch_compile_config=TorchCompileConfig(
+                enable=False,
+                enable_fullgraph=True,
+            ),
+        )
+
+        assert args.torch_compile_config.enable is False
+        assert args.torch_compile_config.enable_fullgraph is True
 
 
 class TestParallelConfigValidation:

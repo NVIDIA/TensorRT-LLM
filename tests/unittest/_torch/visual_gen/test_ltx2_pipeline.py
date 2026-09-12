@@ -1284,6 +1284,9 @@ class TestLTX2TwoStageLoRAHelpers:
                 self.active_topology = "default"
                 self.device = "cuda"
 
+            def register_cuda_graph_extra_key_fns(self, runner):
+                del runner
+
             def forward(self, x):
                 return self.lin(x)
 
@@ -1344,6 +1347,9 @@ class TestLTX2TwoStageLoRAHelpers:
         """CUDA graph setup runs before the two-stage model_config is assigned."""
 
         class TinyTransformer:
+            def register_cuda_graph_extra_key_fns(self, runner):
+                del runner
+
             def forward(self, *args, **kwargs):
                 return args, kwargs
 
@@ -1363,6 +1369,180 @@ class TestLTX2TwoStageLoRAHelpers:
         assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
         assert runner._lora_state_getter() == "original"
         assert pipeline.transformer.forward.__wrapped__.__self__ is pipeline.transformer
+
+    def test_two_stage_cuda_graph_setup_registers_sol_phase_key(self):
+        """Dense and sparse SOL phases must never reuse one CUDA graph."""
+        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+        from tensorrt_llm.visual_gen.args import SolAttentionConfig
+
+        class TinySolTransformer(BaseDiffusionModel):
+            def __init__(self):
+                super().__init__(
+                    DiffusionModelConfig(
+                        attention=AttentionConfig(
+                            backend="TRTLLM",
+                            sparse_attention_config=SolAttentionConfig(disabled_until_timestep=0.6),
+                        )
+                    )
+                )
+                self.active_topology = "default"
+
+            def forward(self, video, audio, *, text_cache, timestep=None, step_index=None):
+                del audio, text_cache, timestep, step_index
+                return video.latent, None
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinySolTransformer()
+        pipeline._cuda_graph_runners = {}
+        pipeline._setup_cuda_graphs()
+        runner = pipeline._cuda_graph_runners["transformer"]
+
+        captured_keys = []
+
+        def fake_capture(key, fn, args, kwargs):
+            del fn, args, kwargs
+            captured_keys.append(key)
+            runner.graphs[key] = object()
+
+        runner.capture = fake_capture
+        runner.replay = lambda key, args, kwargs: key
+
+        def modality(timestep):
+            return Modality(
+                latent=torch.empty(1, 2, 4),
+                timesteps=torch.tensor([timestep]),
+                positions=torch.empty(1, 3, 2),
+                context=torch.empty(1, 3, 4),
+            )
+
+        dense_key = pipeline.transformer(
+            video=modality(0.8), audio=None, text_cache=None, step_index=0
+        )
+        sparse_key = pipeline.transformer(
+            video=modality(0.2), audio=None, text_cache=None, step_index=1
+        )
+        dense_replay_key = pipeline.transformer(
+            video=modality(0.8), audio=None, text_cache=None, step_index=2
+        )
+
+        assert "sol_attn_phase" in runner._extra_key_fns
+        assert ("sol_attn_phase", (("video", 0),)) in dense_key
+        assert ("sol_attn_phase", (("video", 1),)) in sparse_key
+        assert dense_key != sparse_key
+        assert dense_replay_key == dense_key
+        assert captured_keys == [dense_key, sparse_key]
+
+    def test_ltx2_threads_raw_modality_timestep_for_sol_phase(self):
+        """SOL phase preparation must not use the AdaLN-transformed timestep."""
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.transformer_args import (
+            TransformerArgs,
+        )
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
+
+        def modality(timestep):
+            return Modality(
+                latent=torch.empty(1, 1, 1),
+                timesteps=torch.tensor([timestep]),
+                positions=torch.empty(1, 1, 1),
+                context=torch.empty(1, 1, 1),
+            )
+
+        def transformer_args(timestep):
+            return TransformerArgs(
+                x=torch.empty(1, 1, 1),
+                context=torch.empty(1, 1, 1),
+                context_mask=None,
+                timesteps=torch.tensor([timestep]),
+                embedded_timestep=torch.empty(1, 1, 1),
+                positional_embeddings=(torch.empty(1), torch.empty(1)),
+                cross_positional_embeddings=None,
+                cross_scale_shift_timestep=None,
+                cross_gate_timestep=None,
+                enabled=True,
+            )
+
+        class Preprocessor:
+            def __init__(self, value):
+                self.value = value
+
+            def prepare(self, *args, **kwargs):
+                del args, kwargs
+                return self.value
+
+        observed_phases = []
+
+        class Block:
+            def __call__(
+                self,
+                *,
+                video,
+                audio,
+                video_sol_timestep=None,
+                audio_sol_timestep=None,
+                **kwargs,
+            ):
+                del kwargs
+                video_timestep = (
+                    video.timesteps if video_sol_timestep is None else video_sol_timestep
+                )
+                audio_timestep = (
+                    audio.timesteps if audio_sol_timestep is None else audio_sol_timestep
+                )
+                observed_phases.append(
+                    (
+                        SolParams.get_graph_phase_for_timestep(
+                            video_timestep,
+                            disabled_until_timestep=0.6,
+                        ),
+                        SolParams.get_graph_phase_for_timestep(
+                            audio_timestep,
+                            disabled_until_timestep=0.6,
+                        ),
+                    )
+                )
+                return video, audio
+
+        model = object.__new__(LTXModel)
+        torch.nn.Module.__init__(model)
+        model._active_seq_size = 1
+        model.model_type = SimpleNamespace(
+            is_video_enabled=lambda: True,
+            is_audio_enabled=lambda: True,
+        )
+        model._audio_pad = 0
+        model.video_args_preprocessor = Preprocessor(transformer_args(0.8))
+        model.audio_args_preprocessor = Preprocessor(transformer_args(0.2))
+        model._active_sharder = SimpleNamespace(is_active=False)
+        model.model_config = SimpleNamespace(cache_backend=None)
+        model.transformer_blocks = [Block()]
+        model.scale_shift_table = model.norm_out = model.proj_out = None
+        model.audio_scale_shift_table = model.audio_norm_out = model.audio_proj_out = None
+        model._process_output = lambda table, norm, proj, x, embedded: x
+        text_cache = SimpleNamespace(
+            video_context=None,
+            video_mask=None,
+            video_pe=None,
+            video_cross_pe=None,
+            video_kv=None,
+            audio_context=None,
+            audio_mask=None,
+            audio_pe=None,
+            audio_cross_pe=None,
+            audio_kv=None,
+        )
+
+        model(video=modality(0.2), audio=modality(0.8), text_cache=text_cache)
+
+        assert observed_phases == [(1, 0)]
 
     def test_cuda_graph_rejects_nonpersistent_lora_bindings(self):
         """CUDA graph is valid only when distilled LoRA uses persistent bindings."""

@@ -20,8 +20,9 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
@@ -74,6 +75,38 @@ class BaseDiffusionModel(nn.Module):
         the shared registrations.
         """
         sparse_config = self.model_config.attention.sparse_attention_config
+        if isinstance(sparse_config, SolAttentionConfig):
+            disabled_until_timestep = sparse_config.disabled_until_timestep
+            if disabled_until_timestep is None:
+                return
+
+            def sol_phase_key(*args, **kwargs):
+                del args
+                modality_phases = tuple(
+                    (name, phase)
+                    for name in ("video", "audio")
+                    if (modality := kwargs.get(name)) is not None
+                    and hasattr(modality, "timesteps")
+                    and (
+                        phase := SolParams.get_graph_phase_for_timestep(
+                            modality.timesteps,
+                            disabled_until_timestep=disabled_until_timestep,
+                        )
+                    )
+                    is not None
+                )
+                if modality_phases:
+                    return modality_phases
+                return SolParams.get_graph_phase_for_timestep(
+                    kwargs.get("timestep"),
+                    disabled_until_timestep=disabled_until_timestep,
+                )
+
+            # SOL backend warmup prepares the matching phase before capture. Key
+            # each modality's live timestep so dense and sparse graphs stay separate.
+            runner.register_extra_key_fn("sol_attn_phase", sol_phase_key)
+            return
+
         if not isinstance(sparse_config, SkipSoftmaxAttentionConfig):
             return
 
