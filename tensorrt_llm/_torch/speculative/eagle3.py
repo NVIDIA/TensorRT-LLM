@@ -656,6 +656,32 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def can_verify_vocab_sharded_target_logits(self, spec_metadata) -> bool:
+        # Everything that reads the target logits' *values* has to be out of the
+        # picture, leaving only the argmax in _sample_tokens_for_batch:
+        #   - the guided decoder masks the full-vocab row in place;
+        #   - relaxed acceptance takes a softmax and a top-k over it;
+        #   - the occurrence penalties index it by token id;
+        #   - rejection sampling needs each row's full distribution -- already
+        #     excluded by is_all_greedy_sample (_can_use_rejection_sampling);
+        #   - the dynamic-tree subclasses override sample_and_accept_draft_tokens
+        #     and argmax the logits directly instead.
+        if (self.guided_decoder is not None or self.use_dynamic_tree
+                or getattr(self.spec_config,
+                           "use_relaxed_acceptance_for_thinking", False)):
+            return False
+        if spec_metadata is None or not spec_metadata.is_all_greedy_sample:
+            return False
+        if spec_metadata.enable_penalty:
+            return False
+        # Only plain tensor parallelism shards the vocabulary across ranks that
+        # hold the same rows. Under attention DP each rank owns a different set
+        # of requests and the head is replicated, so there are no shards to
+        # combine and a cross-rank gather would desync the ranks.
+        mapping = self.mapping
+        return (mapping is not None and getattr(mapping, "tp_size", 1) > 1
+                and not mapping.enable_attention_dp)
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs

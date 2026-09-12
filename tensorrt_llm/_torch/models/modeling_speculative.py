@@ -1576,6 +1576,21 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
+def _lm_head_shard_is_self_contained(lm_head: nn.Module) -> bool:
+    """Whether dropping the LM head's output gather leaves each rank holding
+    exactly its own contiguous, unpadded slice of the vocabulary.
+
+    ``gather_output`` is what turns the COLUMN-parallel shards into full-vocab
+    logits; without it a rank keeps ``[rows, vocab // tp_size]`` starting at
+    ``tp_rank * vocab // tp_size``. A vocabulary that does not divide evenly is
+    excluded: the padding columns are only trimmed on the gathered path, so the
+    shard would otherwise carry scores for token ids that do not exist.
+    """
+    return (lm_head.tp_mode == TensorParallelMode.COLUMN
+            and lm_head.gather_output and lm_head.tp_size > 1
+            and getattr(lm_head, "padding_size", 0) == 0)
+
+
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
@@ -1687,6 +1702,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.spec_worker.set_draft_model(self.draft_model)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
+        # Gather decisions already logged for the target head, so each of the
+        # two is reported once instead of on every alternation. See forward().
+        self._target_logits_sharding_logged: set[bool] = set()
 
     def setup_aliases(self) -> None:
         if (self.draft_model is not None
@@ -1721,12 +1739,49 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_worker is not None:
             # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            #
+            # The LM head is COLUMN tensor-parallel, so by default it
+            # all-gathers its vocab shards and LogitsProcessor upcasts the
+            # full-vocab result to fp32 -- both proportional to the whole
+            # vocabulary, on every step. When the worker's only consumer is a
+            # greedy argmax, that argmax can be recovered from the shards'
+            # maxima instead (two floats per row), which is what the
+            # vocab-sharded draft head already does. Ask the worker whether
+            # this step qualifies and keep today's gathered fp32 path when it
+            # does not.
+            keep_vocab_sharded = (
+                _lm_head_shard_is_self_contained(self.lm_head)
+                and self.spec_worker.can_verify_vocab_sharded_target_logits(
+                    spec_metadata))
+            # Written on every forward so the worker cannot read a value left
+            # over from a step that took the other branch.
+            spec_metadata.target_logits_vocab_sharded = keep_vocab_sharded
+            # The decision sets both the cost of the per-step logits tail and
+            # the width of the logits this engine returns, so report each of the
+            # two outcomes once -- an unexpected one is then attributable
+            # without a profiler, as for the one-off LMHead quantization log.
+            # Reported per outcome rather than per change: a batch mix that
+            # alternates would otherwise log on every step.
+            if keep_vocab_sharded not in self._target_logits_sharding_logged:
+                self._target_logits_sharding_logged.add(keep_vocab_sharded)
+                logger.info("Speculative target LM head: " + (
+                    "keeping its vocab shard; greedy argmax combines the "
+                    "per-rank maxima."
+                    if keep_vocab_sharded else "gathering full-vocab logits."))
+
+            gather_output = self.lm_head.gather_output
+            if keep_vocab_sharded:
+                self.lm_head.gather_output = False
+            try:
+                logits = self.logits_processor.forward(
+                    hidden_states[spec_metadata.gather_ids],
+                    self.lm_head,
+                    attn_metadata,
+                    True,
+                    upcast_to_float=not keep_vocab_sharded,
+                )
+            finally:
+                self.lm_head.gather_output = gather_output
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs

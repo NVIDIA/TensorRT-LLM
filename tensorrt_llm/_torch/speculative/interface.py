@@ -564,6 +564,13 @@ class SpecMetadata:
     # a greedy rank pulled onto the advanced path still samples greedily via
     # its sentinel params.
     group_all_greedy_sample: Optional[bool] = None
+    # Whether the target logits handed to the worker this step are one rank's
+    # vocab shard rather than the full vocabulary. Written on every one-engine
+    # target forward (see SpecDecOneEngineForCausalLM.forward), so it never
+    # carries over from a step that took the other branch. Token selection has
+    # to combine the shards' maxima when set; a local argmax would return a
+    # shard-local index.
+    target_logits_vocab_sharded: bool = False
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
@@ -2467,6 +2474,42 @@ class SpecWorkerBase(nn.Module, ABC):
                                     max_indices).squeeze(-1).type(torch.int32)
         return draft_tokens
 
+    def _greedy_argmax_over_vocab_shards(self, logits, mapping=None):
+        """Global greedy argmax over logits each rank holds one vocab shard of.
+
+        All-gathers only the per-rank ``(global index, max value)`` pairs -- two
+        floats per row -- instead of the ``[rows, vocab_shard]`` scores
+        themselves, then keeps the pair with the largest value. Equivalent to an
+        argmax over the concatenated vocabulary, tie-breaking included: the
+        shards are contiguous and ordered by rank, so the first rank holding the
+        maximum also holds its lowest global index.
+
+        Expects 2D ``[num_tokens, vocab_shard]`` logits sharded over ``mapping``
+        (defaults to this worker's mapping).
+        """
+        from ..distributed.ops import allgather
+        mapping = mapping if mapping is not None else self.mapping
+        combined = self._get_local_max_and_combined(logits, mapping)
+        gathered = allgather(combined, mapping, dim=-1)
+        return self._get_draft_tokens_from_gathered(gathered)
+
+    def can_verify_vocab_sharded_target_logits(self, spec_metadata) -> bool:
+        """Whether this step's target-side work can run on vocab-sharded logits.
+
+        A one-engine target LM head is COLUMN tensor-parallel, so it all-gathers
+        its shards into full-vocab logits before the worker sees them. That
+        gather -- and the fp32 upcast and full-width argmax behind it -- is only
+        needed when something actually reads the scores. A worker returns True
+        when every consumer of the target logits on its own path this step is
+        the greedy argmax, which :meth:`_greedy_argmax_over_vocab_shards`
+        recovers from the shard maxima instead.
+
+        False by default: a worker opts in only after checking each of its own
+        consumers, and the caller keeps today's gathered full-vocab path
+        otherwise.
+        """
+        return False
+
     def greedy_sample_draft_with_tp_gather(self,
                                            logits: torch.Tensor,
                                            spec_metadata=None,
@@ -2505,10 +2548,7 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
-            from ..distributed.ops import allgather
-            combined = self._get_local_max_and_combined(logits)
-            gathered = allgather(combined, mapping, dim=-1)
-            return self._get_draft_tokens_from_gathered(gathered)
+            return self._greedy_argmax_over_vocab_shards(logits, mapping)
         # No cross-rank gather for plain attention-DP: each rank owns its own
         # requests with replicated full-vocab logits, so a per-rank argmax is
         # the correct proposal and a gather would desync the ranks (see
@@ -2819,6 +2859,12 @@ class SpecWorkerBase(nn.Module, ABC):
         Sample tokens from logits using per-request sampling parameters.
         Supports both greedy and non-greedy sampling.
 
+        On the all-greedy path the logits may be one rank's vocab shard rather
+        than the full vocabulary (``target_logits_vocab_sharded``), in which
+        case the global argmax is recovered from the per-rank shard maxima.
+        Non-greedy sampling always reads full-vocab logits, so the caller never
+        shards them for it.
+
         Args:
             logits: [num_tokens, vocab_size] - Logits to sample from
             spec_metadata: Metadata containing sampling parameters
@@ -2850,6 +2896,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    eff_top_ps,
                                                    seed=seed,
                                                    offset=offset)
+        elif spec_metadata.target_logits_vocab_sharded:
+            sampled_tokens = self._greedy_argmax_over_vocab_shards(logits)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
