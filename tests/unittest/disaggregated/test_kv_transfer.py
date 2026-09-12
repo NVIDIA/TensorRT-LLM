@@ -334,6 +334,7 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
         tokens_per_block=tokens_per_block,
         get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
         get_block_ids=lambda req, idx, lg: source_block_ids,
+        get_block_ordinals=lambda req, idx, lg: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
     transceiver._kv_cache_manager = SimpleNamespace(

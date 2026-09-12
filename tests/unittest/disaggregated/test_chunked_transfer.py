@@ -939,6 +939,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_block_ids=lambda _req, _idx, _lg: source_block_ids,
+        get_block_ordinals=lambda _req, _idx, _lg: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(
         layer_groups=[SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=None)]
