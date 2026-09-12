@@ -23,7 +23,10 @@ an id it has not seen opened.
 
 import pytest
 
-from tensorrt_llm.serve.responses_utils import ResponsesStreamingEventsHelper
+from tensorrt_llm.serve.responses_utils import (
+    ResponsesStreamingEventsHelper,
+    _generate_streaming_event,
+)
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
 # test in the file is deselected, which pytest reports as exit code 5 and the
@@ -123,6 +126,90 @@ def test_done_events_carry_the_open_item_id():
     item_id = helper.item_id
     assert helper.get_text_done_event("hi", []).item_id == item_id
     assert helper.get_content_part_done_event(_output_text("hi")).item_id == item_id
+
+
+# ---------------------------------------------------------------------------
+# Reasoning that shares a chunk with the answer
+# ---------------------------------------------------------------------------
+
+
+class _FakeOutput:
+    """The three attributes _generate_streaming_event reads from an output."""
+
+    def __init__(self, text_diff, index=0):
+        self.text_diff = text_diff
+        self.index = index
+
+
+class _FakeRequest:
+    tools = None
+
+
+def _stream(chunks):
+    """Drive the real dispatch over a sequence of generation chunks.
+
+    Returns (reasoning deltas, text deltas) as the client would receive them.
+    """
+    helper = ResponsesStreamingEventsHelper()
+    parsers = {}
+    reasoning, text = [], []
+    for i, chunk in enumerate(chunks):
+        events = _generate_streaming_event(
+            output=_FakeOutput(chunk),
+            request=_FakeRequest(),
+            finished_generation=(i == len(chunks) - 1),
+            streaming_events_helper=helper,
+            reasoning_parser_id="glm",
+            reasoning_parser_dict=parsers,
+        )
+        for event in events:
+            kind = getattr(event, "type", "")
+            if kind == "response.reasoning_text.delta":
+                reasoning.append(event.delta)
+            elif kind == "response.output_text.delta":
+                text.append(event.delta)
+    return "".join(reasoning), "".join(text)
+
+
+def test_reasoning_sharing_a_chunk_with_the_answer_is_not_dropped():
+    """Regression: the reasoning half of the straddling chunk was discarded.
+
+    A generation chunk whose raw text spans the closing think tag parses into
+    both a reasoning part and a content part. The dispatch chose its branch on
+    the content part alone, so the reasoning part fell into a branch that never
+    ran and was never emitted -- and closing the item cleared the flag the
+    done-event path is guarded on, so the done event carried the short text
+    too. Measured at 56% of reasoning items across four fleets.
+    """
+    reasoning, text = _stream(["Let", " me check the reference.</think>I will read the file."])
+    assert reasoning == "Let me check the reference."
+    assert text == "I will read the file."
+
+
+def test_reasoning_shorter_than_one_chunk_survives():
+    """The worst case: the whole reasoning shares a chunk with the answer.
+
+    Reasoning short enough to fit inside a single chunk was truncated to
+    nothing at all, which is why the losses looked like first words.
+    """
+    reasoning, _ = _stream(["Sure.</think>Here it is."])
+    assert reasoning == "Sure."
+
+
+def test_reasoning_ending_on_a_chunk_boundary_is_unaffected():
+    """The case that always worked, kept so a fix cannot regress it."""
+    reasoning, text = _stream(
+        ["Let", " me check the reference.", "</think>", "I will read the file."]
+    )
+    assert reasoning == "Let me check the reference."
+    assert text == "I will read the file."
+
+
+def test_reasoning_with_no_answer_after_it_is_unaffected():
+    """A turn that ends in a tool call emits no text, so the other branch ran."""
+    reasoning, text = _stream(["Let", " me check the reference.</think>"])
+    assert reasoning == "Let me check the reference."
+    assert text == ""
 
 
 def _output_text(text):
