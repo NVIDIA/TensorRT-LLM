@@ -562,8 +562,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         # path 2
         return _get_default(tp_size)
 
-    @property
-    def enable_postprocess_parallel(self) -> bool:
-        ret = super().enable_postprocess_parallel
-        assert ret == False, "Postprocess parallel is not supported in RayExecutor"
-        return ret
+    # Postprocess parallelism is supported: the rank-0 RayGPUWorker spawns a
+    # local PostprocWorker pool and feeds finished Output records back into
+    # the RPC response stream (see RpcWorkerMixin.init_postproc_workers), so
+    # the base-class property applies unchanged.
