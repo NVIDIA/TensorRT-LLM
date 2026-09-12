@@ -574,12 +574,13 @@ void KvCache::suspend()
 
 void KvCache::close()
 {
-    // Disposal, not work -- see KvCacheManager::shutdown().
+    // Disposal, not work -- see KvCacheManager::shutdown(), including why the latch is read under
+    // the lock.
+    auto const apiLock = mManager->lockExclusive();
     if (Poison::poisoned())
     {
         return;
     }
-    auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(_checkSanity());
     if (mStatus == Status::CLOSED)
         return;

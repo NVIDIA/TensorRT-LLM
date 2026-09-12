@@ -166,11 +166,14 @@ void KvCacheManager::shutdown()
     // manager down, so this succeeds while poisoned instead of rejecting. The cleanup below is
     // skipped for the same reason every poisoned destructor skips its own -- the structures it
     // would walk are known to be inconsistent -- so the manager's memory is leaked deliberately.
+    //
+    // The latch is read under the lock because it is normally set by a thread holding it: a read
+    // taken before blocking would only say the cache was intact before this call started waiting.
+    auto const apiLock = lockExclusive();
     if (Poison::poisoned())
     {
         return;
     }
-    auto const apiLock = lockExclusive();
     _checkNoLivingKvCaches("shutdown()");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);

@@ -48,6 +48,9 @@ void Poison::set(char const* context, char const* what) noexcept
 {
     try
     {
+        // Logged from a copy: clear() may run between releasing the mutex and the log, and it
+        // mutates the stored string.
+        std::string recorded;
         {
             std::lock_guard<std::mutex> lock(reasonMutex());
             if (sPoisoned.load(std::memory_order_relaxed))
@@ -58,9 +61,10 @@ void Poison::set(char const* context, char const* what) noexcept
             }
             reasonStorage() = std::string(context != nullptr ? context : "<unknown context>") + ": "
                 + (what != nullptr ? what : "<no message>");
+            recorded = reasonStorage();
             sPoisoned.store(true, std::memory_order_release);
         }
-        TLLM_LOG_ERROR("KVCM2 poisoned, refusing further work: %s", reasonStorage().c_str());
+        TLLM_LOG_ERROR("KVCM2 poisoned, refusing further work: %s", recorded.c_str());
     }
     catch (...)
     {
