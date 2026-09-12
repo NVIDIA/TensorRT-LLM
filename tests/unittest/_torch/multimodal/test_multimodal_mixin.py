@@ -21,6 +21,7 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalEncoderContractError,
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
 )
@@ -745,3 +746,41 @@ def test_build_multimodal_encoder_input_unhandled_layout_raises(mm_data, expecte
     model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
     with pytest.raises(NotImplementedError, match=expected_match):
         model.build_multimodal_encoder_input(param, [0])
+
+
+@pytest.mark.parametrize(
+    "module_path, class_name, attrs",
+    [
+        (
+            "tensorrt_llm._torch.models.modeling_qwen3vl",
+            "Qwen3VLModelBase",
+            {"mm_encoder": None},
+        ),
+        (
+            "tensorrt_llm._torch.models.modeling_mistral",
+            "Mistral3VLM",
+            {"_vision_tower": None, "_multi_modal_projector": None},
+        ),
+    ],
+)
+def test_encode_without_a_local_encoder_raises_the_contract_error(module_path, class_name, attrs):
+    """A text-only worker must fail the request, not the executor.
+
+    ``disable_mm_encoder`` (and the encoder-handoff worker) leaves the model
+    with no encoder while the endpoint still accepts image_url. Only
+    ``MultimodalEncoderContractError`` is translated into a
+    ``MultimodalEncoderRequestError`` by the item scheduler, which is what
+    routes the failure to the one request; a plain ``ValueError`` escapes into
+    the executor event loop and takes every rank down with it.
+    """
+    import importlib
+
+    model_cls = getattr(importlib.import_module(module_path), class_name)
+    # The guard is the first statement in the method, so an uninitialized
+    # instance carrying only the encoder attributes is enough to reach it.
+    model = model_cls.__new__(model_cls)
+    for name, value in attrs.items():
+        setattr(model, name, value)
+
+    with pytest.raises(MultimodalEncoderContractError, match="require a local multimodal encoder"):
+        model.encode_multimodal_inputs([])
