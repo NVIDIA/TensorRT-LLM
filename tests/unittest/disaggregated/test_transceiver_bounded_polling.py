@@ -32,6 +32,8 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RecvReqInfo,
+    Sender,
     TaskStatus,
     TransferWorker,
     TransferWorkerConfig,
@@ -390,9 +392,14 @@ def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
     assert transceiver._transfer_worker.sweep_count == 1
 
 
-def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
-    # With no tp/pp sync (e.g. attention_dp), a never-sent worker skips the consensus and the sweep,
-    # unchanged from before -- a true no-op, so the fix can't slow attention_dp workers.
+def test_context_transfer_status_never_sent_no_sync_still_sweeps() -> None:
+    """A never-sent worker skips the consensus but must not skip the sweep.
+
+    Under attention DP at pp=1 both sync flags are false and this early-out is
+    the only path such a rank takes -- and it is exactly the rank that piles up
+    broadcast RecvReqInfo entries no TxSession will ever consume. The sweep
+    rate-limits its own scan, so calling it every poll costs a clock read.
+    """
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_send_session = False
     transceiver._ctx_need_tp_sync = False
@@ -404,7 +411,72 @@ def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
 
     assert transceiver.check_context_transfer_status(at_least_request_num=0) == ([], [])
     transceiver._ctx_consensus.assert_not_called()
-    assert transceiver._transfer_worker.sweep_count == 0  # matches the original early-out exactly
+    assert transceiver._transfer_worker.sweep_count == 1  # the early-out sweeps too
+
+
+def _sweep_only_sender(ttl_s: Optional[float]) -> Sender:
+    """A Sender carrying only what the stale-demand sweep reads."""
+    sender = Sender.__new__(Sender)
+    sender._init_stale_sweep(ttl_s)
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    return sender
+
+
+def _demand(sender: Sender, rid: int, age_s: float) -> None:
+    """Record a demand the way the listener does: the sweep reads it back."""
+    info = RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+    )
+    sender._peer_requests[rid] = {0: info}
+    sender._peer_requests_timestamps[rid] = time.monotonic() - age_s
+
+
+def test_a_demand_is_swept_on_the_configured_timeout_not_a_constant() -> None:
+    """A transfer timeout longer than the floor lengthens the lease with it.
+
+    Inside that window the demand may still be waited on, and evicting it strands
+    the transfer silently -- nothing re-sends REQUEST_DATA, so the generation side
+    only learns of it when it times out.
+    """
+    sender = _sweep_only_sender(300.0)
+    _demand(sender, rid=1, age_s=200.0)  # past the 120s constant, inside the timeout
+    _demand(sender, rid=2, age_s=400.0)
+
+    sender.sweep_stale_req_infos()
+
+    assert 1 in sender._peer_requests
+    assert 2 not in sender._peer_requests
+    assert sender._peer_requests_timestamps.keys() == {1}
+
+
+def test_an_unset_transfer_timeout_falls_back_to_the_constant() -> None:
+    """Nothing configured leaves the TTL where it was."""
+    assert _sweep_only_sender(None)._stale_req_info_ttl_s == Sender._STALE_REQ_INFO_TTL_S
+
+
+def test_the_stale_scan_is_rate_limited_between_sweeps() -> None:
+    """The poll that drives it runs every executor iteration; the scan must not.
+
+    Each scan holds the lock the ZMQ listener needs to record a new demand.
+    """
+    sender = _sweep_only_sender(400.0)  # 100s between scans
+    sender.sweep_stale_req_infos()
+    _demand(sender, rid=1, age_s=500.0)
+
+    sender.sweep_stale_req_infos()
+    assert 1 in sender._peer_requests  # too soon; the entry is not even looked at
+
+    sender._next_stale_sweep_at = 0.0
+    sender.sweep_stale_req_infos()
+    assert 1 not in sender._peer_requests
 
 
 def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:

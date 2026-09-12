@@ -58,6 +58,9 @@ _COLLECTIVE_COORDINATOR_CALLS = {
     "receive_gen_init",  # async receive polls gen status consensus
     "reap_context_sends",  # ctx transfer status consensus
     "handle_timeouts_synced",  # tp_allgather_int64 under ADP
+    # refuse_incomplete_gen_handoffs is deliberately absent: it only mutates
+    # this rank's active_requests, and ranks that refuse different subsets are
+    # reconciled by the tp_allgather in handle_errors_synced next iteration.
 }
 # Executor-owned per-iteration collectives that must stay in lockstep with the
 # coordinator calls under ADP.
@@ -211,6 +214,7 @@ _SCHEDULE_HEAD = [
     ("handle_errors_synced",),
     ("prepare_context_schedulable", []),
     ("poll_gen_transfers",),
+    ("refuse_incomplete_gen_handoffs",),
     ("check_transfer_timeouts",),
     ("admit", []),
     ("receive_gen_init", []),
@@ -270,6 +274,7 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("handle_errors_synced",),
             ("prepare_context_schedulable", []),
             ("poll_gen_transfers",),
+            ("refuse_incomplete_gen_handoffs",),
             ("admit", []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
@@ -291,6 +296,7 @@ def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
             ("handle_errors_synced",),
             ("prepare_context_schedulable", []),
             ("poll_gen_transfers",),
+            ("refuse_incomplete_gen_handoffs",),
             ("revert_deferred_gen_init", [], []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),

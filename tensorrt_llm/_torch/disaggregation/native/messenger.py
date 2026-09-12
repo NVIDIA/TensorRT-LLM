@@ -174,11 +174,19 @@ class ZMQMessenger(MessengerInterface):
         self._listener_thread = Thread(target=listener, daemon=True)
         self._listener_thread.start()
 
-    def stop(self, timeout: int = 5) -> None:
-        def _close_socket(socket: zmq.Socket) -> None:
+    def stop(self, timeout: int = 5, linger_ms: int = 0) -> None:
+        """Close this messenger. ``linger_ms`` bounds the wait for queued frames.
+
+        Zero discards whatever send() only handed to ZMQ, which is what every
+        caller wanted until a result frame had to survive the close that
+        follows it. Only the data socket honours it; the control pair always
+        closes at once so context.term() is not held up by them.
+        """
+
+        def _close_socket(socket: zmq.Socket, linger: int = 0) -> None:
             try:
                 if not socket.closed:
-                    socket.setsockopt(zmq.LINGER, 0)
+                    socket.setsockopt(zmq.LINGER, linger)
                     socket.close()
             except Exception as e:
                 logger.error(f"Error closing socket: {e}")
@@ -197,7 +205,7 @@ class ZMQMessenger(MessengerInterface):
                 if self._listener_thread.is_alive():
                     logger.warning("Listener thread did not terminate within timeout")
 
-            _close_socket(self._socket)
+            _close_socket(self._socket, linger_ms)
             _close_socket(self._internal_socket)
             _close_socket(self._control_socket)
 

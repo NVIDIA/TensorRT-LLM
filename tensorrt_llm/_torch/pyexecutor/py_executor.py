@@ -2571,6 +2571,7 @@ class PyExecutor:
 
                 self.disagg.prepare_context_schedulable(new_requests)
                 self.disagg.poll_gen_transfers()
+                self.disagg.refuse_incomplete_gen_handoffs()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
@@ -3589,6 +3590,8 @@ class PyExecutor:
                 handle_errors_synced=self._handle_disagg_cache_errors_synced,
                 prepare_context_schedulable=self.
                 _check_disagg_ctx_schedulable_status,
+                refuse_incomplete_gen_handoffs=self.
+                _refuse_incomplete_disagg_gen_handoffs,
                 admit=self._apply_disagg_transfer_admission,
                 revert_deferred_gen_init=self.
                 _revert_deferred_disagg_gen_init_alloc,
@@ -3807,6 +3810,7 @@ class PyExecutor:
 
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
+        self.disagg.refuse_incomplete_gen_handoffs()
         self.disagg.check_transfer_timeouts()
 
         iter_stats = None
@@ -7316,8 +7320,54 @@ class PyExecutor:
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
+    def _refuse_incomplete_disagg_gen_handoffs(self) -> None:
+        """Fail a landed handoff that cannot say which token to resume from.
+
+        Called from the loop head, before the scheduler can pick the request
+        up, because once it is batched nothing downstream can tell: the model
+        engine substitutes the prompt's trailing token and the sampler treats
+        the step as ordinary generation, so the client is served a wrong
+        answer that reports success. The handoff is per request, so only the
+        short one is failed.
+
+        Reached as the ``refuse_incomplete_gen_handoffs`` coordinator delegate.
+        """
+        # The coordinator is already a no-op without a transceiver; this keeps
+        # the method safe for a direct call too.
+        if self.kv_cache_transceiver is None:
+            return
+        refused = False
+        for req in self.active_requests:
+            if req.state != LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
+                continue
+            ctx_params = req.context_phase_params
+            first_gen_tokens = (ctx_params.first_gen_tokens
+                                if ctx_params is not None else None)
+            num_first_gen_tokens = (0 if first_gen_tokens is None else
+                                    len(first_gen_tokens))
+            if num_first_gen_tokens >= req.py_beam_width:
+                continue
+            logger.error(
+                "A completed disaggregated generation transfer carried "
+                f"{num_first_gen_tokens} first tokens for {req.py_beam_width} "
+                f"beams (request {req.py_request_id}); nothing here knows "
+                "where to resume computing.")
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            refused = True
+        # Nothing else visits this state: the request left the transfer manager
+        # when its handoff landed, so the polling sweeps no longer see it and it
+        # would sit in active_requests to the end of the run.
+        if refused:
+            self._check_cache_transfer_errors("generation requests")
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        """Turn requests whose context handoff landed into live generation ones.
+
+        Every request reaching here has already cleared
+        ``_refuse_incomplete_disagg_gen_handoffs``, so its first tokens are
+        present; a handoff short of them never becomes schedulable.
+        """
         cache_trans_complete_requests = []
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -7350,6 +7400,8 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                beam_width = req.py_beam_width
+                first_gen_tokens = req.context_phase_params.first_gen_tokens
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 if self.kv_cache_transceiver is not None:
@@ -7358,7 +7410,6 @@ class PyExecutor:
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
                 req.py_kv_transfer_timed_out = False
-                first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 if not ctx_draft_tokens and self.model_engine.enable_spec_decode:
                     # CTX has no speculative decoding — fill dummy draft tokens
@@ -7369,7 +7420,6 @@ class PyExecutor:
                         0
                     ] * self.model_engine.max_total_draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
-                beam_width = req.py_beam_width
                 if not self._update_sampler_state_for_disagg_gen_request(
                         req, beam_width, first_gen_tokens):
                     continue

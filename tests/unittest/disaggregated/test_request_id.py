@@ -83,7 +83,7 @@ def _build_recv_req_info(tfr, task):
     recv_self = SimpleNamespace(
         _registrar=SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="gen-0", instance_rank=0)
-        )
+        ),
     )
     return tfr.Receiver._build_recv_req_info(recv_self, task)
 

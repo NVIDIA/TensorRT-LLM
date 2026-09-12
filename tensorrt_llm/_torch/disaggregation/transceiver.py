@@ -457,9 +457,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
             groups.append(block_ids)
 
+        # State the range even when it is the whole prompt: leaving it None
+        # makes "no range" mean "all of it", the specialization standing in as
+        # the default. Downstream reads identically (start 0, full block count).
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
+            token_range=TokenRange(start=0, end=req.prompt_len),
         )
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
@@ -944,6 +948,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             is_last_slice=is_last_chunk,
             block_ids_per_layer_groups=chunk_block_ids,
             token_range=TokenRange(start=chunk_start * tpb, end=chunk_end * tpb),
+            # Marks the session, not this chunk: a prompt short enough to fit
+            # one chunk still addresses like a pipelined one, and the peer's
+            # cp_size is not known until it asks.
+            pipelined=True,
         )
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
@@ -1081,13 +1089,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ) -> CtxTransferStatus:
+        """Reap the context transfers that finished, by consensus across ranks.
+
+        Also this rank's only periodic tick, so the stale-demand sweep rides it
+        even on the ranks that take the early return.
+        """
         # A worker that never sends KV has nothing to reconcile here, so skip the consensus. Safe
         # because the flag flips together on every rank and never resets, so they all skip in step;
         # gating on the live session dict instead would not be, since a cancel clears it per-rank.
-        # Keep the original sweep (only when tp/pp sync is on) so nothing is leaked.
         if not self._ever_had_send_session:
-            if self._ctx_need_tp_sync or self._ctx_need_pp_sync:
-                self._transfer_worker.sweep_stale_req_infos()
+            # Under attention DP at pp=1 both sync flags are false, and that is
+            # the rank that accumulates broadcast entries it never consumes.
+            self._transfer_worker.sweep_stale_req_infos()
             return CtxTransferStatus([], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -1442,6 +1455,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Bounce buffers stage a whole request, not individual chunks.
         if cfg.kv_cache_bounce_size_mb != 0:
             blockers.append(f"kv_cache_bounce_size_mb={cfg.kv_cache_bounce_size_mb}")
+        # Only a prompt short enough to be one chunk would go through, and one chunk
+        # is what pipelining exists to avoid. Refused here rather than on chunk two;
+        # the peer's cp_size arrives too late, so the plan-time check stays.
+        if self._mapping.cp_size > 1:
+            blockers.append(f"context parallelism (cp_size={self._mapping.cp_size})")
         if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
             blockers.append("a Mamba/hybrid cache manager")
         # Policies other than all_reusable defer the whole prompt's commit to the final

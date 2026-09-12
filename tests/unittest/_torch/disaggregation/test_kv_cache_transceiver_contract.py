@@ -85,15 +85,20 @@ def test_bind_normalizes_void_cpp_gen_status_to_empty_typed_result() -> None:
 
 
 def test_v2_early_return_paths_are_typed() -> None:
+    """The short-circuit returns still hand back the declared status types."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     v2 = object.__new__(KvCacheTransceiverV2)
     v2._ever_had_send_session = False
     v2._ctx_need_tp_sync = False
     v2._ctx_need_pp_sync = False
+    v2._transfer_worker = Mock()
     ctx_status = v2.check_context_transfer_status(0)
     assert isinstance(ctx_status, CtxTransferStatus)
     assert ctx_status == CtxTransferStatus([], [])
+    # Returning early is not the same as having nothing to do: this is the rank
+    # that accumulates broadcast entries no send session will ever consume.
+    v2._transfer_worker.sweep_stale_req_infos.assert_called_once_with()
 
     v2._ever_had_recv_session = False
     v2._gen_need_sync = False
