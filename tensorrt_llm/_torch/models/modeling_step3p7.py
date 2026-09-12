@@ -716,11 +716,12 @@ class Step3p7MoE(nn.Module):
         )
 
         self.router_bias = Step3p7RouterBiasHolder(self.num_experts)
+        # Keep routing weights normalized but unscaled. The common output scale
+        # in forward applies the checkpoint factor exactly once for every backend.
         routing_method = Step3p7MoeRoutingMethod(
             top_k=self.top_k,
             num_experts=self.num_experts,
             callable_router_bias=lambda: self.router_bias.router_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         (
@@ -898,16 +899,17 @@ class Step3p7MoE(nn.Module):
         router_logits = self.gate(gate_input)
 
         if self._use_python_clamp and self._clamp_weights_loaded and not self._moe_lora_enabled:
-            # Python path's routing.apply already scales topk_weights.
-            return self._python_clamped_moe_forward(h, router_logits).view(orig_shape)
-
-        routed = self.experts(
-            h,
-            router_logits,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            use_dp_padding=False,
-            lora_params=lora_params,
-        )
+            # The Python loop consumes the same unscaled routing weights as the
+            # separated CUTLASS path, then joins the common output scaling below.
+            routed = self._python_clamped_moe_forward(h, router_logits)
+        else:
+            routed = self.experts(
+                h,
+                router_logits,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                use_dp_padding=False,
+                lora_params=lora_params,
+            )
         # Step3p7 uses the generic MiniMax2 metadata with routeScale=1.0, so apply
         # ``routed_scaling_factor`` to the MoE output here (mathematically
         # equivalent to scaling each topk weight).
