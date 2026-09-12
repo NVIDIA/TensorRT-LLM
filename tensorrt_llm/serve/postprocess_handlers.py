@@ -55,7 +55,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               PromptTokensDetails, ResponsesRequest,
                               ResponsesResponse, StreamOptions, ToolCall,
                               UsageInfo, to_disaggregated_params)
-from .tool_parser.base_tool_parser import BaseToolParser
+from .tool_parser.base_tool_parser import (BaseToolParser,
+                                           warn_if_tool_call_unparsed)
 from .tool_parser.core_types import StreamingParseResult, ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
 
@@ -250,6 +251,9 @@ def apply_tool_parser(args: ChatPostprocArgs,
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
+        if not streaming:
+            warn_if_tool_call_unparsed(args.tool_parser, tool_parser, text,
+                                       calls)
     else:
         normal_text, calls = text, []
 
