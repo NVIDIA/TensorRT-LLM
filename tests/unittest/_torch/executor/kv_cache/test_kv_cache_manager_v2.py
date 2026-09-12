@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_ca
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
+    Role,
     _extend_swa_windows_for_reuse,
     _KVCacheManagerInitStatus,
     _sync_kv_cache_manager_init_status,
@@ -46,12 +47,17 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
+    AttentionLayerConfig,
     BatchDesc,
+    BufferConfig,
+    DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
+    LayerId,
+    SsmLayerConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
@@ -66,7 +72,14 @@ class _CacheTierInitError(Exception):
 @dataclass
 class _FakeManagerConfig:
     cache_tiers: list[object]
-    layers: list[object] = field(default_factory=lambda: [None])
+    layers: list[object] = field(
+        default_factory=lambda: [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=128)],
+            )
+        ]
+    )
 
 
 class _FakeKVCache:
@@ -276,6 +289,160 @@ def test_base_config_uses_local_attention_window_order() -> None:
         128,
         None,
     ]
+
+
+@pytest.mark.parametrize(
+    "num_kv_heads,head_dim",
+    [
+        pytest.param([9, 0, 2, 0, 3], [128] * 5, id="zero-heads"),
+        pytest.param([9, None, 2, None, 3], [128] * 5, id="missing-heads"),
+        pytest.param([9, 2, 2, 3, 3], [128, 0, 128, 0, 64], id="zero-head-dim"),
+    ],
+)
+def test_zero_size_layers_are_removed_before_pool_allocation(
+    num_kv_heads: list[int | None], head_dim: list[int]
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            max_attention_window=[MAX_SEQ_LEN, 8, MAX_SEQ_LEN, 12, TOKENS_PER_BLOCK],
+            pool_ratio=[0.5, 0.5],
+        ),
+        CacheType.SELF,
+        num_layers=4,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        layer_mask=[False, True, True, True, True],
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=16,
+    )
+    try:
+        config = manager.kv_cache_manager_py_config
+        assert manager.num_layers == 5
+        assert manager.num_local_layers == 2
+        assert manager.pp_layers == [2, 4]
+        assert manager.layer_offsets == {2: 0, 4: 1}
+        assert manager.num_kv_heads_per_layer == [2, 3]
+        assert manager.head_dim_per_layer == [head_dim[2], head_dim[4]]
+        assert manager.max_attention_window_vec == [None, TOKENS_PER_BLOCK]
+        assert [layer.layer_id for layer in config.layers] == [0, 1]
+        assert [layer.sliding_window_size for layer in config.layers] == [
+            None,
+            TOKENS_PER_BLOCK,
+        ]
+        assert config.initial_pool_ratio == pytest.approx([0.5, 0.5])
+        assert all(buffer.size > 0 for layer in config.layers for buffer in layer.buffers)
+        assert set(manager.layer_to_pool_mapping_dict) == {0, 1}
+        assert manager.num_pools == 2
+
+        cache = manager._create_kv_cache(0, None, None)
+        assert cache.resume(manager._stream.cuda_stream)
+        assert cache.resize(MAX_SEQ_LEN, 0)
+        assert cache.capacity == MAX_SEQ_LEN
+        for global_layer_id in manager.pp_layers:
+            buffer = manager.get_buffers(global_layer_id)
+            assert buffer.is_cuda
+            assert buffer.shape[0] > 0
+            assert buffer.shape[1:] == (
+                2,
+                TOKENS_PER_BLOCK,
+                num_kv_heads[global_layer_id],
+                head_dim[global_layer_id],
+            )
+            buffer[0].fill_(global_layer_id)
+            assert torch.all(buffer[0] == global_layer_id)
+    finally:
+        manager.shutdown()
+
+
+def test_zero_size_filter_preserves_ssm_and_nonempty_extra_buffers() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.pp_layers = [3, 4, 5]
+    manager.num_layers = 6
+    manager.num_local_layers = 3
+    manager.layer_offsets = {3: 0, 4: 1, 5: 2}
+    manager.num_kv_heads_per_layer = [0, 0, 2]
+    manager.head_dim_per_layer = [128, 128, 64]
+    manager.max_attention_window_vec = [64, None, 128]
+
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=0)],
+                sliding_window_size=64,
+            ),
+            SsmLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=DataRole("ssm_state"), size=256)],
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=1024),
+                    BufferConfig(role=Role.VALUE, size=1024),
+                    BufferConfig(role=Role.INDEX_KEY, size=0),
+                    BufferConfig(role=DataRole("extra_state"), size=32),
+                ],
+                sliding_window_size=128,
+                num_sink_tokens=4,
+            ),
+        ],
+        initial_pool_ratio=[0.25, 0.75],
+        commit_min_snapshot=True,
+    )
+
+    filtered = manager._remove_zero_size_buffers(config)
+
+    assert manager.num_layers == 6
+    assert manager.pp_layers == [4, 5]
+    assert manager.num_local_layers == 2
+    assert manager.layer_offsets == {4: 0, 5: 1}
+    assert manager.num_kv_heads_per_layer == [0, 2]
+    assert manager.head_dim_per_layer == [128, 64]
+    assert manager.max_attention_window_vec == [None, 128]
+    assert [layer.layer_id for layer in filtered.layers] == [0, 1]
+    ssm_layer, attention_layer = filtered.layers
+    assert isinstance(ssm_layer, SsmLayerConfig)
+    assert [(buffer.role, buffer.size) for buffer in ssm_layer.buffers] == [
+        (DataRole("ssm_state"), 256)
+    ]
+    assert isinstance(attention_layer, AttentionLayerConfig)
+    assert attention_layer.sliding_window_size == 128
+    assert attention_layer.num_sink_tokens == 4
+    assert [(buffer.role, buffer.size) for buffer in attention_layer.buffers] == [
+        (Role.KEY, 1024),
+        (Role.VALUE, 1024),
+        (DataRole("extra_state"), 32),
+    ]
+    assert filtered.initial_pool_ratio == pytest.approx([0.25, 0.75])
+
+
+def test_zero_size_filter_rejects_empty_local_cache() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    config = KVCacheManagerConfig(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=0)],
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="at least one non-empty local cache layer"):
+        manager._remove_zero_size_buffers(config)
 
 
 def test_draft_token_relocation_uses_local_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:
