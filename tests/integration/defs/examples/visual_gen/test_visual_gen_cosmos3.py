@@ -428,11 +428,10 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
 
 
 def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/cosmos3/cosmos3.py with FP8 config end-to-end.
+    """Run examples/visual_gen/models/cosmos3/cosmos3.py end-to-end.
 
-    Validates that the Cosmos3-Nano example script and ``configs/cosmos3-nano-1gpu.yaml``
-    work together as documented. Uses the local Cosmos3-Nano checkpoint and
-    the shared FP8 dynamic-quant config.
+    Validates that the Cosmos3-Nano example script runs on engine defaults
+    (no ``--visual_gen_args``) and produces a video from the local checkpoint.
     """
     model_path = _lpips_model_path("Cosmos3-Nano")
     _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
@@ -444,11 +443,7 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
     script_path = os.path.join(
         llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
     )
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "cosmos3-nano-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -456,8 +451,6 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--prompt",
             "A serene mountain landscape with snow-capped peaks and a flowing river",
             "--output_path",

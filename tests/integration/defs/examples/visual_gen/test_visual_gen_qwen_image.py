@@ -369,11 +369,10 @@ def test_qwen_image_layered_lpips_against_golden(tmp_path):
 
 
 def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/qwen_image.py with FP8 config end-to-end.
+    """Run examples/visual_gen/models/qwen_image.py end-to-end on defaults.
 
-    Validates that the Qwen-Image example script and
-    ``configs/qwen-image-fp8-1gpu.yaml`` work together as documented. Uses the
-    local Qwen-Image checkpoint and the shared FP8 blockwise dynamic-quant config.
+    Validates that the Qwen-Image example script runs as documented using the
+    local Qwen-Image checkpoint.
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, QWEN_IMAGE_MODEL_SUBPATH)
@@ -391,11 +390,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     output_path = os.path.join(out_dir, "qwen_image_output.png")
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "qwen_image.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "qwen-image-fp8-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -403,8 +398,6 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--output_path",
             output_path,
         ],
@@ -437,10 +430,6 @@ def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_ve
         llm_root, "examples", "visual_gen", "models", "qwen_image_layered.py"
     )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "qwen-image-layered-1gpu.yaml"
-    )
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -448,8 +437,6 @@ def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_ve
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--image",
             str(input_path),
             "--prompt",
@@ -462,10 +449,9 @@ def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_ve
 
 
 def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv: Any) -> None:
-    """Run examples/visual_gen/models/qwen_image_edit.py end-to-end.
+    """Run examples/visual_gen/models/qwen_image_edit.py end-to-end on defaults.
 
-    Validates that the Qwen-Image-Edit example script and
-    ``configs/qwen-image-edit-2511-fp8-1gpu.yaml`` work together as documented.
+    Validates that the Qwen-Image-Edit example script runs as documented.
     """
     model_path = os.environ.get("QWEN_IMAGE_EDIT_MODEL_PATH") or os.path.join(
         conftest.llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
@@ -485,12 +471,8 @@ def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv:
     output_path = os.path.join(out_dir, "qwen_image_edit_output.png")
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "qwen_image_edit.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "qwen-image-edit-2511-fp8-1gpu.yaml"
-    )
     image_path = os.path.join(llm_root, "examples", "visual_gen", "cat_piano.png")
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
     assert os.path.isfile(image_path), f"Input image not found: {image_path}"
 
     venv_check_call(
@@ -499,8 +481,6 @@ def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv:
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--image",
             image_path,
             "--prompt",

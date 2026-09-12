@@ -459,17 +459,16 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
 
 # =============================================================================
 # Core example tests — run per-model scripts from examples/visual_gen/models/
-# with shared YAML configs from examples/visual_gen/configs/.
+# on engine defaults.
 # =============================================================================
 
 
 def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/wan_t2v.py with NVFP4 config end-to-end.
+    """Run examples/visual_gen/models/wan_t2v.py end-to-end on defaults.
 
-    This is a core example test: it validates that the per-model example script
-    and the shared YAML config work together as documented in the README.
-    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint and the shared
-    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant).
+    Core example test: validates the per-model example script runs as documented.
+    Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint, whose embedded
+    quantization metadata drives NVFP4 without an explicit config.
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
@@ -483,11 +482,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     output_path = os.path.join(out_dir, "wan_t2v_output.mp4")
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_t2v.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "wan2.2-t2v-fp4-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -495,8 +490,6 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--output_path",
             output_path,
         ],
@@ -505,11 +498,12 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
 
 
 def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/wan_i2v.py with NVFP4 config end-to-end.
+    """Run examples/visual_gen/models/wan_i2v.py end-to-end on defaults.
 
-    Validates that the Wan I2V example script and ``configs/wan2.2-i2v-fp4-1gpu.yaml``
-    work together as documented. Uses the pre-quantized Wan 2.2 I2V A14B NVFP4
-    checkpoint and the default input image (cat_piano.png) bundled with the examples.
+    Validates that the Wan I2V example script runs as documented. Uses the
+    pre-quantized Wan 2.2 I2V A14B NVFP4 checkpoint (embedded quantization
+    metadata drives NVFP4) and the default input image (cat_piano.png) bundled
+    with the examples.
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
@@ -524,11 +518,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     output_path = os.path.join(out_dir, "wan_i2v_output.mp4")
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "wan_i2v.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "wan2.2-i2v-fp4-1gpu.yaml"
-    )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
-    assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
     venv_check_call(
         llm_venv,
@@ -536,8 +526,6 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--visual_gen_args",
-            config_path,
             "--output_path",
             output_path,
         ],

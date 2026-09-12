@@ -26,7 +26,6 @@ Generate the control, then run transfer with it:
     python generate_bouncing_ball_control.py --out_dir ./ball_control
 
     python cosmos3.py --model nvidia/Cosmos3-Nano \
-        --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
         --prompt "A photorealistic beach ball with colorful panels bouncing \
                   between the walls of an enclosed room, studio lighting." \
         --extra_params '{"edge": "./ball_control/control.mp4"}' \

@@ -9,37 +9,30 @@ for feature details.
 |---|---|
 | [`quickstart_example.py`](quickstart_example.py) | Minimal VisualGen API example |
 | [`models/`](models/) | Per-model example scripts |
-| [`configs/`](configs/) | Shared `VisualGenArgs` YAMLs (used by `--visual_gen_args` and `trtllm-serve`) |
+| [`configs/`](configs/) | Curated showcase `VisualGenArgs` recipes — multi-GPU / deployment (used by `--visual_gen_args` and `trtllm-serve`) |
 | [`serve/`](serve/) | `trtllm-serve` usage, benchmarking, and clients |
 
 ## Usage
 
-```bash
-# Defaults
-python quickstart_example.py
-python models/wan_t2v.py
-python models/ltx2.py
-python models/flux1.py
-python models/flux2.py
-python models/cosmos3_ti2v.py --prompt "A robot arm picks fruit in a grocery store"
-python models/qwen_image.py
-python models/qwen_image_layered.py --image /path/to/image.png
-python models/qwen_image_edit.py --image /path/to/source.png --prompt "Make the image look like a watercolor painting"
-python models/glm_image.py
-python models/hunyuan_t2v.py
+Each script in [`models/`](models/) runs one model end-to-end on defaults.
+[`configs/`](configs/) holds a small set of curated showcase recipes — multi-GPU
+parallelism layouts and full deployment configs — passed with `--visual_gen_args`.
+Using Wan 2.2 text-to-video as the worked example:
 
-# With engine config (quant, parallelism, etc.)
-python models/wan_t2v.py --visual_gen_args configs/wan2.2-t2v-fp4-1gpu.yaml
-python models/wan_i2v.py --visual_gen_args configs/wan2.2-i2v-fp4-1gpu.yaml --image /path/to/image.png
-python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
-python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
-python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
-python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
-python models/qwen_image.py --visual_gen_args configs/qwen-image-fp8-1gpu.yaml
-python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-1gpu.yaml --image /path/to/image.png
-python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-fp4-1gpu.yaml --image /path/to/source.png --prompt "Make the image look like a watercolor painting"
-python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
+```bash
+# Model defaults (single GPU)
+python models/wan_t2v.py
+
+# With a curated multi-GPU recipe (4-GPU NVFP4)
+torchrun --nproc_per_node=4 models/wan_t2v.py \
+    --visual_gen_args configs/wan2.2-t2v-fp4-4gpu.yaml
 ```
+
+The same shape applies to every script in [`models/`](models/); run one with
+`--help` for model-specific inputs (e.g. `--image`, `--prompt`). Some models
+document mode-specific usage in their own directory (e.g.
+[`models/cosmos3/`](models/cosmos3/)). A minimal API-level example lives in
+[`quickstart_example.py`](quickstart_example.py).
 
 Install deps from the repo root: `pip install -r requirements-dev.txt`.
 

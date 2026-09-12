@@ -16,8 +16,6 @@
 
 Usage:
     python qwen_image_layered.py --image input.png
-    python qwen_image_layered.py --visual_gen_args ../configs/qwen-image-layered-1gpu.yaml \
-        --image input.png
 """
 
 import argparse
