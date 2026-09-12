@@ -280,6 +280,7 @@ class MultimodalEncoderRequestState:
 
 
 if TYPE_CHECKING:
+    from .sampler.embedding_bias import CachedEmbeddingBias
     from .sampler.sampler_strategy import Strategy
 
 
@@ -916,6 +917,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # consumer, so the C++ request no longer carries a copy.
         self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
             "embedding_bias", None)
+        self._py_embedding_bias_cache: Optional["CachedEmbeddingBias"] = None
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
