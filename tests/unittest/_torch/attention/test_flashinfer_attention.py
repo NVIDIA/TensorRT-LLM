@@ -1517,6 +1517,72 @@ class TestSplitKVScratchReset(unittest.TestCase):
             self._reset(untouched, wrapper, is_decode=is_decode)
             self.assertTrue(untouched.eq(self.FILL).all())
 
+    def test_plan_info_layout_matches_flashinfer_0_6_18(self):
+        # The fixtures above build plan vectors from the production layout
+        # constants, so a wrong constant would corrupt fixture and
+        # implementation alike and the extent tests would still pass. Pin the
+        # layout here with the literal FlashInfer 0.6.18 values (PrefillPlanInfo
+        # and DecodePlanInfo::ToVector order in scheduler.cuh) so a constant
+        # edit fails this test instead.
+        self.assertEqual(flashinfer_backend._FI_PREFILL_PLAN_INFO_LEN, 15)
+        self.assertEqual(flashinfer_backend._FI_PLAN_PADDED_BATCH_SIZE, 0)
+        self.assertEqual(flashinfer_backend._FI_PLAN_CTA_TILE_Q, 3)
+        self.assertEqual(flashinfer_backend._FI_PLAN_V_OFFSET, 10)
+        self.assertEqual(flashinfer_backend._FI_PLAN_S_OFFSET, 11)
+        self.assertEqual(flashinfer_backend._FI_PLAN_SPLIT_KV, 14)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_INFO_LEN, 10)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_PADDED_BATCH_SIZE,
+                         0)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_V_OFFSET, 1)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_S_OFFSET, 2)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_SPLIT_KV, 9)
+
+    def test_out_of_range_extent_raises_and_leaves_workspace_untouched(self):
+        # An extent past the workspace end means the pinned plan-info layout
+        # no longer matches the FlashInfer build; the reset must fail loudly
+        # instead of zeroing bytes outside the plan's ranges.
+        for plan_info, is_decode, num_rows in (
+            (self._plan_info(), False,
+             self.PADDED_BATCH_SIZE * self.CTA_TILE_Q * self.NUM_QO_HEADS),
+            (self._decode_plan_info(), True,
+             self.PADDED_BATCH_SIZE * self.NUM_QO_HEADS),
+        ):
+            s_bytes = num_rows * flashinfer_backend._FI_SIZEOF_FLOAT
+            # One byte short of tmp_s's planned end.
+            workspace = torch.full((self.S_OFFSET + s_bytes - 1, ),
+                                   self.FILL,
+                                   dtype=torch.uint8)
+            with self.assertRaisesRegex(RuntimeError, "out of range"):
+                self._reset(workspace,
+                            SimpleNamespace(_plan_info=plan_info),
+                            is_decode=is_decode)
+            self.assertTrue(workspace.eq(self.FILL).all())
+
+    def test_post_init_zeroes_workspace_and_checks_version(self):
+        # The helper tests above would keep passing if
+        # _post_init_with_buffers() stopped zeroing the fresh workspace or
+        # stopped invoking the version guard when the reset is enabled. Drive
+        # the real method with a stub metadata up to the workspace block, then
+        # cut it off at the first CUDA allocation that follows.
+        class _Stop(Exception):
+            pass
+
+        dirty = torch.full((1024, ), self.FILL, dtype=torch.uint8)
+        stub = SimpleNamespace(is_cuda_graph=False,
+                               workspace_buffer=None,
+                               max_num_requests=1,
+                               get_empty=lambda *args, **kwargs: dirty)
+        with mock.patch.object(flashinfer_backend, "_FI_SPLIT_KV_RESET_ENABLED",
+                               True), \
+             mock.patch.object(flashinfer_backend,
+                               "_assert_split_kv_reset_supported") as guard, \
+             mock.patch.object(torch, "empty", side_effect=_Stop):
+            with self.assertRaises(_Stop):
+                FlashInferAttentionMetadata._post_init_with_buffers(stub, None)
+        self.assertIs(stub.workspace_buffer, dirty)
+        self.assertTrue(dirty.eq(0).all())
+        guard.assert_called_once_with()
+
     def test_version_guard_rejects_unpinned_flashinfer(self):
         # The opt-in per-pass reset pins the plan-info offsets to a known
         # FlashInfer version; an unrecognized version must fail loudly rather

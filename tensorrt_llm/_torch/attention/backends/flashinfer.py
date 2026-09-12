@@ -346,8 +346,8 @@ def _assert_split_kv_reset_supported() -> None:
             f"installed flashinfer-python ({version}) is not one of the "
             f"versions the split-KV plan-info offsets were derived against "
             f"({', '.join(_FI_SPLIT_KV_SUPPORTED_VERSIONS)}). Re-derive the "
-            "offsets from scheduler.cuh and update "
-            "_FI_SPLIT_KV_SUPPORTED_VERSIONS, or unset the env var.")
+            "offsets from scheduler.cuh and extend "
+            "_FI_SPLIT_KV_SUPPORTED_VERSIONS, or disable the env var.")
 
 
 @dataclass(kw_only=True)
