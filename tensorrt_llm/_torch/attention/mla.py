@@ -1383,10 +1383,7 @@ class MLA(nn.Module):
                     q.dtype,
                     q.device,
                 )
-            if (
-                trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
-                and get_sm_version() >= 100
-            ):
+            if trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata):
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output
                 )
