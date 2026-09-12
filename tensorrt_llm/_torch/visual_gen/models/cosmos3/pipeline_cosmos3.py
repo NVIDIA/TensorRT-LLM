@@ -2371,6 +2371,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             "text_mask": (cond_mask, uncond_mask),
         }
         self.transformer.reset_cache()
+        denoise_batch_size = latents.shape[0]
+
+        def cfg_batch_transition_fn(step_do_cfg: bool) -> None:
+            if step_do_cfg:
+                self.transformer.reset_cache()
+            else:
+                self.transformer.retain_cfg_conditional_cache(denoise_batch_size)
 
         timer.mark_denoise_start()
         extra_streams = None
@@ -2401,6 +2408,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 else self._conditioning_anchor_post_step(prepared.image_latent)
             ),
             scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            cfg_batch_transition_fn=cfg_batch_transition_fn,
         )
 
         action_latents = prepared.action_latents

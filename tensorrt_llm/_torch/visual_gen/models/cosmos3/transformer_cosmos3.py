@@ -1476,6 +1476,31 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
 
+    def retain_cfg_conditional_cache(self, batch_size: int) -> None:
+        """Keep the conditional half of a standard ``[negative, positive]`` CFG cache."""
+        if self.cached_kv is None:
+            return
+
+        cfg_batch_size = 2 * batch_size
+
+        def conditional_half(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.shape[0] != cfg_batch_size:
+                raise RuntimeError(
+                    "Cosmos3 CFG cache batch does not match the denoiser batch transition: "
+                    f"cache={tensor.shape[0]}, expected={cfg_batch_size}."
+                )
+            return tensor[batch_size:].clone()
+
+        self.cached_kv = [
+            (conditional_half(key), conditional_half(value)) for key, value in self.cached_kv
+        ]
+        if self.cached_freqs_gen is not None:
+            self.cached_freqs_gen = tuple(conditional_half(freq) for freq in self.cached_freqs_gen)
+        if self.cached_freqs_gen_combined is not None:
+            self.cached_freqs_gen_combined = tuple(
+                conditional_half(freq) for freq in self.cached_freqs_gen_combined
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,

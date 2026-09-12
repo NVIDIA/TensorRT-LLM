@@ -1023,6 +1023,12 @@ class BasePipeline(nn.Module):
         do_cfg_parallel = cfg_size >= 2 and guidance_scale > 1.0
 
         local_extras = {}
+        conditional_embeds = prompt_embeds
+        conditional_extras = {
+            name: pos_tensor
+            for name, (pos_tensor, _) in (extra_cfg_tensors or {}).items()
+            if pos_tensor is not None
+        }
 
         if do_cfg_parallel:
             if self.rank == 0:
@@ -1039,6 +1045,7 @@ class BasePipeline(nn.Module):
             else:
                 neg_embeds, pos_embeds = prompt_embeds.chunk(2)
 
+            conditional_embeds = pos_embeds
             local_embeds = pos_embeds if is_conditional else neg_embeds
 
             # Split extra tensors if provided
@@ -1052,6 +1059,8 @@ class BasePipeline(nn.Module):
             local_embeds = None
             if is_split_embeds and guidance_scale > 1.0:
                 prompt_embeds = torch.cat([neg_prompt_embeds, prompt_embeds])
+            elif not is_split_embeds and guidance_scale > 1.0:
+                _, conditional_embeds = prompt_embeds.chunk(2)
 
             # For standard CFG, concatenate extra tensors
             if extra_cfg_tensors:
@@ -1067,6 +1076,8 @@ class BasePipeline(nn.Module):
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
+            "conditional_embeds": conditional_embeds,
+            "conditional_extras": conditional_extras,
         }
 
     def _denoise_step_cfg_parallel(
@@ -1262,6 +1273,7 @@ class BasePipeline(nn.Module):
         guidance_interval: Optional[Tuple[float, float]] = None,
         post_step_fn: Optional[Callable] = None,
         scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
+        cfg_batch_transition_fn: Optional[Callable[[bool], None]] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -1292,8 +1304,8 @@ class BasePipeline(nn.Module):
             boundary_timestep: Optional timestep boundary for two-stage denoising.
                               Switches guidance scale when crossing this threshold.
             guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
-                              is active. Outside the interval the effective scale is 1.0
-                              (conditional prediction only); both branches still run.
+                              is active. Outside the interval the effective scale is 1.0.
+                              Standard batched CFG runs only the conditional branch there.
             post_step_fn: Optional callable applied after each scheduler step.
                          It is invoked as ``post_step_fn(latents,
                          extra_stream_latents) -> (latents, extra_stream_latents)``,
@@ -1302,6 +1314,11 @@ class BasePipeline(nn.Module):
                          Use for constraints that must hold throughout denoising.
             scheduler_step_kwargs: Extra keyword arguments forwarded to every
                          scheduler's ``step()`` call.
+            cfg_batch_transition_fn: Optional callback invoked before a standard
+                         CFG step when the loop switches between a paired CFG batch
+                         and a conditional-only batch. The bool argument is True for
+                         paired CFG. Pipelines with batch-shaped caches can use it to
+                         select or rebuild the matching cache.
 
         Returns:
             Single latents if no extra_streams
@@ -1333,6 +1350,7 @@ class BasePipeline(nn.Module):
         do_cfg_parallel = cfg_config["enabled"]
         prompt_embeds = cfg_config["prompt_embeds"]
         local_extras = cfg_config["local_extras"]
+        previous_step_do_cfg = None
 
         # Extract extra stream latents and schedulers
         extra_stream_latents = {}
@@ -1377,6 +1395,18 @@ class BasePipeline(nn.Module):
                         local_extras,
                     )
                 else:
+                    step_do_cfg = do_cfg and current_guidance_scale > 1.0
+                    if (
+                        previous_step_do_cfg is not None
+                        and step_do_cfg != previous_step_do_cfg
+                        and cfg_batch_transition_fn is not None
+                    ):
+                        cfg_batch_transition_fn(step_do_cfg)
+                    previous_step_do_cfg = step_do_cfg
+                    step_prompt_embeds = (
+                        prompt_embeds if step_do_cfg else cfg_config["conditional_embeds"]
+                    )
+                    step_extras = local_extras if step_do_cfg else cfg_config["conditional_extras"]
                     (
                         noise_pred,
                         extra_noise_preds,
@@ -1387,12 +1417,12 @@ class BasePipeline(nn.Module):
                         extra_stream_latents,
                         i,
                         t,
-                        prompt_embeds,
+                        step_prompt_embeds,
                         forward_fn,
                         current_guidance_scale,
                         guidance_rescale,
-                        local_extras,
-                        do_cfg=do_cfg,
+                        step_extras,
+                        do_cfg=step_do_cfg,
                     )
 
             # Scheduler step for all streams
