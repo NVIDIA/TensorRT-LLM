@@ -25,7 +25,6 @@
 
 #include <gtest/gtest.h>
 
-#include "kvCacheManagerV2PoisonCheck.h"
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>

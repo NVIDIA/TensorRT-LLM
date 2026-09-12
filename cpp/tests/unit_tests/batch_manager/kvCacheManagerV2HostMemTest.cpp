@@ -22,7 +22,6 @@
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 
-#include "kvCacheManagerV2PoisonCheck.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
