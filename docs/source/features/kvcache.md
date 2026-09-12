@@ -94,6 +94,19 @@ Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
 unified pool, so `use_kv_cache_manager_v2` does not apply to them.
 
+For a model whose `layer_types` mixes sliding-window and full-attention layers
+and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager
+derives one attention window per layer from `layer_types` when
+`max_attention_window` is not set: sliding layers get `sliding_window`, full
+layers get `max_seq_len`, and the two window sizes form two layer groups whose
+pools are sized independently. The derived list is logged at startup. Set
+`max_attention_window` explicitly to override the derivation; a single entry
+restores one full-context pool for every layer. With derived windows,
+`pool_ratio` must carry one entry per layer group (two for such a model). If a
+configured `pool_ratio` does not match the derived group count, the manager
+logs a warning and keeps the single-window default, so existing configurations
+continue to run.
+
 Two-model speculative decoding (for example Eagle3 with
 `eagle3_one_model=False`) is not supported by V2: the draft model runs in a
 separate engine with its own KV cache manager, and V2 sizes both managers from

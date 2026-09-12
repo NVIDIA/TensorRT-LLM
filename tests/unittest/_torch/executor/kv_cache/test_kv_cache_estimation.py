@@ -18,11 +18,18 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import (
+    CacheCost,
+    KvCacheCreator,
+    _create_kv_cache_manager,
+    _derive_v2_layer_type_attention_windows,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -959,8 +966,6 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     and OOM risk during KV cache estimation).
     """
 
-    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
-
     captured_kwargs = {}
 
     class _RecordingManager:
@@ -1093,8 +1098,6 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 ) -> None:
     import torch
 
-    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
-
     captured_configs = []
 
     class _RecordingKVCacheManagerV2(KVCacheManagerV2):
@@ -1200,3 +1203,200 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     assert draft_config.pool_ratio == [1.0]
     assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
+
+
+# ---------------------------------------------------------------------------
+# Per-layer attention windows derived from a mixed layer_types schedule
+# ---------------------------------------------------------------------------
+#
+# `_derive_layer_type_attention_windows` (covered in
+# test_layer_type_attention_windows.py) turns a mixed sliding/full
+# `layer_types` schedule into one window per layer for KVCacheManagerV2.
+# `_derive_v2_layer_type_attention_windows` applies it in
+# `_create_kv_cache_manager` (tested here) and in the static per-token cost
+# model the creator splits the GPU budget with (tested in
+# test_kv_cache_budget_split.py), and keeps the single-window default for
+# hybrid linear-attention configs and for a `pool_ratio` that does not match
+# the derived layer groups. The creator also gives one-model speculative
+# layers appended after the decoder stack the full context, and leaves the
+# cross-attention pool alone.
+
+_SLIDING = "sliding_attention"
+_FULL = "full_attention"
+
+
+def _create_manager_and_capture_config(
+    pretrained: SimpleNamespace,
+    kv_cache_config: KvCacheConfig,
+    max_seq_len: int,
+    manager_cls: type[KVCacheManager] | type[KVCacheManagerV2] = KVCacheManagerV2,
+    **factory_overrides: object,
+) -> KvCacheConfig:
+    """Run `_create_kv_cache_manager` with a recording subclass of `manager_cls`
+    and return the `KvCacheConfig` the manager was constructed with.
+    `factory_overrides` replace the default keyword arguments of the factory
+    call (for example `spec_config`, `layer_mask` or `kv_cache_type`)."""
+    captured = []
+
+    class _RecordingManager(manager_cls):
+        def __init__(self, kv_cache_config: KvCacheConfig, *args: object, **kwargs: object) -> None:
+            captured.append(kv_cache_config)
+
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+    model_config.quant_config = None
+
+    factory_kwargs: dict[str, object] = dict(
+        model_engine=None,
+        kv_cache_manager_cls=_RecordingManager,
+        mapping=Mock(),
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=32,
+        max_seq_len=max_seq_len,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=1024,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+    factory_kwargs.update(factory_overrides)
+    _create_kv_cache_manager(**factory_kwargs)
+
+    assert len(captured) == 1
+    return captured[0]
+
+
+def _mixed_schedule_pretrained(layer_types: list[str], **overrides: object) -> SimpleNamespace:
+    fields = dict(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=len(layer_types),
+        vocab_size=32000,
+        layer_types=layer_types,
+        sliding_window=512,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _eagle3_one_model_spec_config(num_draft_hidden_layers: int | None = None) -> SimpleNamespace:
+    """The fields `get_num_spec_layers` and `should_use_separate_draft_kv_cache`
+    read from an Eagle3 one-model speculative config."""
+    return SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+        _use_shared_kv_cache=False,
+        _allow_separate_draft_kv_cache=True,
+        _num_draft_hidden_layers=num_draft_hidden_layers,
+    )
+
+
+def test_create_kv_cache_manager_pool_ratio_arity_mismatch_keeps_single_window() -> None:
+    """A `pool_ratio` written for the single pool (one entry) does not match the
+    two layer groups the derived windows would create. Rather than failing the
+    manager's arity check at startup, the derivation is skipped with a warning
+    and the configuration keeps the single-window default it was written for."""
+    kv_cache_config = KvCacheConfig(pool_ratio=[1.0])
+
+    with patch("tensorrt_llm._torch.pyexecutor._util.logger") as mock_logger:
+        manager_config = _create_manager_and_capture_config(
+            _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+            kv_cache_config,
+            max_seq_len=2048,
+        )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window is None
+    mock_logger.warning_once.assert_called_once()
+    message = mock_logger.warning_once.call_args.args[0]
+    assert "pool_ratio has 1 entries" in message
+    assert "2 layer groups" in message
+
+
+def test_create_kv_cache_manager_pool_ratio_per_layer_group_keeps_derivation() -> None:
+    """One `pool_ratio` entry per derived layer group is the intended pairing."""
+    kv_cache_config = KvCacheConfig(pool_ratio=[0.5, 0.5])
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+    )
+
+    assert manager_config.max_attention_window == [512, 512, 2048, 512]
+    assert manager_config.pool_ratio == [0.5, 0.5]
+
+
+def test_derive_v2_windows_skip_hybrid_linear_configs() -> None:
+    """A hybrid linear-attention model (recurrent layers interleaved with
+    attention layers) keeps the single-window default even when its
+    `layer_types` and `sliding_window` would derive a per-layer list: the
+    static cost model indexes windows by attention-layer position while the
+    manager indexes them by global layer id, so the two would disagree."""
+    model_config = Mock()
+    model_config.pretrained_config = _mixed_schedule_pretrained(
+        [_SLIDING, _FULL, _SLIDING, _FULL], hybrid_override_pattern="M*M*"
+    )
+
+    assert (
+        _derive_v2_layer_type_attention_windows(
+            KvCacheConfig(), KVCacheManagerV2, model_config, max_seq_len=2048
+        )
+        is None
+    )
+
+    # Without the hybrid marker the same schedule derives a per-layer list.
+    model_config.pretrained_config = _mixed_schedule_pretrained([_SLIDING, _FULL, _SLIDING, _FULL])
+    assert _derive_v2_layer_type_attention_windows(
+        KvCacheConfig(), KVCacheManagerV2, model_config, max_seq_len=2048
+    ) == [512, 2048, 512, 2048]
+
+
+@pytest.mark.parametrize(
+    ("layer_mask", "expected_windows"),
+    [
+        (None, [512, 512, 2048, 512, 2048, 2048]),
+        ([True] * 4, [512, 512, 2048, 512]),
+    ],
+    ids=["spec_layers_appended", "target_only_mask"],
+)
+def test_create_kv_cache_manager_keeps_appended_spec_layers_full_context(
+    layer_mask: list[bool] | None,
+    expected_windows: list[int],
+) -> None:
+    """Without a `layer_mask`, `get_pp_layers` appends the one-model speculative
+    layers after the decoder layers and V2 reads the window list modulo its
+    length, so the derived list gets one full-context entry per appended layer.
+    A target-only mask holds the decoder layers alone and needs no extra entry."""
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        KvCacheConfig(),
+        max_seq_len=2048,
+        spec_config=_eagle3_one_model_spec_config(num_draft_hidden_layers=2),
+        layer_mask=layer_mask,
+    )
+
+    assert manager_config.max_attention_window == expected_windows
+
+
+def test_create_kv_cache_manager_cross_pool_keeps_single_window_default() -> None:
+    """The cross-attention pool stores encoder-side KV, which the decoder's
+    `layer_types` do not describe."""
+    kv_cache_config = KvCacheConfig()
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+        kv_cache_type=batch_manager.CacheType.CROSS,
+        num_layers=4,
+        num_kv_heads=8,
+        head_dim=128,
+    )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window is None
