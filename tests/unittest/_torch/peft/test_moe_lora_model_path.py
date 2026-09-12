@@ -22,12 +22,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_afmoe import AfmoeMoE
-from tensorrt_llm._torch.models.modeling_glm import Glm4MoE
-from tensorrt_llm._torch.models.modeling_minimaxm2 import MiniMaxM2MoE
-from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3MoE
+from tensorrt_llm._torch.models.modeling_afmoe import AfmoeDecoderLayer, AfmoeMoE
+from tensorrt_llm._torch.models.modeling_glm import Glm4DecoderLayer, Glm4MoE
+from tensorrt_llm._torch.models.modeling_minimaxm2 import MiniMaxM2DecoderLayer, MiniMaxM2MoE
+from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3DecoderLayer, MiniMaxM3MoE
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralMoE
-from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7MoE
+from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7DecoderLayer, Step3p7MoE
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
@@ -142,6 +142,7 @@ def test_step3p7_moe_forward_passes_lora_params_to_routed_experts() -> None:
         gate=MagicMock(return_value=torch.randn(num_tokens, 2)),
         experts=experts,
         _use_python_clamp=False,
+        _moe_lora_enabled=True,
         routed_scaling_factor=1.0,
     )
 
@@ -153,6 +154,107 @@ def test_step3p7_moe_forward_passes_lora_params_to_routed_experts() -> None:
     )
 
     experts.assert_called_once()
+    assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+
+
+def _make_decoder_layer(decoder_cls: type[torch.nn.Module]) -> tuple[torch.nn.Module, MagicMock]:
+    """Build a lightweight decoder whose real forward reaches a mocked MoE."""
+    decoder = decoder_cls.__new__(decoder_cls)
+    torch.nn.Module.__init__(decoder)
+
+    hidden_states = torch.randn(4, 8)
+    residual = torch.randn_like(hidden_states)
+    decoder.input_layernorm = MagicMock(return_value=(hidden_states, residual))
+    decoder.self_attn = MagicMock(return_value=hidden_states)
+    decoder.post_attention_layernorm = MagicMock(return_value=(hidden_states, residual))
+
+    moe = MagicMock(return_value=hidden_states)
+    if decoder_cls is AfmoeDecoderLayer:
+        decoder.pre_mlp_layernorm = MagicMock(return_value=(hidden_states, residual))
+        decoder.post_mlp_layernorm = MagicMock(return_value=hidden_states)
+        decoder.moe_enabled = True
+        decoder.mlp = moe
+    elif decoder_cls is MiniMaxM2DecoderLayer:
+        decoder.block_sparse_moe = moe
+    elif decoder_cls is MiniMaxM3DecoderLayer:
+        decoder.pre_feed_forward_fusion = False
+        decoder.post_feed_forward_fusion = False
+        decoder.next_layer_layernorm = None
+        decoder.block_sparse_moe = moe
+    elif decoder_cls is Glm4DecoderLayer:
+        glm_moe = Glm4MoE.__new__(Glm4MoE)
+        torch.nn.Module.__init__(glm_moe)
+        glm_moe.forward = moe
+        decoder.mlp = glm_moe
+        decoder.disable_attn_allreduce = False
+        decoder.layer_idx = 0
+        decoder.fusion_config = SimpleNamespace(PRE_MOE_FUSION=False, POST_MOE_FUSION=False)
+        decoder.mapping = SimpleNamespace(tp_size=1, is_multi_node=lambda: True)
+        decoder.next_layer_layernorm = None
+    elif decoder_cls is Step3p7DecoderLayer:
+        decoder.moe = moe
+        decoder.share_expert = MagicMock(return_value=torch.zeros_like(hidden_states))
+        decoder.allreduce = None
+    else:
+        raise AssertionError(f"Unsupported decoder class: {decoder_cls.__name__}")
+
+    return decoder, moe
+
+
+@pytest.mark.parametrize(
+    "decoder_cls",
+    [
+        AfmoeDecoderLayer,
+        MiniMaxM2DecoderLayer,
+        MiniMaxM3DecoderLayer,
+        Glm4DecoderLayer,
+        Step3p7DecoderLayer,
+    ],
+)
+def test_decoder_layer_passes_lora_params_to_moe(
+    decoder_cls: type[torch.nn.Module],
+) -> None:
+    """Decoder layers must preserve request LoRA state at the MoE boundary."""
+    decoder, moe = _make_decoder_layer(decoder_cls)
+    hidden_states = torch.randn(4, 8)
+
+    decoder.forward(
+        position_ids=torch.arange(4),
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(all_rank_num_tokens=[4]),
+        residual=torch.randn_like(hidden_states),
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    moe.assert_called_once()
+    assert moe.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+
+
+def test_step3p7_moe_lora_uses_clamp_capable_expert_path() -> None:
+    """Step3p7 must not bypass routed-expert LoRA through its Python path."""
+    hidden_states = torch.randn(4, 8)
+    experts = MagicMock(return_value=torch.randn_like(hidden_states))
+    python_clamped_forward = MagicMock(return_value=torch.randn_like(hidden_states))
+    fake_self = SimpleNamespace(
+        hidden_size=hidden_states.shape[-1],
+        need_fp32_gate=False,
+        gate=MagicMock(return_value=torch.randn(4, 2)),
+        experts=experts,
+        _use_python_clamp=True,
+        _clamp_weights_loaded=True,
+        _moe_lora_enabled=True,
+        _python_clamped_moe_forward=python_clamped_forward,
+        routed_scaling_factor=1.0,
+    )
+
+    Step3p7MoE.forward(
+        fake_self,
+        hidden_states,
+        SimpleNamespace(all_rank_num_tokens=[4]),
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    python_clamped_forward.assert_not_called()
     assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
 
 

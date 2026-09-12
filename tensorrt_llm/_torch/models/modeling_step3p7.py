@@ -58,9 +58,10 @@ from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import create_moe
+from ..moe.fused_moe import SwigluActivation, create_moe
 from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..moe.fused_moe.routing import MiniMaxM2MoeRoutingMethod
+from ..peft.lora.validation import has_moe_lora_targets
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, create_lm_head_tp_mapping
 from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
@@ -727,6 +728,7 @@ class Step3p7MoE(nn.Module):
             self._use_python_clamp,
             self._python_path_reason,
         ) = _select_python_expert_path(model_config, text_config, layer_idx)
+        self._moe_lora_enabled = has_moe_lora_targets(model_config.lora_config)
 
         self.experts = create_moe(
             num_experts=self.num_experts,
@@ -739,6 +741,7 @@ class Step3p7MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+            activation=SwigluActivation(clamp=self._routed_swiglu_limit),
         )
 
         if self._use_python_clamp:
@@ -894,7 +897,7 @@ class Step3p7MoE(nn.Module):
         gate_input = h.to(torch.float32) if self.need_fp32_gate else h
         router_logits = self.gate(gate_input)
 
-        if self._use_python_clamp and self._clamp_weights_loaded:
+        if self._use_python_clamp and self._clamp_weights_loaded and not self._moe_lora_enabled:
             # Python path's routing.apply already scales topk_weights.
             return self._python_clamped_moe_forward(h, router_logits).view(orig_shape)
 
