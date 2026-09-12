@@ -28,7 +28,11 @@ from tensorrt_llm._torch.models.modeling_glm import Glm4DecoderLayer, Glm4MoE
 from tensorrt_llm._torch.models.modeling_minimaxm2 import MiniMaxM2DecoderLayer, MiniMaxM2MoE
 from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3DecoderLayer, MiniMaxM3MoE
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralMoE
-from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7DecoderLayer, Step3p7MoE
+from tensorrt_llm._torch.models.modeling_step3p7 import (
+    Step3p7Attention,
+    Step3p7DecoderLayer,
+    Step3p7MoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
@@ -314,6 +318,54 @@ def test_step3p7_cutlass_moe_lora_applies_routed_scale_once() -> None:
         routed,
         torch.full_like(hidden_states, routed_scaling_factor),
     )
+
+
+def test_step3p7_attention_applies_lora_to_qkv_and_output() -> None:
+    """Step3p7 attention must retain non-zero QKV and output LoRA contributions."""
+    hidden_states = torch.zeros(1, 4)
+    lora_params = {"enabled_modules": {"attn_qkv", "attn_dense"}}
+    qkv_lora_contribution = torch.ones_like(hidden_states)
+    output_lora_contribution = torch.full_like(hidden_states, 2.0)
+
+    def forward_with_base(base_forward, lora_layers, x, params, layer_idx):
+        assert params is lora_params
+        assert layer_idx == 3
+        assert lora_layers == ("split_qkv_lora", "fused_qkv_lora")
+        return base_forward() + qkv_lora_contribution
+
+    def output_projection(x, *, lora_params, layer_idx):
+        assert lora_params is not None
+        assert lora_params["enabled_modules"] == {"attn_qkv", "attn_dense"}
+        assert layer_idx == 3
+        return x + output_lora_contribution
+
+    fake_self = SimpleNamespace(
+        rope_fusion=True,
+        text_config=SimpleNamespace(num_hidden_layers=8),
+        layer_idx=3,
+        sliding_window=None,
+        qkv_proj=MagicMock(return_value=torch.zeros_like(hidden_states)),
+        splitted_qkv_lora="split_qkv_lora",
+        fused_qkv_lora="fused_qkv_lora",
+        apply_rope=MagicMock(side_effect=lambda qkv, _k, _v, _positions: (qkv, qkv, qkv)),
+        convert_qkv=MagicMock(side_effect=lambda q, k, v: (q, k, v)),
+        forward_impl=MagicMock(side_effect=lambda q, _k, _v, *_args, **_kwargs: q),
+        use_head_wise_gate=False,
+        o_proj=MagicMock(side_effect=output_projection),
+    )
+
+    with patch.object(step3p7_module.LoraLayer, "forward_with_base", side_effect=forward_with_base):
+        output = Step3p7Attention.forward(
+            fake_self,
+            position_ids=torch.arange(1),
+            hidden_states=hidden_states,
+            attn_metadata=SimpleNamespace(),
+            lora_params=lora_params,
+        )
+
+    torch.testing.assert_close(output, torch.full_like(hidden_states, 3.0))
+    assert fake_self.forward_impl.call_args.kwargs["has_lora"] is True
+    assert fake_self.o_proj.call_args.kwargs["lora_params"] is lora_params
 
 
 def test_configurable_moe_forward_impl_forwards_lora_params_to_scheduler():
