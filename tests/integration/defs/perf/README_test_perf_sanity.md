@@ -297,7 +297,7 @@ Test lists are defined in `tests/integration/test_lists/test-db/`.
 | Test Type | File Pattern | Example |
 |-----------|--------------|---------|
 | Single-node aggregated | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_b200_multi_gpus_perf_sanity.yml` |
-| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_b200_multi_nodes_perf_sanity_node2_gpu16.yml` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml` |
 | Multi-node disaggregated | `l0_{gpu_type}_multi_gpus_perf_sanity_ctx{ctx worker count}node{node count per ctx worker}_gpu{gpu count per ctx worker}_gen{gen worker count}node{node count per gen worker}_gpu{gen gpus per gen worker}.yml` | `l0_b200_multi_gpus_perf_sanity_ctx1node1_gpu8_gen1node1_gpu8.yml` |
 
 ### Jenkins Pipeline Configuration
@@ -329,9 +329,41 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 
 By default, `test_perf_sanity.py` fails CI on perf regression for pre-merge stages and only warns for post-merge stages. This is auto-detected from the Jenkins job URL (`PostMerge` substring), not the stage name.
 
-**`FUNCTIONAL-ONLY` stage-name flag**: A pre-merge stage whose name contains `FUNCTIONAL-ONLY` (e.g. `GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4`) still runs the full perf harness — benchmarks execute, metrics are uploaded to OpenSearch, dashboards update — but perf regressions **do not fail CI**. Only functional failures (build errors, crashes, empty output) fail the stage.
+**A pre-merge case does not fail when `main` has already regressed.** Both pipelines
+compare against the same post-merge baseline, so once a regression lands on `main`
+every PR measures the same regressed value and every PR fails a test it did not
+break — blocking the whole queue until a fix merges and everyone rebases. To avoid
+that, `prepare_regressive_test_cases` checks the **latest post-merge document** for
+the same test case: if that value misses the same baseline by more than the same
+pre-merge threshold (10%), the pre-merge case is reported as a warning but does not
+raise. Functional failures still fail the stage as usual.
+
+The comparison deliberately re-evaluates `main`'s value rather than reusing the
+`b_is_regression` the post-merge run recorded, because that verdict was computed at
+the tighter post-merge threshold (5%). Re-evaluating keeps the exemption exactly as
+wide as the failure it prevents: if `main` is only 6% down, a PR reproducing that
+value never fails the 10% gate, so the gate stays armed.
+
+Two things to be aware of when you see that warning:
+
+- While a case is exempt it is exempt **entirely**: a genuine new regression the PR
+  adds on top of `main`'s passes silently. The exempt band is only the range where
+  the gate would have fired on `main`'s own value anyway, but inside it there is no
+  coverage.
+- The exemption clears itself as the rolling baseline absorbs the regression, which
+  also means the regression stops being reported. If you land the fix, the baseline
+  recovers and the gate re-arms at the original level; if nobody does, it re-arms at
+  the lowered one. Check the post-merge trend before assuming a green stage means the
+  case is healthy.
+
+See [README_perf_regression_system.md](README_perf_regression_system.md) for the full
+rule and how to force gating back on.
+
+**`FUNCTIONAL-ONLY` stage-name flag**: A pre-merge stage whose name contains `FUNCTIONAL-ONLY` still runs the full perf harness — benchmarks execute, metrics are uploaded to OpenSearch, dashboards update — but perf regressions **do not fail CI**. Only functional failures (build errors, crashes, empty output) fail the stage.
 
 Use this for pre-merge stages whose goal is to catch functional regressions on paths that only had post-merge coverage before. It preserves the data-continuity benefit of running in pre-merge (baselines still update from PR data points) without the flakiness cost of gating on the noisier disagg perf numbers.
+
+**No stage currently sets this flag.** Pre-merge perf-sanity is single-node `ctx_only` only, and every `ctx_only` case gates on perf; the multi-node disagg cases that used it are post-merge only. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
 
 Detection is by substring match on `os.environ["stageName"]` inside `test_perf_sanity.py`; no changes to `perf_regression_utils.py`.
 
