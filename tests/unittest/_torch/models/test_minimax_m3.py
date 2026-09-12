@@ -38,9 +38,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3DecoderLayer,
     MiniMaxM3Model,
+    MiniMaxM3MoE,
     _build_swiglu_oai_dense_mlp,
     _minimax_m3_swiglu_oai,
+    _moe_routed_output_is_global,
     _strip_language_model_prefix,
     _validate_sparse_attention_runtime_config,
     _wrap_dict_as_config,
@@ -52,10 +55,12 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
+from tensorrt_llm._torch.utils import AuxStreamType, EventType
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -67,6 +72,145 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+class _M3CompositionGate(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
+class _M3CompositionExperts(nn.Module):
+    def __init__(self, scheduler_kind: MoESchedulerKind) -> None:
+        super().__init__()
+        self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, **kwargs: object
+    ) -> torch.Tensor:
+        del router_logits, kwargs
+        return torch.full_like(hidden_states, 3.0)
+
+
+class _M3CompositionShared(nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(hidden_states, 2.0)
+
+
+class _M3CompositionAllReduce(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs = []
+        self.params = []
+
+    def forward(
+        self, value: torch.Tensor, *, all_reduce_params: object | None = None
+    ) -> torch.Tensor:
+        self.inputs.append(value.clone())
+        self.params.append(all_reduce_params)
+        return value * 4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "scheduler_kind, expected, reduced_input",
+    [
+        (MoESchedulerKind.EXTERNAL_COMM, 20.0, 5.0),
+        (MoESchedulerKind.FUSED_COMM, 11.0, 2.0),
+    ],
+)
+def test_minimax_m3_moe_reduces_only_local_terms(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_kind: MoESchedulerKind,
+    expected: float,
+    reduced_input: float,
+) -> None:
+    """An already-global routed result must not enter M3's TP AllReduce."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.maybe_execute_in_parallel",
+        lambda routed, shared, *_args, **_kwargs: (routed(), shared()),
+    )
+    moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
+    nn.Module.__init__(moe)
+    moe.gate = _M3CompositionGate()
+    moe.experts = _M3CompositionExperts(scheduler_kind)
+    moe.shared_experts = _M3CompositionShared()
+    moe.routed_output_is_global = _moe_routed_output_is_global(moe.experts)
+    moe.allreduce = _M3CompositionAllReduce()
+    moe.event_dict = {EventType.Main: None, EventType.MoeShared: None}
+    moe.aux_stream = None
+
+    hidden_states = torch.ones((2, 4))
+    output = moe(hidden_states, SimpleNamespace(all_rank_num_tokens=None))
+
+    torch.testing.assert_close(output, torch.full_like(hidden_states, expected))
+    assert len(moe.allreduce.inputs) == 1
+    torch.testing.assert_close(
+        moe.allreduce.inputs[0], torch.full_like(hidden_states, reduced_input)
+    )
+    assert moe.allreduce.params == [None]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "scheduler_kind, expected_post_fusion",
+    [
+        (MoESchedulerKind.EXTERNAL_COMM, True),
+        (MoESchedulerKind.FUSED_COMM, False),
+    ],
+)
+def test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_kind: MoESchedulerKind,
+    expected_post_fusion: bool,
+) -> None:
+    """A fused-communication MoE must not schedule a second boundary reduction."""
+
+    monkeypatch.setenv("TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED", "0")
+
+    class _DecoderComponent(nn.Module):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            super().__init__()
+
+    class _DecoderMoE(_DecoderComponent):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+            self.routed_output_is_global = _moe_routed_output_is_global(self)
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.MiniMaxM3Attention",
+        _DecoderComponent,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.MiniMaxM3MoE",
+        _DecoderMoE,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.RMSNorm",
+        _DecoderComponent,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.AllReduce",
+        _DecoderComponent,
+    )
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        mapping=Mapping(world_size=2, rank=0, tp_size=2),
+    )
+
+    layer = MiniMaxM3DecoderLayer(
+        model_config=model_config,
+        layer_idx=3,
+        aux_stream_dict={
+            AuxStreamType.Attention: None,
+            AuxStreamType.MoeShared: None,
+        },
+    )
+
+    assert layer.enable_fusion
+    assert layer.pre_feed_forward_fusion
+    assert layer.post_feed_forward_fusion is expected_post_fusion
 
 
 @pytest.mark.parametrize(
