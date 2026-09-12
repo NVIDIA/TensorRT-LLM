@@ -685,13 +685,47 @@ class ClampedGatedMLP(GatedMLP):
         )
         self.swiglu_limit = swiglu_limit
 
-    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens=None,
+        final_all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         if self.swiglu_limit is None:
-            return super().forward(hidden_states, **kwargs)
-        gate, up = self.gate_up_proj(hidden_states).chunk(2, dim=-1)
+            return super().forward(
+                hidden_states,
+                all_rank_num_tokens=all_rank_num_tokens,
+                final_all_reduce_params=final_all_reduce_params,
+                lora_params=lora_params,
+                **kwargs,
+            )
+        if bool(lora_params):
+            assert self.layer_idx is not None, "layer_idx is required for lora"
+            if self._uneven_tp_blocks_lora:
+                raise NotImplementedError(
+                    "LoRA is not supported with uneven TP for ClampedGatedMLP "
+                    "(intermediate_size not divisible by tp_size)."
+                )
+            gate_up = LoraLayer.forward_with_base(
+                lambda: self.gate_up_proj(hidden_states),
+                (self.splitted_gate_up_lora, self.fused_gate_up_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            gate_up = self.gate_up_proj(hidden_states)
+        gate, up = gate_up.chunk(2, dim=-1)
         gate = torch.nn.functional.silu(gate).clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        return self.down_proj(gate * up)
+        return self.down_proj(
+            gate * up,
+            all_reduce_params=final_all_reduce_params,
+            lora_params=lora_params,
+            layer_idx=self.layer_idx,
+        )
 
 
 class Step3p7MoE(nn.Module):
@@ -1050,12 +1084,12 @@ class Step3p7DecoderLayer(DecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.moe is not None:
             routed = self.moe(hidden_states, attn_metadata, lora_params=lora_params)
-            shared = self.share_expert(hidden_states)
+            shared = self.share_expert(hidden_states, lora_params=lora_params)
             hidden_states = routed + shared
             if self.allreduce is not None:
                 hidden_states = self.allreduce(hidden_states)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, lora_params=lora_params)
         return hidden_states, residual
 
 
