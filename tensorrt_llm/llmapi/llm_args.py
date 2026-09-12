@@ -71,7 +71,8 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
-from ..tokenizer import TOKENIZER_ALIASES
+from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
+from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -1637,12 +1638,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
-# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) is
-# imported from `tensorrt_llm.tokenizer`, which is where the built-in custom
-# tokenizers live. It used to be duplicated here, and the copy drifted: it was
-# missing every alias added after it, so `--custom_tokenizer <alias>` failed
-# with "not enough values to unpack" for those while the identical alias worked
-# through `load_custom_tokenizer`.
+# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) lives in
+# `tensorrt_llm.tokenizer`, where the built-in custom tokenizers register
+# themselves, and is re-exported from here. It used to be duplicated here, and
+# the copy drifted: it was missing every alias added after it, so
+# `--custom_tokenizer <alias>` failed with "not enough values to unpack" for
+# those. `custom_tokenizer` now resolves through `load_custom_tokenizer`, the
+# same loader every other entry point uses.
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
@@ -5228,27 +5230,15 @@ class BaseLlmArgs(StrictBaseModel):
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            # Resolve short aliases via the module-level TOKENIZER_ALIASES.
-            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
-                                                   self.custom_tokenizer)
-
-            # Dynamically import and use custom tokenizer
-            from importlib import import_module
-            try:
-                module_path, class_name = tokenizer_path.rsplit('.', 1)
-                module = import_module(module_path)
-                tokenizer_class = getattr(module, class_name)
-                # Use tokenizer path if specified, otherwise use model path
-                load_path = self.tokenizer if self.tokenizer else self.model
-                self.tokenizer = tokenizer_class.from_pretrained(
-                    load_path,
-                    trust_remote_code=self.trust_remote_code,
-                    use_fast=self.tokenizer_mode != 'slow')
-            except (ValueError, ImportError, AttributeError) as e:
-                raise ValueError(
-                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
-                    "Expected format: 'module.path.ClassName' or a recognized alias."
-                ) from e
+            # Use tokenizer path if specified, otherwise use model path.
+            load_path = self.tokenizer if self.tokenizer else self.model
+            # The one loader for aliases and import paths; it raises
+            # ValueError("Failed to load custom tokenizer ...") on failure.
+            self.tokenizer = load_custom_tokenizer(
+                self.custom_tokenizer,
+                load_path,
+                trust_remote_code=self.trust_remote_code,
+                use_fast=self.tokenizer_mode != 'slow')
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
