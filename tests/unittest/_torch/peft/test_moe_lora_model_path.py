@@ -17,11 +17,12 @@ that a non-empty lora_params is forwarded:
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+import tensorrt_llm._torch.models.modeling_step3p7 as step3p7_module
 from tensorrt_llm._torch.models.modeling_afmoe import AfmoeDecoderLayer, AfmoeMoE
 from tensorrt_llm._torch.models.modeling_glm import Glm4DecoderLayer, Glm4MoE
 from tensorrt_llm._torch.models.modeling_minimaxm2 import MiniMaxM2DecoderLayer, MiniMaxM2MoE
@@ -256,6 +257,63 @@ def test_step3p7_moe_lora_uses_clamp_capable_expert_path() -> None:
 
     python_clamped_forward.assert_not_called()
     assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+
+
+def test_step3p7_cutlass_moe_lora_applies_routed_scale_once() -> None:
+    """Separated routing and the common output path must not both scale MoE output."""
+    routed_scaling_factor = 3.0
+    text_config = SimpleNamespace(
+        hidden_size=4,
+        moe_num_experts=2,
+        moe_top_k=2,
+        moe_intermediate_size=8,
+        moe_router_scaling_factor=routed_scaling_factor,
+        need_fp32_gate=False,
+        torch_dtype=torch.float32,
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=text_config,
+        mapping=SimpleNamespace(enable_attention_dp=True, tp_size=1),
+        lora_config=object(),
+    )
+    experts = MagicMock()
+
+    with (
+        patch.object(step3p7_module, "Linear", return_value=MagicMock()),
+        patch.object(step3p7_module, "_select_python_expert_path", return_value=(1.0, False, "")),
+        patch.object(step3p7_module, "has_moe_lora_targets", return_value=True),
+        patch.object(step3p7_module, "create_moe", return_value=experts) as create_moe,
+    ):
+        moe = Step3p7MoE(model_config, layer_idx=0, aux_stream_dict={})
+
+    routing_method = create_moe.call_args.kwargs["routing_method"]
+    moe.router_bias.router_bias.data.zero_()
+    router_logits = torch.zeros(1, text_config.moe_num_experts)
+    moe.gate.return_value = router_logits
+    moe._use_python_clamp = True
+    moe._clamp_weights_loaded = True
+
+    def separated_experts(
+        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        _, routing_weights = routing_method.apply(logits)
+        return routing_weights.sum(dim=-1, keepdim=True).expand_as(hidden_states)
+
+    experts.side_effect = separated_experts
+    hidden_states = torch.ones(1, text_config.hidden_size)
+
+    routed = moe(
+        hidden_states,
+        SimpleNamespace(all_rank_num_tokens=[1]),
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    torch.testing.assert_close(
+        routed,
+        torch.full_like(hidden_states, routed_scaling_factor),
+    )
 
 
 def test_configurable_moe_forward_impl_forwards_lora_params_to_scheduler():
