@@ -2,22 +2,26 @@ import asyncio
 import atexit
 import os
 import queue
-import socket
 import threading
 import time
 import traceback
 import weakref
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import zmq
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.visual_gen.launch import (
+    LaunchPlan,
+    find_free_port,
+    resolve_launch_plan,
+    start_workers,
+)
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
@@ -34,110 +38,18 @@ if TYPE_CHECKING:
 POLL_TIMEOUT = 0.01
 AWAIT_TIMEOUT = 0.05
 THREAD_TIMEOUT = 5.0
-WORKER_TIMEOUT = 2.0
-WORKER_SPAWN_SHUTDOWN_TIMEOUT = 5.0
 
 # Module-local seams keep lifecycle tests from monkeypatching process-wide
 # module objects used by unrelated threads and tests.
 _Event = threading.Event
 _Thread = threading.Thread
-_get_mp_context = mp.get_context
 _register_atexit = atexit.register
-_get_process_id = os.getpid
 _start_coordinator_watchdog = start_coordinator_watchdog
 
 
 # Default cap on the size of the iteration-stats snapshot buffer used by the
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
 _DEFAULT_ITER_STATS_MAX = 1000
-
-
-def _reap_worker_process(process: mp.Process) -> bool:
-    worker_pid = process.pid
-    if worker_pid is None:
-        return False
-    process.join(timeout=WORKER_TIMEOUT)
-    if process.is_alive():
-        logger.warning(f"DiffusionClient: Terminating worker {worker_pid} with SIGTERM")
-        process.terminate()
-        process.join(timeout=WORKER_TIMEOUT)
-        if process.is_alive():
-            logger.warning(f"DiffusionClient: Force killing worker {worker_pid} with SIGKILL")
-            process.kill()
-            process.join(timeout=WORKER_TIMEOUT)
-    return True
-
-
-class _WorkerProcessSpawner:
-    """Spawn workers off the signal-handling thread and reap late starts."""
-
-    def __init__(self, processes: List[mp.Process]):
-        self._processes = processes
-        self._spawn_cancelled = _Event()
-        self._spawn_complete = _Event()
-        self._thread_entered = _Event()
-        self._reap_locks = {id(process): threading.Lock() for process in processes}
-        self._reaped_process_ids: Set[int] = set()
-        self._spawn_error: Optional[BaseException] = None
-        self._thread = _Thread(
-            target=self._run,
-            name="visualgen-worker-process-spawner",
-            daemon=True,
-        )
-
-    def start(self) -> None:
-        try:
-            self._thread.start()
-        except BaseException as e:
-            # A main-thread signal can interrupt Thread.start() after the OS
-            # thread exists but before start() returns. Give that thread a
-            # chance to publish its entry before declaring the batch inert.
-            self._thread_entered.wait(timeout=THREAD_TIMEOUT)
-            if not self._thread_entered.is_set():
-                self._spawn_error = e
-                self._spawn_complete.set()
-            raise
-
-    def cancel_spawn(self) -> None:
-        self._spawn_cancelled.set()
-
-    def wait_for_spawn(self, timeout: Optional[float] = None, *, raise_error: bool = True) -> bool:
-        if not self._spawn_complete.wait(timeout=timeout):
-            if raise_error:
-                raise TimeoutError(
-                    f"VisualGen worker process spawn did not complete within {timeout:.0f}s"
-                )
-            return False
-        if raise_error and self._spawn_error is not None:
-            raise self._spawn_error
-        return True
-
-    def reap_started_processes(self) -> None:
-        for process in self._processes:
-            process_id = id(process)
-            with self._reap_locks[process_id]:
-                if process_id in self._reaped_process_ids:
-                    continue
-                if _reap_worker_process(process):
-                    self._reaped_process_ids.add(process_id)
-
-    def _run(self) -> None:
-        try:
-            self._thread_entered.set()
-            for process in self._processes:
-                if self._spawn_cancelled.is_set():
-                    break
-                process.start()
-        except BaseException as e:
-            self._spawn_error = e
-            logger.error(f"VisualGen worker process spawn failed: {e}")
-        finally:
-            self._thread_entered.set()
-            self._spawn_complete.set()
-            # Process.start() may publish its pid after shutdown's bounded
-            # wait. Reap that late worker before this short-lived thread exits.
-            if self._spawn_cancelled.is_set():
-                self.reap_started_processes()
 
 
 class _IterationStatsTracker:
@@ -267,68 +179,6 @@ class _IterationStatsTracker:
         """Return a single snapshot of the *current* state (no buffering)."""
         with self._lock:
             return self._snapshot_locked(num_queued_requests)
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def get_ip_address() -> str:
-    """Get local IP address."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
-def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
-    """Detect whether the process was launched by an external distributed launcher.
-
-    Checks for torchrun (``RANK`` + ``WORLD_SIZE``) and then SLURM
-    (``SLURM_PROCID`` + ``SLURM_NTASKS``).  Returns a
-    ``(rank, local_rank, world_size, master_addr, master_port)`` tuple when a
-    multi-process launcher is detected (world_size > 1), or ``None`` for
-    single-process / single-node ``mp.Process`` mode.
-    """
-    # torchrun / torchelastic sets RANK and WORLD_SIZE
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        if world_size > 1:
-            local_rank = int(os.environ.get("LOCAL_RANK", rank))
-            master_addr = os.environ.get("MASTER_ADDR")
-            if master_addr is None:
-                raise RuntimeError(
-                    "MASTER_ADDR must be set for multi-node torchrun runs. "
-                    "Add --master-addr=<node0-ip> to your torchrun command, or set "
-                    "MASTER_ADDR in the environment before launching."
-                )
-            master_port = int(os.environ.get("MASTER_PORT", 29500))
-            return rank, local_rank, world_size, master_addr, master_port
-
-    # SLURM: srun --ntasks-per-node=GPUS_PER_NODE sets SLURM_PROCID / SLURM_NTASKS
-    if "SLURM_PROCID" in os.environ and "SLURM_NTASKS" in os.environ:
-        rank = int(os.environ["SLURM_PROCID"])
-        world_size = int(os.environ["SLURM_NTASKS"])
-        if world_size > 1:
-            local_rank = int(os.environ.get("SLURM_LOCALID", rank))
-            master_addr = os.environ.get("MASTER_ADDR")
-            if master_addr is None:
-                raise RuntimeError(
-                    "MASTER_ADDR must be set for multi-node SLURM runs. "
-                    "Add to your sbatch script:\n"
-                    "  MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -1)"
-                )
-            master_port = int(os.environ.get("MASTER_PORT", 29500))
-            return rank, local_rank, world_size, master_addr, master_port
-
-    return None
 
 
 def _cuda_memory_logging_enabled() -> bool:
@@ -755,12 +605,23 @@ def run_diffusion_worker(
     local_rank: Optional[int] = None,
     in_client_process: bool = False,
     parent_pid: Optional[int] = None,
+    disable_mpi_env: bool = True,
+    pg_timeout: Optional[timedelta] = None,
 ):
     """Entry point for worker process.
 
     ``in_client_process``: True only when this worker runs inside the client
     process. Declared by the launch site — never derive it from the
     environment here, the env writes below make every worker look external.
+
+    ``disable_mpi_env``: when True, sets ``TLLM_DISABLE_MPI=1`` so shared
+    TRT-LLM helpers resolve ranks via torch.distributed instead of MPI.
+    MGMN workers pass False: they run inside persistent MPI rank processes
+    where that env write would corrupt rank resolution for anything sharing
+    the process.
+
+    ``pg_timeout``: explicit ``torch.distributed`` process-group timeout;
+    ``None`` keeps the PyTorch default.
     """
     # This native watchdog starts before CUDA, distributed, or model
     # initialization and does not depend on the Python GIL. It follows the
@@ -781,7 +642,8 @@ def run_diffusion_worker(
         logger.set_level(log_level)
 
         # Setup distributed env — use PyTorch distributed, not MPI
-        os.environ["TLLM_DISABLE_MPI"] = "1"
+        if disable_mpi_env:
+            os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["RANK"] = str(rank)
@@ -812,6 +674,7 @@ def run_diffusion_worker(
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             init_method="env://",
+            timeout=pg_timeout,
             world_size=world_size,
             rank=rank,
             device_id=torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else None,
@@ -845,71 +708,28 @@ class DiffusionRemoteClient:
     entry point is :class:`tensorrt_llm.visual_gen.VisualGen`, which resolves
     every request's seed before reaching :meth:`enqueue_requests`.
 
-    Supports two launch modes:
-
-    **Single-node (default)**
-        ``VisualGen`` is called from an ordinary Python script.
-        ``DiffusionRemoteClient`` spawns all worker processes locally via
-        ``mp.Process`` with ``master_addr=127.0.0.1``. Each worker starts a
-        native coordinator watchdog before model initialization and exits if
-        this coordinator process dies. The watchdog uses a pidfd where
-        available and falls back to low-frequency parent-PID polling. The
-        coordinator also monitors worker liveness and terminates the remaining
-        local ranks after one exits.
-
-    **Multi-node (external launcher)**
-        The script is launched by ``torchrun`` or ``srun --ntasks-per-node=GPUS``.
-        Each rank runs the same script; ``RANK`` / ``WORLD_SIZE`` / ``MASTER_ADDR``
-        / ``MASTER_PORT`` are already set in the environment.
-
-        - Rank 0: becomes the request coordinator.  It creates the ZMQ server
-          sockets and starts its own worker in a background thread, then returns
-          to the caller so the user script can call ``generate()``.
-        - Rank > 0: handled by ``VisualGen.__init__`` before this class is
-          instantiated — they call ``run_diffusion_worker`` directly and exit
-          via ``sys.exit(0)``.  These ranks never reach ``DiffusionRemoteClient``.
-
-        The external launcher owns sibling-rank cleanup. ``torchrun`` monitors
-        and terminates its worker group. ``srun`` deployments must enable
-        ``KillOnBadExit`` or ``--kill-on-bad-exit`` to provide that guarantee.
+    The launch mode and topology come from a :class:`LaunchPlan` resolved by
+    :mod:`tensorrt_llm._torch.visual_gen.launch`; this class binds its ZMQ
+    server sockets and asks that module to bring the workers up, then observes
+    them through a :class:`WorkerHandle`. In EXTERNAL mode it is always the
+    rank-0 process — ranks 1..N-1 became workers in ``VisualGen.__init__`` and
+    never reach here.
     """
 
     def __init__(
         self,
         args: VisualGenArgs,
+        plan: Optional[LaunchPlan] = None,
     ):
         self.args = args
         self.n_workers = args.parallel_config.n_workers
+        self.plan = plan if plan is not None else resolve_launch_plan(self.n_workers)
 
-        # --- Detect external launcher (torchrun / srun) ---
-        ext = _detect_external_launch()
-
-        if ext is None:
-            # Single-node: coordinator spawns all workers locally
-            # Setup distributed env
-            self.master_addr = "127.0.0.1"
-            self.master_port = find_free_port()
-
-            # Setup IPC addresses
-            self.host_ip = get_ip_address()
-            req_port, resp_port = find_free_port(), find_free_port()
-
-            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-            self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
-            self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
-
-        else:
-            # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
-            rank, local_rank, world_size, master_addr, master_port = ext
-            req_port = find_free_port()
-            resp_port = find_free_port()
-            self.master_addr = master_addr
-            self.master_port = master_port
-            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-            self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
-            self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
+        req_port, resp_port = find_free_port(), find_free_port()
+        self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
+        self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+        self.req_addr_connect = f"tcp://{self.plan.ipc_host}:{req_port}"
+        self.resp_addr_connect = f"tcp://{self.plan.ipc_host}:{resp_port}"
 
         # Generate shared HMAC keys for IPC authentication
         self.req_hmac_key = os.urandom(32)
@@ -943,10 +763,9 @@ class DiffusionRemoteClient:
         self._shutdown_complete = _Event()
         self._shutdown_error: Optional[BaseException] = None
         self._shutdown_thread: Optional[threading.Thread] = None
-        self.worker_processes: List[mp.Process] = []
-        self._worker_spawner: Optional[_WorkerProcessSpawner] = None
-        self._ext_worker_thread: Optional[threading.Thread] = None
-        self._monitor_worker_liveness = False
+        # None until the workers are up; the background thread starts first
+        # and polls liveness before then.
+        self._workers = None
         self._worker_failure: Optional[str] = None
         self._request_to_send: Optional[DiffusionRequest] = None
 
@@ -970,63 +789,19 @@ class DiffusionRemoteClient:
         _register_atexit(DiffusionRemoteClient._atexit_shutdown, weakref.ref(self))
 
         try:
-            if ext is None:
-                logger.info(f"DiffusionClient: Launching {self.n_workers} workers")
-                ctx = _get_mp_context("spawn")
-                parent_pid = _get_process_id()
-                for rank in range(self.n_workers):
-                    p = ctx.Process(
-                        target=run_diffusion_worker,
-                        kwargs={
-                            "rank": rank,
-                            "world_size": self.n_workers,
-                            "master_addr": self.master_addr,
-                            "master_port": self.master_port,
-                            "request_queue_addr": self.req_addr_connect,
-                            "response_queue_addr": self.resp_addr_connect,
-                            "visual_gen_args": self.args,
-                            "req_hmac_key": self.req_hmac_key,
-                            "resp_hmac_key": self.resp_hmac_key,
-                            "log_level": logger.level,
-                            "local_rank": rank,
-                            "parent_pid": parent_pid,
-                        },
-                    )
-                    self.worker_processes.append(p)
-
-                # Process.start() can block during spawn bootstrap. Run the
-                # finite spawn batch away from Python's signal-handling thread
-                # so shutdown can remain bounded. This thread exits as soon as
-                # spawning finishes; worker lifetime follows the coordinator
-                # process through the native watchdog instead.
-                self._worker_spawner = _WorkerProcessSpawner(self.worker_processes)
-                self._worker_spawner.start()
-                self._worker_spawner.wait_for_spawn()
-                self._monitor_worker_liveness = True
-            else:
-                # External launch: rank 0 runs its own worker in a background thread.
-                # Other nodes' workers are already running (they were launched by the
-                # external launcher and will connect to our ZMQ server once it binds).
-                self._ext_worker_thread = _Thread(
-                    target=run_diffusion_worker,
-                    kwargs={
-                        "rank": rank,
-                        "world_size": self.n_workers,
-                        "master_addr": master_addr,
-                        "master_port": master_port,
-                        "request_queue_addr": self.req_addr_connect,
-                        "response_queue_addr": self.resp_addr_connect,
-                        "visual_gen_args": self.args,
-                        "req_hmac_key": self.req_hmac_key,
-                        "resp_hmac_key": self.resp_hmac_key,
-                        "log_level": logger.level,
-                        "local_rank": local_rank,
-                        "in_client_process": True,
-                    },
-                    daemon=True,
-                )
-                self._ext_worker_thread.start()
-                self._monitor_worker_liveness = True
+            self._workers = start_workers(
+                self.plan,
+                worker_fn=run_diffusion_worker,
+                worker_kwargs={
+                    "request_queue_addr": self.req_addr_connect,
+                    "response_queue_addr": self.resp_addr_connect,
+                    "visual_gen_args": self.args,
+                    "req_hmac_key": self.req_hmac_key,
+                    "resp_hmac_key": self.resp_hmac_key,
+                    "log_level": logger.level,
+                },
+                event_loop=self._event_loop,
+            )
 
             self._wait_ready()
         except BaseException:
@@ -1353,31 +1128,9 @@ class DiffusionRemoteClient:
             await asyncio.sleep(POLL_TIMEOUT)
 
     def _check_worker_liveness(self) -> Optional[str]:
-        if (
-            not self._monitor_worker_liveness
-            or self._worker_failure is not None
-            or self._shutdown_started
-        ):
+        if self._workers is None or self._worker_failure is not None or self._shutdown_started:
             return None
-
-        dead_workers = []
-        for process in self.worker_processes:
-            if not process.is_alive():
-                dead_workers.append((process.pid, process.exitcode))
-        external_worker_dead = (
-            self._ext_worker_thread is not None and not self._ext_worker_thread.is_alive()
-        )
-        if not dead_workers and not external_worker_dead:
-            return None
-
-        if dead_workers:
-            statuses = ", ".join(
-                f"pid={worker_pid}, exitcode={exitcode}" for worker_pid, exitcode in dead_workers
-            )
-            detail = f"local worker processes exited: {statuses}"
-        else:
-            detail = "external-launch worker thread exited"
-        return f"DiffusionClient: {detail}"
+        return self._workers.liveness_failure()
 
     def _abort_worker_group(self, worker_failure: str) -> None:
         """Record a terminal worker failure, then kill and reap the worker group."""
@@ -1392,23 +1145,31 @@ class DiffusionRemoteClient:
         self.response_event.set()
 
         try:
-            # A surviving rank may be blocked in a collective that can never
-            # complete after another rank exits, so containment is immediate.
-            for process in self.worker_processes:
-                if process.is_alive():
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-
-            worker_spawner = getattr(self, "_worker_spawner", None)
-            if worker_spawner is not None:
-                worker_spawner.reap_started_processes()
-            else:
-                for process in self.worker_processes:
-                    _reap_worker_process(process)
+            if self._workers.must_be_signaled_to_exit:
+                self._signal_workers_to_exit()
+            self._workers.abort()
         finally:
             self._discard_unsent_request(request_to_discard)
+
+    def _signal_workers_to_exit(self) -> None:
+        """Ask a worker group this client cannot kill to stop itself.
+
+        Best-effort and non-blocking: the rank-0 worker may be the one that
+        died, leaving the request socket without a peer. Reaching it only ends
+        its request recv — a surviving rank still tears its process group down
+        against dead peers, so exit stays bounded by the group timeout.
+        """
+        if self.requests_ipc is None:
+            return
+        try:
+            self.requests_ipc.put_nowait(None)
+        except zmq.Again:
+            logger.info(
+                "DiffusionClient: request socket has no peer; the rank-0 worker "
+                "cannot be signaled and must be reaped by the launcher"
+            )
+        except Exception as e:
+            logger.warning(f"DiffusionClient: Failed to signal the worker group: {e}")
 
     def shutdown(self):
         """Shutdown client and workers."""
@@ -1458,23 +1219,8 @@ class DiffusionRemoteClient:
         try:
             logger.info("DiffusionClient: Shutting down")
 
-            worker_spawner = getattr(self, "_worker_spawner", None)
-            if worker_spawner is not None:
-                worker_spawner.cancel_spawn()
-                # p.start() runs on the spawner thread and cannot be interrupted
-                # by Python's main-thread signal handlers. Give the current
-                # start a short bounded chance to finish, then reap every
-                # registered process whose pid has been published.
-                spawn_complete = worker_spawner.wait_for_spawn(
-                    timeout=WORKER_SPAWN_SHUTDOWN_TIMEOUT,
-                    raise_error=False,
-                )
-                if not spawn_complete:
-                    logger.error(
-                        "VisualGen worker spawn batch did not complete within "
-                        f"{WORKER_SPAWN_SHUTDOWN_TIMEOUT:.0f}s during shutdown; "
-                        "continuing to reap every worker with a published pid"
-                    )
+            if self._workers is not None:
+                self._workers.begin_shutdown()
 
             self.pending_requests.put(None)
 
@@ -1489,16 +1235,8 @@ class DiffusionRemoteClient:
 
         try:
             logger.info("DiffusionClient: Stopping workers")
-            worker_spawner = getattr(self, "_worker_spawner", None)
-            if worker_spawner is not None:
-                worker_spawner.reap_started_processes()
-            else:
-                for process in self.worker_processes:
-                    _reap_worker_process(process)
-
-            # External-launch mode: join rank-0 worker thread.
-            if self._ext_worker_thread is not None and self._ext_worker_thread.is_alive():
-                self._ext_worker_thread.join(timeout=WORKER_TIMEOUT)
+            if self._workers is not None:
+                self._workers.shutdown()
         except BaseException as e:
             if shutdown_error is None:
                 shutdown_error = e
@@ -1554,11 +1292,7 @@ class DiffusionRemoteClient:
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return
 
-            worker_dead = any(not p.is_alive() for p in self.worker_processes)
-            ext_dead = (
-                self._ext_worker_thread is not None and not self._ext_worker_thread.is_alive()
-            )
-            if worker_dead or ext_dead:
+            if self._workers.liveness_failure() is not None:
                 raise RuntimeError("DiffusionClient: Worker died during initialization")
 
             now = time.time()
