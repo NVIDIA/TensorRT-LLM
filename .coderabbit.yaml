@@ -30,6 +30,10 @@ reviews:
     Example: "[feat] Add logit_bias support".
 
   commit_status: false
+  # Post the high-level summary in the walkthrough comment instead of writing it
+  # into the PR description, so author-written description text is never replaced
+  # or pushed down by generated content.
+  high_level_summary_in_walkthrough: true
   high_level_summary_instructions: |
     Provide two concise sections:
 
