@@ -182,6 +182,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # _msa_fields_ready marks that the current step's buffers are populated.
     _msa_buffers_ready: bool = False
     _msa_fields_ready: bool = False
+    # Read through msa_live_token_count, which states the contract.
+    _msa_live_total_q: int = 0
     # Sparse geometry the plans need.
     _msa_params: Optional[MiniMaxM3SparseMetadataParams] = None
     # This step's fmha_sm100 plans, plain tuples with no graph-stable buffers
@@ -974,6 +976,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         decoding the inputs for on_update_kv_lens are staged as well.
         """
         self._msa_fields_ready = False
+        # The live count describes the slot mapping staged at the end of this
+        # method, so clear it with the ready flag. An early return below would
+        # otherwise leave a count describing a batch that is no longer scheduled.
+        self._msa_live_total_q = 0
         if not self._msa_buffers_ready:
             return
         request_ids = self.request_ids
@@ -1034,6 +1040,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"smaller than the step's per-request page count ({block_table_cols})."
             )
 
+        # Piecewise graphs pad token-shaped inputs to the capture bucket, and the
+        # fused index producer runs over that padded extent: it sits inside the
+        # captured region, so trimming it to a host-side count would make its
+        # shape dynamic. A negative slot is what makes those rows cache-write
+        # no-ops. Fill before the copy, because a prior larger step leaves valid
+        # slot ids in the tail and those address real pages.
+        self.msa_out_cache_loc.fill_(-1)
         self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
         # Captured producers also execute padded rows. Invalidate only the
         # unwritten tail so they cannot reuse the previous step's live slots.
@@ -1059,6 +1072,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 self._msa_subpages_per_slot,
                 self.msa_subpage_block_table[:batch_size],
             )
+
+        # Live, unpadded new-token count for this step, staged before either
+        # exit so the non-dynamic early return below carries it too. Cache
+        # writers read it through msa_live_token_count to find where
+        # msa_out_cache_loc stops holding real slots.
+        self._msa_live_total_q = total_new_tokens
 
         self._msa_kv_lens_dynamic = self._msa_kv_lens_may_change()
         if not self._msa_kv_lens_dynamic:
@@ -1087,6 +1106,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self.msa_kv_lens_staged[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
         self._msa_fields_ready = True
 
+    def msa_live_token_count(self) -> int:
+        """This step's live, unpadded new-token count.
+
+        Cache writers take the padded token extent and need this to find where
+        msa_out_cache_loc stops holding real slots. Raising when no mapping is
+        staged keeps an unprepared step from writing against another step's
+        slots, which a stale count would otherwise allow.
+        """
+        if not self._msa_fields_ready:
+            raise RuntimeError(
+                "MiniMax-M3 MSA cache write requires prepared metadata, but "
+                "prepare() did not stage a slot mapping for this step."
+            )
+        return self._msa_live_total_q
+
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
         """Return the paged index-K cache in the HND layout MSA consumes."""
         return self.kv_cache_manager.get_index_k_buffer(layer_idx)
@@ -1101,6 +1135,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self.msa_out_cache_loc[:num_tokens],
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
             layout="HND",
+            num_live_tokens=self.msa_live_token_count(),
         )
 
     def msa_proxy_max_score_view(
@@ -1257,17 +1292,22 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             return
         num_kv_heads = int(k_view.shape[1])
         head_dim = int(k_view.shape[3])
+        # The dispatch clips k/v/idx_k to the step's live tokens before this
+        # runs, so every supplied row owns a real slot: num_tokens is the live
+        # count write_kv_slots requires.
         write_kv_slots(
             k_view,
             out_cache_loc,
             k.reshape(num_tokens, num_kv_heads, head_dim),
             layout="HND",
+            num_live_tokens=num_tokens,
         )
         write_kv_slots(
             v_view,
             out_cache_loc,
             v.reshape(num_tokens, num_kv_heads, head_dim),
             layout="HND",
+            num_live_tokens=num_tokens,
         )
         if idx_k is not None:
             write_kv_slots(
@@ -1275,6 +1315,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 out_cache_loc,
                 idx_k.reshape(num_tokens, 1, int(idx_cache.shape[-1])),
                 layout="HND",
+                num_live_tokens=num_tokens,
             )
 
     def run_indexer(

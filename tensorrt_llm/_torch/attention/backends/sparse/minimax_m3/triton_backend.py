@@ -158,8 +158,11 @@ def _write_main_kv_slots_to_pool(
     ``out_cache_loc`` is the 1-D ``[num_new_tokens]`` int tensor of flat slot
     ids to update. ``pool[:, kv_index]`` is a storage-sharing view, so the
     shared :func:`common.write_kv_slots` propagates the write to the pool.
+
+    Every row owns a slot, so the row count is the live count: the slot mapping
+    emits one real slot per new token and no sentinel.
     """
-    write_kv_slots(pool[:, kv_index], out_cache_loc, values)
+    write_kv_slots(pool[:, kv_index], out_cache_loc, values, num_live_tokens=int(values.shape[0]))
 
 
 def _write_main_kv_slots(
@@ -173,7 +176,7 @@ def _write_main_kv_slots(
     flat-slot layout used by focused unit tests and the 4-D paged view of
     ``kv_pool[:, 0]`` / ``kv_pool[:, 1]``.
     """
-    write_kv_slots(cache, out_cache_loc, values)
+    write_kv_slots(cache, out_cache_loc, values, num_live_tokens=int(values.shape[0]))
 
 
 def _scatter_topk_to_block_mask(
