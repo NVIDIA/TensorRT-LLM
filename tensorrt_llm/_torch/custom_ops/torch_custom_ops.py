@@ -2267,6 +2267,11 @@ class AllReduceRunner(TunableRunner):
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
     _prealloc_dtype: ClassVar[Optional[torch.dtype]] = None
+    # Ordered as the tuner should see them: NCCL_SYMMETRIC first, then NCCL.
+    _NCCL_TACTICS: ClassVar[Tuple[int, ...]] = (
+        AllReduceStrategy.NCCL_SYMMETRIC.value,
+        AllReduceStrategy.NCCL.value,
+    )
     # Keep these buckets synchronized with kAllReduceTuningBuckets in
     # cpp/tensorrt_llm/thop/allreduceOp.cpp.
     tuning_config = TuningConfig(
@@ -2359,30 +2364,52 @@ class AllReduceRunner(TunableRunner):
         torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
                                                         2)
 
+    def _nccl_competes_with_fusion_kernels(self, input: torch.Tensor) -> bool:
+        """Whether the NCCL variants may be ranked against the fusion kernels.
+
+        The tuner ranks tactics on latency alone, but for a fused pattern the
+        NCCL variants are not numerically interchangeable with the fusion
+        kernels: they reduce across ranks in the native dtype and then run
+        residualRmsNorm separately, where ONESHOT/TWOSHOT reduce in fp32 inside
+        the kernel (use_fp32_acc(), allReduceFusionKernels.cu). Picking between
+        them on profiling jitter silently changes the arithmetic of the residual
+        stream on every layer of every step. Defer to the tuned AUTO table,
+        which already decides this per (SM, TP, fusionOp, hidden, tokens) cell,
+        so every hand-tuned NCCL cell is preserved.
+        """
+        if self.op == AllReduceFusionOp.NONE.value:
+            return True
+        if not hasattr(torch.ops.trtllm, "allreduce_auto_strategy"):
+            return True
+        return torch.ops.trtllm.allreduce_auto_strategy(
+            input.shape[0], input.shape[-1], self.op,
+            self.tp_size) in self._NCCL_TACTICS
+
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
+        input = inputs[0]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
-        workspace_size = inputs[0].numel() * inputs[0].element_size()
+        workspace_size = input.numel() * input.element_size()
         max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
             self.tp_size,
             support_deterministic=False,
         )
         if workspace_size > max_workspace_size:
-            return valid_strategies
+            return list(self._NCCL_TACTICS)
+
+        valid_strategies = []
+        if self._nccl_competes_with_fusion_kernels(input):
+            valid_strategies.extend(self._NCCL_TACTICS)
 
         valid_strategies.append(AllReduceStrategy.ONESHOT.value)
 
         # Additional restrictions for TWOSHOT strategy
-        if inputs[0].shape[0] >= self.tp_size:
+        if input.shape[0] >= self.tp_size:
             valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
 
         return valid_strategies
@@ -2455,11 +2482,17 @@ class AllReduceRunner(TunableRunner):
                 )
             return input
         if tactic == -1:
-            # tactic == -1 means the autotuner cache missed for this shape.
-            # Fall back to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
-            # by a cross-rank barrier in NCCLWindowAllocator which falls back
-            # to plain NCCL.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # tactic == -1 means the autotuner cache missed for this shape, so this
+            # branch must obey the same rule as get_valid_tactics: NCCL_SYMMETRIC
+            # is only sound where the NCCL variants are candidates at all (see
+            # _nccl_competes_with_fusion_kernels). Asymmetric ncclMemAlloc failures
+            # are handled by a cross-rank barrier in NCCLWindowAllocator which falls
+            # back to plain NCCL. Otherwise use AUTO, which resolves through the
+            # same lookup table in selectImplementation and keeps its own
+            # workspace/P2P/NVLink fallbacks to NCCL.
+            tactic = (AllReduceStrategy.NCCL_SYMMETRIC.value
+                      if self.op == AllReduceFusionOp.NONE.value else
+                      AllReduceStrategy.AUTO.value)
 
         return torch.ops.trtllm.allreduce(
             input,
