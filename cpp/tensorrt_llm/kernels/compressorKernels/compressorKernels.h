@@ -49,6 +49,20 @@ void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or f
     int out_elem_bytes,                          // bytes per element for output
     cudaStream_t stream);
 
+// Incremental ratio-128 HCA decode using an associative online-softmax summary.
+void incrementalHcaCompressLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
+    int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
+    int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size, int max_blocks, int head_dim,
+    int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes, cudaStream_t stream);
+
+// Incremental ratio-128 HCA prefill. Complete windows emit compressed tokens;
+// the final incomplete window stores one (value, LSE) endpoint summary.
+void incrementalHcaPrefillLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
+    int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
+    int32_t const* start_pos, int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size,
+    int max_blocks, int head_dim, int max_outputs, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
+    cudaStream_t stream);
+
 // Prefill kernel: bulk compression with per-token gather/scatter + state update.
 // Writes all newly seen token states to paged cache for block reuse, then performs
 // online softmax reduction.

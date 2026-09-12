@@ -30,6 +30,7 @@ def prefill_kernel(
     compress_ratio: int = None,
     head_dim: int = None,
     page_size: int = 32,
+    incremental_hca: bool = False,
 ):
     """CUDA prefill kernel wrapper with head_dim skip guard."""
     if head_dim not in _CUDA_SUPPORTED_HEAD_DIMS:
@@ -42,7 +43,12 @@ def prefill_kernel(
     paged_kv_2d = paged_kv.flatten(1) if paged_kv.dim() == 3 else paged_kv
     paged_score_2d = paged_score.flatten(1) if paged_score.dim() == 3 else paged_score
 
-    torch.ops.trtllm.compressor_prefill_reduction(
+    compressor_op = (
+        torch.ops.trtllm.compressor_prefill_reduction_incremental
+        if incremental_hca
+        else torch.ops.trtllm.compressor_prefill_reduction
+    )
+    compressor_op(
         kv_score,
         ape,
         paged_kv_2d,
@@ -102,6 +108,7 @@ def decode_kernel(
     head_dim: int = None,
     page_size: int = 32,
     next_n: int = 1,
+    incremental_hca: bool = False,
 ):
     """CUDA decode kernel wrapper with head_dim skip guard."""
     if head_dim not in _CUDA_SUPPORTED_HEAD_DIMS:
@@ -111,7 +118,12 @@ def decode_kernel(
     if block_table_score is None:
         block_table_score = block_table_kv
 
-    torch.ops.trtllm.compressor_paged_kv_compress(
+    compressor_op = (
+        torch.ops.trtllm.compressor_paged_kv_compress_incremental
+        if incremental_hca
+        else torch.ops.trtllm.compressor_paged_kv_compress
+    )
+    compressor_args = (
         kv_score,
         ape,
         paged_kv,
@@ -128,6 +140,7 @@ def decode_kernel(
         compress_ratio,
         next_n,
     )
+    compressor_op(*compressor_args)
 
 
 # ============================================================================
@@ -1840,6 +1853,403 @@ def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_po
             f"batch={b} sp={start_pos_val} seqlen={new_seqlen} "
             f"max_diff={(ref_out_b - kernel_out_b).abs().max():.6f}"
         )
+
+
+@pytest.mark.parametrize("head_dim", [128, 512])
+@pytest.mark.parametrize("page_size", [128, 256])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "prefill_len,next_n",
+    [
+        pytest.param(255, 1, id="next1"),
+        pytest.param(254, 2, id="next2"),
+        pytest.param(253, 3, id="next3"),
+        pytest.param(252, 4, id="next4"),
+        pytest.param(251, 5, id="next5"),
+        pytest.param(250, 6, id="next6"),
+        pytest.param(249, 7, id="next7"),
+        pytest.param(248, 8, id="next8"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_eager_incremental_hca_prefill_decode_and_rewind(
+    head_dim, page_size, input_dtype, prefill_len, next_n
+):
+    """Prefill saves an endpoint summary that decode extends across a rewind."""
+    torch.manual_seed(1234)
+    compress_ratio = 128
+    rtol, atol = (2e-3, 5e-3) if input_dtype == torch.bfloat16 else (1e-5, 1e-5)
+
+    prefill_kv = torch.randn(prefill_len, head_dim, device="cuda", dtype=input_dtype)
+    prefill_score = torch.randn(prefill_len, head_dim, device="cuda", dtype=input_dtype)
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    paged_kv, paged_score, block_table, _, _ = create_paged_cache(
+        1, prefill_len + next_n, compress_ratio, head_dim, False, page_size
+    )
+    paged_kv.fill_(float("nan"))
+    paged_score.fill_(float("nan"))
+
+    kv_lens = torch.tensor([prefill_len], device="cuda", dtype=torch.int32)
+    start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
+    cu_seq_lens, cu_outputs = prepare_prefill_metadata(kv_lens, start_pos, compress_ratio, head_dim)
+    prefill_output = prepare_compress_output(cu_outputs, 1, head_dim, kv_lens.device, input_dtype)
+    prefill_kernel(
+        fuse_kv_score(prefill_kv, prefill_score),
+        ape,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_outputs,
+        prefill_output,
+        paged_kv,
+        paged_score,
+        block_table,
+        1,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        incremental_hca=True,
+    )
+
+    first_logits = prefill_score[:compress_ratio].float() + ape
+    first_expected = (prefill_kv[:compress_ratio].float() * first_logits.softmax(dim=0)).sum(dim=0)
+    assert torch.allclose(prefill_output[0], first_expected.to(input_dtype), rtol=rtol, atol=atol)
+
+    # Only the final incomplete window endpoint is persisted. Its paged KV is
+    # the normalized partial value and paged score is logsumexp, both FP32.
+    tail_pos = prefill_len - 1
+    tail_physical_block = block_table[0, tail_pos // page_size].item()
+    tail_block_offset = tail_pos % page_size
+    tail_logits = prefill_score[compress_ratio:].float() + ape[: prefill_len - compress_ratio]
+    tail_expected_lse = torch.logsumexp(tail_logits, dim=0)
+    tail_expected_value = (prefill_kv[compress_ratio:].float() * tail_logits.softmax(dim=0)).sum(
+        dim=0
+    )
+    assert torch.allclose(
+        paged_kv[tail_physical_block, tail_block_offset],
+        tail_expected_value,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        paged_score[tail_physical_block, tail_block_offset],
+        tail_expected_lse,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert torch.isfinite(paged_kv).sum().item() == head_dim
+    assert torch.isfinite(paged_score).sum().item() == head_dim
+
+    decode_cu_seq_lens, decode_cu_outputs = prepare_decode_metadata(
+        1, compress_ratio, head_dim, kv_lens.device, next_n
+    )
+    decode_kv_lens = torch.tensor([prefill_len + next_n], device="cuda", dtype=torch.int32)
+    stale_start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    # Execute twice from the same committed prefix. The second call represents
+    # rejected draft tokens being replaced at the same logical positions.
+    for _ in range(2):
+        decode_kv = torch.randn(next_n, head_dim, device="cuda", dtype=input_dtype)
+        decode_score = torch.randn(next_n, head_dim, device="cuda", dtype=input_dtype)
+        decode_output = prepare_compress_output(
+            decode_cu_outputs, 1, head_dim, kv_lens.device, input_dtype
+        )
+        decode_kernel(
+            fuse_kv_score(decode_kv, decode_score),
+            ape,
+            decode_kv_lens,
+            stale_start_pos,
+            decode_cu_seq_lens,
+            decode_cu_outputs,
+            decode_output,
+            paged_kv,
+            paged_score,
+            block_table,
+            block_table,
+            compress_ratio,
+            head_dim,
+            page_size,
+            next_n,
+            incremental_hca=True,
+        )
+
+        second_kv = torch.cat([prefill_kv[compress_ratio:], decode_kv], dim=0).float()
+        second_score = torch.cat([prefill_score[compress_ratio:], decode_score], dim=0).float()
+        second_logits = second_score + ape
+        second_expected = (second_kv * second_logits.softmax(dim=0)).sum(dim=0)
+        assert torch.allclose(
+            decode_output[0], second_expected.to(input_dtype), rtol=rtol, atol=atol
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_incremental_hca_decode_runtime_next_n_crosses_multiple_windows():
+    """Runtime next_n is not limited to a fixed MTP width or one CR boundary."""
+    torch.manual_seed(5678)
+    compress_ratio = 128
+    head_dim = 512
+    page_size = 128
+    prefill_len = compress_ratio - 1
+    next_n = compress_ratio + 1
+    total_len = prefill_len + next_n
+
+    kv = torch.randn(total_len, head_dim, device="cuda")
+    score = torch.randn(total_len, head_dim, device="cuda")
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    paged_kv, paged_score, block_table, _, _ = create_paged_cache(
+        1, total_len, compress_ratio, head_dim, False, page_size
+    )
+
+    prefill_kv_lens = torch.tensor([prefill_len], device="cuda", dtype=torch.int32)
+    prefill_start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
+    prefill_cu_seq_lens = torch.tensor([0, prefill_len], device="cuda", dtype=torch.int32)
+    prefill_cu_outputs = torch.zeros(2, device="cuda", dtype=torch.int32)
+    prefill_kernel(
+        fuse_kv_score(kv[:prefill_len], score[:prefill_len]),
+        ape,
+        prefill_kv_lens,
+        prefill_start_pos,
+        prefill_cu_seq_lens,
+        prefill_cu_outputs,
+        torch.empty(0, head_dim, device="cuda"),
+        paged_kv,
+        paged_score,
+        block_table,
+        0,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        incremental_hca=True,
+    )
+
+    decode_cu_seq_lens, decode_cu_outputs = prepare_decode_metadata(
+        1, compress_ratio, head_dim, kv.device, next_n
+    )
+    decode_output = torch.empty(2, head_dim, device="cuda")
+    decode_kernel(
+        fuse_kv_score(kv[prefill_len:], score[prefill_len:]),
+        ape,
+        torch.tensor([total_len], device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        decode_cu_seq_lens,
+        decode_cu_outputs,
+        decode_output,
+        paged_kv,
+        paged_score,
+        block_table,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        next_n,
+        incremental_hca=True,
+    )
+
+    logits = score + ape[torch.arange(total_len, device="cuda") % compress_ratio]
+    expected = torch.stack(
+        [
+            (
+                kv[start : start + compress_ratio]
+                * logits[start : start + compress_ratio].softmax(dim=0)
+            ).sum(dim=0)
+            for start in (0, compress_ratio)
+        ]
+    )
+    torch.testing.assert_close(decode_output, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("head_dim", [128, 512])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_incremental_hca_chunked_prefill(head_dim, input_dtype):
+    """Chunked prefill merges a prior endpoint and writes the new tail endpoint."""
+    torch.manual_seed(4321)
+    compress_ratio = 128
+    page_size = 128
+    first_len = 50
+    total_len = 260
+    second_len = total_len - first_len
+    rtol, atol = (2e-3, 5e-3) if input_dtype == torch.bfloat16 else (1e-5, 1e-5)
+
+    kv = torch.randn(total_len, head_dim, device="cuda", dtype=input_dtype)
+    score = torch.randn(total_len, head_dim, device="cuda", dtype=input_dtype)
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    paged_kv, paged_score, block_table, _, _ = create_paged_cache(
+        1, total_len, compress_ratio, head_dim, False, page_size
+    )
+    paged_kv.fill_(float("nan"))
+    paged_score.fill_(float("nan"))
+
+    first_kv_lens = torch.tensor([first_len], device="cuda", dtype=torch.int32)
+    first_start_pos = torch.zeros(1, device="cuda", dtype=torch.int32)
+    first_cu_seq_lens = torch.tensor([0, first_len], device="cuda", dtype=torch.int32)
+    first_cu_outputs = torch.zeros(2, device="cuda", dtype=torch.int32)
+    first_output = torch.empty(0, head_dim, device="cuda", dtype=input_dtype)
+    prefill_kernel(
+        fuse_kv_score(kv[:first_len], score[:first_len]),
+        ape,
+        first_kv_lens,
+        first_start_pos,
+        first_cu_seq_lens,
+        first_cu_outputs,
+        first_output,
+        paged_kv,
+        paged_score,
+        block_table,
+        0,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        incremental_hca=True,
+    )
+
+    second_kv_lens = torch.tensor([total_len], device="cuda", dtype=torch.int32)
+    second_start_pos = torch.tensor([first_len], device="cuda", dtype=torch.int32)
+    second_cu_seq_lens = torch.tensor([0, second_len], device="cuda", dtype=torch.int32)
+    second_cu_outputs = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    second_output = torch.empty(2, head_dim, device="cuda", dtype=input_dtype)
+    prefill_kernel(
+        fuse_kv_score(kv[first_len:], score[first_len:]),
+        ape,
+        second_kv_lens,
+        second_start_pos,
+        second_cu_seq_lens,
+        second_cu_outputs,
+        second_output,
+        paged_kv,
+        paged_score,
+        block_table,
+        2,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        incremental_hca=True,
+    )
+
+    full_logits = score.float() + ape[torch.arange(total_len, device="cuda") % compress_ratio]
+    expected_output = torch.stack(
+        [
+            (
+                kv[start : start + compress_ratio].float()
+                * full_logits[start : start + compress_ratio].softmax(dim=0)
+            ).sum(dim=0)
+            for start in (0, compress_ratio)
+        ]
+    )
+    assert torch.allclose(second_output, expected_output.to(input_dtype), rtol=rtol, atol=atol)
+
+    tail_pos = total_len - 1
+    tail_physical_block = block_table[0, tail_pos // page_size].item()
+    tail_block_offset = tail_pos % page_size
+    tail_logits = full_logits[2 * compress_ratio :]
+    tail_expected_lse = torch.logsumexp(tail_logits, dim=0)
+    tail_expected_value = (kv[2 * compress_ratio :].float() * tail_logits.softmax(dim=0)).sum(dim=0)
+    assert torch.allclose(
+        paged_kv[tail_physical_block, tail_block_offset],
+        tail_expected_value,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        paged_score[tail_physical_block, tail_block_offset],
+        tail_expected_lse,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [128, 512])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_incremental_hca_aligned_prefill_starts_fresh_window(head_dim, input_dtype):
+    """An aligned prefill boundary starts the next summary without stale state."""
+    torch.manual_seed(5678)
+    compress_ratio = 128
+    page_size = 128
+    aligned_len = 256
+    partial_len = compress_ratio - 1
+    decode_len = 1
+    total_len = aligned_len + partial_len + decode_len
+    rtol, atol = (2e-3, 5e-3) if input_dtype == torch.bfloat16 else (1e-5, 1e-5)
+
+    kv = torch.randn(total_len, head_dim, device="cuda", dtype=input_dtype)
+    score = torch.randn(total_len, head_dim, device="cuda", dtype=input_dtype)
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    paged_kv, paged_score, block_table, _, _ = create_paged_cache(
+        1, total_len, compress_ratio, head_dim, False, page_size
+    )
+    paged_kv.fill_(float("nan"))
+    paged_score.fill_(float("nan"))
+
+    aligned_outputs = torch.empty(2, head_dim, device="cuda", dtype=input_dtype)
+    prefill_kernel(
+        fuse_kv_score(kv[:aligned_len], score[:aligned_len]),
+        ape,
+        torch.tensor([aligned_len], device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        torch.tensor([0, aligned_len], device="cuda", dtype=torch.int32),
+        torch.tensor([0, 2], device="cuda", dtype=torch.int32),
+        aligned_outputs,
+        paged_kv,
+        paged_score,
+        block_table,
+        2,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        incremental_hca=True,
+    )
+    assert torch.isfinite(paged_kv).sum().item() == 0
+    assert torch.isfinite(paged_score).sum().item() == 0
+
+    partial_end = aligned_len + partial_len
+    prefill_kernel(
+        fuse_kv_score(kv[aligned_len:partial_end], score[aligned_len:partial_end]),
+        ape,
+        torch.tensor([partial_end], device="cuda", dtype=torch.int32),
+        torch.tensor([aligned_len], device="cuda", dtype=torch.int32),
+        torch.tensor([0, partial_len], device="cuda", dtype=torch.int32),
+        torch.zeros(2, device="cuda", dtype=torch.int32),
+        torch.empty(0, head_dim, device="cuda", dtype=input_dtype),
+        paged_kv,
+        paged_score,
+        block_table,
+        0,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        incremental_hca=True,
+    )
+
+    decode_output = torch.empty(1, head_dim, device="cuda", dtype=input_dtype)
+    decode_kernel(
+        fuse_kv_score(kv[partial_end:], score[partial_end:]),
+        ape,
+        torch.tensor([total_len], device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        torch.tensor([0, decode_len], device="cuda", dtype=torch.int32),
+        torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        decode_output,
+        paged_kv,
+        paged_score,
+        block_table,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        decode_len,
+        incremental_hca=True,
+    )
+
+    window_logits = score[aligned_len:].float() + ape
+    expected = (kv[aligned_len:].float() * window_logits.softmax(dim=0)).sum(dim=0)
+    assert torch.allclose(decode_output[0], expected.to(input_dtype), rtol=rtol, atol=atol)
 
 
 # ============================================================================

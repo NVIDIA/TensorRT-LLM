@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
@@ -401,6 +402,20 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 ],
                 DeepseekV4AttentionType.COMPRESS.role,
                 PageIndexMode.SHARED,
+            )
+
+        # Endpoint summaries are deterministic prefix state and can be reused.
+        # Partial-page reuse remains safe because the cache manager uses
+        # copy-on-write before a continued request appends a new endpoint.
+        self.incremental_hca_enabled = (
+            128 in pp_compress_ratios
+            and os.environ.get("TRTLLM_HCA_INCREMENTAL_SUMMARY", "0") == "1"
+        )
+        if self.incremental_hca_enabled:
+            logger.info_once(
+                "Enabled incremental HCA compressor summaries "
+                f"(block reuse={kv_cache_config.enable_block_reuse})",
+                key="incremental_hca_enabled",
             )
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
