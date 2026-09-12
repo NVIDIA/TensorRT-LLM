@@ -22,6 +22,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import tensorrt_llm._torch.models.modeling_glm as glm_module
+import tensorrt_llm._torch.models.modeling_minimaxm3 as minimaxm3_module
 import tensorrt_llm._torch.models.modeling_step3p7 as step3p7_module
 from tensorrt_llm._torch.models.modeling_afmoe import AfmoeDecoderLayer, AfmoeMoE
 from tensorrt_llm._torch.models.modeling_glm import Glm4DecoderLayer, Glm4MoE
@@ -29,6 +31,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm2 import MiniMaxM2DecoderLayer,
 from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3DecoderLayer, MiniMaxM3MoE
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralMoE
 from tensorrt_llm._torch.models.modeling_step3p7 import (
+    ClampedGatedMLP,
     Step3p7Attention,
     Step3p7DecoderLayer,
     Step3p7MoE,
@@ -233,6 +236,210 @@ def test_decoder_layer_passes_lora_params_to_moe(
 
     moe.assert_called_once()
     assert moe.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+    if decoder_cls is Step3p7DecoderLayer:
+        assert decoder.share_expert.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+
+
+def test_afmoe_dense_mlp_receives_lora_params() -> None:
+    """AFMoE dense layers must forward request LoRA state to GatedMLP."""
+    hidden_states = torch.randn(2, 4)
+    residual = torch.randn_like(hidden_states)
+    mlp = MagicMock(return_value=hidden_states)
+    fake_self = SimpleNamespace(
+        input_layernorm=MagicMock(return_value=(hidden_states, residual)),
+        self_attn=MagicMock(return_value=hidden_states),
+        post_attention_layernorm=MagicMock(return_value=hidden_states),
+        pre_mlp_layernorm=MagicMock(return_value=(hidden_states, residual)),
+        moe_enabled=False,
+        mlp=mlp,
+        post_mlp_layernorm=MagicMock(return_value=hidden_states),
+    )
+
+    AfmoeDecoderLayer.forward(
+        fake_self,
+        position_ids=torch.arange(2),
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+        residual=residual,
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    assert mlp.call_args.kwargs["lora_params"] is _LORA_PARAMS_SENTINEL
+
+
+def test_glm_dense_mlp_receives_lora_params() -> None:
+    """GLM dense layers must forward request LoRA state to GatedMLP."""
+    hidden_states = torch.randn(2, 4)
+    residual = torch.randn_like(hidden_states)
+    mlp = MagicMock(return_value=hidden_states)
+    fake_self = SimpleNamespace(
+        fusion_config=SimpleNamespace(PRE_MLP_FUSION=False, POST_MLP_FUSION=False),
+        post_attention_layernorm=MagicMock(return_value=(hidden_states, residual)),
+        mlp=mlp,
+        mlp_tp_size=1,
+        next_layer_layernorm=None,
+    )
+
+    Glm4DecoderLayer.forward_mlp(
+        fake_self,
+        hidden_states,
+        residual,
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    assert mlp.call_args.kwargs["lora_params"] is _LORA_PARAMS_SENTINEL
+
+
+def test_minimax_m3_dense_mlp_receives_lora_params() -> None:
+    """MiniMax-M3 dense layers must forward request LoRA state to GatedMLP."""
+    hidden_states = torch.randn(2, 4)
+    residual = torch.randn_like(hidden_states)
+    mlp = MagicMock(return_value=hidden_states)
+    fake_self = SimpleNamespace(
+        _apply_pre_feed_forward_norm=MagicMock(return_value=(hidden_states, residual)),
+        mlp=mlp,
+        _feed_forward_all_reduce_params=MagicMock(return_value=None),
+        _apply_next_layer_layernorm=MagicMock(return_value=(hidden_states, residual)),
+    )
+
+    MiniMaxM3DecoderLayer.forward_mlp(
+        fake_self,
+        hidden_states,
+        residual,
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    assert mlp.call_args.kwargs["lora_params"] is _LORA_PARAMS_SENTINEL
+
+
+def test_step3p7_dense_mlp_receives_lora_params() -> None:
+    """Step3p7 dense layers must forward request LoRA state to GatedMLP."""
+    hidden_states = torch.randn(2, 4)
+    residual = torch.randn_like(hidden_states)
+    mlp = MagicMock(return_value=hidden_states)
+    fake_self = SimpleNamespace(
+        input_layernorm=MagicMock(return_value=(hidden_states, residual)),
+        self_attn=MagicMock(return_value=hidden_states),
+        post_attention_layernorm=MagicMock(return_value=(hidden_states, residual)),
+        moe=None,
+        mlp=mlp,
+    )
+
+    Step3p7DecoderLayer.forward(
+        fake_self,
+        position_ids=torch.arange(2),
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+        residual=residual,
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    assert mlp.call_args.kwargs["lora_params"] is _LORA_PARAMS_SENTINEL
+
+
+def test_feed_forward_moe_wrappers_combine_routed_and_shared_lora() -> None:
+    """AFMoE, GLM, and MiniMax-M3 must retain both adapted MoE branches."""
+    hidden_states = torch.zeros(2, 4)
+    routed = torch.ones_like(hidden_states)
+    shared = torch.full_like(hidden_states, 2.0)
+
+    af_shared = MagicMock(return_value=shared.clone())
+    af_self = SimpleNamespace(
+        gate=MagicMock(return_value=torch.zeros(2, 2)),
+        experts=MagicMock(return_value=routed.clone()),
+        shared_experts=af_shared,
+        allreduce=None,
+    )
+    af_output = AfmoeMoE.forward(
+        af_self,
+        hidden_states,
+        SimpleNamespace(all_rank_num_tokens=[2]),
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    def run_both(routed_fn, shared_fn, *_args, **_kwargs):
+        return routed_fn(), shared_fn()
+
+    glm_shared = MagicMock(return_value=shared.clone())
+    glm_self = SimpleNamespace(
+        use_dp=True,
+        shared_experts=glm_shared,
+        shared_output_scale=None,
+        compute_routed_output=MagicMock(return_value=routed.clone()),
+        event_dict=MagicMock(),
+        aux_stream=object(),
+        mapping=SimpleNamespace(tp_size=1),
+        top_k=1,
+    )
+    with patch.object(glm_module, "maybe_execute_in_parallel", side_effect=run_both):
+        glm_output = Glm4MoE.forward(
+            glm_self,
+            hidden_states,
+            all_rank_num_tokens=[2],
+            lora_params=_LORA_PARAMS_SENTINEL,
+        )
+
+    m3_shared = MagicMock(return_value=shared.clone())
+    m3_self = SimpleNamespace(
+        gate=MagicMock(return_value=torch.zeros(2, 2)),
+        experts=MagicMock(return_value=routed.clone()),
+        shared_experts=m3_shared,
+        event_dict=MagicMock(),
+        aux_stream=object(),
+        allreduce=None,
+    )
+    with patch.object(minimaxm3_module, "maybe_execute_in_parallel", side_effect=run_both):
+        m3_output = MiniMaxM3MoE.forward(
+            m3_self,
+            hidden_states,
+            SimpleNamespace(all_rank_num_tokens=[2]),
+            lora_params=_LORA_PARAMS_SENTINEL,
+        )
+
+    for output in (af_output, glm_output, m3_output):
+        torch.testing.assert_close(output, torch.full_like(hidden_states, 3.0))
+    for shared_expert in (af_shared, glm_shared, m3_shared):
+        assert shared_expert.call_args.kwargs["lora_params"] is _LORA_PARAMS_SENTINEL
+
+
+def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora() -> None:
+    """The clamped path must preserve both projection adapter contributions."""
+    hidden_states = torch.zeros(1, 2)
+    gate_up_lora = torch.tensor([[1.0, 1.0, 2.0, 2.0]])
+    down_lora = torch.full_like(hidden_states, 3.0)
+
+    def forward_with_base(base_forward, lora_layers, x, params, layer_idx):
+        assert params is _LORA_PARAMS_SENTINEL
+        assert layer_idx == 4
+        assert lora_layers == ("split_gate_up", "fused_gate_up")
+        return base_forward() + gate_up_lora
+
+    def down_projection(x, *, all_reduce_params, lora_params, layer_idx):
+        assert all_reduce_params == "reduce"
+        assert lora_params is _LORA_PARAMS_SENTINEL
+        assert layer_idx == 4
+        return x + down_lora
+
+    fake_self = SimpleNamespace(
+        swiglu_limit=5.0,
+        layer_idx=4,
+        _uneven_tp_blocks_lora=False,
+        gate_up_proj=MagicMock(return_value=torch.zeros_like(gate_up_lora)),
+        splitted_gate_up_lora="split_gate_up",
+        fused_gate_up_lora="fused_gate_up",
+        down_proj=MagicMock(side_effect=down_projection),
+    )
+
+    with patch.object(step3p7_module.LoraLayer, "forward_with_base", side_effect=forward_with_base):
+        output = ClampedGatedMLP.forward(
+            fake_self,
+            hidden_states,
+            final_all_reduce_params="reduce",
+            lora_params=_LORA_PARAMS_SENTINEL,
+        )
+
+    expected = torch.full_like(hidden_states, torch.nn.functional.silu(torch.tensor(1.0)) * 2 + 3)
+    torch.testing.assert_close(output, expected)
 
 
 def test_step3p7_moe_lora_uses_clamp_capable_expert_path() -> None:

@@ -245,6 +245,7 @@ def _minimax_m3_swiglu_oai(gate_up: torch.Tensor, *, alpha: float, limit: float)
 def _build_swiglu_oai_dense_mlp(
     model_config: "ModelConfig[PretrainedConfig]",
     intermediate_size: int,
+    layer_idx: Optional[int] = None,
     *,
     is_shared_expert: bool = False,
 ) -> GatedMLP:
@@ -294,6 +295,7 @@ def _build_swiglu_oai_dense_mlp(
         overridden_tp_size=1 if enable_adp else None,
         reduce_output=reduce_output,
         is_shared_expert=is_shared_expert,
+        layer_idx=layer_idx,
     )
 
 
@@ -477,6 +479,7 @@ class MiniMaxM3MoE(nn.Module):
             self.shared_experts = _build_swiglu_oai_dense_mlp(
                 model_config=model_config,
                 intermediate_size=shared_intermediate,
+                layer_idx=layer_idx,
                 is_shared_expert=True,
             )
         else:
@@ -520,7 +523,7 @@ class MiniMaxM3MoE(nn.Module):
             )
 
         def _compute_shared_output():
-            return self.shared_experts(hidden_states)
+            return self.shared_experts(hidden_states, lora_params=lora_params)
 
         if self.shared_experts is None:
             result = _compute_routed_output()
@@ -1690,7 +1693,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 getattr(config, "dense_intermediate_size", config.intermediate_size)
             )
             self.mlp = _build_swiglu_oai_dense_mlp(
-                model_config=model_config, intermediate_size=dense_intermediate
+                model_config=model_config,
+                intermediate_size=dense_intermediate,
+                layer_idx=layer_idx,
             )
             self.block_sparse_moe = None
 
@@ -1781,7 +1786,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 hidden_states, attn_metadata, residual, lora_params=lora_params
             )
         else:
-            hidden_states, residual = self.forward_mlp(hidden_states, residual)
+            hidden_states, residual = self.forward_mlp(
+                hidden_states, residual, lora_params=lora_params
+            )
 
         return hidden_states, residual
 
@@ -1873,12 +1880,14 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
+            lora_params=lora_params,
         )
 
         hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)

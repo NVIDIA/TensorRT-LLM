@@ -319,6 +319,8 @@ class Glm4MoE(nn.Module):
             config=model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
+            layer_idx=layer_idx,
+            is_shared_expert=True,
         )
 
         self.allreduce = AllReduce(
@@ -423,7 +425,8 @@ class Glm4MoE(nn.Module):
 
         def _compute_shared_output():
             shared_output = self.shared_experts(
-                hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states
+                hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states,
+                lora_params=lora_params,
             )
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
@@ -579,6 +582,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 config=model_config,
                 overridden_tp_size=self.mlp_tp_size,
                 reduce_output=True,
+                layer_idx=layer_idx,
             )
 
         self.input_layernorm = RMSNorm(
@@ -692,6 +696,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
     def forward_MoE(
@@ -791,6 +796,7 @@ class Glm4DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(
@@ -814,6 +820,7 @@ class Glm4DecoderLayer(DecoderLayer):
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)
             ),
+            lora_params=lora_params,
         )
 
         if self.fusion_config.POST_MLP_FUSION:

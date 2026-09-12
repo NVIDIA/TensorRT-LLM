@@ -198,6 +198,7 @@ class AfmoeMoE(nn.Module):
                 overridden_tp_size=1 if self.enable_attention_dp else None,
                 reduce_output=False,
                 layer_idx=layer_idx,
+                is_shared_expert=True,
             )
         else:
             self.shared_experts = None
@@ -229,7 +230,7 @@ class AfmoeMoE(nn.Module):
         )
 
         if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(hidden_states, lora_params=lora_params)
             final_output = shared_output.add_(routed_output)
         else:
             final_output = routed_output
@@ -381,7 +382,7 @@ class AfmoeDecoderLayer(DecoderLayer):
         if self.moe_enabled:
             hidden_states = self.mlp(hidden_states, attn_metadata, lora_params=lora_params)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, lora_params=lora_params)
 
         hidden_states = self.post_mlp_layernorm(hidden_states)
 
