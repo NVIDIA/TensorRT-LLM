@@ -5,7 +5,6 @@ build
 colored
 cuda-python>=13
 # FlowMatchEuler respects a supplied generator starting in 0.39.0 (huggingface/diffusers#13678).
-# 0.40.0 adds the Cosmos3 Edge reference pipeline used by parity tests.
 diffusers>=0.40.0
 ftfy
 lark
