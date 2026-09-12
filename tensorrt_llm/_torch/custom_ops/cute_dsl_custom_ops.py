@@ -16188,6 +16188,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 import (
                 Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel,
                 validate_l2_atomic_descriptor_bounds)
+            from ..cute_dsl_kernels.rubin.moe.fused_fc12_workspace import (
+                reset_fc12_sync_workspace)
             from ..cute_dsl_kernels.rubin.moe.utils import TRTLLM_ENABLE_PDL
 
             # MXFP8: E4M3 operands with UE8M0 scales over 32 elements.
@@ -16275,6 +16277,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_class = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
                 kernel_cache = dict()
                 tuning_config_cache = dict()
+                # (device, m // 128) -> (fc1_ready, fc1_counter, fc2_counter):
+                # the per-launch zeroed synchronization workspace, allocated
+                # once per padded route count and cleared by one reset launch.
+                workspace_cache = dict()
+                # use_pdl -> compiled reset_fc12_sync_workspace
+                reset_kernel_cache = dict()
                 sf_vec_size = MXFP8_FUSED_FC12_SF_VEC_SIZE
                 # FP8 UMMA_K is 64; the CTA K tile may be one or two 128-byte atoms.
                 mma_inst_k = 64
@@ -16550,21 +16558,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           device=fc1_sfa.device)
                     # Per-launch zeroed workspaces: FC1->FC2 readiness counters
                     # (one per 128-row M tile is an upper bound for every tile
-                    # geometry) and the two L2-atomic work-ID counters. One
-                    # allocation + one fill kernel for all three (they used to
-                    # be three fill launches on the MoE critical path); the
-                    # counters sit on their own 128 B lines so the hot atomics
-                    # do not share a line with the readiness flags.
-                    num_ready = m // 128
-                    ready_words = (num_ready + 31) // 32 * 32
-                    workspace = torch.zeros(ready_words + 64,
-                                            dtype=torch.int32,
-                                            device=fc1_a.device)
-                    fc1_ready = workspace[:num_ready]
-                    fc1_scheduler_counter = workspace[ready_words:ready_words +
-                                                      1]
-                    fc2_scheduler_counter = workspace[ready_words +
-                                                      32:ready_words + 33]
+                    # geometry) and the two L2-atomic work-ID counters. The
+                    # buffers are cached per (device, tile count) and cleared
+                    # by one reset launch below instead of three torch.zeros
+                    # (three allocations + three fill kernels per forward).
+                    # Launches on one stream serialize, so sharing the buffers
+                    # across calls is safe; CUDA graphs capture fixed addresses.
+                    workspace_key = (fc1_a.device, m // 128)
+                    workspace = self.__class__.workspace_cache.get(workspace_key)
+                    if workspace is None:
+                        workspace = (
+                            torch.empty(m // 128,
+                                        dtype=torch.int32,
+                                        device=fc1_a.device),
+                            torch.empty(1, dtype=torch.int32,
+                                        device=fc1_a.device),
+                            torch.empty(1, dtype=torch.int32,
+                                        device=fc1_a.device),
+                        )
+                        self.__class__.workspace_cache[workspace_key] = workspace
+                    fc1_ready, fc1_scheduler_counter, fc2_scheduler_counter = \
+                        workspace
 
                     def _e4m3_ptr(t):
                         return make_ptr(cutlass.Float8E4M3FN,
@@ -16616,9 +16630,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters = get_max_activate_clusters(
                         cluster_shape_mn[0] * cluster_shape_mn[1])
 
+                    # Decode tiles carry a few valid rows per 128-row tile; the
+                    # dynamic-trip-count A gather skips the wholly padded 16-row
+                    # groups there, while full tiles keep the statically unrolled
+                    # gather. Select from static shapes only (num_tokens * top_k
+                    # bounds the valid routes; ``m`` is the padded route count)
+                    # so the choice is fixed per CUDA-graph bucket.
+                    sparse_gather = orig_m * self.top_k * 2 < m
+
                     cache_key = (self.tile_size, self.top_k, mma_tiler,
                                  mma_inst_shape, cluster_shape_mn, scheduler,
-                                 self.swiglu_limit, max_active_clusters)
+                                 self.swiglu_limit, max_active_clusters,
+                                 sparse_gather)
                     if cache_key not in self.__class__.kernel_cache:
                         gemm = self.__class__.kernel_class(
                             self.sf_vec_size,
@@ -16630,6 +16653,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             use_pdl=TRTLLM_ENABLE_PDL,
                             swiglu_limit=self.swiglu_limit,
                             scheduler=scheduler,
+                            sparse_gather=sparse_gather,
                         )
                         sf_vec_cx = self.sf_vec_size
                         tile_size_cx = self.tile_size
@@ -16815,6 +16839,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.__class__.kernel_cache[cache_key] = compiled_gemm
                     else:
                         compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                    # Clear the readiness flags and work-ID counters with one
+                    # launch. PDL lets it overlap the previous kernel's tail and
+                    # the fused GEMM's prologue; the GEMM's griddepcontrol_wait
+                    # precedes its first workspace access. Cluster launches keep
+                    # the plain ordering.
+                    use_reset_pdl = TRTLLM_ENABLE_PDL and (
+                        cluster_shape_mn[0] * cluster_shape_mn[1] == 1)
+                    compiled_reset = self.__class__.reset_kernel_cache.get(
+                        use_reset_pdl)
+                    if compiled_reset is None:
+                        compiled_reset = cute.compile(
+                            reset_fc12_sync_workspace,
+                            fc1_ready_ptr,
+                            cutlass.Int32(m // 128),
+                            fc1_scheduler_counter_ptr,
+                            fc2_scheduler_counter_ptr,
+                            stream,
+                            use_reset_pdl,
+                        )
+                        self.__class__.reset_kernel_cache[
+                            use_reset_pdl] = compiled_reset
+                    compiled_reset(
+                        fc1_ready_ptr,
+                        cutlass.Int32(m // 128),
+                        fc1_scheduler_counter_ptr,
+                        fc2_scheduler_counter_ptr,
+                        stream,
+                    )
 
                     compiled_gemm(
                         fc1_a_ptr,

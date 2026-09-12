@@ -864,6 +864,12 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
     :param topk: Experts selected per token.
     :param swiglu_limit: DS-v4 SwiGLU clamp limit; ``+inf`` disables clamp.
     :param scheduler: Persistent work-ID scheduler: ``static`` or ``l2_atomic``.
+    :param sparse_gather: Compile the FC1 A gather as a dynamic-trip-count loop
+        that skips 16-row groups lying wholly beyond a tile's valid rows (decode
+        tiles with a few real rows per 128-row tile). Leave it False for full
+        tiles: that keeps the original statically unrolled loop, which is faster
+        when every group is live. The caller selects it per launch from the
+        routing (only one loop body is ever compiled).
     """
 
     def __init__(
@@ -877,8 +883,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         use_pdl: bool = True,
         swiglu_limit: cutlass.Float32 = float("inf"),
         scheduler: str = "static",
+        sparse_gather: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
+        self.sparse_gather = sparse_gather
         self.topk = topk
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
@@ -2957,6 +2965,23 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
             while is_valid_tile:
                 gToken_ml_tile = gToken_ml[(None, tile_info[0])]
+                # Each gather iteration covers 16 M rows. With ``sparse_gather``
+                # skip groups wholly beyond the valid-row limit for MXFP8 decode
+                # tiles. Those rows never contribute to a valid output: MMA is
+                # row-wise and the epilogue masks padding. The final partial
+                # group keeps its per-row zero-fill predicates. All gather
+                # threads still commit every A/SFA stage, preserving barrier
+                # counts.
+                a_num_loads = self.fc1_a_num_loads
+                if cutlass.const_expr(self.sparse_gather and self.a_dtype.width == 8):
+                    valid_rows = cutlass.min(
+                        self.cta_tile_shape_mnk[0],
+                        cutlass.max(
+                            0,
+                            tile_info[4] - tile_info[0] * self.cta_tile_shape_mnk[0],
+                        ),
+                    )
+                    a_num_loads = cute.ceil_div(valid_rows, 16)
                 for i in range(self.fc1_a_num_loads):
                     token_ml_tile_offset = (tidx_in_warpgroup // 8) + i * 16
                     a_token_offset_tensor[i] = gToken_ml_tile[token_ml_tile_offset]
@@ -3016,34 +3041,71 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         (None, None, None, None, fc1_a_producer_state.index)
                     ]
 
-                    for i in range(self.fc1_a_num_loads):
-                        A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
-                            a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
-                            divby=a_elems,
-                        )
-                        a_predicate_slice = cute.make_rmem_tensor(
-                            cute.make_layout((1,)), cutlass.Boolean
-                        )
-                        a_predicate_slice[0] = a_predicate_tensor[i]
-                        # One 16-byte copy per 128-byte atom column of the K tile.
-                        for kk in cutlass.range_constexpr(self.fc1_a_k_passes):
-                            A_gmem_slice_offset = cute.assume(
-                                A_gmem_row_offset + kk * a_k_atom, divby=a_elems
+                    # Compile-time choice (``sparse_gather``): the original
+                    # statically unrolled loop (compile-time `i`, no per-group
+                    # guards) for full tiles, or the dynamic-trip-count loop that
+                    # skips wholly padded 16-row groups for decode tiles. Only one
+                    # body is traced, so neither variant pays for the other.
+                    if cutlass.const_expr(
+                        not (self.sparse_gather and self.a_dtype.width == 8)
+                    ):
+                        for i in range(self.fc1_a_num_loads):
+                            A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
+                                a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
+                                divby=a_elems,
                             )
-                            tFC1AgA_slice_ptr = tFC1AgA_ktile.iterator + A_gmem_slice_offset
-                            tFC1AgA_slice = cute.make_tensor(
-                                tFC1AgA_slice_ptr, layout=cute.make_layout((a_elems,))
+                            a_predicate_slice = cute.make_rmem_tensor(
+                                cute.make_layout((1,)), cutlass.Boolean
                             )
-                            tFC1AsA_slice = cute.make_tensor(
-                                tFC1AsA_ktile[(None, i, None, kk)].iterator,
-                                layout=cute.make_layout((a_elems,)),
+                            a_predicate_slice[0] = a_predicate_tensor[i]
+                            # One 16-byte copy per 128-byte atom column of the K tile.
+                            for kk in cutlass.range_constexpr(self.fc1_a_k_passes):
+                                A_gmem_slice_offset = cute.assume(
+                                    A_gmem_row_offset + kk * a_k_atom, divby=a_elems
+                                )
+                                tFC1AgA_slice_ptr = tFC1AgA_ktile.iterator + A_gmem_slice_offset
+                                tFC1AgA_slice = cute.make_tensor(
+                                    tFC1AgA_slice_ptr, layout=cute.make_layout((a_elems,))
+                                )
+                                tFC1AsA_slice = cute.make_tensor(
+                                    tFC1AsA_ktile[(None, i, None, kk)].iterator,
+                                    layout=cute.make_layout((a_elems,)),
+                                )
+                                cute.copy_atom_call(
+                                    a_atom_copy,
+                                    tFC1AgA_slice,
+                                    tFC1AsA_slice,
+                                    pred=a_predicate_slice,
+                                )
+                    else:
+                        for i in cutlass.range(a_num_loads):
+                            A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
+                                a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
+                                divby=a_elems,
                             )
-                            cute.copy_atom_call(
-                                a_atom_copy,
-                                tFC1AgA_slice,
-                                tFC1AsA_slice,
-                                pred=a_predicate_slice,
+                            a_predicate_slice = cute.make_rmem_tensor(
+                                cute.make_layout((1,)), cutlass.Boolean
                             )
+                            a_predicate_slice[0] = a_predicate_tensor[i]
+                            # One 16-byte copy per 128-byte atom column of the K tile.
+                            for kk in cutlass.range_constexpr(self.fc1_a_k_passes):
+                                A_gmem_slice_offset = cute.assume(
+                                    A_gmem_row_offset + kk * a_k_atom, divby=a_elems
+                                )
+                                tFC1AgA_slice_ptr = tFC1AgA_ktile.iterator + A_gmem_slice_offset
+                                tFC1AgA_slice = cute.make_tensor(
+                                    tFC1AgA_slice_ptr, layout=cute.make_layout((a_elems,))
+                                )
+                                tFC1AsA_slice = cute.make_tensor(
+                                    tFC1AsA_ktile[(None, i, None, kk)].iterator,
+                                    layout=cute.make_layout((a_elems,)),
+                                )
+                                cute.copy_atom_call(
+                                    a_atom_copy,
+                                    tFC1AgA_slice,
+                                    tFC1AsA_slice,
+                                    pred=a_predicate_slice,
+                                )
 
                     # SFA for the same stage, issued by the same threads so
                     # the single producer_commit below covers A and SFA. The
@@ -3685,11 +3747,28 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         # SFA 128dp UTCCP (Cp128x128b, smem → 128dp TMEM) +
                         # SFB UTCCP (Cp4x32x128b). Both land before the MMA.
                         sfa_s2t_stage_coord = (None, None, None, sfa_stage_idx)
-                        cute.copy(
-                            sfa_s2t_bundle.tiled_copy,
-                            sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
-                            sfa_s2t_bundle.tSF_compact,
-                        )
+                        # One gathered SFA chunk (16 bytes per row) covers
+                        # fc1_sfa_k_tiles_per_chunk consecutive k_tiles (four
+                        # for MXFP8 K=128, two for K=256). Copy it smem -> TMEM
+                        # once per chunk and keep it in its dedicated TMEM
+                        # region until the next chunk; the column offset above
+                        # selects the current tile's scales. k_tile restarts at
+                        # zero for each FC1 tile, so a new expert/N tile always
+                        # reloads SFA. SFB and accumulators occupy separate
+                        # regions.
+                        if cutlass.const_expr(self.fc1_sfa_k_tiles_per_chunk > 1):
+                            if k_tile % self.fc1_sfa_k_tiles_per_chunk == 0:
+                                cute.copy(
+                                    sfa_s2t_bundle.tiled_copy,
+                                    sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
+                                    sfa_s2t_bundle.tSF_compact,
+                                )
+                        else:
+                            cute.copy(
+                                sfa_s2t_bundle.tiled_copy,
+                                sfa_s2t_bundle.sSF_compact[sfa_s2t_stage_coord],
+                                sfa_s2t_bundle.tSF_compact,
+                            )
                         self._mainloop_s2t_copies(b_stage_idx, sfb_s2t_bundle)
 
                         num_kblocks = cute.size(tCrA, mode=[2])
