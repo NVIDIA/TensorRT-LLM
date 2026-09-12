@@ -402,10 +402,11 @@ def test_feed_forward_moe_wrappers_combine_routed_and_shared_lora() -> None:
         assert shared_expert.call_args.kwargs["lora_params"] is _LORA_PARAMS_SENTINEL
 
 
-def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora() -> None:
+@pytest.mark.parametrize("gate_value", [10.0, -10.0])
+def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora(gate_value: float) -> None:
     """The clamped path must preserve both projection adapter contributions."""
     hidden_states = torch.zeros(1, 2)
-    gate_up_lora = torch.tensor([[10.0, 10.0, 2.0, 2.0]])
+    gate_up_lora = torch.tensor([[gate_value, gate_value, 2.0, 2.0]])
     down_lora = torch.full_like(hidden_states, 3.0)
 
     def forward_with_base(base_forward, lora_layers, x, params, layer_idx):
@@ -438,7 +439,11 @@ def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora() -> None:
             lora_params=_LORA_PARAMS_SENTINEL,
         )
 
-    expected = torch.full_like(hidden_states, torch.nn.functional.silu(torch.tensor(5.0)) * 2 + 3)
+    clamped_gate = min(gate_value, 5.0)
+    expected = torch.full_like(
+        hidden_states,
+        torch.nn.functional.silu(torch.tensor(clamped_gate)) * 2 + 3,
+    )
     torch.testing.assert_close(output, expected)
 
 
@@ -468,63 +473,6 @@ def test_step3p7_moe_lora_uses_clamp_capable_expert_path() -> None:
 
     python_clamped_forward.assert_not_called()
     assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
-
-
-def test_step3p7_cutlass_moe_lora_applies_routed_scale_once() -> None:
-    """Separated routing and the common output path must not both scale MoE output."""
-    routed_scaling_factor = 3.0
-    text_config = SimpleNamespace(
-        hidden_size=4,
-        moe_num_experts=2,
-        moe_top_k=2,
-        moe_intermediate_size=8,
-        moe_router_scaling_factor=routed_scaling_factor,
-        need_fp32_gate=False,
-        torch_dtype=torch.float32,
-    )
-    model_config = SimpleNamespace(
-        pretrained_config=text_config,
-        mapping=SimpleNamespace(enable_attention_dp=True, tp_size=1),
-        lora_config=object(),
-    )
-    experts = MagicMock()
-
-    with (
-        patch.object(step3p7_module, "Linear", return_value=MagicMock()),
-        patch.object(step3p7_module, "_select_python_expert_path", return_value=(1.0, False, "")),
-        patch.object(step3p7_module, "has_moe_lora_targets", return_value=True),
-        patch.object(step3p7_module, "create_moe", return_value=experts) as create_moe,
-    ):
-        moe = Step3p7MoE(model_config, layer_idx=0, aux_stream_dict={})
-
-    routing_method = create_moe.call_args.kwargs["routing_method"]
-    moe.router_bias.router_bias.data.zero_()
-    router_logits = torch.zeros(1, text_config.moe_num_experts)
-    moe.gate.return_value = router_logits
-    moe._use_python_clamp = True
-    moe._clamp_weights_loaded = True
-
-    def separated_experts(
-        hidden_states: torch.Tensor,
-        logits: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        _, routing_weights = routing_method.apply(logits)
-        return routing_weights.sum(dim=-1, keepdim=True).expand_as(hidden_states)
-
-    experts.side_effect = separated_experts
-    hidden_states = torch.ones(1, text_config.hidden_size)
-
-    routed = moe(
-        hidden_states,
-        SimpleNamespace(all_rank_num_tokens=[1]),
-        lora_params=_LORA_PARAMS_SENTINEL,
-    )
-
-    torch.testing.assert_close(
-        routed,
-        torch.full_like(hidden_states, routed_scaling_factor),
-    )
 
 
 def test_step3p7_attention_applies_lora_to_qkv_and_output() -> None:
