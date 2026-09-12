@@ -699,6 +699,13 @@ class Attention(nn.Module):
             self.create_weights()
 
     def create_weights(self):
+        if (self.quant_config is not None
+                and self.quant_config.layer_quant_mode.has_int8_kv_cache()
+                and (self.attn_backend.upper() != "TRTLLM"
+                     or self.mapping.cp_size > 1)):
+            raise ValueError(
+                "INT8 KV cache requires TRTLLM attention without context parallelism."
+            )
         # self.attn has no weights but has states that are related to quant_config,
         # which could be modified after __init__
         self.attn.update_quant_config(self.quant_config)
@@ -895,6 +902,10 @@ class Attention(nn.Module):
         ):
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales
+        elif (self.quant_config is not None
+              and self.quant_config.layer_quant_mode.has_int8_kv_cache()):
+            kv_scale_orig_quant = self.qkv_proj.inv_kv_cache_scaling_factor
+            kv_scale_quant_orig = self.qkv_proj.kv_cache_scaling_factor
 
         attn_output = self.attn.forward(
             q,

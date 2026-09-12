@@ -457,7 +457,9 @@ def _get_static_cache_size_layer_components(
 
     cache_size_per_token = kv_factor * head_dim
     quant_config = model_config.quant_config
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+    if quant_config is not None and (
+        quant_config.quant_mode.has_fp8_kv_cache() or quant_config.quant_mode.has_int8_kv_cache()
+    ):
         layer_size = cache_size_per_token
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
         layer_size = math.ceil(cache_size_per_token / 2) + math.ceil(cache_size_per_token / 16)
@@ -4173,6 +4175,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
         if self.dtype not in (
+            DataType.INT8,
             DataType.FP8,
             DataType.HALF,
             DataType.BF16,

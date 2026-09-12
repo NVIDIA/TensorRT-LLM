@@ -629,6 +629,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             module: Linear,
             weights: List[Dict],
             allow_partial_loading: bool = False) -> None:
+        module._load_kv_cache_scales(weights, allow_partial_loading)
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights, allow_partial_loading=allow_partial_loading)
         if not allow_partial_loading:
@@ -643,24 +644,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
                         shard_key]
                     copy_weight_shard(module.weight, weight, shard_offset,
                                       shard_size)
-
-        if hasattr(module, "kv_scales") and os.environ.get(
-                "TRTLLM_LOAD_KV_SCALES", "1") == "1":
-            k_scales = [
-                w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w
-            ]
-            v_scales = [
-                w["v_scale"][...].reshape([]) for w in weights if "v_scale" in w
-            ]
-            if k_scales:
-                assert v_scales, "k_scale and v_scale must be loaded together"
-                copy_weight(
-                    module.kv_scales,
-                    torch.tensor(
-                        [1.0, max(k_scales).item(),
-                         max(v_scales).item()],
-                        dtype=torch.float32))
-                module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(
             self,
@@ -3908,6 +3891,18 @@ class Linear(nn.Module):
                                          self.out_features, self.has_bias,
                                          self.dtype)
 
+        if (self.quant_config is not None
+                and self.quant_config.layer_quant_mode.has_int8_kv_cache()
+                and self.weights_loading_config.weight_mode
+                == WeightMode.FUSED_QKV_LINEAR):
+            # INT8 kernels share one per-layer scale between K and V.
+            self.kv_cache_scaling_factor = Parameter(torch.ones(
+                1, dtype=torch.float32),
+                                                     requires_grad=False)
+            self.inv_kv_cache_scaling_factor = Parameter(torch.ones(
+                1, dtype=torch.float32),
+                                                         requires_grad=False)
+
         self._weights_created = True
         self._weights_transformed = False
 
@@ -4102,6 +4097,71 @@ class Linear(nn.Module):
             weights,
             weight_mode,
             allow_partial_loading=allow_partial_loading)
+
+    def _load_kv_cache_scales(self, weights: list[dict],
+                              allow_partial_loading: bool) -> None:
+        """Load unquantized fused-QKV cache scales at one checkpoint hook.
+
+        INT8 requires calibrated paired scalars; FP4 retains its optional
+        per-K/V scales and the existing environment opt-out. INT8 rejects that
+        opt-out rather than silently running with uncalibrated unity scales.
+        Weight-only partial reloads leave the existing scale parameters intact.
+        """
+        int8_cache = (self.quant_config is not None and
+                      self.quant_config.layer_quant_mode.has_int8_kv_cache())
+        if not int8_cache and not hasattr(self, "kv_scales"):
+            return
+        if os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") != "1":
+            if int8_cache:
+                raise ValueError(
+                    "INT8 KV cache requires TRTLLM_LOAD_KV_SCALES=1 "
+                    "to load calibrated scales.")
+            return
+        scales = {
+            name: [w[name][...] for w in weights if name in w]
+            for name in ("k_scale", "v_scale")
+        }
+        if not int8_cache:
+            # Preserve the existing optional FP4 scale-loading contract.
+            if scales["k_scale"]:
+                assert scales[
+                    "v_scale"], "k_scale and v_scale must be loaded together"
+                k_scale = max(scale.reshape([])
+                              for scale in scales["k_scale"]).item()
+                v_scale = max(scale.reshape([])
+                              for scale in scales["v_scale"]).item()
+                scale = self.kv_scales.new_tensor([1.0, k_scale, v_scale])
+                copy_weight(self.kv_scales, scale)
+                copy_weight(self.inv_kv_scales, scale.reciprocal())
+            return
+        if allow_partial_loading and not any(scales.values()):
+            return
+        if not all(scales.values()):
+            raise ValueError(
+                "INT8 KV cache requires calibrated k_scale and v_scale "
+                "checkpoint tensors; both scales must be loaded together.")
+        values = []
+        for tensors in scales.values():
+            for scale in tensors:
+                if scale.numel() != 1:
+                    raise ValueError(
+                        "INT8 KV cache scales must be scalar tensors.")
+                value = scale.item()
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(
+                        "INT8 KV cache scales must be finite and positive.")
+                values.append(value)
+        # The largest dequantization scale covers both calibrated ranges.
+        # Copy into stable parameters so weight reloads preserve graph pointers.
+        scale = self.kv_cache_scaling_factor.new_tensor([max(values)])
+        inverse = scale.reciprocal()
+        if not (torch.isfinite(scale).all() and torch.isfinite(inverse).all()
+                and (scale > 0).all() and (inverse > 0).all()):
+            raise ValueError(
+                "INT8 KV cache scale and reciprocal must be finite and "
+                "positive in float32.")
+        copy_weight(self.kv_cache_scaling_factor, scale)
+        copy_weight(self.inv_kv_cache_scaling_factor, inverse)
 
     def process_weights_after_loading(self):
         self.quant_method.process_weights_after_loading(self)

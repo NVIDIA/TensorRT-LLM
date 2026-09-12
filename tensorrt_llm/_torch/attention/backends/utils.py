@@ -81,6 +81,10 @@ def create_attention(
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
             f"Backend {backend_name} does not support chunked attention.")
+    if (quant_config is not None
+            and quant_config.layer_quant_mode.has_int8_kv_cache()
+            and backend_name.upper() != "TRTLLM"):
+        raise ValueError("INT8 KV cache requires the TRTLLM attention backend.")
     attn_cls = get_attention_backend(backend_name, sparse_params=sparse_params)
 
     if is_mla_enable:
