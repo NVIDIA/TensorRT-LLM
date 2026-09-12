@@ -25,6 +25,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
     check_decode_span_shape,
     msa_paged_kv,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
+    write_kv_slots,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import MsaDecodeSpan
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -444,6 +447,8 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
     metadata.kv_cache_manager = manager
     metadata.msa_out_cache_loc = torch.tensor([2, page_size + 5], dtype=torch.int32)
     values = torch.arange(2 * head_dim, dtype=torch.float32).reshape(2, 1, head_dim)
+    metadata._msa_fields_ready = True
+    metadata._msa_live_total_q = 2
 
     returned = metadata.msa_idx_k_cache(3)
     metadata.msa_write_idx_k(3, values)
@@ -569,6 +574,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
                 self.msa_out_cache_loc,
                 idx_k,
                 layout="HND",
+                num_live_tokens=int(idx_k.shape[0]),
             )
 
         def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
@@ -994,6 +1000,106 @@ def test_decode_span_shape_check_names_the_kernel_that_rejected_the_q():
     # 128 page table rows out of a batch that only has 11.
     with pytest.raises(ValueError, match=r"kernel: total_q \(512\) must be batch \(11\)"):
         check_decode_span_shape("kernel", 512, 11, 4)
+
+
+def test_a_shrinking_step_leaves_no_live_slot_in_the_padded_tail():
+    """The slot-guarded consumers recognize a negative slot and nothing else, so
+    every row a step does not own has to hold one."""
+    block_ids = torch.arange(3 * 4, dtype=torch.int32).reshape(3, 4)
+
+    class FakeCacheManager:
+        tokens_per_block = 4
+
+        def get_block_ids_per_seq(self, request_ids):
+            return block_ids[: len(request_ids)]
+
+        def get_buffers(self, layer_idx, kv_layout="NHD"):
+            # Only its device is read, which keeps this test off the GPU.
+            return torch.zeros(1, dtype=torch.bfloat16)
+
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = FakeCacheManager()
+    metadata.mapping = None
+    metadata._msa_buffers_ready = True
+    metadata._msa_params = None
+    metadata._msa_decode_span = None
+    metadata.max_num_sequences = 3
+    metadata.msa_subpage_block_table = None
+    metadata._msa_subpages_per_slot = 0
+    metadata.msa_out_cache_loc = torch.zeros(16, dtype=torch.int32)
+    metadata.msa_kv_indices = torch.zeros(3 * 4, dtype=torch.int32)
+    metadata.msa_block_table = torch.zeros(3, 4, dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(3, dtype=torch.int32)
+
+    def build(request_ids, qo_lens, kv_lens):
+        # The host lengths are read-only properties over these.
+        metadata.request_ids = request_ids
+        metadata._msa_qo_lens_cpu = torch.tensor(qo_lens, dtype=torch.int32)
+        metadata._msa_kv_lens_cpu = torch.tensor(kv_lens, dtype=torch.int32)
+        metadata._msa_qo_offset_cpu = metadata._msa_kv_lens_cpu - metadata._msa_qo_lens_cpu
+        metadata._build_msa_fields()
+
+    # A three-request step of six new tokens, then a smaller one of two.
+    build([0, 1, 2], (4, 1, 1), (9, 3, 5))
+    assert metadata.msa_live_token_count() == 6
+    wide_tail = metadata.msa_out_cache_loc[2:6].tolist()
+    assert all(slot >= 0 for slot in wide_tail)
+
+    build([0, 1], (1, 1), (3, 5))
+
+    assert metadata.msa_live_token_count() == 2
+    # The rows the shrunk step does not own, including those the wider one did.
+    assert metadata.msa_out_cache_loc[2:].tolist() == [-1] * 14
+    assert (metadata.msa_out_cache_loc[:2] >= 0).all()
+
+
+def test_the_eager_writer_drops_the_sentinel_tail_it_is_handed():
+    """The padded rows of a step must reach no page at all, the wrap target of a
+    surviving -1 included."""
+    num_pages, page_size, head_dim = 4, 8, 16
+    cache = torch.zeros(num_pages, 1, page_size, head_dim, dtype=torch.bfloat16)
+    # Two live tokens, then the -1 tail a capture bucket pads the step out to.
+    out_cache_loc = torch.tensor([2, page_size + 5, -1, -1], dtype=torch.int32)
+    values = torch.arange(4 * head_dim, dtype=torch.float32).reshape(4, 1, head_dim)
+
+    write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=2)
+
+    torch.testing.assert_close(cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
+    torch.testing.assert_close(cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
+    # The page a wrapped -1 would have hit.
+    assert not cache[num_pages - 1].any()
+
+
+def test_the_eager_writer_refuses_a_live_count_it_has_no_rows_for():
+    """A count past the rows supplied is a caller bug, not a short write."""
+    cache = torch.zeros(4, 1, 8, 16, dtype=torch.bfloat16)
+    out_cache_loc = torch.tensor([2, 5], dtype=torch.int32)
+    values = torch.zeros(2, 1, 16)
+
+    with pytest.raises(ValueError, match=r"num_live_tokens=3 exceeds the rows supplied"):
+        write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=3)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=-1)
+
+    # A step that scheduled nothing writes nothing rather than erroring.
+    write_kv_slots(cache, out_cache_loc, values, layout="HND", num_live_tokens=0)
+    assert not cache.any()
+
+
+def test_an_unprepared_step_has_no_live_count_to_write_against():
+    """A stale count would let a write land on another step's slots."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_fields_ready = False
+    metadata._msa_live_total_q = 7
+
+    with pytest.raises(RuntimeError, match="did not stage a slot mapping"):
+        metadata.msa_live_token_count()
+
+    metadata._msa_fields_ready = True
+    assert metadata.msa_live_token_count() == 7
 
 
 def test_a_pure_prefill_step_has_no_decode_span():
