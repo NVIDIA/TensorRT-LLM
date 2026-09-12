@@ -336,6 +336,16 @@
     },
     {
       "allowed_values": [
+        "context",
+        "generation"
+      ],
+      "annotation": "Optional[tensorrt_llm.llmapi.llm_args.DisaggWorkerRole]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "disagg_worker_role"
+    },
+    {
+      "allowed_values": [
         "auto",
         "float16",
         "bfloat16",

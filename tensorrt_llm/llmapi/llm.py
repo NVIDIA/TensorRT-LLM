@@ -403,7 +403,7 @@ class BaseLLM:
             # check the kwargs and raise ValueError directly
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
-                ['_mpi_session', 'backend'])
+                ['_mpi_session', '_disagg_worker_role', 'backend'])
             if issubclass(llm_args_cls, TorchLlmArgs):
                 # Values are vetted by TorchLlmArgs._drop_removed_args.
                 valid_keys |= TORCH_LLMARGS_REMOVED_ARGS

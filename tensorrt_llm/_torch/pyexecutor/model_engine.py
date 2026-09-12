@@ -33,6 +33,7 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
+                                          DisaggWorkerRole,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
@@ -476,6 +477,8 @@ class PyTorchModelEngine(ModelEngine):
         # overhead should not pay.
         self.enable_in_graph_sampling = bool(
             getattr(llm_args, "enable_in_graph_sampling", False))
+        # Consumed by _capture_generation_cuda_graphs; see the gate there.
+        self._disagg_worker_role = llm_args.disagg_worker_role
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
             spec_config.tokens_per_gen_step -
@@ -2702,6 +2705,17 @@ class PyTorchModelEngine(ModelEngine):
                                         resource_manager: ResourceManager):
         """Warm up or capture pure-generation CUDA graph shapes."""
         if not self.cuda_graph_runner.enabled:
+            return
+
+        # A batch is graph-eligible only when it carries no context request
+        # (ScheduledRequests.can_run_cuda_graph), and every serving step on a
+        # context worker carries one -- so these graphs can never be replayed
+        # there, and capturing them only costs warmup time and pinned memory.
+        # Prefill graphs (_capture_prefill_cuda_graphs) are unaffected.
+        if self._disagg_worker_role == DisaggWorkerRole.CONTEXT:
+            logger.info("Skipping generation CUDA graph capture: this is a "
+                        "disaggregated context worker, which never runs a "
+                        "pure-generation step.")
             return
 
         operation = ("warmup"
