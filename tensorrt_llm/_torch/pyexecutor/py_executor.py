@@ -107,7 +107,7 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
-from .scheduler import (RequestScheduler, ScheduledRequests,
+from .scheduler import (KVCacheV2Scheduler, RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
@@ -948,6 +948,7 @@ class PyExecutor:
         if kv_cache_transceiver is not None:
             self.hang_detector.register_status_provider(
                 kv_cache_transceiver.get_status_dump)
+            self._register_in_transmission_predicate()
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
@@ -8159,6 +8160,25 @@ class PyExecutor:
 
         self._pending_recompute_pause_ids.remove(request_id)
         self.inflight_req_ids.erase(request_id)
+
+    def _register_in_transmission_predicate(self) -> None:
+        """Let the V2 scheduler recognise requests owned by the transfer fabric.
+
+        V2 disagg addresses a peer's KV by GPU pool slot id, which is valid only
+        while the owning cache is active and its pages are GPU-locked. Suspending
+        or freeing such a request to make room would move memory the fabric is
+        still using, so the scheduler needs the predicate to exclude it from
+        victim selection.
+        """
+        scheduler = self.scheduler
+        # The multimodal schedulers wrap the LLM scheduler without forwarding
+        # attributes, so walk down to the one that owns victim selection.
+        while scheduler is not None and not isinstance(scheduler,
+                                                       KVCacheV2Scheduler):
+            scheduler = getattr(scheduler, "scheduler", None)
+        if scheduler is not None:
+            scheduler.set_in_transmission_predicate(
+                self._is_request_in_transmission)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request's KV cache may still be read by the fabric.

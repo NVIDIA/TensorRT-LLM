@@ -24,6 +24,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV1,
+    _CacheReuseAdapterV2,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -140,6 +141,26 @@ class TestPackedBeamBlockLayout:
         assert mgr.beam_width == 4
         assert mgr.pool_indices_window == 512
         np.testing.assert_array_equal(block_ids, [10, 11, 12, 13])
+
+    def test_v2_adapter_returns_slot_ids_for_an_active_cache(self):
+        req = _FakeReq(prompt_len=7)
+        req.py_request_id = 1
+
+        block_ids = _CacheReuseAdapterV2(_FakeV2Mgr(is_active=True)).get_block_ids(req, 0, _lg())
+
+        np.testing.assert_array_equal(block_ids, [10, 11, 12])
+
+    def test_v2_adapter_rejects_a_suspended_cache(self):
+        """A suspended cache is not addressable by the peer.
+
+        Its pages can sit in a host tier, so its slot ids are not offsets into
+        the GPU pool the peer pointer arithmetic uses.
+        """
+        req = _FakeReq(prompt_len=7)
+        req.py_request_id = 1
+
+        with pytest.raises(AssertionError, match="no active KV cache"):
+            _CacheReuseAdapterV2(_FakeV2Mgr(is_active=False)).get_block_ids(req, 0, _lg())
 
     def test_pack_beam_cache_indices_single_block_prompt_keeps_all_beams(self):
         packed = KVCacheManager._pack_beam_cache_indices([[10], [10], [10], [10]])
@@ -585,6 +606,24 @@ class _StubAdapter(CacheReuseAdapter):
 class _FakeReq:
     def __init__(self, prompt_len: int):
         self.prompt_len = prompt_len
+
+
+class _FakeV2Mgr:
+    """KVCacheManagerV2 stand-in: one request, one page list, a liveness flag."""
+
+    enable_block_reuse = True
+    tokens_per_block = 32
+
+    def __init__(self, is_active: bool):
+        self._is_active = is_active
+        self.kv_cache_map = {
+            1: SimpleNamespace(
+                get_aggregated_page_indices=lambda group_idx, valid_only: iter([10, 11, 12])
+            )
+        }
+
+    def is_request_active(self, request_id):  # noqa: ARG002
+        return self._is_active
 
 
 class _FakeSamplingConfig:
