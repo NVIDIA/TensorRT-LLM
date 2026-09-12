@@ -47,13 +47,18 @@ chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
 # Every rank needs the test sources importable, not just rank 0. Rank 0 runs
-# pytest, whose rootdir handling puts tests/integration on sys.path; ranks 1..N
-# run the mgmn_worker_node started by trtllm-llmapi-launch, a bare MPI worker
-# that unpickles request-attached objects the tests define (for example the
-# logits processors in `defs.accuracy.accuracy_core`) and otherwise dies with
-# "ModuleNotFoundError: No module named 'defs'". Single-node stages never see
-# this because MpiPoolSession spawns its workers with rank 0's sys.path.
-export PYTHONPATH="$llmSrcNode/tests/integration${PYTHONPATH:+:$PYTHONPATH}"
+# pytest, whose pythonpath ini setting (tests/integration/defs/pytest.ini sets
+# `pythonpath = ../../`, i.e. the tests/ root) plus rootdir handling puts both
+# tests/ and tests/integration on sys.path; ranks 1..N run the mgmn_worker_node
+# started by trtllm-llmapi-launch, a bare MPI worker that unpickles
+# request-attached objects the tests define (for example the logits processors
+# in `defs.accuracy.accuracy_core`) and otherwise dies with
+# "ModuleNotFoundError: No module named 'defs'". tests/ is needed too:
+# importing `defs.accuracy.accuracy_core` pulls in `defs.conftest`, which
+# imports the `test_common` package that lives at tests/test_common.
+# Single-node stages never see any of this because MpiPoolSession spawns its
+# workers with rank 0's sys.path.
+export PYTHONPATH="$llmSrcNode/tests/integration:$llmSrcNode/tests${PYTHONPATH:+:$PYTHONPATH}"
 
 # Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
