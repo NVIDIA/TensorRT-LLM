@@ -20,7 +20,11 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import (
+    CacheCost,
+    KvCacheCreator,
+    _get_num_pool_groups_for_estimation,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
@@ -469,6 +473,8 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         layer_types=layer_types,
         sliding_window=sliding_window,
     )
+    config = hybrid._model_engine.model.model_config.pretrained_config
+    config.head_dim, config.global_head_dim = 256, 128
     uniform = _make_creator(
         tpb,
         [_make_mock_request(max_seq_len - 1), _make_mock_request(1)],
@@ -523,7 +529,7 @@ def test_hybrid_linear_attention_scales_by_num_pool_groups():
     ],
     ids=["multiple_window_sizes", "missing_window"],
 )
-def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
+def test_plain_v2_collapses_unsupported_full_sliding_metadata(
     sliding_window,
     use_sliding_window,
 ):
@@ -550,7 +556,17 @@ def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
         layer_types=["full_attention", "full_attention"],
     )
 
-    assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
+    assert hybrid._get_token_num_for_estimation() == uniform._get_token_num_for_estimation()
+
+
+def test_uniform_window_overrides_mixed_attention_metadata() -> None:
+    config = SimpleNamespace(
+        num_hidden_layers=2,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=128,
+    )
+
+    assert _get_num_pool_groups_for_estimation(config, 4096, [512]) == 1
 
 
 def test_vswa_max_attention_window_fallback_scales():
@@ -604,6 +620,8 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         layer_types=layer_types,
         sliding_window=sliding_window,
     )
+    config = c._model_engine.model.model_config.pretrained_config
+    config.head_dim, config.global_head_dim = 256, 128
 
     total_tokens = c._get_token_num_for_estimation()
     per_pool_tokens = total_tokens // 2  # 2 pool groups
@@ -1142,6 +1160,7 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 
 def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator = object.__new__(KvCacheCreator)
+    creator._model_engine = Mock(_max_cuda_graph_batch_size=4)
     target_pool_ratio = [0.32, 0.68]
     creator._kv_cache_config = KvCacheConfig(
         pool_ratio=target_pool_ratio,
@@ -1193,10 +1212,12 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
         codec_provider = object()
         creator._create_one_model_draft_kv_cache_manager(
             creator._max_seq_len,
+            estimating_kv_cache=True,
             cold_page_codec_provider=codec_provider,
         )
 
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
     assert draft_config.pool_ratio == [1.0]
+    assert create_manager.call_args.kwargs["max_cuda_graph_batch_size"] == 4
     assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio

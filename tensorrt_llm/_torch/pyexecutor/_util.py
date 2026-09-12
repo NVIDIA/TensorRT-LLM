@@ -52,7 +52,8 @@ from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
-from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
+                           extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
@@ -511,33 +512,27 @@ def _get_num_pool_groups_for_estimation(
     max_seq_len: int,
     fallback_attention_windows: Optional[List[Optional[int]]],
 ) -> int:
-    """Infer the number of V2 KV-cache pools needed during estimation.
+    """Estimate V2 pool groups from KV storage windows and layer metadata.
 
-    Sliding/full-attention hybrids are best distinguished by their effective
-    windows. Hybrid linear-attention models with mixed layer types fall back to
-    their distinct layer types. Unsupported target window metadata must not
-    make estimation fail; in that
-    case preserve the legacy layer-type/window heuristic.
+    Model sliding attention alone does not imply separate storage pools.
+    Preserve distinctions required by hybrid layer types and page sizes.
     """
-    num_layers = getattr(model_config, "num_hidden_layers", None)
+    if (fallback_attention_windows is not None
+            and not is_hybrid_linear(model_config)):
+        normalized_windows = _normalize_attention_windows(
+            fallback_attention_windows, max_seq_len)
+        return 1 if normalized_windows is None else len(set(normalized_windows))
+
     layer_types = getattr(model_config, "layer_types", None)
     attention_windows = None
-    if isinstance(num_layers, int) and num_layers > 0:
-        try:
-            inferred_windows = [
-                get_layer_attention_window(model_config, layer_idx)
-                for layer_idx in range(num_layers)
-            ]
-        except (NotImplementedError, ValueError) as error:
-            logger.warning(
-                "Unable to infer target attention windows for KV-cache "
-                f"estimation ({error}); falling back to layer metadata.")
-        else:
-            if any(window is not None for window in inferred_windows):
-                attention_windows = [
-                    max_seq_len if window is None else window
-                    for window in inferred_windows
-                ]
+    if (fallback_attention_windows is None and is_gemma4_hybrid(model_config)):
+        attention_windows = _derive_layer_type_attention_windows(
+            model_config, max_seq_len)
+    # Check whether KV storage uses configured or inferred attention windows,
+    # which can be independently configured from the model's use of sliding-window
+    # attention for computation.
+    kv_cache_uses_attention_windows = (fallback_attention_windows is not None
+                                       or attention_windows is not None)
 
     if attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
@@ -547,9 +542,21 @@ def _get_num_pool_groups_for_estimation(
         return len(set(normalized_windows))
 
     if isinstance(layer_types, (list, tuple)):
-        num_layer_types = len(set(layer_types))
-        if num_layer_types > 1:
-            return num_layer_types
+        # These tags come from HF pretrained_config.layer_types.
+        # As above, sliding-window attention in the model does not imply windowed
+        # KV storage. Without windowed storage, sliding/full attention share a pool
+        # type unless their page sizes differ (Gemma4).
+        pool_types = set()
+        for layer_type in layer_types:
+            if (not kv_cache_uses_attention_windows
+                    and not is_gemma4_hybrid(model_config) and
+                (_is_sliding_attention_layer(layer_type)
+                 or getattr(layer_type, "name",
+                            str(layer_type)).lower() == "full_attention")):
+                layer_type = "full_attention"
+            pool_types.add(layer_type)
+        if len(pool_types) > 1:
+            return len(pool_types)
 
     if fallback_attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
@@ -1699,6 +1706,8 @@ class KvCacheCreator:
         sparse_attn_config = effective_draft_config.sparse_attention_config
         return _create_kv_cache_manager(
             model_engine=None,
+            max_cuda_graph_batch_size=self._model_engine.
+            _max_cuda_graph_batch_size,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=draft_kv_config,
@@ -2418,7 +2427,8 @@ def _create_kv_cache_manager(
         is_disagg: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
-        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
+        joint_kv_cache_reuse: bool = False,
+        max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2514,8 +2524,11 @@ def _create_kv_cache_manager(
     # target's num_hidden_layers, so _project_max_attention_window_vec would
     # wrap them back onto pattern[0]. The draft config sets
     # max_attention_window=None to opt out, not to request derivation.
+    # Keep estimation storage full-context unless distinct page layouts require
+    # windowed storage (Gemma4). Enable automatic windowing for the final manager.
     if (kv_cache_config.max_attention_window is None and not is_draft
-            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
+            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
+            and (not estimating_kv_cache or is_gemma4_hybrid(config))):
         derived_windows = _derive_layer_type_attention_windows(
             config, max_seq_len)
         if derived_windows is not None:
@@ -2569,6 +2582,9 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs["max_cuda_graph_batch_size"] = (
+            model_engine._max_cuda_graph_batch_size
+            if model_engine is not None else max_cuda_graph_batch_size)
         # V2 builds the block-reuse cache key of a multimodal token run from
         # the vocabulary size. Resolve it here rather than per-branch: the
         # manager needs it whenever block reuse can meet multimodal input,
