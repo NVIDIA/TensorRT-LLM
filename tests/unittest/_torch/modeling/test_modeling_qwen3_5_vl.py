@@ -270,6 +270,57 @@ def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int
     )
 
 
+@pytest.mark.parametrize("group_size", [16, 32])
+def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int) -> None:
+    """The bf16 lm_head fallback infers the scale block width from ``weight_scale``,
+    so 32-element weight-only exports dequantize correctly, and a scale shape that
+    does not divide the input width is rejected."""
+    out_features, in_features = 2, 64
+    mapper = SimpleNamespace(
+        config=SimpleNamespace(
+            quant_config_dict={},
+            pretrained_config=SimpleNamespace(torch_dtype=torch.float32),
+        ),
+        _E2M1_VALUES=Qwen3_5MoeHfWeightMapper._E2M1_VALUES,
+    )
+    torch.manual_seed(0)
+    packed = torch.randint(0, 256, (out_features, in_features // 2), dtype=torch.uint8)
+    num_groups = in_features // group_size
+    # Distinct, exactly representable E4M3 values so a mis-mapped block shows up.
+    block_scale = (
+        torch.arange(1, out_features * num_groups + 1, dtype=torch.float32)
+        .view(out_features, num_groups)
+        .to(torch.float8_e4m3fn)
+    )
+    global_scale = torch.tensor(0.5, dtype=torch.float32)
+    weights = {
+        "lm_head.weight": packed,
+        "lm_head.weight_scale": block_scale,
+        "lm_head.weight_scale_2": global_scale,
+        "lm_head.input_scale": torch.tensor(1.0),
+        "model.norm.weight": torch.ones(4),
+    }
+
+    result = Qwen3_5MoeHfWeightMapper._dequantize_lm_head_nvfp4(mapper, weights)
+
+    lut = torch.tensor(Qwen3_5MoeHfWeightMapper._E2M1_VALUES, dtype=torch.float32)
+    expected = torch.empty(out_features, in_features)
+    expected[:, 0::2] = lut[(packed & 0x0F).long()]
+    expected[:, 1::2] = lut[(packed >> 4).long()]
+    expected = expected.view(out_features, num_groups, group_size) * (
+        block_scale.float() * global_scale
+    ).unsqueeze(-1)
+    assert set(result) == {"lm_head.weight", "model.norm.weight"}
+    torch.testing.assert_close(result["lm_head.weight"], expected.view(out_features, in_features))
+
+    # Three scale groups cannot tile 64 inputs regardless of the block width.
+    bad_scale = torch.ones(out_features, 3, dtype=torch.float32).to(torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="3 groups for 64 inputs"):
+        Qwen3_5MoeHfWeightMapper._dequantize_lm_head_nvfp4(
+            mapper, {**weights, "lm_head.weight_scale": bad_scale}
+        )
+
+
 def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
     name = "model.language_model.layers.0.mlp.gate_proj"
     model_config = SimpleNamespace(

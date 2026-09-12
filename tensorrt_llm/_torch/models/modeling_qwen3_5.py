@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
@@ -463,7 +464,7 @@ def _lm_head_nvfp4_enabled(model_config):
     )
 
 
-def _has_nvfp4_gemm_block_width(cfg) -> bool:
+def _has_nvfp4_gemm_block_width(cfg: QuantConfig | None) -> bool:
     """Whether a W4A16_NVFP4 entry can be promoted to the W4A4 NVFP4 GEMMs.
 
     The GEMMs are hardware-bound to 16-element scale blocks; ModelOpt's
