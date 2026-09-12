@@ -77,8 +77,9 @@ class TestShareTensor(unittest.TestCase):
     def test_share_tensor_different_shapes(self) -> None:
         """Test CPU and CUDA tensor sharing with different shapes."""
         test_shapes = [(1, ), (2, 3), (1, 2, 3, 4), (10, )]
+        devices = ("cpu", "cuda") if self.cuda_available else ("cpu", )
         for shape in test_shapes:
-            for device in ("cpu", "cuda"):
+            for device in devices:
                 with self.subTest(shape=shape, device=device):
                     test_tensor = torch.randn(shape)
                     with self._shared_tensor(test_tensor,
@@ -89,8 +90,9 @@ class TestShareTensor(unittest.TestCase):
     def test_share_tensor_different_dtypes(self) -> None:
         """Test CPU and CUDA tensor sharing with different data types."""
         test_dtypes = [torch.float32, torch.float64, torch.int32, torch.int64]
+        devices = ("cpu", "cuda") if self.cuda_available else ("cpu", )
         for dtype in test_dtypes:
-            for device in ("cpu", "cuda"):
+            for device in devices:
                 # xdist cannot serialize torch.dtype in subtest reports.
                 with self.subTest(dtype=str(dtype), device=device):
                     test_tensor = torch.randn(2, 3).to(dtype)
@@ -99,6 +101,29 @@ class TestShareTensor(unittest.TestCase):
                         self.assertTrue(
                             torch.allclose(reconstructed.cpu(), test_tensor))
                         self.assertEqual(reconstructed.dtype, test_tensor.dtype)
+
+    def test_producer_cleanup_after_consumer_error(self) -> None:
+        """A consumer failure propagates after its producer exits cleanly."""
+        existing_pids = {child.pid for child in mp.active_children()}
+        producer = None
+        error = RuntimeError("Consumer failed")
+        with self.assertRaises(RuntimeError) as raised:
+            with self._shared_tensor(self.ref_tensor, "cpu"):
+                producers = [
+                    child for child in mp.active_children()
+                    if child.pid not in existing_pids
+                ]
+                self.assertEqual(len(producers), 1)
+                producer = producers[0]
+                raise error
+
+        self.assertIs(raised.exception, error)
+        self.assertIsNotNone(producer)
+        self.assertFalse(producer.is_alive())
+        self.assertEqual(producer.exitcode, 0)
+        self.assertNotIn(producer.pid,
+                         {child.pid
+                          for child in mp.active_children()})
 
     @staticmethod
     def _stand_by_producer(conn):
