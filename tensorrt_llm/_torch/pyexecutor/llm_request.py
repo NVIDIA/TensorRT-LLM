@@ -1548,7 +1548,6 @@ def executor_request_to_llm_request(
         sampling_config=sampling_config,
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
-        pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
@@ -1573,7 +1572,6 @@ def executor_request_to_llm_request(
         py_lora_path=getattr(executor_request, "py_lora_path", None),
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
-        lookahead_config=None,
         return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
@@ -1588,11 +1586,8 @@ def executor_request_to_llm_request(
         ] if executor_request.output_config.additional_model_outputs is not None
         else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
-        draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
-        logits_post_processor=None,
-        apply_logits_post_processor_batched=False,
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),

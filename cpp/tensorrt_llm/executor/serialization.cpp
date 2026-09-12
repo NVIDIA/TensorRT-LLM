@@ -824,15 +824,12 @@ size_t Serialization::serializedSize(ContextPhaseParams const& contextPhaseParam
 // Request
 Request Serialization::deserializeRequest(std::istream& is)
 {
-    // Serialization of Request with logitsPostProcessor is currently not supported.
-    // Dynamic logitsPostProcessor only supported with replicate=false or no tensor parallelism.
     auto inputTokenIds = su::deserialize<VecTokens>(is);
     auto maxNewTokens = su::deserialize<SizeType32>(is);
     auto streaming = su::deserialize<bool>(is);
     auto samplingConfig = su::deserialize<SamplingConfig>(is);
     auto outputConfig = su::deserialize<OutputConfig>(is);
     auto endId = su::deserialize<std::optional<SizeType32>>(is);
-    auto padId = su::deserialize<std::optional<SizeType32>>(is);
     auto positionIds = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto badWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto stopWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
@@ -842,9 +839,7 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto multimodalEmbedding = su::deserialize<std::optional<Tensor>>(is);
     auto mRopeConfig = su::deserialize<std::optional<MropeConfig>>(is);
     auto loraConfig = su::deserialize<std::optional<LoraConfig>>(is);
-    auto lookaheadConfig = su::deserialize<std::optional<LookaheadDecodingConfig>>(is);
     auto kvCacheRetentionConfig = su::deserialize<std::optional<KvCacheRetentionConfig>>(is);
-    auto logitsPostProcessorName = su::deserialize<std::optional<std::string>>(is);
     auto encoderInputTokenIds = su::deserialize<std::optional<VecTokens>>(is);
     auto clientId = su::deserialize<std::optional<IdType>>(is);
     auto returnAllGeneratedTokens = su::deserialize<bool>(is);
@@ -853,11 +848,7 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto contextPhaseParams = su::deserialize<std::optional<ContextPhaseParams>>(is);
     auto encoderInputFeatures = su::deserialize<std::optional<Tensor>>(is);
     auto encoderOutputLength = su::deserialize<std::optional<SizeType32>>(is);
-    auto crossAttentionMask = su::deserialize<std::optional<Tensor>>(is);
-    auto numReturnSequences = su::deserialize<SizeType32>(is);
-    auto skipCrossAttnBlocks = su::deserialize<std::optional<Tensor>>(is);
     auto guidedDecodingParams = su::deserialize<std::optional<GuidedDecodingParams>>(is);
-    auto languageAdapterUid = su::deserialize<std::optional<SizeType32>>(is);
     auto allottedTimeInt = su::deserialize<std::optional<std::chrono::milliseconds::rep>>(is);
     auto allottedTimeMs = allottedTimeInt
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
@@ -865,14 +856,12 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto disaggRequestId = su::deserialize<std::optional<IdType>>(is);
     auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
 
-    return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
+    return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
-        std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
-        std::nullopt, std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
-        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        std::move(crossAttentionMask), numReturnSequences, std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
+        std::move(loraConfig), std::move(kvCacheRetentionConfig), std::move(encoderInputTokenIds), clientId,
+        returnAllGeneratedTokens, priority, requestType, std::move(contextPhaseParams), std::move(encoderInputFeatures),
+        encoderOutputLength, std::move(guidedDecodingParams), allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
