@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import inspect
 import math
 import os
@@ -316,6 +319,8 @@ class Glm4MoE(nn.Module):
             config=model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
+            layer_idx=layer_idx,
+            is_shared_expert=True,
         )
 
         self.allreduce = AllReduce(
@@ -375,7 +380,12 @@ class Glm4MoE(nn.Module):
         )
 
     def compute_routed_output(
-        self, hidden_states, hidden_states_fp4, all_rank_num_tokens, do_finalize
+        self,
+        hidden_states,
+        hidden_states_fp4,
+        all_rank_num_tokens,
+        do_finalize,
+        lora_params,
     ):
         # max-throughput
         use_dp_padding = False
@@ -396,6 +406,7 @@ class Glm4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            lora_params=lora_params,
         )
 
         return routed_output
@@ -407,13 +418,15 @@ class Glm4MoE(nn.Module):
         all_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
 
         def _compute_shared_output():
             shared_output = self.shared_experts(
-                hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states
+                hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states,
+                lora_params=lora_params,
             )
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
@@ -421,7 +434,11 @@ class Glm4MoE(nn.Module):
 
         def _compute_routed_output():
             routed_output = self.compute_routed_output(
-                hidden_states, hidden_states_fp4, all_rank_num_tokens, do_finalize
+                hidden_states,
+                hidden_states_fp4,
+                all_rank_num_tokens,
+                do_finalize,
+                lora_params,
             )
             return routed_output
 
@@ -565,6 +582,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 config=model_config,
                 overridden_tp_size=self.mlp_tp_size,
                 reduce_output=True,
+                layer_idx=layer_idx,
             )
 
         self.input_layernorm = RMSNorm(
@@ -645,6 +663,7 @@ class Glm4DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -656,6 +675,7 @@ class Glm4DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
+            lora_params=lora_params,
             **kwargs,
         )
         if isinstance(self.mlp, Glm4MoE):
@@ -666,6 +686,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
@@ -675,6 +696,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
     def forward_MoE(
@@ -683,6 +705,7 @@ class Glm4DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
@@ -695,6 +718,7 @@ class Glm4DecoderLayer(DecoderLayer):
                     )
                 ),
                 do_finalize=do_finalize,
+                lora_params=lora_params,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -772,6 +796,7 @@ class Glm4DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(
@@ -795,6 +820,7 @@ class Glm4DecoderLayer(DecoderLayer):
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1)
             ),
+            lora_params=lora_params,
         )
 
         if self.fusion_config.POST_MLP_FUSION:
@@ -872,6 +898,7 @@ class Glm4MTP(Glm4DecoderLayer):
         embed_tokens: Embedding,
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         def norm_embeds():
@@ -907,6 +934,7 @@ class Glm4MTP(Glm4DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -933,6 +961,7 @@ class Glm4MTP(Glm4DecoderLayer):
                     self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
                 )
             ),
+            lora_params=lora_params,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -1009,6 +1038,7 @@ class Glm4Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                **kwargs,
             )
 
         return hidden_states
