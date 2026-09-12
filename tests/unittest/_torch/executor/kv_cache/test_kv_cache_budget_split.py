@@ -98,6 +98,7 @@ class TestSplitGpuBudgetForDraft:
     ) -> None:
         class DraftModelConfig:
             quant_config = None
+            sparse_attention_config = None
             pretrained_config = SimpleNamespace(
                 num_hidden_layers=1,
                 hidden_size=32,
@@ -133,6 +134,8 @@ class TestSplitGpuBudgetForDraft:
         creator._max_seq_len = 16384
         creator._max_batch_size = 1
         creator._max_num_tokens = 128
+        creator._max_beam_width = 1
+        creator._kv_connector_manager = None
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
@@ -160,10 +163,7 @@ class TestSplitGpuBudgetForDraft:
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]
         assert target_kv_config.max_attention_window == [16384]
-        if mode.is_external_drafter():
-            assert get_manager_cls.call_args.args[1] is draft_kv_config
-        else:
-            get_manager_cls.assert_not_called()
+        assert get_manager_cls.call_args.args[1] is draft_kv_config
 
     def test_v1_mixed_draft_build_uses_original_max_seq_len(self, mocker):
         c = _make_creator(max_gpu_total_bytes=10 * GB)
