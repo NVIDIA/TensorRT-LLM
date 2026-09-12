@@ -43,6 +43,8 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <optional>
+#include <tuple>
 
 #define C10_THROW_ERROR_FORMATTED(ErrorType, ...)                                                                      \
     do                                                                                                                 \
@@ -1189,10 +1191,10 @@ private:
         // low-rank intermediate is owned here.
         at::Tensor lowrank_workspace; // dtype  [P_max * max_lora_rank]
 
-        // Pinned-host single GemmCoord upper bounds; required by the
+        // Pinned-host per-problem GemmCoord upper bounds; required by the
         // cuda_graph_*_grouped_gemm wrappers for kernel selection.
-        at::Tensor host_max_problem_in;  // int8 pinned [sizeof(GemmCoord)]
-        at::Tensor host_max_problem_out; // int8 pinned [sizeof(GemmCoord)]
+        at::Tensor host_max_problem_in;  // int8 pinned [P_max * sizeof(GemmCoord)]
+        at::Tensor host_max_problem_out; // int8 pinned [P_max * sizeof(GemmCoord)]
     };
 
     LoraGroupedGemmBuffers mFc1DeviceBuf;
@@ -1207,6 +1209,8 @@ private:
     int64_t mLoraDeviceScratchDtypeBytes = 0;
     int64_t mLoraDeviceScratchSplitKSlices = 0;
     bool mLoraDeviceScratchHasGated = false;
+    using LoraHostMaxProblemShape = std::tuple<int64_t, int64_t, int64_t, int64_t, bool>;
+    std::optional<LoraHostMaxProblemShape> mLoraHostMaxProblemShape;
 
     // Split-K slice count for the grouped-GEMM low-rank in-GEMM. Shared between
     // buildMoeLoraParams (lazy sizing) and reserveLoraHostBuffers (warmup
@@ -1576,8 +1580,8 @@ private:
     // so callers must ensure any in-flight CUDA graph referencing the old
     // addresses has been destroyed or will not replay.
     //
-    // The host-side max-problem-size pins hold one GemmCoord each; the value is
-    // a worst-case upper bound, independent of per-call data.
+    // The host-side max-problem-size pins hold one GemmCoord per possible
+    // problem; every entry contains the same worst-case upper bound.
     void ensureLoraDeviceScratch(int64_t capacity, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
         bool has_gated, cudaStream_t stream = nullptr)
     {
@@ -1648,8 +1652,8 @@ private:
 
             mod.lowrank_workspace = at::empty({new_capacity * new_max_lora_rank}, dev_dtype_opts);
 
-            mod.host_max_problem_in = at::empty({gemm_coord_bytes}, pinned_int8_opts);
-            mod.host_max_problem_out = at::empty({gemm_coord_bytes}, pinned_int8_opts);
+            mod.host_max_problem_in = at::empty({new_capacity * gemm_coord_bytes}, pinned_int8_opts);
+            mod.host_max_problem_out = at::empty({new_capacity * gemm_coord_bytes}, pinned_int8_opts);
         };
 
         alloc_one(mFc1DeviceBuf);
@@ -1664,6 +1668,7 @@ private:
         mLoraDeviceScratchDtypeBytes = dtype_bytes;
         mLoraDeviceScratchSplitKSlices = splitk_slices;
         mLoraDeviceScratchHasGated = new_has_gated;
+        mLoraHostMaxProblemShape.reset();
     }
 
     // Pack the per-module at::Tensor scratch into the typed pointer bundle
@@ -2069,20 +2074,32 @@ private:
             // for kernel selection. Values are upper bounds safe to fix at
             // warmup time (M=1 since each problem is one row; N/K depend on
             // module direction and max_lora_rank).
-            auto fill_max_problem = [](void* host_ptr, int m, int n, int k)
+            auto fill_max_problems = [](void* host_ptr, int64_t count, int m, int n, int k)
             {
                 auto* coord = static_cast<cutlass::gemm::GemmCoord*>(host_ptr);
-                *coord = cutlass::gemm::GemmCoord(m, n, k);
+                std::fill_n(coord, count, cutlass::gemm::GemmCoord(m, n, k));
             };
-            // In-GEMM: M=1, N=max_lora_rank, K=in_dim. Out-GEMM: M=1, N=out_dim, K=max_lora_rank.
-            fill_max_problem(grouped_gemm.fc1.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
-            fill_max_problem(grouped_gemm.fc1.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
-            fill_max_problem(grouped_gemm.fc2.host_max_problem_in_pinned, 1, lora_max_low_rank, inter_size);
-            fill_max_problem(grouped_gemm.fc2.host_max_problem_out_pinned, 1, hidden_size, lora_max_low_rank);
-            if (has_gated)
+            auto const max_problem_shape
+                = std::make_tuple(mLoraDeviceScratchCapacity, hidden_size, inter_size, lora_max_low_rank, has_gated);
+            if (mLoraHostMaxProblemShape != max_problem_shape)
             {
-                fill_max_problem(grouped_gemm.gated.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
-                fill_max_problem(grouped_gemm.gated.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
+                // In-GEMM: M=1, N=max_lora_rank, K=in_dim. Out-GEMM: M=1, N=out_dim, K=max_lora_rank.
+                fill_max_problems(grouped_gemm.fc1.host_max_problem_in_pinned, mLoraDeviceScratchCapacity, 1,
+                    lora_max_low_rank, hidden_size);
+                fill_max_problems(grouped_gemm.fc1.host_max_problem_out_pinned, mLoraDeviceScratchCapacity, 1,
+                    inter_size, lora_max_low_rank);
+                fill_max_problems(grouped_gemm.fc2.host_max_problem_in_pinned, mLoraDeviceScratchCapacity, 1,
+                    lora_max_low_rank, inter_size);
+                fill_max_problems(grouped_gemm.fc2.host_max_problem_out_pinned, mLoraDeviceScratchCapacity, 1,
+                    hidden_size, lora_max_low_rank);
+                if (has_gated)
+                {
+                    fill_max_problems(grouped_gemm.gated.host_max_problem_in_pinned, mLoraDeviceScratchCapacity, 1,
+                        lora_max_low_rank, hidden_size);
+                    fill_max_problems(grouped_gemm.gated.host_max_problem_out_pinned, mLoraDeviceScratchCapacity, 1,
+                        inter_size, lora_max_low_rank);
+                }
+                mLoraHostMaxProblemShape = max_problem_shape;
             }
         }
 
