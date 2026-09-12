@@ -17,6 +17,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
 
+from tensorrt_llm._bootstrap import _UNIFIED_CACHE_ENV_VARS
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -553,13 +554,19 @@ class MpiPoolSession(MpiSession):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
-                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
+            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            or key in _UNIFIED_CACHE_ENV_VARS or key == "FLASHINFER_CUBIN_DIR"
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
         explicit_workspace_override = (_FLASHINFER_WORKSPACE_ENV
                                        in self._env_overrides)
+        workspace_root = _FLASHINFER_WORKSPACE_ROOT
+        if cache_root := env.get("TRTLLM_CACHE_DIR"):
+            workspace_root = os.path.join(os.path.expanduser(cache_root),
+                                          "flashinfer")
+            workspace_managed |= env.get(
+                _FLASHINFER_WORKSPACE_ENV) == workspace_root
         isolate_workspace = (
             (self.n_workers > 1 or workspace_managed)
             and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
@@ -567,12 +574,17 @@ class MpiPoolSession(MpiSession):
                  (workspace_managed and not explicit_workspace_override)))
         if isolate_workspace:
             env.pop(_FLASHINFER_WORKSPACE_ENV, None)
+            if cache_root:
+                logger.warning_once(
+                    "TRTLLM_CACHE_DIR keeps FlashInfer isolation enabled; "
+                    "set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 for better "
+                    "cache reuse at the risk of concurrent writes.",
+                    key="flashinfer_unified_cache_isolation")
         elif explicit_workspace_override:
             # The override is user-owned, including in any further nested pool.
             env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
-        python_args = ([
-            "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
-        ] if isolate_workspace else None)
+        python_args = (["-c", _FLASHINFER_WORKER_BOOTSTRAP, workspace_root]
+                       if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,

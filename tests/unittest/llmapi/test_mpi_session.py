@@ -246,6 +246,57 @@ def test_llmapi_launch_isolates_pmi_rank_without_size(tmp_path: Path) -> None:
 
 
 @pytest.mark.cpu_only
+def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    python_stub = stub_bin / "python3"
+    python_stub.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = \"-c\" ]; then\n"
+                           "    echo ipc:///tmp/trtllm-unified-cache-test\n"
+                           "fi\n")
+    python_stub.chmod(0o755)
+    openssl_stub = stub_bin / "openssl"
+    openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
+    openssl_stub.chmod(0o755)
+
+    env = os.environ.copy()
+    for name in (
+            "SLURM_NTASKS",
+            "SLURM_PROCID",
+            "OMPI_COMM_WORLD_SIZE",
+            "OMPI_COMM_WORLD_RANK",
+            "PMI_ID",
+            "FLASHINFER_WORKSPACE_BASE",
+            "FLASHINFER_CUBIN_DIR",
+            "TRTLLM_FLASHINFER_WORKSPACE_MANAGED",
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
+    ):
+        env.pop(name, None)
+    cache_root = tmp_path / "home" / "unified"
+    env["PMI_RANK"] = "0"
+    env["HOME"] = str(tmp_path / "home")
+    env["TRTLLM_CACHE_DIR"] = "~/unified"
+    env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
+    env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
+
+    launcher = Path(__file__).parents[
+        3] / "tensorrt_llm" / "llmapi" / "trtllm-llmapi-launch"
+    result = subprocess.run(  # nosec B603
+        ["bash", str(launcher), "/usr/bin/env"],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+    workspace = cache_root / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+    assert "better cache reuse" in result.stderr
+
+
+@pytest.mark.cpu_only
 def test_llmapi_launch_aborts_when_no_workspace_is_available(
         tmp_path: Path) -> None:
     env = os.environ.copy()
