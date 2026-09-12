@@ -4,6 +4,7 @@
 
 from collections.abc import Mapping
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -123,6 +124,7 @@ def _run_production_prefill(
         use_initial_states=use_initial_states,
         has_initial_states=has_initial_states,
         state_indices=slot_indices.to(torch.int32),
+        # causal_conv1d wants int32 offsets, unlike the int64 cu_seqlens above.
         query_start_loc=cu_seqlens.to(torch.int32),
     )
     core = attention.forward_prefill(
@@ -583,23 +585,31 @@ def test_kda_prefill_op_partial_final_chunk_large_batch():
 @torch.no_grad()
 @pytest.mark.parametrize(
     "sequence_lengths",
-    ([30], [65], [6, 12], [1, 2, 3], [64, 64, 63], [6, 12, 20, 25]),
+    ([1], [30], [65], [6, 12], [64, 64], [1, 2, 3], [64, 64, 63], [6, 12, 20, 25]),
     ids=(
+        # The only shape taking the sentinel-padded, forced-VARLEN_PURE branch.
+        "single-token",
         "one-chunk",
         "two-chunk-single-seq",
         "two-chunk-varlen",
+        # All-aligned, so the tile guard alone bounds the kernel's stores.
+        "two-chunk-varlen-aligned",
         "three-short-seqs",
         "three-chunk-boundary",
-        "four-chunk-optimized-boundary",
+        "four-chunk",
     ),
 )
-def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_lengths):
-    """Cover every small-varlen fallback chunk count and the optimized boundary.
+def test_kda_prefill_small_varlen_stays_on_optimized_op(
+    monkeypatch: pytest.MonkeyPatch,
+    sequence_lengths: list[int],
+) -> None:
+    """The optimized op owns every small varlen chunk count, not just NT >= 4.
 
-    The persistent K123 scheduler needs at least four total chunks. The
-    one-, two-, and three-chunk configurations must use FLA; the final case
-    has exactly four chunks and verifies the optimized boundary.
+    Routing these short-prompt shapes to FLA instead would make a real serving
+    run pay FLA's cold Triton autotune on its first short context.
     """
+    import fla.ops.kda
+
     optimized = _make_kda()
     reference = _make_reference(optimized.state_dict())
     cumulative_lengths = torch.tensor(
@@ -617,7 +627,17 @@ def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_length
         )
         * 0.05
     )
+
+    # The FLA fallback resolves ``chunk_kda`` at call time, so this counts it;
+    # the reference binds it at import time and is unaffected.
+    fla_spy = MagicMock(side_effect=fla.ops.kda.chunk_kda)
+    monkeypatch.setattr(fla.ops.kda, "chunk_kda", fla_spy)
     actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
+    assert fla_spy.call_count == 0, (
+        f"prefill fell back to FLA for sequence lengths {sequence_lengths}; "
+        "the optimized op must handle every varlen chunk count"
+    )
+
     expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
     _assert_close(actual, expected)
 

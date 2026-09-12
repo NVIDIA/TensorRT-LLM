@@ -15,7 +15,7 @@
 
 import contextlib
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -327,6 +327,11 @@ class Mamba2Metadata:
     # during warmup. Class-scoped (not env-var) so it cannot leak into real
     # inference from a stray shell export or a forked worker.
     _warmup_force_initial_states: bool = False
+
+    # Set by a subclass whose prefill kernel compiles a separate variant
+    # depending on whether every context length is a multiple of this value.
+    # Warmup reads it to cover both variants.
+    prefill_chunk_alignment: Optional[int] = None
 
     @classmethod
     @contextlib.contextmanager
