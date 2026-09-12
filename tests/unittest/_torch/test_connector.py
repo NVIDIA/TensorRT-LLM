@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import cloudpickle
 import mpi4py
 import pytest
+from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
@@ -59,7 +60,7 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
 
         req.request_id = 42
 
@@ -112,7 +113,7 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
         manager = KvCacheConnectorManager(worker, scheduler=scheduler)
 
-        req = MagicMock()
+        req = MagicMock(is_dummy_request=False)
 
         req.request_id = 42
         req.is_generation_only_request = False
@@ -142,11 +143,11 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
 
         scheduled_requests = ScheduledRequests()
 
-        req0 = MagicMock()
+        req0 = MagicMock(is_dummy_request=False)
         req0.request_id = 0
         req0.is_generation_only_request = False
 
-        req1 = MagicMock()
+        req1 = MagicMock(is_dummy_request=False)
         req1.request_id = 1
         req1.is_generation_only_request = False
 
@@ -186,7 +187,7 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
     kv_cache_manager.commit_and_get_block_hashes.return_value = []
 
     # Create a mock request in generation state with draft tokens
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 42
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.get_tokens.return_value = [1, 2, 3, 4, 5]  # 5 tokens already generated
@@ -225,7 +226,7 @@ def test_scheduler_output_block_hashes_read_through():
     # one full block whose hash has just been committed by the manager.
     kv_cache_manager.commit_and_get_block_hashes.side_effect = [[], [12345]]
 
-    req = MagicMock()
+    req = MagicMock(is_dummy_request=False)
     req.request_id = 42
     req.state = LlmRequestState.GENERATION_IN_PROGRESS
     req.py_draft_tokens = []
@@ -252,3 +253,45 @@ def test_scheduler_output_block_hashes_read_through():
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
     for call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
         assert call.args == (req, )
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_connector_adp_disjoint_requests(
+        mpi_pool_executor: MPIPoolExecutor) -> None:
+    """A busy owner must finish without request callbacks on its idle peer."""
+
+    def test() -> None:
+
+        class AdapterMock(MagicMock):
+            supports_attention_dp = True
+
+        worker = AdapterMock()
+        scheduler = AdapterMock()
+        scheduler.get_num_new_matched_tokens.return_value = (4, False)
+        scheduler.request_finished.return_value = True
+        manager = KvCacheConnectorManager(worker,
+                                          scheduler,
+                                          enable_attention_dp=True)
+        requests = []
+        # Different callback counts would deadlock the old per-request MPI
+        # broadcasts; intersecting all owners' completions would never release.
+        if mpi_rank() == 1:
+            for request_id in (10, 20, 30):
+                req = MagicMock(is_dummy_request=False,
+                                is_generation_only_request=False)
+                req.request_id = request_id
+                assert manager.get_num_new_matched_tokens(req, 0) == 4
+                manager.update_state_after_alloc(req, [request_id])
+                assert manager.request_finished(req, [request_id])
+                requests.append(req)
+        worker.get_finished.return_value = ([
+            req.request_id for req in requests
+        ], [])
+        assert {req.request_id
+                for req in manager.get_finished()
+                } == {req.request_id
+                      for req in requests}
+        assert not manager.pending_async_requests.saving
+
+    run_across_mpi(mpi_pool_executor, test, 2)
