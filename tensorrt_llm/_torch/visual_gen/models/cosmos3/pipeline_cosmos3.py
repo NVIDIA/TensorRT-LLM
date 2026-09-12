@@ -2243,6 +2243,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if prepared.video_latents is None:
             raise RuntimeError("Cosmos3 request reached denoising without prepared video latents.")
         latents = prepared.video_latents
+        policy_solver_fp32 = request.action_mode == ACTION_MODE_POLICY
+        if policy_solver_fp32:
+            latents = latents.float()
         video_shape = tuple(latents.shape[2:5])
 
         self.sampling.set_timesteps(self.scheduler, request.num_inference_steps, device=self.device)
@@ -2301,7 +2304,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 action_domain_ids = action_domain_ids.expand(current_action.shape[0])
 
             result = self.transformer(
-                hidden_states=latent_input,
+                hidden_states=(latent_input.to(self.dtype) if policy_solver_fp32 else latent_input),
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
                 raw_timestep=timestep,
                 text_ids=extra_tensors["text_ids"],
@@ -2311,7 +2314,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 noisy_frame_mask=prepared.velocity_mask,
                 audio_latents=current_audio,
                 offload_context=self.offloader.context_if_requested,
-                action_latents=current_action,
+                action_latents=(
+                    current_action.to(self.dtype)
+                    if policy_solver_fp32 and current_action is not None
+                    else current_action
+                ),
                 action_domain_ids=action_domain_ids,
                 action_noisy_mask=prepared.action_velocity_mask,
                 action_start_frame_offset=prepared.action_frame_offset,
@@ -2364,11 +2371,21 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             "text_mask": (cond_mask, uncond_mask),
         }
         self.transformer.reset_cache()
+        denoise_batch_size = latents.shape[0]
+
+        def cfg_batch_transition_fn(step_do_cfg: bool) -> None:
+            if step_do_cfg:
+                self.transformer.reset_cache()
+            else:
+                self.transformer.retain_cfg_conditional_cache(denoise_batch_size)
 
         timer.mark_denoise_start()
         extra_streams = None
         if request.do_action:
-            extra_streams = {"action": (prepared.action_latents, self.action_scheduler)}
+            action_latents = prepared.action_latents
+            if policy_solver_fp32 and action_latents is not None:
+                action_latents = action_latents.float()
+            extra_streams = {"action": (action_latents, self.action_scheduler)}
         elif do_audio:
             extra_streams = {"audio": (audio_latents, self.audio_scheduler)}
 
@@ -2391,6 +2408,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 else self._conditioning_anchor_post_step(prepared.image_latent)
             ),
             scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            cfg_batch_transition_fn=cfg_batch_transition_fn,
         )
 
         action_latents = prepared.action_latents
