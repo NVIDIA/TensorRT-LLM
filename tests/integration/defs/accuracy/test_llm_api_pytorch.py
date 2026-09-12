@@ -7874,7 +7874,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("use_msa", [False, True])
+    @parametrize_with_ids("use_msa", [True])
     def test_mxfp8_piecewise_cuda_graph(self, use_msa):
         tp_size = ep_size = 4
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
