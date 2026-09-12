@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
+    check_decode_span_shape,
     msa_paged_kv,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import MsaDecodeSpan
@@ -982,6 +983,17 @@ def test_the_decode_span_of_a_mixed_step_is_its_generation_suffix():
     # The trtllm-gen scheduling bound must come from the span's own rows: the
     # 4096-token context row here would inflate a whole-batch maximum by 100x.
     assert metadata.msa_max_kv_len == 40
+
+
+def test_decode_span_shape_check_names_the_kernel_that_rejected_the_q():
+    """The guard both decode kernels share."""
+    # Eleven speculative decode requests of 4 query tokens each.
+    check_decode_span_shape("kernel", 44, 11, 4)
+
+    # A piecewise CUDA graph's pad folded into the batch: the kernels would read
+    # 128 page table rows out of a batch that only has 11.
+    with pytest.raises(ValueError, match=r"kernel: total_q \(512\) must be batch \(11\)"):
+        check_decode_span_shape("kernel", 512, 11, 4)
 
 
 def test_a_pure_prefill_step_has_no_decode_span():

@@ -40,6 +40,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
     MiniMaxM3Model,
     _build_swiglu_oai_dense_mlp,
+    _dispatch_attention_over_live_tokens,
     _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
     _validate_sparse_attention_runtime_config,
@@ -195,6 +196,64 @@ def _has_cuda() -> bool:
 # ---------------------------------------------------------------------------
 # CPU-only unit tests
 # ---------------------------------------------------------------------------
+
+
+def test_attention_dispatch_clips_the_piecewise_token_pad():
+    """Only the live tokens reach the attention core, and the output's pad rows
+    come back zeroed rather than as the buffer supplied them."""
+    seen = {}
+
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+        del attn_metadata
+        seen["rows"] = [None if t is None else int(t.shape[0]) for t in (q, k, v, idx_q, idx_k)]
+        seen["out_rows"] = int(output.shape[0])
+        output.fill_(7.0)
+
+    attn_layer = SimpleNamespace(_dispatch_attention_backend=capture)
+    # Eleven speculative decode requests of 4 query tokens, padded to 64.
+    padded, live, hidden = 64, 44, 8
+    q = torch.ones((padded, hidden))
+    output = torch.full((padded, hidden), float("nan"))
+
+    _dispatch_attention_over_live_tokens(
+        attn_layer,
+        q,
+        q,
+        q,
+        None,
+        None,
+        SimpleNamespace(num_tokens=live),
+        output,
+    )
+
+    assert seen["rows"] == [live, live, live, None, None]
+    assert seen["out_rows"] == live
+    assert torch.equal(output[:live], torch.full((live, hidden), 7.0))
+    assert torch.equal(output[live:], torch.zeros(padded - live, hidden))
+
+
+def test_attention_dispatch_leaves_an_unpadded_step_alone():
+    """No pad, so nothing to clip and nothing to zero."""
+    seen = {}
+
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+        del q, k, v, idx_q, idx_k, attn_metadata
+        seen["out"] = output
+
+    output = torch.full((5, 8), float("nan"))
+    _dispatch_attention_over_live_tokens(
+        SimpleNamespace(_dispatch_attention_backend=capture),
+        torch.ones((5, 8)),
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_tokens=5),
+        output,
+    )
+
+    assert seen["out"].shape == (5, 8)
+    assert output.isnan().all()
 
 
 def test_is_minimax_m3_vl_config_detects_vl():

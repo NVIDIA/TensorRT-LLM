@@ -23,6 +23,21 @@ MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
 
+def check_decode_span_shape(kernel: str, total_q: int, batch: int, query_len: int) -> None:
+    """Reject a q that does not cover exactly the batch it was handed.
+
+    The decode kernels derive the request id as token // query_len, so a longer
+    q reads page table rows and lengths past the batch's last one. The caller
+    names itself so the error does too, rather than surfacing as an assert
+    several frames inside a kernel.
+    """
+    if total_q != batch * query_len:
+        raise ValueError(
+            f"{kernel}: total_q ({total_q}) must be batch ({batch}) * "
+            f"decode_query_len ({query_len})."
+        )
+
+
 def is_msa_layer(attn) -> bool:
     """Whether this layer's attention is served by the MiniMax-M3 MSA kernels."""
     sparse_params = attn.sparse_params
@@ -264,6 +279,7 @@ __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
+    "check_decode_span_shape",
     "msa_package_available",
     "msa_paged_kv",
     "per_token_valid_blocks",
