@@ -26,6 +26,18 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+constexpr int kNvfp4ValuesPerByte = 2;
+constexpr int kNvfp4SfVecSize = 16;
+
+inline bool isRmsNormFp4QuantSupportedSm(int sm)
+{
+    constexpr int kSm100 = 100;
+    constexpr int kSm110 = 110;
+    constexpr int kSm120 = 120;
+    constexpr int kSm130 = 130;
+    return (sm >= kSm100 && sm < kSm110) || (sm >= kSm120 && sm < kSm130);
+}
+
 // All parameters for the fused (optional residual-add +) RMSNorm + NVFP4
 // input-quantize kernel: inputs, outputs, and layout config alike, so the
 // launcher takes a single struct. Self-contained (does not borrow

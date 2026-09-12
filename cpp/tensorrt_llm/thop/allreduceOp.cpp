@@ -856,6 +856,11 @@ private:
     {
         // If we reach here, it means the extra fallback operations are required.
         // All patterns are broken into ALlReduce + residual_rms_norm + following operations (quantization, etc.)
+        // Both local tails consume raw device pointers, so rejecting a device
+        // mismatch is required even when the fused NVFP4 path is not selected.
+        TORCH_CHECK(!residual || residual->device() == input.device(), "residual must be on the input device");
+        TORCH_CHECK(!norm_weight || norm_weight->device() == input.device(), "norm_weight must be on the input device");
+        TORCH_CHECK(!scale || scale->device() == input.device(), "scale must be on the input device");
         auto const size = input.numel();
         auto const hidden_size = input.size(-1);
         auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -865,38 +870,38 @@ private:
         // RMSNorm, and NVFP4 quantization into one local kernel. The conservative
         // gates below keep every unsupported shape/dtype/layout on the existing
         // residualRmsNorm + fp4_quantize path.
-        bool const is_nvfp4 = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
+        bool const isNvfp4 = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
         int const sm = tensorrt_llm::common::getSMVersion();
-        bool const supported_dtype = mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16;
-        bool const same_dtype = residual && norm_weight && reduce_output.scalar_type() == residual.value().scalar_type()
+        bool const supportedDtype = mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16;
+        bool const sameDtype = residual && norm_weight && reduce_output.scalar_type() == residual.value().scalar_type()
             && reduce_output.scalar_type() == norm_weight.value().scalar_type();
-        bool const supported_layout = reduce_output.is_contiguous() && residual && residual.value().is_contiguous()
+        bool const supportedLayout = reduce_output.is_contiguous() && residual && residual.value().is_contiguous()
             && norm_weight && norm_weight.value().is_contiguous();
-        bool const supported_scale = scale && scale.value().is_contiguous()
+        bool const supportedScale = scale && scale.value().is_contiguous()
             && scale.value().scalar_type() == torch::kFloat32 && scale.value().numel() == 1;
-        bool const supported_sm = (sm >= 100 && sm < 110) || (sm >= 120 && sm < 130);
-        if (is_nvfp4 && supported_sm && supported_dtype && same_dtype && supported_layout && supported_scale && !bias
-            && input.dim() >= 2 && hidden_size > 0 && hidden_size % 16 == 0)
+        bool const supportedSm = tensorrt_llm::kernels::isRmsNormFp4QuantSupportedSm(sm);
+        if (isNvfp4 && supportedSm && supportedDtype && sameDtype && supportedLayout && supportedScale && !bias
+            && input.dim() >= 2 && hidden_size > 0 && hidden_size % tensorrt_llm::kernels::kNvfp4SfVecSize == 0)
         {
-            int64_t rows = size / hidden_size;
-            std::vector<int64_t> quant_shape(input.sizes().begin(), input.sizes().end());
-            quant_shape.back() = hidden_size / 2;
-            torch::Tensor quant_out = at::detail::empty_cuda(quant_shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-            torch::Tensor scale_out
-                = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(rows, hidden_size / 16)}, SF_DTYPE,
-                    input.device(), std::nullopt);
-            torch::Tensor residual_out = at::detail::empty_cuda(
+            int64_t const rows = size / hidden_size;
+            std::vector<int64_t> quantShape(input.sizes().begin(), input.sizes().end());
+            quantShape.back() = hidden_size / tensorrt_llm::kernels::kNvfp4ValuesPerByte;
+            torch::Tensor quantOut = at::detail::empty_cuda(quantShape, FLOAT4_E2M1X2, input.device(), std::nullopt);
+            torch::Tensor scaleOut = at::detail::empty_cuda(
+                {tensorrt_llm::computeSwizzledLayoutSFSize(rows, hidden_size / tensorrt_llm::kernels::kNvfp4SfVecSize)},
+                SF_DTYPE, input.device(), std::nullopt);
+            torch::Tensor residualOut = at::detail::empty_cuda(
                 input.sizes().vec(), reduce_output.scalar_type(), input.device(), std::nullopt);
 
-            bool const return_norm_out = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
-            torch::Tensor norm_out;
-            void* norm_out_ptr = nullptr;
-            if (return_norm_out)
+            bool const returnNormOut = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
+            torch::Tensor normOut;
+            void* normOutPtr = nullptr;
+            if (returnNormOut)
             {
-                norm_out = at::detail::empty_cuda(
+                normOut = at::detail::empty_cuda(
                     input.sizes().vec(), reduce_output.scalar_type(), input.device(), std::nullopt);
-                norm_out_ptr = norm_out.mutable_data_ptr();
+                normOutPtr = normOut.mutable_data_ptr();
             }
 
             tensorrt_llm::kernels::RmsNormFp4QuantParams params{};
@@ -904,21 +909,21 @@ private:
             params.residual_buffer = residual.value().data_ptr();
             params.weight_buffer = norm_weight.value().data_ptr();
             params.scale_factor_ptr = static_cast<float const*>(scale.value().data_ptr());
-            params.quant_out = quant_out.mutable_data_ptr();
-            params.scale_out = scale_out.mutable_data_ptr();
-            params.norm_out = norm_out_ptr;
-            params.residual_out_buffer = residual_out.mutable_data_ptr();
+            params.quant_out = quantOut.mutable_data_ptr();
+            params.scale_out = scaleOut.mutable_data_ptr();
+            params.norm_out = normOutPtr;
+            params.residual_out_buffer = residualOut.mutable_data_ptr();
             params.hidden_size = static_cast<int>(hidden_size);
             params.eps = mEps;
             params.elts_total = size;
             params.sf_layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
             tensorrt_llm::kernels::residualRmsNormFp4Quant(params, mType, stream);
 
-            if (return_norm_out)
+            if (returnNormOut)
             {
-                return {norm_out, quant_out, scale_out, residual_out};
+                return {normOut, quantOut, scaleOut, residualOut};
             }
-            return {quant_out, scale_out, residual_out};
+            return {quantOut, scaleOut, residualOut};
         }
 
         torch::Tensor norm_out = torch::empty_like(input);
