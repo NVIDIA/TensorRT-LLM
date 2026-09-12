@@ -173,31 +173,39 @@ __launch_bounds__(BLOCK_SIZE, 8)
 
     if constexpr (HAS_LN_AFFINE)
     {
-        // ln_weight[D], ln_bias[D] -- direct GMEM reads while waiting for SMEM fill.
+        // ln_weight[D], ln_bias[D] -- fp32, direct GMEM reads while waiting for SMEM fill.
+        // Load 8 floats per thread per chunk via two float4 (128-bit) loads each.
 #pragma unroll
         for (int chunk = 0; chunk < CHUNKS_PER_THREAD; ++chunk)
         {
             int const vecIdx = chunk * BLOCK_SIZE + tid;
             int const elemOff = vecIdx * 8;
-            uint4 const wVec = *reinterpret_cast<uint4 const*>(p.ln_weight + elemOff);
-            uint4 const bVec = *reinterpret_cast<uint4 const*>(p.ln_bias + elemOff);
-            __nv_bfloat162 const* wVec2 = reinterpret_cast<__nv_bfloat162 const*>(&wVec);
-            __nv_bfloat162 const* bVec2 = reinterpret_cast<__nv_bfloat162 const*>(&bVec);
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float2 wf = __bfloat1622float2(wVec2[i]);
-                float2 bf = __bfloat1622float2(bVec2[i]);
-                wVals[chunk * 8 + i * 2 + 0] = wf.x;
-                wVals[chunk * 8 + i * 2 + 1] = wf.y;
-                bVals[chunk * 8 + i * 2 + 0] = bf.x;
-                bVals[chunk * 8 + i * 2 + 1] = bf.y;
-            }
+            float4 const w0 = *reinterpret_cast<float4 const*>(p.ln_weight + elemOff);
+            float4 const w1 = *reinterpret_cast<float4 const*>(p.ln_weight + elemOff + 4);
+            float4 const b0 = *reinterpret_cast<float4 const*>(p.ln_bias + elemOff);
+            float4 const b1 = *reinterpret_cast<float4 const*>(p.ln_bias + elemOff + 4);
+            wVals[chunk * 8 + 0] = w0.x;
+            wVals[chunk * 8 + 1] = w0.y;
+            wVals[chunk * 8 + 2] = w0.z;
+            wVals[chunk * 8 + 3] = w0.w;
+            wVals[chunk * 8 + 4] = w1.x;
+            wVals[chunk * 8 + 5] = w1.y;
+            wVals[chunk * 8 + 6] = w1.z;
+            wVals[chunk * 8 + 7] = w1.w;
+            bVals[chunk * 8 + 0] = b0.x;
+            bVals[chunk * 8 + 1] = b0.y;
+            bVals[chunk * 8 + 2] = b0.z;
+            bVals[chunk * 8 + 3] = b0.w;
+            bVals[chunk * 8 + 4] = b1.x;
+            bVals[chunk * 8 + 5] = b1.y;
+            bVals[chunk * 8 + 6] = b1.z;
+            bVals[chunk * 8 + 7] = b1.w;
         }
     }
     else if constexpr (HAS_MODULATION)
     {
-        // scale_msa[B, D], shift_msa[B, D] -- batch_idx = row / seq_len_per_batch.
+        // scale_msa[B, D], shift_msa[B, D] -- fp32, batch_idx = row / seq_len_per_batch.
+        // Load 8 floats per thread per chunk via two float4 (128-bit) loads each.
         int const batchIdx = row / p.seq_len_per_batch;
         int64_t const modBase = static_cast<int64_t>(batchIdx) * D;
 #pragma unroll
@@ -205,22 +213,28 @@ __launch_bounds__(BLOCK_SIZE, 8)
         {
             int const vecIdx = chunk * BLOCK_SIZE + tid;
             int const elemOff = vecIdx * 8;
-            uint4 const sVec = *reinterpret_cast<uint4 const*>(p.scale_msa + modBase + elemOff);
-            uint4 const shVec = *reinterpret_cast<uint4 const*>(p.shift_msa + modBase + elemOff);
-            __nv_bfloat162 const* sVec2 = reinterpret_cast<__nv_bfloat162 const*>(&sVec);
-            __nv_bfloat162 const* shVec2 = reinterpret_cast<__nv_bfloat162 const*>(&shVec);
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float2 sf = __bfloat1622float2(sVec2[i]);
-                float2 shf = __bfloat1622float2(shVec2[i]);
-                // AdaLN: y = normalized * (1 + scale_msa) + shift_msa.
-                // Fold +1 into wVals so Phase 2 is one fma.
-                wVals[chunk * 8 + i * 2 + 0] = 1.0f + sf.x;
-                wVals[chunk * 8 + i * 2 + 1] = 1.0f + sf.y;
-                bVals[chunk * 8 + i * 2 + 0] = shf.x;
-                bVals[chunk * 8 + i * 2 + 1] = shf.y;
-            }
+            float4 const s0 = *reinterpret_cast<float4 const*>(p.scale_msa + modBase + elemOff);
+            float4 const s1 = *reinterpret_cast<float4 const*>(p.scale_msa + modBase + elemOff + 4);
+            float4 const sh0 = *reinterpret_cast<float4 const*>(p.shift_msa + modBase + elemOff);
+            float4 const sh1 = *reinterpret_cast<float4 const*>(p.shift_msa + modBase + elemOff + 4);
+            // AdaLN: y = normalized * (1 + scale_msa) + shift_msa.
+            // Fold +1 into wVals so Phase 2 is one fma.
+            wVals[chunk * 8 + 0] = 1.0f + s0.x;
+            wVals[chunk * 8 + 1] = 1.0f + s0.y;
+            wVals[chunk * 8 + 2] = 1.0f + s0.z;
+            wVals[chunk * 8 + 3] = 1.0f + s0.w;
+            wVals[chunk * 8 + 4] = 1.0f + s1.x;
+            wVals[chunk * 8 + 5] = 1.0f + s1.y;
+            wVals[chunk * 8 + 6] = 1.0f + s1.z;
+            wVals[chunk * 8 + 7] = 1.0f + s1.w;
+            bVals[chunk * 8 + 0] = sh0.x;
+            bVals[chunk * 8 + 1] = sh0.y;
+            bVals[chunk * 8 + 2] = sh0.z;
+            bVals[chunk * 8 + 3] = sh0.w;
+            bVals[chunk * 8 + 4] = sh1.x;
+            bVals[chunk * 8 + 5] = sh1.y;
+            bVals[chunk * 8 + 6] = sh1.z;
+            bVals[chunk * 8 + 7] = sh1.w;
         }
     }
 
