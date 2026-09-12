@@ -24,7 +24,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -3671,7 +3671,13 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
+def _create_nixl_agent(
+    name: str,
+    rank: int,
+    world_size: int,
+    agent_buffer_size_mb: int = 0,
+    agent_bounce_params: Optional[Dict[str, str]] = None,
+) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
@@ -3682,6 +3688,8 @@ def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAge
         num_threads=num_threads,
         rank=rank,
         world_size=world_size,
+        agent_buffer_size_mb=agent_buffer_size_mb,
+        agent_bounce_params=agent_bounce_params,
         **kwargs,
     )
 
@@ -3713,6 +3721,15 @@ class TransferWorkerConfig:
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
     enforce_physical_ownership: bool = False
+    # Transfer-agent staging (bounce v2) buffer size in MiB; 0 disables the
+    # fast path. Derived upstream from CacheTransceiverConfig: it equals
+    # kv_cache_bounce_size_mb when agent_bounce_buffer_enable is set (in which
+    # case `bounce` above is off) and 0 otherwise.
+    agent_buffer_size_mb: int = 0
+    # Expert bounce knobs (TRTLLM_NIXL_BOUNCE_* names without the prefix and the
+    # trailing _BYTES, lowercased); dict > env > default. Ignored when
+    # agent_buffer_size_mb == 0.
+    agent_bounce_params: Optional[Dict[str, str]] = None
 
 
 class TransferWorker:
@@ -3783,7 +3800,22 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             rank=mapping.rank,
             world_size=mapping.world_size,
+            agent_buffer_size_mb=self._config.agent_buffer_size_mb,
+            agent_bounce_params=self._config.agent_bounce_params,
         )
+        # The pure-Python agent has no bounce_enabled attribute and already warns on its own.
+        if (
+            self._config.agent_buffer_size_mb > 0
+            and hasattr(self._agent, "bounce_enabled")
+            and not self._agent.bounce_enabled
+        ):
+            logger.warning(
+                f"TransferWorker: the C++ transfer-agent bounce was requested "
+                f"(agent_bounce_buffer_enable=True, kv_cache_bounce_size_mb="
+                f"{self._config.agent_buffer_size_mb}) but is inactive on agent "
+                f"{self._agent.name} (init failed); standard per-descriptor NIXL "
+                "transfers are in use."
+            )
         self._registered_mem: list = []
         try:
             self._register_kv_cache()
@@ -3893,6 +3925,14 @@ class TransferWorker:
         # (e.g. when the KV cache manager is recreated after profiling).
         agent = getattr(self, "_agent", None)
         if agent is not None:
+            try:
+                if getattr(agent, "bounce_enabled", False):
+                    logger.info(
+                        f"TransferWorker.shutdown: agent {agent.name} bounce_submit_count="
+                        f"{agent.bounce_submit_count} bounce_reject_count={agent.bounce_reject_count}"
+                    )
+            except Exception as e:  # observability only; never skip deregister/shutdown below
+                logger.debug(f"TransferWorker.shutdown: bounce counters unavailable: {e}")
             registered = getattr(self, "_registered_mem", [])
             while registered:
                 desc = registered.pop(0)
