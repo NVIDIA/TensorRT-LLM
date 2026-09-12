@@ -22,7 +22,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.models.modeling_afmoe import AfmoeMoE
+from tensorrt_llm._torch.models.modeling_glm import Glm4MoE
+from tensorrt_llm._torch.models.modeling_minimaxm2 import MiniMaxM2MoE
+from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3MoE
 from tensorrt_llm._torch.models.modeling_mixtral import MixtralMoE
+from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7MoE
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
@@ -68,6 +73,87 @@ def test_mixtral_moe_forward_passes_lora_params_to_routed_experts():
         "MixtralMoE.forward dropped lora_params on the routed-expert call; "
         "routed-expert MoE LoRA would be silently disabled."
     )
+
+
+@pytest.mark.parametrize(
+    "moe_cls",
+    [AfmoeMoE, MiniMaxM2MoE, MiniMaxM3MoE],
+)
+def test_model_moe_forward_passes_lora_params_to_routed_experts(
+    moe_cls: type[torch.nn.Module],
+) -> None:
+    """MoE model wrappers must forward lora_params to routed experts."""
+    num_tokens, hidden_dim = 4, 8
+    hidden_states = torch.randn(num_tokens, hidden_dim)
+    router_logits = torch.randn(num_tokens, 2)
+    experts = MagicMock(return_value=torch.randn_like(hidden_states))
+    fake_self = SimpleNamespace(
+        gate=MagicMock(return_value=router_logits),
+        experts=experts,
+        shared_experts=None,
+        allreduce=None,
+    )
+    if moe_cls is MiniMaxM2MoE:
+        fake_self.hidden_dim = hidden_dim
+
+    moe_cls.forward(
+        fake_self,
+        hidden_states,
+        SimpleNamespace(all_rank_num_tokens=[num_tokens]),
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    experts.assert_called_once()
+    assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+
+
+def test_glm_moe_forward_passes_lora_params_to_routed_experts() -> None:
+    """Glm4MoE.compute_routed_output must forward lora_params to experts."""
+    num_tokens, hidden_dim = 4, 8
+    hidden_states = torch.randn(num_tokens, hidden_dim)
+    experts = MagicMock(return_value=torch.randn_like(hidden_states))
+    fake_self = SimpleNamespace(
+        use_dp=False,
+        gate=MagicMock(return_value=torch.randn(num_tokens, 2)),
+        experts=experts,
+    )
+
+    Glm4MoE.compute_routed_output(
+        fake_self,
+        hidden_states,
+        hidden_states_fp4=None,
+        all_rank_num_tokens=[num_tokens],
+        do_finalize=True,
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    experts.assert_called_once()
+    assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
+
+
+def test_step3p7_moe_forward_passes_lora_params_to_routed_experts() -> None:
+    """Step3p7MoE.forward must forward lora_params to routed experts."""
+    num_tokens, hidden_dim = 4, 8
+    hidden_states = torch.randn(num_tokens, hidden_dim)
+    experts = MagicMock(return_value=torch.randn_like(hidden_states))
+    fake_self = SimpleNamespace(
+        hidden_size=hidden_dim,
+        need_fp32_gate=False,
+        gate=MagicMock(return_value=torch.randn(num_tokens, 2)),
+        experts=experts,
+        _use_python_clamp=False,
+        routed_scaling_factor=1.0,
+    )
+
+    Step3p7MoE.forward(
+        fake_self,
+        hidden_states,
+        SimpleNamespace(all_rank_num_tokens=[num_tokens]),
+        lora_params=_LORA_PARAMS_SENTINEL,
+    )
+
+    experts.assert_called_once()
+    assert experts.call_args.kwargs.get("lora_params") is _LORA_PARAMS_SENTINEL
 
 
 def test_configurable_moe_forward_impl_forwards_lora_params_to_scheduler():

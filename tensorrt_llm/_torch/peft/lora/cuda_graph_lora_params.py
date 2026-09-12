@@ -132,8 +132,8 @@ class CudaGraphLoraParams:
         # layer/module actually has pointers for: an adapter need not cover every
         # MoE layer, and the grouped-GEMM problem builder reads an unmasked
         # rank > 0 on a null-pointer slot as an active rank-sized GEMM.
-        self._moe_slot_cache: Dict[
-            Tuple[int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        self._moe_slot_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
 
         # The pointer table is packed as PTR_DTYPE and relies on Tensor.copy_'s
@@ -342,7 +342,7 @@ class CudaGraphLoraParams:
 
     def _moe_slot_entry(
         self, layer_idx: int, module_id: int
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Return this (layer, module)'s cached MoE slot buffers, allocating them
         on first use. Never refreshes their contents.
 
@@ -353,7 +353,13 @@ class CudaGraphLoraParams:
         would hide a missing refresh from any test that reads back through
         `get_moe_slot_inputs`.
 
-        Returns None if (layer_idx, module_id) carries no LoRA modules.
+        Args:
+            layer_idx: Model layer whose cached slot buffers are requested.
+            module_id: Routed-expert LoRA module within the layer.
+
+        Returns:
+            The cached rank, pointer, and scratch-mask tensors, or None if the
+            layer and module carry no LoRA weights.
         """
         key = self.layer_module2key.get((layer_idx, module_id))
         layer_param = self.layer_params.get(key) if key is not None else None
@@ -400,6 +406,13 @@ class CudaGraphLoraParams:
 
         The cached pinned buffers are updated in place to keep their addresses
         stable (the captured H2D copy reads them by address at replay).
+
+        Args:
+            layer_idx: Model layer whose cached slot buffers are refreshed.
+            module_id: Routed-expert LoRA module within the layer.
+
+        Returns:
+            None.
         """
         key = self.layer_module2key[(layer_idx, module_id)]
         layer_param = self.layer_params[key]
