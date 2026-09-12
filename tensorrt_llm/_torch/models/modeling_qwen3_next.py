@@ -524,7 +524,26 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                                        or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
 
-        self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+        # MoEAllReduce is not merely unused under attention DP -- constructing it
+        # is destructive. Its __init__ eagerly calls get_allreduce_workspace(),
+        # which opens a CUDA-IPC workspace across the TP group
+        # (ops.py -> allreduce_helper.allocate_allreduce_fusion_workspace ->
+        # IpcMemory.open_ipc_memory). With attention DP that peer topology does
+        # not exist and the import faults with cudaErrorIllegalAddress, which is
+        # sticky: every later CUDA call in the context fails too, so the crash
+        # surfaces somewhere unrelated (create_rope_const_params).
+        #
+        # It is also genuinely unreachable here: _eager_fusion_enabled() returns
+        # False under attention DP, so PRE/POST_MOE_FUSION are False and the only
+        # call sites (inside `if self.fusion_config.POST_MOE_FUSION`) never run.
+        # Gate on the fusion flag itself: it already excludes attention DP and
+        # pipeline-parallel layers, and also skips the workspace when eager
+        # fusion is disabled (TRTLLM_QWEN3_EAGER_FUSION_DISABLED=1). Forward
+        # only ever clears the flag (spec-metadata layer capture), never sets
+        # it, so the construction-time value is a superset of runtime use.
+        self.moe_allreduce = None
+        if self.fusion_config.POST_MOE_FUSION and self.mapping.tp_size > 1:
+            self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
         self,
@@ -694,7 +713,26 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.mapping.tp_size == 1
                                        or self.enable_attention_dp)
-        self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+        # MoEAllReduce is not merely unused under attention DP -- constructing it
+        # is destructive. Its __init__ eagerly calls get_allreduce_workspace(),
+        # which opens a CUDA-IPC workspace across the TP group
+        # (ops.py -> allreduce_helper.allocate_allreduce_fusion_workspace ->
+        # IpcMemory.open_ipc_memory). With attention DP that peer topology does
+        # not exist and the import faults with cudaErrorIllegalAddress, which is
+        # sticky: every later CUDA call in the context fails too, so the crash
+        # surfaces somewhere unrelated (create_rope_const_params).
+        #
+        # It is also genuinely unreachable here: _eager_fusion_enabled() returns
+        # False under attention DP, so PRE/POST_MOE_FUSION are False and the only
+        # call sites (inside `if self.fusion_config.POST_MOE_FUSION`) never run.
+        # Gate on the fusion flag itself: it already excludes attention DP and
+        # pipeline-parallel layers, and also skips the workspace when eager
+        # fusion is disabled (TRTLLM_QWEN3_EAGER_FUSION_DISABLED=1). Forward
+        # only ever clears the flag (spec-metadata layer capture), never sets
+        # it, so the construction-time value is a superset of runtime use.
+        self.moe_allreduce = None
+        if self.fusion_config.POST_MOE_FUSION and self.mapping.tp_size > 1:
+            self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
         self,
