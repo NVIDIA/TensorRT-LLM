@@ -525,7 +525,7 @@ def _get_num_pool_groups_for_estimation(
 
     layer_types = getattr(model_config, "layer_types", None)
     attention_windows = None
-    if fallback_attention_windows is None:
+    if (fallback_attention_windows is None and is_gemma4_hybrid(model_config)):
         attention_windows = _derive_layer_type_attention_windows(
             model_config, max_seq_len)
     # Check whether KV storage uses configured or inferred attention windows,
@@ -2524,8 +2524,11 @@ def _create_kv_cache_manager(
     # target's num_hidden_layers, so _project_max_attention_window_vec would
     # wrap them back onto pattern[0]. The draft config sets
     # max_attention_window=None to opt out, not to request derivation.
+    # Keep estimation storage full-context unless distinct page layouts require
+    # windowed storage (Gemma4). Enable automatic windowing for the final manager.
     if (kv_cache_config.max_attention_window is None and not is_draft
-            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
+            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
+            and (not estimating_kv_cache or is_gemma4_hybrid(config))):
         derived_windows = _derive_layer_type_attention_windows(
             config, max_seq_len)
         if derived_windows is not None:
