@@ -110,7 +110,7 @@ def test_collectors_tolerate_partial_and_malformed_run_state(tmp_path: Path) -> 
 
 
 def test_timing_report_and_archive_survive_a_failed_run(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     layout = _failed_run(tmp_path / "run")
 
@@ -134,7 +134,10 @@ def test_timing_report_and_archive_survive_a_failed_run(
         "tp_size": 1,
         "rows": rows,
     }
-    assert capsys.readouterr().out.count("MX E2E timing role=") == len(ROLES)
+    # capfd, not capsys: tests/unittest/conftest.py has an autouse fixture
+    # (cuda_error_early_quit) that takes capfd, and pytest forbids holding
+    # capsys and capfd in the same test.
+    assert capfd.readouterr().out.count("MX E2E timing role=") == len(ROLES)
 
     assert destination == tmp_path / "output" / "model_express" / "llama-bf16-tp1"
     assert (destination / "timing.json").read_text(
