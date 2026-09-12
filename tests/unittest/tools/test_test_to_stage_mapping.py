@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import random
 import re
@@ -30,9 +31,21 @@ pytestmark = pytest.mark.cpu_only
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
+STAGE_CONFIG_JSON = os.path.join(REPO_ROOT, 'jenkins', 'scripts',
+                                 'test_stage_configs.json')
 GROOVY = os.path.join(REPO_ROOT, 'jenkins', 'L0_Test.groovy')
 DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
                       'test-db')
+
+# Matches the literal "Stage-Name": ["platform", "yaml_file", ...] entries
+# that test_to_stage_mapping.py used to regex-scan out of L0_Test.groovy
+# directly, before jenkins/scripts/test_stage_configs.json became the single
+# source of truth. Any stage still defined this way in Groovy bypasses the
+# JSON file, so scripts/test_to_stage_mapping.py -- and this test -- would
+# never see it.
+_GROOVY_STAGE_RE = re.compile(
+    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"'
+    r'(?:,\s*(?:\d+|true|false))*\s*\]')
 
 # Sampling configuration
 MAX_SAMPLES = 10  # Small number for efficient testing
@@ -63,7 +76,7 @@ def test_stage_backed_tests_exclude_mixed_mappings() -> None:
 @pytest.fixture(scope="module")
 def stage_query():
     """Fixture that provides a StageQuery instance."""
-    return StageQuery(GROOVY, DB_DIR)
+    return StageQuery(STAGE_CONFIG_JSON, DB_DIR)
 
 
 @pytest.fixture(scope="module")
@@ -89,10 +102,10 @@ def sample_stages(stage_query: StageQuery) -> list[str]:
     if not all_stages:
         raise RuntimeError(
             "No stages found in stage mapping. This indicates a configuration "
-            "issue - either the Jenkins L0_Test.groovy file is not being "
-            "parsed correctly or the regex pattern for stage matching needs "
-            "to be updated. Please check that the groovy file exists and "
-            "contains stage definitions in the expected format.")
+            "issue - either jenkins/scripts/test_stage_configs.json is not "
+            "being parsed correctly, or it's missing/empty. Please check "
+            "that the file exists and contains stage definitions in the "
+            "expected format.")
 
     # Return up to MAX_SAMPLES stages randomly selected
     if len(all_stages) <= MAX_SAMPLES:
@@ -151,12 +164,43 @@ def test_documented_stage_examples_are_live(stage_query):
                 why = (f'{os.path.basename(path)} documents --stages {name}, '
                        'which ')
                 assert name in stage_query.stage_to_yaml, \
-                    why + f'is not a stage in {os.path.basename(GROOVY)}'
+                    why + f'is not a stage in {os.path.basename(STAGE_CONFIG_JSON)}'
                 assert stage_query.stages_to_tests([name]), \
                     why + 'maps to no tests'
                 checked += 1
 
     assert checked, 'Found no documented --stages examples to validate'
+
+
+def test_groovy_literal_stage_maps_are_registered(stage_query):
+    """Every literal stage->YAML entry left in Groovy must also be in the JSON.
+
+    jenkins/L0_Test.groovy still has a handful of ``"Stage": ["platform",
+    "yaml_file", ...]`` maps (e.g. multiNodesSBSAConfigs) that predate the
+    move to jenkins/scripts/test_stage_configs.json. Those are only safe to
+    keep as literals because every stage they define is *also* generated
+    from the JSON file. If a future edit adds a new literal stage entry
+    without registering it in the JSON, scripts/test_to_stage_mapping.py
+    would silently never see it -- catch that here instead.
+    """
+    with open(GROOVY, 'r') as f:
+        lines = f.readlines()
+
+    unregistered = []
+    for lineno, line in enumerate(lines, start=1):
+        if line.lstrip().startswith('//'):
+            continue
+        m = _GROOVY_STAGE_RE.search(line)
+        if not m:
+            continue
+        stage, yml = m.group('stage'), m.group('yml') + '.yml'
+        if stage_query.stage_to_yaml.get(stage) != yml:
+            unregistered.append(f'{GROOVY}:{lineno}: "{stage}": "{yml}"')
+
+    assert not unregistered, (
+        'Found stage(s) defined literally in jenkins/L0_Test.groovy that are '
+        'missing (or mismatched) from jenkins/scripts/test_stage_configs.json:'
+        '\n' + '\n'.join(unregistered))
 
 
 def test_unknown_stage_reports_a_diagnostic(stage_query):
@@ -179,10 +223,28 @@ def test_known_stage_without_tests_is_reported(tmp_path):
     """A known stage that runs no tests stays visible alongside other stages."""
     # No live stage is currently empty, so build a minimal repo whose
     # ``empty`` stage maps to a YAML holding only post_merge tests.
-    (tmp_path / 'jenkins').mkdir()
-    (tmp_path / 'jenkins' / 'L0_Test.groovy').write_text(
-        '"Filled-PyTorch-1": ["x", "l0_filled", 1, 1],\n'
-        '"Empty-PyTorch-1": ["x", "l0_empty", 1, 1],\n')
+    (tmp_path / 'jenkins' / 'scripts').mkdir(parents=True)
+    (tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json').write_text(
+        json.dumps({
+            'configs': [
+                {
+                    'name': 'Filled-PyTorch',
+                    'arch': 'x86',
+                    'slurm': False,
+                    'platform': 'x',
+                    'testDB': 'l0_filled',
+                    'splits': 1
+                },
+                {
+                    'name': 'Empty-PyTorch',
+                    'arch': 'x86',
+                    'slurm': False,
+                    'platform': 'x',
+                    'testDB': 'l0_empty',
+                    'splits': 1
+                },
+            ]
+        }))
     db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
     db_dir.mkdir(parents=True)
     for name, stage in (('l0_filled', 'pre_merge'), ('l0_empty', 'post_merge')):
@@ -201,6 +263,92 @@ def test_known_stage_without_tests_is_reported(tmp_path):
                           timeout=60)
     assert proc.stdout.decode().split() == ['unittest/l0_filled.py']
     assert 'no tests mapped to: Empty-PyTorch-1' in proc.stderr.decode()
+
+
+def test_dynamic_split_sizing_from_durations(tmp_path):
+    """Splits are sized from .test_durations using per-family block matching."""
+    (tmp_path / 'jenkins' / 'scripts').mkdir(parents=True)
+    (tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json').write_text(
+        json.dumps({
+            'configs': [
+                {
+                    'name': 'Solo-PyTorch',
+                    'arch': 'x86',
+                    'slurm': False,
+                    'platform': 'x',
+                    'testDB': 'l0_solo',
+                    'splits': 1  # hardcoded fallback; overridden below
+                },
+                # Share testDB l0_shared, but told apart at CI-run time by
+                # stage-name keyword filtering (auto_trigger/orchestrator),
+                # same as the real DGX_H100-2_GPUs-PyTorch-{GptOss,Ray}
+                # families -- each is still sized from only its own matching
+                # block, not the whole shared testDB.
+                {
+                    'name': 'Shared-GptOss-PyTorch',
+                    'arch': 'x86',
+                    'slurm': False,
+                    'platform': 'x',
+                    'testDB': 'l0_shared',
+                    'splits': 1
+                },
+                {
+                    'name': 'Shared-Ray-PyTorch',
+                    'arch': 'x86',
+                    'slurm': False,
+                    'platform': 'x',
+                    'testDB': 'l0_shared',
+                    'splits': 1
+                },
+            ]
+        }))
+    db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
+    db_dir.mkdir(parents=True)
+    (db_dir / 'l0_solo.yml').write_text(
+        'version: 0.0.1\nl0_solo:\n- condition:\n    terms:\n'
+        '      stage: pre_merge\n      backend: pytorch\n'
+        '  tests:\n  - unittest/l0_solo_a.py\n  - unittest/l0_solo_b.py\n')
+    (db_dir / 'l0_shared.yml').write_text(
+        'version: 0.0.1\nl0_shared:\n'
+        '- condition:\n    terms:\n'
+        '      stage: pre_merge\n      backend: pytorch\n'
+        '      auto_trigger: gpt_oss\n'
+        '  tests:\n  - unittest/l0_shared_gptoss_a.py\n'
+        '  - unittest/l0_shared_gptoss_b.py\n'
+        '- condition:\n    terms:\n'
+        '      stage: pre_merge\n      backend: pytorch\n'
+        '      orchestrator: ray\n'
+        '  tests:\n  - unittest/l0_shared_ray_a.py\n')
+    durations_path = tmp_path / 'tests' / 'integration' / 'defs' / '.test_durations'
+    durations_path.parent.mkdir(parents=True)
+    # ~5h total for l0_solo and for the GptOss block (2 * 2h target) -> 3
+    # shards each; the Ray block is well under target -> stays at 1 shard.
+    durations_path.write_text(
+        json.dumps({
+            'unittest/l0_solo_a.py': 9000.0,
+            'unittest/l0_solo_b.py': 9000.0,
+            'unittest/l0_shared_gptoss_a.py': 9000.0,
+            'unittest/l0_shared_gptoss_b.py': 9000.0,
+            'unittest/l0_shared_ray_a.py': 100.0,
+        }))
+
+    query = StageQuery(
+        str(tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json'),
+        str(db_dir), str(durations_path))
+    solo_shards = sorted(s for s in query.stage_to_yaml
+                         if s.startswith('Solo-PyTorch-'))
+    assert solo_shards == ['Solo-PyTorch-1', 'Solo-PyTorch-2', 'Solo-PyTorch-3']
+
+    gptoss_shards = sorted(s for s in query.stage_to_yaml
+                           if s.startswith('Shared-GptOss-PyTorch-'))
+    assert gptoss_shards == [
+        'Shared-GptOss-PyTorch-1', 'Shared-GptOss-PyTorch-2',
+        'Shared-GptOss-PyTorch-3'
+    ]
+
+    ray_shards = sorted(s for s in query.stage_to_yaml
+                        if s.startswith('Shared-Ray-PyTorch-'))
+    assert ray_shards == ['Shared-Ray-PyTorch-1']
 
 
 @pytest.mark.parametrize("direction",
