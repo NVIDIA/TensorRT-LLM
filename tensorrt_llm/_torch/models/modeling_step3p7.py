@@ -61,6 +61,7 @@ from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import SwigluActivation, create_moe
 from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..moe.fused_moe.routing import MiniMaxM2MoeRoutingMethod
+from ..peft.lora.layer import LoraLayer
 from ..peft.lora.validation import has_moe_lora_targets
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, create_lm_head_tp_mapping
@@ -578,13 +579,14 @@ class Step3p7Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask=PredefinedAttentionMask.CAUSAL,
         attention_window_size: Optional[int] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Step3p7 attention with module-side QK-norm + RoPE + head gate.
 
         Bypasses the base ``Attention.forward`` to apply the per-head output
         gate (``sigmoid(g_proj(hidden))``) between the attention backend and
-        ``o_proj``. Helix CP, LoRA, and attention sinks are not plumbed here.
+        ``o_proj``. Helix CP and attention sinks are not plumbed here.
         """
         effective_window = (
             attention_window_size if attention_window_size is not None else self.sliding_window
@@ -606,7 +608,16 @@ class Step3p7Attention(Attention):
         if position_ids is not None and self.layer_idx >= num_text_layers:
             position_ids = position_ids.clamp_min(0)
 
-        qkv = self.qkv_proj(hidden_states)
+        if bool(lora_params):
+            qkv = LoraLayer.forward_with_base(
+                lambda: self.qkv_proj(hidden_states),
+                (self.splitted_qkv_lora, self.fused_qkv_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            qkv = self.qkv_proj(hidden_states)
         q, k, v = self.apply_rope(qkv, None, None, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -620,7 +631,7 @@ class Step3p7Attention(Attention):
             kwargs.get("attention_mask_data"),
             mrope_config=kwargs.get("mrope_config"),
             attention_sinks=None,
-            has_lora=False,
+            has_lora=bool(lora_params),
         )
 
         if self.use_head_wise_gate:
@@ -631,7 +642,11 @@ class Step3p7Attention(Attention):
             attn_output = attn_output * gate.unsqueeze(-1).sigmoid()
             attn_output = attn_output.view(*orig_shape)
 
-        return self.o_proj(attn_output)
+        return self.o_proj(
+            attn_output,
+            lora_params=lora_params,
+            layer_idx=self.layer_idx,
+        )
 
 
 # ---------------------------------------------------------------------------
