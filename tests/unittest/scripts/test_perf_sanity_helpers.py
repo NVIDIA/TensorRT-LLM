@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,19 @@ pytest.importorskip("torch._inductor")
 
 __extra_import_path__ = ["~/tests/integration"]
 from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
+
+
+def _load_module(name: str, path: Path):
+    """Import a script that is not on sys.path and is not part of a package.
+
+    The perf harness generators under jenkins/scripts/perf/ are invoked as scripts,
+    never imported, so they have no importable package path.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None, f"cannot load {path}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _assignment(
@@ -1353,3 +1367,205 @@ def test_every_gated_metric_is_actually_emitted() -> None:
     """A gated metric the log never carries is skipped by 'not in new_data'."""
     emitted = {f"d_{name}" for name in perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS}
     assert set(perf_sanity.GEN_ONLY_REGRESSION_METRICS) <= emitted
+
+
+# ---------------------------------------------------------------------------
+# gen_only_no_context: a disaggregated topology with zero context workers.
+#
+# The mode drops the ctx fleet entirely (14 nodes/56 GPUs -> 2/8 for con4301) and
+# has the gen worker fabricate its own KV blocks. Seven call sites have to agree
+# that a given case is "no context"; these tests pin the ones reachable without a
+# cluster. The launch-script halves live in test_perf_sanity_submit_generators.py.
+# ---------------------------------------------------------------------------
+
+CON4301 = "gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL"
+
+# (benchmark_mode, config, expected). Shared by the runner test and the
+# cross-copy equivalence test so the three implementations are pinned to one table.
+GEN_ONLY_NO_CONTEXT_TRUTH_TABLE = [
+    # The test id names the mode: always true, whatever the yaml says.
+    ("gen_only_no_context", None, True),
+    ("gen_only_no_context", {}, True),
+    ("gen_only_no_context", {"benchmark": {"mode": "e2e"}}, True),
+    # Legacy opt-in: id says gen_only, yaml asks for no context.
+    ("gen_only", {"benchmark": {"mode": "gen_only_no_context"}}, True),
+    # Plain gen_only keeps its ctx fleet, however the config is shaped.
+    ("gen_only", {"benchmark": {"mode": "gen_only"}}, False),
+    ("gen_only", None, False),
+    ("gen_only", {}, False),
+    ("gen_only", {"benchmark": None}, False),
+    # Other modes never read the yaml opt-in.
+    ("e2e", {"benchmark": {"mode": "gen_only_no_context"}}, False),
+    ("ctx_only", {"benchmark": {"mode": "gen_only_no_context"}}, False),
+    (None, {"benchmark": {"mode": "gen_only_no_context"}}, False),
+]
+
+
+@pytest.mark.parametrize(("benchmark_mode", "config", "expected"), GEN_ONLY_NO_CONTEXT_TRUTH_TABLE)
+def test_is_gen_only_no_context_truth_table(
+    benchmark_mode: str, config: dict, expected: bool
+) -> None:
+    """The predicate both the node arithmetic and the env injection consult.
+
+    They are separate call sites: if they ever disagree, the job is sized with no
+    ctx fleet while the gen worker still waits for KV that never arrives, and every
+    request hangs in DISAGG_GENERATION_INIT.
+    """
+    assert perf_sanity.is_gen_only_no_context(benchmark_mode, config) is expected
+
+
+def test_is_gen_only_no_context_copies_agree() -> None:
+    """Pin the duplicated predicate copies to one truth table.
+
+    `jenkins/scripts/perf/benchmark_utils.py` and this runner cannot import each
+    other (different trees, each copied into the container independently), so the
+    predicate is deliberately duplicated. This is the test that keeps the copies
+    honest -- without it a fix applied to one tree silently misses the other.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    benchmark_utils = _load_module(
+        "gonc_benchmark_utils", repo_root / "jenkins" / "scripts" / "perf" / "benchmark_utils.py"
+    )
+
+    for benchmark_mode, config, expected in GEN_ONLY_NO_CONTEXT_TRUTH_TABLE:
+        assert benchmark_utils.is_gen_only_no_context(benchmark_mode, config) is expected, (
+            f"benchmark_utils disagrees on ({benchmark_mode!r}, {config!r})"
+        )
+
+    assert benchmark_utils.GEN_ONLY_MODES == perf_sanity.GEN_ONLY_MODES
+    assert benchmark_utils.DISAGG_BENCHMARK_MODES == perf_sanity.DISAGG_BENCHMARK_MODES
+    assert benchmark_utils.DISAGG_CONFIG_MODES == perf_sanity.DISAGG_CONFIG_MODES
+
+
+@pytest.mark.parametrize("prefix", ["aggr", "aggr_upload"])
+def test_parse_test_string_accepts_gen_only_no_context(prefix: str) -> None:
+    """The new id form parses, and the config stem survives intact.
+
+    The prefix is `aggr`, and the runtime it yields is "aggregated", because the
+    prefix names the *launch path*: one pytest process owns the gen worker, the
+    proxy and the benchmark client, exactly as ctx_only does out of the same
+    disaggregated yaml. The topology underneath is still disaggregated.
+
+    The stem contains '-' (…_ccb-NIXL), so this also guards the "-".join(labels[2:])
+    reassembly that makes the mode segment separable from the filename -- and it is
+    what keeps the mode from being mistaken for an aggregated config stem, since the
+    fall-through branch of the same `elif` reads labels[1] as the filename.
+    """
+    assert perf_sanity.parse_test_string(f"{prefix}-gen_only_no_context-{CON4301}") == (
+        CON4301,
+        None,
+        "aggregated",
+        "gen_only_no_context",
+        False,
+    )
+
+
+def test_parse_test_string_composes_gen_only_no_context_with_time_breakdown() -> None:
+    """The mode segment and the modifier segment are independent."""
+    assert perf_sanity.parse_test_string(
+        f"aggr-gen_only_no_context-{perf_sanity.TIME_BREAKDOWN_MODIFIER}-{CON4301}"
+    ) == (CON4301, None, "aggregated", "gen_only_no_context", True)
+
+
+def test_parse_test_string_rejects_gen_only_no_context_under_a_disagg_prefix() -> None:
+    """The mode is not reachable through the four-role disaggregated launch path.
+
+    A stale test-db line (or a hand-typed id) spelling it `disagg-...` must fail
+    loudly. Silently accepting it would launch the mode with DISAGG_SERVING_TYPE
+    role splitting and a ctx fleet of zero: the proxy would come up, no benchmark
+    client would ever be the right role, and the stage would hang to its TIMEOUT.
+    """
+    with pytest.raises(ValueError, match="Invalid benchmark_mode for disagg"):
+        perf_sanity.parse_test_string(f"disagg-gen_only_no_context-{CON4301}")
+
+
+def test_parse_test_string_rejects_an_unknown_benchmark_mode() -> None:
+    """A near-miss spelling must fail loudly, not resolve to a missing config."""
+    with pytest.raises(ValueError, match="Invalid benchmark_mode for disagg"):
+        perf_sanity.parse_test_string(f"disagg-gen_only_nocontext-{CON4301}")
+
+
+def test_gen_only_no_context_reads_a_disaggregated_config_on_the_aggregated_path() -> None:
+    """Disagg yaml, aggregated launch path -- the ctx_only arrangement.
+
+    The two halves dispatch off the same mode string and must not drift: the config
+    folder is the disaggregated one (an aggregated yaml has no `worker_config.gen`
+    to size the job from), while the launch path is the aggregated single-pytest
+    one (the four-role path has no role for a process that is all four at once).
+    """
+    assert perf_sanity.get_config_dir("gen_only_no_context") == perf_sanity.get_config_dir(
+        "gen_only"
+    )
+    assert "gen_only_no_context" in perf_sanity.DISAGG_CONFIG_MODES
+    # Beside ctx_only, and *not* in the set the four-role runtime accepts.
+    assert "gen_only_no_context" in perf_sanity.AGGREGATED_DISAGG_YAML_MODES
+    assert "ctx_only" in perf_sanity.AGGREGATED_DISAGG_YAML_MODES
+    assert "gen_only_no_context" not in perf_sanity.DISAGG_BENCHMARK_MODES
+
+
+def test_get_disagg_test_cases_emits_gen_only_no_context_for_every_config() -> None:
+    """Every existing disagg config gains the mode with no YAML edit.
+
+    That is the whole point: gen_only and gen_only_no_context become two ids over
+    one file, so they can be A/B'd without a duplicate YAML that silently drifts.
+    """
+    test_cases = perf_sanity.get_disagg_test_cases()
+    new_ids = [tc for tc in test_cases if "-gen_only_no_context-" in tc]
+    gen_only_ids = [tc for tc in test_cases if "-gen_only-" in tc]
+
+    assert new_ids, "no gen_only_no_context ids were generated"
+    # One per (config, test_type), same as gen_only -- but over the *aggregated*
+    # prefixes, so the counts only match because the two prefix lists are the same
+    # length. Assert the sets, not just the totals.
+    assert len(new_ids) == len(gen_only_ids)
+    for test_type in perf_sanity.AGG_TEST_TYPES:
+        assert f"{test_type}-gen_only_no_context-{CON4301}" in test_cases
+    # It launches through the aggregated single-pytest path, so it must never be
+    # emitted under a disagg prefix -- which parse_test_string would reject anyway,
+    # turning a stray id into an uncollectable test-db line.
+    assert not [tc for tc in new_ids if tc.startswith("disagg")]
+    ctx_only_ids = [tc for tc in test_cases if "-ctx_only-" in tc]
+    assert len(new_ids) == len(
+        [tc for tc in ctx_only_ids if perf_sanity.TIME_BREAKDOWN_MODIFIER not in tc]
+    )
+
+
+def test_gen_only_no_context_zeroes_the_ctx_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The saving, measured on the real config, against gen_only as the control.
+
+    con4301 ships `benchmark.mode: e2e`, so this also proves the id alone selects
+    the mode. Without the gen_only arm the assertion could pass vacuously.
+    """
+    monkeypatch.setattr(
+        perf_sanity.subprocess, "check_output", lambda *a, **k: "Product Name : GB300\n"
+    )
+
+    def ctx_servers(benchmark_mode: str) -> int:
+        # The prefix differs with the mode: gen_only_no_context launches through the
+        # aggregated single-pytest path, gen_only through the four-role one.
+        prefix = "aggr" if benchmark_mode == "gen_only_no_context" else "disagg"
+        config = perf_sanity.PerfSanityTestConfig(
+            f"{prefix}-{benchmark_mode}-{CON4301}", output_dir="/tmp/gonc-unit-test"
+        )
+        config.parse_config_file()
+        # server_configs entries are (ctx_config, gen_config, disagg_config) tuples.
+        disagg_config = config.server_configs[0][2]
+        return disagg_config.hardware["num_ctx_servers"]
+
+    assert ctx_servers("gen_only_no_context") == 0
+    assert ctx_servers("gen_only") == 12
+
+
+def test_both_gen_modes_share_every_gen_only_special_case() -> None:
+    """The two arms must differ only by the ctx fleet and the injected env vars.
+
+    Any other divergence confounds the A/B -- it would measure the harness rather
+    than the mode. So the gen_only special cases are keyed on GEN_ONLY_MODES, and
+    both members must be present in each.
+    """
+    assert set(perf_sanity.GEN_ONLY_MODES) == {"gen_only", "gen_only_no_context"}
+    for mode in perf_sanity.GEN_ONLY_MODES:
+        assert mode in perf_sanity.DEVICE_STEP_TIME_MODES
+        # Warmup is driven by WARMUP_BENCHMARK_MODES, which lists neither gen mode.
+        # Keeping it off for both is what makes the arms comparable.
+        assert not perf_sanity.wants_warmup(mode)

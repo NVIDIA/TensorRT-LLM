@@ -349,8 +349,21 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
     hardware = cfg.get("hardware", {}) or {}
     benchmark = cfg.get("benchmark", {}) or {}
 
+    # Mirrors is_gen_only_no_context in jenkins/scripts/perf/benchmark_utils.py:
+    # either the test id names the mode outright, or the legacy yaml
+    # benchmark.mode opts in. Duplicated because this tree is copied into the
+    # container independently of jenkins/scripts and cannot import from it;
+    # tests/unittest/scripts/test_perf_sanity_helpers.py pins the copies equal.
+    #
+    # Belt and braces: slurm_ct_precheck_gate.sh already returns early when
+    # TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1, so this is normally unreachable. It
+    # matters if that export is ever dropped -- without it, resolve_plan would
+    # sail past here and build a KV-transfer plan against a ctx fleet that was
+    # never launched.
     yaml_mode = str(benchmark.get("mode", ""))
-    if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+    if benchmark_mode == "gen_only_no_context" or (
+        benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
+    ):
         # No ctx workers at launch -> no KV transfer in the real test either.
         return {"skip": True, "skip_reason": "gen_only_no_context mode has no KV transfer"}
 

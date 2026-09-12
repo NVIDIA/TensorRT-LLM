@@ -21,10 +21,22 @@ AUTOTUNER_MARKER = "[Autotuner]"
 AUTOTUNER_BENIGN_TEXTS = [
     "out of memory",
 ]
+# wait_for_endpoint_ready prints the exception it retried on, once per second,
+# for as long as the server is still starting: "endpoint http://h:p/health is not
+# ready, with exception: ... ConnectionRefusedError(111, 'Connection refused')".
+# That is a healthy run's normal progress output, but it carries an error
+# keyword, so a scan of any file that holds both the poller's stdout and a
+# server's log would fail the wait on the wait's own messages. Perf-sanity's
+# gen_only_no_context mode is exactly that case: it redirects the srun aggregate
+# (which is pytest's stdout as well as the gen worker rank 0's) into
+# gen_server_0.log, which the readiness wait then scans.
+ENDPOINT_RETRY_MARKER = "is not ready, with exception:"
 
 
 def is_benign_line(line: str) -> bool:
     """True for lines expected during a HEALTHY run despite an error keyword."""
+    if ENDPOINT_RETRY_MARKER in line:
+        return True
     return AUTOTUNER_MARKER in line and any(text in line for text in AUTOTUNER_BENIGN_TEXTS)
 
 
