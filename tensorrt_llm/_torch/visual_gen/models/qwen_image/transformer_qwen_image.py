@@ -895,6 +895,18 @@ def _supports_qwen_key_padding_mask(attn_backend: str, attn: Any) -> bool:
     return attn_backend == "VANILLA" and not isinstance(attn, (Attention2DAttention, RingAttention))
 
 
+def _validate_qwen_ulysses_attention_backend(model_config: DiffusionModelConfig) -> None:
+    attention_backend = model_config.attention.backend
+    ulysses_size = getattr(model_config.visual_gen_mapping, "ulysses_size", 1)
+    if ulysses_size > 1 and attention_backend != "VANILLA":
+        raise ValueError(
+            "Qwen-Image Ulysses parallelism requires "
+            "attention_config.backend='VANILLA'. "
+            f"Got attention_config.backend='{attention_backend}' with "
+            f"parallel_config.ulysses_size={ulysses_size}."
+        )
+
+
 def _build_joint_attention_mask(
     encoder_hidden_states_mask: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
@@ -936,6 +948,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         attn_backend: str = "sdpa",
     ):
         model_config = model_config or DiffusionModelConfig()
+        _validate_qwen_ulysses_attention_backend(model_config)
         super().__init__(model_config)
         self.attn_backend = attn_backend
 
