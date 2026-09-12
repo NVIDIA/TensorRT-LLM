@@ -98,6 +98,11 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseDoesNotMutateTheRadixTree)
     fresh.salt = 9999;
     tree.addOrGetExisting(fresh);
     EXPECT_EQ(tree.roots().size(), 1U) << "addOrGetExisting() must drain the pending root erases";
+
+    // Committing a block is what creates a root in production, so every root has a child and is
+    // proposed for erase when that child goes. This test drives the bookkeeping directly and
+    // leaves a childless root that nothing proposed, which tree teardown asserts against.
+    tree.proposeToEraseEmptyRoot(RootBlock::makeKey(fresh));
 }
 
 // Stress form of the above: with pending erases present, concurrent probes must neither corrupt the
