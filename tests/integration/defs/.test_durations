@@ -952,8 +952,6 @@
    "ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp1_4instances]": 180.03309016393442,
    "ray_orchestrator/RL/test_rl_perf_reproduce.py::test_rl_perf_reproduce[tp2_2instances]": 118.81139344262296,
    "test_doc.py::test_url_validity": 58.620444444444445,
-   "test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]": 53.562916666666666,
-   "test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]": 52.28075,
    "test_e2e.py::test_get_ci_container_port": 1.3129744408945687,
    "test_e2e.py::test_openai_chat_example[pytorch]": 559.9921818181817,
    "test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]": 65.26727115716753,

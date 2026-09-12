@@ -432,9 +432,7 @@ def _build_spec_metadata(spec_config,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             is_mtp_eagle=False,
-            eagle_choices=spec_config.eagle_choices,
-            is_spec_dec_tree=spec_config.eagle_choices is not None
-            or effective_dynamic_tree,
+            is_spec_dec_tree=effective_dynamic_tree,
             is_spec_dec_dynamic_tree=effective_dynamic_tree,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -452,7 +450,6 @@ def _build_spec_metadata(spec_config,
             draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=_is_effective_dynamic_tree(spec_config),
-            eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
@@ -682,26 +679,13 @@ def get_spec_decoder(
         # moves the worker's pre-sampled output around, and its buffer shapes
         # derive from sampler_args alone.
         #
-        # WORKAROUND (remove with eagle_choices in release 1.4): the static
-        # tree is the one mode where a step can accept more than
-        # max_draft_len + 1 tokens. The one-model drafter never builds the tree
-        # -- _forward_draft_loop is linear over runtime_draft_len, which for a
-        # non-linear tree is max_total_draft_tokens -- so max_draft_len only
-        # describes a tree depth that is never used, and acceptance is bounded
-        # by the wire width instead. Tree-aware acceptance only exists in the
-        # two-model TorchSampler path, which is deprecated alongside this.
-        accepted_path_len = None
-        if getattr(spec_config, "eagle_choices", None):
-            accepted_path_len = sampler_args.max_total_draft_tokens + 1
         # Occurrence penalties assume the linear row layout: one logits row per
         # speculative position, so a position's prefix is the positions before it.
         # A tree's rows are nodes whose prefix is their root path instead, and
         # sibling branches must not penalize each other -- so tree modes are not
         # supported yet and are rejected at admission rather than mispenalized.
-        penalty_supported = not (getattr(spec_config, "eagle_choices", None)
-                                 or _is_effective_dynamic_tree(spec_config))
+        penalty_supported = not _is_effective_dynamic_tree(spec_config)
         return SpecSampler(sampler_args,
-                           accepted_path_len=accepted_path_len,
                            enable_penalty=spec_config.enable_penalty,
                            penalty_supported=penalty_supported)
     raise ValueError(
