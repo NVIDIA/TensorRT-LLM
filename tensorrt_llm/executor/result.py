@@ -1252,6 +1252,34 @@ class IterationResult:
             raise StopAsyncIteration
 
 
+# Element budget for the chunked rank computation below. The comparison
+# materializes a [chunk, vocab_size] boolean tensor, so the chunk size is
+# derived from the vocabulary size to keep peak memory bounded (and, on CPU,
+# the working set cache-resident).
+_RANK_CHUNK_ELEMS_CUDA = 1 << 24
+_RANK_CHUNK_ELEMS_CPU = 1 << 20
+
+
+def _sampled_token_ranks(logprobs: torch.Tensor,
+                         sampled_logprobs: torch.Tensor) -> torch.Tensor:
+    """1-based vocabulary rank of the sampled token at each position.
+
+    Equivalent to ``(logprobs[t] > sampled_logprobs[t]).sum() + 1`` per row,
+    but batched over rows and chunked to bound peak memory.
+    """
+    num_tokens, vocab_size = logprobs.shape
+    budget = (_RANK_CHUNK_ELEMS_CUDA
+              if logprobs.device.type == "cuda" else _RANK_CHUNK_ELEMS_CPU)
+    chunk = max(1, budget // max(vocab_size, 1))
+    ranks = torch.empty(num_tokens, dtype=torch.long, device=logprobs.device)
+    for start in range(0, num_tokens, chunk):
+        end = min(start + chunk, num_tokens)
+        ranks[start:end] = (logprobs[start:end]
+                            > sampled_logprobs[start:end].unsqueeze(1)).sum(
+                                dim=1)
+    return ranks.add_(1)
+
+
 def compute_logprobs(
     k_prompt_logprobs: int,
     k_logprobs: int,
@@ -1294,47 +1322,76 @@ def compute_logprobs(
             logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+        num_tokens = logprobs.size(0)
+
+        sampled_token_ids = None
+        if tokens is not None:
+            sampled_token_ids = torch.as_tensor(tokens[:num_tokens],
+                                                dtype=torch.long,
+                                                device=logprobs.device)
 
         # only return sampled token
         if top_k == 0:
+            if tokens is None:
+                return []
+
+            # One gather + one D2H copy instead of one .item() per token.
+            sampled_logprobs = logprobs.gather(
+                1, sampled_token_ids.unsqueeze(1)).squeeze(1)
+
             if simple:
-                simple_results: list[float] = []
-                if tokens is not None:
-                    for t in range(logprobs.size(0)):
-                        simple_results.append(logprobs[t, tokens[t]].item())
+                simple_results: list[float] = sampled_logprobs.tolist()
                 return simple_results
 
-            results: TokenLogprobs = []
-            if tokens is not None:
-                for t in range(logprobs.size(0)):
-                    token_id = tokens[t]
-                    token_logprob = logprobs[t, token_id].item()
-                    rank = (logprobs[t] > token_logprob).sum().item() + 1
-                    token_dict = {
-                        token_id: Logprob(logprob=token_logprob, rank=rank)
-                    }
-                    results.append(token_dict)
+            sampled_ranks = _sampled_token_ranks(logprobs, sampled_logprobs)
+            results: TokenLogprobs = [{
+                token_id:
+                Logprob(logprob=token_logprob, rank=rank)
+            } for token_id, token_logprob, rank in zip(
+                tokens[:num_tokens], sampled_logprobs.tolist(),
+                sampled_ranks.tolist())]
             return results
 
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
+        # Bulk D2H transfer: two copies for the whole batch instead of
+        # 2 * top_k * num_tokens scalar transfers.
+        topk_vals_list = topk_vals.tolist()
+        topk_indices_list = topk_indices.tolist()
+
+        # Sampled tokens that did not make it into top-k need their own
+        # logprob and rank. Restrict the (expensive) rank computation to
+        # exactly those rows.
+        extra_logprobs: dict[int, tuple[float, int]] = {}
+        if tokens is not None:
+            missing_rows = (topk_indices != sampled_token_ids.unsqueeze(1)).all(
+                dim=1).nonzero(as_tuple=True)[0]
+            if missing_rows.numel() > 0:
+                missing_logprobs = logprobs.index_select(0, missing_rows)
+                missing_sampled = missing_logprobs.gather(
+                    1,
+                    sampled_token_ids.index_select(
+                        0, missing_rows).unsqueeze(1)).squeeze(1)
+                missing_ranks = _sampled_token_ranks(missing_logprobs,
+                                                     missing_sampled)
+                extra_logprobs = dict(
+                    zip(missing_rows.tolist(),
+                        zip(missing_sampled.tolist(), missing_ranks.tolist())))
 
         results: TokenLogprobs = []
         # for each token position
-        for t in range(logprobs.size(0)):
+        for t in range(num_tokens):
             token_dict = {
-                idx.item(): Logprob(logprob=val.item(), rank=r + 1)
-                for r, (val,
-                        idx) in enumerate(zip(topk_vals[t], topk_indices[t]))
+                idx: Logprob(logprob=val, rank=r + 1)
+                for r, (val, idx) in enumerate(
+                    zip(topk_vals_list[t], topk_indices_list[t]))
             }
 
             # If we have the sampled token list and it's not in top-k, add it
-            if tokens is not None:
-                token_id = tokens[t]
-                if token_id not in token_dict:
-                    token_logprob = logprobs[t, token_id].item()
-                    rank = (logprobs[t] > token_logprob).sum().item() + 1
-                    token_dict[token_id] = Logprob(logprob=token_logprob,
-                                                   rank=rank)
+            extra = extra_logprobs.get(t)
+            if extra is not None:
+                token_logprob, rank = extra
+                token_dict[tokens[t]] = Logprob(logprob=token_logprob,
+                                                rank=rank)
 
             results.append(token_dict)
         return results
