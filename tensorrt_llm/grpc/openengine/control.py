@@ -7,8 +7,10 @@ Reported capabilities describe what ``Generate`` accepts, not how the engine was
 built: a capability a client acts on and ``Generate`` then rejects turns
 discovery into a per-request failure.
 
-The LoRA lifecycle and KV-event RPCs return ``UNIMPLEMENTED`` -- the LLM API has
-no runtime adapter load/unload, and KV events are published out of band.
+The LoRA lifecycle RPCs return ``UNIMPLEMENTED``: the LLM API has no runtime
+adapter load/unload. The KV-event RPCs are served from the engine's streaming
+publisher, which is off unless ``kv_cache_config.kv_events_config`` enables it;
+see ``kv_events``.
 """
 
 import asyncio
@@ -18,6 +20,7 @@ from typing import Any, Optional
 
 import grpc
 from openengine.v1 import (
+    error_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -32,6 +35,15 @@ from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS
 
 from .capabilities import supported_guides
 from .errors import AbortFailedError
+from .kv_events import (
+    KvEventsUnavailableError,
+    data_parallel_size,
+    events_config,
+    resolve_advertise_host,
+    resolve_sources,
+    stream_batches,
+    to_proto_source,
+)
 
 __all__ = ["OpenEngineControlServicer"]
 
@@ -100,6 +112,8 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         inference: The paired inference servicer, whose in-flight request table
             backs ``Abort`` and ``GetLoad``.
         kv_transfer_backend: KV cache transfer backend name, when configured.
+        bind_host: Interface the server listens on. Used to name a routable host
+            for KV event sources when the publishers bind a wildcard.
     """
 
     def __init__(
@@ -108,11 +122,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         model: str,
         inference: Any,
         kv_transfer_backend: str = "",
+        bind_host: str = "",
     ) -> None:
         self._llm = llm
         self._model = model
         self._inference = inference
         self._kv_transfer_backend = kv_transfer_backend
+        self._advertise_host = resolve_advertise_host(bind_host)
         self._probe: Optional[asyncio.Future] = None
 
     def _engine_is_healthy(self) -> bool:
@@ -162,6 +178,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             ("tensor_parallel_size", args.tensor_parallel_size),
             ("pipeline_parallel_size", args.pipeline_parallel_size),
             ("decode_context_parallel_size", args.context_parallel_size),
+            # One KV event publisher binds per attention-DP rank, so a client
+            # subscribing to GetKvEventSources needs this to tell a complete set
+            # of sources from a partial one.
+            ("data_parallel_size", data_parallel_size(self._llm)),
         ):
             size = _positive_int(value)
             if size is not None:
@@ -473,14 +493,48 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             "runtime LoRA enumeration is not supported",
         )
 
+    async def _requested_sources(
+        self,
+        ranks: Any,
+        context: grpc.aio.ServicerContext,
+    ) -> list:
+        """Resolve the publishers for `ranks`, or every rank when it is empty.
+
+        Returns an empty list when KV events are disabled: the RPC is
+        implemented, there is simply nothing to publish, and a client can tell
+        that from "not supported" by the absence of an UNIMPLEMENTED status.
+        """
+        try:
+            sources = resolve_sources(self._llm, self._advertise_host)
+        except KvEventsUnavailableError as error:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+        if not sources:
+            return []
+        if not ranks:
+            return sources
+        by_rank = {source.data_parallel_rank: source for source in sources}
+        unknown = sorted(set(ranks) - by_rank.keys())
+        if unknown:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"no KV event source for data-parallel rank(s) {unknown}; this engine "
+                f"publishes ranks 0..{len(sources) - 1}",
+            )
+        # Deduplicated and ordered by rank: a client repeating a rank must not
+        # get two subscriptions to the same socket.
+        return [by_rank[rank] for rank in sorted(set(ranks))]
+
     async def GetKvEventSources(
         self,
         request: kv_pb2.GetKvEventSourcesRequest,
         context: grpc.aio.ServicerContext,
     ) -> kv_pb2.GetKvEventSourcesResponse:
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "KV cache events are not published over the OpenEngine Control service",
+        sources = await self._requested_sources(request.data_parallel_ranks, context)
+        if not sources:
+            return kv_pb2.GetKvEventSourcesResponse()
+        config = events_config(self._llm)
+        return kv_pb2.GetKvEventSourcesResponse(
+            sources=[to_proto_source(source, config, _SCHEMA_REVISION) for source in sources]
         )
 
     async def SubscribeKvEvents(
@@ -488,7 +542,33 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         request: kv_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ):
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "KV cache events are not published over the OpenEngine Control service",
+        sources = await self._requested_sources(request.data_parallel_ranks, context)
+        if not sources:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "KV cache events are not enabled; set kv_cache_config.kv_events_config to "
+                "publish them",
+            )
+        config = events_config(self._llm)
+        batches = stream_batches(
+            sources,
+            config.topic,
+            start_sequence_number=request.start_sequence_number,
+            include_snapshot=request.include_snapshot,
         )
+        try:
+            async for batch in batches:
+                yield kv_pb2.SubscribeKvEventsResponse(batch=batch)
+        except KvEventsUnavailableError as error:
+            # Terminal by contract: the last message carries the error and the
+            # stream then closes OK, so no batch may follow it.
+            logger.error(f"OpenEngine KV event subscription failed: {error}")
+            yield kv_pb2.SubscribeKvEventsResponse(
+                error=error_pb2.EngineError(
+                    code=error_pb2.ERROR_CODE_INTERNAL,
+                    message=str(error),
+                    retryable=True,
+                )
+            )
+        finally:
+            await batches.aclose()

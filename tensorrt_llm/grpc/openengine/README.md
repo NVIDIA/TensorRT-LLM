@@ -29,7 +29,48 @@ The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyT
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health` and `Abort`; its LoRA lifecycle and KV-event RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health`, `Abort` and the KV-event RPCs; its LoRA lifecycle RPCs return `UNIMPLEMENTED`.
+
+### KV cache events
+
+`Control.GetKvEventSources` and `Control.SubscribeKvEvents` expose TensorRT-LLM's
+streaming KV cache event publisher, which is off until
+`kv_cache_config.kv_events_config` enables it:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  kv_events_config:
+    enable_kv_cache_events: true
+    endpoint: "tcp://*:5557"
+    replay_endpoint: "tcp://*:5657"
+```
+
+Events are produced inside the engine: every attention-DP rank binds its own
+ZeroMQ `PUB` socket at `base_port + rank` and publishes msgpack batches from a
+background thread. `GetKvEventSources` advertises those sockets -- resolving the
+bind wildcard to a routable host, because a client cannot connect to one -- so a
+router subscribes to the engine directly and events never touch this server's
+event loop. `SubscribeKvEvents` is for clients that cannot reach the ZeroMQ
+ports: it subscribes on the client's behalf and re-publishes each batch as
+protobuf, at the cost of a decode and re-encode per batch in this process.
+
+Both return nothing rather than an error when publishing is disabled, so a
+client can tell "not configured" from "not supported". Two configurations are
+rejected with `FAILED_PRECONDITION` instead of being advertised unusably:
+`ipc://` and `inproc://` endpoints, which have no host and port for the protocol
+to carry, and attention DP spanning more than one node, where ranks bind on
+hosts this process cannot name.
+
+Delivery is best effort in both modes. Every batch carries a sequence number, so
+a batch dropped by a full queue leaves an observable gap; a subscriber must treat
+any gap as lost KV-cache state and resynchronize. When a replay endpoint is
+configured, `SubscribeKvEventsRequest.start_sequence_number` and
+`include_snapshot` replay the retained batches first.
+
+The ZeroMQ listeners are a second unauthenticated, unencrypted surface alongside
+the gRPC one -- see [Transport security](#transport-security) -- so the same
+colocation rule applies to them.
 
 ### Disaggregated serving
 

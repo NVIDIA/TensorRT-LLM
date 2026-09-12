@@ -93,7 +93,7 @@ class OpenEngineServer:
         # Abort and GetLoad see the same requests Generate is serving.
         openengine_pb2_grpc.add_ControlServicer_to_server(
             OpenEngineControlServicer(
-                llm, model, inference, kv_transfer_backend=kv_transfer_backend
+                llm, model, inference, kv_transfer_backend=kv_transfer_backend, bind_host=host
             ),
             self._server,
         )

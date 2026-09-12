@@ -94,6 +94,7 @@ l0_cpu:
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_ray_stub.py
   - unittest/grpc/openengine/test_control.py
+  - unittest/grpc/openengine/test_kv_events.py
   - unittest/grpc/openengine/test_openengine.py
   - unittest/grpc/openengine/test_servicer.py
   - unittest/inputs
