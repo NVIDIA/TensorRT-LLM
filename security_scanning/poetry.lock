@@ -4896,14 +4896,14 @@ windows-terminal = ["colorama (>=0.4.6)"]
 
 [[package]]
 name = "pyjwt"
-version = "2.13.0"
+version = "2.14.0"
 description = "JSON Web Token implementation in Python"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728"},
-    {file = "pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423"},
+    {file = "pyjwt-2.14.0-py3-none-any.whl", hash = "sha256:ad0cef71c756a56e74863c2919cf0985f72decbcfcb550ee2f422e7c62b5eedc"},
+    {file = "pyjwt-2.14.0.tar.gz", hash = "sha256:77283c83fb56ecf566a886c757a714bc83668e38156de2cce8263302f42e0b86"},
 ]
 
 [package.dependencies]
@@ -6275,14 +6275,14 @@ dev = ["bitsandbytes", "blobfile", "cmake (>=3.19.0,<4.0.0)", "diskcache", "expe
 
 [[package]]
 name = "tqdm"
-version = "4.70.0"
+version = "4.70.1"
 description = "Fast, Extensible Progress Meter"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "tqdm-4.70.0-py3-none-any.whl", hash = "sha256:7f585706bfddbdebf89daac705b2dfcc16890130727d3197ca62c732b4310953"},
-    {file = "tqdm-4.70.0.tar.gz", hash = "sha256:55b0b0dbd97462d06ebee91e4dac24ed4d4702be82b24f07e6c1d27e08cea220"},
+    {file = "tqdm-4.70.1-py3-none-any.whl", hash = "sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73"},
+    {file = "tqdm-4.70.1.tar.gz", hash = "sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4"},
 ]
 
 [package.dependencies]
@@ -6565,14 +6565,14 @@ files = [
 
 [[package]]
 name = "xdsl"
-version = "0.70.0"
+version = "0.71.0"
 description = "xDSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "xdsl-0.70.0-py3-none-any.whl", hash = "sha256:f80a5356470af0dac46083ddde5bf1896271f19676aac7fb04ba44590d47c52b"},
-    {file = "xdsl-0.70.0.tar.gz", hash = "sha256:86295a650cca786f2da2b5ec23953c777e6cd2b90b1315a39bd4a123742666a9"},
+    {file = "xdsl-0.71.0-py3-none-any.whl", hash = "sha256:05d10d4ad3662eb722b94ec2abcf5559a05491cb6d737b68d9eea71d3749619e"},
+    {file = "xdsl-0.71.0.tar.gz", hash = "sha256:19aa3f3843daf25c0eb2c4de2eb57bd823cd7e03db4680c28f36d12519a0e997"},
 ]
 
 [package.dependencies]
@@ -6581,10 +6581,10 @@ ordered-set = "4.1"
 typing-extensions = ">=4.7,<5"
 
 [package.extras]
-dev = ["coverage (<8)", "filecheck (==1.0.3)", "lit (<19)", "marimo (>=0.23,<0.24)", "prek (>=0.4.0,<0.5.0)", "pyright (==1.1.411)", "pytest (<9.2)", "pytest-asyncio", "pytest-cov", "ruff (==0.16.3)", "sympy (==1.14)", "textual-dev (==1.8)", "toml (<0.11)"]
+dev = ["coverage (<8)", "filecheck (==1.0.6)", "lit (<19)", "marimo (>=0.23,<0.24)", "prek (>=0.4.0,<0.5.0)", "pyright (==1.1.411)", "pytest (<9.2)", "pytest-asyncio", "pytest-cov", "ruff (==0.16.6)", "sympy (==1.14)", "textual-dev (==1.8)", "toml (<0.11)"]
 gui = ["pyclip (==0.7)", "textual (>=8,<9)"]
 heir = ["heir-py (==2026.8.1)"]
-llvm = ["llvmlite (>=0.47.0,<0.48.0)"]
+llvm = ["cffi (>=2)", "llvmlite (>=0.47.0,<0.48.0)"]
 
 [[package]]
 name = "xgrammar"
