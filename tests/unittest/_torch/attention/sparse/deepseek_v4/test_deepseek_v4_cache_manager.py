@@ -36,11 +36,14 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekV4SparseAttentionConfig,
+    DraftTargetDecodingConfig,
+    KvCacheConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, KVCacheDesc, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
@@ -1730,11 +1733,7 @@ class TestDeepseekV4CacheManager:
             cache_manager.shutdown()
 
     def test_swa_scratch_reuse_uses_extra_kv_tokens_for_rewind(self):
-        spec_config = SimpleNamespace(
-            max_draft_len=7,
-            max_total_draft_tokens=7,
-            spec_dec_mode=SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL,
-        )
+        spec_config = DraftTargetDecodingConfig(max_draft_len=7, speculative_model="draft")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
