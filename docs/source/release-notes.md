@@ -4,6 +4,12 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.3
+
+### API Changes
+
+- **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. It remains Hopper-only (SM90) and continues to work with a one-time runtime warning during that window. The recommended replacement on Hopper is `moe_config.backend="CUTLASS"`, which covers the same quantization formats functionally; performance may differ. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+
 ## TensorRT-LLM Release 1.2
 
 ### Key Features and Enhancements
