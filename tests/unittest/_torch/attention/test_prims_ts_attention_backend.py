@@ -105,16 +105,29 @@ def test_prims_ts_qwen2_gqa(
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-def test_prims_ts_context_zero_fills_nan_v_tail(
+def test_prims_ts_context_receives_zeroed_v_tail(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
 ) -> None:
+    import backend_case
+
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
 
+    original_build_kv_cache_manager = backend_case._build_kv_cache_manager
     original_run = BatchPrefillPagedTSWrapper.run
-    poisoned_tails: list[tuple[int, int]] = []
+    zeroed_tails: list[tuple[int, int]] = []
 
-    def run_with_nan_v_tail(
+    def build_kv_cache_manager_with_nan_v(
+        case: BackendCase,
+        backend: str,
+        kv_dtype: torch.dtype,
+    ) -> object:
+        manager = original_build_kv_cache_manager(case, backend, kv_dtype)
+        if backend == "TRTLLM":
+            manager.get_buffers(0, kv_layout="HND")[:, 1].fill_(float("nan"))
+        return manager
+
+    def run_with_zeroed_v_tail_check(
         self: BatchPrefillPagedTSWrapper,
         q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -124,8 +137,8 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
         seq_lens_kv: torch.Tensor,
         **kwargs: object,
     ) -> torch.Tensor:
-        # Poison after TRT-LLM writes valid KV and immediately before PrimTS
-        # launches, so only the kernel's handling of unused V rows is tested.
+        # The TRT-LLM producer promises zeroed V tails to PrimTS. Check the
+        # invariant at the handoff, before the PrimTS consumer launches.
         page_size = v_cache.shape[2]
         seq_lens = seq_lens_kv.cpu().tolist()
         page_indices = block_tables.cpu()
@@ -135,8 +148,9 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
             if tail_start == page_size:
                 continue
             physical_page = int(page_indices[batch_idx, logical_last_page].item())
-            v_cache[physical_page, :, tail_start:, :].fill_(float("nan"))
-            poisoned_tails.append((batch_idx, tail_start))
+            tail = v_cache[physical_page, :, tail_start:, :]
+            assert torch.count_nonzero(tail).item() == 0
+            zeroed_tails.append((batch_idx, tail_start))
 
         return original_run(
             self,
@@ -149,7 +163,17 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
             **kwargs,
         )
 
-    monkeypatch.setattr(BatchPrefillPagedTSWrapper, "run", run_with_nan_v_tail)
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    monkeypatch.setattr(
+        backend_case,
+        "_build_kv_cache_manager",
+        build_kv_cache_manager_with_nan_v,
+    )
+    monkeypatch.setattr(
+        BatchPrefillPagedTSWrapper,
+        "run",
+        run_with_zeroed_v_tail_check,
+    )
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     case = BackendCase(
         **_QWEN2_7B,
@@ -162,7 +186,7 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
     results = run_case(case)
 
     assert "TRTLLM" in results
-    assert poisoned_tails == [(0, 1), (1, 5)]
+    assert zeroed_tails == [(0, 1), (1, 5)]
 
 
 def test_prims_ts_fp16_dense_context_with_alternate_shape(
