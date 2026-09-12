@@ -575,7 +575,7 @@ def _get_num_pool_groups_for_estimation(
 
     layer_types = getattr(model_config, "layer_types", None)
     attention_windows = None
-    if fallback_attention_windows is None:
+    if (fallback_attention_windows is None and is_gemma4_hybrid(model_config)):
         attention_windows = _derive_layer_type_attention_windows(
             model_config, max_seq_len)
     # Check whether KV storage uses configured or inferred attention windows,
@@ -2608,9 +2608,12 @@ def _create_kv_cache_manager(
     # max_attention_window=None to opt out, not to request derivation.
     # The cross-attention pool holds encoder-side KV that the decoder's
     # `layer_types` do not describe, so it keeps the default too.
+    # Keep estimation storage full-context unless distinct page layouts require
+    # windowed storage (Gemma4). Enable automatic windowing for the final manager.
     derived_windows = None
     if (not is_draft and kv_cache_type
-            == tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF):
+            == tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+            and (not estimating_kv_cache or is_gemma4_hybrid(config))):
         derived_windows = _derive_v2_layer_type_attention_windows(
             kv_cache_config, kv_cache_manager_cls, _model_config, max_seq_len)
     if derived_windows is not None:
@@ -2671,14 +2674,14 @@ def _create_kv_cache_manager(
             draft_config_for_kv)
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+        manager_extra_kwargs["max_cuda_graph_batch_size"] = (
+            model_engine._max_cuda_graph_batch_size
+            if model_engine is not None else max_cuda_graph_batch_size)
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
-        manager_extra_kwargs["max_cuda_graph_batch_size"] = (
-            model_engine._max_cuda_graph_batch_size
-            if model_engine is not None else max_cuda_graph_batch_size)
         # V2 builds the block-reuse cache key of a multimodal token run from
         # the vocabulary size. Resolve it here rather than per-branch: the
         # manager needs it whenever block reuse can meet multimodal input,
