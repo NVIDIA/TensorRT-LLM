@@ -144,6 +144,26 @@ def test_gen_only_no_context_skips():
     assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
 
 
+def test_gen_only_no_context_test_id_skips_over_an_ordinary_yaml():
+    """The primary entry path: the test id names the mode, the yaml does not.
+
+    Every checked-in config says `mode: e2e`, so this -- not the legacy yaml opt-in
+    above -- is what the new `disagg-gen_only_no_context-<config>` id exercises.
+    Without it resolve_plan would fall through to the KV-transfer plan and raise on
+    a ctx fleet that was never launched.
+    """
+    cfg = _disagg_yaml(benchmark={"mode": "e2e", "input_length": 1024})
+
+    plan = pcfg.resolve_plan(cfg, benchmark_mode="gen_only_no_context")
+    assert plan["skip"]
+    assert "gen_only_no_context" in plan["skip_reason"]
+
+    # Control: the same yaml under the other two disagg modes still plans a
+    # transfer, so the skip above is attributable to the mode and nothing else.
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="gen_only")["skip"]
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
+
+
 def test_backend_mismatch_raises():
     cfg = _disagg_yaml(
         gen_extra={"cache_transceiver_config": {"backend": "UCX", "max_tokens_in_buffer": 16384}}

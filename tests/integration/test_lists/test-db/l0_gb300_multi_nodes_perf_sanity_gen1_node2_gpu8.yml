@@ -1,0 +1,22 @@
+version: 0.0.1
+l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8:
+- condition:
+    ranges:
+      # No ctx workers at all: gen_only_no_context has the gen worker fabricate its
+      # own KV blocks, so only the 1 gen worker (2 nodes, 4 GPUs each) is allocated.
+      # The same case under gen_only needs 56 GPUs -- see
+      # l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8.yml.
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb300*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # deepseek-v4-pro-fp4 8k1k con4301 (max throughput), decode loop only.
+  # Exactly one test: the disagg gen_only path requires a single selected case per
+  # split group, so the stage's splits must stay 1 and this list must stay length 1.
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (120)

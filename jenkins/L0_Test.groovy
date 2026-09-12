@@ -6523,6 +6523,20 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         56,
         14
     )
+    // 2 Nodes: gen1 (2 nodes, 8 GPUs) + NO ctx fleet = 8 GPUs.
+    // Same con4301 config as the 14-node stage above, run as gen_only_no_context:
+    // the gen worker fabricates its own KV blocks, so the 12 ctx workers whose only
+    // job was feeding it are not launched at all (56 GPUs -> 8, -86%).
+    // splits must stay 1: the disagg gen_only path requires exactly one selected
+    // test per split group and raises on both zero and many.
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
+        1,
+        8,
+        2
+    )
     // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
