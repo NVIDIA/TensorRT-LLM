@@ -64,7 +64,9 @@ def test_load_hf_quant_config_parses_nvfp4_with_kv_cache_scheme():
     assert set(quant_config.exclude_modules) == {gate_exclude, "lm_head"}
 
 
-def _modelopt_hf_quant_config(quant_algo, group_size=None, **quantization_overrides):
+def _modelopt_hf_quant_config(
+    quant_algo: str, group_size: int | None = None, **quantization_overrides: object
+) -> dict:
     """Mimic a ModelOpt ``hf_quant_config.json`` (producer + quantization)."""
     quantization = {
         "quant_algo": quant_algo,
@@ -89,9 +91,12 @@ def _modelopt_hf_quant_config(quant_algo, group_size=None, **quantization_overri
         ("W4A16_NVFP4", None),
         ("NVFP4", 16),
         ("NVFP4", None),
+        ("NVFP4_ARC", 16),
     ],
 )
-def test_modelopt_quant_config_accepts_supported_nvfp4_group_sizes(quant_algo, group_size):
+def test_modelopt_quant_config_accepts_supported_nvfp4_group_sizes(
+    quant_algo: str, group_size: int | None
+) -> None:
     quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
         _modelopt_hf_quant_config(quant_algo, group_size), moe_backend="CUTLASS"
     )
@@ -112,14 +117,16 @@ def test_modelopt_quant_config_accepts_supported_nvfp4_group_sizes(quant_algo, g
         ("W4A16_NVFP4", 128),
     ],
 )
-def test_modelopt_quant_config_rejects_unsupported_nvfp4_group_size(quant_algo, group_size):
+def test_modelopt_quant_config_rejects_unsupported_nvfp4_group_size(
+    quant_algo: str, group_size: int
+) -> None:
     with pytest.raises(ValueError, match=f"group_size={group_size}.*{quant_algo}"):
         ModelConfig.load_hf_quant_config(
             _modelopt_hf_quant_config(quant_algo, group_size), moe_backend="CUTLASS"
         )
 
 
-def test_modelopt_mixed_precision_validates_per_layer_nvfp4_group_size():
+def test_modelopt_mixed_precision_validates_per_layer_nvfp4_group_size() -> None:
     quantized_layers = {
         "model.layers.0.mlp.down_proj": {"quant_algo": "W4A16_NVFP4", "group_size": 32},
         "model.layers.0.self_attn.o_proj": {"quant_algo": "FP8"},
