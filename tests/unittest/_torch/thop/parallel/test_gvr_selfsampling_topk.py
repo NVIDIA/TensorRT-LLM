@@ -55,6 +55,10 @@ from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
 _DEV = "cuda"
 
 
+def _varlen_cache_key(*parts: int) -> tuple[int, ...]:
+    return (*parts, ss_host._device_num_sms(torch.cuda.current_device()))
+
+
 def _make_case(batch_size, n_valid, top_k, seed, hit_ratio=0.6):
     """Decode-like fp32 logits + prev-step hint. The padded tail is poisoned
     with +3e38 so any read past n_valid corrupts the top-K values."""
@@ -675,6 +679,131 @@ def test_selfsampling_route_4k_8k_register_rungs():
                     )
 
 
+def test_selfsampling_register_rungs_follow_available_sms() -> None:
+    """Only register wave boundaries follow the available SM count."""
+    for num_sms in (148, 160, 208):
+        for k in (512, 1024, 2048):
+            n, npad = 8195, 8256
+            wide = ss_host.route(num_sms, n, npad, k, num_sms)
+            assert wide["kernel"] == "reg"
+            assert tuple(wide["tpl"][:3]) == (1024, 2, 1)
+            for rows in (num_sms + 1, 2 * num_sms):
+                mid = ss_host.route(rows, n, npad, k, num_sms)
+                assert mid["kernel"] == "reg"
+                assert tuple(mid["tpl"][:3]) == (512, 4, 2)
+            assert ss_host.route(2 * num_sms + 1, n, npad, k, num_sms)["kernel"] == "main"
+
+            n, npad = 12288, 12288
+            assert ss_host.route(num_sms, n, npad, k, num_sms)["kernel"] == "reg"
+            assert ss_host.route(num_sms + 1, n, npad, k, num_sms)["kernel"] == "main"
+
+        # Streaming and clustered-register tuning is intentionally invariant.
+        for rows, n, k, family in (
+            (52, 32768, 1024, "reg_clus"),
+            (32, 262144, 1024, "clus"),
+            (192, 131072, 2048, "main"),
+            (320, 131072, 2048, "main"),
+        ):
+            baseline = ss_host.route(rows, n, n, k, 148)
+            assert baseline["kernel"] == family
+            assert ss_host.route(rows, n, n, k, num_sms) == baseline
+
+        # The default preserves the 148-SM B200 behavior exactly.
+        for rows in (148, 149, 296, 297):
+            assert ss_host.route(rows, 8195, 8256, 1024) == ss_host.route(
+                rows, 8195, 8256, 1024, 148
+            )
+
+
+def test_selfsampling_route_sms_factorization() -> None:
+    """The factored route preserves topology-dependent register plans."""
+    for num_sms in (148, 160, 208):
+        for rows in (num_sms, num_sms + 1, 2 * num_sms, 2 * num_sms + 1):
+            for n in (4100, 8195, 12288, 131072):
+                for k in (512, 1024, 2048):
+                    npad = (n + 63) // 64 * 64
+                    assert ss_host.route_split(rows, n, npad, k, num_sms) == ss_host.route(
+                        rows, n, npad, k, num_sms
+                    )
+
+
+def test_selfsampling_device_num_sms_is_cached_per_device(monkeypatch) -> None:
+    """The device-property query is cold-path-only and cached per CUDA device."""
+    counts = {0: 160, 1: 208}
+    queries = []
+
+    class Properties:
+        def __init__(self, multi_processor_count: int) -> None:
+            self.multi_processor_count = multi_processor_count
+
+    def get_device_properties(device: int) -> Properties:
+        queries.append(device)
+        return Properties(counts[device])
+
+    monkeypatch.setattr(ss_host, "_DEVICE_NUM_SMS", {})
+    monkeypatch.setattr(ss_host, "_get_device_properties", get_device_properties)
+    assert ss_host._device_num_sms(0) == 160
+    assert ss_host._device_num_sms(1) == 208
+    counts[0] = 148
+    assert ss_host._device_num_sms(0) == 160
+    assert queries == [0, 1]
+
+
+def test_selfsampling_launcher_cache_identity_includes_num_sms(monkeypatch) -> None:
+    """Uniform and varlen launchers compiled for different SM counts never alias."""
+
+    class FakeCudaTensor:
+        is_cuda = True
+
+        def __init__(self, shape: tuple[int, int], dtype: torch.dtype) -> None:
+            self.shape = shape
+            self.dtype = dtype
+
+        def is_contiguous(self) -> bool:
+            return True
+
+        def data_ptr(self) -> int:
+            return 0
+
+        def get_device(self) -> int:
+            return 0
+
+    current_sms = [148]
+    builds = []
+
+    def build_launcher(batch_size: int, n_valid: int, npad: int, top_k: int, num_sms: int) -> tuple:
+        builds.append((batch_size, n_valid, npad, top_k, num_sms))
+        return (lambda *args: None, (), False)
+
+    monkeypatch.setattr(ss_host, "_LAUNCH_CACHE", {})
+    monkeypatch.setattr(ss_host, "_device_num_sms", lambda device: current_sms[0])
+    monkeypatch.setattr(ss_host, "_build_launcher", build_launcher)
+    logits = FakeCudaTensor((160, 8192), torch.float32)
+    pre_idx = FakeCudaTensor((160, 512), torch.int32)
+    indices = FakeCudaTensor((160, 512), torch.int32)
+
+    ss_host._run_impl(logits, pre_idx, 8192, indices, None)
+    ss_host._run_impl(logits, pre_idx, 8192, indices, None)
+    current_sms[0] = 160
+    ss_host._run_impl(logits, pre_idx, 8192, indices, None)
+    assert builds == [(160, 8192, 8192, 512, 148), (160, 8192, 8192, 512, 160)]
+    assert set(ss_host._LAUNCH_CACHE) == {
+        (160, 8192, 8192, 512, 148),
+        (160, 8192, 8192, 512, 160),
+    }
+
+    shape = (160, 8192, 512, 8192, 1, 1)
+    launcher_148 = ("sms148",)
+    launcher_160 = ("sms160",)
+    monkeypatch.setattr(
+        ss_host,
+        "_VARLEN_CACHE",
+        {(*shape, 148): launcher_148, (*shape, 160): launcher_160},
+    )
+    assert ss_host._varlen_launcher(*shape, num_sms=148) is launcher_148
+    assert ss_host._varlen_launcher(*shape, num_sms=160) is launcher_160
+
+
 def test_selfsampling_topk_varlen_rejects_non_fp32():
     """Engine-level dtype contract: bf16/fp16 logits must raise a clear
     error (the dispatch seam falls through before this; direct callers get
@@ -750,7 +879,7 @@ def test_selfsampling_varlen_regclus_parity_and_oracle():
     kv = torch.tensor([msl_c * cr, 900, nn - 1], dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-    key = (rows, npad, k, msl_c, nn, cr)
+    key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
     torch.cuda.synchronize()
     ref = _reference_varlen_indices(lg, kv, nn, cr, k)
@@ -815,7 +944,7 @@ def test_selfsampling_varlen_reg_parity_and_oracle():
         kv = torch.tensor([msl, max((k - 3) * cr, nn), nn - 1], dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
-        key = (rows, npad, k, msl_c, nn, cr)
+        key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
         torch.cuda.synchronize()
         ref = _reference_varlen_indices(lg, kv, nn, cr, k)
@@ -855,7 +984,7 @@ def test_selfsampling_varlen_clus_parity_and_oracle():
         )
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-        key = (rows, npad, k, msl_c, nn, cr)
+        key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
         torch.cuda.synchronize()
         ref = _reference_varlen_indices(lg, kv, nn, cr, k)
@@ -882,7 +1011,7 @@ def test_selfsampling_varlen_clus_cuda_graph():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr)
+    key = _varlen_cache_key(rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
@@ -908,7 +1037,7 @@ def test_selfsampling_varlen_reg_cuda_graph():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr)
+    key = _varlen_cache_key(rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
@@ -960,7 +1089,7 @@ def test_selfsampling_varlen_4k_8k_rungs_exact(rows, n, top_k):
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(logits, kv_lens, out, next_n=1, compress_ratio=1, max_seq_len=n)
     torch.cuda.synchronize()
-    key = (rows, npad, top_k, n, 1, 1)
+    key = _varlen_cache_key(rows, npad, top_k, n, 1, 1)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     ref = _reference_varlen_indices(logits, kv_lens, 1, 1, top_k)
     for r in range(rows):
@@ -994,7 +1123,7 @@ def test_selfsampling_varlen_mid_rung_mtp_cr4():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, npad, k, msl_c, nn, cr)
+    key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     ref = _reference_varlen_indices(lg, kv, nn, cr, k)
     for r in range(rows):
@@ -1018,7 +1147,7 @@ def test_selfsampling_varlen_mid_rung_cuda_graph():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=1, max_seq_len=n)
     torch.cuda.synchronize()
-    key = (rows, n, k, n, 1, 1)
+    key = _varlen_cache_key(rows, n, k, n, 1, 1)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     assert tuple(ss_host.route(rows, n, n, k)["tpl"][:3]) == (512, 4, 2)
     g = torch.cuda.CUDAGraph()
@@ -1047,7 +1176,7 @@ def test_selfsampling_varlen_full_row_range():
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
         torch.cuda.synchronize()
-        key = (rows, msl_c, k, msl_c, 1, cr)
+        key = _varlen_cache_key(rows, msl_c, k, msl_c, 1, cr)
         assert key in ss_host._VARLEN_CACHE, "row count must dispatch in-engine"
         ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
         got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
@@ -1138,7 +1267,7 @@ def test_selfsampling_warmup_incremental_rows_populate_exact_launchers() -> None
     k, msl, cr, nn = 512, 8192, 1, 1
     npad = (msl + 63) // 64 * 64
     ss_host.warmup_varlen(k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(64,))
-    key63 = (63, npad, k, min(msl, npad), nn, cr)
+    key63 = _varlen_cache_key(63, npad, k, min(msl, npad), nn, cr)
     ss_host._VARLEN_CACHE.pop(key63, None)  # independent of earlier tests in this process
     ss_host.warmup_varlen(k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(63, 64))
     assert key63 in ss_host._VARLEN_CACHE
