@@ -75,3 +75,23 @@ TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
 TestKimiK3DSpark::test_gsm8k_tep8:
   ref_al: 4.323
   min_al: 4.0
+# Shared by both legs of TestStaircaseDeepseekR10528Nvfp4Sm103Dep4::
+# test_mtp3_acceptance. Keyed by target and variant rather than by test
+# function, because that is what the number is a property of, and because the
+# staircase and stock legs are read against the same minimum on purpose:
+# staircase failing while stock passes means the draft path regressed; both
+# failing means this anchor is stale. Populated from the STOCK leg -- taking it
+# from the target's own number would make the gate self-referential.
+StaircaseDeepseekR10528Nvfp4Sm103Dep4::mtp3:
+  ref_al: 3.020
+  # Hand-set, not the automatic 95%. Measured on GB300 over three runs each:
+  # stock 3.020 / 2.998 / 3.009 / 3.014, staircase 2.921 / 2.938 / 2.933. Each
+  # side is stable to ~0.7%, and the two ranges do not overlap -- staircase
+  # runs about 2.6% under stock on this workload, consistently rather than as
+  # noise. The automatic 95% floor (2.869) would therefore have left the
+  # staircase leg 1.8% of headroom against a 0.7% spread: a flaky test, not a
+  # gate. 2.5 is a collapse tripwire instead, the same role the
+  # TestKimiK3DSpark entry above states -- a collapsed draft path scores ~1.0
+  # and a subtly wrong one ~2.1, both far below this, while every accuracy
+  # gate stays green. It leaves staircase 17% of headroom and stock 20%.
+  min_al: 2.5
