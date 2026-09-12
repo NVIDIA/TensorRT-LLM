@@ -365,6 +365,41 @@ class RMSNorm(nn.Module):
         else:
             return hidden_states, cast(Optional[torch.Tensor], residual)
 
+    def forward_with_additional_residual(
+        self,
+        hidden_states: torch.Tensor,
+        additional_residual: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fuse a BF16-rounded MoE output add into FlashInfer RMSNorm.
+
+        Args:
+            hidden_states: BF16 tensor of shape ``(M, H)`` containing one MoE
+                contribution. Mutated in place with the normalized output.
+            additional_residual: BF16 tensor of shape ``(M, H)`` containing
+                the second MoE contribution. This tensor is not modified.
+            residual: BF16 tensor of shape ``(M, H)``. Mutated in place with
+                the BF16-rounded MoE sum plus the original residual.
+
+        Returns:
+            A tuple containing the same ``hidden_states`` and ``residual``
+            tensor objects after their in-place updates.
+        """
+        if (self.nvfp4_scale is not None or self.return_hp_output
+                or self.use_gemma or self.use_cuda_tile):
+            raise ValueError(
+                "Three-input FlashInfer RMSNorm does not support NVFP4 output, "
+                "Gemma RMSNorm, or cuda.tile RMSNorm")
+        from ..custom_ops import flashinfer_fused_add_add_rmsnorm
+        flashinfer_fused_add_add_rmsnorm(
+            hidden_states,
+            additional_residual,
+            residual,
+            self.weight,
+            self.variance_epsilon,
+        )
+        return hidden_states, residual
+
 
 class GroupRMSNormKernelSelection(enum.Enum):
     heuristic = 0
