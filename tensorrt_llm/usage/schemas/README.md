@@ -225,28 +225,28 @@ flags such as LoRA/speculative decoding have explicit safe config fields.
 
 The `llmApiConfigJson` field is a JSON-serialized dict containing a type-driven
 subset of the validated, effective LLM API configuration. Capture is
-**type-driven**: a field is captured automatically when its type is categorical
-(`Literal`/`Enum`/`bool`) or numeric (`int`/`float`), or a safe collection of
-those. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are not captured unless the
-field carries an explicit allowlist (`TelemetryField.categorical(...)`). Any field
-can opt out with `telemetry=False`.
+automatic for `bool`, `int`, finite `float`, `Literal`, `Enum`, supported unions,
+and homogeneous sequences. Unsafe scalar `str`, `Any`, and `object` branches
+require `TelemetryField.categorical(...)`; paths, mappings, callables, and
+unsupported structures always fail closed. Use `telemetry=False` to exclude a
+field.
 
 Captured values must be safe primitives. Raw strings are excluded unless the
-field is a `Literal[...]` or uses an explicit `allowlist` converter. Paths,
+field is a `Literal[...]`/`Enum` or matches explicit `allowed_values`. Paths,
 tokenizer locations, dicts, objects, callables, raw `Any` values, non-finite
 floats (`nan`/`inf`), and unsafe or heterogeneous sequences are excluded.
+Union branches are compiled and sanitized independently: explicit
+`allowed_values` opt in only otherwise unsafe scalar branches and do not filter
+safe numeric, boolean, `Literal`, or `Enum` branches in the same union.
 Captured sequences are capped at a fixed length and any clipping is reported in
 `llmApiConfigMetaJson`. Exclusion is fail-closed: the value is omitted instead
 of being serialized, and `llmApiConfigMetaJson` reports whether any resolved field
 was excluded as unsafe.
 
-The table below is a non-exhaustive set of examples for readers building
-dashboards. The exhaustive source of truth is
-`tensorrt_llm/usage/llm_args_golden_manifest.json` (regenerated from
-`build_capture_manifest`), after the safety sanitizer has excluded unsafe values.
-Use `llmApiConfigMetaJson` digests and field counts to track the exact capture
-manifest for a given release. The rendered documentation generates the
-exhaustive field table at docs build time under **Developer Guide > Telemetry**.
+The table below gives common dashboard examples. The committed manifest is the
+canonical list of `TorchLlmArgs` capturable paths, merged policies, and
+categorical domains. `llmApiConfigMetaJson` identifies that manifest by digest.
+The docs build renders the full table under **Developer Guide > Telemetry**.
 
 | Key | Description |
 |-----|-------------|
@@ -256,7 +256,7 @@ exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 | `moe_expert_parallel_size` | MoE expert parallelism degree (None/unset when runtime decides). |
 | `moe_tensor_parallel_size` | MoE tensor parallelism degree (None/unset when runtime decides). |
 | `moe_cluster_parallel_size` | MoE cluster parallelism degree (None/unset when runtime decides). |
-| `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args, and through an explicit allowlist (`pytorch`, `tensorrt`, `_autodeploy`) on the base/TRT args. |
+| `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args, and through explicit allowed values (`pytorch`, `tensorrt`, `_autodeploy`) on the base/TRT args. |
 | `dtype` | Model dtype, captured through an explicit allowlist. |
 | `load_format` | Weight load format, captured as a low-cardinality enum/string value. |
 | `quant_config.quant_algo` | Quantization algorithm, captured as a closed `QuantAlgo` enum value (TRT args only). Empty/absent when unquantized. |
@@ -321,9 +321,10 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    exclusion sentinel keeps a categorical/numeric field out of capture.
 4. **Do not capture unsafe data.** No model/tokenizer/file paths, prompts,
    outputs, secrets/tokens/URLs/hostnames, free-form user strings, raw
-   dict/object payloads, or callables. The sanitizer fails closed regardless:
-   bare `str`, `Any`, `object`, `Path`, `dict`, callables, permissive unions, and
-   non-finite floats are dropped unless an approved `allowlist` converter applies.
+   dict/object payloads, or callables. Paths, mappings, callables, arbitrary
+   non-scalars, heterogeneous sequences, and non-finite floats always fail
+   closed. A `str`/`Any`/`object` scalar branch is emitted only when it exactly
+   matches the field's finite `allowed_values`.
 5. **`tests/unittest/usage/test_llmapi_config_capture.py`** — Add behavior
    coverage: assert the value is captured, and for a categorical bare-string
    field assert that an out-of-allowlist value is redacted (dropped) while an
@@ -338,8 +339,9 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    important enough for dashboard users to know by name.
 
 Dashboard note: payloads carry `capture_version` and `field_policy_version` in
-`llmApiConfigMetaJson`. During release adoption, v1 (opt-in) and v2 (type-driven)
-payloads coexist in the same index — **bucket by these before aggregating**
+`llmApiConfigMetaJson`. During release adoption, v1 (opt-in), v2 (initial
+type-driven), and v3 (composed branch-policy) payloads coexist in the same index
+— **bucket by these before aggregating**
 `captured_field_count` or any `llmApiConfigJson.<field>`.
 
 ### Conventions

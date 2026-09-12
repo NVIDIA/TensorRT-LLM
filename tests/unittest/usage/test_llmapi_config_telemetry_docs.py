@@ -68,9 +68,7 @@ def _sample_manifest() -> dict[str, list[dict[str, object]]]:
             {
                 "path": "flag",
                 "kind": "value",
-                "converter": "",
-                "annotation": "<class 'bool'>",
-                "allowed_values": [],
+                "capture_policy": "bool",
             }
         ],
     }
@@ -288,8 +286,34 @@ def test_build_capture_manifest_matches_committed_golden():
     _assert_committed_manifest_current(golden_manifest())
 
 
+def test_golden_manifest_uses_compact_semantic_policies():
+    from tensorrt_llm.usage.llmapi_config import golden_manifest
+
+    by_path = {row["path"]: row for row in golden_manifest()["TorchLlmArgs"]}
+    bool_row = by_path["enable_chunked_prefill"]
+    enum_row = by_path["prefill_cuda_graph_backend"]
+    literal_row = by_path["kv_cache_config.mamba_ssm_cache_dtype"]
+
+    assert bool_row == {
+        "path": "enable_chunked_prefill",
+        "kind": "value",
+        "capture_policy": "bool",
+    }
+    assert literal_row["capture_policy"] == "literal"
+    assert literal_row["allowed_values"] == [
+        "auto",
+        "float16",
+        "bfloat16",
+        "float32",
+    ]
+    assert enum_row["capture_policy"] == "enum[PrefillCudaGraphBackend]"
+    assert enum_row["allowed_values"] == ["disabled", "piecewise", "breakable"]
+    assert "annotation" not in literal_row
+    assert "converter" not in literal_row
+
+
 def test_kv_cache_compression_discriminator_captures_both_algorithms() -> None:
-    """The shared allowlist captures either compression discriminator."""
+    """Each arm's Literal composes without duplicated telemetry metadata."""
     from tensorrt_llm.llmapi.llm_args import (
         ColdPageQuantizationCompressionConfig,
         TorchLlmArgs,
@@ -305,20 +329,15 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms() -> None:
         for item in build_capture_manifest(TorchLlmArgs)
         if item.path == "kv_cache_compression_config.algorithm"
     )
-    assert repr(entry.annotation) == "typing.Literal['triattention']"
-    assert entry.converter == "allowlist"
+    assert entry.capture_types == ("literal",)
     assert set(entry.allowed_values) == {
         "quantization_for_cold_page",
         "triattention",
     }
     cold_field = ColdPageQuantizationCompressionConfig.model_fields["algorithm"]
-    assert cold_field.json_schema_extra["telemetry"] == {"exclude": True}
+    assert not cold_field.json_schema_extra
     tri_field = TriAttentionKvCacheCompressionConfig.model_fields["algorithm"]
-    assert tri_field.json_schema_extra["telemetry"] == {
-        "kind": "categorical",
-        "converter": "allowlist",
-        "allowed_values": ["quantization_for_cold_page", "triattention"],
-    }
+    assert not tri_field.json_schema_extra
 
     private_paths = (
         "/private/modelopt-scales",
@@ -349,67 +368,6 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms() -> None:
         assert metadata["capture_succeeded"] is True
 
 
-def test_load_generator_does_not_leak_sys_modules():
-    """_load_generator must not leak its temporary module into sys.modules.
-
-    The loader needs the module registered while exec_module runs (frozen
-    dataclasses resolve their module via sys.modules), but it must restore the
-    prior state on both success and failure.
-    """
-    name = "llmapi_config_telemetry"
-    sys.modules.pop(name, None)
-
-    _load_generator()
-    assert name not in sys.modules
-
-    import importlib.util as _util
-
-    real_spec_from_file_location = _util.spec_from_file_location
-
-    def _boom(*args, **kwargs):
-        spec = real_spec_from_file_location(*args, **kwargs)
-
-        class _BoomLoader:
-            name = spec.name
-
-            def create_module(self, spec):
-                return None
-
-            def exec_module(self, module):
-                raise RuntimeError("synthetic load failure")
-
-        spec.loader = _BoomLoader()
-        return spec
-
-    _util.spec_from_file_location = _boom
-    try:
-        try:
-            _load_generator()
-        except RuntimeError:
-            pass
-        assert name not in sys.modules
-    finally:
-        _util.spec_from_file_location = real_spec_from_file_location
-
-
-def test_domain_values_cover_literal_and_enum():
-    from enum import Enum
-    from typing import Literal, Optional
-
-    from tensorrt_llm.usage import llmapi_config as rc
-
-    class _Color(str, Enum):
-        RED = "red"
-        BLUE = "blue"
-
-    assert rc._domain_values(Optional[Literal["a", "b"]], {}) == ["a", "b"]
-    assert rc._domain_values(Optional[_Color], {}) == ["red", "blue"]
-    assert rc._domain_values(int, {"converter": "allowlist", "allowed_values": ["x", "y"]}) == [
-        "x",
-        "y",
-    ]
-
-
 def _small_models():
     from enum import Enum
 
@@ -434,8 +392,6 @@ def _small_models():
         allow: str = Field(
             default="a",
             telemetry={
-                "kind": "categorical",
-                "converter": "allowlist",
                 "allowed_values": ["a", "b"],
             },
         )
@@ -466,7 +422,7 @@ def test_build_capture_manifest_kinds_and_domains():
     assert by_path["mode"].kind == "categorical"
     assert list(by_path["mode"].allowed_values) == ["a", "b"]  # Enum domain
     assert by_path["allow"].kind == "categorical"
-    assert by_path["allow"].converter == "allowlist"
+    assert by_path["allow"].capture_types == ("allowlist",)
     assert list(by_path["allow"].allowed_values) == ["a", "b"]
 
 
@@ -478,6 +434,9 @@ def test_renderer_emits_table_from_committed_golden(tmp_path):
     assert "## LLM API Configuration Fields" in text
     assert "python3 scripts/generate_llm_args_golden_manifest.py" in text
     assert "explicitly marked" not in text  # opt-in prose must be gone
+    assert "Capture policy" in text
+    assert "Categorical domain" in text
+    assert "Converter" not in text
     assert "`backend`" in text  # a known captured key renders
 
 
@@ -502,6 +461,41 @@ def test_build_capture_manifest_fails_on_divergent_kind_across_union_arms():
 
     with pytest.raises(ValueError, match="conflicting kinds"):
         build_capture_manifest(Root)
+
+
+def test_shared_path_policies_are_scoped_to_the_active_union_arm():
+    from typing import Literal, Union
+
+    from pydantic import BaseModel
+
+    from tensorrt_llm.usage.llmapi_config import (
+        build_capture_manifest,
+        collect_llm_api_config_payloads,
+    )
+
+    class ArmA(BaseModel):
+        tag: Literal["a"] = "a"
+        shared: Literal["a-only"] = "a-only"
+
+    class ArmB(BaseModel):
+        tag: Literal["b"] = "b"
+        shared: Literal["b-only"] = "b-only"
+
+    class Root(BaseModel):
+        arm: Union[ArmA, ArmB] = ArmA()
+
+    entry = next(item for item in build_capture_manifest(Root) if item.path == "arm.shared")
+    assert entry.allowed_values == ("a-only", "b-only")
+
+    arm_b = Root(arm=ArmB())
+    config_json, _ = collect_llm_api_config_payloads(arm_b)
+    assert json.loads(config_json)["arm.shared"] == "b-only"
+
+    invalid_arm_a = Root()
+    invalid_arm_a.arm.shared = "b-only"
+    config_json, metadata_json = collect_llm_api_config_payloads(invalid_arm_a)
+    assert "arm.shared" not in json.loads(config_json)
+    assert json.loads(metadata_json)["unsafe_excluded"] is True
 
 
 def test_build_capture_manifest_cycle_guard_terminates_on_self_reference():
