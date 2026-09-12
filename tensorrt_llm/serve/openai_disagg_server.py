@@ -19,6 +19,7 @@ import json
 import signal
 import socket
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
@@ -47,7 +48,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
+                                                resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
@@ -55,7 +57,7 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    UCompletionRequest, UCompletionResponse,
+    ConversationParams, UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
@@ -380,13 +382,27 @@ class OpenAIDisaggServer:
         return Response(content=body, status_code=status, headers=headers)
 
     @staticmethod
-    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_params.conversation_id from supported headers.
-
-        Body ``conversation_params.conversation_id`` is canonical. Headers are
-        used only when the body does not provide an id.
-        """
+    def _extract_conversation_id(
+            req: UCompletionRequest,
+            raw_req: Request,
+            subagent_affinity_header: Optional[str] = None) -> None:
+        """Resolve conversation identity and the optional parent routing key."""
         resolve_request_conversation_id(req, raw_req.headers)
+
+        # The configured header is the source of parent affinity.
+        if req.conversation_params is not None:
+            req.conversation_params.subagent_affinity_id = None
+
+        parent = extract_subagent_parent_id(raw_req.headers,
+                                            subagent_affinity_header)
+        if not subagent_affinity_header or parent is None:
+            return
+
+        # Give parent-only requests an independent conversation identity.
+        if req.conversation_params is None:
+            req.conversation_params = ConversationParams(
+                conversation_id=f"subagent:{uuid.uuid4()}")
+        req.conversation_params.subagent_affinity_id = parent
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
@@ -406,7 +422,9 @@ class OpenAIDisaggServer:
                         req, self._allow_request_chat_template)
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
-                self._extract_conversation_id(req, raw_req)
+                self._extract_conversation_id(
+                    req, raw_req,
+                    self._config.conversation_affinity_header_for_subagents)
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)

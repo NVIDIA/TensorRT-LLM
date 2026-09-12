@@ -66,6 +66,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._strip_gen_message_history = config.gen_strip_message_history
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
         self._tokids_ctxbytes = config.gen_tokids_ctxbytes
+        self._subagent_affinity_scope = config.subagent_affinity_scope
 
         self._ctx_client = None
         self._gen_client = None
@@ -196,6 +197,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             # benchmark-only path above is the only trusted source here.
             if not benchmark_gen_only:
                 gen_req = request.model_copy(update={"disaggregated_params": None})
+        self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
@@ -226,19 +228,28 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
-        ctx_request = request.model_copy(
-            update={
-                "disaggregated_params": DisaggregatedParams(
-                    request_type="context_only",
-                    disagg_request_id=disagg_request_id,
-                    schedule_style=self._schedule_style,
-                    return_prompt_token_ids_b64=self._tokids_ctxbytes,
-                ),
-                "stream": False,
-                "stream_options": None,
-            }
-        )
+        update = {
+            "disaggregated_params": DisaggregatedParams(
+                request_type="context_only",
+                disagg_request_id=disagg_request_id,
+                schedule_style=self._schedule_style,
+                return_prompt_token_ids_b64=self._tokids_ctxbytes,
+            ),
+            "stream": False,
+            "stream_options": None,
+        }
+        # Isolate context affinity from the generation request's shallow copy.
+        if request.conversation_params is not None:
+            update["conversation_params"] = request.conversation_params.model_copy()
+        ctx_request = request.model_copy(update=update)
         return ctx_request
+
+    def _strip_gen_subagent_affinity(self, gen_req: UCompletionRequest) -> None:
+        """Keep generation parent affinity only for the "both" scope."""
+        if self._subagent_affinity_scope == "both":
+            return
+        if gen_req.conversation_params is not None:
+            gen_req.conversation_params.subagent_affinity_id = None
 
     def _get_gen_request(
         self,
@@ -426,6 +437,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             disagg_request_id=disagg_request_id,
             ctx_server_info=ctx_server_info,
         )
+        self._strip_gen_subagent_affinity(gen_req)
 
         if request.stream and need_ctx:
             # For streaming gen_first requests, the gen client returns a lazy

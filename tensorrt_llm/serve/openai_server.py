@@ -82,7 +82,8 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (
+    extract_subagent_affinity_id_from_headers, resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
@@ -2298,7 +2299,9 @@ class OpenAIServer(_VideoRoutesMixin):
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
             scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy)
+                agent_hierarchy=request.agent_hierarchy,
+                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
+                    None if raw_request is None else raw_request.headers))
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -3102,7 +3105,9 @@ class OpenAIServer(_VideoRoutesMixin):
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
             scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy)
+                agent_hierarchy=request.agent_hierarchy,
+                subagent_affinity_id=extract_subagent_affinity_id_from_headers(
+                    None if raw_request is None else raw_request.headers))
 
             # Generate
             promise = self.generator.generate_async(

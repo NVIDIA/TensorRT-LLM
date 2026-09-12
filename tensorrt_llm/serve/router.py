@@ -25,7 +25,7 @@ from blake3 import blake3
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.conversation_id import get_request_conversation_id
+from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 # Shared tokenization / block-hashing utilities (single source of truth).
@@ -1478,7 +1478,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     # ── routing helpers ──
 
     def _get_conversation_id(self, request: OpenAIRequest) -> Optional[str]:
-        return get_request_conversation_id(request)
+        return get_request_routing_id(request)
 
     def _generate_implicit_id(self) -> str:
         self._implicit_id_counter += 1
