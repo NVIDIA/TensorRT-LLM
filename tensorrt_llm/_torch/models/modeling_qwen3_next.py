@@ -1111,17 +1111,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Bound live recurrent-state memory and keep snapshot reuse opt-in."""
-        # The generic batch size of 2048 needs about 50 GiB of live recurrent
-        # states even for Qwen3.5-4B, before allocating any attention pages.
-        # Apply this before executor sizing so cache, scheduler, and CUDA
-        # graphs agree. Explicit user batch sizes still take precedence.
-        return {
-            "max_batch_size": 128,
-            "kv_cache_config": {
-                "enable_block_reuse": False
-            },
-        }
+        """Disable block reuse until a snapshot policy is configured."""
+        return {"kv_cache_config": {"enable_block_reuse": False}}
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,
