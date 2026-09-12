@@ -21,7 +21,6 @@
 
 #include <gtest/gtest.h>
 
-#include "kvCacheManagerV2PoisonCheck.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>

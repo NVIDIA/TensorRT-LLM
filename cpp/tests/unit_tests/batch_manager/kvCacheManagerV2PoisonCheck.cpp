@@ -15,23 +15,25 @@
  * limitations under the License.
  */
 
-#pragma once
-
-#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.h"
-
-#include <gtest/gtest.h>
-
-namespace tensorrt_llm::batch_manager::kv_cache_manager_v2::test
-{
-
-// Fails any test that leaves the KVCM2 poison latch set.
+// Fails any KVCM2 test that leaves the poison latch set.
 //
 // A broken invariant is recorded rather than aborting, so nothing else in a gtest binary would
 // notice one: the detecting code is usually a destructor, which is attached to no assertion. This
 // listener is what makes such a failure visible, and it clears the latch afterwards so a single
 // bad test does not condemn every test that follows it.
 //
-// Including this header registers the listener; there is nothing to call.
+// Linked into each KVCM2 test target by CMakeLists.txt rather than included, so registration
+// cannot be lost to an unused-include cleanup and does not depend on inline-variable semantics.
+
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.h"
+
+#include <gtest/gtest.h>
+
+namespace
+{
+
+namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
+
 class PoisonCheckListener : public ::testing::EmptyTestEventListener
 {
 public:
@@ -39,7 +41,7 @@ public:
     {
         // Only reachable if the previous test could not clear the latch, which means a manager
         // outlived it. Say so here rather than blaming this test for the earlier one's damage.
-        if (auto const reason = Poison::reason())
+        if (auto const reason = kv::Poison::reason())
         {
             ADD_FAILURE() << "KVCM2 was already poisoned before this test started, by an earlier "
                              "test whose manager is still alive: "
@@ -49,14 +51,14 @@ public:
 
     void OnTestEnd(::testing::TestInfo const& /*testInfo*/) override
     {
-        auto const reason = takePoison();
+        auto const reason = kv::takePoison();
         if (!reason)
         {
             return;
         }
         // Still set means takePoison() refused to clear, which it only does while a manager is
         // alive -- so every test after this one will trip the OnTestStart check too.
-        bool const stillPoisoned = Poison::reason().has_value();
+        bool const stillPoisoned = kv::Poison::reason().has_value();
         ADD_FAILURE() << "KVCM2 was poisoned during this test: " << *reason
                       << (stillPoisoned ? " A manager is still alive, so the latch could not be"
                                           " cleared and the tests after this one will also fail."
@@ -64,12 +66,16 @@ public:
     }
 };
 
-// Registered at static initialization, before gtest_main runs the suite. `inline` so a binary
-// built from several translation units still appends exactly one listener.
-inline bool const kPoisonCheckRegistered = []
+// Runs before gtest_main enters the suite. This translation unit is linked straight into the test
+// executable, so its initializer always runs.
+struct PoisonCheckRegistrar
 {
-    ::testing::UnitTest::GetInstance()->listeners().Append(new PoisonCheckListener());
-    return true;
-}();
+    PoisonCheckRegistrar()
+    {
+        ::testing::UnitTest::GetInstance()->listeners().Append(new PoisonCheckListener());
+    }
+};
 
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2::test
+PoisonCheckRegistrar const kPoisonCheckRegistrar;
+
+} // namespace
