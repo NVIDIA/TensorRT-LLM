@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from typing import Callable, List, Optional, Sequence, Union
 from unittest.mock import patch
@@ -11,6 +14,7 @@ from torch.fx.passes.split_module import split_module
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
+from ..nccl_window_graph import nccl_window_graph_capture
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
@@ -239,7 +243,7 @@ class PiecewiseRunner(object):
                 # it's ready rather than capture it ourselves
                 # Graph Capture would override the stream. We need to setup the stream correctly.
                 extra_attrs = get_model_extra_attrs()
-                with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                with nccl_window_graph_capture(graph, self.graph_pool_handle):
                     extra_attrs["global_stream"] = torch.cuda.current_stream()
                     output = entry.callable(*args)
                 extra_attrs["global_stream"] = torch.cuda.current_stream()

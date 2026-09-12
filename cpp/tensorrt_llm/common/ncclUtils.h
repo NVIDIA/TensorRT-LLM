@@ -30,19 +30,28 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE
+
+#ifndef TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT
+#define TLLM_NCCL_WINDOW_LIFECYCLE_ASSERT 1
+#endif
 
 // TLLM_NCCL_CHECK (throw on failure) is provided by multiDeviceUtils.h.
 
@@ -186,12 +195,14 @@ struct NCCLWindowBuffer
     int handle;          // Buffer handle/index (for compatibility with UB interface)
     size_t size;         // Size in bytes
     ncclWindow_t window; // NCCL window handle
+    uint64_t leaseId;    // Changes every time this allocation is checked out
 
-    NCCLWindowBuffer(void* p = nullptr, int h = -1, size_t s = 0, ncclWindow_t w = nullptr)
+    NCCLWindowBuffer(void* p = nullptr, int h = -1, size_t s = 0, ncclWindow_t w = nullptr, uint64_t l = 0)
         : ptr(p)
         , handle(h)
         , size(s)
         , window(w)
+        , leaseId(l)
     {
     }
 
@@ -220,17 +231,61 @@ public:
     static NCCLWindowAllocator& getInstance();
 
     // Request a buffer for the given communicator and size.
-    // If an unused buffer of at least the requested size exists for this communicator, it will be reused.
-    // Uses best-fit strategy: selects the smallest available buffer that meets the size requirement.
-    // Otherwise, a new buffer is allocated and registered.
+    // Eager requests only reuse unowned buffers. A request made during CUDA graph capture first
+    // reuses buffers owned by that PyTorch graph memory pool, then may claim an unowned buffer for it.
+    // Uses best-fit strategy: selects the smallest eligible buffer that meets the size requirement.
+    // New allocation/registration is prohibited during capture.
     NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size);
+
+    // Select the allocation domain on this host thread. owner == -1 explicitly selects eager;
+    // owner >= 0 selects a stable PyTorch graph-memory-pool owner. Other values are invalid.
+    void setGraphPoolOwner(int64_t owner);
+    // Return this owner's idle buffers to eager use. This changes best-fit eligibility and
+    // therefore must be called at the same explicit lifecycle boundary on every rank. Buffers
+    // still in use are returned when their deterministic tensor scope ends.
+    void releaseGraphPoolOwner(int64_t owner);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
     NCCLWindowBuffer searchBuffer(ncclComm_t comm, void* ptr) const;
 
-    // Release a buffer back to the pool for potential reuse
+    // Release a buffer that has not been submitted to a CUDA stream, making it reusable on any stream.
+    // This overload is intended for preallocation and focused allocator tests.
     void releaseBuffer(ncclComm_t comm, void* ptr);
+
+    // Release a buffer after its final use has been enqueued on stream. The buffer may be reused on
+    // that stream; requests on other streams leave it untouched.
+    // Returns false when ptr is not a currently active registered buffer.
+    bool releaseBuffer(ncclComm_t comm, void* ptr, cudaStream_t stream);
+
+    // Snapshot explicitly released buffers before the caller synchronizes the device, then mark
+    // only those releases reusable on any stream. PyTorch CUDA-graph setup uses its existing
+    // capture-begin synchronization between these calls. Destructor-released/quarantined buffers
+    // remain ineligible.
+    uint64_t getBufferReleaseEpoch();
+    void promoteBufferReleases(int device, uint64_t releaseEpoch);
+
+    // Bind a PyTorch storage to the exact checkout that backs it. Views share StorageImpl, so
+    // explicit release through any view still resolves the original lease generation.
+    void registerTensorLease(ncclComm_t comm, c10::StorageImpl const* storage, void* ptr, uint64_t leaseId, int device);
+    bool releaseTensorBuffer(c10::StorageImpl const* storage, cudaStream_t stream);
+    bool releaseTensorBuffer(ncclComm_t comm, c10::StorageImpl const* storage, cudaStream_t stream);
+
+    // A scope adopts window-backed input storages and all window tensors created while it is
+    // active. On successful exit, returned storages escape to the parent scope and every other
+    // lease is released on stream. Failed scopes preserve escaped inputs but quarantine every other
+    // lease instead of making partially submitted work reusable. Scopes are keyed by CUDA device and
+    // host execution thread, so allocations made while the caller temporarily selects an auxiliary
+    // stream still join the active compiled scope. Before ending a scope, callers must order
+    // auxiliary-stream consumers before the supplied completion stream.
+    void beginTensorLeaseScope(std::vector<c10::StorageImpl const*> const& inputStorages, int device);
+    void endTensorLeaseScope(
+        std::vector<c10::StorageImpl const*> const& outputStorages, int device, cudaStream_t stream, bool failed);
+
+    // Destructor fallback. The lease ID prevents a late tensor destructor from releasing a newer
+    // checkout of the same allocation. Fallback-released buffers are quarantined until communicator
+    // teardown because destructor timing and stream identity are not rank-deterministic.
+    void releaseBufferFromDestructor(ncclComm_t comm, void* ptr, uint64_t leaseId);
 
     // Get the window handle for a specific buffer pointer
     ncclWindow_t getWindow(ncclComm_t comm, void* ptr) const;
@@ -269,7 +324,24 @@ private:
     // Record a failed new symmetric allocation (assumes mMutex is already locked).
     void recordSymmetricFailureLocked(ncclComm_t comm, size_t size);
 
+    enum class FallbackWarning : uint8_t
+    {
+        kCaptureStateUnknown = 1U << 0U,
+        kCaptureWithoutOwner = 1U << 1U,
+        kNoEligibleCaptureBuffer = 1U << 2U,
+        kDestructorFallback = 1U << 3U,
+    };
+
+    // Record a fallback warning for this communicator and return true only for its first occurrence.
+    bool markFallbackWarningLogged(ncclComm_t comm, FallbackWarning warning);
+    bool markFallbackWarningLoggedLocked(ncclComm_t comm, FallbackWarning warning);
+
     using CudaGetLastErrorFunc = cudaError_t (*)();
+
+    // Drain a sticky CUDA error when capture state cannot be queried. Registration is unsafe when
+    // the capture state is unknown, so the caller must use an unregistered buffer.
+    static bool clearCudaErrorIfCaptureQueryFailed(
+        cudaError_t captureError, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
 
     // Drain the sticky CUDA error left by a failed symmetric allocation.
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
@@ -288,15 +360,59 @@ private:
     {
         NCCLWindowBuffer buffer;
         bool inUse;
+        int device;
+        // Empty for eager/ungraphed buffers. A value reserves the buffer for captures sharing
+        // that exact PyTorch graph memory pool.
+        std::optional<uint64_t> graphPoolOwner;
+        bool releaseOwnerWhenUnused{false};
+        // An explicitly released buffer is reusable everywhere after a synchronization boundary,
+        // or only on the stream containing its final consumer. Neither value means it was released
+        // by its destructor fallback and is quarantined.
+        bool reusableOnAnyStream{false};
+        std::optional<cudaStream_t> reusableStream;
+        uint64_t releaseEpoch{0};
     };
 
+    struct TensorLeaseScope;
+
+    struct TensorLease
+    {
+        ncclComm_t comm;
+        void* ptr;
+        uint64_t leaseId;
+        TensorLeaseScope* scope{nullptr};
+    };
+
+    struct TensorLeaseScope
+    {
+        std::unordered_set<c10::StorageImpl const*> storages;
+        // Leases whose PyTorch storage died before the deterministic scope boundary.
+        std::vector<TensorLease> detachedLeases;
+    };
+
+    using TensorLeaseScopeKey = std::pair<int, std::thread::id>;
+    static TensorLeaseScopeKey getTensorLeaseScopeKey(int device);
+
+    bool releaseTensorLeaseLocked(TensorLease const& tensorLease, cudaStream_t stream);
+    bool releaseTensorBufferLocked(c10::StorageImpl const* storage, cudaStream_t stream, ncclComm_t expectedComm);
+    void quarantineTensorLeaseLocked(TensorLease const& tensorLease);
+    void assertLifecycleWarning() const noexcept;
+
     mutable std::mutex mMutex;
+    std::atomic_bool mSuppressLifecycleWarningAssertionsForTest{false};
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
     // Smallest request size that is known to fail collectively for each communicator.
     // Requests below the recorded size may still succeed and already-pooled buffers are always
     // reused before consulting this cache.
     std::unordered_map<ncclComm_t, size_t> mMinSymmetricFailureSize;
+    // Bitset of fallback warnings already emitted for each live communicator.
+    std::unordered_map<ncclComm_t, uint8_t> mLoggedFallbackWarnings;
+    std::unordered_map<c10::StorageImpl const*, TensorLease> mTensorLeases;
+    uint64_t mNextLeaseId{1};
+    uint64_t mNextReleaseEpoch{1};
+    // Deque keeps scope addresses stable while scopes are pushed onto the per-thread stack.
+    std::map<TensorLeaseScopeKey, std::deque<TensorLeaseScope>> mTensorLeaseScopeStacks;
 };
 
 // RAII wrapper for NCCL window buffers
@@ -382,15 +498,10 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
-    try
-    {
-        buffer = allocator.requestBuffer(*comm, buffer_size);
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_DEBUG("[createNCCLWindowTensor] requestBuffer failed; returning invalid buffer: %s", e.what());
-        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
-    }
+    // Expected resource failures, unknown capture state, and captures without a graph-pool owner
+    // return an invalid buffer so callers can use their existing unregistered fallback. Other
+    // programming errors must propagate instead of silently changing the collective implementation.
+    buffer = allocator.requestBuffer(*comm, buffer_size);
 
     // Defensive validation: ensure buffer is valid before proceeding
     if (!buffer.isValid())
@@ -400,10 +511,13 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     }
 
     // Create custom deleter that releases the buffer
-    auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(*comm, ptr); };
+    auto deleter = [comm, ptr = buffer.ptr, leaseId = buffer.leaseId](void*)
+    { NCCLWindowAllocator::getInstance().releaseBufferFromDestructor(*comm, ptr, leaseId); };
 
     // Create tensor from the buffer
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
+    auto const device = tensor.get_device();
+    allocator.registerTensorLease(*comm, tensor.storage().unsafeGetStorageImpl(), buffer.ptr, buffer.leaseId, device);
 
     return std::make_pair(tensor, buffer);
 }
