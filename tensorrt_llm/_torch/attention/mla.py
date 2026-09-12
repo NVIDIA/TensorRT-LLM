@@ -669,6 +669,20 @@ class MLA(nn.Module):
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
         )
         mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
+        if isinstance(self.mqa, TrtllmAttention) and self.mqa.has_fp4_kv_cache:
+            if (
+                mla_weight_dtype != torch.bfloat16
+                or self.mapping.cp_size != 1
+                or self.apply_rotary_emb
+                or self.kv_cache_dtype == "fp8_ds_mla"
+            ):
+                raise ValueError(
+                    "FP4 MLA requires BF16 absorption weights and fused RoPE "
+                    "on the TRTLLM backend without context parallelism or "
+                    "fp8_ds_mla cache packing."
+                )
+            if not self.mqa.rope_params.duplicate_data:
+                raise ValueError("FP4 MLA requires RopeParams.duplicate_data=True.")
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
                 (self.num_heads_tp, self.kv_lora_rank, self.qk_nope_head_dim),
@@ -1465,6 +1479,15 @@ class MLA(nn.Module):
                 device=q.device,
             )
 
+            fp4_mla = isinstance(self.mqa, TrtllmAttention) and self.mqa.has_fp4_kv_cache
+            if fp4_mla and latent_cache is None:
+                raise RuntimeError(
+                    "FP4 MLA generation requires a latent cache for fused "
+                    "Q quantization, RoPE, and cache update."
+                )
+            fuse_fp4_q_quant = fp4_mla
+            fp4_rope_kwargs = {"fuse_fp4_q_quant": True} if fuse_fp4_q_quant else {}
+
             def _mla_gen_rope():
                 if self.apply_rotary_emb:
                     # Non-fused backends (Vanilla / FlashInfer) do not fuse RoPE
@@ -1494,9 +1517,13 @@ class MLA(nn.Module):
                             mla_bmm1_scale,
                             mla_bmm2_scale,
                             quant_q_buffer,
+                            **fp4_rope_kwargs,
                         )
 
-            rope_stream = self.aux_stream if not use_fp8_mla else None
+            if fuse_fp4_q_quant or use_fp8_mla:
+                rope_stream = None
+            else:
+                rope_stream = self.aux_stream
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
