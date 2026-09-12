@@ -133,6 +133,7 @@ add_library(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   specDecOp.cpp
+  fusedSamplingOp.cpp
   dynamicTreeOp.cpp
   loraOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp

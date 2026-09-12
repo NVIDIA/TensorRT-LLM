@@ -345,6 +345,14 @@ def get_spec_metadata(spec_config,
     # the per-mode constructors are easy to miss one of.
     if metadata is not None:
         metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
+        # advanced_sampling_mode has exactly that property, and getting it wrong fails
+        # silently rather than loudly: SpecSampler.validate_request reads the mode off the
+        # *config* to decide whether a min_p request is admitted, while the buffer fill
+        # (fill_min_p) and the sampling dispatcher read it off the *metadata*. If the two
+        # disagree the request is accepted, its buffers are never filled, and the
+        # dispatcher routes to a backend that takes no min_p argument -- so the filter is
+        # dropped with nothing raised. One assignment here keeps them in step.
+        metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
     return metadata
 
 
@@ -383,7 +391,6 @@ def _build_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
-            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
             num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
@@ -483,7 +490,6 @@ def _build_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
             use_rejection_sampling=use_rejection_sampling,
-            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
@@ -700,10 +706,12 @@ def get_spec_decoder(
         # supported yet and are rejected at admission rather than mispenalized.
         penalty_supported = not (getattr(spec_config, "eagle_choices", None)
                                  or _is_effective_dynamic_tree(spec_config))
+        fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
         return SpecSampler(sampler_args,
                            accepted_path_len=accepted_path_len,
                            enable_penalty=spec_config.enable_penalty,
-                           penalty_supported=penalty_supported)
+                           penalty_supported=penalty_supported,
+                           fused_sampling=fused_sampling)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
