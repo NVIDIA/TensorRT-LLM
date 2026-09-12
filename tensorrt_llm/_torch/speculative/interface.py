@@ -799,7 +799,7 @@ class SpecMetadata:
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
-        # clamped to the executor's batch size (_filter_cuda_graph_batch_sizes),
+        # clamped to the executor's batch size (filter_cuda_graph_batch_sizes),
         # and graph padding refuses to cross it, so exceeding it here means the
         # invariant broke upstream and should surface.
         assert len(requests) <= self.max_num_requests, (

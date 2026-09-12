@@ -14,10 +14,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer,
-    MoeLoadBalancerIterContext,
-)
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -136,10 +133,18 @@ class NoKVCacheRunner(ABC):
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager,
+        resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
+        **model_inputs: Any,
     ) -> PreparedInputs:
+        if model_inputs:
+            raise NotImplementedError(
+                "NoKVCacheRunner does not support additional model inputs. "
+                f"Unsupported keys: {sorted(model_inputs)}"
+            )
+        if resource_manager is None:
+            raise ValueError("NoKVCacheRunner requires a resource manager.")
         runner_config = self._config
         attn_metadata = self.setup_attn_metadata()
         spec_metadata = self.setup_spec_metadata(
@@ -368,29 +373,33 @@ class NoKVCacheRunner(ABC):
 
         return PreparedInputs(inputs)
 
-    def warmup(self, resource_manager: ResourceManager) -> None:
+    def warmup(self, resource_manager: ResourceManager | None) -> None:
         return
 
-    def capture_graphs(self, resource_manager: ResourceManager) -> None:
+    def capture_graphs(self, resource_manager: ResourceManager | None) -> None:
+        return
+
+    def release_graph(self) -> None:
         return
 
     def forward(
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager,
+        resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-        moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
+        **model_inputs: Any,
     ) -> dict[str, Any]:
         prepared = self.prepare_inputs(
             scheduled_requests,
             resource_manager=resource_manager,
             cuda_graph_lora_manager=cuda_graph_lora_manager,
             runtime_draft_len=runtime_draft_len,
+            **model_inputs,
         )
-        with MoeLoadBalancerIterContext(moe_load_balancer):
+        with MoeLoadBalancerIterContext(self._deps.moe_load_balancer):
             return self._forward_step(
                 prepared.kwargs,
                 scheduled_requests,

@@ -1261,8 +1261,8 @@ class BaseLLM:
         flat_token_ids = [tid for tids in token_ids_list for tid in tids]
 
         # Build inputs dict — common + model-specific kwargs.
-        # Filter keys that are set internally by _prepare_encoder_inputs or
-        # _forward_step to avoid "multiple values for keyword argument" errors.
+        # Filter keys that are supplied by EncoderRunner itself to avoid
+        # "multiple values for keyword argument" errors.
         _RESERVED_KEYS = {
             'input_ids',
             'seq_lens',
@@ -1273,12 +1273,6 @@ class BaseLLM:
             k: v
             for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
         }
-
-        if filtered_kwargs and engine.encoder_cuda_graph_runner.enabled:
-            raise NotImplementedError(
-                "LLM.encode(..., **model_kwargs) is not supported when encoder CUDA "
-                "graphs are enabled. Disable encoder CUDA graphs or omit model_kwargs. "
-                f"Unsupported keys: {sorted(filtered_kwargs)}")
 
         forward_inputs = {
             'input_ids': flat_token_ids,

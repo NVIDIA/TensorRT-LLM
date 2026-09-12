@@ -427,35 +427,3 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
     # The remaining shape is never attempted: recovering locally would leave
     # peers waiting in a forward this rank has abandoned.
     engine._create_warmup_request.assert_called_once()
-
-
-def _encoder_engine(*, world_size: int) -> PyTorchModelEngine:
-    engine = _engine(world_size=world_size)
-    engine.no_encoder_cuda_graph = contextlib.nullcontext
-    engine._create_encoder_warmup_inputs = mock.Mock(return_value={"input_ids": [0]})
-    return engine
-
-
-def test_encoder_oom_recovers_when_alone() -> None:
-    engine = _encoder_engine(world_size=1)
-    engine.encoder_forward = mock.Mock(side_effect=[torch.OutOfMemoryError("OOM"), None])
-
-    with _no_cuda_side_effects() as (empty_cache, _synchronize):
-        engine._general_warmup_encoder([(2, 16, 8), (1, 8, 8)])
-
-    assert engine.encoder_forward.call_count == 2
-    empty_cache.assert_called_once_with()
-
-
-def test_encoder_oom_is_fatal_when_distributed() -> None:
-    engine = _encoder_engine(world_size=2)
-    error = torch.OutOfMemoryError("OOM")
-    engine.encoder_forward = mock.Mock(side_effect=error)
-
-    with _no_cuda_side_effects():
-        with pytest.raises(torch.OutOfMemoryError) as excinfo:
-            engine._general_warmup_encoder([(2, 16, 8), (1, 8, 8)])
-
-    assert excinfo.value is error
-    # The second shape is never attempted; peers are stuck in the first.
-    engine.encoder_forward.assert_called_once()

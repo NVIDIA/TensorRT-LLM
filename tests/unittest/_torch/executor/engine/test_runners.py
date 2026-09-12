@@ -4,7 +4,7 @@
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -12,6 +12,8 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
     PreparedInputs,
     RunnerConfig,
@@ -26,7 +28,11 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    EncodeCudaGraphConfig,
+    PrefillCudaGraphBackend,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -64,6 +70,7 @@ def _deps(*, model_forward: Mock | None = None) -> RunnerDeps:
         draft_tokens_cuda=None,
         cache_indirection=None,
         lora=SimpleNamespace(build=Mock(return_value=None)),
+        moe_load_balancer=None,
         model_forward=model_forward,
     )
 
@@ -112,8 +119,8 @@ def _model(*, is_generation: bool, is_encoder_decoder: bool = False) -> SimpleNa
     [
         (False, True, False, False, MultimodalEncoderRunner),
         (False, False, False, False, PoolingRunner),
-        (True, False, False, False, None),
-        (False, False, True, True, None),
+        (True, False, False, False, EncoderRunner),
+        (False, False, True, True, EncoderDecoderRunner),
         (False, False, True, False, None),
     ],
 )
@@ -143,7 +150,7 @@ def test_resolve_runner_type_does_not_require_runtime_dependencies() -> None:
 def test_resolve_runner_checks_encode_only_before_pooling() -> None:
     args = SimpleNamespace(encode_only=True, mm_encoder_only=False)
 
-    assert resolve_runner_type(_model(is_generation=False), args) is None
+    assert resolve_runner_type(_model(is_generation=False), args) is EncoderRunner
 
 
 def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
@@ -152,13 +159,75 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
     assert resolve_runner_type(_model(is_generation=False), args) is MultimodalEncoderRunner
 
 
-def test_model_engine_initializes_no_kv_cache_runner_by_family() -> None:
+@pytest.mark.parametrize(
+    ("runner_type", "initializer_name"),
+    [
+        (EncoderRunner, "_initialize_encoder_runner"),
+        (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
+        (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
+    ],
+)
+def test_model_engine_initializes_runner_by_family(
+    runner_type: type[Any], initializer_name: str
+) -> None:
     engine = object.__new__(PyTorchModelEngine)
-    expected = Mock(spec=NoKVCacheRunner)
-    engine._initialize_no_kv_cache_runner = Mock(return_value=expected)
+    expected = Mock(spec=runner_type)
+    initializer = Mock(return_value=expected)
+    setattr(engine, initializer_name, initializer)
 
-    assert engine._initialize_runner(NoKVCacheRunner) is expected
-    engine._initialize_no_kv_cache_runner.assert_called_once_with(NoKVCacheRunner)
+    assert engine._initialize_runner(runner_type) is expected
+    initializer.assert_called_once_with(runner_type)
+
+
+@pytest.mark.parametrize(
+    ("cuda_graph_config", "expected_encode_config"),
+    [
+        (None, False),
+        (CudaGraphConfig(), False),
+        (EncodeCudaGraphConfig(batch_sizes=[1], num_tokens=[16], seq_lens=[16]), True),
+    ],
+)
+def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
+    cuda_graph_config: CudaGraphConfig | None,
+    expected_encode_config: bool,
+) -> None:
+    """Encode-only takes its buckets from `cuda_graph_config`, never from llm_args."""
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = object()
+    engine.mapping = object()
+    engine.cuda_graph_config = cuda_graph_config
+    engine.llm_args = SimpleNamespace(
+        encoder_cuda_graph_config=EncodeCudaGraphConfig(
+            batch_sizes=[8],
+            num_tokens=[64],
+            seq_lens=[64],
+        ),
+        enable_autotuner=False,
+    )
+    engine.batch_size = 4
+    engine.max_num_tokens = 16
+    engine.max_seq_len = 16
+    engine.max_beam_width = 1
+    engine.without_logits = False
+    engine.attn_backend = _AttentionBackend
+    engine.attn_runtime_features = AttentionRuntimeFeatures()
+    engine.is_draft_model = False
+    deps = object()
+    engine._create_runner_deps = Mock(return_value=deps)
+    runner_config = object()
+    expected_runner = object()
+    runner_type = Mock(return_value=expected_runner)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.model_engine.EncoderRunnerConfig.create",
+        return_value=runner_config,
+    ) as create_config:
+        actual = engine._initialize_encoder_runner(runner_type)
+
+    assert actual is expected_runner
+    resolved = create_config.call_args.kwargs["graph_config"]
+    assert resolved is (cuda_graph_config if expected_encode_config else None)
+    runner_type.assert_called_once_with(engine.model, deps, runner_config)
 
 
 def test_model_engine_rejects_unregistered_runner_family() -> None:
@@ -172,7 +241,7 @@ def test_model_engine_rejects_unregistered_runner_family() -> None:
 
 
 def _model_engine_with_runner(
-    runner: Mock,
+    runner: Mock | None,
     *,
     kv_cache_manager: object | None,
 ) -> tuple[PyTorchModelEngine, Mock]:
@@ -197,8 +266,13 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         kv_cache_manager=None,
     )
     batch = ScheduledRequests()
+    model_input = object()
 
-    actual_outputs = engine.forward(batch, resource_manager)
+    actual_outputs = engine.forward(
+        batch,
+        resource_manager,
+        token_type_ids=model_input,
+    )
 
     assert actual_outputs is expected_outputs
     runner.forward.assert_called_once_with(
@@ -206,8 +280,8 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         resource_manager=resource_manager,
         cuda_graph_lora_manager=None,
         runtime_draft_len=0,
-        moe_load_balancer=None,
         gather_context_logits=False,
+        token_type_ids=model_input,
     )
 
 
@@ -225,6 +299,61 @@ def test_model_engine_rejects_kv_manager_with_no_kv_cache_runner() -> None:
         engine.forward(ScheduledRequests(), resource_manager)
 
     runner.forward.assert_not_called()
+
+
+def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:
+    runner = Mock(spec=EncoderDecoderRunner)
+    hidden_states = object()
+    runner.forward.return_value = {
+        "encoder_hidden_states": hidden_states,
+        "encoder_seq_lens": [2, 3],
+    }
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = SimpleNamespace(
+        model_config=SimpleNamespace(is_encoder_decoder=True),
+    )
+    engine._runner = runner
+    requests = [object(), object()]
+    resource_manager = object()
+
+    outputs = engine.forward_encoder(requests, resource_manager)
+
+    assert outputs == (hidden_states, [2, 3])
+    scheduled_requests = runner.forward.call_args.args[0]
+    assert scheduled_requests.encoder_requests == requests
+    runner.forward.assert_called_once_with(
+        scheduled_requests,
+        resource_manager=resource_manager,
+        cuda_graph_lora_manager=None,
+        runtime_draft_len=0,
+        gather_context_logits=False,
+    )
+
+
+def test_model_engine_legacy_decoder_rejects_runner_model_inputs() -> None:
+    engine, resource_manager = _model_engine_with_runner(
+        None,
+        kv_cache_manager=object(),
+    )
+
+    with pytest.raises(NotImplementedError, match="token_type_ids"):
+        engine.forward(
+            ScheduledRequests(),
+            resource_manager,
+            token_type_ids=object(),
+        )
+
+
+def test_model_engine_releases_runner_owned_graphs() -> None:
+    engine = object.__new__(PyTorchModelEngine)
+    engine._runner = Mock(spec=EncoderRunner)
+    engine._torch_compile_backend = None
+    engine.cuda_graph_runner = None
+    engine.breakable_cuda_graph_runner = None
+
+    engine._release_cuda_graphs()
+
+    engine._runner.release_graph.assert_called_once_with()
 
 
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:
@@ -289,7 +418,7 @@ def test_no_kv_cache_runner_owns_spec_metadata_setup(
         replace(
             _config(),
             spec_config=SimpleNamespace(
-                get_runtime_tokens_per_gen_step=lambda runtime_draft_len: (runtime_draft_len + 1),
+                get_runtime_tokens_per_gen_step=lambda runtime_draft_len: runtime_draft_len + 1,
             ),
             original_max_draft_len=2,
             spec_dec_max_total_draft_tokens=3,
@@ -349,7 +478,6 @@ def test_pooling_runner_owns_forward_output_processing(
         resource_manager=SimpleNamespace(),
         cuda_graph_lora_manager=None,
         runtime_draft_len=0,
-        moe_load_balancer=None,
         gather_context_logits=False,
     )
 

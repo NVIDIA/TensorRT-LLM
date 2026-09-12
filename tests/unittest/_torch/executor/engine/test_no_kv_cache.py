@@ -91,6 +91,7 @@ def _prepare(
             draft_tokens_cuda=draft_tokens_cuda,
             cache_indirection=None,
             lora=lora,
+            moe_load_balancer=None,
             model_forward=Mock(),
         ),
         NoKVCacheRunnerConfig(
@@ -139,6 +140,19 @@ def _prepare(
         gather_ids_cuda,
         draft_tokens_cuda,
     )
+
+
+def test_no_kv_cache_runner_rejects_unhandled_model_inputs() -> None:
+    runner = PoolingRunner.__new__(PoolingRunner)
+
+    with pytest.raises(NotImplementedError, match="token_type_ids"):
+        runner.prepare_inputs(
+            SimpleNamespace(),
+            resource_manager=None,
+            cuda_graph_lora_manager=None,
+            runtime_draft_len=0,
+            token_type_ids=object(),
+        )
 
 
 def test_no_kv_cache_runner_prepare_inputs_packs_context_requests(
