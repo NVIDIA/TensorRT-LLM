@@ -257,8 +257,8 @@ def test_nvfp4_linear_hopper_marlin_applies_bias_as_post_op():
 
 @pytest.mark.parametrize("scaling_vector_size", [16, 32])
 def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize(
-    scaling_vector_size,
-):
+    scaling_vector_size: int,
+) -> None:
     method = W4A16NVFP4LinearMethod()
     input_tensor = torch.ones((2, 32), dtype=torch.bfloat16)
     bias = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16)
@@ -317,7 +317,9 @@ def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize(
         (QuantConfig.model_fields["group_size"].default, 16),
     ],
 )
-def test_nvfp4_scaling_vector_size_honors_declared_block_width(group_size, expected):
+def test_nvfp4_scaling_vector_size_honors_declared_block_width(
+    group_size: int | None, expected: int
+) -> None:
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=group_size)
 
     assert nvfp4_scaling_vector_size(quant_config) == expected
@@ -334,8 +336,8 @@ def test_nvfp4_scaling_vector_size_honors_declared_block_width(group_size, expec
     ],
 )
 def test_w4a16_nvfp4_linear_allocates_scales_for_declared_block_width(
-    group_size, expected_scale_numel
-):
+    group_size: int | None, expected_scale_numel: int
+) -> None:
     with patch.object(MarlinNVFP4LinearMethod, "is_supported", return_value=False):
         linear = Linear(
             128,
@@ -359,7 +361,9 @@ def test_w4a16_nvfp4_linear_allocates_scales_for_declared_block_width(
         (QuantAlgo.NVFP4, 32),
     ],
 )
-def test_nvfp4_linear_rejects_unsupported_block_width(quant_algo, group_size):
+def test_nvfp4_linear_rejects_unsupported_block_width(
+    quant_algo: QuantAlgo, group_size: int
+) -> None:
     with (
         patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=100),
         pytest.raises(ValueError, match=f"group_size={group_size}"),
@@ -375,7 +379,9 @@ def test_nvfp4_linear_rejects_unsupported_block_width(quant_algo, group_size):
 
 
 @pytest.mark.parametrize(("group_size", "expect_marlin"), [(16, True), (32, False)])
-def test_w4a16_nvfp4_marlin_requires_16_element_blocks(group_size, expect_marlin):
+def test_w4a16_nvfp4_marlin_requires_16_element_blocks(
+    group_size: int, expect_marlin: bool
+) -> None:
     """The Marlin NVFP4 kernel is written for 16-element blocks, so a 32-block
     checkpoint on SM120 must fall back to the Triton dequantization path."""
     with (
@@ -402,7 +408,10 @@ _E2M1_MAGNITUDES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_VALUES = _E2M1_MAGNITUDES + [-v for v in _E2M1_MAGNITUDES]
 
 
-def _reference_dequant(packed, block_scale, global_scale, group_size):
+def _reference_dequant(
+    packed: torch.Tensor, block_scale: torch.Tensor, global_scale: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    """Dequantize packed NVFP4 weights in plain torch, one E4M3 scale per ``group_size``."""
     lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=packed.device)
     out_features, packed_in = packed.shape
     in_features = packed_in * 2
@@ -414,7 +423,10 @@ def _reference_dequant(packed, block_scale, global_scale, group_size):
     return vals.view(out_features, in_features)
 
 
-def _random_nvfp4_checkpoint(out_features, in_features, group_size, device):
+def _random_nvfp4_checkpoint(
+    out_features: int, in_features: int, group_size: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random ModelOpt-style ``weight``, ``weight_scale`` and ``weight_scale_2`` tensors."""
     packed = torch.randint(
         0, 256, (out_features, in_features // 2), dtype=torch.uint8, device=device
     )
@@ -429,7 +441,7 @@ def _random_nvfp4_checkpoint(out_features, in_features, group_size, device):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton dequant kernel needs a GPU")
 @pytest.mark.parametrize("group_size", [16, 32])
-def test_w4a16_nvfp4_linear_dequantizes_declared_block_width(group_size):
+def test_w4a16_nvfp4_linear_dequantizes_declared_block_width(group_size: int) -> None:
     torch.manual_seed(0)
     in_features, out_features = 256, 24
     with (
@@ -461,7 +473,7 @@ def test_w4a16_nvfp4_linear_dequantizes_declared_block_width(group_size):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NVFP4 scale loading needs a GPU")
-def test_w4a16_nvfp4_linear_row_tp_shards_scales_by_declared_block_width():
+def test_w4a16_nvfp4_linear_row_tp_shards_scales_by_declared_block_width() -> None:
     """ROW TP slices the scale tensor in units of the declared block width; a
     16-element assumption would shard a 32-block checkpoint out of range."""
     torch.manual_seed(0)

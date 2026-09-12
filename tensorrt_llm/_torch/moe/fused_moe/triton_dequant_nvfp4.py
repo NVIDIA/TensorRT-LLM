@@ -142,8 +142,9 @@ def dequant_nvfp4_active_triton(
         weight_scale_2: ``[E]`` float32 -- per-tensor scale.
         active_mask: ``[E]`` uint8 -- 1 for experts that need dequanting.
         target_dtype: ``torch.bfloat16`` or ``torch.float16``.
-        sf_vec_size: NVFP4 per-block scale vector size (16, or 32 for
-            weight-only checkpoints).
+        sf_vec_size: NVFP4 per-block scale vector size. The MoE path is
+            16-only (``NVFP4FusedMoEMethod.create_weights`` rejects wider
+            blocks); only the 2D Linear path below also accepts 32.
         block_n, block_k: Triton tile shape. ``block_k`` should be a
             multiple of ``sf_vec_size`` so each tile covers an integer
             number of scale blocks.
@@ -154,7 +155,7 @@ def dequant_nvfp4_active_triton(
         are never read by the downstream MoE kernel.
     """
     assert packed_weight.dim() == 3, "packed_weight must be 3D [E, N, K/2]"
-    assert sf_vec_size in (16, 32), f"sf_vec_size must be 16 or 32, got {sf_vec_size}"
+    assert sf_vec_size == 16, "NVFP4 MoE dequant is fixed at 16-element blocks"
     assert block_k % sf_vec_size == 0, (
         f"block_k={block_k} must be a multiple of sf_vec_size={sf_vec_size}"
     )

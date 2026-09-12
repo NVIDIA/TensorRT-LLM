@@ -23,7 +23,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 pytestmark = pytest.mark.cpu_only
 
 
-def test_nvfp4_moe_rejects_32_element_scale_blocks():
+def test_nvfp4_moe_rejects_32_element_scale_blocks() -> None:
     """Only the dense W4A16_NVFP4 Linear path dequantizes 32-element blocks; the
     MoE methods must fail before allocating weights for such a checkpoint."""
     module = SimpleNamespace(

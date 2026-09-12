@@ -1467,6 +1467,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         return 32
 
     def resolve_scaling_vector_size(self, module: Linear) -> int:
+        """Scale block width for ``module``, validated against this method."""
         size = nvfp4_scaling_vector_size(getattr(module, "quant_config", None))
         if size not in self.supported_scaling_vector_sizes:
             raise ValueError(
