@@ -250,6 +250,37 @@ in the replan phase under the lock-matrix rules below.
 _STAGE_GOAL_REPLAN_LOCK_MATRIX = """\
 ## Replan lock matrix (Stage/Goal mode)
 
+In **concurrent mode**, this replan turn has one of two triggers, and the
+orchestrator's prompt tells you which:
+
+1. **Failure-triggered** (after a scheduler pass) — one or more nodes ended
+   **FAILED**. Your job is to revise the plan for the **failed subtree only** —
+   the failed node(s) and their blocked dependents. Their findings are in the
+   aggregated per-node records (`nodes/<id>/status.md`) of the FAILED nodes;
+   read those to see why they failed. If the failure is acceptable (e.g. a node
+   that hit its iteration budget while its evidence run was still loading, or a
+   bar that should be relaxed with justification), you are the terminator:
+   return `DONE` to accept the outcome and end the replan loop.
+
+2. **Feedback-triggered before any scheduler pass** (the turn is marked
+   feedback-triggered and **no** node has FAILED) — fresh human `--feedback` is
+   the driver. There is **no failed subtree**. The default, lowest-risk shape is
+   **purely additive**: insert a NEW independent Stage (`depends_on: []`, so the
+   scheduler dispatches it in the very next pass, in parallel with any node that
+   is still in flight) that serves the feedback, and leave every existing Stage
+   and Goal — their ids, `depends_on` edges, titles, and criteria — **unchanged**.
+   Prefer this over interrupting an in-flight Stage: in concurrent mode the
+   scheduler already resumes an interrupted node from its own saved iteration
+   state, so interrupting it discards work for no benefit. Only fall back to the
+   interrupt protocol below if the feedback genuinely cannot be served by an
+   added parallel Stage.
+
+**DONE nodes are frozen** under both triggers: the orchestrator preserves them
+via the checkpoint and any edit you make to a DONE node's plan is ignored — do
+not touch them. A node that was **in flight** when the run was stopped is reset
+to `PENDING` and resumes from its own `nodes/<id>/status.md`; do not rewrite its
+plan either unless the feedback explicitly targets it.
+
 The replan phase of this workflow allows you to revise `plan.md` and
 `acceptance-criteria.md` based on QA findings — but execution history
 constrains what you may change. Before any replan-turn edit, read
@@ -549,6 +580,7 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
     ]
 )
 
+
 # Stage/Goal control flow is only wired when the workflow runs with
 # --replan-on-qa; ``build_modeling_bringup_prompts`` appends this block
 # on top of ``SYSTEM_PROMPT_EXTENSION`` in that mode only.
@@ -560,3 +592,186 @@ STAGE_GOAL_EXTENSION = "\n".join(
         _STAGE_GOAL_REPLAN_DECISION_MAPPING,
     ]
 )
+
+
+# Canonical ``## Execution Graph`` block. This constant is embedded verbatim in
+# the concurrent PlanDrafter prompt AND reused by the round-trip test, so the
+# format the prompt teaches is provably the format the engine's
+# ``extract_execution_graph`` / ``parse_execution_graph`` accept. It is a plain
+# module-level string (no backend probe) so it is safe to import anywhere.
+EXECUTION_GRAPH_EXAMPLE = """\
+## Execution Graph
+
+```yaml
+nodes:
+  - id: s1
+    type: stage
+    kind: impl
+    depends_on: []
+    children:
+      - id: s1.g1
+        type: goal
+        kind: impl
+        depends_on: []
+      - id: s1.g2
+        type: goal
+        kind: impl
+        depends_on: []
+      - id: s1.g3
+        type: goal
+        kind: merge
+        depends_on: [s1.g1, s1.g2]
+        isolation: shared
+  - id: s2
+    type: stage
+    kind: impl
+    depends_on: [s1]
+    children:
+      - id: s2.g1
+        type: goal
+        kind: impl
+        depends_on: []
+      - id: s2.g2
+        type: goal
+        kind: merge
+        depends_on: [s2.g1]
+        isolation: shared
+```
+"""
+
+_CONCURRENT_PLAN_GUIDANCE_HEAD = """\
+## Concurrent execution graph (mandatory for `plan.md`)
+
+Concurrent mode reuses the same Stage/Goal decomposition thinking as the
+single-cursor protocol — a **Stage** is a milestone version of the model
+where a defined accuracy bar is met, and a **Goal** is a concrete
+module-implementation or focused-debugging task whose closure contributes
+to the Stage's accuracy bar (Stage 1 accuracy convergence on simple
+backends, Stage 2 the performance backends named in `task.yaml`, Stage 3
+cuda_graph + overlap_scheduler; drop later Stages `task.yaml` is silent
+on). Write that decomposition as prose in `plan.md`'s
+`## Implementation Steps` exactly as before.
+
+But concurrent mode is executed by an orchestrator that schedules
+independent nodes in **parallel**, so `plan.md` MUST additionally carry a
+machine-readable `## Execution Graph` block that the orchestrator parses
+to build the DAG. There is NO single-cursor `## Stages & Goals` status
+table and NO replan lock matrix in concurrent mode — the orchestrator
+owns the live run-state.
+
+### `## Execution Graph` format
+
+Write a `## Execution Graph` heading followed by a single fenced `yaml`
+block whose body is a mapping with one top-level `nodes:` list. Each node
+is a mapping with these keys:
+
+- `id` — stable, globally-unique identifier (e.g. `s1`, `s1.g2`). Stage
+  ids and their Goal ids are all unique across the whole graph.
+- `type` — `stage` or `goal`.
+- `depends_on` — list of **sibling** ids (same nesting level) that must
+  finish before this node runs. A Stage's `depends_on` names sibling
+  Stages; a Goal's `depends_on` names sibling Goals inside the same
+  Stage. Never reference a parent, child, or cousin id.
+- `kind` — `impl` (produces module / debug work) or `merge` (folds its
+  dependency nodes together — the per-Stage wiring / integration Goal).
+- `isolation` — optional; `worktree` (default, runs in its own git
+  worktree) or `shared` (runs in the parent workspace; use it for a
+  `merge` Goal that integrates its sibling worktrees).
+- `children` — optional nested sub-DAG. A `stage` node holds its Goals as
+  `children`; each Goal is itself a node.
+
+Encode the decomposition like this:
+
+- One `type: stage` node per Stage; that Stage's Goals are its
+  `children`.
+- Cross-Stage ordering is `depends_on` between the Stage nodes (e.g.
+  Stage 2 `depends_on: [s1]`).
+- Within a Stage, module Goals are `kind: impl`; the wiring / integration
+  Goal that pulls them together is `kind: merge` and `depends_on` the
+  module Goals it merges.
+- **A node inherits the committed output of every node in its `depends_on`**:
+  before a node runs, each dependency's work is merged into its workspace, and
+  each node's own work is committed to its branch when it finishes. So any Goal
+  that builds on another Goal's code MUST list that Goal in `depends_on` — this
+  is how the code reaches it. This holds for **both** `impl` and `merge` Goals
+  (an assembly Goal that consumes sibling modules receives their code even as
+  `kind: impl`); reserve `kind: merge` + `isolation: shared` for the Goal that
+  must land the integrated result in the shared checkout. Never rely on prose
+  ordering or a node reaching another node's worktree — only `depends_on`
+  carries code.
+- Every `depends_on` id resolves to a same-level sibling and each sibling
+  level is acyclic.
+
+Canonical example — emit a block of exactly this shape (ids and scope
+adapted to the real decomposition):
+"""
+
+_CONCURRENT_PLAN_GUIDANCE_TAIL = """\
+### `acceptance-criteria.md` — node-id-partitioned checklist
+
+Partition `acceptance-criteria.md` into one `## <node-id>` subsection per
+node in the `## Execution Graph` — the partition is **node-id keyed**
+(e.g. `## s1.g1`, `## s1.g3`, `## s2`), **replacing** the `## Stage N`
+ordinal keying the single-cursor protocol uses. Each subsection is a flat
+`- [ ] ...` checklist scoped to exactly that node: a module Goal node's
+subsection lists the acceptance items its module / debug work must
+satisfy; a `merge` Goal's or Stage node's subsection lists the
+integration / accuracy items proven once its dependencies are folded in.
+The node ids in `acceptance-criteria.md` must match the ids in the
+`## Execution Graph` exactly, so the orchestrator can hand each node
+worker just its own `## <node-id>` acceptance subsection.
+
+All the bring-up validation-matrix requirements above still hold per node
+(risk covered, independent reference, `reference_tier` / `validation_tier`,
+device / runtime path, hard config, expected failure signal, command) —
+concurrent mode only changes how the checklist is **partitioned**
+(node-id keyed, not Stage-ordinal keyed), not what each item must prove.
+
+Do **not** write a `## Stages & Goals` status table and do **not** write a
+replan lock matrix in concurrent mode: the orchestrator owns graph state,
+scheduling, and node transitions. `plan.md` records the decomposition
+(prose Steps + the `## Execution Graph`) and `acceptance-criteria.md`
+records the per-node pass/fail contract; the live run-state is the
+orchestrator's, not a file you maintain.
+"""
+
+# Concurrent DAG control flow is only wired when the workflow runs with
+# --concurrent; ``build_modeling_bringup_prompts`` appends this block on top of
+# ``SYSTEM_PROMPT_EXTENSION`` in that mode only (INSTEAD of STAGE_GOAL_EXTENSION
+# — concurrent is a distinct mode). The canonical example is embedded verbatim
+# so the taught format matches the parser.
+CONCURRENT_EXTENSION = "\n".join(
+    [
+        _CONCURRENT_PLAN_GUIDANCE_HEAD,
+        EXECUTION_GRAPH_EXAMPLE,
+        _CONCURRENT_PLAN_GUIDANCE_TAIL,
+    ]
+)
+
+
+def concurrent_budget_guidance(max_parallel: int) -> str:
+    """Soft graph-sizing guidance naming the concurrent scheduler's budget.
+
+    Appended to the PlanDrafter's concurrent system prompt (and only the
+    PlanDrafter's) so the drafter sizes the ``## Execution Graph`` against the
+    real ``--max-parallel`` value the orchestrator throttles to, instead of
+    staying blind to it. Wired in ``build_modeling_bringup_prompts`` only when
+    ``concurrent`` is set and a ``max_parallel`` value is supplied. Advisory,
+    not a hard cap: genuinely-independent modules stay separate Goals and the
+    scheduler serializes any overflow.
+    """
+    n = max_parallel
+    return (
+        "### Concurrency budget\n"
+        "\n"
+        f"This run executes the `## Execution Graph` under `--max-parallel {n}`: "
+        f"the orchestrator runs at most {n} independent nodes at once and queues "
+        "the rest. Size the graph with that budget in mind — keep the widest "
+        f"ready-to-run level on the order of {n} `impl` nodes. Fanning a single "
+        f"Stage out into far more than {n} parallel Goals buys no additional "
+        "parallelism (the surplus just waits for a slot) while multiplying "
+        "git-worktree setup and fragmenting the `merge` Goal that folds them "
+        "back together. Do not manufacture width you don't need; but when a "
+        f"Stage genuinely has more than {n} independent modules, keep them as "
+        "separate Goals — the scheduler serializes the overflow safely."
+    )

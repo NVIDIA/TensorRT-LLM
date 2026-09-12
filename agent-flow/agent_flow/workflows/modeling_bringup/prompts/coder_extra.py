@@ -74,6 +74,35 @@ _CODER_GUIDANCE = """\
   edit `auto_deploy/` or `tests/.../auto_deploy/`.
 """
 
+_DETACHED_JOBS_GUIDANCE = """\
+## Long-running commands — launch DETACHED, and re-attach yourself on resume
+
+For any command that runs longer than a few minutes (Slurm `sbatch`/`srun`, long
+builds, long evals), DO NOT block your turn on a synchronous command — your turn
+can be paused/cancelled mid-flight, and a blocking `srun` child dies with it.
+Launch it DETACHED via the framework wrapper, which records the job in a per-node
+`jobs.json` so it survives a pause:
+
+    python -m agent_flow.jobs.run_detached \\
+      --registry <workspace>/nodes/<node_id>/jobs.json \\
+      --handle <stable-logical-key e.g. mmmu-full-cg1ov1> \\
+      --kind slurm --name <node_id>-<handle> \\
+      -- sbatch <your job script and args>
+
+Use a STABLE `--handle` (describe WHAT the job computes; no timestamps).
+
+**Re-attach on resume — this is YOUR job, do it every turn before submitting.**
+Before launching, read your node's `jobs.json` (and your own status notes) for a
+job already recorded under this `--handle`. If one exists, check it yourself
+(`squeue -j <job_id>` for liveness, then `sacct -j <job_id> -o State,ExitCode`
+for a finished job's outcome) and act on the result:
+- still RUNNING/PENDING → keep polling that job; do NOT resubmit (resubmitting
+  duplicates the job and orphans the original, wasting the cluster);
+- finished (COMPLETED) → collect its output and move on;
+- gone / failed → resubmit fresh with `run_detached` (same `--handle`).
+
+Only run `run_detached` to submit when there is no live job for the handle."""
+
 _STAGE_GOAL_CODER_PROTOCOL = """\
 ## Stage/Goal protocol — working a single Goal per turn
 
@@ -201,6 +230,7 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
         GSM8K_REFERENCE_CONFIG_POLICY,
         ACCURACY_GAP_PARITY_POLICY,
         _CODER_GUIDANCE,
+        _DETACHED_JOBS_GUIDANCE,
     ]
 )
 
@@ -208,3 +238,45 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
 # --replan-on-qa; ``build_modeling_bringup_prompts`` appends this block
 # on top of ``SYSTEM_PROMPT_EXTENSION`` in that mode only.
 STAGE_GOAL_EXTENSION = _STAGE_GOAL_CODER_PROTOCOL
+
+_CONCURRENT_CODER_PROTOCOL = """\
+## Concurrent node protocol — working one assigned node per turn
+
+In concurrent mode the orchestrator schedules the plan's
+`## Execution Graph` as a DAG and runs many nodes in parallel. You are
+assigned **exactly ONE node this turn** — its `id` and scope are given in
+your turn prompt. Everything you do is confined to that node.
+
+- **Work only that node's scope.** Implement, debug, and test only the
+  module or integration work the assigned node's `plan.md` Goal / Stage
+  describes and its `## <node-id>` acceptance subsection requires. Work
+  that belongs to another node — a sibling Goal, a downstream node, a
+  different Stage — is out of bounds this turn.
+- **Edit code under your worktree.** Your node runs in its own workspace
+  (an isolated git worktree unless the node declares `isolation:
+  shared`). Make all source and test edits there; never reach into a
+  sibling node's worktree.
+- **Record progress / status to YOUR private files.** Write your per-turn
+  progress and status to your own node-scoped files (the ones your turn
+  prompt points at). They describe only this node's work.
+- **Do NOT read or maintain a shared stage/goal status table.**
+  Concurrent mode has no shared status table for you to open, rewrite, or
+  keep in sync — the orchestrator holds the run-state.
+- **Do NOT promote Goals and never emit a stage-closed marker.** You
+  never flip node state, never promote the next Goal, never mark a Stage
+  or node closed. The orchestrator owns graph state, scheduling, and
+  every node transition — it decides when your node is done and drives
+  the next ready node from the DAG's `depends_on` edges.
+
+The bring-up engineering rules above (Python-first kernels, tier order,
+CUDA-graph hard-path evidence, backend selection, no `auto_deploy/`) apply
+in full to the node you are assigned — concurrent mode changes only *what
+you own this turn* (one node, no shared table), not *how* you validate the
+work.
+"""
+
+# Concurrent DAG control flow is only wired when the workflow runs with
+# --concurrent; ``build_modeling_bringup_prompts`` appends this block on top of
+# ``SYSTEM_PROMPT_EXTENSION`` in that mode only (INSTEAD of STAGE_GOAL_EXTENSION
+# — concurrent is a distinct mode).
+CONCURRENT_EXTENSION = _CONCURRENT_CODER_PROTOCOL

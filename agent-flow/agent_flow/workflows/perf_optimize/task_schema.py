@@ -65,6 +65,7 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     TaskSchemaError,
     cluster_ssh,
     concurrency_points,
+    container_setup,
     dump_task_yaml,
     has_slurm_environment,
     is_curve_mode,
@@ -104,6 +105,11 @@ OPTIMIZE_DEFAULTS: dict[str, Any] = {
     # both serial and parallel execution modes.
     "max_items_per_round": 3,
     "item_execution": "parallel",
+    # Which engine drives ``item_execution: parallel``. ``threads`` is this
+    # workflow's own thread pool and stays the default; ``dag`` opts into the
+    # shared ``agent_flow.orchestration`` scheduler, which is the same batch
+    # under a general engine. Ignored by ``item_execution: serial``.
+    "parallel_engine": "threads",
     # Which roadmap ``approach`` values the run may plan/apply. Restrict
     # to ["code"] to forbid tuning-YAML knob changes (code-only campaign)
     # or to ["config"] to leave the TRT-LLM checkout untouched.
@@ -114,6 +120,8 @@ OPTIMIZE_DEFAULTS: dict[str, Any] = {
 }
 
 ITEM_EXECUTIONS = ("serial", "parallel")
+
+PARALLEL_ENGINES = ("threads", "dag")
 
 ACCURACY_DEFAULTS: dict[str, Any] = {
     "max_drop_pct": 1.0,
@@ -143,7 +151,16 @@ VALID_METRICS: frozenset[str] = frozenset(
 # The perf-optimize half of the key census the base schema documents. Same
 # contract: this is what a lint may call real, not what the validator rejects.
 KNOWN_OPTIMIZE_KEYS: frozenset[str] = frozenset(
-    set(OPTIMIZE_DEFAULTS) | {"target_improvement_pct", "focus_concurrencies", "max_regression_pct"}
+    set(OPTIMIZE_DEFAULTS)
+    | {
+        "target_improvement_pct",
+        "focus_concurrencies",
+        "max_regression_pct",
+        # Deliberately absent from OPTIMIZE_DEFAULTS: unset means "follow
+        # max_items_per_round", which is not a value the merged block can
+        # carry without freezing the coupling it exists to break.
+        "max_parallel_items",
+    }
 )
 KNOWN_ACCURACY_KEYS: frozenset[str] = frozenset({"command", "baseline_score", "max_drop_pct"})
 KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "coverage_target_pct"})
@@ -184,6 +201,7 @@ def _validate_optimize_block(optimize: Mapping[str, Any], errors: list[str]) -> 
         "max_rounds",
         "max_attempts_per_item",
         "max_items_per_round",
+        "max_parallel_items",
     ):
         if field in optimize and optimize[field] is not None:
             value = optimize[field]
@@ -195,6 +213,13 @@ def _validate_optimize_block(optimize: Mapping[str, Any], errors: list[str]) -> 
         if value not in ITEM_EXECUTIONS:
             errors.append(
                 f"'optimize.item_execution' must be one of {list(ITEM_EXECUTIONS)}, got {value!r}"
+            )
+
+    if "parallel_engine" in optimize and optimize["parallel_engine"] is not None:
+        value = optimize["parallel_engine"]
+        if value not in PARALLEL_ENGINES:
+            errors.append(
+                f"'optimize.parallel_engine' must be one of {list(PARALLEL_ENGINES)}, got {value!r}"
             )
 
     if "accept_fraction" in optimize and optimize["accept_fraction"] is not None:
@@ -410,7 +435,10 @@ def _validate_disagg_block(data: dict[str, Any], errors: list[str]) -> dict[str,
 
 
 def load_and_validate_task_yaml(
-    path: str | Path, *, max_rounds_override: int | None = None
+    path: str | Path,
+    *,
+    max_rounds_override: int | None = None,
+    parallel_engine_override: str | None = None,
 ) -> dict[str, Any]:
     """Parse ``path`` as YAML and validate the perf-optimize schema.
 
@@ -419,7 +447,9 @@ def load_and_validate_task_yaml(
     this pass into a single :class:`TaskSchemaError`. Returns the mapping
     with defaults merged under the user's values so the resolved spec the
     agents read on disk is fully explicit; ``max_rounds_override`` (the
-    CLI ``--max-rounds`` flag) is applied last, over the user's value.
+    CLI ``--max-rounds`` flag) and ``parallel_engine_override`` (the CLI
+    ``--parallel-engine`` flag) are applied last, over the user's values,
+    so an overridden run still resolves to a spec that states what it ran.
     """
     data = _base_load_and_validate(path)
 
@@ -455,6 +485,12 @@ def load_and_validate_task_yaml(
     if max_rounds_override is not None and max_rounds_override < 1:
         errors.append(f"--max-rounds must be >= 1, got {max_rounds_override}")
 
+    if parallel_engine_override is not None and parallel_engine_override not in PARALLEL_ENGINES:
+        errors.append(
+            f"--parallel-engine must be one of {list(PARALLEL_ENGINES)}, "
+            f"got {parallel_engine_override!r}"
+        )
+
     if errors:
         bullet = "\n  - "
         raise TaskSchemaError(
@@ -471,6 +507,8 @@ def load_and_validate_task_yaml(
         data["profile"]["kernel_coverage"] = normalized_kernel_coverage
     if max_rounds_override is not None:
         data["optimize"]["max_rounds"] = max_rounds_override
+    if parallel_engine_override is not None:
+        data["optimize"]["parallel_engine"] = parallel_engine_override
     if has_accuracy_check(data):
         data["accuracy"] = {**ACCURACY_DEFAULTS, **accuracy}
 
@@ -537,6 +575,7 @@ __all__ = [
     "KNOWN_KERNEL_COVERAGE_KEYS",
     "KNOWN_OPTIMIZE_KEYS",
     "ITEM_EXECUTIONS",
+    "PARALLEL_ENGINES",
     "OPTIMIZE_DEFAULTS",
     "REMOTE_RUN_ROOT_FIELD",
     "VALID_METRICS",
@@ -546,6 +585,7 @@ __all__ = [
     "focus_concurrencies",
     "has_accuracy_check",
     "cluster_ssh",
+    "container_setup",
     "has_slurm_environment",
     "is_curve_mode",
     "kernel_coverage",

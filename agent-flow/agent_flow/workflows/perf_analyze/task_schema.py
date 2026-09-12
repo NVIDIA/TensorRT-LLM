@@ -83,6 +83,14 @@ SLURM_REQUIRED_FIELDS: tuple[str, ...] = (
 SLURM_CLUSTER_SSH_FIELD = "cluster_ssh"
 REMOTE_RUN_ROOT_FIELD = "remote_run_root"
 
+# Optional shell, run verbatim inside the container before anything else, in
+# every Slurm step. Needed when ``docker_image`` is a CI *build* image rather
+# than a release one: those carry the toolchain but not the runtime
+# dependencies, and pyxis resets ``PATH`` when it starts a container, so a
+# virtualenv on the shared filesystem cannot be handed in from outside.
+# Absent ⇒ the agents launch straight into their work.
+SLURM_CONTAINER_SETUP_FIELD = "container_setup"
+
 # SOL-projection block. The workflow runs the projector stage
 # (benchmarker -> projector -> analyzer -> reporter), which follows the
 # ``internal-perf-sol-analysis`` skill, **by default** — so the block is
@@ -177,7 +185,8 @@ KNOWN_BENCHMARK_KEYS: frozenset[str] = frozenset(
 )
 KNOWN_PROFILE_KEYS: frozenset[str] = frozenset({"methods", "nsys_iter_range", PROFILE_RANKS_FIELD})
 KNOWN_SLURM_KEYS: frozenset[str] = frozenset(
-    SLURM_REQUIRED_FIELDS + (SLURM_CLUSTER_SSH_FIELD, REMOTE_RUN_ROOT_FIELD)
+    SLURM_REQUIRED_FIELDS
+    + (SLURM_CLUSTER_SSH_FIELD, REMOTE_RUN_ROOT_FIELD, SLURM_CONTAINER_SETUP_FIELD)
 )
 KNOWN_SOL_KEYS: frozenset[str] = frozenset(SOL_FIELDS)
 KNOWN_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
@@ -593,6 +602,17 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
                     f"'{SLURM_ENVIRONMENT_FIELD}.{REMOTE_RUN_ROOT_FIELD}' must be a "
                     "non-empty absolute POSIX path when set"
                 )
+            # Same contract, and the same reason: this string is pasted into
+            # every containerized shell the run opens, so a wrong type has to
+            # fail here rather than as a broken command inside a Slurm step.
+            container_setup = slurm_environment.get(SLURM_CONTAINER_SETUP_FIELD)
+            if container_setup is not None and (
+                not isinstance(container_setup, str) or not container_setup.strip()
+            ):
+                errors.append(
+                    f"'{SLURM_ENVIRONMENT_FIELD}.{SLURM_CONTAINER_SETUP_FIELD}' must be a "
+                    f"non-empty string when set, got {type(container_setup).__name__}"
+                )
 
     if _RENAMED_SOL_FIELD in data:
         errors.append(
@@ -734,6 +754,20 @@ def remote_run_root(data: Mapping[str, Any], campaign_name: str) -> str:
     return f"~/agent_flow_workspace/{campaign_name}"
 
 
+def container_setup(data: Mapping[str, Any]) -> str:
+    """The shell prelude for containerized steps, or ``""`` when none is set.
+
+    Mirrors :func:`cluster_ssh`: the empty string is the decision every caller
+    makes — inject a setup block into the agents' prompts, or leave them
+    launching straight into their work — and returning ``""`` rather than
+    ``None`` keeps "nothing to do" the falsy default.
+    """
+    block = data.get(SLURM_ENVIRONMENT_FIELD)
+    if not isinstance(block, Mapping):
+        return ""
+    return str(block.get(SLURM_CONTAINER_SETUP_FIELD) or "").strip()
+
+
 def sol_enabled(data: Mapping[str, Any]) -> bool:
     """Return whether a task spec enables the projector stage.
 
@@ -832,6 +866,7 @@ __all__ = [
     "SERVE_HOST",
     "SERVE_PORT",
     "SLURM_CLUSTER_SSH_FIELD",
+    "SLURM_CONTAINER_SETUP_FIELD",
     "SLURM_ENVIRONMENT_FIELD",
     "SLURM_REQUIRED_FIELDS",
     "SOL_DEFAULTS",
@@ -844,6 +879,7 @@ __all__ = [
     "concurrency_points",
     "dump_task_yaml",
     "cluster_ssh",
+    "container_setup",
     "has_slurm_environment",
     "is_curve_mode",
     "load_and_validate_task_yaml",

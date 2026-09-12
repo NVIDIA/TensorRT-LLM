@@ -120,15 +120,76 @@ class FakeGitOps:
     def fast_forward(self, repo, branch):
         self.calls.append(("fast_forward", str(repo), branch))
 
+    def delete_branch(self, repo, name):
+        self.calls.append(("delete_branch", name))
+
     def count(self, name: str) -> int:
         return sum(1 for c in self.calls if c[0] == name)
 
 
+class FakeItemIsolation:
+    """Stand-in for the parallel path's git-worktree isolation provider.
+
+    ``CandidateWorktreeIsolation`` shells out to real ``git``, which the rest of
+    this suite deliberately avoids (``FakeGitOps`` keeps the runs fast and lets
+    a test assert on the git calls a workflow *decided* to make). This mirrors
+    the provider's observable contract on a plain directory: ``acquire`` hands
+    back a per-node directory it creates, ``release`` takes it away, ``reclaim``
+    is the deferred no-op the real subclass makes it, and the path/branch naming
+    helpers agree with the real ones so the checkpointed batch ledger lines up
+    with what the scheduler passes ``run_node``.
+    """
+
+    def __init__(self, repo_path, worktrees_root, branch_prefix="node/", base_ref="HEAD"):
+        self.repo_path = Path(repo_path)
+        self.worktrees_root = Path(worktrees_root)
+        self.branch_prefix = branch_prefix
+        self.base_ref = base_ref
+        self.calls: list[tuple] = []
+
+    def worktree_path(self, node_id: str) -> Path:
+        return self.worktrees_root / node_id
+
+    def branch_name(self, node_id: str) -> str:
+        return f"{self.branch_prefix}{node_id}"
+
+    async def acquire(self, node):
+        path = self.worktree_path(node.id)
+        path.mkdir(parents=True, exist_ok=True)
+        self.calls.append(("acquire", node.id))
+        return path
+
+    async def release(self, node):
+        self.calls.append(("release", node.id))
+        shutil.rmtree(self.worktree_path(node.id), ignore_errors=True)
+
+    async def reclaim(self, node):
+        self.calls.append(("reclaim", node.id))
+
+    async def prepare(self, node, dep_nodes, cwd):
+        return None
+
+    async def commit(self, node, cwd):
+        return None
+
+
+def patch_git(monkeypatch, fake: FakeGitOps) -> FakeGitOps:
+    """Route BOTH git surfaces the workflow uses through fakes.
+
+    The workflow reaches git two ways — the synchronous ``gitops`` helpers and,
+    on the parallel path, the scheduler's isolation provider. Patching only the
+    first leaves the provider shelling out to real ``git`` against a checkout
+    that does not exist, so the two are patched together here rather than at
+    each call site.
+    """
+    monkeypatch.setattr(workflow_module, "gitops", fake)
+    monkeypatch.setattr(workflow_module, "CandidateWorktreeIsolation", FakeItemIsolation)
+    return fake
+
+
 @pytest.fixture
 def fake_git(monkeypatch):
-    fake = FakeGitOps()
-    monkeypatch.setattr(workflow_module, "gitops", fake)
-    return fake
+    return patch_git(monkeypatch, FakeGitOps())
 
 
 def _item(item_id: str = "opt-001", gain: float = 10.0, **overrides) -> dict:
@@ -412,20 +473,41 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     ) == "{}\n"
 
 
+def _assert_verdict_downgraded(workflow, ws, reason: str) -> None:
+    """The verdict was not applied, and the run says which check refused it."""
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap["current_best"]["value"] == pytest.approx(roadmap["baseline"]["value"])
+    downgrades = [
+        e
+        for e in progress_module.read_progress(workflow.progress_path)["optimization"]
+        if e.get("event") == "verdict_downgraded_to_reject"
+    ]
+    assert len(downgrades) == 1
+    assert downgrades[0]["agent"] == "integrator"
+    assert reason in downgrades[0]["summary"]
+    assert (ws / "optimization_report.md").is_file()
+
+
 @pytest.mark.parametrize(
-    ("verdict_overrides", "error"),
+    ("verdict_overrides", "reason"),
     [
-        ({"measured_gain_pct": 0.1}, "below required"),
+        ({"measured_gain_pct": 0.1}, "below the required"),
         ({"required_gain_pct": 0.0}, "required_gain_pct mismatch"),
         ({"included_item_ids": []}, "included no candidates"),
         ({"included_item_ids": ["opt-failed"]}, "non-candidate item"),
-        ({"round": 0}, "without a structured verdict"),
     ],
 )
-def test_integrator_rejects_invalid_acceptance_verdict(
-    tmp_path, fake_git, verdict_overrides, error
+def test_integrator_verdict_that_fails_its_checks_is_downgraded_to_reject(
+    tmp_path, fake_git, verdict_overrides, reason
 ):
-    """A contradictory APPROVE cannot mutate the campaign checkout."""
+    """A contradictory APPROVE changes nothing — and does not strand the run.
+
+    The checks exist to keep a verdict the orchestrator cannot confirm out of
+    ``current_best``, so the campaign must end up exactly as if the Integrator
+    had said REJECT. Raising instead used to ALSO trap the run: the integrator's
+    report and progress entry are already on disk, so the cached-verdict guard
+    skips re-running it on resume and the same check fails forever.
+    """
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -457,18 +539,62 @@ def test_integrator_rejects_invalid_acceptance_verdict(
         progress_module.write_progress(workflow.progress_path, data)
 
     workflow.integrator = authoritative_integrator
-    with pytest.raises(RuntimeError, match=error):
-        try:
-            workflow.run(str(task))
-        finally:
-            workflow.close()
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
 
+    # Nothing was promoted: no fast-forward, and current_best still the baseline.
     assert fake_git.count("fast_forward") == 0
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap["current_best"]["value"] == pytest.approx(roadmap["baseline"]["value"])
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "failed"
+
+    # The downgrade is recorded against the integrator, naming which check failed,
+    # so the run does not merely look like an ordinary rejection afterwards.
+    downgrades = [
+        e
+        for e in progress_module.read_progress(workflow.progress_path)["optimization"]
+        if e.get("event") == "verdict_downgraded_to_reject"
+    ]
+    assert len(downgrades) == 1
+    assert downgrades[0]["agent"] == "integrator"
+    assert reason in downgrades[0]["summary"]
+
+    # The run completed rather than aborting, so the report exists.
+    assert (ws / "optimization_report.md").is_file()
+
     active_repo = str(ws / "worktrees" / "round_1" / "integration")
     assert f"Active runtime checkout: `{active_repo}`" in integrator_prompts[0]
     assert (
         f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in integrator_prompts[0]
     )
+
+
+def test_integrator_without_a_structured_verdict_still_raises(tmp_path, fake_git):
+    """A MISSING verdict is a different failure from an unconfirmable one.
+
+    Downgrading applies to a verdict the orchestrator read and could not
+    confirm. When the integrator produced no parseable verdict at all there is
+    nothing to downgrade — the turn did not do its job — so that stays a hard
+    abort with a resumable checkpoint.
+    """
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow)
+
+    def silent_integrator(prompt):
+        state = state_module.load_state(workflow.state_path)
+        integration_dir = workflow._round_dir(state) / "integration"
+        (integration_dir / "integration.md").write_text("# no verdict\n", encoding="utf-8")
+
+    workflow.integrator = silent_integrator
+    with pytest.raises(RuntimeError, match="without a structured verdict"):
+        try:
+            workflow.run(str(task))
+        finally:
+            workflow.close()
 
 
 def test_relative_workspace_resolves_reference_result_dir(tmp_path, fake_git, monkeypatch):
@@ -1847,11 +1973,12 @@ def test_integrator_rejects_curve_point_beyond_regression_budget(tmp_path, fake_
         baseline_curve=_WF_CURVE,
         evaluator_curve=measured,
     )
-    with pytest.raises(RuntimeError, match="regresses concurrency 32"):
-        try:
-            workflow.run(str(task))
-        finally:
-            workflow.close()
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    _assert_verdict_downgraded(workflow, ws, "regresses concurrency 32")
 
     assert fake_git.count("fast_forward") == 0
 
@@ -1865,11 +1992,12 @@ def test_integrator_rejects_curve_mode_accept_without_curve(tmp_path, fake_git):
         evaluator_verdicts=[("APPROVE", "none", 5.5, 105.15)],
         baseline_curve=_WF_CURVE,
     )
-    with pytest.raises(RuntimeError, match="curve verdict is missing a curve"):
-        try:
-            workflow.run(str(task))
-        finally:
-            workflow.close()
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    _assert_verdict_downgraded(workflow, ws, "curve verdict is missing a curve")
 
     assert fake_git.count("fast_forward") == 0
 
@@ -2022,7 +2150,7 @@ def test_latest_evaluator_curve_returns_none_on_malformed_entries(tmp_path, fake
 
 def test_resume_mid_round_starts_at_evaluator(tmp_path, monkeypatch):
     fake = FakeGitOps()  # accept path commits
-    monkeypatch.setattr(workflow_module, "gitops", fake)
+    patch_git(monkeypatch, fake)
 
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -2131,7 +2259,7 @@ def test_resume_redispatch_purges_stale_attempt_benchmark_results(tmp_path, monk
     as fresh measurements.
     """
     fake = FakeGitOps()
-    monkeypatch.setattr(workflow_module, "gitops", fake)
+    patch_git(monkeypatch, fake)
 
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -2488,6 +2616,11 @@ def test_crash_mid_accept_is_logged_and_leaves_resumable_checkpoint(tmp_path, mo
     the session log simply ending after the evaluator's turn, which read
     as a deliberate exit. The abort must be logged and the checkpoint left
     at the evaluator stage so a plain re-run retries the accept.
+
+    The assertion is on the underlying git failure — the type and message a
+    reader needs to diagnose the abort. Both engines propagate the *original*
+    exception rather than a summary ``RuntimeError`` wrapping it, so this holds
+    whichever one dispatched the batch (here, the default).
     """
     from agent_flow.workflows.perf_optimize import gitops as gitops_module
 
@@ -2497,7 +2630,7 @@ def test_crash_mid_accept_is_logged_and_leaves_resumable_checkpoint(tmp_path, mo
         raise gitops_module.GitOpsError("`git commit` failed: pre-commit hook")
 
     fake.commit_all = _boom
-    monkeypatch.setattr(workflow_module, "gitops", fake)
+    patch_git(monkeypatch, fake)
 
     messages: list[str] = []
     real_print_message = workflow_module.print_message
@@ -2513,7 +2646,7 @@ def test_crash_mid_accept_is_logged_and_leaves_resumable_checkpoint(tmp_path, mo
     workflow = Workflow(workspace=ws)
     _stub_agents(workflow)
     try:
-        with pytest.raises(RuntimeError, match="parallel optimization item"):
+        with pytest.raises(gitops_module.GitOpsError, match="pre-commit hook"):
             workflow.run(str(task))
     finally:
         workflow.close()
@@ -2601,7 +2734,7 @@ def test_reporter_requires_both_md_and_html(tmp_path, fake_git):
 
 def test_non_git_checkout_aborts_fresh_run(tmp_path, monkeypatch):
     fake = FakeGitOps(is_repo=False)
-    monkeypatch.setattr(workflow_module, "gitops", fake)
+    patch_git(monkeypatch, fake)
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -2625,7 +2758,7 @@ def test_branch_is_checkpointed_before_creation(tmp_path, monkeypatch):
             super().create_branch(repo, name)
 
     fake = AssertingGit()
-    monkeypatch.setattr(workflow_module, "gitops", fake)
+    patch_git(monkeypatch, fake)
     task = _write_task(tmp_path)
     workflow = Workflow(workspace=ws)
     _stub_agents(workflow)
@@ -2807,6 +2940,64 @@ def test_max_rounds_override_applies_on_fresh_run(tmp_path, fake_git):
     ]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.max_rounds == 1
+
+
+def test_parallel_engine_override_reaches_the_resolved_workspace_spec(tmp_path, fake_git):
+    """The override survives the trip from constructor arg to campaign record.
+
+    Which is the whole point of putting it in the resolved spec rather than in
+    ``WorkflowState``: two finished campaigns are otherwise indistinguishable
+    without the shell history that launched them.
+    """
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws, parallel_engine_override="threads")
+    _stub_agents(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
+    assert resolved["optimize"]["parallel_engine"] == "threads"
+    assert workflow._parallel_engine() == "threads"
+
+
+def test_parallel_engine_override_is_ignored_on_resume_with_a_warning(tmp_path, fake_git, capsys):
+    """A campaign keeps the engine it started under, and says so if you ask.
+
+    The resolved spec is written once, on the fresh run. Someone comparing the
+    engines would plausibly try re-running the same workspace with the other
+    value, so the flag has to say plainly that this is not how to do it.
+    """
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1}})
+    ws = tmp_path / "ws"
+    first = Workflow(workspace=ws, parallel_engine_override="threads")
+    _stub_agents(first)
+    try:
+        first.run(str(task))
+    finally:
+        first.close()
+
+    # Reopen the finished campaign asking for the other engine.
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    state.done = False
+    state_module.save_state(ws / state_module.STATE_FILENAME, state)
+    capsys.readouterr()
+
+    resumed = Workflow(workspace=ws, parallel_engine_override="dag")
+    _stub_agents(resumed)
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+
+    out = capsys.readouterr().out
+    assert "--parallel-engine dag" in out
+    assert "ignored on resume" in out
+    # The workspace kept the engine it was resolved with.
+    resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
+    assert resolved["optimize"]["parallel_engine"] == "threads"
 
 
 # ---------------------------------------------------------- real-git end-to-end
@@ -4464,3 +4655,413 @@ def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
     assert "only these ranks are wrapped" in analyzer
     assert "Step 0 survey" in analyzer
     assert "straggler verdict" in analyzer
+
+
+# --------------------------------------------- concurrent DAG engine (wiring)
+
+
+def _verdicts_by_item(workflow, table: dict[str, tuple]) -> None:
+    """Replace the evaluator stub with one whose verdict depends on the item.
+
+    ``_stub_agents`` hands out verdicts in call order, which is not stable once
+    the items run concurrently. Keying on ``current_item_id`` makes a mixed
+    accept/reject batch deterministic.
+    """
+
+    def evaluator(state, *, agent=None, progress_ctx=None):
+        (workflow._attempt_dir(state) / "evaluation.md").write_text("# e\n", encoding="utf-8")
+        decision, reason, gain, value = table[state.current_item_id]
+        entry = {
+            "step": 1,
+            "agent": "evaluator",
+            "summary": "e",
+            "decision": decision,
+            "reason_category": reason,
+            "measured_gain_pct": gain,
+            "measured_value": value,
+            "attempt": state.attempt_index + 1,
+            "item_id": state.current_item_id,
+        }
+        with workflow._progress_lock:
+            data = progress_module.read_progress(workflow.progress_path)
+            promoted = dict(entry)
+            promoted["step"] = len(data["optimization"]) + 1
+            data["optimization"].append(promoted)
+            progress_module.write_progress(workflow.progress_path, data)
+        if progress_ctx is not None:
+            local = progress_module.read_progress(progress_ctx.path)
+            local["optimization"].append(entry)
+            progress_module.write_progress(progress_ctx.path, local)
+
+    workflow._run_evaluator = evaluator
+
+
+def test_a_rejected_item_never_blocks_its_siblings_from_integrating(tmp_path, fake_git):
+    """A rejected item is a finished node with nothing to contribute, not a failure.
+
+    The scheduler BLOCKS every dependent of a FAILED node and never runs it.
+    Reporting an evaluator REJECT as ``NodeState.FAILED`` would therefore let
+    one turned-down optimization suppress the whole batch. Terminal items are
+    always ``DONE`` and carry their verdict in ``NodeOutcome.info`` instead;
+    this pins that end to end — two of three items are rejected and the
+    survivor still reaches the Integrator, the roadmap, and ``current_best``.
+    """
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1, "max_items_per_round": 3}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(
+        workflow,
+        analyzer_items=[
+            [_item("opt-001", gain=10.0), _item("opt-002", gain=8.0), _item("opt-003", gain=5.0)]
+        ],
+    )
+    _verdicts_by_item(
+        workflow,
+        {
+            "opt-001": ("REJECT", "perf_shortfall", -0.4, 99.6),
+            "opt-002": ("APPROVE", "none", 8.4, 108.4),
+            "opt-003": ("REJECT", "perf_shortfall", -0.2, 99.8),
+        },
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "failed"
+    assert roadmap_schema.find_item(roadmap, "opt-003")["status"] == "failed"
+    # The Integrator ran despite two rejections, and its measurement is the
+    # one the campaign now compares against.
+    assert (ws / "rounds" / "round_1" / "integration" / "integration.md").is_file()
+    assert roadmap["current_best"]["value"] == pytest.approx(108.4)
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        # Unset ⇒ follow the batch size, as sizing the pool to it always did.
+        (None, 3),
+        (1, 1),
+        (2, 2),
+        # A knob above the batch size cannot invent items to run.
+        (9, 3),
+    ],
+)
+def test_max_parallel_items_bounds_concurrency_independently_of_the_batch(
+    tmp_path, fake_git, monkeypatch, configured, expected
+):
+    """``optimize.max_parallel_items`` is what the scheduler is actually given.
+
+    The batch size is a statement about planning breadth; how many
+    ``trtllm-serve`` instances the hardware can host at once is a separate fact,
+    and before the knob existed the two were the same number by construction.
+    Pinned on the ``dag`` engine here; ``threads`` gets the same treatment in
+    ``test_the_threads_engine_also_honors_max_parallel_items``.
+    """
+    seen: list[int] = []
+    real_scheduler = workflow_module.NodeScheduler
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["max_parallel"])
+        return real_scheduler(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "NodeScheduler", spy)
+
+    optimize: dict = {"max_rounds": 1, "max_items_per_round": 3, "parallel_engine": "dag"}
+    if configured is not None:
+        optimize["max_parallel_items"] = configured
+    task = _write_task(tmp_path, {"optimize": optimize})
+    workflow = Workflow(workspace=tmp_path / "ws")
+    _stub_agents(
+        workflow,
+        analyzer_items=[
+            [_item("opt-001", gain=10.0), _item("opt-002", gain=8.0), _item("opt-003", gain=5.0)]
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert seen, "the parallel path must drive the batch through the scheduler"
+    assert set(seen) == {expected}
+
+
+def test_a_batch_row_predating_the_engine_still_derives_its_node_id():
+    """A checkpoint written before ``node_id`` existed must still dispatch.
+
+    The id is a pure function of the row's position and item id, so a resumed
+    batch re-derives it instead of failing on a missing field — and a row that
+    *does* carry one keeps it, so recorded worktree paths stay valid.
+    """
+    assert (
+        workflow_module._entry_node_id({"item_index": 1, "current_item_id": "opt-007"})
+        == "item_2_opt-007"
+    )
+    assert (
+        workflow_module._entry_node_id(
+            {"node_id": "item_9_pinned", "item_index": 1, "current_item_id": "opt-007"}
+        )
+        == "item_9_pinned"
+    )
+
+
+@pytest.mark.parametrize("engine", ["dag", "threads"])
+def test_a_concurrent_real_git_batch_isolates_every_item(tmp_path, engine):
+    """Three items, real git, running concurrently — on either engine.
+
+    This is the test that says concurrent ``git worktree add`` against one
+    repository is safe and that each item really edited its own checkout rather
+    than a shared one. Both engines are held to it because the point of keeping
+    ``threads`` is that it is interchangeable; they differ only in *who* creates
+    the worktrees — the provider inside ``acquire`` (``dag``) versus
+    ``_ensure_item_runtime`` up front on the orchestrator thread (``threads``).
+    """
+    repo = _init_real_repo(tmp_path)
+    task = _write_task(
+        tmp_path,
+        {
+            "optimize": {
+                "max_rounds": 1,
+                "max_items_per_round": 3,
+                "max_parallel_items": 3,
+                "parallel_engine": engine,
+            }
+        },
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(
+        workflow,
+        analyzer_items=[
+            [
+                _item("opt-001", gain=10.0, approach="code"),
+                _item("opt-002", gain=8.0, approach="code"),
+                _item("opt-003", gain=5.0, approach="code"),
+            ]
+        ],
+    )
+    original_optimizer = workflow._run_optimizer
+    seen_worktrees: dict[str, str] = {}
+
+    def optimizer_editing_its_own_worktree(state, **kwargs):
+        worktree = Path(state.item_worktree_path)
+        seen_worktrees[state.current_item_id] = str(worktree)
+        # Each item writes a marker only it should ever produce. A shared
+        # checkout would let one item observe (and commit) another's marker.
+        (worktree / f"{state.current_item_id}.py").write_text(
+            f"# {state.current_item_id}\n", encoding="utf-8"
+        )
+        original_optimizer(state, **kwargs)
+
+    workflow._run_optimizer = optimizer_editing_its_own_worktree
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    # Every item got its own worktree, and every worktree was distinct.
+    assert set(seen_worktrees) == {"opt-001", "opt-002", "opt-003"}
+    assert len(set(seen_worktrees.values())) == 3
+
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    for item_id in ("opt-001", "opt-002", "opt-003"):
+        assert roadmap_schema.find_item(roadmap, item_id)["status"] == "accepted"
+
+    # The integrated campaign branch carries all three markers — proof the
+    # per-item commits survived teardown and were cherry-picked, not lost.
+    tracked = _real_git(repo, "ls-files")
+    for item_id in ("opt-001", "opt-002", "opt-003"):
+        assert f"{item_id}.py" in tracked
+
+    # Worktrees and branches are both cleaned up afterwards, on either engine.
+    assert not (ws / "worktrees" / "round_1").exists() or not any(
+        (ws / "worktrees" / "round_1").iterdir()
+    )
+    branches = _real_git(repo, "branch", "--list")
+    assert "round-1-item_1_opt-001" not in branches
+
+
+def test_the_threads_engine_runs_a_batch_without_the_scheduler(tmp_path, fake_git, monkeypatch):
+    """The default engine fans out without building a scheduler at all.
+
+    The scheduler is made un-constructible, so this fails if the default ever
+    silently becomes ``dag``. The round must still land where the DAG engine
+    lands it: both items accepted through one Integrator verdict.
+    """
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the threads engine must not build a NodeScheduler")
+
+    monkeypatch.setattr(workflow_module, "NodeScheduler", refuse)
+
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"max_items_per_round": 2, "parallel_engine": "threads"}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
+        evaluator_verdicts=[
+            ("APPROVE", "none", 8.4, 108.4),
+            ("APPROVE", "none", 3.0, 111.6),
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace.count("optimizer") == 2
+    assert trace.count("evaluator") == 2
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    for item_id in ("opt-001", "opt-002"):
+        assert roadmap_schema.find_item(roadmap, item_id)["status"] == "accepted"
+    # Via the Integrator, not accepted straight from the items.
+    assert roadmap["current_best"]["source"] == "rounds/round_1/integration/integration.md"
+    # The batch lifecycle is emitted by the shared caller, so it survives the
+    # engine swap — the events a resume and the report both read.
+    events = [
+        entry.get("event")
+        for entry in progress_module.read_progress(workflow.progress_path)["optimization"]
+        if entry.get("agent") == "optimizer_evaluator"
+    ]
+    assert events == ["batch_started", "batch_completed"]
+
+
+def test_the_threads_engine_also_honors_max_parallel_items(tmp_path, fake_git, monkeypatch):
+    """The concurrency cap is a statement about the machine, not about an engine.
+
+    The thread pool used to be sized to the batch, so without this the default
+    engine would silently lack the ability to say "this node hosts one
+    ``trtllm-serve`` at a time" that ``dag`` has.
+    """
+    real_pool = workflow_module.ThreadPoolExecutor
+    seen: list[int] = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["max_workers"])
+        return real_pool(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "ThreadPoolExecutor", spy)
+
+    task = _write_task(
+        tmp_path,
+        {
+            "optimize": {
+                "max_rounds": 1,
+                "max_items_per_round": 3,
+                "max_parallel_items": 1,
+                "parallel_engine": "threads",
+            }
+        },
+    )
+    workflow = Workflow(workspace=tmp_path / "ws")
+    _stub_agents(
+        workflow,
+        analyzer_items=[
+            [_item("opt-001", gain=10.0), _item("opt-002", gain=8.0), _item("opt-003", gain=5.0)]
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert seen == [1]
+
+
+def test_a_failed_integrator_check_does_not_strand_a_resume(tmp_path, fake_git):
+    """The deadlock this downgrade exists to break, pinned end to end.
+
+    Observed on a real campaign: the integrator returned FALLBACK_BEST with a
+    gain below the threshold it had itself reported, the orchestrator raised,
+    and the run could never continue — ``integration.md`` and the progress entry
+    were already on disk, so the cached-verdict guard skipped re-running the
+    integrator on resume and the very same check raised again. ``--clean`` was
+    the only way out of a campaign that had already paid for two hours of GPU.
+
+    A second ``run()`` on the same workspace must therefore be a no-op that
+    finds the campaign finished, not another abort.
+    """
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow)
+
+    def contradictory_integrator(prompt):
+        state = state_module.load_state(workflow.state_path)
+        integration_dir = workflow._round_dir(state) / "integration"
+        (integration_dir / "integration.md").write_text("# contradictory\n", encoding="utf-8")
+        data = progress_module.read_progress(workflow.progress_path)
+        data["optimization"].append(
+            {
+                "step": len(data["optimization"]) + 1,
+                "agent": "integrator",
+                "round": state.round_index + 1,
+                "summary": "fallback that misses its own bar",
+                "decision": "FALLBACK_BEST",
+                "included_item_ids": ["opt-001"],
+                "dropped_item_ids": [],
+                "remediation_attempts": 2,
+                # Below required_gain_pct — exactly the real failure.
+                "measured_gain_pct": 0.5,
+                "measured_value": 100.5,
+                "required_gain_pct": 7.4,
+                "best_candidate_id": "opt-001",
+            }
+        )
+        progress_module.write_progress(workflow.progress_path, data)
+
+    workflow.integrator = contradictory_integrator
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    _assert_verdict_downgraded(workflow, ws, "below the required")
+    assert state_module.load_state(workflow.state_path).done is True
+
+    # Resume: the campaign is already done, so this must return quietly rather
+    # than re-entering the integrator stage and raising again.
+    resumed = Workflow(workspace=ws)
+    try:
+        resumed.run(str(task))
+    finally:
+        resumed.close()
+    assert state_module.load_state(resumed.state_path).done is True
+
+
+def test_a_closed_round_leaves_no_dangling_branches(tmp_path, fake_git):
+    """Every branch a round created is freed when the round closes.
+
+    Item branches outlive their worktrees on purpose — the out-of-graph
+    Integrator still has to cherry-pick them — so the campaign, not the
+    isolation provider, owns freeing them. The integration branch belongs to the
+    same sweep: an accepted integration is already fast-forwarded onto the
+    campaign branch and a rejected one contributed nothing, so keeping it just
+    leaks one ref per round.
+    """
+    task = _write_task(tmp_path, {"optimize": {"max_rounds": 1, "max_items_per_round": 2}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(
+        workflow,
+        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=8.0)]],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    deleted = {c[1] for c in fake_git.calls if c[0] == "delete_branch"}
+    created = {c[2] for c in fake_git.calls if c[0] == "create_worktree"}
+    assert created, "the round must have created per-item branches to free"
+    assert created <= deleted, f"item branches left dangling: {sorted(created - deleted)}"
+    assert any("-integration" in b for b in deleted), (
+        f"the integration branch was never freed; deleted={sorted(deleted)}"
+    )

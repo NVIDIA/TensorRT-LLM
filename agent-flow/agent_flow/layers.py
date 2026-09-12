@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncIterator, Callable
 
@@ -102,6 +103,20 @@ class AgentLayer(Module):
         return self.config.name or self.__class__.__name__
 
     def forward(self, content: str) -> str:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # A loop is already running on this thread. The stateless path
+            # (``anyio.run``) would fail here with a cryptic message, and the
+            # persistent path (``PortalRunner`` on a background loop) might not
+            # fail at all — silently binding the client to the wrong loop.
+            # Raise one clear, consistent error for both modes.
+            raise RuntimeError(
+                "AgentLayer.forward() called from within a running event "
+                "loop; use `await aforward()` instead."
+            )
         if self.config.session.mode == "persistent":
             return self._runner.call(self._invoke_persistent, content)
         return anyio.run(self._invoke_once, content)

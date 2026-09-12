@@ -243,6 +243,28 @@ def _append(path: Path, agent: str, entry: dict[str, Any]) -> None:
     write_progress(path, data)
 
 
+def record_progress_entry(
+    path: Path, agent: str, iteration: int, fields: dict[str, Any]
+) -> dict[str, Any]:
+    """Stamp, append, and log one progress entry, returning the full entry.
+
+    The write path for a caller that already holds the entry's content rather
+    than receiving it through an ``append_*_progress`` MCP tool. ``iteration``,
+    ``agent`` and ``timestamp`` are stamped here so a log written this way stays
+    consistent with the tool-written one; ``fields`` supplies the role-specific
+    keys in their canonical order.
+    """
+    entry = {
+        "iteration": iteration,
+        "agent": agent,
+        "timestamp": _now_iso(),
+        **fields,
+    }
+    _append(path, agent, entry)
+    _log_progress_write(agent, entry)
+    return entry
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 

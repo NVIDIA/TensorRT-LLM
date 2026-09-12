@@ -92,11 +92,12 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   unexplained).
 - **optimizer** — one independent persistent optimizer is created for each
   dispatched item. With `item_execution: parallel`, up to
-  `max_items_per_round` pairs run concurrently from the same frozen round
-  base. With `serial`, each worktree starts from the latest accepted
-  campaign state. In both modes, approved and rejected terminal items
-  consume the shared `max_items_per_round` budget. Retries for one item
-  are always sequential:
+  `max_parallel_items` pairs run concurrently from the same frozen round
+  base, on whichever engine `parallel_engine` selects (see *How the parallel
+  batch runs* below). With `serial`, each worktree starts
+  from the latest accepted campaign state. In both modes, approved and
+  rejected terminal items consume the shared `max_items_per_round` budget.
+  Retries for one item are always sequential:
   `approach: config` edits `tuning/extra_llm_api_options.yaml`;
   `approach: code` edits the TRT-LLM source (installed-package check
   first). Smoke-checks the server, never benchmarks, never commits.
@@ -281,6 +282,48 @@ according to `optimize.item_execution`; parallel candidates are combined
 and measured by the Integrator, while serial candidates are accepted
 directly.
 
+### How the parallel batch runs
+
+Parallel mode fans the round's items out over a `ThreadPoolExecutor`, bounded by
+`max_parallel_items`, with each item's worktree created up front from the path
+and branch the batch ledger records. This is the default (`parallel_engine:
+threads`).
+
+`optimize.parallel_engine: dag` runs the same batch on
+`agent_flow.orchestration.NodeScheduler` — the workflow-agnostic DAG engine the
+framework ships — instead. It is opt-in: the two are interchangeable for what
+this workflow does today, so the engine buys a round what the engine gains
+(pause/replan, cross-node dependencies) at the cost of a second scheduling
+mechanism in the picture. Under `dag`:
+
+- **The graph is flat.** The items are independent by construction (they all
+  fork from the same frozen base), and the Integrator is deliberately *not* a
+  node: it runs after the scheduler returns so it can cherry-pick candidates in
+  roadmap order and apply the acceptance checks the engine knows nothing about.
+- **A turned-down item is a completed node, not a failed one.** The scheduler
+  blocks the dependents of a `FAILED` node; an evaluator REJECT is therefore
+  reported as `DONE` carrying its verdict, so one rejected optimization can
+  never suppress its siblings. `FAILED` is reserved for infrastructure errors,
+  which abort the round and leave a resumable checkpoint.
+- **Isolation is the engine's `IsolationProvider`.** Each item gets its worktree
+  from `CandidateWorktreeIsolation`, which frees the worktree as soon as the
+  item finishes but keeps its branch alive — the out-of-graph Integrator still
+  has to read it. The branches are freed once integration is done.
+- **`max_parallel_items` is independent of the batch size.** See the config
+  table.
+- **`item_batch` in the checkpoint stays the single authority** on which items
+  are terminal, so the scheduler runs without a checkpoint of its own and the
+  graph is rebuilt from the ledger on every resume.
+
+Everything around either engine — the batch ledger, resume, the worktree and
+branch naming, the Integrator, round cleanup, and how a crashed item's original
+exception propagates — is engine-agnostic and shared, which is what makes them
+swappable. Compare them with `--parallel-engine` (see *Usage*).
+
+`item_execution: serial` uses neither — it keeps its own one-at-a-time path,
+because each serial item rebases on the previous item's *accepted* state and is
+accepted directly rather than through the Integrator.
+
 - **Profiling round** — round 1; any round opening after an accept; and
   any round whose reverted code attempt may have changed ignored build
   output. Re-profiles the current runtime (nsys + ncu per
@@ -375,7 +418,16 @@ perf-optimize --task path/to/task.yaml --workspace workspace/perf-optimize/my-mo
 perf-optimize --task ... --workspace ... --max-rounds 5
 # start at the optimize stage, reusing a previous run's analysis:
 perf-optimize --task ... --workspace ... --reuse-analysis workspace/perf-analyze/my-model
+
+# A/B the two parallel engines on ONE task.yaml — two workspaces, one flag apart.
+# Each workspace's resolved task.yaml records the engine it ran under.
+perf-optimize --task task.yaml --workspace ws/engine-threads --parallel-engine threads
+perf-optimize --task task.yaml --workspace ws/engine-dag     --parallel-engine dag
 ```
+
+`--parallel-engine` (like `--max-rounds`) applies on a **fresh run** only: the
+resolved spec is materialized into the workspace once, so re-running an existing
+workspace with the other value warns and keeps the engine it started with.
 
 ## task.yaml
 
@@ -398,6 +450,9 @@ exactly as in perf-analyze):
 | `optimize.max_rounds` | no | `5` | The number of rounds the loop **runs** (not just a cap — only the two deterministic breaks above end it earlier); each round is one analyzer turn + up to `max_items_per_round` items, so `max_rounds × max_items_per_round` bounds total items attempted. Only rounds with a stale or unproven runtime profile pay to refresh it (see *What a round costs*), so this bounds items far more tightly than GPU hours. |
 | `optimize.max_items_per_round` | no | `3` | Maximum optimizer/evaluator pairs selected per round. Every pair owns an isolated worktree, tuning copy, progress file, and bounded attempt loop. |
 | `optimize.item_execution` | no | `parallel` | `parallel` fans out all selected pairs from one frozen round base and runs the Integrator. `serial` runs them one at a time from the latest accepted campaign state, accepts each approved candidate directly, and emits no batch lifecycle or Integrator progress events. |
+| `optimize.parallel_engine` | no | `threads` | Parallel mode only: which engine fans the batch out. `threads` is this workflow's own thread pool. `dag` opts into the shared `agent_flow.orchestration` scheduler — same batch ledger, same worktree/branch naming, same Integrator, same `max_parallel_items`, same propagated exception on a crash. The one behavioral difference is *when* worktrees are freed: `dag` releases each as its item finishes, `threads` keeps them until the round closes. |
+| `optimize.max_parallel_items` | no | `max_items_per_round` | Parallel mode only: how many of the round's selected items may execute **at once**. The batch size is a statement about planning breadth; this is a statement about the machine, because every concurrent item launches its own `trtllm-serve` and benchmark. Lower it when the batch is wider than the hardware can host simultaneously. |
+| `slurm-environment.container_setup` | no | — | Shell run verbatim **inside the container**, before anything else, in every Slurm step. Write it when `docker_image` is a CI build image rather than a release one — those ship the toolchain but not the runtime dependencies, and pyxis resets `PATH` when it starts a container, so a virtualenv on the shared filesystem cannot be handed in from outside. Reaches every role that opens a step (benchmarker, analyzer, optimizer, evaluator, integrator, qa). |
 | `optimize.max_attempts_per_item` | no | `3` | Total optimizer attempts per item: PUSH_BACK verdicts retry until this bound, then the item is marked `failed` and reverted (an explicit REJECT fails it immediately). |
 | `optimize.approaches` | no | `[config, code]` | Which optimization approaches the run may plan/apply: `config` edits the live tuning YAML, `code` edits the TRT-LLM source. Restrict to `[code]` for a code-only campaign (no knob tuning) or `[config]` to leave the checkout untouched. Enforced in three layers: the analyzer only plans allowed items, the orchestrator never dispatches a disallowed pending item, and any attempt that edits through a disallowed approach (tuning file differs from the accepted snapshot / dirty worktree) is auto-rejected before the evaluator benchmarks it. |
 | `optimize.accept_fraction` | no | `0.5` | Fraction of an item's `expected_gain_pct` the measured gain must reach. |

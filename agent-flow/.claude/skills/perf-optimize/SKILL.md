@@ -139,6 +139,19 @@ than inventing values:
   is what bounds the items a campaign can attempt — 15 with the defaults.
   `optimize.item_execution` defaults to `parallel`; set it to `serial`
   to apply approved items directly in order from the latest campaign state.
+  In `parallel` mode, `optimize.max_parallel_items` caps how many items run at
+  once (default: `max_items_per_round`). Each concurrent item launches its own
+  `trtllm-serve` and benchmark, so on a single node without a
+  `slurm-environment` block tell the user to set it to `1` — otherwise the
+  concurrent servers contend for the same GPUs and port.
+  `optimize.parallel_engine` picks the engine: `threads` (default, this
+  workflow's thread pool) or `dag` (the shared orchestration scheduler). They
+  run the same batch, the same Integrator, and honor `max_parallel_items`. Do
+  not raise this unprompted — it is for a user who wants to compare the two or
+  needs what the DAG engine adds. For a comparison, tell them to point two
+  `--workspace` directories at one task.yaml and vary only
+  `--parallel-engine`: the flag is fresh-run only, so re-running one workspace
+  with the other value will not switch engines.
   Two things worth telling the user when sizing a run:
   - **Rounds are not equally expensive.** A round pays for a profile
     after an accept, after a reverted code attempt may have changed

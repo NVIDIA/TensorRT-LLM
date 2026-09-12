@@ -298,6 +298,33 @@ def test_clean_wipes_checkpoint_and_managed_files(tmp_path):
         workflow.close()
 
 
+def test_clean_wipes_concurrent_graph_state_and_node_workspaces(tmp_path):
+    """``--clean`` also removes concurrent-mode state so a rerun re-plans from scratch.
+
+    Regression: ``--clean`` previously wiped only the linear managed files, leaving
+    ``.graph_state.json`` (the NodeScheduler checkpoint) and ``nodes/`` (per-node
+    sub-workspaces) behind — so a ``--clean --concurrent`` rerun silently resumed the
+    prior (possibly crashed) graph instead of starting over.
+    """
+    module = _load_module()
+    (tmp_path / ".graph_state.json").write_text(
+        '{"version": 1, "states": {"s1": "running"}}\n', encoding="utf-8"
+    )
+    node_dir = tmp_path / "nodes" / "s1.g1"
+    node_dir.mkdir(parents=True)
+    (node_dir / "progress.yaml").write_text("- iteration: 3\n", encoding="utf-8")
+
+    workflow = _make_workflow(module, tmp_path, clean=True)
+    try:
+        assert workflow.resume is False
+        # The concurrent scheduler checkpoint is gone (no stale resume).
+        assert not (tmp_path / ".graph_state.json").exists()
+        # Per-node sub-workspaces are gone.
+        assert not (tmp_path / "nodes").exists()
+    finally:
+        workflow.close()
+
+
 def test_clean_on_empty_workspace_is_a_noop(tmp_path):
     """``--clean`` against an empty workspace just starts fresh, no error."""
     module = _load_module()
@@ -765,6 +792,27 @@ def test_clean_cli_flag_default_and_value(tmp_path):
     assert args.clean is False
     args = module._parse_args(_TASK_CLI + ["--clean"])
     assert args.clean is True
+
+
+def test_max_replan_rounds_default_and_custom(tmp_path):
+    """``max_replan_rounds`` defaults to 3 and stores a custom value."""
+    module = _load_module()
+    ws_a, ws_b = tmp_path / "a", tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    wf = module.AgentTeamWorkflow(workspace=ws_a)
+    assert wf.max_replan_rounds == 3
+    wf = module.AgentTeamWorkflow(workspace=ws_b, max_replan_rounds=5)
+    assert wf.max_replan_rounds == 5
+
+
+def test_max_replan_rounds_cli_flag_default_and_value():
+    """``--max-replan-rounds`` parses to 3 by default and to the supplied int."""
+    module = _load_cli_module()
+    args = module._parse_args(_TASK_CLI)
+    assert args.max_replan_rounds == 3
+    args = module._parse_args(_TASK_CLI + ["--max-replan-rounds", "5"])
+    assert args.max_replan_rounds == 5
 
 
 def test_feedback_cli_flag_default_and_value():

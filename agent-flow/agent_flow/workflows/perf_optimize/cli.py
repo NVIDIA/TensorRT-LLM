@@ -10,7 +10,9 @@ from .disagg import has_disagg
 from .prompts import build_perf_optimize_prompts
 from .state import STATE_FILENAME
 from .task_schema import (
+    PARALLEL_ENGINES,
     TaskSchemaError,
+    container_setup,
     has_slurm_environment,
     kernel_coverage,
     load_and_validate_task_yaml,
@@ -104,6 +106,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "`optimize.item_execution` mode). "
         "Ignored on resume — the checkpointed budget wins.",
     )
+    parser.add_argument(
+        "--parallel-engine",
+        choices=list(PARALLEL_ENGINES),
+        default=None,
+        help="Override `optimize.parallel_engine` from task.yaml on a fresh "
+        "run: which engine fans out an `item_execution: parallel` batch. "
+        "`threads` (the default) uses this workflow's own thread pool; `dag` "
+        "opts into the shared agent_flow.orchestration scheduler. To compare "
+        "them, point two --workspace directories at one task.yaml and vary "
+        "only this flag — each workspace's resolved task.yaml then records "
+        "the engine it ran under. "
+        "Ignored on resume — the resolved spec in the workspace wins.",
+    )
     return parser.parse_args(argv)
 
 
@@ -113,6 +128,7 @@ def main(argv: list[str] | None = None) -> None:
         task_data = load_and_validate_task_yaml(
             args.task,
             max_rounds_override=args.max_rounds,
+            parallel_engine_override=args.parallel_engine,
         )
     except TaskSchemaError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -139,6 +155,7 @@ def main(argv: list[str] | None = None) -> None:
         kernel_coverage=kernel_coverage(task_data),
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
+        container_setup=container_setup(task_data),
     )
     with PerfOptimizeWorkflow(
         workspace=args.workspace,
@@ -147,6 +164,7 @@ def main(argv: list[str] | None = None) -> None:
         max_rounds_override=args.max_rounds,
         reuse_analysis=args.reuse_analysis,
         sol_methodology=methodology,
+        parallel_engine_override=args.parallel_engine,
     ) as workflow:
         workflow.run(args.task)
 

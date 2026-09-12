@@ -98,6 +98,21 @@ def remove_worktree(repo: str | Path, path: str | Path) -> None:
     _git(repo, "worktree", "remove", "--force", str(path))
 
 
+def delete_branch(repo: str | Path, name: str) -> None:
+    """Delete a per-item candidate branch once integration has consumed it.
+
+    Deliberately tolerant: an already-deleted branch (a re-run, a batch whose
+    worktree creation never got far enough to make one) must not fail the
+    campaign, so a non-zero ``git branch -D`` is swallowed. The branch is
+    plumbing — losing the ability to delete it is not worth aborting a round
+    that has already produced measurements.
+    """
+    try:
+        _git(repo, "branch", "-D", name)
+    except GitOpsError:
+        return
+
+
 def reset_to(repo: str | Path, commit: str) -> None:
     """Reset a worker branch and its files to the frozen item base."""
     _git(repo, "reset", "--hard", commit)

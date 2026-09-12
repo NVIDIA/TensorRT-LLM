@@ -114,6 +114,17 @@ profile:
 #   max_items_per_round: 3      # maximum roadmap items selected per round
 #   item_execution: parallel    # parallel: isolated workers then Integrator;
 #                               # serial: one worker at a time, accepted directly
+#   parallel_engine: threads    # which engine runs `item_execution: parallel`.
+#                               # threads (default): this workflow's own thread
+#                               # pool. dag: the shared orchestration DAG
+#                               # scheduler — same batch, same Integrator, one
+#                               # more moving part. Ignored by serial
+#   max_parallel_items: 3       # how many of those items may run AT ONCE
+#                               # (parallel mode only; defaults to
+#                               # max_items_per_round). Each concurrent item
+#                               # launches its own trtllm-serve + benchmark, so
+#                               # lower this when the batch is wider than the
+#                               # hardware can host at the same time
 #   max_attempts_per_item: 3    # total optimizer attempts per item: evaluator
 #                               # PUSH_BACK verdicts retry up to this bound (an
 #                               # explicit REJECT fails the item immediately)
@@ -168,6 +179,16 @@ profile:
 #   docker_image: /remote/path/to/trtllm-pytorch-<version>.sqsh
 #   cluster_ssh: user@login-host       # enables remote execution
 #   remote_run_root: /remote/path/to/perf-optimize/my-campaign
+#   # Optional shell prelude, run verbatim INSIDE the container before any
+#   # other command, in every Slurm step. Needed when docker_image is a CI
+#   # *build* image rather than a release one: those carry the toolchain but
+#   # not the runtime dependencies, so `trtllm-serve` is missing and
+#   # `import tensorrt_llm` fails on the first third-party package. A
+#   # virtualenv on the shared filesystem cannot be handed in from outside --
+#   # pyxis resets PATH when it starts a container (PYTHONPATH survives, PATH
+#   # does not) -- so this is where you say "activate it". Also covers a
+#   # `module load`, an extra PATH entry, or a license variable.
+#   container_setup: "source /path/to/TensorRT-LLM/.venv-3.12/bin/activate"
 
 # Optional: the one-shot analytical SOL-projection stage between the
 # baseline benchmark and round 1 (benchmarker -> projector ->

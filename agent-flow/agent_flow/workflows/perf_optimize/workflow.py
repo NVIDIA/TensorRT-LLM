@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+import anyio
 import yaml
 from rich.markup import escape
 
@@ -23,6 +24,7 @@ from agent_flow import (
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
+from agent_flow.orchestration import ExecutionGraph, Node, NodeOutcome, NodeScheduler, NodeState
 from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
 from agent_flow.workflows.perf_analyze.sol_methodology import (
     SolMethodology,
@@ -33,6 +35,7 @@ from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_res
 
 from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
+from .isolation import CandidateWorktreeIsolation, item_node_id
 from .progress import (
     EVALUATOR_DECISIONS,
     INTEGRATOR_DECISIONS,
@@ -74,6 +77,21 @@ from .task_schema import (
     profile_ranks,
     sol_enabled,
 )
+
+
+def _entry_node_id(entry: dict[str, Any]) -> str:
+    """The scheduler node id for a batch row, derived when the row predates it.
+
+    ``node_id`` is written by :meth:`PerfOptimizeWorkflow._prepare_item_batch`,
+    but a checkpoint from before the DAG engine landed carries a batch without
+    it. The id is a pure function of the row's position and item id, so it is
+    re-derived rather than treated as a missing-field error — a resumed batch
+    keeps the worktree paths it already recorded.
+    """
+    recorded = str(entry.get("node_id", "") or "")
+    if recorded:
+        return recorded
+    return item_node_id(int(entry.get("item_index", 0)), str(entry["current_item_id"]))
 
 
 def _progress_has_entries(path: Path) -> bool:
@@ -224,6 +242,7 @@ class PerfOptimizeWorkflow:
         max_rounds_override: int | None = None,
         reuse_analysis: str | Path | None = None,
         sol_methodology: SolMethodology | None = None,
+        parallel_engine_override: str | None = None,
     ) -> None:
         self.workspace = workspace
         self.prompts = prompts or DEFAULT_PROMPTS
@@ -233,6 +252,7 @@ class PerfOptimizeWorkflow:
         # suite included — never pays a live probe.
         self.sol_methodology = sol_methodology or SolMethodology()
         self.max_rounds_override = max_rounds_override
+        self.parallel_engine_override = parallel_engine_override
         self.reuse_analysis = Path(reuse_analysis).expanduser() if reuse_analysis else None
         self.task_path = workspace / "task.yaml"
         self.baseline_dir = workspace / "baseline"
@@ -530,7 +550,7 @@ class PerfOptimizeWorkflow:
                         break
                     state.stage = STAGE_OPTIMIZER_EVALUATOR
                     parallel = state.item_execution == "parallel"
-                    self._prepare_item_batch(state, items, eager_runtime=parallel)
+                    self._prepare_item_batch(state, items, seed_workspaces=parallel)
                     if parallel:
                         for item in items:
                             roadmap_schema.mark_in_progress(self.roadmap_path, item["id"])
@@ -647,6 +667,17 @@ class PerfOptimizeWorkflow:
                     f"--clean to start fresh with the new budget.[/bold yellow]",
                     log,
                 )
+            if (
+                self.parallel_engine_override is not None
+                and self.parallel_engine_override != self._parallel_engine()
+            ):
+                print_message(
+                    f"[bold yellow]⚠ --parallel-engine {self.parallel_engine_override} "
+                    f"ignored on resume; this workspace is already resolved to "
+                    f"{self._parallel_engine()}. Compare the engines with a second "
+                    f"--workspace, not by re-running this one.[/bold yellow]",
+                    log,
+                )
             if self.reuse_analysis is not None:
                 print_message(
                     f"[bold yellow]⚠ --reuse-analysis {self.reuse_analysis} ignored on "
@@ -662,6 +693,7 @@ class PerfOptimizeWorkflow:
         task_data = load_and_validate_task_yaml(
             task,
             max_rounds_override=self.max_rounds_override,
+            parallel_engine_override=self.parallel_engine_override,
         )
         self.task_path.write_text(dump_task_yaml(task_data), encoding="utf-8")
 
@@ -835,31 +867,54 @@ class PerfOptimizeWorkflow:
                 log,
             )
 
+    def _item_isolation(self, state: WorkflowState, base_commit: str):
+        """Build the worktree provider for this round's parallel item batch.
+
+        Naming is owned here rather than by :meth:`_prepare_item_batch` so the
+        checkpointed ledger and the scheduler can never disagree about where an
+        item ran: both derive every path and branch from this one provider plus
+        :func:`~agent_flow.workflows.perf_optimize.isolation.item_node_id`.
+        """
+        round_no = state.round_index + 1
+        return CandidateWorktreeIsolation(
+            repo_path=Path(self._trtllm_repo_path()),
+            worktrees_root=self.worktrees_dir / f"round_{round_no}",
+            branch_prefix=f"{state.campaign_git_branch}-round-{round_no}-",
+            base_ref=base_commit,
+        )
+
     def _prepare_item_batch(
         self,
         state: WorkflowState,
         items: list[dict[str, Any]],
         *,
-        eager_runtime: bool = True,
+        seed_workspaces: bool = True,
     ) -> None:
-        """Checkpoint a batch and optionally create every item runtime eagerly."""
+        """Checkpoint a round's batch and optionally seed each item's workspace.
+
+        ``seed_workspaces`` is the parallel path: every row's tuning copies and
+        private progress log are created up front, because the scheduler may
+        start all of them at once. Worktrees are **not** created here — on the
+        parallel path the isolation provider's ``acquire`` owns that, and on the
+        serial path each row's worktree is created just before it runs (its base
+        is the previous item's accepted state, which does not exist yet).
+        """
         repo = self._trtllm_repo_path()
         base = gitops.rev_parse_head(repo)
-        round_no = state.round_index + 1
+        isolation = self._item_isolation(state, base)
         batch: list[dict[str, Any]] = []
         for index, item in enumerate(items):
             item_id = str(item["id"])
-            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", item_id).strip("-.")[:48] or "item"
-            worktree = self.worktrees_dir / f"round_{round_no}" / f"item_{index + 1}_{safe}"
-            branch = f"{state.campaign_git_branch}-round-{round_no}-item-{index + 1}-{safe}"
+            node_id = item_node_id(index, item_id)
             batch.append(
                 {
                     "current_item_id": item_id,
                     "item_index": index,
                     "attempt_index": 0,
                     "approach_violation": "",
-                    "item_worktree_path": str(worktree),
-                    "item_branch": branch,
+                    "node_id": node_id,
+                    "item_worktree_path": str(isolation.worktree_path(node_id)),
+                    "item_branch": isolation.branch_name(node_id),
                     "item_base_commit": base,
                     "phase": STAGE_OPTIMIZER,
                     "status": "pending",
@@ -873,12 +928,18 @@ class PerfOptimizeWorkflow:
         state.batch_started = False
         state.batch_completed = False
         self._checkpoint(state)
-        if eager_runtime:
+        if seed_workspaces:
             for entry in state.item_batch:
-                self._ensure_item_runtime(state, entry)
+                self._ensure_item_workspace(state, entry)
 
     def _ensure_item_runtime(self, state: WorkflowState, entry: dict[str, Any]) -> None:
-        """Create any missing worktree/config/progress parts for a batch row."""
+        """Create any missing worktree/config/progress parts for a batch row.
+
+        The serial path calls this for everything, including the worktree. On
+        the parallel path the scheduler's isolation provider owns the worktree
+        (``acquire`` creates it), so only the workspace-side parts are seeded
+        there — see :meth:`_ensure_item_workspace`.
+        """
         worktree = Path(str(entry["item_worktree_path"]))
         if not worktree.exists():
             gitops.create_worktree(
@@ -887,6 +948,17 @@ class PerfOptimizeWorkflow:
                 str(entry["item_branch"]),
                 str(entry["item_base_commit"]),
             )
+        self._ensure_item_workspace(state, entry)
+
+    def _ensure_item_workspace(self, state: WorkflowState, entry: dict[str, Any]) -> None:
+        """Seed a batch row's workspace-side files (tuning copies, progress log).
+
+        Split out of :meth:`_ensure_item_runtime` because these live under
+        ``rounds/round_N/item_K/`` in the workspace, not in the git worktree —
+        so they are needed identically whether the worktree came from
+        ``gitops.create_worktree`` (serial) or the isolation provider
+        (parallel), and they must survive the provider's ``release``.
+        """
         local_state = self._local_item_state(state, entry)
         item_dir = self._item_dir(local_state)
         tuning_dir = item_dir / "tuning"
@@ -918,7 +990,7 @@ class PerfOptimizeWorkflow:
 
     def _run_opt_items_parallel(self, state: WorkflowState, log) -> None:
         for entry in state.item_batch:
-            self._ensure_item_runtime(state, entry)
+            self._ensure_item_workspace(state, entry)
         item_ids = [str(entry["current_item_id"]) for entry in state.item_batch]
         if not state.batch_started:
             append_workflow_event(
@@ -932,26 +1004,16 @@ class PerfOptimizeWorkflow:
             state.batch_started = True
             self._checkpoint(state)
 
-        errors: list[BaseException] = []
-        with ThreadPoolExecutor(
-            max_workers=max(1, len(state.item_batch)),
-            thread_name_prefix="perf-opt-item",
-        ) as executor:
-            futures = {
-                executor.submit(self._run_opt_item, state, dict(entry), log): entry
-                for entry in state.item_batch
-                if entry.get("status") not in ("candidate_ready", "failed")
-            }
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except BaseException as exc:  # preserve other completed item results
-                    errors.append(exc)
-        if errors:
-            raise RuntimeError(
-                f"{len(errors)} parallel optimization item(s) failed; "
-                f"first error: {type(errors[0]).__name__}: {errors[0]}"
-            ) from errors[0]
+        pending = [
+            entry
+            for entry in state.item_batch
+            if entry.get("status") not in ("candidate_ready", "failed")
+        ]
+        if pending:
+            if self._parallel_engine() == "dag":
+                self._run_item_graph(state, pending, log)
+            else:
+                self._run_item_threads(state, pending, log)
 
         if not state.batch_completed:
             append_workflow_event(
@@ -964,6 +1026,240 @@ class PerfOptimizeWorkflow:
             )
             state.batch_completed = True
             self._checkpoint(state)
+
+    def _run_item_graph(
+        self,
+        state: WorkflowState,
+        pending: list[dict[str, Any]],
+        log,
+    ) -> None:
+        """Drive one round's pending items through the concurrent DAG engine.
+
+        The ``parallel_engine: dag`` opt-in. Equivalent to
+        :meth:`_run_item_threads` for this workflow's purposes — same batch,
+        same ledger, same Integrator — but expressed on the shared engine, so
+        the round gains what the engine gains (pause/replan, cross-node
+        dependencies) at the cost of a second scheduling mechanism to reason
+        about. That trade is why it is opt-in rather than the default.
+
+        The graph is flat: the items all fork from the same frozen base, and the
+        Integrator runs after this returns rather than as a fan-in node.
+
+        The per-item optimizer ⇄ evaluator loop stays synchronous and is
+        offloaded with ``anyio.to_thread.run_sync``; calling it straight from
+        the coroutine would stall the event loop and silently serialize the
+        batch (pinned by ``tests/orchestration/test_agent_layer_offload.py``).
+
+        ``checkpoint_path`` is ``None`` on purpose — ``item_batch`` is already
+        the authority on which items are terminal and the graph is rebuilt from
+        it on resume, so a second on-disk cursor could only drift.
+        """
+        base_commit = str(pending[0]["item_base_commit"])
+        isolation = self._item_isolation(state, base_commit)
+        node_ids = {str(entry["current_item_id"]): _entry_node_id(entry) for entry in pending}
+        graph = ExecutionGraph(
+            nodes=tuple(
+                Node(id=node_id, type="roadmap_item", isolation="worktree")
+                for node_id in node_ids.values()
+            )
+        )
+        by_node = {node_id: item_id for item_id, node_id in node_ids.items()}
+
+        async def run_node(node: Node, cwd: Path) -> NodeOutcome:
+            item_id = by_node[node.id]
+            # The provider owns the worktree path; record where the item is
+            # actually running before the loop reads it back out of the ledger.
+            entry = self._update_batch_item(state, item_id, item_worktree_path=str(cwd))
+            await anyio.to_thread.run_sync(self._run_opt_item, state, entry, log)
+            status = str(self._batch_entry(state, item_id).get("status", ""))
+            # An item the Evaluator turned down is a DONE node with nothing to
+            # contribute, NOT a FAILED one: the scheduler blocks a failed node's
+            # dependents, and a rejected optimization must never be able to stop
+            # its siblings from being integrated.
+            return NodeOutcome(
+                terminal_state=NodeState.DONE,
+                info={"item_id": item_id, "status": status},
+            )
+
+        def on_transition(node_id: str, _from: NodeState, to: NodeState) -> None:
+            print_message(
+                f"[cyan]• item node {escape(node_id)} → {to.value}[/cyan]",
+                log,
+            )
+
+        scheduler = NodeScheduler(
+            graph,
+            run_node,
+            isolation,
+            on_transition=on_transition,
+            max_parallel=self._max_parallel_items(state),
+            checkpoint_path=None,
+        )
+        result = anyio.run(scheduler.run)
+        stalled = [nid for nid, node_state in result.states.items() if node_state != NodeState.DONE]
+        if stalled:
+            raise RuntimeError(
+                "optimizer/evaluator item nodes did not complete: " + ", ".join(sorted(stalled))
+            )
+
+    def _run_item_threads(
+        self,
+        state: WorkflowState,
+        pending: list[dict[str, Any]],
+        log,
+    ) -> None:
+        """Drive one round's pending items through this workflow's thread pool.
+
+        The default. With no scheduler there is no isolation provider either, so
+        each item's worktree is created here, up front, by
+        :meth:`_ensure_item_runtime` — the serial path's call — from the path
+        and branch the ledger already records. The item loop and everything
+        downstream of the batch never learn which engine dispatched them, which
+        is what lets :meth:`_run_item_graph` be a drop-in alternative.
+        """
+        for entry in pending:
+            self._ensure_item_runtime(state, entry)
+
+        errors: list[BaseException] = []
+        with ThreadPoolExecutor(
+            max_workers=self._max_parallel_items(state),
+            thread_name_prefix="perf-opt-item",
+        ) as executor:
+            futures = [
+                executor.submit(self._run_opt_item, state, dict(entry), log) for entry in pending
+            ]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except BaseException as exc:  # preserve other completed item results
+                    errors.append(exc)
+        if errors:
+            if len(errors) > 1:
+                print_message(
+                    f"[bold red]✗ {len(errors)} parallel optimization items failed; "
+                    f"aborting on the first[/bold red]",
+                    log,
+                )
+            # Re-raise the original, not a summary ``RuntimeError`` wrapping it:
+            # the exception's type and message are what a reader needs to
+            # diagnose the abort, and :meth:`_run_item_graph` propagates them
+            # too. How a crash reads must not depend on which engine ran it.
+            raise errors[0]
+
+    def _integrator_verdict_defect(
+        self,
+        verdict: dict[str, Any],
+        decision: str,
+        candidates: list[dict[str, Any]],
+        included: set[str],
+    ) -> str | None:
+        """Why the Integrator's verdict cannot be applied, or ``None`` if it can.
+
+        The Integrator is the only role allowed to move ``current_best``, and it
+        both sets its own acceptance threshold and reports the measurement it is
+        judged against — so every number it states is re-derived here from data
+        the orchestrator already holds. A verdict that fails any of these is not
+        applied; the caller downgrades it to REJECT rather than raising, so a
+        campaign that has already paid for its measurements can still close.
+
+        Returns a human-readable reason (recorded in progress and surfaced in
+        the report) rather than a bool, because "which check failed" is the only
+        useful thing to tell whoever reads the run afterwards.
+        """
+        candidate_ids = {str(entry["current_item_id"]) for entry in candidates}
+        unknown = included - candidate_ids
+        if unknown:
+            return "included non-candidate item(s): " + ", ".join(sorted(unknown))
+        if decision == "REJECT":
+            if included:
+                return "REJECT verdict must include no candidates"
+            return None
+        if not included:
+            return f"{decision} verdict included no candidates"
+
+        noise_floor = float(self._optimize_block()["noise_floor_pct"])
+        best_standalone_gain = max(float(entry["measured_gain_pct"]) for entry in candidates)
+        expected_required_gain = max(noise_floor, best_standalone_gain - noise_floor)
+        reported_required_gain = float(verdict["required_gain_pct"])
+        if abs(reported_required_gain - expected_required_gain) > 1e-6:
+            return (
+                f"required_gain_pct mismatch: reported {reported_required_gain}, "
+                f"expected {expected_required_gain}"
+            )
+        measured_gain = float(verdict["measured_gain_pct"])
+        if measured_gain < reported_required_gain:
+            return f"gain {measured_gain} is below the required {reported_required_gain}"
+
+        if self._curve_mode():
+            roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
+            reference_curve = roadmap["current_best"].get("curve")
+            measured_curve = verdict.get("curve")
+            if not isinstance(reference_curve, list) or not isinstance(measured_curve, list):
+                return "curve verdict is missing a curve"
+            reference_by_point = {
+                int(point["concurrency"]): float(point["value"]) for point in reference_curve
+            }
+            measured_by_point = {
+                int(point["concurrency"]): float(point["value"]) for point in measured_curve
+            }
+            expected_points = set(self._curve_points())
+            if (
+                set(reference_by_point) != expected_points
+                or set(measured_by_point) != expected_points
+            ):
+                return "curve verdict does not cover the configured concurrency points"
+            metric = str(self._optimize_block()["target_metric"])
+            regression_budget = self._regression_budget()
+            allowed_regression = noise_floor if regression_budget is None else regression_budget
+            for point in sorted(expected_points):
+                gain = self._normalized_gain_pct(
+                    reference_by_point[point], measured_by_point[point], metric
+                )
+                if gain is None or gain < -allowed_regression:
+                    return (
+                        f"curve regresses concurrency {point} beyond the "
+                        f"{allowed_regression}% budget"
+                    )
+
+        if decision == "FALLBACK_BEST":
+            best_id = str(verdict["best_candidate_id"])
+            if best_id not in candidate_ids or included != {best_id}:
+                return "FALLBACK_BEST must include exactly its best_candidate_id"
+        return None
+
+    def _batch_entry(self, state: WorkflowState, item_id: str) -> dict[str, Any]:
+        """Return the batch row for ``item_id`` under the checkpoint lock."""
+        with self._checkpoint_lock:
+            for entry in state.item_batch:
+                if entry["current_item_id"] == item_id:
+                    return dict(entry)
+        raise RuntimeError(f"item batch has no item {item_id!r}")
+
+    def _parallel_engine(self) -> str:
+        """Which engine runs ``item_execution: parallel`` for this campaign.
+
+        ``threads`` (the default) is this workflow's own thread pool; ``dag``
+        opts into the shared ``agent_flow.orchestration`` scheduler. Read off
+        the resolved ``workspace/task.yaml``, which is written once on the fresh
+        run — so a campaign keeps the engine it started under for its whole
+        life, and a finished workspace still says which one produced its numbers.
+        """
+        return str(self._optimize_block()["parallel_engine"])
+
+    def _max_parallel_items(self, state: WorkflowState) -> int:
+        """How many item loops may execute at once on the parallel path.
+
+        Defaults to ``max_items_per_round`` — the pre-engine behavior, where the
+        pool was sized to the batch — but ``optimize.max_parallel_items`` can
+        cut it below the batch size. That matters because every concurrent item
+        launches its own ``trtllm-serve`` and benchmark: on a single node the
+        batch size is a statement about planning breadth, not about how many
+        servers the hardware can host at once.
+        """
+        configured = self._optimize_block().get("max_parallel_items")
+        if isinstance(configured, bool) or not isinstance(configured, int):
+            return max(1, state.max_items_per_round)
+        return max(1, min(configured, state.max_items_per_round))
 
     def _run_opt_items_serial(self, state: WorkflowState, log) -> None:
         """Run the preselected batch one item at a time, accepting directly."""
@@ -1343,75 +1639,34 @@ class PerfOptimizeWorkflow:
             raise RuntimeError("integrator finished without a structured verdict")
 
         decision = str(verdict["decision"])
-        candidate_ids = {str(entry["current_item_id"]) for entry in candidates}
         included = {str(item_id) for item_id in verdict.get("included_item_ids", [])}
-        unknown = included - candidate_ids
-        if unknown:
-            raise RuntimeError(
-                "integrator included non-candidate item(s): " + ", ".join(sorted(unknown))
+
+        defect = self._integrator_verdict_defect(verdict, decision, candidates, included)
+        if defect is not None:
+            # Downgraded, not raised: "cannot confirm" safely reads as "change
+            # nothing", and raising also stranded the run — the cached-verdict
+            # guard above skips re-running the integrator on resume, so the same
+            # check would fail forever.
+            print_message(
+                f"[bold yellow]⚠ integrator verdict {decision} failed the "
+                f"orchestrator's consistency check and was downgraded to "
+                f"REJECT: {escape(defect)}[/bold yellow]",
+                log,
             )
-        if decision == "REJECT":
-            if included:
-                raise RuntimeError("integrator REJECT verdict must include no candidates")
-        else:
-            if not included:
-                raise RuntimeError(f"integrator {decision} verdict included no candidates")
-            noise_floor = float(self._optimize_block()["noise_floor_pct"])
-            best_standalone_gain = max(float(entry["measured_gain_pct"]) for entry in candidates)
-            expected_required_gain = max(
-                noise_floor,
-                best_standalone_gain - noise_floor,
+            append_workflow_event(
+                self.progress_path,
+                self._progress_lock,
+                agent="integrator",
+                event="verdict_downgraded_to_reject",
+                round_no=round_no,
+                item_ids=sorted(included),
+                summary=(
+                    f"Integrator reported {decision}, but the orchestrator could not "
+                    f"confirm it and applied REJECT instead: {defect}"
+                ),
             )
-            reported_required_gain = float(verdict["required_gain_pct"])
-            if abs(reported_required_gain - expected_required_gain) > 1e-6:
-                raise RuntimeError(
-                    "integrator required_gain_pct mismatch: "
-                    f"reported {reported_required_gain}, expected {expected_required_gain}"
-                )
-            measured_gain = float(verdict["measured_gain_pct"])
-            if measured_gain < reported_required_gain:
-                raise RuntimeError(
-                    f"integrator {decision} gain {measured_gain} is below required "
-                    f"{reported_required_gain}"
-                )
-            if self._curve_mode():
-                roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
-                reference_curve = roadmap["current_best"].get("curve")
-                measured_curve = verdict.get("curve")
-                if not isinstance(reference_curve, list) or not isinstance(measured_curve, list):
-                    raise RuntimeError("integrator curve verdict is missing a curve")
-                reference_by_point = {
-                    int(point["concurrency"]): float(point["value"]) for point in reference_curve
-                }
-                measured_by_point = {
-                    int(point["concurrency"]): float(point["value"]) for point in measured_curve
-                }
-                expected_points = set(self._curve_points())
-                if (
-                    set(reference_by_point) != expected_points
-                    or set(measured_by_point) != expected_points
-                ):
-                    raise RuntimeError(
-                        "integrator curve verdict does not cover the configured concurrency points"
-                    )
-                metric = str(self._optimize_block()["target_metric"])
-                regression_budget = self._regression_budget()
-                allowed_regression = noise_floor if regression_budget is None else regression_budget
-                for point in sorted(expected_points):
-                    gain = self._normalized_gain_pct(
-                        reference_by_point[point], measured_by_point[point], metric
-                    )
-                    if gain is None or gain < -allowed_regression:
-                        raise RuntimeError(
-                            f"integrator curve regresses concurrency {point} beyond "
-                            f"the {allowed_regression}% budget"
-                        )
-            if decision == "FALLBACK_BEST":
-                best_id = str(verdict["best_candidate_id"])
-                if best_id not in candidate_ids or included != {best_id}:
-                    raise RuntimeError(
-                        "integrator FALLBACK_BEST must include exactly its best_candidate_id"
-                    )
+            decision = "REJECT"
+            included = set()
         if decision != "REJECT":
             # Persist the stale-profile decision before mutating the accepted
             # campaign state so a crash cannot resume into replan-only mode.
@@ -1453,7 +1708,12 @@ class PerfOptimizeWorkflow:
         self._finish_item_batch(state, log)
 
     def _finish_item_batch(self, state: WorkflowState, log) -> None:
-        """Clean batch worktrees and deterministically close the round."""
+        """Free the round's worktrees and branches, then close it deterministically.
+
+        This is the deferred half of ``CandidateWorktreeIsolation``'s teardown:
+        the provider keeps candidate branches alive for the out-of-graph
+        Integrator, and integration is over by the time this runs.
+        """
         repo = self._trtllm_repo_path()
         paths = [str(entry.get("item_worktree_path", "")) for entry in state.item_batch]
         if state.integration_worktree_path:
@@ -1461,6 +1721,13 @@ class PerfOptimizeWorkflow:
         for path in paths:
             if path and Path(path).exists():
                 self._remove_worktree_best_effort(repo, path, log)
+        branches = [str(entry.get("item_branch", "")) for entry in state.item_batch]
+        # Spent either way: an accepted integration is already fast-forwarded
+        # onto the campaign branch, a rejected one contributed nothing.
+        branches.append(state.integration_branch)
+        for branch in branches:
+            if branch:
+                gitops.delete_branch(repo, branch)
 
         state.round_index += 1
         state.item_index = 0

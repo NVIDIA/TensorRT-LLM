@@ -13,6 +13,7 @@ from ._common import (
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
     SOL_OPTIMIZER_CONTEXT,
     approach_restriction_note,
+    build_container_setup_block,
     kernel_coverage_analyzer_note,
 )
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
@@ -101,6 +102,7 @@ def build_perf_optimize_prompts(
     kernel_coverage: Mapping[str, Any] | None = None,
     sol_methodology: str = "full",
     include_disagg: bool = False,
+    container_setup: str = "",
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, augmented per the task spec.
 
@@ -186,13 +188,20 @@ def build_perf_optimize_prompts(
             evaluator=restriction,
         )
     if include_slurm_environment:
+        # Appended to the bootstrap rather than to the role, so the prelude
+        # reaches exactly the roles that open a Slurm step — and reads as a
+        # refinement of "work inside the container" rather than a stray rule.
+        slurm_block = EXECUTION_SLURM_BOOTSTRAP
+        setup_block = build_container_setup_block(container_setup)
+        if setup_block:
+            slurm_block = f"{slurm_block}\n\n{setup_block}"
         bundle = bundle.with_extensions(
-            benchmarker=EXECUTION_SLURM_BOOTSTRAP,
-            analyzer=EXECUTION_SLURM_BOOTSTRAP,
-            optimizer=EXECUTION_SLURM_BOOTSTRAP,
-            evaluator=EXECUTION_SLURM_BOOTSTRAP,
-            integrator=EXECUTION_SLURM_BOOTSTRAP,
-            qa=EXECUTION_SLURM_BOOTSTRAP,
+            benchmarker=slurm_block,
+            analyzer=slurm_block,
+            optimizer=slurm_block,
+            evaluator=slurm_block,
+            integrator=slurm_block,
+            qa=slurm_block,
         )
     if include_sol:
         bundle = bundle.with_extensions(

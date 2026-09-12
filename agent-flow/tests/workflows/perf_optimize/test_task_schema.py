@@ -32,6 +32,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
         "max_attempts_per_item": 3,
         "max_items_per_round": 3,
         "item_execution": "parallel",
+        "parallel_engine": "threads",
         "approaches": ["config", "code"],
         "accept_fraction": 0.5,
         "noise_floor_pct": 1.0,
@@ -90,6 +91,21 @@ def test_invalid_item_execution_rejected(tmp_path):
         task_schema.load_and_validate_task_yaml(task)
 
 
+def test_parallel_engine_accepts_dag_and_threads(tmp_path):
+    for value in task_schema.PARALLEL_ENGINES:
+        task = _write_task(tmp_path, {"optimize": {"parallel_engine": value}})
+        data = task_schema.load_and_validate_task_yaml(task)
+        assert data["optimize"]["parallel_engine"] == value
+
+
+def test_invalid_parallel_engine_rejected(tmp_path):
+    # ``parallel`` is the ``item_execution`` value: confusing the two keys is
+    # the likeliest way to get this one wrong.
+    task = _write_task(tmp_path, {"optimize": {"parallel_engine": "parallel"}})
+    with pytest.raises(task_schema.TaskSchemaError, match="optimize.parallel_engine"):
+        task_schema.load_and_validate_task_yaml(task)
+
+
 def test_invalid_approaches_rejected(tmp_path):
     for value in ([], ["yaml-only"], ["config", "config"], "config", ["config", 3]):
         task = _write_task(tmp_path, {"optimize": {"approaches": value}})
@@ -106,6 +122,19 @@ def test_max_rounds_override_wins_over_user_value(tmp_path):
 def test_invalid_max_rounds_override_rejected(tmp_path):
     with pytest.raises(task_schema.TaskSchemaError, match="--max-rounds"):
         task_schema.load_and_validate_task_yaml(_write_task(tmp_path), max_rounds_override=0)
+
+
+def test_parallel_engine_override_wins_over_user_value(tmp_path):
+    task = _write_task(tmp_path, {"optimize": {"parallel_engine": "dag"}})
+    data = task_schema.load_and_validate_task_yaml(task, parallel_engine_override="threads")
+    assert data["optimize"]["parallel_engine"] == "threads"
+
+
+def test_invalid_parallel_engine_override_rejected(tmp_path):
+    with pytest.raises(task_schema.TaskSchemaError, match="--parallel-engine"):
+        task_schema.load_and_validate_task_yaml(
+            _write_task(tmp_path), parallel_engine_override="parallel"
+        )
 
 
 def test_base_validation_still_enforced(tmp_path):
@@ -639,3 +668,77 @@ def test_the_census_matches_a_fully_populated_spec(tmp_path):
     )
 
     assert unknown == []
+
+
+# ------------------------------------------------------------ max_parallel_items
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, "all", 1.5])
+def test_max_parallel_items_must_be_a_positive_int(tmp_path, bad):
+    """The knob is the concurrency the scheduler is handed; nonsense is rejected here.
+
+    The workflow also guards the type defensively, but this validator is the
+    guard that matters: a bad value must stop the campaign before it books GPUs,
+    not be silently coerced into some other level of parallelism.
+    """
+    task = _write_task(tmp_path, {"optimize": {"max_parallel_items": bad}})
+    with pytest.raises(task_schema.TaskSchemaError, match="optimize.max_parallel_items"):
+        task_schema.load_and_validate_task_yaml(task)
+
+
+def test_max_parallel_items_is_known_but_has_no_default(tmp_path):
+    """Unset means "follow ``max_items_per_round``", which is not a storable value.
+
+    Giving it an entry in ``OPTIMIZE_DEFAULTS`` would freeze the coupling to the
+    batch size that the knob exists to break, so it is a known key the defaults
+    merge deliberately leaves absent.
+    """
+    assert "max_parallel_items" not in task_schema.OPTIMIZE_DEFAULTS
+    data = task_schema.load_and_validate_task_yaml(_write_task(tmp_path, {}))
+    assert "max_parallel_items" not in data["optimize"]
+
+
+def test_max_parallel_items_survives_validation_when_set(tmp_path):
+    task = _write_task(tmp_path, {"optimize": {"max_parallel_items": 2}})
+    data = task_schema.load_and_validate_task_yaml(task)
+    assert data["optimize"]["max_parallel_items"] == 2
+
+
+# ---------------------------------------------- slurm-environment.container_setup
+
+
+def _slurm_task(tmp_path, slurm_extra: dict):
+    block = {
+        "slurm_partition": "batch",
+        "docker_image": "/images/trtllm.sqsh",
+    }
+    block.update(slurm_extra)
+    return _write_task(tmp_path, {"slurm-environment": block})
+
+
+def test_container_setup_is_optional_and_absent_by_default(tmp_path):
+    """A task without the field behaves exactly as it did before it existed."""
+    data = task_schema.load_and_validate_task_yaml(_slurm_task(tmp_path, {}))
+    assert "container_setup" not in data["slurm-environment"]
+    assert task_schema.container_setup(data) == ""
+    # No Slurm block at all is the local-execution case — nothing to prepare.
+    assert task_schema.container_setup({}) == ""
+    assert task_schema.container_setup({"slurm-environment": None}) == ""
+
+
+def test_container_setup_survives_validation_and_is_stripped(tmp_path):
+    task = _slurm_task(tmp_path, {"container_setup": "  source /repo/.venv/bin/activate  "})
+    data = task_schema.load_and_validate_task_yaml(task)
+    assert task_schema.container_setup(data) == "source /repo/.venv/bin/activate"
+
+
+@pytest.mark.parametrize("bad", [42, [], {}, "", "   "])
+def test_container_setup_must_be_a_non_empty_string(tmp_path, bad):
+    """The value is pasted into every containerized shell the run opens.
+
+    A wrong type has to fail here, not tens of minutes later as a mangled
+    command inside a Slurm step.
+    """
+    task = _slurm_task(tmp_path, {"container_setup": bad})
+    with pytest.raises(task_schema.TaskSchemaError, match="container_setup"):
+        task_schema.load_and_validate_task_yaml(task)
