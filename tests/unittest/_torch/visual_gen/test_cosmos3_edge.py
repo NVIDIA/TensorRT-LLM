@@ -1500,7 +1500,7 @@ def _policy_parity_models():
 def _policy_reference_forward(transformer, inputs: dict[str, object]):
     inputs = {key: _policy_parity_to_device(value) for key, value in inputs.items()}
     with torch.inference_mode():
-        video_out, _, action_out = transformer(
+        output = transformer(
             input_ids=inputs["input_ids"],
             text_indexes=inputs["text_indexes"],
             position_ids=inputs["position_ids"],
@@ -1520,7 +1520,7 @@ def _policy_reference_forward(transformer, inputs: dict[str, object]):
             action_noisy_frame_indexes=inputs["action_noisy_frame_indexes"],
             action_domain_ids=inputs["action_domain_ids"],
         )
-    return video_out[0], action_out[0]
+    return output.sample[0], output.action[0]
 
 
 def _policy_trt_forward(transformer, inputs: dict[str, object], action: torch.Tensor):
@@ -1579,11 +1579,11 @@ def _policy_parity_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[s
 
 
 class TestDiffusersParity:
-    """Per-step velocity parity against Diffusers.
+    """Per-step velocity parity against the installed Diffusers package.
 
-    Edge checkpoint parity uses the first Diffusers revision with the Edge
-    classes and remains an explicitly gated diagnostic. Policy action parity
-    below is checkpoint-free and runs against the pinned Diffusers package.
+    Edge checkpoint parity runs in a subprocess to isolate its heavyweight
+    reference and TRT-LLM pipelines. Policy action parity below is
+    checkpoint-free and runs against the pinned Diffusers package.
     """
 
     def test_per_step_velocity_parity(self):
@@ -1591,9 +1591,6 @@ class TestDiffusersParity:
         import subprocess
         import sys
 
-        diffusers_main = os.environ.get("DIFFUSERS_MAIN_PATH")
-        if not diffusers_main:
-            pytest.skip("Set DIFFUSERS_MAIN_PATH to a diffusers checkout with Edge support")
         checkpoint = _require_edge_checkpoint()
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
@@ -1601,7 +1598,6 @@ class TestDiffusersParity:
         script = Path(__file__).parent / "cosmos3_edge_diffusers_parity.py"
         result = subprocess.run(
             [sys.executable, str(script), checkpoint],
-            env={**os.environ, "DIFFUSERS_MAIN_PATH": diffusers_main},
             capture_output=True,
             text=True,
             timeout=900,
@@ -1619,14 +1615,13 @@ class TestDiffusersParity:
         The emitted tensors are one-step BF16 video and action velocities. The
         model-specific behavior is a clean state row followed by 32 noisy
         actions, with domain-selected input/output heads. The trusted reference
-        is pinned Diffusers 0.39.0 with identical synthetic weights and packed
+        is pinned Diffusers 0.40.0 with identical synthetic weights and packed
         inputs. This is transparent T1; its tolerance covers reduction
         reordering between SDPA and TRT-LLM's vanilla attention backend.
 
-        Pinned Diffusers predates the Nemotron-dense Edge backbone, so this pair
-        deliberately exercises the shared action machinery on the Qwen3 recipe.
-        The Edge-only norm, MLP and generator K-normalization forks have focused
-        tests above.
+        This pair deliberately exercises the shared action machinery on the
+        Qwen3 recipe. The Edge-only norm, MLP and generator K-normalization
+        forks have focused tests above.
         """
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
