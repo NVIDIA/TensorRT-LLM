@@ -447,6 +447,7 @@ def parse_chat_messages_coroutines(
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     model_type_override: Optional[str] = None,
+    resolve_media: bool = True,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -464,6 +465,9 @@ def parse_chat_messages_coroutines(
             (e.g. `--media_io_kwargs`); defaults to empty.
         request_media_io_kwargs: Per-request override merged per
             modality with the server default via `BaseMediaIO.create`.
+        resolve_media: When False the returned coroutine closes the
+            pending loads instead of running them and yields
+            `(None, None)`.
 
     Returns:
         `(conversation, mm_coroutine, mm_placeholder_counts)` where
@@ -535,8 +539,10 @@ def parse_chat_messages_coroutines(
 
     # ``item_order`` is populated synchronously by ``add_data``, so it can
     # be returned directly (not through the coroutine).
-    return (conversation, mm_data_tracker.retrieve_all_async(),
-            mm_placeholder_counts, mm_data_tracker.item_order())
+    mm_coroutine = (mm_data_tracker.retrieve_all_async()
+                    if resolve_media else mm_data_tracker.discard_all_async())
+    return (conversation, mm_coroutine, mm_placeholder_counts,
+            mm_data_tracker.item_order())
 
 
 def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):

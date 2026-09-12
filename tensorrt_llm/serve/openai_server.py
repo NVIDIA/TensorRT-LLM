@@ -2184,12 +2184,31 @@ class OpenAIServer(_VideoRoutesMixin):
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
+            # A generation-only worker already has prompt_token_ids with the
+            # placeholders expanded and the KV behind them over the
+            # transceiver, so the media still on the relayed messages is not
+            # its to resolve.
+            #
+            # Decided before the fetch rather than after it: resolving
+            # downloads and decodes every item a second time, and fails
+            # outright on a reference only the context worker could read --
+            # a node-local path, or a single-use or expired URL.
+            #
+            # prompt_token_ids_b64 counts too; it is decoded into
+            # prompt_token_ids further below.
+            resolve_media = not (disaggregated_params is not None
+                                 and disaggregated_params.request_type
+                                 == "generation_only" and
+                                 (request.prompt_token_ids is not None
+                                  or request.prompt_token_ids_b64))
+
             try:
                 conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
+                    resolve_media=resolve_media,
                 )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
@@ -2200,6 +2219,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.model_config,
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
+                    resolve_media=resolve_media,
                 )
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
