@@ -21,7 +21,7 @@ DeepEP Low Latency is optimized for small token counts with minimal communicatio
 """
 
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -107,6 +107,9 @@ class DeepEPLowLatency(Communication):
 
         self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(mapping)
         self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens, hidden_size, num_slots)
+        self._adapter_free_placeholder_cache: Dict[
+            Tuple[torch.device, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     def destroy(self):
         """Release the DeepEP low-latency buffer to prevent deadlock/hang.
@@ -115,6 +118,7 @@ class DeepEPLowLatency(Communication):
         explicit release, non-deterministic GC timing across ranks causes
         some ranks to block in the barrier indefinitely.
         """
+        self._adapter_free_placeholder_cache.clear()
         self.deep_ep_buffer = None
 
     @staticmethod
@@ -193,6 +197,8 @@ class DeepEPLowLatency(Communication):
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool] = None,
         pre_quant_scale: Optional[torch.Tensor] = None,
+        use_direct_expert_metadata: bool = False,
+        remove_adapter: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -201,6 +207,12 @@ class DeepEPLowLatency(Communication):
         all_rank_max_num_tokens = max(all_rank_num_tokens)
 
         assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
+        if remove_adapter and not use_direct_expert_metadata:
+            raise ValueError("Removing the DeepEP adapter requires direct expert metadata")
+        if remove_adapter and (not self._has_nvfp4() or not self.supports_post_quant_dispatch()):
+            raise ValueError(
+                "Removing the DeepEP adapter requires NVFP4 post-quant DeepEPLowLatency dispatch"
+            )
 
         deep_ep_topk_idx = token_selected_slots
         deep_ep_topk_weights = token_final_scales
@@ -212,10 +224,15 @@ class DeepEPLowLatency(Communication):
                     hidden_states, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots
                 )
             )
+            expert_capacity = hidden_states.shape[1]
 
             hidden_states, _, token_selected_slots, token_final_scales = (
                 self._modify_output_to_adapt_fused_moe(
-                    hidden_states, None, recv_expert_count, token_final_scales.dtype
+                    hidden_states,
+                    None,
+                    recv_expert_count,
+                    token_final_scales.dtype,
+                    remove_adapter=remove_adapter,
                 )
             )
 
@@ -225,6 +242,7 @@ class DeepEPLowLatency(Communication):
                 "deep_ep_topk_idx": deep_ep_topk_idx,
                 "deep_ep_topk_weights": deep_ep_topk_weights,
                 "recv_expert_count": recv_expert_count,
+                "expert_capacity": expert_capacity,
             }
 
         else:
@@ -306,9 +324,14 @@ class DeepEPLowLatency(Communication):
             else:
                 raise ValueError("Unsupported quantization mode for post-quant DeepEPLowLatency")
 
+            expert_capacity = hidden_states.shape[1]
             hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
                 self._modify_output_to_adapt_fused_moe(
-                    hidden_states, hidden_states_sf, recv_expert_count, token_final_scales.dtype
+                    hidden_states,
+                    hidden_states_sf,
+                    recv_expert_count,
+                    token_final_scales.dtype,
+                    remove_adapter=remove_adapter,
                 )
             )
 
@@ -318,9 +341,17 @@ class DeepEPLowLatency(Communication):
                 "deep_ep_topk_idx": deep_ep_topk_idx,
                 "deep_ep_topk_weights": deep_ep_topk_weights,
                 "recv_expert_count": recv_expert_count,
+                "expert_capacity": expert_capacity,
             }
 
         return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
+
+    def get_expert_major_dispatch_metadata(self) -> Tuple[torch.Tensor, int]:
+        """Return device counts and per-expert capacity from the latest dispatch."""
+        return (
+            self._dispatch_state["recv_expert_count"],
+            self._dispatch_state["expert_capacity"],
+        )
 
     def combine(
         self,
@@ -395,15 +426,54 @@ class DeepEPLowLatency(Communication):
         hidden_states_sf: Optional[torch.Tensor],
         recv_expert_count: torch.Tensor,
         final_scales_dtype: torch.dtype,
+        remove_adapter: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-        """
-        Adapter for DeepEP output to match fused_moe interface
+        """Adapt expert-major DeepEP output to the fused-MoE interface.
 
         hidden_states shape: [#local experts, EP size * all_rank_max_num_tokens, hidden_size]
         recv_expert_count shape: [#local experts]
 
-        TODO: remove the adapter by changing `torch.ops.trtllm.fused_moe` API
+        Direct expert metadata makes selected-slot contents redundant. Its
+        adapter-free path therefore returns views plus persistent placeholders;
+        unit scales remain required by fused finalize.
         """
+        if remove_adapter:
+            expert_capacity = hidden_states.shape[1]
+            num_rows = hidden_states.shape[0] * expert_capacity
+            num_local_experts = hidden_states.shape[0]
+            cache_key = (hidden_states.device, num_local_experts, final_scales_dtype)
+            placeholders = self._adapter_free_placeholder_cache.get(cache_key)
+            if placeholders is None:
+                if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "DeepEP adapter-free placeholders must be warmed up before CUDA graph capture"
+                    )
+                max_expert_capacity = self.mapping.moe_ep_size * self.deep_ep_max_num_tokens
+                max_num_rows = num_local_experts * max_expert_capacity
+                token_selected_slots = torch.full(
+                    (max_num_rows, 1), -1, dtype=torch.int32, device=hidden_states.device
+                )
+                token_final_scales = torch.ones(
+                    (max_num_rows, 1), dtype=final_scales_dtype, device=hidden_states.device
+                )
+                placeholders = (token_selected_slots, token_final_scales)
+                self._adapter_free_placeholder_cache[cache_key] = placeholders
+
+            if num_rows > placeholders[0].size(0):
+                raise ValueError(
+                    "DeepEP adapter-free output exceeds the configured maximum token capacity"
+                )
+
+            hidden_states = hidden_states.view(num_rows, hidden_states.shape[2])
+            if hidden_states_sf is not None:
+                hidden_states_sf = hidden_states_sf.view(num_rows, hidden_states_sf.shape[2])
+            return (
+                hidden_states,
+                hidden_states_sf,
+                placeholders[0][:num_rows],
+                placeholders[1][:num_rows],
+            )
+
         mask = torch.arange(
             hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device
         ).expand(hidden_states.shape[0], hidden_states.shape[1]) < recv_expert_count.unsqueeze(1)

@@ -852,6 +852,18 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         """
         return False
 
+    def can_use_deep_ep_direct_metadata(
+            self, supports_post_quant_dispatch: bool) -> bool:
+        """Return whether this backend instance can consume DeepEP counts directly.
+
+        ``can_implement`` and ``capabilities`` remain pure construction-time
+        declarations. This query is instance-level because the complete fast
+        path also depends on the selected quantization method, finalize fusion,
+        and rollback controls.
+        """
+        del supports_post_quant_dispatch
+        return False
+
     def reducescatter_or_allreduce(
         self,
         inputs,
