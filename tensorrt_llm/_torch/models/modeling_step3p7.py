@@ -718,7 +718,7 @@ class ClampedGatedMLP(GatedMLP):
         else:
             gate_up = self.gate_up_proj(hidden_states)
         gate, up = gate_up.chunk(2, dim=-1)
-        gate = torch.nn.functional.silu(gate).clamp(max=self.swiglu_limit)
+        gate = torch.nn.functional.silu(gate.clamp(max=self.swiglu_limit))
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         return self.down_proj(
             gate * up,
