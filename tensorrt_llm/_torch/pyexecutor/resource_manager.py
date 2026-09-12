@@ -70,7 +70,8 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig)
 
-    from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from .kv_cache.kv_cache_manager_v2 import (KVCacheManagerV2,
+                                               KVCacheManagerV2Pair)
 
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -2986,6 +2987,23 @@ class ResourceManager:
     def __init__(self, resource_managers: dict[ResourceManagerType,
                                                BaseResourceManager]):
         self.resource_managers = OrderedDict(resource_managers)
+        self.kv_cache_manager_pair: Optional["KVCacheManagerV2Pair"] = None
+        self._refresh_kv_cache_manager_pair()
+
+    def _refresh_kv_cache_manager_pair(self) -> None:
+        """Bind the target and optional draft V2 managers as one unit."""
+        self.kv_cache_manager_pair = None
+        target_kv_cache_manager = self.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if target_kv_cache_manager is not None:
+            from .kv_cache.kv_cache_manager_v2 import (KVCacheManagerV2,
+                                                       KVCacheManagerV2Pair)
+
+            if isinstance(target_kv_cache_manager, KVCacheManagerV2):
+                draft_kv_cache_manager = self.resource_managers.get(
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+                self.kv_cache_manager_pair = KVCacheManagerV2Pair(
+                    target_kv_cache_manager, draft_kv_cache_manager)
 
     def __call__(self, type: ResourceManagerType):
         return self.resource_managers[type]
@@ -2993,6 +3011,9 @@ class ResourceManager:
     def register_resource_manager(self, type: ResourceManagerType,
                                   resource_manager: BaseResourceManager):
         self.resource_managers[type] = resource_manager
+        if type in (ResourceManagerType.KV_CACHE_MANAGER,
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+            self._refresh_kv_cache_manager_pair()
 
     def get_resource_manager(
             self, type: ResourceManagerType) -> Optional[BaseResourceManager]:

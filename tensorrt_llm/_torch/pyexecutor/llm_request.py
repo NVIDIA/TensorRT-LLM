@@ -1158,6 +1158,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0
         self.py_ctx_pre_resize_cap = None
+        self.py_draft_ctx_pre_resize_cap = None
         self._cached_tokens = 0
         self._cached_tokens_set = False
 

@@ -828,6 +828,62 @@ class TestKVCacheV2SchedulerCrossParam:
         assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
         assert kwargs["enable_recompute_pause"] is enable_recompute_pause
 
+    def test_factory_forwards_shared_target_draft_v2_pair(self) -> None:
+        from tensorrt_llm._torch.pyexecutor._util import create_py_executor_instance
+
+        target_mgr = object.__new__(KVCacheManagerV2)
+        target_mgr.is_draft = False
+        draft_mgr = object.__new__(KVCacheManagerV2)
+        draft_mgr.is_draft = True
+        resources = {
+            ResourceManagerType.KV_CACHE_MANAGER: target_mgr,
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_mgr,
+        }
+        model_engine = SimpleNamespace(
+            spec_config=None,
+            model=SimpleNamespace(model_config=_make_model_config()),
+        )
+        llm_args = TorchLlmArgs(
+            model=_DUMMY_MODEL,
+            skip_tokenizer_init=True,
+            disable_overlap_scheduler=True,
+        )
+
+        with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.KVCacheV2Scheduler",
+            ) as scheduler_cls,
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.create_kv_cache_transceiver",
+                return_value=None,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.PyExecutor",
+            ) as executor_cls,
+        ):
+            scheduler_cls.return_value = Mock()
+            create_py_executor_instance(
+                dist=Mock(),
+                resources=resources,
+                mapping=Mapping(),
+                llm_args=llm_args,
+                ctx_chunk_config=None,
+                model_engine=model_engine,
+                start_worker=False,
+                sampler=Mock(),
+                drafter=None,
+                max_seq_len=128,
+                max_batch_size=8,
+                max_beam_width=1,
+                max_num_tokens=4096,
+            )
+
+        resource_manager = executor_cls.call_args.args[0]
+        scheduler_pair = scheduler_cls.call_args.kwargs["kv_cache_manager_pair"]
+        assert scheduler_pair is resource_manager.kv_cache_manager_pair
+        assert scheduler_pair.target is target_mgr
+        assert scheduler_pair.draft is draft_mgr
+
 
 # ---------------------------------------------------------------------------
 # Tests: V1 scheduler cross_kv_cache_manager wiring.
