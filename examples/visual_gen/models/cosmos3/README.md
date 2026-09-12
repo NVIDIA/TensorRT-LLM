@@ -17,7 +17,7 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano)
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
 - [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
-- [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
+- [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) needs more device memory than one H200 provides; use a higher-memory GPU, such as Blackwell, or `configs/cosmos3-super-4gpu.yaml` on a single 4-GPU Hopper node. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
 - [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
 
@@ -26,7 +26,9 @@ Pass the Hub ID or local path via `--model`:
 Guardrails are enabled by default (required by the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)). Install and authenticate as follows:
 
 ```bash
-pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python
+pip install cosmos_guardrail==0.3.0
+pip uninstall -y opencv-python
+pip install opencv-python-headless
 ```
 
 Accept the terms for the guardrail checkpoint at https://huggingface.co/nvidia/Cosmos-1.0-Guardrail and set a valid `HF_TOKEN` (the checkpoint is downloaded automatically on first run).
@@ -48,7 +50,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 See `examples/visual_gen/configs/`:
 
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
-- `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
+- `cosmos3-super-4gpu.yaml` — 4 GPU, tensor parallel + Ulysses + parallel VAE
 - `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
@@ -125,12 +127,13 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Text2Image-4Step \
     --output_type image \
     --output_path output.png
 
-# I2V, distilled 4-step checkpoint (steps/guidance and the system-prompt
-# default come from the checkpoint automatically; defaults are the deployed
-# 720p x 189-frame shape, so no config is required)
+# I2V, distilled 4-step checkpoint on one node with 4 H200 GPUs. Steps,
+# guidance, and the system-prompt default come from the checkpoint; the config
+# supplies the parallel deployment for the default 720p x 189-frame shape.
 python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step \
     --prompt "The camera slowly pans right across the scene" \
     --image_path https://example.com/frame.jpg \
+    --visual_gen_args ../../configs/cosmos3-super-4gpu.yaml \
     --output_path output.mp4
 
 # Transfer: control-video conditioning — structure from the control video,
