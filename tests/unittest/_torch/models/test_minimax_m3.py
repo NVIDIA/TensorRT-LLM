@@ -256,6 +256,40 @@ def test_attention_dispatch_leaves_an_unpadded_step_alone():
     assert output.isnan().all()
 
 
+@pytest.mark.cpu_only
+def test_every_attention_dispatch_goes_through_the_live_token_clip():
+    """A dispatch path that bypassed the clip would hand the kernels the pad.
+
+    The clipping helper is the only thing standing between a padded step and
+    kernels that read a request out of a token index, so which callers reach
+    the backend is itself the invariant.
+    """
+    import ast
+    import inspect
+
+    from tensorrt_llm._torch.models import modeling_minimaxm3
+
+    tree = ast.parse(inspect.getsource(modeling_minimaxm3))
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def enclosing_function(node):
+        while node is not None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node.name
+            node = parents.get(node)
+        return None
+
+    callers = {
+        enclosing_function(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_dispatch_attention_backend"
+    }
+
+    assert callers == {"_dispatch_attention_over_live_tokens"}
+
+
 def test_is_minimax_m3_vl_config_detects_vl():
     assert is_minimax_m3_vl_config(_make_vl_config()) is True
 

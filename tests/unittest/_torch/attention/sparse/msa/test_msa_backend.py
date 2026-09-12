@@ -1002,6 +1002,63 @@ def test_decode_span_shape_check_names_the_kernel_that_rejected_the_q():
         check_decode_span_shape("kernel", 512, 11, 4)
 
 
+def test_both_decode_kernels_reject_a_q_that_outruns_the_batch():
+    """The guard has to be reached, not merely available.
+
+    Both kernels read their shapes before touching a device, so the refusal
+    happens at the call and needs no GPU. The dense kernel is handed no cache
+    manager for the same reason: it must decline before consulting one.
+    """
+    batch, query_len, total_q = 11, 4, 512
+    num_heads, head_dim, page_size = 4, 128, 128
+    q = torch.empty(total_q, num_heads, head_dim)
+    output = torch.empty(total_q, num_heads, head_dim)
+    block_table = torch.zeros(batch, 4, dtype=torch.int32)
+    seq_lens = torch.zeros(batch, dtype=torch.int32)
+
+    pytest.importorskip("triton")
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
+        minimax_m3_sparse_attn_decode,
+    )
+
+    paged = torch.empty(1, 1, page_size, head_dim)
+    with pytest.raises(
+        ValueError, match=r"Triton sparse decode: total_q \(512\) must be batch \(11\)"
+    ):
+        minimax_m3_sparse_attn_decode(
+            q,
+            paged,
+            paged,
+            torch.zeros(1, total_q, 64, dtype=torch.int64),
+            block_table,
+            seq_lens,
+            sm_scale=head_dim**-0.5,
+            output=output,
+            decode_query_len=query_len,
+        )
+
+    pytest.importorskip("flashinfer")
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
+        minimax_m3_trtllm_gen_dense_decode,
+    )
+
+    with pytest.raises(
+        ValueError, match=r"trtllm-gen dense decode: total_q \(512\) must be batch \(11\)"
+    ):
+        minimax_m3_trtllm_gen_dense_decode(
+            q,
+            None,
+            0,
+            block_table,
+            seq_lens,
+            sm_scale=head_dim**-0.5,
+            output=output,
+            decode_query_len=query_len,
+            max_seq_len=1024,
+            max_num_requests=batch,
+        )
+
+
 def test_a_shrinking_step_leaves_no_live_slot_in_the_padded_tail():
     """The slot-guarded consumers recognize a negative slot and nothing else, so
     every row a step does not own has to hold one."""
