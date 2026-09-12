@@ -215,6 +215,7 @@ class AfmoeMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         router_logits = self.gate(hidden_states)
@@ -224,6 +225,7 @@ class AfmoeMoE(nn.Module):
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=False,
+            lora_params=lora_params,
         )
 
         if self.shared_experts is not None:
@@ -356,6 +358,7 @@ class AfmoeDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -368,6 +371,7 @@ class AfmoeDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -375,7 +379,7 @@ class AfmoeDecoderLayer(DecoderLayer):
         hidden_states, residual = self.pre_mlp_layernorm(hidden_states, residual)
 
         if self.moe_enabled:
-            hidden_states = self.mlp(hidden_states, attn_metadata)
+            hidden_states = self.mlp(hidden_states, attn_metadata, lora_params=lora_params)
         else:
             hidden_states = self.mlp(hidden_states)
 

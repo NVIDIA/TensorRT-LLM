@@ -501,6 +501,7 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         final_all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
@@ -511,6 +512,7 @@ class MiniMaxM3MoE(nn.Module):
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=False,
+                lora_params=lora_params,
             )
 
         def _compute_shared_output():
@@ -1747,6 +1749,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Layer-0 prologue only. For every subsequent layer the input_layernorm
@@ -1769,6 +1772,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=attn_all_reduce_params,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -1779,7 +1783,11 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             self.post_feed_forward_fusion = False
         if self.block_sparse_moe is not None:
             hidden_states, residual = self.forward_MoE(
-                hidden_states, attn_metadata, residual, spec_metadata=spec_metadata
+                hidden_states,
+                attn_metadata,
+                residual,
+                spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
         else:
             hidden_states, residual = self.forward_mlp(
@@ -1859,6 +1867,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
@@ -1866,6 +1875,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             hidden_states,
             attn_metadata,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
+            lora_params=lora_params,
         )
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
@@ -1969,6 +1979,7 @@ class MiniMaxM3Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                **kwargs,
             )
 
         # When setup_aliases has chained the final norm into the last decoder

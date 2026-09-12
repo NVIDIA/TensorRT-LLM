@@ -884,6 +884,7 @@ class Step3p7MoE(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_size
@@ -902,6 +903,7 @@ class Step3p7MoE(nn.Module):
             router_logits,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             use_dp_padding=False,
+            lora_params=lora_params,
         )
         # Step3p7 uses the generic MiniMax2 metadata with routeScale=1.0, so apply
         # ``routed_scaling_factor`` to the MoE output here (mathematically
@@ -1010,6 +1012,7 @@ class Step3p7DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -1021,11 +1024,12 @@ class Step3p7DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.moe is not None:
-            routed = self.moe(hidden_states, attn_metadata)
+            routed = self.moe(hidden_states, attn_metadata, lora_params=lora_params)
             shared = self.share_expert(hidden_states)
             hidden_states = routed + shared
             if self.allreduce is not None:
