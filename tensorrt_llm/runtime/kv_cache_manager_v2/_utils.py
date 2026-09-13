@@ -21,7 +21,6 @@ import functools
 import itertools
 import operator
 import os
-import platform
 import sys
 import traceback
 import warnings
@@ -502,11 +501,11 @@ class HostMem:
     __slots__ = ("_address", "_size", "_num_registered_chunks")
     _address: int
     _size: int
-    # If True and _size > 2GB, use multiple chunks to register pinned memory due to a Linux kernel
-    # 6.11/6.12/6.13 bug preventing pinning more than 2GB of host memory in one operation.
-    _CHUNKED_REGISTRATION: ClassVar[bool] = platform.system() == "Linux" and platform.release()[
-        :4
-    ] in ["6.11", "6.12", "6.13"]
+    # Pinning is always chunked. It works around a Linux kernel 6.11/6.12/6.13 bug preventing
+    # pinning more than 2GB of host memory in one operation, and it bounds how long a single
+    # cuMemHostRegister holds the driver-global locks that every other process on the node
+    # contends on for its own CUDA/NVML calls -- one unbroken multi-hundred-GB registration
+    # stalls colocated workers for the whole duration.
     _CHUNK_SIZE: ClassVar[int] = 2 << 30
     _num_registered_chunks: int
 
@@ -624,9 +623,11 @@ class HostMem:
         assert self._num_registered_chunks == 0
 
     def _iterate_chunks(self) -> Iterator[tuple[int, int]]:
+        if self._size == 0:
+            return
         start = self._address
         end = start + self._size
-        chunk_size = self._CHUNK_SIZE if self._CHUNKED_REGISTRATION else self._size
+        chunk_size = min(self._CHUNK_SIZE, self._size)
         for addr in range(start, end, chunk_size):
             yield addr, min(end - addr, chunk_size)
 

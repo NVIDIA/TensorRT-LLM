@@ -34,8 +34,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //   - Optionally prefaulted in parallel before CUDA registration
 //   - Registered to CUDA as page-locked (CU_MEMHOSTREGISTER_DEVICEMAP)
 //
-// On kernels 6.11/6.12/6.13, pinning is chunked in 2GB pieces to work around
-// a kernel bug that prevents pinning more than 2GB in one call.
+// Pinning is always chunked in 2GB pieces. It works around a kernel bug on
+// 6.11/6.12/6.13 that prevents pinning more than 2GB in one call, and it bounds
+// how long a single cuMemHostRegister holds the driver-global locks that every
+// other process on the node contends on for its own CUDA/NVML calls.
 // ---------------------------------------------------------------------------
 class HostMem
 {

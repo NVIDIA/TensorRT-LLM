@@ -310,9 +310,7 @@ void HostMem::parallelPrefault(int numThreads)
 void HostMem::registerToCuda()
 {
     TLLM_CHECK_DEBUG(mNumRegisteredChunks == 0);
-    static bool chunked = shouldUseChunkedRegistration();
-
-    size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
+    size_t chunkSize = std::min(kChunkSize, mSize);
     for (size_t offset = 0; offset < mSize; offset += chunkSize)
     {
         size_t sz = std::min(chunkSize, mSize - offset);
@@ -325,8 +323,7 @@ void HostMem::registerToCuda()
 
 void HostMem::unregisterFromCuda()
 {
-    static bool chunked = shouldUseChunkedRegistration();
-    size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
+    size_t chunkSize = std::min(kChunkSize, mSize);
     for (size_t offset = 0; offset < mSize && mNumRegisteredChunks > 0; offset += chunkSize)
     {
         cuMemHostUnregister(reinterpret_cast<void*>(mAddr + offset));

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <list>
 #include <memory>
@@ -41,6 +42,20 @@
 
 namespace tensorrt_llm::runtime
 {
+
+//! \brief Page-locks [ptr, ptr + size) with CUDA, issuing one ::cudaHostRegister call per \p chunkSize bytes.
+//!
+//! Page-locking host memory serializes on driver-global locks. A single multi-hundred-GB request keeps those locks
+//! held for many minutes, which blocks CUDA and NVML calls issued by every other process sharing the node. Splitting
+//! the request bounds how long any one call holds the locks, so unrelated processes keep making progress.
+//!
+//! \p ptr and \p chunkSize must be multiples of the host page size. Already registered chunks are unregistered again
+//! before rethrowing if a chunk fails.
+void hostRegisterChunked(void* ptr, std::size_t size, std::size_t chunkSize);
+
+//! \brief Reverses hostRegisterChunked() using the same chunk boundaries. Must be called with the \p size and
+//! \p chunkSize that were passed to hostRegisterChunked().
+void hostUnregisterChunked(void* ptr, std::size_t size, std::size_t chunkSize);
 
 // CRTP base class
 template <typename TDerived, MemoryType memoryType, bool count = true>
@@ -159,6 +174,12 @@ protected:
     }
 };
 
+//! \brief Allocator for page-locked host memory.
+//!
+//! Allocations larger than getPinChunkSize() are backed by ordinary host memory that is page-locked in chunks rather
+//! than by a single ::cudaHostAlloc. ::cudaHostAlloc page-locks the whole range in one go, so a large allocation
+//! (e.g. a several-hundred-GB KV cache host offload pool) holds driver-global locks for the entire allocation and
+//! stalls the CUDA and NVML calls of every other process on the node for just as long. See hostRegisterChunked().
 class PinnedAllocator : public BaseAllocator<PinnedAllocator, MemoryType::kPINNED>
 {
     friend class BaseAllocator<PinnedAllocator, MemoryType::kPINNED>;
@@ -167,17 +188,31 @@ public:
     using Base = BaseAllocator<PinnedAllocator, MemoryType::kPINNED>;
     PinnedAllocator() noexcept = default;
 
-protected:
-    void allocateImpl(PointerType* ptr, std::size_t n) // NOLINT(readability-convert-member-functions-to-static)
-    {
-        TLLM_CUDA_CHECK(::cudaHostAlloc(ptr, n, cudaHostAllocDefault));
-    }
+    //! \brief Host page size that chunked allocations and their chunk boundaries are aligned to, as required by
+    //! ::cudaHostRegister.
+    static std::size_t constexpr kHostPageSize{4096};
 
-    void deallocateImpl( // NOLINT(readability-convert-member-functions-to-static)
-        PointerType ptr, [[maybe_unused]] std::size_t n)
-    {
-        TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeHost(ptr));
-    }
+    //! \brief Default value of getPinChunkSize().
+    static std::size_t constexpr kDefaultPinChunkSize{std::size_t{1} << 30}; // 1 GiB
+
+    //! \brief Number of bytes page-locked per ::cudaHostRegister call, and the size up to which allocations keep
+    //! using a single ::cudaHostAlloc.
+    //!
+    //! Read once from TRTLLM_HOST_PIN_CHUNK_BYTES, defaulting to kDefaultPinChunkSize. Setting it to 0 disables
+    //! chunking and restores plain ::cudaHostAlloc for every allocation size.
+    [[nodiscard]] static std::size_t getPinChunkSize();
+
+    //! \brief Allocates \p n bytes of host memory and page-locks it in \p chunkSize pieces.
+    [[nodiscard]] static PointerType allocateChunkPinned(std::size_t n, std::size_t chunkSize);
+
+    //! \brief Frees memory obtained from allocateChunkPinned(). \p n and \p chunkSize must match the allocation.
+    static void deallocateChunkPinned(PointerType ptr, std::size_t n, std::size_t chunkSize);
+
+protected:
+    void allocateImpl(PointerType* ptr, std::size_t n); // NOLINT(readability-convert-member-functions-to-static)
+
+    void deallocateImpl(                                // NOLINT(readability-convert-member-functions-to-static)
+        PointerType ptr, std::size_t n);
 };
 
 class HostAllocator : public BaseAllocator<HostAllocator, MemoryType::kCPU>
