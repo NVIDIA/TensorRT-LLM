@@ -969,6 +969,10 @@ def test_selfsampling_varlen_4k_8k_rungs_exact(rows, n, top_k):
         want_v = row[ref[r].long().clamp_min(0)].sort().values
         assert torch.equal(got, want_v), f"row {r} value multiset mismatch"
         assert torch.equal(out[r] < 0, ref[r] < 0), f"row {r} pad mask mismatch"
+        # the two-valued row has thousands of tied values: a duplicated index
+        # would still match the value multiset, so pin uniqueness of the head
+        head = out[r][out[r] >= 0]
+        assert int(torch.unique(head).numel()) == head.numel(), f"row {r} duplicate indices"
 
 
 def test_selfsampling_varlen_mid_rung_mtp_cr4():
