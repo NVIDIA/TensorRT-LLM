@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,9 +68,10 @@ public:
     void exchangeAttentionDpThread();
 
 private:
-    // Add an event to mEventQueue
+    // Add an event to mEventQueue. Caller must hold mEventQueueMutex.
     void enqueueEvent(executor::KVCacheEvent&& event);
 
+    // Flush pending removed events for a window. Caller must hold mEventQueueMutex.
     void flushRemovedEvents(SizeType32 windowSize);
 
     /// @brief Flag to terminate the worker
@@ -94,7 +95,9 @@ private:
     /// @brief Condition variable to notify worker thread
     std::condition_variable mPendingEmptyCV;
 
-    /// @brief Buffer of events waiting to be added to the eventQueue. Only ever accessed by forward pass thread.
+    /// @brief Protects event production before events are flushed to the worker thread.
+    std::mutex mEventQueueMutex;
+    /// @brief Buffer of events waiting to be added to the eventQueue.
     std::deque<executor::KVCacheEvent> mEventQueue;
 
     /// @brief The maximum size of the deque
