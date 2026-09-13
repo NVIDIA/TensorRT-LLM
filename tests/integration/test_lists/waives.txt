@@ -260,7 +260,6 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspar
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] SKIP (https://nvbugs/6759009)
 test_doc.py::test_http_url_validity SKIP (https://nvbugs/6709495)
 test_doc.py::test_relative_path_validity SKIP (https://nvbugs/6731971)
-test_e2e.py::test_openai_chat_harmony SKIP (https://nvbugs/6751484)
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4] SKIP (https://nvbugs/6624972)
 test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (https://nvbugs/6605819)
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (bug pending, tracked in PR 17414)
