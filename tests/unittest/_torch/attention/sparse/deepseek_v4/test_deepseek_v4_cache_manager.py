@@ -95,6 +95,7 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
     manager.dtype = DataType.BF16
+    manager._use_nvfp4_compress = False
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
@@ -130,6 +131,7 @@ def test_needed_resource_uses_context_swa_scratch_slope():
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
     manager.dtype = DataType.BF16
+    manager._use_nvfp4_compress = False
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"

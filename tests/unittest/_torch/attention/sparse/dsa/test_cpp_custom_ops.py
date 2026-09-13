@@ -19,6 +19,7 @@
 - ``torch.ops.trtllm.convert_req_index_to_global``
 - ``torch.ops.trtllm.convert_req_index_to_global_grouped``
 - ``torch.ops.trtllm.nvfp4_mla_kv_cache_gather``
+- ``torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct``
 - ``torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather``
 - ``torch.ops.trtllm.fused_cat_fp4``
 - ``torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell``
@@ -113,6 +114,41 @@ def test_nvfp4_mla_kv_cache_gather():
         device="cuda",
     )
     valid = global_indices >= 0
+    assert torch.equal(output[valid], expected.expand(output[valid].shape[0], -1))
+
+
+@skip_pre_blackwell
+def test_nvfp4_mla_kv_cache_gather_direct():
+    """Gather separate COMPRESS pools and compact global indices in place."""
+    num_pool_tokens = 4
+    head_dim = 512
+    data_pool = torch.full((num_pool_tokens, head_dim // 2), 0x22, dtype=torch.uint8, device="cuda")
+    scale_pool = torch.full(
+        (num_pool_tokens, head_dim // 16),
+        2.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    global_indices = torch.tensor([[2, 0, -1], [3, 1, 2]], dtype=torch.int32, device="cuda")
+    output = torch.empty(
+        (*global_indices.shape, head_dim), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    global_dequant_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        data_pool,
+        scale_pool,
+        global_indices,
+        output,
+        global_dequant_scale,
+        0,
+        num_pool_tokens,
+    )
+
+    expected_indices = torch.tensor([[0, 1, -1], [3, 4, 5]], dtype=torch.int32, device="cuda")
+    assert torch.equal(global_indices, expected_indices)
+    expected = torch.full((head_dim,), 0.5, dtype=torch.float8_e4m3fn, device="cuda")
+    valid = expected_indices >= 0
     assert torch.equal(output[valid], expected.expand(output[valid].shape[0], -1))
 
 

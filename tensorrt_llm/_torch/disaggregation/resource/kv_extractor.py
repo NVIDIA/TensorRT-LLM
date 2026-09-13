@@ -572,6 +572,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     # Every V2 manager declares how native roles map to the closed set of
     # disaggregation mapper kinds; Role.ALL is the required fallback.
     role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
+    ignored_roles = frozenset(getattr(manager, "get_disagg_ignored_roles", lambda: frozenset())())
     if Role.ALL not in role_mapper_kinds:
         raise ValueError("Disaggregation role mapping must define Role.ALL")
     for role, mapper_kind in role_mapper_kinds.items():
@@ -676,12 +677,15 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 single_buffer_size = int(coalesced_buffer.single_buffer_size)
                 offset = 0
                 for buffer_id in coalesced_buffer.buffer_ids:
-                    kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
-                    bucket_key = (pool_idx, kind)
-                    bucket_entries[bucket_key].append(
-                        (int(buffer_id.layer_id), offset, single_buffer_size)
-                    )
-                    bucket_roles[bucket_key].add(str(buffer_id.role))
+                    # Local-only buffers still occupy physical slot offsets,
+                    # but do not contribute model state to a transfer view.
+                    if buffer_id.role not in ignored_roles:
+                        kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
+                        bucket_key = (pool_idx, kind)
+                        bucket_entries[bucket_key].append(
+                            (int(buffer_id.layer_id), offset, single_buffer_size)
+                        )
+                        bucket_roles[bucket_key].add(str(buffer_id.role))
                     offset += single_buffer_size
 
             # Emit this layer group's views: one per (pool, mapper-kind
