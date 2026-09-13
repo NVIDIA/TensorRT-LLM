@@ -21,6 +21,28 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
 - [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
 
+### Static FP8 checkpoints
+
+Statically quantized (ModelOpt) FP8 builds of Nano and Super run on this path.
+Quantization is detected from the checkpoint's own metadata — pass the directory
+to `--model` exactly as you would a BF16 one, with no extra flag:
+
+```bash
+python cosmos3.py --model /path/to/Cosmos3-Nano-FP8 \
+    --prompt_file prompts/t2v.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+```
+
+There are no FP8 Hub IDs yet, so use a local path. T2V, T2I, I2V and V2V are
+validated on a **single GPU**; every multi-GPU configuration is refused with an
+explicit error, so use BF16 there.
+
+These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
+rather than being refused — audio is quantized and generated like any other
+supported task. It simply has not been exercised as thoroughly as the four
+video/image tasks above, and no FP8 audio quality claim is made. FP8 output
+quality in general has not been benchmarked against BF16.
+
 ## Guardrails
 
 Guardrails are enabled by default (required by the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)). Install and authenticate as follows:

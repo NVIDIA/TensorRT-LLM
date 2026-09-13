@@ -2288,6 +2288,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             encoder_hidden_states,
             extra_tensors,
         ):
+            # Activation precision for this step. A pure function of step_index,
+            # so the conditional and unconditional CFG branches of one step
+            # always select the same path even though each calls this
+            # separately. No-op unless the checkpoint declares a step policy.
+            self.transformer.set_denoising_step(
+                step_index=step_index, num_steps=len(self.scheduler.timesteps)
+            )
+
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
             current_action = extra_stream_latents.get("action") if extra_stream_latents else None
 
@@ -2375,23 +2383,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         should_pin_condition = (
             prepared.condition_latents is not None and prepared.velocity_mask is not None
         )
-        denoise_result = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=cond_ids,
-            neg_prompt_embeds=uncond_ids,
-            guidance_scale=request.guidance_scale,
-            forward_fn=forward_fn,
-            extra_cfg_tensors=extra_cfg_tensors,
-            extra_streams=extra_streams,
-            guidance_interval=request.guidance_interval,
-            post_step_fn=(
-                post_step_fn
-                if (request.do_action or should_pin_condition)
-                else self._conditioning_anchor_post_step(prepared.image_latent)
-            ),
-            scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
-        )
+        try:
+            denoise_result = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=cond_ids,
+                neg_prompt_embeds=uncond_ids,
+                guidance_scale=request.guidance_scale,
+                forward_fn=forward_fn,
+                extra_cfg_tensors=extra_cfg_tensors,
+                extra_streams=extra_streams,
+                guidance_interval=request.guidance_interval,
+                post_step_fn=(
+                    post_step_fn
+                    if (request.do_action or should_pin_condition)
+                    else self._conditioning_anchor_post_step(prepared.image_latent)
+                ),
+                scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            )
+        finally:
+            # In a finally because a failed request must not leave the selection
+            # latched. The transfer path runs the transformer without selecting
+            # a step, so it would inherit whatever the failed request left
+            # behind and run every call in 16-bit with nothing to indicate it.
+            self.transformer.reset_denoising_step()
 
         action_latents = prepared.action_latents
         if extra_streams is not None:
