@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Stress test script for inference of model using TensorRT LLM with PyTorch/TRT backend.
+Stress test script for model inference using the TensorRT LLM PyTorch backend.
 This script is used for stress testing inference performance using trtllm-serve and aiperf.
 
 The script supports three test modes:
@@ -115,12 +115,10 @@ class ModelConfig:
     model_dir: str
     tp_size: int
     memory_requirement: int
-    backend: Optional[str] = None
 
     def __str__(self) -> str:
         model_name = os.path.basename(self.model_dir)
-        backend_str = f"_{self.backend}" if self.backend else ""
-        return f"{model_name}_tp{self.tp_size}{backend_str}"
+        return f"{model_name}_tp{self.tp_size}"
 
     @property
     def model_name(self) -> str:
@@ -419,7 +417,6 @@ def is_port_available(port: int,
     "test_mode",
     ["stress-test", "stress-stage-alone", "stress-test-with-accuracy"],
     ids=lambda x: x)
-@pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
 @pytest.mark.parametrize("capacity_scheduler_policy",
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
                          ids=lambda x: x)
@@ -464,9 +461,9 @@ def is_port_available(port: int,
                     memory_requirement=172032),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
-def test_run_stress_test(config, stress_time_timeout, backend,
-                         capacity_scheduler_policy, test_mode):
-    """Run the stress test with the provided configuration, backend, and test mode.
+def test_run_stress_test(config, stress_time_timeout, capacity_scheduler_policy,
+                         test_mode):
+    """Run the stress test with the provided configuration and test mode.
 
     This test function calls the stress_test function with the given parameters.
     The function should start with test_ prefix to be recognized as a test function by pytest.
@@ -474,18 +471,9 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     Args:
         config: Model configuration for the test (injected by pytest.mark.parametrize)
         stress_time_timeout: Tuple of (stress_time, stress_timeout) in seconds
-        backend: Backend to use ("trt" or "pytorch")
         capacity_scheduler_policy: Scheduler policy ("GUARANTEED_NO_EVICT", "MAX_UTILIZATION")
         test_mode: Test mode ("stress-test" or "stress-stage-alone")
     """
-    # Create a new ModelConfig with the backend parameter
-    # Convert 'trt' to None as expected by the ModelConfig
-
-    new_config = ModelConfig(model_dir=config.model_dir,
-                             tp_size=config.tp_size,
-                             memory_requirement=config.memory_requirement,
-                             backend=backend)
-
     # Extract stress_time and stress_timeout from the tuple
     stress_time, stress_timeout = stress_time_timeout
 
@@ -493,9 +481,8 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     server_config = ServerConfig(
         capacity_scheduler_policy=capacity_scheduler_policy)
 
-    # Call the existing stress_test function with the new config and test mode
-    stress_test(new_config, test_mode, server_config, stress_time,
-                stress_timeout)
+    # Call the existing stress_test function with the config and test mode
+    stress_test(config, test_mode, server_config, stress_time, stress_timeout)
 
 
 def stress_test(config,
@@ -684,14 +671,13 @@ def stress_test(config,
             print_warning(f"Failed to detect GPU architecture: {e}. "
                           "Using default MOE backend (CUTLASS).")
 
-        if config.backend == "pytorch":
-            extra_llm_options.update({
-                "cuda_graph_config": {
-                    "enable_padding": True,
-                    "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
-                },
-                "print_iter_log": True,
-            })
+        extra_llm_options.update({
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            },
+            "print_iter_log": True,
+        })
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
                                      delete=False) as temp_file:
@@ -711,7 +697,7 @@ def stress_test(config,
         "--pp_size",
         str(test_server_config.pp_size),
         "--backend",
-        config.backend,
+        "pytorch",
     ]
 
     # Only add ep_size parameter if it's not None
