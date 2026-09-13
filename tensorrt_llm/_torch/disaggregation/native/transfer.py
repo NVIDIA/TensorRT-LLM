@@ -37,6 +37,7 @@ except ImportError:
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -646,6 +647,9 @@ class Sender(SenderBase):
         self._enforce_physical_ownership = enforce_physical_ownership
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
+        self._peer_requests_ready_timestamps: dict[
+            int, Optional[disagg_diagnostics.DiagnosticTimestamp]
+        ] = {}
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._dealers = {}  # used by listener thread only (single-threaded path)
@@ -696,6 +700,24 @@ class Sender(SenderBase):
                 return False
             return len(requests) == expected_count
 
+    def _get_req_ready_state(
+        self, unique_rid: int, expected_count: int
+    ) -> tuple[bool, Optional[disagg_diagnostics.DiagnosticTimestamp]]:
+        """Return readiness and preserve the timestamp of its first observation."""
+        with self._peer_requests_lock:
+            requests = self._peer_requests.get(unique_rid)
+            ready = bool(requests) and len(requests) == expected_count
+            if not ready or not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                return ready, None
+            if unique_rid not in self._peer_requests_ready_timestamps:
+                ready_timestamp = None
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    ready_timestamp = disagg_diagnostics.capture_timestamp()
+                self._peer_requests_ready_timestamps[unique_rid] = ready_timestamp
+            else:
+                ready_timestamp = self._peer_requests_ready_timestamps[unique_rid]
+            return True, ready_timestamp
+
     def _get_req_info(self, unique_rid: Optional[int]) -> Optional[dict]:
         with self._peer_requests_lock:
             return self._peer_requests.get(unique_rid)
@@ -711,6 +733,7 @@ class Sender(SenderBase):
         with self._peer_requests_lock:
             self._peer_requests.pop(unique_rid, None)
             self._peer_requests_timestamps.pop(unique_rid, None)
+            self._peer_requests_ready_timestamps.pop(unique_rid, None)
 
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
@@ -733,6 +756,7 @@ class Sender(SenderBase):
                 if rid not in self._sessions and rid in self._peer_requests:
                     self._peer_requests.pop(rid, None)
                     self._peer_requests_timestamps.pop(rid, None)
+                    self._peer_requests_ready_timestamps.pop(rid, None)
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
 
     def setup_session(self, tx_session: "TxSession"):
@@ -779,9 +803,28 @@ class Sender(SenderBase):
                 req_info.instance_name, req_info.instance_rank
             )
             expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
-            if self._is_req_ready(unique_rid, expected_count):
+            ready, ready_timestamp = self._get_req_ready_state(unique_rid, expected_count)
+            if ready:
+                became_ready = False
                 with tx_session.lock:
-                    tx_session.receiver_ready = True
+                    if not tx_session.receiver_ready:
+                        tx_session.receiver_ready = True
+                        became_ready = True
+                if (
+                    became_ready
+                    and ready_timestamp is not None
+                    and disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                ):
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "ctx_all_receivers_ready",
+                            side="ctx",
+                            request_id=unique_rid,
+                            local_request_id=tx_session.request_id,
+                            rank_info=self._registrar.self_rank_info,
+                            expected_receivers=expected_count,
+                            timestamp=ready_timestamp,
+                        )
         return
 
     def _get_session(self, unique_rid: Optional[int]) -> Optional["TxSession"]:
@@ -817,10 +860,25 @@ class Sender(SenderBase):
             return True
 
     def _enqueue(self, write_meta: WriteMeta):
+        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if write_meta.meta_type == WriteMetaType.KV and write_meta.src_ptrs.size > 0:
+                    disagg_diagnostics.emit_event(
+                        "ctx_transfer_queued",
+                        side="ctx",
+                        request_id=write_meta.unique_rid,
+                        rank_info=self._registrar.self_rank_info,
+                        slice_id=write_meta.slice_id,
+                        peer_rank=write_meta.peer_rank,
+                        receiver_slice_id=write_meta.receiver_slice_id,
+                        is_last_slice=write_meta.is_last_slice,
+                        transfer_bytes=int(write_meta.sizes.sum()),
+                        worker_queue_index=thread_idx,
+                    )
         # Route by (unique_rid, peer_rank) so that:
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
@@ -850,9 +908,13 @@ class Sender(SenderBase):
         task: SendTaskBase,
         peer_rank: int,
         request: TransferRequest,
+        on_submitted: Optional[Callable[[], None]] = None,
     ) -> tuple[bool, Optional[str]]:
         if not self._enforce_physical_ownership:
             status = self._agent.submit_transfer_requests(request)
+            if on_submitted is not None:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    on_submitted()
             completed = status.wait()
             detail = None if completed else getattr(status, "last_status_str", lambda: None)()
             return completed, detail
@@ -874,6 +936,9 @@ class Sender(SenderBase):
                 self._ownership_poisoned = error
                 task.mark_physical_operation_in_doubt(peer_rank)
                 return False, str(error)
+        if on_submitted is not None:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                on_submitted()
         try:
             if not status.wait():
                 # A non-success query is a logical transfer failure, but the
@@ -912,6 +977,24 @@ class Sender(SenderBase):
                     except Exception as e:
                         logger.warning(f"failed to send transfer rejection: {e}")
                     continue
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        if (
+                            write_meta.meta_type == WriteMetaType.KV
+                            and write_meta.src_ptrs.size > 0
+                        ):
+                            disagg_diagnostics.emit_event(
+                                "ctx_worker_dequeued",
+                                side="ctx",
+                                request_id=write_meta.unique_rid,
+                                rank_info=self._registrar.self_rank_info,
+                                slice_id=write_meta.slice_id,
+                                peer_rank=write_meta.peer_rank,
+                                receiver_slice_id=write_meta.receiver_slice_id,
+                                is_last_slice=write_meta.is_last_slice,
+                                transfer_bytes=int(write_meta.sizes.sum()),
+                                worker_queue_index=thread_idx,
+                            )
                 try:
                     if write_meta.meta_type == WriteMetaType.AUX:
                         logger.debug(
@@ -1043,6 +1126,29 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
+        backend_submitted = False
+        submission_callback: Optional[Callable[[], None]] = None
+        diagnostic_transfer_bytes = None
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                diagnostic_transfer_bytes = int(write_meta.sizes.sum())
+
+            def emit_submitted() -> None:
+                nonlocal backend_submitted
+                backend_submitted = True
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    disagg_diagnostics.emit_event(
+                        "ctx_backend_submitted",
+                        side="ctx",
+                        request_id=write_meta.unique_rid,
+                        rank_info=self._registrar.self_rank_info,
+                        slice_id=write_meta.slice_id,
+                        peer_rank=write_meta.peer_rank,
+                        receiver_slice_id=write_meta.receiver_slice_id,
+                        transfer_bytes=diagnostic_transfer_bytes,
+                    )
+
+            submission_callback = emit_submitted
         if write_meta.src_ptrs.size > 0:
             try:
                 request, send_slot_id = build_send_request(
@@ -1074,8 +1180,25 @@ class Sender(SenderBase):
                 timer.record_transfer_start(write_meta.peer_rank)
             transfer_finished = False
             try:
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "ctx_backend_submit_start",
+                            side="ctx",
+                            request_id=write_meta.unique_rid,
+                            rank_info=self._registrar.self_rank_info,
+                            slice_id=write_meta.slice_id,
+                            peer_rank=write_meta.peer_rank,
+                            receiver_slice_id=write_meta.receiver_slice_id,
+                            transfer_bytes=diagnostic_transfer_bytes,
+                            transfer_entries=int(write_meta.sizes.size),
+                        )
+
                 transfer_finished, last_status = self._submit_transfer(
-                    task, write_meta.peer_rank, request
+                    task,
+                    write_meta.peer_rank,
+                    request,
+                    on_submitted=submission_callback,
                 )
                 if transfer_finished:
                     del request
@@ -1109,6 +1232,24 @@ class Sender(SenderBase):
             task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if (
+                    write_meta.src_ptrs.size > 0
+                    and backend_submitted
+                    and agent_result != AgentResult.IN_DOUBT
+                ):
+                    disagg_diagnostics.emit_event(
+                        "ctx_backend_complete",
+                        side="ctx",
+                        request_id=write_meta.unique_rid,
+                        rank_info=self._registrar.self_rank_info,
+                        slice_id=write_meta.slice_id,
+                        peer_rank=write_meta.peer_rank,
+                        receiver_slice_id=write_meta.receiver_slice_id,
+                        transfer_bytes=diagnostic_transfer_bytes,
+                        outcome=("completed" if agent_result == AgentResult.SUCCESS else "failed"),
+                    )
 
         # Report every chunk so failures reach the receiver immediately.
         tail = (
@@ -1663,6 +1804,17 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.emit_event(
+                    "ctx_request_data_received",
+                    side="ctx",
+                    request_id=info.unique_rid,
+                    rank_info=self._registrar.self_rank_info,
+                    slice_id=info.slice_id,
+                    peer_rank=info.instance_rank,
+                    peer_instance=info.instance_name,
+                )
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
@@ -1675,7 +1827,7 @@ class Sender(SenderBase):
                     terminal = True
                     include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
                 else:
-                    self._save_peer_req_info(info)
+                    became_ready, ready_timestamp = self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
                     terminal = session.has_failed()
                     include_aux = terminal and bool(
@@ -1687,6 +1839,25 @@ class Sender(SenderBase):
             if terminal:
                 self._send_failed_result_to_receiver(info, include_aux=include_aux)
                 return
+        if (
+            became_ready
+            and ready_timestamp is not None
+            and disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+        ):
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+                expected_transfers = len(
+                    self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks
+                )
+                disagg_diagnostics.emit_event(
+                    "ctx_all_receivers_ready",
+                    side="ctx",
+                    request_id=info.unique_rid,
+                    local_request_id=session.request_id,
+                    rank_info=self._registrar.self_rank_info,
+                    expected_receivers=expected_transfers,
+                    timestamp=ready_timestamp,
+                )
         for task in tasks:
             self._dispatch_task_to_peer(task, info)
 
@@ -1817,15 +1988,21 @@ class Sender(SenderBase):
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
 
-    def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
+    def _save_peer_req_info(
+        self, peer_transfer_req_info: RecvReqInfo
+    ) -> tuple[bool, Optional[disagg_diagnostics.DiagnosticTimestamp]]:
         req_info = peer_transfer_req_info
         self._add_req_info(req_info.unique_rid, req_info.instance_rank, req_info)
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
-        if self._is_req_ready(req_info.unique_rid, expected_transfers):
+        became_ready = False
+        ready, ready_timestamp = self._get_req_ready_state(req_info.unique_rid, expected_transfers)
+        if ready:
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
                 session.receiver_ready = True
+                became_ready = True
+        return became_ready, ready_timestamp
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
         req_info = self._get_first_req_info(unique_rid)
@@ -2734,7 +2911,24 @@ class Receiver(ReceiverBase):
                 if fanin_bounce:
                     receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
                     receiver_req_bytes = receiver_req.to_bytes()
+                send_timestamp = None
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        send_timestamp = disagg_diagnostics.capture_timestamp()
                 self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+                if send_timestamp is not None:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "gen_request_data_sent",
+                            side="gen",
+                            request_id=receiver_req.unique_rid,
+                            rank_info=self._registrar.self_rank_info,
+                            slice_id=receiver_req.slice_id,
+                            peer_rank=rank,
+                            expected_writers=task.expected_transfers,
+                            ownership_enabled=False,
+                            timestamp=send_timestamp,
+                        )
             return
 
         peer_ranks = list(peer_overlap.ranks)
@@ -2749,17 +2943,26 @@ class Receiver(ReceiverBase):
             serialized_requests.append((rank, payload))
 
         published_writers: set[int] = set()
+        published_writer_timestamps: Optional[
+            list[tuple[int, disagg_diagnostics.DiagnosticTimestamp]]
+        ] = [] if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED else None
 
         def publish_requests() -> None:
             for rank, payload in serialized_requests:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
+                send_timestamp = None
+                if published_writer_timestamps is not None:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        send_timestamp = disagg_diagnostics.capture_timestamp()
                 published_writers.add(rank)
                 try:
                     self._request_sender_data(peer_infos.sender_endpoints[rank], payload)
                 except Exception:
                     published_writers.discard(rank)
                     raise
+                if published_writer_timestamps is not None and send_timestamp is not None:
+                    published_writer_timestamps.append((rank, send_timestamp))
 
         # Gen-first ADP publishes the destination to every eligible DP group,
         # but the qualified immutable-request, no-retry/no-reroute profile
@@ -2781,6 +2984,20 @@ class Receiver(ReceiverBase):
                 task.cancel_unpublished()
         finally:
             release_admission()
+            if published_writer_timestamps:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    for rank, send_timestamp in published_writer_timestamps:
+                        disagg_diagnostics.emit_event(
+                            "gen_request_data_sent",
+                            side="gen",
+                            request_id=receiver_req.unique_rid,
+                            rank_info=self._registrar.self_rank_info,
+                            slice_id=receiver_req.slice_id,
+                            peer_rank=rank,
+                            expected_writers=task.expected_transfers,
+                            ownership_enabled=True,
+                            timestamp=send_timestamp,
+                        )
         return
 
     @staticmethod
@@ -2921,16 +3138,36 @@ class Receiver(ReceiverBase):
 
         dst_ptrs, sizes, src_base = decode_result_tail(message)
         session = self._get_session(unique_rid)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                diagnostic_result = _AGENT_RESULT_BY_CODE.get(status_code)
+                disagg_diagnostics.emit_event(
+                    "gen_writer_result_received",
+                    side="gen",
+                    request_id=unique_rid,
+                    rank_info=self._registrar.self_rank_info,
+                    slice_id=receiver_slice_id,
+                    peer_rank=peer_rank,
+                    outcome=(
+                        diagnostic_result.value.lower()
+                        if diagnostic_result is not None
+                        else f"unknown:{status_code}"
+                    ),
+                    is_last_slice=is_last_slice,
+                    transfer_bytes=transfer_size,
+                    session_found=session is not None,
+                )
         if session is None:
             logger.warning(
                 f"_process_kv_agent_result: session {unique_rid} not found (already closed?), dropping status"
             )
             return
+        agent_result = _AGENT_RESULT_BY_CODE[status_code]
         session.process_kv_agent_result(
             peer_rank,
             receiver_slice_id,
             is_last_slice,
-            _AGENT_RESULT_BY_CODE[status_code],
+            agent_result,
             dst_ptrs=dst_ptrs,
             sizes=sizes,
             src_base=src_base,
@@ -3285,6 +3522,10 @@ class RxSession(RxSessionBase):
                     # the scatter worker (after cudaStreamSynchronize) for the bounced path, so the
                     # gen consumer never observes completion before the KV is scattered into place.
                     request_id = self.request_id
+                    disagg_request_id = None
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_request_id = self.disagg_request_id
                     ri = self._receiver._registrar.self_rank_info
                     instance_name, instance_rank = ri.instance_name, ri.instance_rank
 
@@ -3294,6 +3535,8 @@ class RxSession(RxSessionBase):
                         peer_rank=peer_rank,
                         receiver_slice_id=receiver_slice_id,
                         request_id=request_id,
+                        disagg_request_id=disagg_request_id,
+                        rank_info=ri,
                         instance_name=instance_name,
                         instance_rank=instance_rank,
                     ):
@@ -3304,12 +3547,32 @@ class RxSession(RxSessionBase):
                         if self._enforce_physical_ownership:
                             task.finish_local_completion()
                         if not success:
+                            destination_timestamp = None
+                            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                                with disagg_diagnostics.suppress_diagnostic_errors():
+                                    destination_timestamp = disagg_diagnostics.capture_timestamp()
                             task.fail(
                                 RuntimeError(
                                     f"KV bounce scatter failed for request {request_id} "
                                     f"slice={receiver_slice_id}"
                                 )
                             )
+                            if (
+                                destination_timestamp is not None
+                                and disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                            ):
+                                with disagg_diagnostics.suppress_diagnostic_errors():
+                                    disagg_diagnostics.emit_event(
+                                        "gen_destination_complete",
+                                        side="gen",
+                                        request_id=disagg_request_id,
+                                        local_request_id=request_id,
+                                        rank_info=rank_info,
+                                        slice_id=receiver_slice_id,
+                                        peer_rank=peer_rank,
+                                        outcome="failed",
+                                        timestamp=destination_timestamp,
+                                    )
                             return
                         if task.status == TaskStatus.ERROR:
                             return  # a concurrent FAILED writer already failed it; don't un-fail
@@ -3322,12 +3585,32 @@ class RxSession(RxSessionBase):
                                 f"KV transfer perf logging failed for request {request_id} "
                                 f"slice={receiver_slice_id}: {e}"
                             )
+                        destination_timestamp = None
+                        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                            with disagg_diagnostics.suppress_diagnostic_errors():
+                                destination_timestamp = disagg_diagnostics.capture_timestamp()
                         task.complete()
                         # Transfer end for perf/time-sync: only meaningful once every slice has
                         # landed. Plain attribute write (atomic under the GIL); on_done must stay
                         # lock-free, and consumers only read it after wait_complete succeeds.
                         if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
                             self.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
+                        if (
+                            destination_timestamp is not None
+                            and disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                        ):
+                            with disagg_diagnostics.suppress_diagnostic_errors():
+                                disagg_diagnostics.emit_event(
+                                    "gen_destination_complete",
+                                    side="gen",
+                                    request_id=disagg_request_id,
+                                    local_request_id=request_id,
+                                    rank_info=rank_info,
+                                    slice_id=receiver_slice_id,
+                                    peer_rank=peer_rank,
+                                    outcome="completed",
+                                    timestamp=destination_timestamp,
+                                )
                         logger.debug(
                             f"KV transfer complete for request {request_id} "
                             f"slice={receiver_slice_id}"

@@ -567,7 +567,9 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
 
 @pytest.mark.cpu_only
-def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
+def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rid = 94
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
@@ -604,7 +606,41 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
             cp_size=1,
         )
     )
-    receiver._request_sender_data = Mock()
+    publication_order: list[tuple[str, int]] = []
+    published_ranks: list[int] = []
+    captured_timestamps: list[tuple[int, int]] = []
+    publication_timestamps: dict[int, tuple[int, int]] = {}
+    fast_response_timestamps: dict[int, tuple[int, int]] = {}
+
+    def request_sender_data(endpoint: str, _payload: bytes) -> None:
+        rank = int(endpoint.rsplit("-", 1)[1])
+        assert publication_order[-1][0] == "capture"
+        publication_timestamps[rank] = captured_timestamps[-1]
+        published_ranks.append(rank)
+        publication_order.append(("send", rank))
+        # Model a listener response that races ahead of the deferred event
+        # emission after this send returns.
+        fast_response_timestamps[rank] = (
+            captured_timestamps[-1][0] + 50,
+            captured_timestamps[-1][1] + 50,
+        )
+        publication_order.append(("result", rank))
+
+    def capture_timestamp() -> tuple[int, int]:
+        index = len(captured_timestamps)
+        timestamp = (index + 100, index + 200)
+        captured_timestamps.append(timestamp)
+        publication_order.append(("capture", index))
+        return timestamp
+
+    def emit_event(event: str, **kwargs) -> None:
+        if event == "gen_request_data_sent":
+            rank = kwargs["peer_rank"]
+            assert kwargs["timestamp"] == publication_timestamps[rank]
+            assert kwargs["timestamp"][0] < fast_response_timestamps[rank][0]
+            publication_order.append(("emit", rank))
+
+    receiver._request_sender_data = request_sender_data
     session = RxSession(
         request_id=rid,
         params=DisaggregatedParams(
@@ -617,13 +653,32 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     task = session.prepare_receive(KVSlice(is_last_slice=True))
     assert task is not None
 
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "capture_timestamp",
+        capture_timestamp,
+    )
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
     session.dispatch_prepared_receive(task)
 
     assert task.expected_transfers == 2
-    assert {call.args[0] for call in receiver._request_sender_data.call_args_list} == {
+    assert {f"tcp://sender-{rank}" for rank in published_ranks} == {
         f"tcp://sender-{rank}" for rank in range(4)
     }
-    assert receiver._request_sender_data.call_count == 4
+    assert len(published_ranks) == 4
+    assert publication_order == [
+        *(
+            entry
+            for index, rank in enumerate(published_ranks)
+            for entry in (("capture", index), ("send", rank), ("result", rank))
+        ),
+        *(("emit", rank) for rank in published_ranks),
+    ]
     session.process_kv_agent_result(
         peer_rank=2,
         receiver_slice_id=0,
@@ -713,6 +768,13 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
             )
 
     receiver._request_sender_data = request_sender_data
+    emit_event = Mock()
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
     monkeypatch.setattr(
         transfer_mod.tensorrt_llm.bindings,
         "global_steady_clock_now",
@@ -732,6 +794,13 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         session.receive(KVSlice(is_last_slice=True))
 
     assert queued_endpoints == ["tcp://sender-0"]
+    request_data_events = [
+        call for call in emit_event.call_args_list if call.args == ("gen_request_data_sent",)
+    ]
+    assert len(request_data_events) == 1
+    assert request_data_events[0].kwargs["request_id"] == rid
+    assert request_data_events[0].kwargs["peer_rank"] == 0
+    assert request_data_events[0].kwargs["ownership_enabled"] is True
     if not writer_settles_before_failure:
         assert bounce.context is not None
         assert bounce.release_count == 0
@@ -1321,11 +1390,145 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender = object.__new__(transfer_mod.Sender)
     sender._enforce_physical_ownership = True
     sender._sessions_lock, sender._sessions = threading.Lock(), {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
+    sender._peer_requests_ready_timestamps = {}
+    sender._pre_cancelled_rids = set()
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
     sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
     sender._instance_rank = 0
     return sender
+
+
+@pytest.mark.cpu_only
+def test_gen_first_ready_timestamp_survives_until_sender_session_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rid = 107
+    ready_timestamp = (123, 456)
+    sender = _make_owned_sender()
+    sender._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="ctx", instance_rank=0),
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(dp_rank=0)),
+        get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[2])),
+    )
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=18,
+        instance_name="gen",
+        instance_rank=2,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        slice_id=0,
+    )
+    capture_timestamp = Mock(return_value=ready_timestamp)
+    emit_event = Mock()
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "capture_timestamp",
+        capture_timestamp,
+    )
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
+
+    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+
+    assert sender._sessions == {}
+    assert sender._peer_requests_ready_timestamps[rid] == ready_timestamp
+    tx_session = SimpleNamespace(
+        disagg_request_id=rid,
+        request_id=19,
+        lock=threading.Lock(),
+        receiver_ready=False,
+    )
+
+    sender.setup_session(tx_session)
+
+    assert tx_session.receiver_ready
+    capture_timestamp.assert_called_once_with()
+    ready_events = [
+        call for call in emit_event.call_args_list if call.args == ("ctx_all_receivers_ready",)
+    ]
+    assert len(ready_events) == 1
+    assert ready_events[0].kwargs["timestamp"] == ready_timestamp
+
+    sender.clear_session(rid)
+
+    assert rid not in sender._peer_requests
+    assert rid not in sender._peer_requests_ready_timestamps
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("diagnostics_enabled", [False, True])
+def test_kv_result_size_is_diagnostics_independent_without_perf_timer(
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostics_enabled: bool,
+) -> None:
+    rid = 108
+    peer_rank = 2
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._device_id = 0
+    sender._bounce = Mock()
+    sender._agent = SimpleNamespace(
+        submit_transfer_requests=Mock(return_value=SimpleNamespace(wait=Mock(return_value=True)))
+    )
+    sender._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="ctx", instance_rank=0)
+    )
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    task = transfer_mod.KVSendTask(
+        KVSlice(is_last_slice=True),
+        DisaggregatedParams(disagg_request_id=rid),
+        slice_id=0,
+    )
+    task._perf_timer = None
+    session = SimpleNamespace(
+        kv_tasks=[task],
+        lock=threading.Lock(),
+        status=SessionStatus.READY,
+        set_exception=Mock(),
+        transfer_end_time=None,
+    )
+    sender._sessions = {rid: session}
+    write_meta = transfer_mod.WriteMeta(
+        task=task,
+        expected_transfers=1,
+        peer_name="gen2",
+        peer_rank=peer_rank,
+        peer_endpoint="receiver",
+        unique_rid=rid,
+        src_ptrs=np.array([0x1000, 0x2000], dtype=np.int64),
+        dst_ptrs=np.array([0x3000, 0x4000], dtype=np.int64),
+        sizes=np.array([0x100, 0x80], dtype=np.int64),
+        dst_device_id=0,
+        slice_id=0,
+        receiver_slice_id=0,
+        is_last_slice=True,
+    )
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        diagnostics_enabled,
+    )
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", Mock())
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        transfer_mod.tensorrt_llm.bindings,
+        "global_steady_clock_now",
+        lambda: 0,
+    )
+
+    sender._deliver_kv_to_agent(write_meta)
+
+    result = transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])
+    assert result[5] == 0
 
 
 @pytest.mark.cpu_only
@@ -1621,7 +1824,7 @@ def test_late_request_data_to_terminal_sender_settles_aux(
         unique_rid=rid,
     )
     sender = _make_owned_sender()
-    sender._save_peer_req_info = Mock()
+    sender._save_peer_req_info = Mock(return_value=(False, None))
     sender._send_failed_result_to_receiver = Mock()
     session = SimpleNamespace(
         lock=threading.Lock(),

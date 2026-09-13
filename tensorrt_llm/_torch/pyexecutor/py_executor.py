@@ -52,6 +52,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
+from ..disaggregation import diagnostics as disagg_diagnostics
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
 from ..disaggregation.orchestration.admission import \
@@ -3652,11 +3653,59 @@ class PyExecutor:
         # Real synchronous gen_only transfers still honor the budget to bound
         # the number of blocking transfers started in one executor iteration.
         if self._is_disagg_gen_only_no_context_benchmark():
+            if (disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                    and fitting_disagg_gen_init_requests):
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    self._emit_disagg_transfer_window_results(
+                        fitting_disagg_gen_init_requests,
+                        fitting_disagg_gen_init_requests,
+                        policy="not_applicable",
+                    )
             return fitting_disagg_gen_init_requests, False
 
         controller = self._get_disagg_transfer_admission_controller()
         if not (self._disagg_transfer_window_is_active()
                 and fitting_disagg_gen_init_requests):
+            if (disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                    and fitting_disagg_gen_init_requests):
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    if not controller.enabled():
+                        policy = "disabled"
+                    elif self._is_disagg_transfer_window_bypass_eligible():
+                        policy = "bypassed"
+                    else:
+                        policy = "inactive"
+                    legacy_result = None
+                    if policy == "bypassed":
+                        # This opt-in counterfactual scans active requests and
+                        # candidates on every bypass admission decision. Keep
+                        # diagnostics disabled outside targeted debugging runs.
+                        try:
+                            legacy_result = controller.select(
+                                self.active_requests,
+                                fitting_disagg_gen_init_requests)
+                        except Exception:
+                            # Preserve the actual bypass result when the
+                            # counterfactual diagnostic cannot be computed.
+                            pass
+                    self._emit_disagg_transfer_window_results(
+                        fitting_disagg_gen_init_requests,
+                        fitting_disagg_gen_init_requests,
+                        policy=policy,
+                        controller=controller,
+                        legacy_admitted_requests=(
+                            legacy_result.admitted_requests
+                            if legacy_result is not None else None),
+                        legacy_active_transfer_blocks=(
+                            legacy_result.active_transfer_blocks
+                            if legacy_result is not None else None),
+                        legacy_admitted_transfer_blocks=(
+                            legacy_result.admitted_transfer_blocks
+                            if legacy_result is not None else None),
+                        legacy_limited_by_budget=(
+                            legacy_result.limited_by_budget
+                            if legacy_result is not None else None),
+                    )
             return fitting_disagg_gen_init_requests, False
 
         admission_result = controller.select(self.active_requests,
@@ -3670,16 +3719,95 @@ class PyExecutor:
                          f"{admission_result.admitted_transfer_blocks}, "
                          f"budget={controller.max_transfer_blocks}")
 
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                self._emit_disagg_transfer_window_results(
+                    fitting_disagg_gen_init_requests,
+                    admission_result.admitted_requests,
+                    policy="enforced",
+                    controller=controller,
+                    active_transfer_blocks=admission_result.
+                    active_transfer_blocks,
+                    admitted_transfer_blocks=admission_result.
+                    admitted_transfer_blocks,
+                )
+
         self._revert_deferred_disagg_gen_init_alloc(
             fitting_disagg_gen_init_requests,
-            admission_result.admitted_requests)
+            admission_result.admitted_requests,
+            reason="transfer_window",
+        )
 
         return (admission_result.admitted_requests,
                 admission_result.is_blocked_by_active_transfers())
 
+    def _emit_disagg_transfer_window_results(
+            self,
+            candidates: List[LlmRequest],
+            admitted_requests: List[LlmRequest],
+            *,
+            policy: str,
+            controller: Optional[DisaggTransferAdmissionController] = None,
+            active_transfer_blocks: Optional[int] = None,
+            admitted_transfer_blocks: Optional[int] = None,
+            legacy_admitted_requests: Optional[List[LlmRequest]] = None,
+            legacy_active_transfer_blocks: Optional[int] = None,
+            legacy_admitted_transfer_blocks: Optional[int] = None,
+            legacy_limited_by_budget: Optional[bool] = None) -> None:
+        """Emit per-request transfer-window decisions for offline analysis."""
+        if not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            return
+
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            admitted_ids = {
+                request.py_request_id
+                for request in admitted_requests
+            }
+            legacy_admitted_ids = ({
+                request.py_request_id
+                for request in legacy_admitted_requests
+            } if legacy_admitted_requests is not None else None)
+            tokens_per_block = getattr(controller, "tokens_per_block", 0)
+            for request in candidates:
+                prompt_tokens = getattr(request, "total_input_len_cp", None)
+                if prompt_tokens is None:
+                    prompt_tokens = request.prompt_len
+                request_blocks = ((prompt_tokens + tokens_per_block - 1) //
+                                  tokens_per_block
+                                  if tokens_per_block > 0 else None)
+                disagg_diagnostics.emit_event(
+                    "gen_transfer_window_result",
+                    side="gen",
+                    request_id=get_unique_rid(request),
+                    local_request_id=request.py_request_id,
+                    rank=self.global_rank,
+                    outcome=("admitted" if request.py_request_id in admitted_ids
+                             else "deferred"),
+                    policy=policy,
+                    prompt_tokens=prompt_tokens,
+                    request_blocks=request_blocks,
+                    active_transfer_blocks=active_transfer_blocks,
+                    admitted_transfer_blocks=admitted_transfer_blocks,
+                    transfer_block_budget=getattr(controller,
+                                                  "max_transfer_blocks", None),
+                    legacy_budget_outcome=(
+                        "admitted" if request.py_request_id
+                        in legacy_admitted_ids else "deferred")
+                    if legacy_admitted_ids is not None else None,
+                    legacy_active_transfer_blocks=legacy_active_transfer_blocks,
+                    legacy_admitted_transfer_blocks=
+                    legacy_admitted_transfer_blocks,
+                    legacy_limited_by_budget=legacy_limited_by_budget,
+                    tp_rank=self.dist.tp_rank,
+                    pp_rank=self.dist.pp_rank,
+                    cp_rank=self.dist.cp_rank,
+                )
+
     def _revert_deferred_disagg_gen_init_alloc(
-            self, candidates: List[LlmRequest],
-            admitted_requests: List[LlmRequest]) -> None:
+            self,
+            candidates: List[LlmRequest],
+            admitted_requests: List[LlmRequest],
+            reason: str = "pp_reconciliation") -> None:
         """Revert Scheduler V2 allocations absent from an admitted request set.
 
         Scheduler V2 allocates KV while evaluating generation-init requests.
@@ -3700,6 +3828,20 @@ class PyExecutor:
         ]
         if deferred_requests:
             self._revert_ctx_alloc(deferred_requests)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    for request in deferred_requests:
+                        disagg_diagnostics.emit_event(
+                            "gen_kv_rollback",
+                            side="gen",
+                            request_id=get_unique_rid(request),
+                            local_request_id=request.py_request_id,
+                            rank=self.global_rank,
+                            reason=reason,
+                            tp_rank=self.dist.tp_rank,
+                            pp_rank=self.dist.pp_rank,
+                            cp_rank=self.dist.cp_rank,
+                        )
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:
@@ -6157,6 +6299,26 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for request in validated_requests:
+                    if not request.is_disagg_generation_init_state:
+                        continue
+                    prompt_tokens = getattr(request, "total_input_len_cp", None)
+                    if prompt_tokens is None:
+                        prompt_tokens = request.prompt_len
+                    disagg_diagnostics.emit_event(
+                        "gen_ingress",
+                        side="gen",
+                        request_id=get_unique_rid(request),
+                        local_request_id=request.py_request_id,
+                        rank=self.global_rank,
+                        prompt_tokens=prompt_tokens,
+                        state=request.state.name,
+                        tp_rank=self.dist.tp_rank,
+                        pp_rank=self.dist.pp_rank,
+                        cp_rank=self.dist.cp_rank,
+                    )
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -7377,6 +7539,22 @@ class PyExecutor:
                     req.add_new_token(first_gen_tokens[beam], beam)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        prompt_tokens = getattr(req, "total_input_len_cp", None)
+                        if prompt_tokens is None:
+                            prompt_tokens = req.prompt_len
+                        disagg_diagnostics.emit_event(
+                            "gen_decode_ready",
+                            side="gen",
+                            request_id=get_unique_rid(req),
+                            local_request_id=req.py_request_id,
+                            rank=self.global_rank,
+                            prompt_tokens=prompt_tokens,
+                            tp_rank=self.dist.tp_rank,
+                            pp_rank=self.dist.pp_rank,
+                            cp_rank=self.dist.cp_rank,
+                        )
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
@@ -7559,7 +7737,26 @@ class PyExecutor:
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                    req.py_kv_transfer_start_time = time.monotonic()
+                    timeout_start = time.monotonic()
+                    req.py_kv_transfer_start_time = timeout_start
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_event(
+                                "transfer_timeout_started",
+                                side="gen",
+                                request_id=get_unique_rid(req),
+                                local_request_id=req.py_request_id,
+                                rank=self.global_rank,
+                                timeout_ms=self.kv_cache_transceiver.
+                                kv_transfer_timeout_ms,
+                                timeout_owner="pyexecutor",
+                                timer_start_monotonic_ns=int(timeout_start *
+                                                             1_000_000_000),
+                                state=req.state.name,
+                                tp_rank=self.dist.tp_rank,
+                                pp_rank=self.dist.pp_rank,
+                                cp_rank=self.dist.cp_rank,
+                            )
 
         self.disagg.reap_gen_receives(0)
 
@@ -8128,6 +8325,22 @@ class PyExecutor:
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
         self.resource_manager.free_resources(request)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if request.is_context_only_request:
+                    disagg_diagnostics.emit_event(
+                        "ctx_source_kv_released",
+                        side="ctx",
+                        request_id=get_unique_rid(request),
+                        local_request_id=request.py_request_id,
+                        rank=self.global_rank,
+                        prompt_tokens=request.prompt_len,
+                        state=request.state.name,
+                        source_kv_request_owned=False,
+                        tp_rank=self.dist.tp_rank,
+                        pp_rank=self.dist.pp_rank,
+                        cp_rank=self.dist.cp_rank,
+                    )
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
 
