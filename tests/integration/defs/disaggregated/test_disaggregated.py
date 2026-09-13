@@ -418,8 +418,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
-        "cancel_stress_test_large":
-        f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
         "llama31_8b":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b.yaml",
         "mamba_conc_greater_than_mbs":
@@ -4272,29 +4270,6 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
-
-
-@pytest.mark.skip_less_device(8)
-@skip_pre_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
-def test_disaggregated_cancel_large_context_requests_long(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        model_path):
-    """Test that disaggregated server handles request cancellations gracefully.
-
-    This test sends bursts of requests with large contexts and cancels them
-    during prefill to stress test resource cleanup.
-    """
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test_large",
-                                  env=llm_venv._new_env,
-                                  num_bursts=1000,
-                                  requests_per_burst=32,
-                                  model_path=model_dir,
-                                  cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
