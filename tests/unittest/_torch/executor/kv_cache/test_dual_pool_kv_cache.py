@@ -772,6 +772,8 @@ class TestKVCacheV2SchedulerCrossParam:
 
         kv_mgr = Mock()
         kv_mgr.tokens_per_block = 64
+        # Bound KVCacheManagerV2 publishes; the factory validates the pool against it.
+        kv_mgr.max_admissible_sequences = 8 * (2 if cache_transceiver_config else 1)
         cross_mgr = Mock()
         resources = {
             ResourceManagerType.KV_CACHE_MANAGER: kv_mgr,
