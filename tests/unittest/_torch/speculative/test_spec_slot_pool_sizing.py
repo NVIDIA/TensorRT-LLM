@@ -4,10 +4,10 @@
 sized by the sequence-slot pool, not by max_batch_size.
 
 The two differ whenever ``compute_max_num_sequences`` widens the pool: under
-pipeline depth, under disaggregation, and under the attention-DP overlap headroom
-where a finished request holds its slot for one more iteration while its
-replacement is already admitted (nvbug-6627795). Two distinct families follow
-from that, and only the first needs the pool size:
+pipeline depth, and under the attention-DP overlap headroom where a finished
+request holds its slot for one more iteration while its replacement is already
+admitted (nvbug-6627795). Two distinct families follow from that, and only the
+first needs the pool size:
 
 * keyed by ``py_seq_slot`` / a per-request ``SlotManager`` slot -- must span the
   pool. ``SpecMetadata.num_seq_slots`` (draft_probs, full_draft_probs,

@@ -124,7 +124,7 @@ class TestKVCacheAwareADPRouter:
     def test_gather_all_rank_states_excludes_retiring(self):
         dist = _mock_dist(tp_rank=0)
         mgr = _mock_kv_cache_manager()
-        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, has_seq_slot_headroom=True)
 
         req1 = Mock(
             py_orig_prompt_len=100,
@@ -181,7 +181,7 @@ class TestKVCacheAwareADPRouter:
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)
         mgr = _mock_kv_cache_manager()
-        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, has_seq_slot_headroom=True)
 
         req1 = Mock(total_input_len_cp=150, cached_tokens=0)
         state = router.create_rank_state([req1], [])

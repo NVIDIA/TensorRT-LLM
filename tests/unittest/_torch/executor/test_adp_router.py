@@ -386,7 +386,7 @@ class TestDefaultADPRouter:
         # and the tokens of the retiring pair go with them, because the filtered
         # list is what create_rank_state sums.
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
-        router = DefaultADPRouter(dist=dist)
+        router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [
             Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
             _retiring_request(prompt_len=200),
@@ -408,7 +408,7 @@ class TestDefaultADPRouter:
         # still resident. num_retiring_requests carries that fact to every peer
         # so the idle-fetch wait stays collective (nvbug-6627795).
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
-        router = DefaultADPRouter(dist=dist)
+        router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [_retiring_request(), _retiring_request()]
         dist.tp_allgather.side_effect = lambda payload: [payload]
 
@@ -467,6 +467,15 @@ class TestDefaultADPRouter:
         # (PyExecutor.__init__), which passes the engine's flag.
         params = inspect.signature(ADPRouter.create).parameters
         assert params["has_seq_slot_headroom"].default is inspect.Parameter.empty
+
+    def test_router_constructors_default_to_no_headroom(self):
+        # The constructors keep a default for direct instantiation, and it must
+        # be the conservative one: a router that drops retiring requests from
+        # the counts admission subtracts, without a seat pool sized for it, lets
+        # residency exceed max_batch_size * pp_size.
+        for cls in (DefaultADPRouter, ConversationAwareADPRouter, KVCacheAwareADPRouter):
+            default = inspect.signature(cls.__init__).parameters["has_seq_slot_headroom"].default
+            assert default is False, cls.__name__
 
     @pytest.mark.parametrize("has_seq_slot_headroom", [True, False])
     def test_router_factory_propagates_the_headroom_flag(self, has_seq_slot_headroom):

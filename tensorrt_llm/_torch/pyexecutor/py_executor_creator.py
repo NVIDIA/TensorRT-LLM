@@ -668,7 +668,8 @@ def create_py_executor(
             mapping,
             max_batch_size,
             llm_args.disable_overlap_scheduler,
-            is_disagg=is_disagg_enabled(cache_transceiver_config))
+            enable_overlap_headroom=getattr(model_engine,
+                                            "_enable_overlap_headroom", False))
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64

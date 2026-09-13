@@ -707,8 +707,8 @@ class PyExecutor:
         # can receive the transfer-manager reference at construction time.
         self.adp_router: ADPRouter = ADPRouter.create(
             dist=self.dist,
-            has_seq_slot_headroom=getattr(
-                model_engine, "_enable_disagg_adp_overlap_headroom", False),
+            has_seq_slot_headroom=getattr(model_engine,
+                                          "_enable_overlap_headroom", False),
             kv_cache_manager=self.kv_cache_manager,
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,

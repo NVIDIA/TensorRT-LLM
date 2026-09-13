@@ -78,6 +78,7 @@ from ..utils import (get_model_extra_attrs,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
@@ -448,27 +449,12 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        # Disaggregated attention-DP can backfill a batch before the overlap
-        # scheduler releases the previous batch's terminal sequence slots.
-        from ._util import (compute_max_num_sequences, is_disagg_enabled,
+        from ._util import (compute_max_num_sequences,
                             should_enable_adp_dummy_fixes,
-                            should_enable_disagg_adp_overlap_headroom,
                             should_enable_non_overlap_adp_forward_intent,
+                            should_enable_overlap_headroom,
                             should_enable_scheduler_aware_adp_dummy)
-        self._is_disagg = is_disagg_enabled(
-            getattr(llm_args, "cache_transceiver_config", None))
-        self._enable_disagg_adp_overlap_headroom = (
-            should_enable_disagg_adp_overlap_headroom(
-                mapping, llm_args.cache_transceiver_config,
-                llm_args.disable_overlap_scheduler))
         self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
-        self.max_num_seq_slots = compute_max_num_sequences(
-            mapping,
-            self.batch_size,
-            llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
-            is_disagg=self._is_disagg,
-        )
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -570,6 +556,24 @@ class PyTorchModelEngine(ModelEngine):
         self._enable_non_overlap_adp_forward_intent = (
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler))
+        # Attention DP drops retiring requests from the per-rank active counts
+        # that admission subtracts from its capacity, so a replacement cohort can
+        # be admitted while the retiring one still holds its sequence slots. The
+        # gate needs the pretrained config (hybrid SSM state is sized by
+        # max_batch_size and cannot absorb the extra cohort), so it is resolved
+        # here rather than before the model load.
+        self._enable_overlap_headroom = should_enable_overlap_headroom(
+            mapping,
+            llm_args.disable_overlap_scheduler,
+            kv_cache_manager_is_v2=(
+                llm_args.kv_cache_config.use_kv_cache_manager_v2 is True),
+            is_hybrid=is_hybrid_linear(pretrained_config))
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping,
+            self.batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=self._enable_overlap_headroom,
+        )
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):

@@ -183,8 +183,14 @@ class ADPRouter(ABC):
 
     needs_prefix_matches: bool = False
 
-    def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = True):
+    def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
         self.dist = dist
+        # Defaults off, and deliberately so: dropping retiring requests from the
+        # per-rank counts admission subtracts from its capacity lets residency
+        # exceed max_batch_size * pp_size, which is only safe when the seat pool
+        # was sized for it (_util.should_enable_overlap_headroom). A caller that
+        # forgets the flag should get the conservative accounting, not a pool
+        # overrun.
         self.exclude_retiring_requests = has_seq_slot_headroom
 
     @classmethod
@@ -546,7 +552,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         self,
         dist: "Distributed",
         kv_cache_manager,
-        has_seq_slot_headroom: bool = True,
+        has_seq_slot_headroom: bool = False,
         load_balance_weight: float = 1.0,
         match_rate_threshold: float = 0.1,
         fair_share_multiplier: float = 2.0,
@@ -852,7 +858,7 @@ class ConversationAwareADPRouter(ADPRouter):
     def __init__(
         self,
         dist: "Distributed",
-        has_seq_slot_headroom: bool = True,
+        has_seq_slot_headroom: bool = False,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
         new_conv_placement: str = "round_robin",
