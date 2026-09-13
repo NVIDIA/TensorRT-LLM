@@ -60,16 +60,6 @@ situ_supported = pytest.mark.skipif(
 )
 
 
-def _make_aux_stream_dict() -> dict[AuxStreamType, object]:
-    return {
-        AuxStreamType.Attention: object(),
-        AuxStreamType.MoeShared: object(),
-        AuxStreamType.MoeChunkingOverlap: object(),
-        AuxStreamType.MoeBalancer: object(),
-        AuxStreamType.MoeOutputMemset: object(),
-    }
-
-
 @pytest.fixture
 def _single_rank_nccl_process_group(monkeypatch):
     if dist.is_initialized():
