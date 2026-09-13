@@ -29,7 +29,6 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError
 from tensorrt_llm._torch.speculative.eagle3 import (
     Eagle3OneModelDynamicTreeResourceManager,
     Eagle3ResourceManager,
@@ -40,7 +39,6 @@ from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAutomatonManager
 from tensorrt_llm._torch.speculative.utils import (
     _build_spec_metadata,
-    get_spec_drafter,
     get_spec_metadata,
     get_spec_resource_manager,
 )
@@ -220,121 +218,6 @@ def test_every_resource_manager_branch_forwards_the_slot_pool():
         f"get_spec_resource_manager builds {sorted(set(missing))} without forwarding "
         "num_seq_slots; slot-keyed pools would be sized at max_batch_size. Either pass "
         "it or justify the exemption in _MANAGERS_WITHOUT_A_SLOT_POOL."
-    )
-
-
-# ---------------------------------------------------------------------------
-# The drafter's own slot pool. Two-model speculation runs a *second*
-# SeqSlotManager (get_spec_drafter), and the guard above cannot see it: it walks
-# get_spec_resource_manager only, and matches names ending in "Manager" that take
-# a num_seq_slots *keyword*, while SeqSlotManager takes its size positionally.
-# That blind spot is why this pool stayed at max_batch_size while every pool
-# around it moved to the seat count.
-# ---------------------------------------------------------------------------
-
-
-def _drafter_engine(seats):
-    """A stub target engine for get_spec_drafter's draft-target branch.
-
-    ``seats=None`` stands for an engine that publishes no pool at all, which is
-    the only case that still falls back to max_batch_size.
-    """
-    spec_dec_mode = types.SimpleNamespace(
-        is_user_provided=lambda: False,
-        is_draft_target=lambda: True,
-        is_eagle3=lambda: False,
-        is_mtp_eagle=lambda: False,
-        is_ngram=lambda: False,
-    )
-    spec_config = types.SimpleNamespace(
-        spec_dec_mode=spec_dec_mode,
-        max_draft_len=2,
-        tokens_per_gen_step=3,
-        max_concurrency=None,
-        draft_len_schedule=None,
-    )
-    engine = types.SimpleNamespace(spec_config=spec_config, batch_size=R)
-    if seats is not None:
-        engine.max_num_seq_slots = seats
-    return engine
-
-
-def _drafter(seats):
-    return get_spec_drafter(
-        _drafter_engine(seats),
-        draft_model_engine=object(),
-        sampler=object(),
-        spec_resource_manager=None,
-    )
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("seats,expected_pool", [(POOL, POOL), (R, R), (None, R)])
-def test_draft_slot_pool_follows_the_target_seat_pool(seats, expected_pool):
-    """The draft pool is sized by the *target* engine's seat count.
-
-    The indices it hands out address buffers sized by that seat count -- the
-    sampler shared with PyExecutor, the draft KV cache manager's IndexMapper, and
-    spec_resource_manager -- and ``_create_draft_request`` even carries the
-    target's ``py_seq_slot`` across as ``target_seq_slot``. Sizing this pool
-    independently is what makes the two disagree.
-
-    Read from the published pool rather than from the reason it is wide: seats
-    exceed max_batch_size under pipeline depth and under disaggregation as well as
-    under the attention-DP headroom, and this pool cannot tell them apart. An
-    engine whose pool already equals max_batch_size (row 2) is therefore
-    unchanged, which is what keeps aggregated non-ADP deployments untouched.
-    """
-    assert _drafter(seats).draft_seq_slot_manager.slot_manager.max_num_requests == expected_pool
-
-
-@pytest.mark.cpu_only
-def test_draft_slot_pool_survives_a_full_overlap_turnover():
-    """R retiring + R admitted, with the negative control that proves it bites.
-
-    ``cleanup_previous_draft_resources`` releases the previous draft batch's slots
-    a full iteration later (py_executor.py:5347), so with the headroom on both
-    cohorts hold draft slots at once. At max_batch_size the (R+1)-th lease raises
-    NoFreeSlotsError -- inside the draft loop, mid-iteration.
-    """
-    pool = _drafter(POOL).draft_seq_slot_manager.slot_manager
-    slots = [pool.add_slot(rid) for rid in range(2 * R)]
-    assert len(set(slots)) == 2 * R
-
-    starved = _drafter(R).draft_seq_slot_manager.slot_manager
-    for rid in range(R):
-        starved.add_slot(rid)
-    with pytest.raises(NoFreeSlotsError):
-        starved.add_slot(R)
-
-
-@pytest.mark.cpu_only
-def test_the_drafter_slot_pool_is_not_re_derived_from_max_batch_size():
-    """Structural guard, because the behavioural test above can be satisfied by
-    an accident of the stub: assert the source never passes a batch-size symbol
-    to SeqSlotManager. A new speculation mode that adds a second drafter branch
-    fails here rather than in a draft loop.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(get_spec_drafter)))
-
-    offenders = []
-    seen = 0
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or getattr(node.func, "id", None) != "SeqSlotManager":
-            continue
-        seen += 1
-        for arg in list(node.args) + [kw.value for kw in node.keywords]:
-            if isinstance(arg, ast.Name) and arg.id in ("max_num_requests", "max_batch_size"):
-                offenders.append(arg.id)
-            elif isinstance(arg, ast.Attribute) and arg.attr in ("batch_size", "max_batch_size"):
-                offenders.append(arg.attr)
-
-    # Without this the guard passes vacuously the day the call is renamed away.
-    assert seen, "get_spec_drafter no longer builds a SeqSlotManager; retarget this guard"
-    assert not offenders, (
-        f"get_spec_drafter sizes its SeqSlotManager from {sorted(set(offenders))}; it must "
-        "follow the target engine's seat pool (seat_pool_or_none) or the draft lease for a "
-        "request seated above max_batch_size raises NoFreeSlotsError."
     )
 
 

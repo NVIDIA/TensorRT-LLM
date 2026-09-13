@@ -166,6 +166,11 @@ class DisaggServerConfig():
     # "Connection reset by peer" on a reused connection.
     server_keep_alive_timeout: int = 10
     internal_request_auth_key: Optional[str] = None
+    # Parent-session header for sub-agent routing, e.g. "X-Dynamo-Parent-Session-ID".
+    # Requires conversation routing; see docs/source/features/subagent-routing.md.
+    conversation_affinity_header_for_subagents: Optional[str] = None
+    # Apply parent affinity to context only (default), or context and generation.
+    subagent_affinity_scope: Literal['context', 'both'] = 'context'
 
 
 @dataclass
@@ -235,29 +240,31 @@ def parse_disagg_config_file(yaml_config_file: str):
         return disagg_server_config
 
 
-def extract_disagg_cfg(hostname: str = 'localhost',
-                       port: int = 8000,
-                       max_retries: int = 1,
-                       perf_metrics_max_requests: int = 0,
-                       return_perf_metrics: bool = False,
-                       perf_metrics_output_dir: Optional[str] = None,
-                       context_servers: Optional[dict] = None,
-                       generation_servers: Optional[dict] = None,
-                       conditional_disagg_config: Optional[dict] = None,
-                       otlp_config: Optional[dict] = None,
-                       disagg_cluster: Optional[dict] = None,
-                       node_id: Optional[int] = None,
-                       schedule_style: Literal[
-                           'context_first',
-                           'generation_first'] = 'context_first',
-                       allow_request_chat_template: bool = False,
-                       gen_strip_message_history: bool = False,
-                       gen_tokids_ctxbytes: bool = False,
-                       num_workers: int = 1,
-                       disagg_coordinator_url: Optional[str] = None,
-                       server_keep_alive_timeout: int = 10,
-                       internal_request_auth_key: Optional[str] = None,
-                       **kwargs: Any) -> DisaggServerConfig:
+def extract_disagg_cfg(
+        hostname: str = 'localhost',
+        port: int = 8000,
+        max_retries: int = 1,
+        perf_metrics_max_requests: int = 0,
+        return_perf_metrics: bool = False,
+        perf_metrics_output_dir: Optional[str] = None,
+        context_servers: Optional[dict] = None,
+        generation_servers: Optional[dict] = None,
+        conditional_disagg_config: Optional[dict] = None,
+        otlp_config: Optional[dict] = None,
+        disagg_cluster: Optional[dict] = None,
+        node_id: Optional[int] = None,
+        schedule_style: Literal['context_first',
+                                'generation_first'] = 'context_first',
+        allow_request_chat_template: bool = False,
+        gen_strip_message_history: bool = False,
+        gen_tokids_ctxbytes: bool = False,
+        num_workers: int = 1,
+        disagg_coordinator_url: Optional[str] = None,
+        server_keep_alive_timeout: int = 10,
+        internal_request_auth_key: Optional[str] = None,
+        conversation_affinity_header_for_subagents: Optional[str] = None,
+        subagent_affinity_scope: Literal['context', 'both'] = 'context',
+        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
     internal_request_auth_key = _extract_internal_request_auth_key(
@@ -329,7 +336,52 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.server_keep_alive_timeout = validate_config_non_negative_int(
         server_keep_alive_timeout, "server_keep_alive_timeout")
     config.internal_request_auth_key = internal_request_auth_key
+    config.conversation_affinity_header_for_subagents = (
+        conversation_affinity_header_for_subagents)
+    if subagent_affinity_scope not in ('context', 'both'):
+        raise ValueError(
+            "subagent_affinity_scope must be 'context' or 'both', got "
+            f"{subagent_affinity_scope!r}")
+    config.subagent_affinity_scope = subagent_affinity_scope
+    _warn_if_subagent_affinity_inactive(config)
     return config
+
+
+def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
+    """Warn when the configured fleets do not support sub-agent affinity."""
+    if not config.conversation_affinity_header_for_subagents:
+        return
+
+    # Conditional disaggregation uses a KV-cache-aware generation router.
+    if (config.subagent_affinity_scope == 'both'
+            and config.conditional_disagg_config is not None):
+        logging.warning(
+            "subagent_affinity_scope='both' is unsupported with conditional "
+            "disaggregation: conditional disagg requires a KV-cache-aware "
+            "generation router, which conflicts with the 'conversation' router "
+            "that gen-side sub-agent affinity needs. Gen-side sub-agent affinity "
+            "will not take effect; use subagent_affinity_scope='context'.")
+
+    def _router_type(router_config: Optional[RouterConfig]) -> Optional[str]:
+        return router_config.type if router_config is not None else None
+
+    relevant = [("context", _router_type(config.ctx_router_config))]
+    if config.subagent_affinity_scope == 'both':
+        relevant.append(("generation", _router_type(config.gen_router_config)))
+
+    # Match create_router()'s case-insensitive type resolution.
+    non_conversation = [
+        fleet for fleet, rtype in relevant
+        if (rtype or "").lower() != "conversation"
+    ]
+    if non_conversation:
+        logging.warning(
+            "conversation_affinity_header_for_subagents="
+            f"{config.conversation_affinity_header_for_subagents!r} with "
+            f"subagent_affinity_scope={config.subagent_affinity_scope!r} requires "
+            "the 'conversation' router on the "
+            f"{', '.join(non_conversation)} fleet(s), but they use a different "
+            "router type; sub-agent instance affinity will be inactive there.")
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],

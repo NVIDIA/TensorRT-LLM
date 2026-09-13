@@ -889,9 +889,14 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
+        # Read routing affinity before ExecutorRequest is merged into LlmRequest.
         req = req_item.request
         if req is None:
             return None
+        scheduling_params = getattr(req, "py_scheduling_params", None)
+        affinity_id = getattr(scheduling_params, "subagent_affinity_id", None)
+        if affinity_id:
+            return affinity_id
         conversation_params = req.py_conversation_params
         if conversation_params is None:
             return None

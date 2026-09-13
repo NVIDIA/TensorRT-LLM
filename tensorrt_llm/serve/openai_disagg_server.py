@@ -19,6 +19,7 @@ import json
 import signal
 import socket
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
@@ -47,7 +48,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
+                                                resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
@@ -55,7 +57,7 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    UCompletionRequest, UCompletionResponse,
+    ConversationParams, UCompletionRequest, UCompletionResponse,
     ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
@@ -72,6 +74,33 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+# Most round trips to spend estimating one ctx/gen server's steady-clock
+# offset. Only the least-delayed sample is kept; see `_sync_server_clock`.
+# Each probe costs ~0.2 s because the `/steady_clock_offset` handler sleeps
+# between its two timestamps, and servers are prepared sequentially, so the
+# loop stops early (below) instead of always spending the full budget.
+_CLOCK_SYNC_PROBES = 5
+
+# A round trip this fast is already conclusive -- its offset estimate is
+# accurate to +/- 2.5 ms -- so stop probing. This is the common case on a
+# healthy server, keeping the added startup cost to one extra round trip.
+_CLOCK_SYNC_GOOD_DELAY_SECONDS = 0.005
+
+# Per-request timeout for the handshake, and a wall-clock budget for the whole
+# probe loop. Servers are prepared one at a time, so an unresponsive worker must
+# not be able to stall startup for `_req_timeout_secs` once per probe. A healthy
+# handshake takes ~0.2 s per round trip.
+_CLOCK_SYNC_REQUEST_TIMEOUT_SECONDS = 10.0
+_CLOCK_SYNC_TOTAL_BUDGET_SECONDS = 15.0
+
+# Largest round-trip delay for which the estimated offset is still worth
+# applying. The NTP estimate is only accurate to +/- delay/2, so this caps the
+# error the handshake can inject into perf-metric timestamps at 5 ms. Co-located
+# servers share CLOCK_MONOTONIC (true offset exactly 0) and NTP-synced hosts are
+# aligned to well under a millisecond, so discarding a noisier estimate is
+# strictly better than applying it.
+_CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
@@ -353,13 +382,27 @@ class OpenAIDisaggServer:
         return Response(content=body, status_code=status, headers=headers)
 
     @staticmethod
-    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_params.conversation_id from supported headers.
-
-        Body ``conversation_params.conversation_id`` is canonical. Headers are
-        used only when the body does not provide an id.
-        """
+    def _extract_conversation_id(
+            req: UCompletionRequest,
+            raw_req: Request,
+            subagent_affinity_header: Optional[str] = None) -> None:
+        """Resolve conversation identity and the optional parent routing key."""
         resolve_request_conversation_id(req, raw_req.headers)
+
+        # The configured header is the source of parent affinity.
+        if req.conversation_params is not None:
+            req.conversation_params.subagent_affinity_id = None
+
+        parent = extract_subagent_parent_id(raw_req.headers,
+                                            subagent_affinity_header)
+        if not subagent_affinity_header or parent is None:
+            return
+
+        # Give parent-only requests an independent conversation identity.
+        if req.conversation_params is None:
+            req.conversation_params = ConversationParams(
+                conversation_id=f"subagent:{uuid.uuid4()}")
+        req.conversation_params.subagent_affinity_id = parent
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
@@ -379,7 +422,9 @@ class OpenAIDisaggServer:
                         req, self._allow_request_chat_template)
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
-                self._extract_conversation_id(req, raw_req)
+                self._extract_conversation_id(
+                    req, raw_req,
+                    self._config.conversation_affinity_header_for_subagents)
                 hooks = RawRequestResponseHooks(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
@@ -517,7 +562,30 @@ class OpenAIDisaggServer:
         await create_uvicorn_server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
-        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
+        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running).
+
+        The offset is estimated with the NTP algorithm from an HTTP round trip,
+        so its error is bounded by half the round-trip delay: a round trip whose
+        two legs are asymmetric is indistinguishable from a clock offset. The
+        handshake runs while the ctx/gen servers are still finishing startup, so
+        a single sample regularly lands on a stalled event loop and yields tens
+        of milliseconds of pure error, which is then baked into every perf-metric
+        timestamp those servers report.
+
+        Two mitigations, both standard NTP practice:
+
+        * Probe ``_CLOCK_SYNC_PROBES`` times and keep the sample with the
+          smallest delay (NTP's clock filter). The least-delayed round trip is
+          the most symmetric one, so it carries the least error. A throwaway
+          warm-up request first keeps DNS resolution and connection setup --
+          which are paid entirely on the outbound leg -- out of the samples.
+        * Skip the adjustment entirely when even the best sample is delayed by
+          more than ``_CLOCK_SYNC_MAX_DELAY_SECONDS``. Past that point the
+          estimate is worth less than the zero it would replace: co-located
+          servers share CLOCK_MONOTONIC and are already exactly aligned, and a
+          cross-host deployment running NTP is aligned to well under a
+          millisecond.
+        """
         async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
                 originate_ts = get_steady_clock_now_in_seconds()
@@ -543,11 +611,44 @@ class OpenAIDisaggServer:
                     logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
 
         async def align_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> None:
-            delay, offset = await query_steady_clock_offset(session, server_url)
-            if delay is None or offset is None:
+            # Warm-up probe: DNS resolution and connection setup are paid on the
+            # outbound leg only, so folding them into a measured sample biases
+            # the offset by half their cost. Its result is deliberately dropped.
+            await query_steady_clock_offset(session, server_url)
+
+            # NTP clock filter: keep the least-delayed round trip, since it is
+            # the most symmetric one and hence carries the least error. Stop as
+            # soon as a sample is conclusive so a healthy server costs one probe.
+            best = None
+            probes = 0
+            deadline = get_steady_clock_now_in_seconds() + _CLOCK_SYNC_TOTAL_BUDGET_SECONDS
+            for _ in range(_CLOCK_SYNC_PROBES):
+                probes += 1
+                sample = await query_steady_clock_offset(session, server_url)
+                if sample[0] is None or sample[1] is None:
+                    # The server is unreachable or erroring; retrying it four
+                    # more times only delays startup for every later server.
+                    break
+                if best is None or sample[0] < best[0]:
+                    best = sample
+                if best[0] <= _CLOCK_SYNC_GOOD_DELAY_SECONDS:
+                    break
+                if get_steady_clock_now_in_seconds() >= deadline:
+                    break
+            if best is None:
                 logger.warning(f"Unable to measure steady clock offset for {server_url}; skipping adjustment")
                 return
-            logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second')
+
+            delay, offset = best
+            logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second '
+                        f'(best of {probes} probes)')
+            if delay > _CLOCK_SYNC_MAX_DELAY_SECONDS:
+                logger.warning(
+                    f"Steady clock handshake with {server_url} was too slow to be conclusive "
+                    f"(best round-trip delay {delay * 1e3:.1f} ms > {_CLOCK_SYNC_MAX_DELAY_SECONDS * 1e3:.1f} ms); "
+                    f"the offset estimate is only accurate to +/-{delay / 2 * 1e3:.1f} ms, so it is discarded "
+                    "rather than applied. Perf-metric timestamps stay on each server's own steady clock.")
+                return
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
@@ -557,7 +658,9 @@ class OpenAIDisaggServer:
         try:
             async with aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
-                timeout=aiohttp.ClientTimeout(total=self._req_timeout_secs)) as session:
+                timeout=aiohttp.ClientTimeout(total=min(
+                    self._req_timeout_secs,
+                    _CLOCK_SYNC_REQUEST_TIMEOUT_SECONDS))) as session:
                 await align_steady_clock_offset(session, server_url)
         except (aiohttp.ClientError, OSError) as e:
             logger.warning(f"Unable to align steady clock offset for {server_url}: {e}; skipping adjustment")

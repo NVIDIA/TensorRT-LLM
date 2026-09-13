@@ -46,8 +46,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
-from .sparse.params import SparseParams
-from .sparse.skip_softmax import SkipSoftmaxParams
+from .sparse.params import BlockSparseForwardInputs, SparseParams
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -1333,9 +1332,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 2: static tree (target model only)
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert (spec_metadata.spec_dec_mode.is_eagle3()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-                        ), "Tree decoding is only supported for Eagle3 now"
+                assert spec_metadata.spec_dec_mode.is_eagle3_one_model(
+                ), "Tree decoding is only supported for Eagle3 now"
                 assert not getattr(spec_metadata, 'is_draft_model', False), (
                     "Static tree spec-dec params are only prepared for the target model"
                 )
@@ -1929,7 +1927,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 )
 
         forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
-            self, q, k, metadata, forward_args)
+            self, q, k, v, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata
@@ -2058,14 +2056,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
-
-        sparse_params = self.sparse_params
-        if isinstance(sparse_params, SkipSoftmaxParams):
-            forward_args.sparse_runtime_params = (
-                sparse_params.scheduler.get_runtime_params(
-                    runtime_params=forward_args.sparse_runtime_params,
-                    timestep=forward_args.timestep,
-                ))
 
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:
@@ -2285,6 +2275,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Predict sparse KV indices when required by an algorithm."""
         return None, None
+
+    def block_sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[BlockSparseForwardInputs]:
+        """Predict the block-sparse routing payload for one attention call.
+
+        The default hands through routes that the attention module predicted
+        before the core forward via ``sparse_backend_args``. Algorithms that
+        predict inside the backend override this method and return ``None``
+        for dense phases.
+        """
+        backend_args = forward_args.sparse_backend_args
+        if backend_args is None:
+            return None
+        return backend_args.block_sparse_inputs
 
     def sparse_attn_predict(
         self,

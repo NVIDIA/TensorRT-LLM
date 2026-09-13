@@ -3393,7 +3393,6 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
         spec_config = MTPDecodingConfig(
             max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
-            mtp_eagle_one_model=True,
             use_rejection_sampling=use_rejection_sampling,
             draft_len_schedule={1: cls.MAX_TOTAL_DRAFT_TOKENS},
         )

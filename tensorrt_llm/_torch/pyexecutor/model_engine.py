@@ -70,7 +70,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
-from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
@@ -823,7 +823,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.is_warmup = False
         self.previous_request_ids = []
-        self.has_previous_device_draft = False
 
         self._encoder_decoder_host_buffer_pool: List[Dict[str, Any]] = []
         self._encoder_decoder_input_fast_path_static_eligible: Optional[
@@ -1198,7 +1197,8 @@ class PyTorchModelEngine(ModelEngine):
                 lora_config,
                 self.lora_model_config,
                 self.batch_size,  # Use engine's max batch size
-                max_tokens_per_seq)
+                max_tokens_per_seq,
+                self.max_num_tokens)
 
     def _use_lora_cuda_graph(self,
                              scheduled_requests: ScheduledRequests) -> bool:
@@ -4595,518 +4595,11 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['cached_kv_tokens'] = cached_kv_tokens
         if not self.is_warmup:
             self.previous_request_ids = generation_request_ids
-            self.has_previous_device_draft = False
 
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
         buffers['event'] = event
         return inputs, None
-
-    def _can_use_incremental_update(
-            self, scheduled_requests: ScheduledRequests,
-            new_tokens_device: Optional[torch.Tensor],
-            next_draft_tokens_device: Optional[torch.Tensor]) -> bool:
-        """
-        Check if we can use incremental update for the given scheduled requests and new tensors device.
-        """
-        # Not use this approach for non-speculative decoding
-        if self.spec_config is None:
-            return False
-
-        # Not allowed for one-model speculative decoding
-        if not self.spec_config.spec_dec_mode.has_draft_model():
-            return False
-
-        if not self.cuda_graph_runner.enabled:
-            return False
-
-        if self.use_mrope:
-            return False
-
-        # Not allowed for non-overlap scheduler
-        if new_tokens_device is None:
-            return False
-
-        # The changes between context and generation requests are not straightforward.
-        if scheduled_requests.num_context_requests > 0:
-            return False
-
-        # Check if the request_ids changes
-        request_ids = [
-            request.py_request_id
-            for request in scheduled_requests.generation_requests
-        ]
-        if self.previous_request_ids != request_ids:
-            return False
-
-        has_current_device_draft = next_draft_tokens_device is not None
-        return has_current_device_draft and self.has_previous_device_draft
-
-    @nvtx_range("_apply_incremental_update")
-    def _apply_incremental_update(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None,
-            req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-            resource_manager: Optional[ResourceManager] = None):
-        """
-        Apply incremental update for the given scheduled requests and new tensors device.
-        """
-
-        if self.is_draft_model:
-            return self._apply_incremental_update_draft(
-                scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, num_accepted_tokens_device)
-        else:
-            return self._apply_incremental_update_target(
-                scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, num_accepted_tokens_device,
-                resource_manager)
-
-    @nvtx_range("_prepare_incremental_update_metadata")
-    def _prepare_incremental_update_metadata(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: KVCacheManager,
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata],
-            prompt_lengths: List[int],
-            num_cached_tokens_per_seq: List[int],
-            total_num_tokens: int,
-            num_generation_tokens: int,
-            request_accepted_path: Optional[Dict[int, Any]] = None,
-            num_extend_ctx_requests: int = 0):
-        """
-        Common metadata preparation logic for incremental updates.
-        """
-
-        enable_spec_decode = self.enable_spec_decode
-        enable_attention_dp = self.enable_attention_dp
-        spec_config = self.spec_config if enable_spec_decode else None
-
-        # Set up attention metadata - batch simple assignments
-        attn_metadata.beam_width = 1
-        attn_metadata.prompt_lens = prompt_lengths
-        attn_metadata.num_contexts = num_extend_ctx_requests if (
-            enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                self.attn_backend) and spec_config.is_linear_tree) else 0
-        attn_metadata.num_chunked_ctx_requests = attn_metadata.num_contexts
-
-        # Create KV cache params and prepare metadata
-        attn_metadata.kv_cache_params = KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
-            use_full_generation_page_table=(
-                self._should_use_full_generation_page_table(
-                    spec_config, attn_metadata)))
-        attn_metadata.kv_cache_manager = kv_cache_manager
-        attn_metadata.prepare()
-
-        # Get LoRA parameters
-        lora_params = self._lora.build(
-            scheduled_requests,
-            attn_metadata,
-            cuda_graph_lora_manager=self.cuda_graph_lora_manager,
-            enable_spec_decode=self.enable_spec_decode,
-            runtime_draft_len=self.runtime_draft_len)
-
-        # Handle padding for piecewise CUDA graphs
-        attn_metadata.padded_num_tokens = None
-
-        # Set the per-batch counts before the attention-DP allgather below:
-        # the allgather and prepare() must derive the DP token count from the
-        # same fields (see SpecMetadata.dp_num_tokens). seq_lens is carried
-        # over from the previous full prepare -- this path only runs when the
-        # request set is unchanged.
-        if spec_metadata is not None:
-            spec_metadata.num_tokens = total_num_tokens
-            spec_metadata.num_generations = attn_metadata.num_generations
-
-        # Handle attention DP
-        spec_all_rank_counts = None
-        if enable_attention_dp:
-            if spec_metadata is not None:
-                (attn_metadata.all_rank_num_tokens, spec_all_rank_counts
-                 ) = self._get_all_rank_num_tokens_and_spec_counts(
-                     attn_metadata, spec_metadata)
-            else:
-                attn_metadata.all_rank_num_tokens = \
-                    get_all_rank_num_tokens(
-                        attn_metadata,
-                        enable_attention_dp=self.enable_attention_dp,
-                        mapping=self.mapping,
-                        dist=self.dist)
-
-        # Prepare speculative metadata
-        if spec_metadata is not None:
-            # Set request_accepted_path if Eagle3
-            if isinstance(spec_metadata, Eagle3SpecMetadata):
-                spec_metadata.request_accepted_path = request_accepted_path
-
-            spec_metadata.prepare()
-
-            # Handle distributed spec metadata
-            if enable_attention_dp:
-                set_spec_metadata_all_rank_num_tokens(spec_metadata,
-                                                      *spec_all_rank_counts)
-
-        # Set iteration states - batch dictionary updates
-        self.iter_states.update({
-            'num_ctx_requests':
-            0,
-            'num_ctx_tokens':
-            0,
-            'num_generation_tokens':
-            num_generation_tokens,
-            'cached_kv_tokens':
-            sum(num_cached_tokens_per_seq),
-        })
-
-        return lora_params
-
-    def _update_draft_input_tensors(self,
-                                    num_accepted_tokens_device: torch.Tensor,
-                                    new_tokens_device: torch.Tensor,
-                                    total_num_tokens: int,
-                                    num_first_draft_requests: int):
-        """
-        This function performs in-place updates on position_ids, num_accepted_draft_tokens,
-        gather_ids, and input_ids tensors for speculative decoding draft operations.
-        """
-        # Prepare position_ids
-        idx_accepted_tokens = self.idx_accepted_tokens_cache[:total_num_tokens]
-        self.position_ids_cuda[:total_num_tokens].add_(
-            self.num_accepted_draft_tokens_cuda[idx_accepted_tokens] + 1)
-
-        # Prepare gather_ids
-        old_accepted_tokens = self.num_accepted_draft_tokens_cuda[:
-                                                                  num_first_draft_requests].clone(
-                                                                  )
-        self.num_accepted_draft_tokens_cuda[:num_first_draft_requests].copy_(
-            num_accepted_tokens_device[
-                self.draft_seq_slots_buffer_cuda[:num_first_draft_requests]],
-            non_blocking=True)
-        self.gather_ids_cuda[:num_first_draft_requests].add_(
-            self.num_accepted_draft_tokens_cuda[:num_first_draft_requests] -
-            old_accepted_tokens)
-
-        # Prepare token_positions for input_ids update
-        tokens_per_first_draft = self.original_max_draft_len + 1
-        token_positions = self.draft_token_positions_cache[:tokens_per_first_draft].repeat(
-            num_first_draft_requests)
-
-        # Prepare input_ids
-        self.input_ids_cuda[
-            self.
-            draft_first_draft_indices_cuda[:total_num_tokens]] = new_tokens_device[
-                token_positions,
-                self.draft_first_draft_seq_slots_cuda[:total_num_tokens], 0]
-
-    def _apply_incremental_update_draft(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: KVCacheManager,
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
-        new_tokens_device = new_tensors_device.new_tokens
-
-        num_generation_tokens = scheduled_requests.num_generation_requests
-        num_gen_requests = 0
-
-        tokens_per_first_draft = self.original_max_draft_len + 1
-        prompt_lengths = []  # per sequence
-        num_cached_tokens_per_seq = []  # per sequence
-
-        for request in scheduled_requests.generation_requests:
-            if request.is_dummy:
-                num_gen_requests += 1
-                past_seen_token_num = request.max_beam_num_tokens - 1
-                request.cached_tokens = past_seen_token_num
-            else:
-                assert request.py_is_first_draft
-                past_seen_token_num = request.max_beam_num_tokens - tokens_per_first_draft
-
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            prompt_lengths.append(request.py_prompt_len)
-            request.py_batch_idx = request.py_seq_slot
-
-        num_first_draft_requests = num_generation_tokens - num_gen_requests
-        total_num_tokens = num_first_draft_requests * tokens_per_first_draft
-
-        self._update_draft_input_tensors(
-            num_accepted_tokens_device=num_accepted_tokens_device,
-            new_tokens_device=new_tokens_device,
-            total_num_tokens=total_num_tokens,
-            num_first_draft_requests=num_first_draft_requests)
-
-        # Prepare spec_metadata
-        if spec_metadata is not None:
-            spec_metadata.draft_tokens = []
-            spec_metadata.gather_ids = self.gather_ids_cuda[:
-                                                            num_generation_tokens]
-            spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:
-                                                                                          num_generation_tokens]
-
-        # Use common metadata preparation logic
-        virtual_num_tokens = total_num_tokens + num_gen_requests
-        lora_params = self._prepare_incremental_update_metadata(
-            scheduled_requests=scheduled_requests,
-            kv_cache_manager=kv_cache_manager,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-            prompt_lengths=prompt_lengths,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            total_num_tokens=virtual_num_tokens,
-            num_generation_tokens=num_generation_tokens,
-            num_extend_ctx_requests=0)
-
-        # No padding because there are only generation requests.
-        attn_metadata.padded_num_tokens = None
-
-        final_position_ids = self.position_ids_cuda[:
-                                                    virtual_num_tokens].unsqueeze(
-                                                        0)
-
-        inputs = {
-            'attn_metadata': attn_metadata,
-            'input_ids': self.input_ids_cuda[:virtual_num_tokens],
-            'position_ids': final_position_ids,
-            'inputs_embeds': None,
-            "multimodal_params": [],
-        }
-
-        if bool(lora_params):
-            inputs['lora_params'] = lora_params
-
-        if spec_metadata is not None:
-            inputs['spec_metadata'] = spec_metadata
-
-        return inputs, self.gather_ids_cuda[:num_generation_tokens]
-
-    def _update_target_input_tensors(
-            self, num_accepted_tokens_device: torch.Tensor,
-            new_tokens_device: torch.Tensor,
-            next_draft_tokens_device: torch.Tensor,
-            new_tokens_lens_device: torch.Tensor, previous_slots: torch.Tensor,
-            total_num_tokens: int, num_extend_reqeust_wo_dummy: int,
-            num_tokens_per_extend_request: int,
-            previous_batch_draft_tokens: int):
-        """
-        This function performs in-place updates on position_ids, num_accepted_draft_tokens,
-        input_ids, draft_tokens, and offset tensors for speculative decoding extend context operations.
-        """
-
-        # Prepare position_ids
-        idx_accepted_tokens = self.idx_accepted_tokens_cache[:total_num_tokens]
-        self.position_ids_cuda[:total_num_tokens].add_(
-            self.num_accepted_draft_tokens_cuda[idx_accepted_tokens] + 1)
-
-        self.num_accepted_draft_tokens_cuda[:num_extend_reqeust_wo_dummy].copy_(
-            num_accepted_tokens_device[:num_extend_reqeust_wo_dummy],
-            non_blocking=True)
-
-        # Initialize offset tensors to zeros
-        self.previous_pos_id_offsets_cuda.mul_(0)
-        self.previous_kv_lens_offsets_cuda.mul_(0)
-
-        # Prepare input_ids
-        # CRITICAL: Only extract the needed tokens based on num_tokens_per_extend_request
-        # new_tokens_device shape: [batch, 1 + max_draft_len]
-        # We need: [previous_batch, num_tokens_per_extend_request]
-        new_tokens = new_tokens_device.transpose(
-            0, 1)[previous_slots, :num_tokens_per_extend_request].flatten()
-        self.input_ids_cuda[:total_num_tokens].copy_(new_tokens,
-                                                     non_blocking=True)
-
-        # Prepare draft tokens
-        num_draft_tokens_per_extend_request = num_tokens_per_extend_request - 1
-        self.draft_tokens_cuda[:previous_batch_draft_tokens].copy_(
-            next_draft_tokens_device[
-                previous_slots, :num_draft_tokens_per_extend_request].flatten(),
-            non_blocking=True)
-
-        # Compute kv_len_offsets and update offset tensors
-        previous_pos_indices = previous_slots.repeat_interleave(
-            num_tokens_per_extend_request)
-        self.previous_pos_indices_cuda[:total_num_tokens].copy_(
-            previous_pos_indices, non_blocking=True)
-        kv_len_offsets_device = new_tokens_lens_device - num_tokens_per_extend_request
-        self.previous_pos_id_offsets_cuda[:num_extend_reqeust_wo_dummy *
-                                          num_tokens_per_extend_request].copy_(
-                                              new_tokens_lens_device[
-                                                  self.
-                                                  previous_pos_indices_cuda[:
-                                                                            total_num_tokens]],
-                                              non_blocking=True)
-        self.previous_kv_lens_offsets_cuda[:num_extend_reqeust_wo_dummy].copy_(
-            kv_len_offsets_device[previous_slots], non_blocking=True)
-
-    def _apply_incremental_update_target(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: KVCacheManager,
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None,
-            resource_manager: Optional[ResourceManager] = None):
-        # Extract tensors from new_tensors_device
-        new_tokens_device = new_tensors_device.new_tokens  # [batch, 1 + draft_len]
-        new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
-        next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
-
-        # Pre-compute constants
-        extend_requests = scheduled_requests.generation_requests
-        num_extend_requests = len(extend_requests)
-        spec_config = self.spec_config
-        num_tokens_per_extend_request = self.get_runtime_tokens_per_gen_step(
-            self.runtime_draft_len)
-        runtime_draft_token_buffer_width = num_tokens_per_extend_request - 1
-
-        prompt_lengths = torch.empty(num_extend_requests,
-                                     dtype=torch.int,
-                                     device='cpu',
-                                     pin_memory=prefer_pinned())
-        num_cached_tokens_per_seq = torch.empty(num_extend_requests,
-                                                dtype=torch.int,
-                                                device='cpu',
-                                                pin_memory=prefer_pinned())
-        previous_batch_indices = torch.empty(num_extend_requests,
-                                             dtype=torch.int,
-                                             device='cpu',
-                                             pin_memory=prefer_pinned())
-
-        request_accepted_path = {}
-        num_extend_dummy_requests = 0
-        num_previous_batch = 0
-
-        use_extend_ctx = (self.enable_spec_decode
-                          and spec_config.spec_dec_mode.extend_ctx(
-                              self.attn_backend) and spec_config.is_linear_tree)
-
-        for idx, request in enumerate(extend_requests):
-            request_accepted_path[request.py_request_id] = \
-                request.py_num_accepted_draft_tokens_indices
-
-            base_past_seen = request.max_beam_num_tokens - 1
-
-            if use_extend_ctx:
-                # We're treating the prompt lengths as context requests here, so
-                # the prompt lens should not include the cached tokens.
-                prompt_lengths[idx] = num_tokens_per_extend_request
-            else:
-                prompt_lengths[idx] = request.py_prompt_len
-
-            # Physical KV length for the kernels: subtract the tokens a
-            # KV-cache compression manager evicted (tracked on the request,
-            # 0 without compression). Position ids and the cached_tokens stat
-            # keep the logical count.
-            if request.is_dummy:
-                num_cached_tokens_per_seq[idx] = base_past_seen
-                request.cached_tokens = base_past_seen
-                num_extend_dummy_requests += 1
-            else:
-                # Request has previous tensor
-                previous_batch_indices[
-                    num_previous_batch] = request.py_batch_idx
-                num_previous_batch += 1
-
-                request.cached_tokens = (base_past_seen +
-                                         num_tokens_per_extend_request)
-                num_cached_tokens_per_seq[idx] = (
-                    base_past_seen + num_tokens_per_extend_request -
-                    request.py_num_compressed_tokens)
-
-            request.py_batch_idx = request.py_seq_slot
-
-        num_extend_reqeust_wo_dummy = num_extend_requests - num_extend_dummy_requests
-        total_num_tokens = num_extend_reqeust_wo_dummy * num_tokens_per_extend_request
-
-        previous_slots = self.previous_batch_indices_cuda[:num_previous_batch]
-        previous_slots.copy_(previous_batch_indices[:num_previous_batch],
-                             non_blocking=True)
-
-        prompt_lengths = prompt_lengths.tolist()
-        num_cached_tokens_per_seq = num_cached_tokens_per_seq.tolist()
-
-        previous_batch_draft_tokens = (num_extend_reqeust_wo_dummy *
-                                       runtime_draft_token_buffer_width)
-
-        self._update_target_input_tensors(
-            num_accepted_tokens_device=num_accepted_tokens_device,
-            new_tokens_device=new_tokens_device,
-            next_draft_tokens_device=next_draft_tokens_device,
-            new_tokens_lens_device=new_tokens_lens_device,
-            previous_slots=previous_slots,
-            total_num_tokens=total_num_tokens,
-            num_extend_reqeust_wo_dummy=num_extend_reqeust_wo_dummy,
-            num_tokens_per_extend_request=num_tokens_per_extend_request,
-            previous_batch_draft_tokens=previous_batch_draft_tokens)
-
-        # Prepare spec_metadata
-        num_generation_tokens = num_extend_requests * num_tokens_per_extend_request
-        if spec_metadata is not None:
-            total_draft_lens = self.max_total_draft_tokens * num_extend_requests
-            spec_metadata.draft_tokens = self.draft_tokens_cuda[:
-                                                                total_draft_lens]
-            spec_metadata.gather_ids = self.gather_ids_cuda[:total_num_tokens]
-            spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:
-                                                                                          num_extend_requests]
-
-        # Determine if we're using extend_ctx mode for linear tree decoding
-        num_extend_ctx_requests = 0
-        if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
-                self.attn_backend) and spec_config.is_linear_tree:
-            num_extend_ctx_requests = num_extend_requests
-
-        virtual_num_tokens = num_generation_tokens
-        lora_params = self._prepare_incremental_update_metadata(
-            scheduled_requests=scheduled_requests,
-            kv_cache_manager=kv_cache_manager,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-            prompt_lengths=prompt_lengths,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            total_num_tokens=virtual_num_tokens,
-            num_generation_tokens=num_generation_tokens,
-            request_accepted_path=request_accepted_path,
-            num_extend_ctx_requests=num_extend_ctx_requests)
-
-        # No padding because there are only generation requests.
-        attn_metadata.padded_num_tokens = None
-
-        final_position_ids = self.position_ids_cuda[:
-                                                    virtual_num_tokens].unsqueeze(
-                                                        0)
-
-        # Prepare inputs
-        # Note: multimodal_params is always empty for incremental updates because:
-        # - This function only processes generation requests (no context requests)
-        # - Multimodal data (images/videos) is only needed during context/prefill phase
-        inputs = {
-            'attn_metadata': attn_metadata,
-            'input_ids': self.input_ids_cuda[:virtual_num_tokens],
-            'position_ids': final_position_ids,
-            'inputs_embeds': None,
-            "multimodal_params": [],
-            'resource_manager': resource_manager,
-        }
-
-        if bool(lora_params):
-            inputs['lora_params'] = lora_params
-
-        if spec_metadata is not None:
-            inputs['spec_metadata'] = spec_metadata
-
-        return inputs, self.gather_ids_cuda[:num_generation_tokens]
 
     def _can_use_steady_gen_fast_prepare(
             self, scheduled_requests: ScheduledRequests,
@@ -5296,21 +4789,6 @@ class PyTorchModelEngine(ModelEngine):
                 runtime_draft_len=self.runtime_draft_len)
 
         if (not promoted_context_request_ids
-                and self._can_use_incremental_update(scheduled_requests,
-                                                     new_tokens_device,
-                                                     next_draft_tokens_device)):
-            # Spec engines never record the steady-gen cache, but invalidate
-            # defensively so the two fast paths can never interleave if the
-            # gates ever evolve.
-            self._steady_gen_cache = None
-            self._encoder_decoder_staged_request_ids = None
-            return self._apply_incremental_update(
-                scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer,
-                num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager)
-
-        if (not promoted_context_request_ids
                 and type(attn_metadata) is TrtllmAttentionMetadata
                 and self._can_use_encoder_decoder_input_fast_path(
                     scheduled_requests, new_tokens_device,
@@ -5371,10 +4849,6 @@ class PyTorchModelEngine(ModelEngine):
         cross_encoder_seq_lens: List[int] = [
         ]  # new encoder K/V tokens per decoder sequence
         cross_encoder_cached_tokens_per_seq: List[int] = []
-        # if using tree decoding, we need to store the request type and accepted path for each request,
-        # which will be used to update the hidden_states_read_indices.
-        request_accepted_path = {}  # per request
-
         # Variables for updating the inputs of draft model
         # Base values for gather_ids computation
         first_draft_base_gather_ids = []
@@ -5462,9 +4936,6 @@ class PyTorchModelEngine(ModelEngine):
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
             num_accepted_draft_tokens.append(len(prompt_tokens) - 1)
-            request_accepted_path[
-                request.
-                py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num -
@@ -5651,9 +5122,6 @@ class PyTorchModelEngine(ModelEngine):
                     padding_gen_slots.append(request.py_seq_slot)
                 request.py_needs_onehot_draft_probs = False  # consume once
             request_ids.append(request.py_request_id)
-            request_accepted_path[
-                request.
-                py_request_id] = request.py_num_accepted_draft_tokens_indices
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
@@ -5785,9 +5253,6 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_accepted_draft_tokens)
 
             sequence_lengths.append(1 + self.original_max_draft_len)
-            request_accepted_path[
-                request.
-                py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num -
@@ -6263,6 +5728,9 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda *= 0
 
         position_ids = apply_position_id_offset(position_ids, model=self.model)
+        host_position_ids = torch.tensor(position_ids,
+                                         dtype=torch.int,
+                                         pin_memory=prefer_pinned())
         # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
         # for text-only batches: keeping position_ids rank-consistent between
         # warmup and serving keeps torch.compile guards stable, so piecewise
@@ -6272,10 +5740,7 @@ class PyTorchModelEngine(ModelEngine):
             # data. Seed the full (3,1,N) buffer from scalar position_ids
             # (text-only tokens get the same value on all 3 axes), then
             # overwrite only the multimodal spans with their real MRoPE coords.
-            position_ids_tensor = torch.tensor(position_ids,
-                                               dtype=torch.int,
-                                               pin_memory=prefer_pinned())
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids_tensor,
+            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids,
                                                             non_blocking=True)
             # Broadcast [N] to [3,1,N]: default for text-only tokens.
             self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
@@ -6305,10 +5770,7 @@ class PyTorchModelEngine(ModelEngine):
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
-            position_ids = torch.tensor(position_ids,
-                                        dtype=torch.int,
-                                        pin_memory=prefer_pinned())
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
+            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids,
                                                             non_blocking=True)
             final_position_ids = self.position_ids_cuda[:
                                                         total_num_tokens].unsqueeze(
@@ -6529,13 +5991,12 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
+            spec_metadata.host_position_ids = host_position_ids
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:len(
                 num_accepted_draft_tokens)]
             if context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(
                     context_prompt_lookahead)
-            if isinstance(spec_metadata, Eagle3SpecMetadata):
-                spec_metadata.request_accepted_path = request_accepted_path
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
@@ -6570,7 +6031,6 @@ class PyTorchModelEngine(ModelEngine):
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
-            self.has_previous_device_draft = next_draft_tokens_device is not None
 
             # Record the steady-state generation cache when this pass handled
             # purely non-dummy generation requests that all carried a previous

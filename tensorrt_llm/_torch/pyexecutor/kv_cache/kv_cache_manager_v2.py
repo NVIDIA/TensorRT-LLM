@@ -73,6 +73,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     ReuseScope,
+    SsmLayerConfig,
     SwaScratchReuseConfig,
     TokenIdExt,
     _cpp_introspection,
@@ -1323,6 +1324,7 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
+        config = self._remove_zero_size_buffers(config)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -1443,15 +1445,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         self._pool_layer_ids_by_role.setdefault(
                             (pool_id, buffer_id.role), buffer_id.layer_id
                         )
-        # num_pools is the logical layer-group count. With SWA scratch reuse,
-        # scratch slot IDs are only valid with per-layer page indices, so the
-        # attention op sees one virtual pool per local layer while the
-        # underlying manager can still group layers.
-        if self.enable_swa_scratch_reuse:
-            self.num_attention_op_pools = self.num_local_layers
-        else:
-            self.num_attention_op_pools = self.num_pools
-
         num_layers = len(config.layers)
         self.layer_to_pool_mapping_dict: dict[int, int] = {
             layer_id: self.impl.get_layer_group_id(layer_id)
@@ -1595,7 +1588,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_pool_pointers_list = []
         kv_cache_pool_mapping_list = []
         block_scale_pool_pointers_list = []
-        if self.enable_swa_scratch_reuse:
+        if self._use_per_layer_page_tables:
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 pool_id = self.impl.get_layer_group_id(layer_id)
                 role_a, _ = self._get_pool_roles(pool_id)
@@ -1728,6 +1721,28 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache_pool_pointers, kv_cache_pool_mapping
 
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        # Keep role-dependent checks in this default page-table initializer:
+        # custom layouts such as DeepSeek V4 override it with their own roles.
+        # A lifecycle group can contain different page sizes in separate
+        # physical pools (e.g. Gemma's heterogeneous head dimensions). Those
+        # layers cannot share a pool pointer or page-index scale. Use the
+        # per-layer conversion path, also required for SWA scratch slots,
+        # while keeping the underlying lifecycle grouping unchanged.
+        self._use_per_layer_page_tables = self.enable_swa_scratch_reuse or any(
+            len(
+                {
+                    self.impl.get_page_stride(layer_id, self._get_pool_roles(pool_id)[0])
+                    for layer_id in layer_ids
+                }
+            )
+            > 1
+            for pool_id, layer_ids in enumerate(self.impl.layer_grouping)
+        )
+        if self._use_per_layer_page_tables:
+            self.num_attention_op_pools = self.num_local_layers
+        else:
+            self.num_attention_op_pools = self.num_pools
+
         self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
@@ -1761,7 +1776,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
-        if self.enable_swa_scratch_reuse:
+        if self._use_per_layer_page_tables:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
 
     def _kv_pool_mapping_offset(
@@ -2309,6 +2324,51 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Exclude empty buffers before creating the runtime storage pools."""
+        if config.layers and all(
+            layer.buffers and all(buffer.size != 0 for buffer in layer.buffers)
+            for layer in config.layers
+        ):
+            return config
+
+        # Inspect the final buffers: a layer with no attention KV heads can
+        # still own recurrent-state or other buffers added by a subclass.
+        layers: list[AttentionLayerConfig | SsmLayerConfig] = []
+        retained_layer_ids = []
+        for layer in config.layers:
+            buffers = [buffer for buffer in layer.buffers if buffer.size != 0]
+            if buffers:
+                retained_layer_ids.append(int(layer.layer_id))
+                layer_id = LayerId(len(layers))
+                if isinstance(layer, AttentionLayerConfig):
+                    layers.append(
+                        AttentionLayerConfig(
+                            layer_id=layer_id,
+                            buffers=buffers,
+                            sliding_window_size=layer.sliding_window_size,
+                            num_sink_tokens=layer.num_sink_tokens,
+                        )
+                    )
+                else:
+                    layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
+
+        if not layers:
+            raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
+
+        # Runtime layer IDs are local offsets. Compact every per-layer view
+        # together while preserving the model's global layer IDs and count.
+        self.pp_layers = [self.pp_layers[i] for i in retained_layer_ids]
+        self.num_local_layers = len(self.pp_layers)
+        self.layer_offsets = {layer_id: offset for offset, layer_id in enumerate(self.pp_layers)}
+        self.num_kv_heads_per_layer = [self.num_kv_heads_per_layer[i] for i in retained_layer_ids]
+        self.head_dim_per_layer = [self.head_dim_per_layer[i] for i in retained_layer_ids]
+        self.max_attention_window_vec = [
+            self.max_attention_window_vec[i] for i in retained_layer_ids
+        ]
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
+        return replace(config, layers=layers)
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the configured typical sequence length, if any."""
@@ -4283,6 +4343,10 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._request_stats_enabled_ids.clear()
+        # Drop the outstanding plans before the manager shuts down: discarding a handle applies
+        # its plan, which mutates manager state.
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()
         self.impl.shutdown()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
@@ -4291,8 +4355,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # on a closed manager, so there is no teardown-time None race.
         if isinstance(self.event_manager, StreamingKVCacheEventManager):
             self.event_manager.shutdown()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
@@ -4508,7 +4570,7 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
 
-        if self.enable_swa_scratch_reuse:
+        if self._use_per_layer_page_tables:
             self._copy_batch_block_offsets_per_layer(
                 dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
             )

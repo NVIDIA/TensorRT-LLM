@@ -73,7 +73,6 @@ MODEL_ARCH_TO_MODULE = {
     "LlavaLlamaModel": "modeling_vila",
     "LlavaNextForConditionalGeneration": "modeling_llava_next",
     "MBartForConditionalGeneration": "modeling_bart",
-    "MTPDraftModelForCausalLM": "modeling_speculative",
     "MiniCPMV4_6ForConditionalGeneration": "modeling_minicpmv4_6",
     "MiniMaxM2ForCausalLM": "modeling_minimaxm2",
     "MiniMaxM3SparseForCausalLM": "modeling_minimaxm3",
@@ -283,7 +282,6 @@ SPEC_MODE_TO_MODULE = {
     "DSPARK": "modeling_dspark",
     "EAGLE3_ONE_MODEL": "modeling_speculative",
     "MTP": "modeling_speculative",
-    "MTP_EAGLE": "modeling_speculative",
     "MTP_EAGLE_ONE_MODEL": "modeling_speculative",
     "PARD": "modeling_speculative",
 }

@@ -207,7 +207,7 @@ In the next section we will illustrate the high-level design.
 
 ## High-level design introduction
 
-Based on the detailed analysis and study in section [Motivation of large-scale EP](#motivation-of-large-scale-ep), it can clearly be observed that expert imbalance in EP is a common pattern for large-scale EP. This EP imbalance can clearly impede the overall system performance in the following ways:
+Based on the detailed analysis and study in section [Motivation of large-scale EP](#motivation-for-large-scale-ep), it can clearly be observed that expert imbalance in EP is a common pattern for large-scale EP. This EP imbalance can clearly impede the overall system performance in the following ways:
 
 * The hot EP rank will consume more memory (for activations) which can limit the effective max batch size scheduled during the inference process.
 * More data will be sent to/received from the hot EP rank.
@@ -521,7 +521,7 @@ The code and scripts required in the reproducing steps described in this section
 
 Please, refer to the [EP Load Balancer example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer) for how to reproduce the results for the offline EP Load Balancer.
 
-##### Step 1: Run inference and collect statistics
+#### Step 1: Run inference and collect statistics
 
 To generate the necessary statistics for load rebalancing, run your model on a target dataset and count the routed expert IDs during inference. Once the counting process is complete, the statistics will be saved for further processing.
 
@@ -567,7 +567,7 @@ python examples/wide_ep/ep_load_balancer/report_load_statistics.py --expert_stat
 
 The output would look like:
 
-```txt
+```text
 Load statistics:
            mean         std  imbalance-ratio
 3        1024.0  187.955200         0.498043
@@ -580,7 +580,7 @@ Load statistics:
 average  1024.0  491.651199         1.564272
 ```
 
-##### Step 2: Generate the EPLB configuration
+#### Step 2: Generate the EPLB configuration
 
 Use the provided `examples/wide_ep/ep_load_balancer/generate_eplb_config.py` script to convert the collected statistics into an EPLB configuration file. Specify the target expert parallelism size (`--ep_size`) and the total number of slots (`--num_slots`) that will be used for deployment. For example, if we choose to maintain 8 expert slots per rank while increasing expert parallelism to 36 ways, there should be 32 redundant experts and 288 expert slots in total.
 
@@ -607,7 +607,7 @@ num_slots: 288
 layer_updates_per_iter: 0
 ```
 
-##### Step 3: Run inference with the EPLB configuration
+#### Step 3: Run inference with the EPLB configuration
 
 Set up some environment variables:
 
@@ -649,7 +649,7 @@ python examples/wide_ep/ep_load_balancer/report_load_statistics.py --expert_stat
 
 The output would look like:
 
-```txt
+```text
 Load statistics:
            mean        std  imbalance-ratio
 3        1024.0  37.612328         0.081947
