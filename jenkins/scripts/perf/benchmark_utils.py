@@ -87,12 +87,22 @@ def is_gen_only_no_context(benchmark_mode, config):
 def gen_only_no_context_world_size(config):
     """GPU count for the single gen worker of a gen_only_no_context case.
 
-    The aggregated launch path gives one pytest process one trtllm-serve worker,
-    and under trtllm-llmapi-launch that worker is one MPI world. A config asking
-    for several gen servers therefore cannot run here -- it needs the four-role
-    srun split that this mode exists to avoid -- so refuse it loudly instead of
-    silently allocating for one server and hanging on a proxy whose other
-    generation_servers urls never come up.
+    The mode runs exactly ONE gen worker, whatever ``hardware.num_gen_servers``
+    says -- the same way it runs zero ctx workers whatever ``num_ctx_servers``
+    says. Both counts describe the *disaggregated* fleet the config was written
+    for; this mode reads the same file to measure one worker's decode loop in
+    isolation, so both are overridden (see gen_only_no_context_server_counts).
+
+    That is a deliberate reversal of the earlier behaviour, which refused
+    ``num_gen_servers != 1`` on the theory that one pytest process cannot host
+    several workers. True, but the conclusion was wrong: the fix is to launch one
+    worker, not to make the mode unreachable for the configs that scale out by
+    replicating gen servers (e.g. the DSv4-Pro con8 case, gen4 x tep8). Refusing
+    those left the cheapest arm of the comparison unavailable on exactly the
+    configs that most wanted it.
+
+    The per-worker shape (tp/pp/cp) is what determines the allocation, and it is
+    identical across replicas, so one replica is a faithful sample of the fleet.
 
     Args:
         config: The parsed disaggregated config YAML.
@@ -101,16 +111,8 @@ def gen_only_no_context_world_size(config):
         int: worker_config.gen's world size, i.e. tp * pp * cp.
 
     Raises:
-        ValueError: If worker_config.gen is missing, or num_gen_servers != 1.
+        ValueError: If worker_config.gen is missing.
     """
-    hardware = config.get("hardware", {}) or {}
-    num_gen_servers = hardware.get("num_gen_servers")
-    if num_gen_servers != 1:
-        raise ValueError(
-            "%s requires hardware.num_gen_servers == 1 (got %r): the aggregated "
-            "launch path hosts exactly one gen worker under one pytest process."
-            % (GEN_ONLY_NO_CONTEXT_MODE, num_gen_servers)
-        )
     gen_config = (config.get("worker_config", {}) or {}).get("gen", {}) or {}
     if not gen_config:
         raise ValueError("worker_config.gen is required for %s mode" % (GEN_ONLY_NO_CONTEXT_MODE,))
@@ -119,6 +121,23 @@ def gen_only_no_context_world_size(config):
         * gen_config.get("pipeline_parallel_size", 1)
         * gen_config.get("context_parallel_size", 1)
     )
+
+
+def gen_only_no_context_server_counts():
+    """The (num_ctx_servers, num_gen_servers) this mode launches, always (0, 1).
+
+    One expression, shared by every consumer, for the same reason
+    is_gen_only_no_context is: the node arithmetic in two generators and the
+    runner's expectation of what to find on disk are separate call sites, and if
+    they disagree the job is sized for one fleet while the runner waits for
+    another. The proxy is handed exactly these counts in server_config.<idx>.yaml,
+    so a generator that allocated for the config's own num_gen_servers would leave
+    the proxy expecting urls that never bind.
+
+    Returns:
+        tuple: (0, 1) -- no ctx fleet, exactly one gen worker.
+    """
+    return 0, 1
 
 
 def parse_positive_concurrency(value: object) -> int:

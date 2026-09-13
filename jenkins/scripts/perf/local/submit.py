@@ -32,6 +32,7 @@ from benchmark_utils import (  # noqa: E402
     DISAGG_BENCHMARK_MODES,
     DISAGG_CONFIG_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    gen_only_no_context_server_counts,
     gen_only_no_context_world_size,
     is_gen_only_no_context,
     parse_positive_concurrency,
@@ -314,10 +315,11 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
         # A test id naming gen_only_no_context takes the aggregated branch above and
         # never reaches here, so only the legacy yaml opt-in (a `gen_only` id whose
         # config says gen_only_no_context) can zero the ctx fleet on this path.
-        num_ctx_servers = (
-            0 if is_gen_only_no_context(benchmark_mode, config) else hardware.get("num_ctx_servers")
-        )
-        num_gen_servers = hardware.get("num_gen_servers")
+        if is_gen_only_no_context(benchmark_mode, config):
+            num_ctx_servers, num_gen_servers = gen_only_no_context_server_counts()
+        else:
+            num_ctx_servers = hardware.get("num_ctx_servers")
+            num_gen_servers = hardware.get("num_gen_servers")
 
         ctx_config = worker_config.get("ctx", {})
         gen_config = worker_config.get("gen", {})
@@ -645,9 +647,9 @@ def generate_pytest_command(
         test_list_content = (
             f"perf/test_perf_sanity.py::test_e2e[disagg-{label}-{config_file_base_name}]"
         )
-    elif benchmark_mode == "ctx_only":
-        # aggr_upload-ctx_only[-{modifier}]-{config_base}
-        label = format_test_label("ctx_only", time_breakdown)
+    elif benchmark_mode in AGGREGATED_DISAGG_YAML_MODES:
+        # aggr_upload-{ctx_only|gen_only_no_context}[-{modifier}]-{config_base}
+        label = format_test_label(benchmark_mode, time_breakdown)
         test_list_content = (
             f"perf/test_perf_sanity.py::test_e2e[aggr-{label}-{config_file_base_name}]"
         )
@@ -870,7 +872,14 @@ def main():
         if config_type == "disagg":
             # Disagg config - need benchmark_mode
             benchmark_mode = args.benchmark_mode if args.benchmark_mode else "e2e"
-            if benchmark_mode == "ctx_only":
+            # Both AGGREGATED_DISAGG_YAML_MODES read this disagg yaml but launch
+            # through the aggregated single-pytest path, so they must not be routed
+            # to the four-role template here. Keyed on the tuple rather than
+            # `== "ctx_only"`: spelling one mode leaves gen_only_no_context
+            # composing a `disagg-gen_only_no_context-` id that parse_test_string
+            # rejects and test_perf_sanity.py never mints -- pytest would exit "no
+            # tests ran" only after the whole multi-node job had been allocated.
+            if benchmark_mode in AGGREGATED_DISAGG_YAML_MODES:
                 runtime_mode = "aggregated"
             else:
                 runtime_mode = "disaggregated"
@@ -907,8 +916,8 @@ def main():
     if runtime_mode == "disaggregated":
         label = format_test_label(benchmark_mode, time_breakdown)
         test_case_name = f"disagg-{label}-{config_file_base_name}"
-    elif benchmark_mode == "ctx_only":
-        label = format_test_label("ctx_only", time_breakdown)
+    elif benchmark_mode in AGGREGATED_DISAGG_YAML_MODES:
+        label = format_test_label(benchmark_mode, time_breakdown)
         test_case_name = f"aggr-{label}-{config_file_base_name}"
     else:
         test_case_name = f"aggr-{config_file_base_name}-{select_pattern}"

@@ -63,6 +63,16 @@ AGG_DRAFT = PERF_SCRIPTS / "aggregated" / "slurm_launch_draft.sh"
 # A/B with no YAML edit and no duplicate config to drift.
 CON4301 = "gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL"
 
+# A second real config, and the only shape the first cannot exercise: it scales the
+# gen fleet out by *replicating* the gen server (`num_gen_servers: 4`, tep8 each)
+# rather than by widening one. gen_only_no_context overrides that count to 1, so the
+# job is one replica's 8 GPUs -- see test_no_context_launches_one_of_a_replicated_gen_fleet.
+CON8 = "gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL"
+# con8 hardware: 1 ctx server x dep4 (1 node) + 4 gen servers x tep8 (2 nodes each),
+# at 4 GPUs per node.
+CON8_GEN_ONLY_NODES, CON8_GEN_ONLY_GPUS = 9, 36
+CON8_NO_CONTEXT_NODES, CON8_NO_CONTEXT_GPUS = 2, 8
+
 # con4301 hardware: 12 ctx servers x tp4 (1 node each) + 1 gen server x dep8 (2 nodes),
 # at 4 GPUs per node.
 GEN_ONLY_NODES, GEN_ONLY_GPUS = 14, 56
@@ -108,7 +118,9 @@ def _require_yaml() -> None:
     pytest.importorskip("yaml", reason="the generators parse the config YAML")
 
 
-def _generate_local(tmp_path: Path, benchmark_mode: str, prefix: str = "") -> str:
+def _generate_local(
+    tmp_path: Path, benchmark_mode: str, prefix: str = "", config: str = CON4301
+) -> str:
     """Run the local generator for one test id and return the launch script text."""
     _require_yaml()
     work_dir = tmp_path / (f"{prefix}_{benchmark_mode}" if prefix else benchmark_mode)
@@ -121,7 +133,7 @@ def _generate_local(tmp_path: Path, benchmark_mode: str, prefix: str = "") -> st
             sys.executable,
             str(LOCAL_SUBMIT),
             "--test-list",
-            f"perf/test_perf_sanity.py::test_e2e[{prefix}-{benchmark_mode}-{CON4301}]",
+            f"perf/test_perf_sanity.py::test_e2e[{prefix}-{benchmark_mode}-{config}]",
             # 'unspecified' omits #SBATCH --partition, so no cluster lookup happens.
             "--partition",
             "unspecified",
@@ -223,6 +235,67 @@ def _generate_ci(tmp_path: Path, benchmark_mode: str, prefix: str = "") -> str:
             stage_name,
             "--cluster-name",
             "aws-cmh",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    return launch_sh.read_text()
+
+
+def _generate_local_from_config_file(
+    tmp_path: Path, benchmark_mode: str, config: str = CON4301
+) -> str:
+    """Run the local generator through its *other* entry path: --config-file.
+
+    The two entry paths derive the same three values from different places, and only
+    one of them is exercised by the tests above:
+
+    * ``--test-list`` parses the mode, the runtime and the config stem out of a
+      pytest id via ``parse_test_string``;
+    * ``--config-file --benchmark-mode`` is handed the mode directly and derives the
+      runtime itself, from ``detect_config_type`` plus a mode check.
+
+    That second derivation is a second place the "which launch path?" question is
+    answered, so it is a second place it can be answered wrongly -- and it was: it
+    keyed on ``== "ctx_only"``, so gen_only_no_context fell to the disaggregated
+    branch and composed a ``disagg-gen_only_no_context-`` id that nothing mints.
+    """
+    _require_yaml()
+    work_dir = tmp_path / f"cfgfile_{benchmark_mode}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    launch_sh = work_dir / "slurm_launch.sh"
+    config_yaml = (
+        REPO_ROOT / "tests" / "scripts" / "perf-sanity" / "disaggregated" / f"{config}.yaml"
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(LOCAL_SUBMIT),
+            "--config-file",
+            str(config_yaml),
+            "--benchmark-mode",
+            benchmark_mode,
+            "--partition",
+            "unspecified",
+            "--account",
+            "unit_test_account",
+            "--job-name",
+            "unit_test_job",
+            "--image",
+            "/dev/null/image.sqsh",
+            "--mounts",
+            "/dev/null:/dev/null",
+            "--work-dir",
+            str(work_dir),
+            "--launch-sh",
+            str(launch_sh),
+            "--llm-src",
+            str(REPO_ROOT),
+            "--llm-models-root",
+            "/dev/null/models",
         ],
         check=True,
         capture_output=True,
@@ -349,6 +422,72 @@ def test_local_generator_keeps_the_ctx_fleet_for_gen_only(tmp_path: Path) -> Non
     assert _export(script, "totalGpus") == str(GEN_ONLY_GPUS)
     assert f"#SBATCH --nodes={GEN_ONLY_NODES}" in script
     assert f"#SBATCH --ntasks={GEN_ONLY_GPUS}" in script
+
+
+def test_no_context_launches_one_of_a_replicated_gen_fleet(tmp_path: Path) -> None:
+    """`num_gen_servers: 4` sizes for ONE replica, and is not refused.
+
+    con4301 cannot test this: its fleet is one wide gen server, so
+    ``num_gen_servers`` is already 1 and every assertion about overriding it passes
+    vacuously. con8 is the other shape -- four tep8 replicas -- and it is the shape
+    the mode used to reject outright, which made the cheap arm unavailable on
+    exactly the config that most wanted it (36 GPUs -> 8).
+
+    The override is sound because the per-worker tp/pp/cp is identical across
+    replicas, so one replica is a faithful sample of the fleet's decode loop; and it
+    is *required* because the proxy is handed the same count in
+    server_config.<idx>.yaml, so allocating for 4 while launching 1 would leave it
+    waiting on three urls that never bind.
+    """
+    script = _generate_local(tmp_path, "gen_only_no_context", config=CON8)
+
+    # The aggregated template has no numCtxServers/numGenServers exports -- there is
+    # one pytest, not a fleet -- so the allocation is the observable. 2 nodes rather
+    # than 8 is exactly the "one replica, not four" claim.
+    assert _export(script, "totalNodes") == str(CON8_NO_CONTEXT_NODES)
+    assert _export(script, "totalGpus") == str(CON8_NO_CONTEXT_GPUS)
+    assert f"#SBATCH --nodes={CON8_NO_CONTEXT_NODES}" in script
+    assert f"#SBATCH --ntasks={CON8_NO_CONTEXT_GPUS}" in script
+
+
+def test_gen_only_keeps_the_replicated_gen_fleet(tmp_path: Path) -> None:
+    """Control for the override: plain gen_only on con8 still allocates all four.
+
+    Without this the previous test cannot tell "overrides num_gen_servers for this
+    mode" from "ignores num_gen_servers everywhere", which would silently under-size
+    every disaggregated job that replicates its gen server.
+    """
+    script = _generate_local(tmp_path, "gen_only", config=CON8)
+
+    assert _export(script, "numCtxServers") == "1"
+    assert _export(script, "numGenServers") == "4"
+    assert _export(script, "totalNodes") == str(CON8_GEN_ONLY_NODES)
+    assert _export(script, "totalGpus") == str(CON8_GEN_ONLY_GPUS)
+
+
+@pytest.mark.parametrize("benchmark_mode", AGGREGATED_PATH_MODES)
+def test_the_config_file_entry_path_picks_the_same_launch_path(
+    tmp_path: Path, benchmark_mode: str
+) -> None:
+    """--config-file must route both aggregated-path modes exactly as --test-list does.
+
+    Parametrized over *both* modes on purpose: ctx_only is the arm that already
+    worked, so it is the control that says this asserts "the branch is keyed on the
+    set of modes" rather than "the branch happens to be right for the new mode".
+
+    Asserting on the composed test id and not just the node count is deliberate --
+    a wrong runtime here still sizes the allocation correctly (both branches read
+    the same worker_config), and only shows up as an id that pytest cannot collect
+    after the whole multi-node job has been queued, built and allocated.
+    """
+    script = _generate_local_from_config_file(tmp_path, benchmark_mode)
+
+    assert f"aggr-{benchmark_mode}-{CON4301}" in script
+    assert f"disagg-{benchmark_mode}-" not in script
+    for export in FOUR_ROLE_EXPORTS:
+        assert f"export {export}=" not in script, (
+            f"--config-file routed {benchmark_mode} to the four-role template"
+        )
 
 
 def test_local_generator_sizes_ctx_only_from_the_ctx_worker(tmp_path: Path) -> None:

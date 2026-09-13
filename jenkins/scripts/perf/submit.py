@@ -59,6 +59,7 @@ from benchmark_utils import (
     AGGREGATED_DISAGG_YAML_MODES,
     DISAGG_BENCHMARK_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    gen_only_no_context_server_counts,
     gen_only_no_context_world_size,
     is_gen_only_no_context,
     parse_positive_concurrency,
@@ -517,10 +518,11 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         # because sizing the job for zero ctx servers without also exporting
         # TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 leaves the gen worker waiting
         # forever for KV that no one will send.
-        num_ctx_servers = (
-            0 if is_gen_only_no_context(benchmark_mode, config) else hardware.get("num_ctx_servers")
-        )
-        num_gen_servers = hardware.get("num_gen_servers")
+        if is_gen_only_no_context(benchmark_mode, config):
+            num_ctx_servers, num_gen_servers = gen_only_no_context_server_counts()
+        else:
+            num_ctx_servers = hardware.get("num_ctx_servers")
+            num_gen_servers = hardware.get("num_gen_servers")
 
         ctx_tp = ctx_config.get("tensor_parallel_size", 1)
         ctx_pp = ctx_config.get("pipeline_parallel_size", 1)
