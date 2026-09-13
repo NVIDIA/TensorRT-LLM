@@ -31,7 +31,7 @@ from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 
 from .multi_stream.auto_multi_stream import multi_stream_schedule
-from .patterns import MATCHER_SUBSYSTEM
+from .patterns import (MATCHER_SUBSYSTEM, append_registered_custom_passes)
 from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import (register_add_norm,
                                          register_add_norm_quant)
@@ -83,7 +83,9 @@ class Backend:
     def build_custom_passes(cls, enable_userbuffers, mapping: Mapping):
         world_size = tensorrt_llm.mpi_world_size()
         # Really naive pass manager here
-        custom_passes = [PatternMatcherPass("add_norm", MATCHER_SUBSYSTEM)]
+        custom_passes = []
+        append_registered_custom_passes(custom_passes)
+        custom_passes.append(PatternMatcherPass("add_norm", MATCHER_SUBSYSTEM))
         if world_size > 1:
             # Currently torch compile cannot work properly with lamport fusion kernel
             # TO-DO: Fix this issue
