@@ -1709,3 +1709,161 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
         Role.ALL: MapperKind.INDEXED,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+
+
+class _FakeLogger:
+    """Stand-in for tensorrt_llm.logger with a settable level and captured messages."""
+
+    def __init__(self, level: str = "debug") -> None:
+        self.level = level
+        self.messages: list[str] = []
+
+    def is_debug_enabled(self) -> bool:
+        return self.level in ("trace", "debug", "verbose")
+
+    def debug(self, *msg) -> None:
+        self.messages.append(" ".join(str(m) for m in msg))
+
+
+class _FakeWindowedKVCache:
+    def __init__(self, page_indices: dict[int, list[int]]) -> None:
+        self._page_indices = page_indices
+
+    def get_base_page_indices(self, layer_group_id, beam_id=DEFAULT_BEAM_INDEX):
+        return self._page_indices[int(layer_group_id)]
+
+
+def _make_window_crossing_manager() -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = 4096
+    manager.tokens_per_block = 64
+    # Group 0 is windowed at 2048; group 1 spans the whole sequence, so it is
+    # not windowed and must never produce a crossing line.
+    manager._windowed_layer_group_sizes = {0: 2048}
+    return manager
+
+
+def test_window_crossing_logs_once_with_capacity_and_blocks(monkeypatch) -> None:
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    kv_cache = _FakeWindowedKVCache({0: [7, 8, 9]})
+    request = SimpleNamespace(py_request_id=42)
+
+    manager._log_window_crossing(request, kv_cache, 2047, 2049, "generation")
+
+    assert len(fake_logger.messages) == 1
+    message = fake_logger.messages[0]
+    assert "request 42" in message
+    assert "generation" in message
+    assert "layer_group_id=0" in message
+    assert "window=2048" in message
+    assert "capacity 2047 -> 2049 tokens" in message
+    assert "num_blocks=3" in message
+    assert "block_range=[7, 9]" in message
+
+    # A further growth on the same request stays quiet: the window was already
+    # crossed, so the once-per-sequence-per-pool contract holds without state.
+    manager._log_window_crossing(request, kv_cache, 2049, 2050, "generation")
+    assert len(fake_logger.messages) == 1
+
+
+@pytest.mark.parametrize(
+    "pre_capacity,new_capacity",
+    [
+        (100, 2048),  # grows up to the window but does not cross it
+        (2048, 2048),  # no growth at all
+        (2049, 3000),  # already past the window
+    ],
+)
+def test_window_crossing_is_silent_without_a_crossing(
+    monkeypatch, pre_capacity: int, new_capacity: int
+) -> None:
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1),
+        _FakeWindowedKVCache({0: [1]}),
+        pre_capacity,
+        new_capacity,
+        "context",
+    )
+
+    assert fake_logger.messages == []
+
+
+@pytest.mark.parametrize(
+    "level,expected",
+    [("trace", 1), ("debug", 1), ("verbose", 1), ("info", 0), ("warning", 0), ("error", 0)],
+)
+def test_window_crossing_follows_the_logger_severity_order(monkeypatch, level, expected) -> None:
+    """Every level at least as verbose as debug logs; the rest stay quiet.
+
+    ``verbose`` and ``trace`` are valid ways to ask for debug output, so a
+    guard that compares the level to the literal ``"debug"`` suppresses the
+    line for users who did enable it.
+    """
+    fake_logger = _FakeLogger(level=level)
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1), _FakeWindowedKVCache({0: [1]}), 2047, 2049, "context"
+    )
+
+    assert len(fake_logger.messages) == expected
+
+
+@pytest.mark.parametrize(
+    "global_level,module_level,expected",
+    [
+        # A module raised to debug logs even though the global level is info.
+        ("info", 10, 1),
+        # A module pinned to info stays quiet even though the global level is debug.
+        ("debug", 20, 0),
+    ],
+)
+def test_window_crossing_honours_per_module_log_levels(
+    monkeypatch, global_level: str, module_level: int, expected: int
+) -> None:
+    """The real logger, not a stand-in: the gate must resolve this module.
+
+    ``TLLM_LOG_LEVEL_BY_MODULE=debug:_torch`` is how a user turns this
+    diagnostic on without drowning in every other subsystem's debug output,
+    and the manager's own module (``_torch``) is what the override names.
+    """
+    from tensorrt_llm.logger import logger as real_logger
+
+    assert kv_cache_v2_module.logger is real_logger, "the manager must log through the real logger"
+    recorded: list[str] = []
+    monkeypatch.setattr(real_logger, "_min_severity", global_level)
+    monkeypatch.setattr(real_logger, "_module_levels", {"_torch": module_level})
+    monkeypatch.setattr(real_logger, "debug", lambda *msg: recorded.append(" ".join(map(str, msg))))
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1), _FakeWindowedKVCache({0: [1]}), 2047, 2049, "context"
+    )
+
+    assert len(recorded) == expected
+
+
+def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
+    """Diagnostics must never turn a working run into a failing one."""
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    class _BrokenKVCache:
+        def get_base_page_indices(self, layer_group_id, beam_id=DEFAULT_BEAM_INDEX):
+            raise KeyError("no base buffer")
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1), _BrokenKVCache(), 2047, 2049, "context"
+    )
+
+    assert len(fake_logger.messages) == 1
+    assert "unavailable" in fake_logger.messages[0]
