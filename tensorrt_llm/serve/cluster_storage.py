@@ -590,7 +590,7 @@ class Etcd3ClusterStorage(ClusterStorage):
     @handle_etcd_error(return_on_error=None)
     async def get(self, key: str) -> str:
         data, meta = self.client.get(key)
-        return data.decode('utf-8') if data else None
+        return data.decode('utf-8') if data is not None else None
 
     @handle_etcd_error(return_on_error=False)
     async def delete(self, key: str) -> bool:
