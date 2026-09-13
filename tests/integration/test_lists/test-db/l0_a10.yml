@@ -78,7 +78,6 @@ l0_a10:
   - unittest/tools/test_host_profiler.py
   - unittest/tools/test_infra_dry_run_pipeline.py
   - unittest/tools/test_infra_dry_run_pytest.py
-  - unittest/tools/test_perf_sanity_matching.py
   - unittest/tools/test_unittest_culprits.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py

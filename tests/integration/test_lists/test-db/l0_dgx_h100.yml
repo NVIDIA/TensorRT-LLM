@@ -34,6 +34,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync
+  - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_mismatched_block_reuse
   - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
   # ------------- Model specific tests ---------------
@@ -55,6 +56,24 @@ l0_dgx_h100:
   tests:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-one_model-overlap_scheduler]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-one_model-overlap_scheduler]
+  - accuracy/test_disaggregated_serving.py::TestGPTOSS20B::test_beam_search
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      auto_trigger: gpt_oss
+      orchestrator: mpi
+  tests:
+  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=False]
+  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=True]
 - condition:
     ranges:
       system_gpu_count:
@@ -104,6 +123,7 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
+  - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_ctx_pp_gen_tp_asymmetric
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_kv_cache_v1
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0]

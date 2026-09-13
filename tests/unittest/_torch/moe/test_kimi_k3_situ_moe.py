@@ -643,8 +643,12 @@ def test_kimi_k3_trtllm_accepts_nvfp4_routed_experts():
         num_shared_experts=1,
     )
 
-    aux_stream_dict = _make_aux_stream_dict()
-    runtime = KimiK3MoERuntime(model_config, cfg, layer_idx=0, aux_stream_dict=aux_stream_dict)
+    runtime = KimiK3MoERuntime(
+        model_config,
+        cfg,
+        layer_idx=0,
+        aux_stream_dict={stream_type: torch.cuda.Stream() for stream_type in AuxStreamType},
+    )
 
     assert runtime.expert_ckpt_spec is modeling_kimi_linear._K3_EXPERT_CKPT_SPECS[QuantAlgo.NVFP4]
     assert isinstance(
