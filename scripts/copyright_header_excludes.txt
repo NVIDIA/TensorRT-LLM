@@ -1,0 +1,29 @@
+# PERMANENT exclusions for scripts/check_copyright_header.py.
+#
+# Files/paths listed here are third-party, vendored, or generated code that
+# must NEVER receive an NVIDIA copyright header. This list is deliberately
+# separate from scripts/copyright_header_baseline.txt: the baseline is a
+# backfill TODO list that is expected to shrink over time; entries here are
+# permanent and must NOT be "cleaned up" or backfilled.
+#
+# One Python regex per line, matched against the repo-relative path
+# (re.match, i.e. anchored at the start). Lines starting with # are comments.
+
+# --- Vendored third-party code ---
+cpp/tensorrt_llm/common/sha256/
+triton_kernels/
+3rdparty/
+
+# vLLM-derived files that keep the upstream "contributors to the vLLM
+# project" copyright notice.
+tensorrt_llm/_torch/configs/deepseek_v3\.py$
+tensorrt_llm/serve/harmony_adapter\.py$
+tensorrt_llm/serve/responses_utils\.py$
+
+# --- Generated artifacts (mirrors the global exclude in
+# --- .pre-commit-config.yaml) ---
+.*trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$
+.*cubin\.(cpp|h)$
+.*trtllmGenKernels/fmha/trtllmGen_fmha_export/
+.*trtllmGenKernels/fmha/cuda_ptx/
+.*trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$
