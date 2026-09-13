@@ -519,6 +519,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
 
+            uses_internal_dispatch_quantization = moe.comm.uses_internal_dispatch_quantization()
             if supports_post_quant:
                 # Quantize -> Dispatch
                 if not used_fused_route_quant:
@@ -552,7 +553,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+                if not uses_internal_dispatch_quantization:
+                    x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
             if not used_fused_route_quant:

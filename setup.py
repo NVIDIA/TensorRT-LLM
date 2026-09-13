@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, find_packages, setup
 from setuptools.dist import Distribution
 
 
@@ -452,6 +452,38 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             elif os.path.isdir(dst_fmha):
                 shutil.rmtree(dst_fmha)
             shutil.copytree(source_fmha, dst_fmha)
+
+        source_nccl_extensions = os.path.join(precompiled_location, "3rdparty",
+                                              "nccl_extensions")
+        if os.path.isdir(source_nccl_extensions):
+            dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
+            if link_artifacts:
+                if os.path.islink(dst_nccl_extensions) and os.path.realpath(
+                        dst_nccl_extensions) == os.path.realpath(
+                            source_nccl_extensions):
+                    print("Keeping existing NCCL-EP symlink: "
+                          f"{dst_nccl_extensions}")
+                else:
+                    if os.path.islink(dst_nccl_extensions):
+                        os.unlink(dst_nccl_extensions)
+                    elif os.path.isdir(dst_nccl_extensions):
+                        shutil.rmtree(dst_nccl_extensions)
+                    os.makedirs(os.path.dirname(dst_nccl_extensions),
+                                exist_ok=True)
+                    print("Linking embedded NCCL-EP packages from local "
+                          f"directory: {source_nccl_extensions}")
+                    os.symlink(source_nccl_extensions, dst_nccl_extensions)
+            else:
+                print("Copying embedded NCCL-EP packages from local directory: "
+                      f"{source_nccl_extensions}")
+                if os.path.islink(dst_nccl_extensions):
+                    os.unlink(dst_nccl_extensions)
+                elif os.path.isdir(dst_nccl_extensions):
+                    shutil.rmtree(dst_nccl_extensions)
+                shutil.copytree(source_nccl_extensions, dst_nccl_extensions)
+        else:
+            print("Precompiled directory does not contain embedded NCCL-EP "
+                  "packages; continuing without NCCL-EP.")
         return
 
     # Handle local file or remote URL
@@ -606,6 +638,24 @@ packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 msa_package_dir = {"fmha_sm100": "3rdparty/fmha_sm100"}
 packages += ["fmha_sm100"]
 
+# NCCL-EP is staged from the source-built nccl-extensions wheel under
+# 3rdparty/. Its ``nccl`` package is a namespace shared with nccl4py, so
+# register only its staged namespace subpackages and preserve nccl4py core.
+nccl_extensions_root = Path("3rdparty/nccl_extensions")
+nccl_extensions_package_data = {}
+if (nccl_extensions_root / "nccl").is_dir():
+    packages += find_namespace_packages(
+        where=str(nccl_extensions_root),
+        include=("nccl.ep", "nccl.ep.*", "nccl._extensions",
+                 "nccl._extensions.*"),
+    )
+    msa_package_dir["nccl"] = str(nccl_extensions_root / "nccl")
+    nccl_extensions_package_data = {
+        "nccl.ep": ["lib/*.so", "include/**/*"],
+        "nccl._extensions.bindings": ["*.so", "_internal/*.so"],
+        "nccl._extensions.bindings._internal": ["*.so"],
+    }
+
 
 def get_build_state_options():
     """Optionally redirect setuptools build state out of the source tree.
@@ -670,6 +720,7 @@ setup(
             'cutlass/tools/util/include/**/*',
             'cutlass/LICENSE.txt',
         ],
+        **nccl_extensions_package_data,
     },
     license_files=get_license(),
     entry_points={
