@@ -37,6 +37,7 @@ The following guidance will mostly focus on benchmarks using `trtllm-bench` CLI.
       - [Supported Quantization Modes](#supported-quantization-modes)
     - [Preparing a Dataset](#preparing-a-dataset)
     - [Running with the PyTorch Workflow](#running-with-the-pytorch-workflow)
+      - [Configuring KV Cache Host Offloading](#configuring-kv-cache-host-offloading)
       - [Benchmarking with LoRA Adapters in PyTorch workflow](#benchmarking-with-lora-adapters-in-pytorch-workflow)
       - [Running multi-modal models in the PyTorch Workflow](#running-multi-modal-models-in-the-pytorch-workflow)
       - [Quantization in the PyTorch Flow](#quantization-in-the-pytorch-flow)
@@ -250,6 +251,35 @@ trtllm-bench --model meta-llama/Llama-3.1-8B \
   --dataset /tmp/synthetic_128_128.txt \
   --backend pytorch
 ```
+
+#### Configuring KV Cache Host Offloading
+
+`trtllm-bench` does not expose every LLM API option as a top-level CLI flag.
+For PyTorch benchmarks, pass any `TorchLlmArgs` field through a YAML file with
+`--config`; this covers nested settings such as `kv_cache_config`,
+`cuda_graph_config`, and `moe_config`. The LLM API field for host offload
+capacity is `kv_cache_config.host_cache_size`, in bytes:
+
+```yaml
+# kv_host_cache.yaml
+kv_cache_config:
+  host_cache_size: 1073741824  # 1 GiB
+```
+
+```shell
+trtllm-bench --model meta-llama/Llama-3.1-8B \
+  throughput \
+  --dataset /tmp/synthetic_128_128.txt \
+  --backend pytorch \
+  --config kv_host_cache.yaml
+```
+
+The setting allocates host memory for KV cache blocks that have been evicted or
+paused and can later be copied back to GPU memory for reuse. If both
+`kv_cache_config.max_tokens` and `kv_cache_config.host_cache_size` are set, the
+runtime uses memory corresponding to the smaller token capacity, so the actual
+host-cache allocation can be smaller than `host_cache_size`. For behavior details
+and limitations, see [](../features/kvcache.md#enable-offloading-to-host-memory).
 
 #### Benchmarking with LoRA Adapters in PyTorch workflow
 
