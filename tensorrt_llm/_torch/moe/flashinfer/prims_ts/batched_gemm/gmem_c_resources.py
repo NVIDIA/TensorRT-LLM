@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1728,6 +1729,11 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _sf_c_index(self, m_row, n_col, output_m):
+        # Both FC1 children quantize directly into the shared full-width SF
+        # layout consumed by FC2. Their channel coordinates remain disjoint.
+        # Keep separate locals for repeated calls from the unrolled DSL epilogue.
+        global_m_row = m_row + output_m * Int32(self.cfg.output_partition_id)
+        global_output_m = output_m * Int32(self.cfg.output_num_partitions)
         block_m = Int32(self.cfg.output_sf_block_size_c)
         group_m = block_m * Int32(4)
         if cutlass.const_expr(self.cfg.output_sf_block_size_c in (16, 32)):
@@ -1736,8 +1742,8 @@ class GmemCResource(MemoryResource):
             # semantics into correction branches.
             block_shift = 4 if self.cfg.output_sf_block_size_c == 16 else 5
             group_shift = block_shift + 2
-            m_block = m_row >> Int32(block_shift)
-            m_groups = (output_m + group_m - Int32(1)) >> Int32(group_shift)
+            m_block = global_m_row >> Int32(block_shift)
+            m_groups = (global_output_m + group_m - Int32(1)) >> Int32(group_shift)
             if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
                 return (
                     (n_col >> Int32(3)) * (m_groups * Int32(32))
@@ -1752,8 +1758,8 @@ class GmemCResource(MemoryResource):
                 + ((n_col >> Int32(5)) & Int32(3)) * Int32(4)
                 + (m_block & Int32(3))
             )
-        m_block = m_row // block_m
-        m_groups = (output_m + group_m - Int32(1)) // group_m
+        m_block = global_m_row // block_m
+        m_groups = (global_output_m + group_m - Int32(1)) // group_m
         if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
             return (
                 (n_col // Int32(8)) * (m_groups * Int32(32))
@@ -2101,10 +2107,10 @@ class GmemCResource(MemoryResource):
         elif output_in_bounds:
             if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                 if token_in_bounds:
-                    flat_idx0 = n_col * output_m + m_row0
+                    flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
                     self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
             else:
-                flat_idx0 = n_col * output_m + m_row0
+                flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
                 self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
 
         sf_packed = sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
@@ -2415,7 +2421,7 @@ class GmemCResource(MemoryResource):
                 ) + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
                 self.sCInt16.subview(smem_offset0 >> Int32(1)).store(packed)
         elif output_in_bounds:
-            flat_idx0 = n_col * output_m + m_row0
+            flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
             if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
                 packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
@@ -2938,7 +2944,7 @@ class GmemCResource(MemoryResource):
                                     output_in_bounds,
                                 )
                             else:
-                                flat_idx0 = n_col * output_m + m_row0
+                                flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
                                 flat_idx1 = flat_idx0 + Int32(1)
                                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                                     if token_in_bounds & output_in_bounds:
@@ -3209,7 +3215,7 @@ class GmemCResource(MemoryResource):
 
                                 m_row = m_tile_base // Int32(2) + m_local_row
                                 n_col = n_tile_base + tmem_col_even
-                                flat_idx = n_col * output_m + m_row
+                                flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
                                 token_in_bounds = (
                                     n_subtile_offset + tmem_col_even
                                 ) < token_limit
@@ -3320,7 +3326,7 @@ class GmemCResource(MemoryResource):
                             warpgroup_idx,
                         )
                         m_row1 = m_row0 + Int32(1)
-                        flat_idx0 = n_col * output_m + m_row0
+                        flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
                         output_pair_in_bounds = (m_row1 < output_m) & (
                             n_col < self.problem_n
                         )
@@ -3486,7 +3492,7 @@ class GmemCResource(MemoryResource):
                             elif row_sub == 3:
                                 val_f32 = val3_vals[pair_idx]
                             val_out = self._to_output_value(val_f32 * q_scale)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
                             output_in_bounds = (m_row < output_m) & (
                                 n_col < self.problem_n
                             )
@@ -3630,7 +3636,7 @@ class GmemCResource(MemoryResource):
                                 val_f32 = val_f32 * val_f32
                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
                             val_out = self._to_output_value(val_f32)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
                             token_in_bounds = (
                                 n_subtile_offset + tmem_col
                             ) < token_limit

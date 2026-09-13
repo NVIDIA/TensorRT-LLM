@@ -85,7 +85,7 @@ index e3b54583922a70d63c8ff16b54e01fdb0f770788..00000000000000000000000000000000
 -
 -"""Prims-TS MoE backend."""
 diff --git a/prims_ts/batched_gemm/batched_gemm_config.py b/prims_ts/batched_gemm/batched_gemm_config.py
-index 087e8e2000d5a8e7e727b4063b623c17741e300d..23685afd0c77b053e6c8a76f12bdfdcbdbf09aa8 100644
+index 087e8e2000d5a8e7e727b4063b623c17741e300d..f3457f0545899fb0034c6369cd9acdc7eac2febe 100644
 --- a/prims_ts/batched_gemm/batched_gemm_config.py
 +++ b/prims_ts/batched_gemm/batched_gemm_config.py
 @@ -1,4 +1,5 @@
@@ -103,6 +103,21 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..23685afd0c77b053e6c8a76f12bdfdcb
  
  
  # `SmemSfLdgstsResource._tail_cp_async_wait_group` lowers the runtime
+@@ -216,11 +217,11 @@ class BatchedGemmConfig:
+     """
+ 
+     mma_k: int = 64
+-    """MMA instruction K depth, in elements; one of ``{16, 32, 64}``.
++    """MMA instruction K depth, in elements; one of ``{16, 32, 64, 128}``.
+ 
+     Must match the MMA dtype (:func:`validate_config`): ``16`` for BF16/CastA,
+-    ``32`` for MX and FP8, ``64`` for NVFP4. :attr:`tile_k` must be a multiple
+-    of it.
++    ``32`` for MX and FP8, ``64`` for Blackwell NVFP4, or ``128`` for Rubin
++    NVFP4. :attr:`tile_k` must be a multiple of it.
+     """
+ 
+     mma_m: int = 128
 @@ -569,6 +570,16 @@ class BatchedGemmConfig:
      Requires :attr:`use_pdl` and :attr:`use_early_exit` (:func:`validate_config`).
      """
@@ -120,7 +135,33 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..23685afd0c77b053e6c8a76f12bdfdcb
      per_token_sf_dtype: int = int(DType.FP32)
      """Element type of per-token FP8 scale factors, as a :class:`DType` value.
  
-@@ -1184,7 +1195,7 @@ class BatchedGemmConfig:
+@@ -617,6 +628,16 @@ class BatchedGemmConfig:
+     must be ``R8c4`` or ``R128c4`` (:func:`validate_config`).
+     """
+ 
++    output_num_partitions: int = 1
++    """Number of equal output-channel shards sharing one output allocation.
++
++    Localized MoE launches use two partitions. GEMM M remains local, while
++    output rows and quantization scales use the full output leading dimension.
++    """
++
++    output_partition_id: int = 0
++    """Output-channel shard written by this launch, starting at zero."""
++
+     tile_scheduler: int = int(TileScheduler.STATIC)
+     """CTA scheduling mode, as a :class:`TileScheduler` value.
+ 
+@@ -881,7 +902,7 @@ class BatchedGemmConfig:
+ 
+     @property
+     def is_nvfp4_mma(self) -> bool:
+-        """True when both operands are ``E2M1`` -- NVFP4 MMA (``mma_k = 64``)."""
++        """True when both operands are ``E2M1`` -- NVFP4 MMA."""
+         return self.dtype_a_kind == int(DType.E2M1) and self.dtype_b_kind == int(
+             DType.E2M1
+         )
+@@ -1184,7 +1205,7 @@ class BatchedGemmConfig:
  
      @property
      def weight_layout_kind(self) -> int:
@@ -129,7 +170,65 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..23685afd0c77b053e6c8a76f12bdfdcb
          return int(self.weight_layout)
  
      @property
-@@ -2859,6 +2870,14 @@ def validate_config(
+@@ -1303,6 +1324,10 @@ class BatchedGemmConfig:
+         if operand == "a":
+             return self.tile_m
+         if operand == "b":
++            if self.is_nvfp4_mma and self.mma_k == 128:
++                # Rubin's eight-vector NVFP4 MMA reads SF4 at the next
++                # 128-row block of TMEM columns even when N is smaller.
++                return ((self.tile_n + 127) // 128) * 128
+             return self.tile_n
+         raise ValueError(f"Unsupported scale-factor operand: {operand}")
+ 
+@@ -2620,9 +2645,9 @@ def validate_config(
+     if cfg.tile_m != 128:
+         raise ValueError(f"Only tile_m=128 supported, got {cfg.tile_m}")
+ 
+-    if cfg.mma_k not in (16, 32, 64):
++    if cfg.mma_k not in (16, 32, 64, 128):
+         raise ValueError(
+-            f"mma_k must be 16 (BF16), 32 (MX/FP8), or 64 (NVFP4), got {cfg.mma_k}"
++            f"mma_k must be 16 (BF16), 32 (MX/FP8), or 64/128 (NVFP4), got {cfg.mma_k}"
+         )
+ 
+     if cfg.is_bf16_mma and cfg.mma_k != 16:
+@@ -2631,8 +2656,8 @@ def validate_config(
+     if cfg.has_cast_a and cfg.mma_k != 16:
+         raise ValueError(f"CastA BF16 MMA requires mma_k=16, got {cfg.mma_k}")
+ 
+-    if cfg.is_nvfp4_mma and cfg.mma_k != 64:
+-        raise ValueError(f"NVFP4 MMA requires mma_k=64, got {cfg.mma_k}")
++    if cfg.is_nvfp4_mma and cfg.mma_k not in (64, 128):
++        raise ValueError(f"NVFP4 MMA requires mma_k=64 or 128, got {cfg.mma_k}")
+ 
+     if cfg.is_mx_mma and cfg.mma_k != 32:
+         raise ValueError(f"MX MMA requires mma_k=32, got {cfg.mma_k}")
+@@ -2853,12 +2878,38 @@ def validate_config(
+     if cfg.use_pdl not in (0, 1):
+         raise ValueError(f"use_pdl must be 0 or 1, got {cfg.use_pdl}")
+ 
++    if (
++        not isinstance(cfg.output_num_partitions, int)
++        or cfg.output_num_partitions not in (1, 2)
++    ):
++        raise ValueError("output_num_partitions must be 1 or 2")
++    if (
++        not isinstance(cfg.output_partition_id, int)
++        or not 0 <= cfg.output_partition_id < cfg.output_num_partitions
++    ):
++        raise ValueError("output_partition_id must identify an output partition")
++    if cfg.output_num_partitions > 1:
++        if not cfg.is_swap_ab:
++            raise ValueError("Partitioned output requires swapAB")
++        if cfg.use_tma_oob_opt:
++            raise ValueError("Partitioned output requires ordinary TMA bounds")
++        if cfg.use_pdl:
++            raise ValueError("Partitioned output requires explicit stream synchronization")
++
+     if cfg.do_pdl_wait_for_num_non_exiting_ctas not in (0, 1):
+         raise ValueError(
+             "do_pdl_wait_for_num_non_exiting_ctas must be 0 or 1, got "
              f"{cfg.do_pdl_wait_for_num_non_exiting_ctas}"
          )
  
@@ -144,7 +243,7 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..23685afd0c77b053e6c8a76f12bdfdcb
      if cfg.do_pdl_wait_for_num_non_exiting_ctas:
          if not cfg.use_pdl:
              raise ValueError("do_pdl_wait_for_num_non_exiting_ctas requires use_pdl=1")
-@@ -2866,10 +2885,10 @@ def validate_config(
+@@ -2866,10 +2917,10 @@ def validate_config(
              raise ValueError(
                  "do_pdl_wait_for_num_non_exiting_ctas requires use_early_exit=1"
              )
@@ -158,10 +257,16 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..23685afd0c77b053e6c8a76f12bdfdcb
  
      if cfg.use_global_scales not in (0, 1):
 diff --git a/prims_ts/batched_gemm/batched_gemm_kernel.py b/prims_ts/batched_gemm/batched_gemm_kernel.py
-index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc8ce04fd8 100644
+index d92fc09e3e88c663984dad337fa9795601eff589..2e1dfd18b4575c55ca2d6dac0e486134157fe10a 100644
 --- a/prims_ts/batched_gemm/batched_gemm_kernel.py
 +++ b/prims_ts/batched_gemm/batched_gemm_kernel.py
-@@ -2537,6 +2537,8 @@ def gemm(
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -2537,6 +2538,8 @@ def gemm(
      validate_config(cfg, problem_mnk=(m, n, k))
      from cutlass.experimental.cuda import TensorMapDataFormat
  
@@ -170,7 +275,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc
      # Typed pointers passed from host-side make_ptr (cute.runtime.make_ptr)
      a_ptr = a_raw_ptr
      b_ptr = b_raw_ptr
-@@ -2558,7 +2560,7 @@ def gemm(
+@@ -2558,7 +2561,7 @@ def gemm(
                  1,
                  a_block_k,
                  cute.assume(m * a_block_k, 32),
@@ -179,7 +284,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc
              ),
          )
          a_tensor = cute.make_tensor(a_ptr, a_layout)
-@@ -2570,7 +2572,7 @@ def gemm(
+@@ -2570,7 +2573,7 @@ def gemm(
      elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
          a_layout = cute.make_layout(
              (64, m, cute.assume(k // 64, 1), num_experts_dim),
@@ -188,7 +293,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc
          )
          a_tensor = cute.make_tensor(a_ptr, a_layout)
      elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
-@@ -2582,7 +2584,7 @@ def gemm(
+@@ -2582,7 +2585,7 @@ def gemm(
      else:
          a_layout = cute.make_layout(
              (cute.assume(k, 32), m, num_experts_dim),
@@ -197,7 +302,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc
          )
          a_tensor = cute.make_tensor(a_ptr, a_layout)
  
-@@ -2594,7 +2596,7 @@ def gemm(
+@@ -2594,7 +2597,7 @@ def gemm(
                  1,
                  b_block_k,
                  cute.assume(n * b_block_k, 32),
@@ -206,7 +311,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc
              ),
          )
      elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
-@@ -2609,7 +2611,7 @@ def gemm(
+@@ -2609,7 +2612,7 @@ def gemm(
      else:
          b_layout = cute.make_layout(
              (cute.assume(k, 32), n, num_experts_dim),
@@ -215,6 +320,31 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc
          )
      b_tensor = cute.make_tensor(b_ptr, b_layout)
  
+@@ -3002,6 +3005,7 @@ def gemm(
+     output_m_for_c = m
+     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
+         output_m_for_c = m // Int32(2)
++    output_stride = output_m_for_c * Int32(cfg.output_num_partitions)
+     if cutlass.const_expr(cfg.is_swap_ab):
+         # SwapAB: C is (M, N) in M-major (column-major) layout.
+         # M = hidden dim (stride-1), N = tokens (stride-M).
+@@ -3039,7 +3043,7 @@ def gemm(
+         else:
+             c_layout = cute.make_layout(
+                 (cute.assume(output_m_for_c, 32), cute.assume(n, 16)),
+-                stride=(1, cute.assume(output_m_for_c, 32)),
++                stride=(1, cute.assume(output_stride, 32)),
+             )
+     else:
+         # Non-swapAB: C is (M, N) row-major.
+@@ -3131,6 +3135,7 @@ def gemm(
+     output_m_for_sf = m
+     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
+         output_m_for_sf = m // Int32(2)
++    output_m_for_sf = output_m_for_sf * Int32(cfg.output_num_partitions)
+     if cutlass.const_expr(cfg.has_epilogue_quant):
+         sf_block_m = Int32(cfg.output_sf_block_size_c)
+         sf_group_m = sf_block_m * Int32(4)
 diff --git a/prims_ts/batched_gemm/batched_gemm_run.py b/prims_ts/batched_gemm/batched_gemm_run.py
 index f554101fc1f6d80a84ec4eae66ef97335a5dd652..6150fd0d01b450c6f87f9b8c8a295bafca480eb9 100644
 --- a/prims_ts/batched_gemm/batched_gemm_run.py
@@ -228,6 +358,179 @@ index f554101fc1f6d80a84ec4eae66ef97335a5dd652..6150fd0d01b450c6f87f9b8c8a295baf
  
  
  def _env_flag_enabled(name: str, default: bool = False) -> bool:
+diff --git a/prims_ts/batched_gemm/gmem_c_resources.py b/prims_ts/batched_gemm/gmem_c_resources.py
+index 1dc5c99841e7fcee147104e8b05657ea5be539b0..b2e32d6504383802c6956de4887b734e3b1a3231 100644
+--- a/prims_ts/batched_gemm/gmem_c_resources.py
++++ b/prims_ts/batched_gemm/gmem_c_resources.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -1728,6 +1729,11 @@ class GmemCResource(MemoryResource):
+ 
+     @cute.jit
+     def _sf_c_index(self, m_row, n_col, output_m):
++        # Both FC1 children quantize directly into the shared full-width SF
++        # layout consumed by FC2. Their channel coordinates remain disjoint.
++        # Keep separate locals for repeated calls from the unrolled DSL epilogue.
++        global_m_row = m_row + output_m * Int32(self.cfg.output_partition_id)
++        global_output_m = output_m * Int32(self.cfg.output_num_partitions)
+         block_m = Int32(self.cfg.output_sf_block_size_c)
+         group_m = block_m * Int32(4)
+         if cutlass.const_expr(self.cfg.output_sf_block_size_c in (16, 32)):
+@@ -1736,8 +1742,8 @@ class GmemCResource(MemoryResource):
+             # semantics into correction branches.
+             block_shift = 4 if self.cfg.output_sf_block_size_c == 16 else 5
+             group_shift = block_shift + 2
+-            m_block = m_row >> Int32(block_shift)
+-            m_groups = (output_m + group_m - Int32(1)) >> Int32(group_shift)
++            m_block = global_m_row >> Int32(block_shift)
++            m_groups = (global_output_m + group_m - Int32(1)) >> Int32(group_shift)
+             if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
+                 return (
+                     (n_col >> Int32(3)) * (m_groups * Int32(32))
+@@ -1752,8 +1758,8 @@ class GmemCResource(MemoryResource):
+                 + ((n_col >> Int32(5)) & Int32(3)) * Int32(4)
+                 + (m_block & Int32(3))
+             )
+-        m_block = m_row // block_m
+-        m_groups = (output_m + group_m - Int32(1)) // group_m
++        m_block = global_m_row // block_m
++        m_groups = (global_output_m + group_m - Int32(1)) // group_m
+         if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
+             return (
+                 (n_col // Int32(8)) * (m_groups * Int32(32))
+@@ -2101,10 +2107,10 @@ class GmemCResource(MemoryResource):
+         elif output_in_bounds:
+             if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                 if token_in_bounds:
+-                    flat_idx0 = n_col * output_m + m_row0
++                    flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                     self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
+             else:
+-                flat_idx0 = n_col * output_m + m_row0
++                flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                 self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
+ 
+         sf_packed = sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
+@@ -2415,7 +2421,7 @@ class GmemCResource(MemoryResource):
+                 ) + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
+                 self.sCInt16.subview(smem_offset0 >> Int32(1)).store(packed)
+         elif output_in_bounds:
+-            flat_idx0 = n_col * output_m + m_row0
++            flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+             if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
+                 packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
+                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+@@ -2938,7 +2944,7 @@ class GmemCResource(MemoryResource):
+                                     output_in_bounds,
+                                 )
+                             else:
+-                                flat_idx0 = n_col * output_m + m_row0
++                                flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                                 flat_idx1 = flat_idx0 + Int32(1)
+                                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                                     if token_in_bounds & output_in_bounds:
+@@ -3209,7 +3215,7 @@ class GmemCResource(MemoryResource):
+ 
+                                 m_row = m_tile_base // Int32(2) + m_local_row
+                                 n_col = n_tile_base + tmem_col_even
+-                                flat_idx = n_col * output_m + m_row
++                                flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
+                                 token_in_bounds = (
+                                     n_subtile_offset + tmem_col_even
+                                 ) < token_limit
+@@ -3320,7 +3326,7 @@ class GmemCResource(MemoryResource):
+                             warpgroup_idx,
+                         )
+                         m_row1 = m_row0 + Int32(1)
+-                        flat_idx0 = n_col * output_m + m_row0
++                        flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                         output_pair_in_bounds = (m_row1 < output_m) & (
+                             n_col < self.problem_n
+                         )
+@@ -3486,7 +3492,7 @@ class GmemCResource(MemoryResource):
+                             elif row_sub == 3:
+                                 val_f32 = val3_vals[pair_idx]
+                             val_out = self._to_output_value(val_f32 * q_scale)
+-                            flat_idx = n_col * output_m + m_row
++                            flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
+                             output_in_bounds = (m_row < output_m) & (
+                                 n_col < self.problem_n
+                             )
+@@ -3630,7 +3636,7 @@ class GmemCResource(MemoryResource):
+                                 val_f32 = val_f32 * val_f32
+                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
+                             val_out = self._to_output_value(val_f32)
+-                            flat_idx = n_col * output_m + m_row
++                            flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
+                             token_in_bounds = (
+                                 n_subtile_offset + tmem_col
+                             ) < token_limit
+diff --git a/prims_ts/batched_gemm/tmem_c_resources.py b/prims_ts/batched_gemm/tmem_c_resources.py
+index 9a012a9e2604ab497b5fbcae3ccb8a231a92aee9..334eb4f85ee2d1bee9aa848696fcc44d227ec0d4 100644
+--- a/prims_ts/batched_gemm/tmem_c_resources.py
++++ b/prims_ts/batched_gemm/tmem_c_resources.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -255,6 +256,16 @@ class TmemCResource(MemoryResource):
+                 n_dim=self.cfg.mma_n,
+                 m_dim=self.cfg.mma_m,
+             )
++        elif cutlass.const_expr(self.cfg.mma_k == 128):
++            # Rubin NVFP4 uses the OMMA descriptor and a 128-element K step.
++            self.idesc = prims.Tcgen05MxOmmaInstrDesc.build(
++                a_dtype=cutlass.Float4E2M1FN,
++                b_dtype=cutlass.Float4E2M1FN,
++                scale_format=0,
++                n_dim=self.cfg.mma_n,
++                m_dim=self.cfg.mma_m,
++                k_dim=2,
++            )
+         else:
+             # FP4 NVF4: block-scaled MMA descriptor (tcgen05_mma_block_scale
+             # MXF4NVF4). NVF4 uses E4M3 scale factors (scale_format=0, UE4M3);
+@@ -626,13 +637,12 @@ class TmemCResource(MemoryResource):
+                     )
+                     desc_b_increment = k_major * desc_b_group_stride + k_minor * 2
+                 elif cutlass.const_expr(self.cfg.tile_k > 256):
+-                    # SM100 swizzled FP4 MMA descriptors are linear only
+-                    # within a 256-wide K group. At kblock 4, generated
+-                    # kernels jump to the next swizzle group instead of using
+-                    # desc += 8.
+-                    k_minor = kblock_idx % 4
+-                    k_major = kblock_idx // 4
+-                    desc_a_increment = k_major * 1024 + k_minor * 2
++                    # Swizzled FP4 descriptors are linear inside a 256-wide
++                    # K group: four Blackwell or two Rubin MMA instructions.
++                    blocks_per_group = 256 // self.cfg.mma_k
++                    k_minor = kblock_idx % blocks_per_group
++                    k_major = kblock_idx // blocks_per_group
++                    desc_a_increment = k_major * 1024 + k_minor * (self.cfg.mma_k // 32)
+                     b_stage_bytes = self.cfg.num_bytes_b_smem_per_stage
+                     if cutlass.const_expr(
+                         self.cfg.has_cluster
+@@ -645,10 +655,11 @@ class TmemCResource(MemoryResource):
+                         64,
+                         (256 * b_stage_bytes // self.cfg.tile_k) >> 4,
+                     )
+-                    desc_b_increment = k_major * desc_b_group_stride + k_minor * 2
++                    desc_b_increment = k_major * desc_b_group_stride + k_minor * (self.cfg.mma_k // 32)
+                 else:
+-                    desc_a_increment = 2 * kblock_idx
+-                    desc_b_increment = 2 * kblock_idx
++                    desc_step = 2 if self.cfg.is_mx_mma else self.cfg.mma_k // 32
++                    desc_a_increment = desc_step * kblock_idx
++                    desc_b_increment = desc_step * kblock_idx
+                 desc_a = desc_a_mma + desc_a_increment
+                 desc_b = desc_b_mma + desc_b_increment
+ 
 diff --git a/prims_ts/moe/compile_cache.py b/prims_ts/moe/compile_cache.py
 index 9d2da158ac1eac930995f2231c17a1736b7303cc..b760edd62aa7c6ee8f9f313035597043e55eb6b7 100644
 --- a/prims_ts/moe/compile_cache.py
@@ -306,10 +609,16 @@ index 5707aa4e7a8614bf9be711c6f08bcb2044167a7b..e8d8d62721c3999699dc525b8a625dc4
      if tensor.dtype == torch.bfloat16:
          return int(DType.BF16)
 diff --git a/prims_ts/moe/tensor_adapter.py b/prims_ts/moe/tensor_adapter.py
-index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc09e24d5c 100644
+index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..9699ef44b60843d4bee7ac2a572907c263968ae6 100644
 --- a/prims_ts/moe/tensor_adapter.py
 +++ b/prims_ts/moe/tensor_adapter.py
-@@ -22,7 +22,7 @@ from typing import Literal
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -22,7 +23,7 @@ from typing import Literal
  
  import torch
  
@@ -318,7 +627,36 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
  
  
  _expert_scale_ones: dict[tuple[torch.device, int], torch.Tensor] = {}
-@@ -187,7 +187,7 @@ def _launch_early_exit_max_token_ctas(
+@@ -51,6 +52,28 @@ def _fc1_out_hidden(intermediate_size: int, activation_type: int) -> int:
+     )
+ 
+ 
++def _partition_output_hidden(cfg, out_hidden: int) -> int:
++    if out_hidden % cfg.output_num_partitions:
++        raise ValueError("Output width must divide evenly across partitions")
++    return out_hidden // cfg.output_num_partitions
++
++
++def _partition_output_ptr(cfg, output_buf: torch.Tensor, out_hidden: int) -> int:
++    """Offset into a full shared output without making a strided tensor view."""
++    if cfg.output_num_partitions == 1:
++        return output_buf.data_ptr()
++    local_width = out_hidden // 2 if cfg.has_gated_epilogue else out_hidden
++    packed_width = local_width // 2 if cfg.has_epilogue_quant else local_width
++    if not output_buf.is_contiguous():
++        raise ValueError("Partitioned output requires a contiguous full allocation")
++    if output_buf.shape[1] != packed_width * cfg.output_num_partitions:
++        raise ValueError("Partitioned output must cover the full output width")
++    offset = cfg.output_partition_id * packed_width * output_buf.element_size()
++    if offset % 16:
++        raise ValueError("Partitioned output pointers must be 16-byte aligned")
++    return output_buf.data_ptr() + offset
++
++
+ def _check_fp8_scale_storage(
+     name: str, tensor: torch.Tensor, *, min_numel: int | None = None
+ ) -> None:
+@@ -187,7 +210,7 @@ def _launch_early_exit_max_token_ctas(
      if not cfg.use_early_exit:
          return 0
  
@@ -327,7 +665,15 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
          compute_max_num_ctas_in_token_dim_for_moe,
      )
  
-@@ -366,7 +366,7 @@ def build_bf16_launch_io(
+@@ -339,6 +362,7 @@ def build_bf16_launch_io(
+     *,
+     fc: Literal["fc1", "fc2"],
+     cfg,
++    cfg_is_normalized: bool = False,
+     hidden_states: torch.Tensor,
+     gemm1_weights: torch.Tensor,
+     gemm2_weights: torch.Tensor,
+@@ -366,7 +390,7 @@ def build_bf16_launch_io(
      from cutlass.cute.runtime import make_ptr
      import cutlass
  
@@ -336,7 +682,29 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
          _runtime_config,
      )
  
-@@ -625,6 +625,7 @@ def build_nvfp4_launch_io(
+@@ -383,7 +407,11 @@ def build_bf16_launch_io(
+         activation_compact = gemm1_output
+         output_buf = gemm2_output
+ 
+-    cfg = _runtime_config(cfg, in_hidden)
++    out_hidden = _partition_output_hidden(cfg, out_hidden)
++    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden)
++
++    if not cfg_is_normalized:
++        cfg = _runtime_config(cfg, in_hidden)
+     _validate_weight_storage(
+         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
+         tensor=weights,
+@@ -490,7 +518,7 @@ def build_bf16_launch_io(
+     )
+     c0_dp = make_ptr(
+         cutlass.BFloat16,
+-        output_buf.data_ptr(),
++        output_ptr,
+         cutlass.AddressSpace.gmem,
+         assumed_align=16,
+     )
+@@ -625,6 +653,7 @@ def build_nvfp4_launch_io(
      *,
      fc: Literal["fc1", "fc2"],
      cfg,
@@ -344,7 +712,7 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
      hidden_states: torch.Tensor,
      hidden_states_scale: torch.Tensor,
      gemm1_weights: torch.Tensor,
-@@ -661,10 +662,10 @@ def build_nvfp4_launch_io(
+@@ -661,10 +690,10 @@ def build_nvfp4_launch_io(
      from cutlass.cute.runtime import make_ptr
      import cutlass
  
@@ -357,18 +725,39 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
  
      if fc == "fc1":
          out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
-@@ -689,7 +690,9 @@ def build_nvfp4_launch_io(
+@@ -689,7 +718,12 @@ def build_nvfp4_launch_io(
          scale_c = output2_scale_scalar
          scale_gate = output2_scale_scalar
  
 -    cfg = _runtime_config(cfg, in_hidden)
++    out_hidden = _partition_output_hidden(cfg, out_hidden)
++    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden)
++
 +    # The TRTLLM caller caches a private config normalized for this K.
 +    if not cfg_is_normalized:
 +        cfg = _runtime_config(cfg, in_hidden)
      _validate_weight_storage(
          name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
          tensor=weights,
-@@ -986,6 +989,7 @@ def build_mxfp4_mxfp8_launch_io(
+@@ -808,7 +842,7 @@ def build_nvfp4_launch_io(
+     if cfg.has_epilogue_quant:
+         c0_dp = make_ptr(
+             data_dtype,
+-            output_buf.data_ptr(),
++            output_ptr,
+             cutlass.AddressSpace.gmem,
+             assumed_align=16,
+         )
+@@ -821,7 +855,7 @@ def build_nvfp4_launch_io(
+     else:
+         c0_dp = make_ptr(
+             cutlass.BFloat16,
+-            output_buf.data_ptr(),
++            output_ptr,
+             cutlass.AddressSpace.gmem,
+             assumed_align=16,
+         )
+@@ -986,6 +1020,7 @@ def build_mxfp4_mxfp8_launch_io(
      *,
      fc: Literal["fc1", "fc2"],
      cfg,
@@ -376,7 +765,7 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
      hidden_states: torch.Tensor,
      hidden_states_scale: torch.Tensor,
      gemm1_weights: torch.Tensor,
-@@ -1020,7 +1024,7 @@ def build_mxfp4_mxfp8_launch_io(
+@@ -1020,7 +1055,7 @@ def build_mxfp4_mxfp8_launch_io(
      from cutlass.cute.runtime import make_ptr
      import cutlass
  
@@ -385,7 +774,7 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
          _runtime_config,
      )
  
-@@ -1047,7 +1051,9 @@ def build_mxfp4_mxfp8_launch_io(
+@@ -1047,7 +1082,9 @@ def build_mxfp4_mxfp8_launch_io(
          scale_c = output2_scale_scalar
          scale_gate = output2_scale_scalar
  
@@ -396,7 +785,7 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
      _validate_weight_storage(
          name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
          tensor=weights,
-@@ -1358,7 +1364,7 @@ def build_fp8_block_scale_launch_io(
+@@ -1358,7 +1395,7 @@ def build_fp8_block_scale_launch_io(
      from cutlass.cute.runtime import make_ptr
      import cutlass
  
@@ -405,7 +794,7 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
          _runtime_config,
      )
  
-@@ -1752,7 +1758,7 @@ def build_mxfp4_bf16_launch_io(
+@@ -1752,7 +1789,7 @@ def build_mxfp4_bf16_launch_io(
      from cutlass.cute.runtime import make_ptr
      import cutlass
  
@@ -414,7 +803,7 @@ index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc
          _runtime_config,
      )
  
-@@ -2061,10 +2067,10 @@ def build_fp8_per_tensor_launch_io(
+@@ -2061,10 +2098,10 @@ def build_fp8_per_tensor_launch_io(
      from cutlass.cute.runtime import make_ptr
      import cutlass
  

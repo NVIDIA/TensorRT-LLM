@@ -707,7 +707,7 @@ class TestLocalityDomainMoePlanner:
         planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
         plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True), activation="Relu2")
         assert not plan.enabled
-        assert "SwiGLU only" in plan.reason_if_disabled
+        assert "Swiglu" in plan.reason_if_disabled
 
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
@@ -716,7 +716,33 @@ class TestLocalityDomainMoePlanner:
         planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
         plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True), moe_backend="CUTLASS")
         assert not plan.enabled
-        assert "CuteDSL backend" in plan.reason_if_disabled
+        assert "CUTEDSL or PRIMS_TS" in plan.reason_if_disabled
+
+    @pytest.mark.parametrize(
+        "nvfp4,activation,expected",
+        [
+            (True, "Swiglu", True),
+            (True, "SiTu", True),
+            (False, "Swiglu", True),
+            (False, "SiTu", False),
+            (True, "Relu2", False),
+        ],
+    )
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
+    def test_prims_ts_moe_partition_plan(self, mock_locality_domain, nvfp4, activation, expected):
+        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        plan = planner.plan_moe(
+            _FakeMoeQuantConfig(nvfp4=nvfp4),
+            moe_backend="PRIMS_TS",
+            activation=activation,
+            use_fused_finalize=False,
+        )
+        assert plan.enabled is expected
+        if expected:
+            assert plan.backend == "prims_ts"
+            assert plan.merge_kind == "none"
 
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True

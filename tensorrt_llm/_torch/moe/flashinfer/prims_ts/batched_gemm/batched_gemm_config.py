@@ -217,11 +217,11 @@ class BatchedGemmConfig:
     """
 
     mma_k: int = 64
-    """MMA instruction K depth, in elements; one of ``{16, 32, 64}``.
+    """MMA instruction K depth, in elements; one of ``{16, 32, 64, 128}``.
 
     Must match the MMA dtype (:func:`validate_config`): ``16`` for BF16/CastA,
-    ``32`` for MX and FP8, ``64`` for NVFP4. :attr:`tile_k` must be a multiple
-    of it.
+    ``32`` for MX and FP8, ``64`` for Blackwell NVFP4, or ``128`` for Rubin
+    NVFP4. :attr:`tile_k` must be a multiple of it.
     """
 
     mma_m: int = 128
@@ -628,6 +628,16 @@ class BatchedGemmConfig:
     must be ``R8c4`` or ``R128c4`` (:func:`validate_config`).
     """
 
+    output_num_partitions: int = 1
+    """Number of equal output-channel shards sharing one output allocation.
+
+    Localized MoE launches use two partitions. GEMM M remains local, while
+    output rows and quantization scales use the full output leading dimension.
+    """
+
+    output_partition_id: int = 0
+    """Output-channel shard written by this launch, starting at zero."""
+
     tile_scheduler: int = int(TileScheduler.STATIC)
     """CTA scheduling mode, as a :class:`TileScheduler` value.
 
@@ -892,7 +902,7 @@ class BatchedGemmConfig:
 
     @property
     def is_nvfp4_mma(self) -> bool:
-        """True when both operands are ``E2M1`` -- NVFP4 MMA (``mma_k = 64``)."""
+        """True when both operands are ``E2M1`` -- NVFP4 MMA."""
         return self.dtype_a_kind == int(DType.E2M1) and self.dtype_b_kind == int(
             DType.E2M1
         )
@@ -1314,6 +1324,10 @@ class BatchedGemmConfig:
         if operand == "a":
             return self.tile_m
         if operand == "b":
+            if self.is_nvfp4_mma and self.mma_k == 128:
+                # Rubin's eight-vector NVFP4 MMA reads SF4 at the next
+                # 128-row block of TMEM columns even when N is smaller.
+                return ((self.tile_n + 127) // 128) * 128
             return self.tile_n
         raise ValueError(f"Unsupported scale-factor operand: {operand}")
 
@@ -2631,9 +2645,9 @@ def validate_config(
     if cfg.tile_m != 128:
         raise ValueError(f"Only tile_m=128 supported, got {cfg.tile_m}")
 
-    if cfg.mma_k not in (16, 32, 64):
+    if cfg.mma_k not in (16, 32, 64, 128):
         raise ValueError(
-            f"mma_k must be 16 (BF16), 32 (MX/FP8), or 64 (NVFP4), got {cfg.mma_k}"
+            f"mma_k must be 16 (BF16), 32 (MX/FP8), or 64/128 (NVFP4), got {cfg.mma_k}"
         )
 
     if cfg.is_bf16_mma and cfg.mma_k != 16:
@@ -2642,8 +2656,8 @@ def validate_config(
     if cfg.has_cast_a and cfg.mma_k != 16:
         raise ValueError(f"CastA BF16 MMA requires mma_k=16, got {cfg.mma_k}")
 
-    if cfg.is_nvfp4_mma and cfg.mma_k != 64:
-        raise ValueError(f"NVFP4 MMA requires mma_k=64, got {cfg.mma_k}")
+    if cfg.is_nvfp4_mma and cfg.mma_k not in (64, 128):
+        raise ValueError(f"NVFP4 MMA requires mma_k=64 or 128, got {cfg.mma_k}")
 
     if cfg.is_mx_mma and cfg.mma_k != 32:
         raise ValueError(f"MX MMA requires mma_k=32, got {cfg.mma_k}")
@@ -2863,6 +2877,24 @@ def validate_config(
 
     if cfg.use_pdl not in (0, 1):
         raise ValueError(f"use_pdl must be 0 or 1, got {cfg.use_pdl}")
+
+    if (
+        not isinstance(cfg.output_num_partitions, int)
+        or cfg.output_num_partitions not in (1, 2)
+    ):
+        raise ValueError("output_num_partitions must be 1 or 2")
+    if (
+        not isinstance(cfg.output_partition_id, int)
+        or not 0 <= cfg.output_partition_id < cfg.output_num_partitions
+    ):
+        raise ValueError("output_partition_id must identify an output partition")
+    if cfg.output_num_partitions > 1:
+        if not cfg.is_swap_ab:
+            raise ValueError("Partitioned output requires swapAB")
+        if cfg.use_tma_oob_opt:
+            raise ValueError("Partitioned output requires ordinary TMA bounds")
+        if cfg.use_pdl:
+            raise ValueError("Partitioned output requires explicit stream synchronization")
 
     if cfg.do_pdl_wait_for_num_non_exiting_ctas not in (0, 1):
         raise ValueError(

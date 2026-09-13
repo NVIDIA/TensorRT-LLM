@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -3004,6 +3005,7 @@ def gemm(
     output_m_for_c = m
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
         output_m_for_c = m // Int32(2)
+    output_stride = output_m_for_c * Int32(cfg.output_num_partitions)
     if cutlass.const_expr(cfg.is_swap_ab):
         # SwapAB: C is (M, N) in M-major (column-major) layout.
         # M = hidden dim (stride-1), N = tokens (stride-M).
@@ -3041,7 +3043,7 @@ def gemm(
         else:
             c_layout = cute.make_layout(
                 (cute.assume(output_m_for_c, 32), cute.assume(n, 16)),
-                stride=(1, cute.assume(output_m_for_c, 32)),
+                stride=(1, cute.assume(output_stride, 32)),
             )
     else:
         # Non-swapAB: C is (M, N) row-major.
@@ -3133,6 +3135,7 @@ def gemm(
     output_m_for_sf = m
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
         output_m_for_sf = m // Int32(2)
+    output_m_for_sf = output_m_for_sf * Int32(cfg.output_num_partitions)
     if cutlass.const_expr(cfg.has_epilogue_quant):
         sf_block_m = Int32(cfg.output_sf_block_size_c)
         sf_group_m = sf_block_m * Int32(4)

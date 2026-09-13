@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -254,6 +255,16 @@ class TmemCResource(MemoryResource):
                 scale_format=1,  # UE8M0
                 n_dim=self.cfg.mma_n,
                 m_dim=self.cfg.mma_m,
+            )
+        elif cutlass.const_expr(self.cfg.mma_k == 128):
+            # Rubin NVFP4 uses the OMMA descriptor and a 128-element K step.
+            self.idesc = prims.Tcgen05MxOmmaInstrDesc.build(
+                a_dtype=cutlass.Float4E2M1FN,
+                b_dtype=cutlass.Float4E2M1FN,
+                scale_format=0,
+                n_dim=self.cfg.mma_n,
+                m_dim=self.cfg.mma_m,
+                k_dim=2,
             )
         else:
             # FP4 NVF4: block-scaled MMA descriptor (tcgen05_mma_block_scale
@@ -626,13 +637,12 @@ class TmemCResource(MemoryResource):
                     )
                     desc_b_increment = k_major * desc_b_group_stride + k_minor * 2
                 elif cutlass.const_expr(self.cfg.tile_k > 256):
-                    # SM100 swizzled FP4 MMA descriptors are linear only
-                    # within a 256-wide K group. At kblock 4, generated
-                    # kernels jump to the next swizzle group instead of using
-                    # desc += 8.
-                    k_minor = kblock_idx % 4
-                    k_major = kblock_idx // 4
-                    desc_a_increment = k_major * 1024 + k_minor * 2
+                    # Swizzled FP4 descriptors are linear inside a 256-wide
+                    # K group: four Blackwell or two Rubin MMA instructions.
+                    blocks_per_group = 256 // self.cfg.mma_k
+                    k_minor = kblock_idx % blocks_per_group
+                    k_major = kblock_idx // blocks_per_group
+                    desc_a_increment = k_major * 1024 + k_minor * (self.cfg.mma_k // 32)
                     b_stage_bytes = self.cfg.num_bytes_b_smem_per_stage
                     if cutlass.const_expr(
                         self.cfg.has_cluster
@@ -645,10 +655,11 @@ class TmemCResource(MemoryResource):
                         64,
                         (256 * b_stage_bytes // self.cfg.tile_k) >> 4,
                     )
-                    desc_b_increment = k_major * desc_b_group_stride + k_minor * 2
+                    desc_b_increment = k_major * desc_b_group_stride + k_minor * (self.cfg.mma_k // 32)
                 else:
-                    desc_a_increment = 2 * kblock_idx
-                    desc_b_increment = 2 * kblock_idx
+                    desc_step = 2 if self.cfg.is_mx_mma else self.cfg.mma_k // 32
+                    desc_a_increment = desc_step * kblock_idx
+                    desc_b_increment = desc_step * kblock_idx
                 desc_a = desc_a_mma + desc_a_increment
                 desc_b = desc_b_mma + desc_b_increment
 

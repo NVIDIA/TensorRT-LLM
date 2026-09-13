@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,6 +50,28 @@ def _fc1_out_hidden(intermediate_size: int, activation_type: int) -> int:
         if _is_gated_activation(activation_type)
         else intermediate_size
     )
+
+
+def _partition_output_hidden(cfg, out_hidden: int) -> int:
+    if out_hidden % cfg.output_num_partitions:
+        raise ValueError("Output width must divide evenly across partitions")
+    return out_hidden // cfg.output_num_partitions
+
+
+def _partition_output_ptr(cfg, output_buf: torch.Tensor, out_hidden: int) -> int:
+    """Offset into a full shared output without making a strided tensor view."""
+    if cfg.output_num_partitions == 1:
+        return output_buf.data_ptr()
+    local_width = out_hidden // 2 if cfg.has_gated_epilogue else out_hidden
+    packed_width = local_width // 2 if cfg.has_epilogue_quant else local_width
+    if not output_buf.is_contiguous():
+        raise ValueError("Partitioned output requires a contiguous full allocation")
+    if output_buf.shape[1] != packed_width * cfg.output_num_partitions:
+        raise ValueError("Partitioned output must cover the full output width")
+    offset = cfg.output_partition_id * packed_width * output_buf.element_size()
+    if offset % 16:
+        raise ValueError("Partitioned output pointers must be 16-byte aligned")
+    return output_buf.data_ptr() + offset
 
 
 def _check_fp8_scale_storage(
@@ -339,6 +362,7 @@ def build_bf16_launch_io(
     *,
     fc: Literal["fc1", "fc2"],
     cfg,
+    cfg_is_normalized: bool = False,
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm2_weights: torch.Tensor,
@@ -383,7 +407,11 @@ def build_bf16_launch_io(
         activation_compact = gemm1_output
         output_buf = gemm2_output
 
-    cfg = _runtime_config(cfg, in_hidden)
+    out_hidden = _partition_output_hidden(cfg, out_hidden)
+    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden)
+
+    if not cfg_is_normalized:
+        cfg = _runtime_config(cfg, in_hidden)
     _validate_weight_storage(
         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
         tensor=weights,
@@ -490,7 +518,7 @@ def build_bf16_launch_io(
     )
     c0_dp = make_ptr(
         cutlass.BFloat16,
-        output_buf.data_ptr(),
+        output_ptr,
         cutlass.AddressSpace.gmem,
         assumed_align=16,
     )
@@ -690,6 +718,9 @@ def build_nvfp4_launch_io(
         scale_c = output2_scale_scalar
         scale_gate = output2_scale_scalar
 
+    out_hidden = _partition_output_hidden(cfg, out_hidden)
+    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden)
+
     # The TRTLLM caller caches a private config normalized for this K.
     if not cfg_is_normalized:
         cfg = _runtime_config(cfg, in_hidden)
@@ -811,7 +842,7 @@ def build_nvfp4_launch_io(
     if cfg.has_epilogue_quant:
         c0_dp = make_ptr(
             data_dtype,
-            output_buf.data_ptr(),
+            output_ptr,
             cutlass.AddressSpace.gmem,
             assumed_align=16,
         )
@@ -824,7 +855,7 @@ def build_nvfp4_launch_io(
     else:
         c0_dp = make_ptr(
             cutlass.BFloat16,
-            output_buf.data_ptr(),
+            output_ptr,
             cutlass.AddressSpace.gmem,
             assumed_align=16,
         )

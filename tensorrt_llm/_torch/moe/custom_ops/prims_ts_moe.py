@@ -14,12 +14,14 @@
 # limitations under the License.
 """PrimsTS MoE launches over TRTLLM routing and quantized weight layouts."""
 
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import lru_cache
 from typing import Optional
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import ceil_div
 
 from ...autotuner import AutoTuner, TunableRunner
@@ -43,13 +45,22 @@ def _gemm_pair(
     has_clamp,
     tactic=(-1, -1),
     enable_pdl=False,
+    is_bf16=False,
+    weight_layout=0,
 ):
     from ..flashinfer.prims_ts.moe.config_mapper import (
+        map_trtllm_bf16_moe_tactic,
         map_trtllm_mxfp4_mxfp8_moe_tactic,
         map_trtllm_nvfp4_moe_tactic,
     )
 
-    mapper = map_trtllm_nvfp4_moe_tactic if is_nvfp4 else map_trtllm_mxfp4_mxfp8_moe_tactic
+    mapper = (
+        map_trtllm_bf16_moe_tactic
+        if is_bf16
+        else map_trtllm_nvfp4_moe_tactic
+        if is_nvfp4
+        else map_trtllm_mxfp4_mxfp8_moe_tactic
+    )
     pair = mapper(
         tactic,
         num_tokens=num_tokens,
@@ -60,6 +71,7 @@ def _gemm_pair(
         has_gemm1_beta=has_beta,
         has_gemm1_clamp_limit=has_clamp,
         enable_pdl=enable_pdl,
+        weight_layout=weight_layout,
     )
     if (
         is_nvfp4
@@ -134,11 +146,11 @@ def _with_routing_profile_hook(config, weights, ids):
 
 def _run_prims_ts_moe(
     hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
     gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
+    gemm1_weights_scale: Optional[torch.Tensor],
     gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
+    gemm2_weights_scale: Optional[torch.Tensor],
     gemm1_alpha: Optional[torch.Tensor],
     gemm1_beta: Optional[torch.Tensor],
     gemm1_clamp_limit: Optional[torch.Tensor],
@@ -162,12 +174,15 @@ def _run_prims_ts_moe(
     topk_group=None,
     routed_scaling_factor=None,
     use_hybrid_routing=False,
+    locality_weights=None,
+    locality_runtime=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = hidden_states.shape[0]
     has_precomputed_routing = topk_ids is not None
     if topk_ids is not None:
         top_k = topk_ids.shape[1]
-    hidden_size = gemm1_weights.shape[-1] * 2
+    hidden_size = output.shape[1]
+    is_bf16 = hidden_states.dtype == torch.bfloat16
     if num_tokens == 0:
         return (
             hidden_states.new_empty((0, hidden_size), dtype=torch.bfloat16),
@@ -180,12 +195,26 @@ def _run_prims_ts_moe(
     from ..flashinfer.prims_ts.batched_gemm.batched_gemm_run import _launch_arg_tuple
     from ..flashinfer.prims_ts.moe.compile_cache import get_compiled_gemm
     from ..flashinfer.prims_ts.moe.tensor_adapter import (
+        build_bf16_launch_io,
         build_mxfp4_mxfp8_launch_io,
         build_nvfp4_launch_io,
     )
 
     local_experts = gemm1_weights.shape[0]
-    intermediate_size = gemm2_weights.shape[-1] * 2
+    from ..flashinfer.tllm_enums import WeightLayout
+
+    if is_bf16:
+        intermediate_size = (
+            gemm2_weights.shape[1] * gemm2_weights.shape[-1]
+            if gemm2_weights.ndim == 4
+            else gemm2_weights.shape[-1]
+        )
+        weight_layout = int(
+            WeightLayout.BlockMajorK if gemm2_weights.ndim == 4 else WeightLayout.MajorK
+        )
+    else:
+        intermediate_size = gemm2_weights.shape[-1] * 2
+        weight_layout = int(WeightLayout.MajorK)
     is_nvfp4 = hidden_states.dtype == torch.uint8
     pair = _gemm_pair(
         num_tokens,
@@ -198,8 +227,12 @@ def _run_prims_ts_moe(
         gemm1_clamp_limit is not None,
         tactic,
         enable_pdl,
+        is_bf16,
+        weight_layout,
     )
     tile_n = pair.tile_n
+    if is_nvfp4 and get_sm_version() == 107 and tile_n > 128:
+        raise ValueError("Rubin PrimsTS NVFP4 requires a token tile of at most 128.")
     capacity, _ = _workspace_rows(num_tokens, top_k, local_experts, tile_n, hidden_size)
     # The externally visible workspace shape must not depend on the autotuned
     # tactic. Every vendored FP4 tactic uses a token tile of at most 256.
@@ -254,13 +287,22 @@ def _run_prims_ts_moe(
             if has_precomputed_routing
             else topk_weights
         )
-    row_bytes = intermediate_size // 2 if is_nvfp4 else intermediate_size
+    row_bytes = (
+        intermediate_size * 2
+        if is_bf16
+        else intermediate_size // 2
+        if is_nvfp4
+        else intermediate_size
+    )
     fc1_rows = max(capacity, ceil_div(128 * 1024, row_bytes))
-    fc1_dtype = torch.uint8 if is_nvfp4 else torch.float8_e4m3fn
-    gemm1_output = torch.empty((fc1_rows, row_bytes), dtype=fc1_dtype, device=hidden_states.device)
+    fc1_dtype = torch.bfloat16 if is_bf16 else torch.uint8 if is_nvfp4 else torch.float8_e4m3fn
+    fc1_cols = intermediate_size if is_bf16 else row_bytes
+    gemm1_output = torch.empty((fc1_rows, fc1_cols), dtype=fc1_dtype, device=hidden_states.device)
     sf_group = 16 if is_nvfp4 else 32
     sf_size = ceil_div(fc1_rows, 128) * 128 * ceil_div(intermediate_size // sf_group, 4) * 4
-    gemm1_output_scale = torch.empty((sf_size,), dtype=torch.uint8, device=hidden_states.device)
+    gemm1_output_scale = (
+        None if is_bf16 else torch.empty((sf_size,), dtype=torch.uint8, device=hidden_states.device)
+    )
     if is_nvfp4:
         hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
         gemm1_output_scale = gemm1_output_scale.view(torch.float8_e4m3fn)
@@ -277,46 +319,83 @@ def _run_prims_ts_moe(
         output1_scale_scalar = unused_scale
         output1_scale_gate_scalar = unused_scale
         output2_scale_scalar = unused_scale
-    build_io = build_nvfp4_launch_io if is_nvfp4 else build_mxfp4_mxfp8_launch_io
-    stream = cuda.CUstream(torch.cuda.current_stream(hidden_states.device).cuda_stream)
+    build_io = (
+        build_bf16_launch_io
+        if is_bf16
+        else build_nvfp4_launch_io
+        if is_nvfp4
+        else build_mxfp4_mxfp8_launch_io
+    )
+    weights = locality_weights or (
+        (gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale),
+    )
     for fc, config in (("fc1", pair.fc1), ("fc2", pair.fc2)):
-        prepared_config, config_hash = _materialize_gemm_config(
-            tuple(config.cfg.kwargs.items()), hidden_size if fc == "fc1" else intermediate_size
-        )
-        io = build_io(
-            fc=fc,
-            cfg=prepared_config,
-            cfg_is_normalized=True,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
-            gemm1_weights=gemm1_weights,
-            gemm1_weights_scale=gemm1_weights_scale,
-            gemm2_weights=gemm2_weights,
-            gemm2_weights_scale=gemm2_weights_scale,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_beta=gemm1_beta,
-            gemm1_clamp_limit=gemm1_clamp_limit,
-            gemm1_output=gemm1_output,
-            gemm1_output_scale=gemm1_output_scale,
-            gemm2_output=gemm2_output,
-            output1_scale_scalar=output1_scale_scalar,
-            output1_scale_gate_scalar=output1_scale_gate_scalar,
-            output2_scale_scalar=output2_scale_scalar,
-            tile_idx=tile_idx,
-            mn_limit=mn_limit,
-            route_map=route_map,
-            num_non_exiting_ctas=num_tiles,
-            total_num_padded_tokens=total_padded,
-            routed_token_capacity=capacity,
-            activation_type=activation_type,
-            num_experts=local_experts,
-            num_tokens=num_tokens,
-            top_k=top_k,
-            intermediate_size=intermediate_size,
-            hidden_size=hidden_size,
-        )
-        compiled = get_compiled_gemm(config_hash, fc, io, stream)
-        compiled(*_launch_arg_tuple(io, stream))
+        if locality_runtime is not None:
+            locality_runtime.fork()
+        try:
+            for partition_id, (w1, sf1, w2, sf2) in enumerate(weights):
+                options = dict(config.cfg.kwargs)
+                if is_nvfp4 and get_sm_version() == 107:
+                    options["mma_k"] = 128
+                if locality_runtime is not None:
+                    options.update(
+                        output_num_partitions=len(weights),
+                        output_partition_id=partition_id,
+                        use_tma_oob_opt=0,
+                    )
+                prepared_config, config_hash = _materialize_gemm_config(
+                    tuple(options.items()), hidden_size if fc == "fc1" else intermediate_size
+                )
+                io_kwargs = dict(
+                    fc=fc,
+                    cfg=prepared_config,
+                    cfg_is_normalized=True,
+                    hidden_states=hidden_states,
+                    gemm1_weights=w1,
+                    gemm2_weights=w2,
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_beta=gemm1_beta,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
+                    gemm1_output=gemm1_output,
+                    gemm2_output=gemm2_output,
+                    tile_idx=tile_idx,
+                    mn_limit=mn_limit,
+                    route_map=route_map,
+                    num_non_exiting_ctas=num_tiles,
+                    total_num_padded_tokens=total_padded,
+                    routed_token_capacity=capacity,
+                    activation_type=activation_type,
+                    num_experts=local_experts,
+                    num_tokens=num_tokens,
+                    top_k=top_k,
+                    intermediate_size=intermediate_size,
+                    hidden_size=hidden_size,
+                )
+                if not is_bf16:
+                    io_kwargs.update(
+                        hidden_states_scale=hidden_states_scale,
+                        gemm1_weights_scale=sf1,
+                        gemm2_weights_scale=sf2,
+                        gemm1_output_scale=gemm1_output_scale,
+                        output1_scale_scalar=output1_scale_scalar,
+                        output1_scale_gate_scalar=output1_scale_gate_scalar,
+                        output2_scale_scalar=output2_scale_scalar,
+                    )
+                io = build_io(**io_kwargs)
+                partition_context = (
+                    locality_runtime.partition_context(partition_id)
+                    if locality_runtime is not None
+                    else nullcontext()
+                )
+                with partition_context:
+                    stream = cuda.CUstream(
+                        torch.cuda.current_stream(hidden_states.device).cuda_stream
+                    )
+                    compiled = get_compiled_gemm(config_hash, fc, io, stream)
+                    compiled(*_launch_arg_tuple(io, stream))
+        finally:
+            if locality_runtime is not None:
+                locality_runtime.join()
     if do_finalize:
         torch.ops.trtllm.moe_unpermute_inplace(gemm2_output, output, expanded_map, topk_weights)
     return gemm2_output, expanded_map, fused_weights
@@ -340,6 +419,8 @@ class PrimsTSMoERunner(TunableRunner):
         routed_scaling_factor=None,
         use_hybrid_routing=False,
     ):
+        self.locality_weights = None
+        self.locality_runtime = None
         self.num_experts = num_experts
         self.local_expert_offset = local_expert_offset
         self.activation_type = activation_type
@@ -354,7 +435,7 @@ class PrimsTSMoERunner(TunableRunner):
         self.use_hybrid_routing = use_hybrid_routing
 
     def unique_id(self):
-        return (
+        identity = (
             "hybrid_routing_v5",
             self.num_experts,
             self.local_expert_offset,
@@ -370,19 +451,45 @@ class PrimsTSMoERunner(TunableRunner):
             self.use_hybrid_routing,
         )
 
+        if get_sm_version() == 107:
+            identity += ("rubin_k128_v1",)
+        if self.locality_runtime is not None:
+            return identity + ("locality_v1", self.locality_runtime.topology_identity())
+        return identity
+
+    def should_profile_tactic_in_subprocess(
+        self, custom_op, inputs, tactic, tuning_config, **kwargs
+    ):
+        if self.locality_runtime is not None:
+            return False
+        return super().should_profile_tactic_in_subprocess(
+            custom_op, inputs, tactic, tuning_config, **kwargs
+        )
+
     def get_valid_tactics(self, inputs, profile, **kwargs):
         from ..flashinfer.prims_ts.moe.config_mapper import (
+            valid_prims_ts_bf16_moe_tactics,
             valid_prims_ts_mxfp4_mxfp8_moe_tactics,
             valid_prims_ts_nvfp4_moe_tactics,
         )
 
         args = FP4BlockScaleMoEInputs(*inputs)
+        is_bf16 = args.hidden_states.dtype == torch.bfloat16
         enumerate_tactics = (
-            valid_prims_ts_nvfp4_moe_tactics
+            valid_prims_ts_bf16_moe_tactics
+            if is_bf16
+            else valid_prims_ts_nvfp4_moe_tactics
             if args.hidden_states.dtype == torch.uint8
             else valid_prims_ts_mxfp4_mxfp8_moe_tactics
         )
-        return enumerate_tactics(
+        extra = {}
+        if is_bf16:
+            from ..flashinfer.tllm_enums import WeightLayout
+
+            extra["weight_layout"] = int(
+                WeightLayout.BlockMajorK if args.gemm2_weights.ndim == 4 else WeightLayout.MajorK
+            )
+        tactics = enumerate_tactics(
             num_tokens=args.hidden_states.shape[0],
             top_k=self.top_k,
             num_local_experts=args.gemm1_weights.shape[0],
@@ -391,13 +498,25 @@ class PrimsTSMoERunner(TunableRunner):
             has_gemm1_beta=args.gemm1_beta is not None,
             has_gemm1_clamp_limit=args.gemm1_clamp_limit is not None,
             enable_pdl=self.enable_pdl,
+            **extra,
         )
+        if args.hidden_states.dtype == torch.uint8 and get_sm_version() == 107:
+            # The vendored N=256 path does not yet produce correct NVFP4
+            # results with Rubin's K=128 OMMA. Smaller tiles cover arbitrary
+            # token counts; never autotune the unsupported variant.
+            tactics = [tactic for tactic in tactics if tactic[0] <= 128]
+        return tactics
 
     def forward(self, inputs, *, tactic=-1, output=None):
         args = FP4BlockScaleMoEInputs(*inputs)
         if output is None:
             output = args.hidden_states.new_empty(
-                (args.hidden_states.shape[0], args.gemm1_weights.shape[-1] * 2),
+                (
+                    args.hidden_states.shape[0],
+                    args.hidden_states.shape[1]
+                    if args.hidden_states.dtype == torch.bfloat16
+                    else args.gemm1_weights.shape[-1] * 2,
+                ),
                 dtype=torch.bfloat16,
             )
         return _run_prims_ts_moe(
@@ -430,6 +549,8 @@ class PrimsTSMoERunner(TunableRunner):
             topk_group=self.topk_group,
             routed_scaling_factor=self.routed_scaling_factor,
             use_hybrid_routing=self.use_hybrid_routing,
+            locality_weights=self.locality_weights,
+            locality_runtime=self.locality_runtime,
         )
 
 

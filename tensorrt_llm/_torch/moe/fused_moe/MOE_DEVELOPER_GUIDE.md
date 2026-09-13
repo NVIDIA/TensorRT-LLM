@@ -200,7 +200,7 @@ Still on old path (standalone, with embedded communication):
 |------|---------|----------|----------|-----------|
 | `fused_moe_cutlass.py` | `CutlassFusedMoE` | SM80+ | High throughput, most comprehensive quant support | `EXTERNAL_COMM` |
 | `fused_moe_trtllm_gen.py` | `TRTLLMGenFusedMoE` | SM100/SM103 | Min-latency and high-throughput on Blackwell; also serves unquantized BF16 through FlashInfer's `trtllm_bf16_moe` (gated on `MoEDep.FLASHINFER_BF16_MOE`, not on a quant algo) | `EXTERNAL_COMM` |
-| `fused_moe_prims_ts.py` | `PrimsTSNvfp4FusedMoE`, `PrimsTSMxfp4Mxfp8FusedMoE` | SM100/SM103 | Vendored FlashInfer PrimsTS GEMMs; NVFP4 and MXFP4/MXFP8, SwiGLU and SiTU | `EXTERNAL_COMM` |
+| `fused_moe_prims_ts.py` | `PrimsTSNvfp4FusedMoE`, `PrimsTSMxfp4Mxfp8FusedMoE`, `PrimsTSBf16FusedMoE` | SM100/SM103/SM107 | Vendored PrimsTS GEMMs; NVFP4/BF16 on Blackwell and Rubin, MXFP4/MXFP8 on Blackwell | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103 | FP8 Block Scales on Blackwell | `EXTERNAL_COMM` |
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
@@ -245,9 +245,16 @@ is available.
 ### PrimsTS MoE
 
 Select `moe_config.backend: PRIMS_TS` to use the FlashInfer PrimsTS kernels.
-The two implementation identities are `flashinfer.cutedsl.prims_ts.nvfp4` and
-`flashinfer.cutedsl.prims_ts.w4a8_mxfp4_mxfp8`. The backend consumes the existing
-TRTLLM quantized weight layout and uses the external communication scheduler.
+The implementation identities are `flashinfer.cutedsl.prims_ts.nvfp4`,
+`flashinfer.cutedsl.prims_ts.w4a8_mxfp4_mxfp8`, and
+`flashinfer.cutedsl.prims_ts.bf16`. NVFP4 and BF16 support Blackwell and Rubin;
+MXFP4/MXFP8 supports Blackwell. The backend consumes the existing TRTLLM weight
+layouts and uses the external communication scheduler.
+Rubin NVFP4 selects a K=128 OMMA instruction descriptor and matching shared-memory
+and scale-factor offsets; Blackwell keeps its K=64 instruction path.
+Rubin NVFP4 currently supports token tiles through N=128. Autotuning excludes
+the vendored N=256 variant, which fails the K=128 numerical check; explicit
+selection raises an error. This restriction does not limit the token count.
 Native routing supplies a token map through `moe_sort(return_token_map=True)` or
 `moe_topk_sort(return_token_map=True)`; their default still supplies an
 expanded-index map. Logits routing emits BF16 weights independently of the
@@ -295,12 +302,40 @@ for the remaining nonempty buckets, during both profiling and inference. This
 ensures a single-token warmup also tunes the medium-batch routing path.
 
 The current capability gate requires BF16 model activations, per-rank
-intermediate sizes aligned to 128, and SwiGLU or SiTU. The shared weight loader
+intermediate sizes aligned to 128, and SwiGLU or SiTU (BF16 supports SwiGLU).
+The shared weight loader
 requires MXFP4 hidden sizes aligned to 512; NVFP4 requires 128, or 256 for
 hidden sizes above 1024. Expert bias, MoE LoRA, EPLB, DWDP, and fused
 shared experts are not enabled for this backend. Numerical comparisons and
 CUDA Graph replay coverage live in `test_prims_ts_moe.py`; the Kimi SiTU tests
 also exercise its NVFP4 path against the activation reference.
+
+On Rubin, PrimsTS also follows the existing `ModelConfig.locality_domain_policy`
+for NVFP4 and BF16 MoE. The policy defaults to disabled; model integrations opt in
+with `LocalityDomainPolicy(enabled=True)`. With this policy and hardware support, FC1 and FC2
+weights are each split along their output-channel dimension into two equal
+shards. Each shard uses its locality domain's memory pool and compute stream.
+BF16's BlockMajorK layout splits axis 2; NVFP4 weights and their block scales
+split axis 1. The staged weight transform builds the shards and releases the
+original full weights, including when called through the full post-load hook. Hidden
+size must be divisible by 256 and per-rank intermediate size by 128 for this
+split; otherwise execution keeps the ordinary unpartitioned path.
+
+Both FC1 partitions write their channel ranges directly into one intermediate
+buffer, including NVFP4 scale-factor storage. After joining FC1, both FC2
+partitions consume that full intermediate and write their output ranges before
+one native weighted unpermutation. This path uses separated routing and
+explicit stream dependencies with PDL disabled. The ordinary Blackwell path
+retains its existing routing and PDL selection. PrimsTS NVFP4 locality supports
+SwiGLU and SiTU; BF16 locality supports SwiGLU.
+
+The autotuner measures both partitions together and includes the actual compute
+split in its cache identity. It retains the localized allocations during
+profiling, disabling cold-L2 tensor cloning and subprocess profiling for this
+path. Reuse the existing `DISABLE_LOCALITY_DOMAINS=1` environment override to
+disable locality domains. Correctness, changed-route CUDA Graph replay, empty
+local routing, and concurrent autotuning are covered by
+`test_prims_ts_locality.py`.
 
 ### Design Documents
 
