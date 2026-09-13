@@ -352,7 +352,7 @@ class TestFormatPromptWithMetadataPlainText:
             duration_template=None,
             resolution_template=None,
         )
-        assert result == "Plain prompt."
+        assert result == "Plain prompt"
 
     def test_empty_prompt_with_templates(self, cosmos3_format_pipeline):
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, "")
@@ -433,6 +433,27 @@ class TestTokenizePrompt:
 
 
 class TestFormatPromptWithMetadataJson:
+    def test_templates_disabled_preserves_structured_prompt_byte_for_byte(
+        self, cosmos3_format_pipeline
+    ):
+        """Disabling templates makes a structured prompt an exact pass-through."""
+        prompt = (
+            ' \n{"aspect_ratio":"16,9", "actions": ['
+            '{"description":"A full backflip","time":"0:03-0:05"}],'
+            ' "duration":"7s", "fps":24, "resolution":{"W":1280,"H":720}} \n'
+        )
+
+        result = _format_prompt_with_metadata(
+            cosmos3_format_pipeline,
+            prompt,
+            duration_template=None,
+            resolution_template=None,
+        )
+
+        assert result == prompt
+        assert json.loads(result)["duration"] == "7s"
+        assert json.loads(result)["fps"] == 24
+
     def test_injects_metadata_fields(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "A foundry pour", "subjects": []})
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
@@ -447,7 +468,7 @@ class TestFormatPromptWithMetadataJson:
         assert data["aspect_ratio"] == "16,9"
         assert '"resolution": {"H": 720, "W": 1280}' in result
 
-    def test_overwrites_existing_metadata_fields(self, cosmos3_format_pipeline):
+    def test_preserves_existing_metadata_fields(self, cosmos3_format_pipeline):
         prompt = json.dumps(
             {
                 "prompt": "test",
@@ -457,10 +478,22 @@ class TestFormatPromptWithMetadataJson:
                 "aspect_ratio": "3,4",
             }
         )
+        result = _format_prompt_with_metadata(cosmos3_format_pipeline, prompt)
+        assert result == prompt
+        assert json.loads(result) == json.loads(prompt)
+
+    def test_fills_only_missing_metadata_fields(self, cosmos3_format_pipeline):
+        prompt = json.dumps(
+            {
+                "prompt": "test",
+                "duration": "5s",
+                "resolution": {"W": 640, "H": 480},
+            }
+        )
         data = json.loads(_format_prompt_with_metadata(cosmos3_format_pipeline, prompt))
-        assert data["duration"] == "7s"
+        assert data["duration"] == "5s"
         assert data["fps"] == 24.0
-        assert data["resolution"] == {"H": 720, "W": 1280}
+        assert data["resolution"] == {"W": 640, "H": 480}
         assert data["aspect_ratio"] == "16,9"
 
     def test_single_frame_skips_duration_by_default(self, cosmos3_format_pipeline):
@@ -488,8 +521,7 @@ class TestFormatPromptWithMetadataJson:
         )
         assert data["duration"] == "0s"
 
-    def test_still_drops_stale_duration_and_fps(self, cosmos3_format_pipeline):
-        """A caller's JSON may already declare a duration; a still must not keep it."""
+    def test_single_frame_preserves_user_duration_and_fps(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "still life", "duration": "7s", "fps": 24.0})
         data = json.loads(
             _format_prompt_with_metadata(
@@ -499,8 +531,9 @@ class TestFormatPromptWithMetadataJson:
                 resolution_template=COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
             )
         )
-        assert "duration" not in data
-        assert "fps" not in data
+        assert data["duration"] == "7s"
+        assert data["fps"] == 24.0
+        assert data["resolution"] == {"W": 1280, "H": 720}
 
     def test_non_ascii_is_escaped(self, cosmos3_format_pipeline):
         """The reference serializes with the json default (``ensure_ascii=True``)."""
@@ -568,7 +601,14 @@ class TestNegativePromptMetadata:
 
     NEGATIVE = json.dumps({"subjects": [{"description": "Blurry, poorly defined subjects."}]})
 
-    def _negative(self, pipeline, **kwargs):
+    def _negative(
+        self,
+        pipeline,
+        *,
+        duration_template=COSMOS3_DURATION_TEMPLATE,
+        resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+        **kwargs,
+    ):
         """Format a negative prompt the way ``forward`` does."""
         return pipeline._apply_metadata_templates(
             self.NEGATIVE,
@@ -576,10 +616,20 @@ class TestNegativePromptMetadata:
             width=WIDTH,
             num_frames=189,
             frame_rate=FRAME_RATE,
-            duration_template=COSMOS3_DURATION_TEMPLATE,
-            resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+            duration_template=duration_template,
+            resolution_template=resolution_template,
             **kwargs,
         )
+
+    def test_templates_disabled_preserves_negative_prompt_byte_for_byte(
+        self, cosmos3_format_pipeline
+    ):
+        result = self._negative(
+            cosmos3_format_pipeline,
+            duration_template=None,
+            resolution_template=None,
+        )
+        assert result == self.NEGATIVE
 
     def test_json_negative_keeps_object_and_appends_sentences(self, cosmos3_format_pipeline):
         result = self._negative(cosmos3_format_pipeline)
