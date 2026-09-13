@@ -198,6 +198,7 @@ Still on old path (standalone, with embedded communication):
 |------|---------|----------|----------|-----------|
 | `fused_moe_cutlass.py` | `CutlassFusedMoE` | SM80+ | High throughput, most comprehensive quant support | `EXTERNAL_COMM` |
 | `fused_moe_trtllm_gen.py` | `TRTLLMGenFusedMoE` | SM100/SM103 | Min-latency and high-throughput on Blackwell; also serves unquantized BF16 through FlashInfer's `trtllm_bf16_moe` (gated on `MoEDep.FLASHINFER_BF16_MOE`, not on a quant algo) | `EXTERNAL_COMM` |
+| `fused_moe_prims_ts.py` | `PrimsTSNvfp4FusedMoE`, `PrimsTSMxfp4Mxfp8FusedMoE` | SM100/SM103 | Vendored FlashInfer PrimsTS GEMMs; NVFP4 and MXFP4/MXFP8, SwiGLU and SiTU | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103 | FP8 Block Scales on Blackwell | `EXTERNAL_COMM` |
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
@@ -238,6 +239,61 @@ upstream `moe_nvfp4_swapab/` + `src/` split). The package is loaded lazily
 by `MegaMoECuteDsl` through `import_kernel()` so the heavyweight kernel
 module only imports when an SM100 GPU with a CUDA 13 Cutlass DSL runtime
 is available.
+
+### PrimsTS MoE
+
+Select `moe_config.backend: PRIMS_TS` to use the FlashInfer PrimsTS kernels.
+The two implementation identities are `flashinfer.cutedsl.prims_ts.nvfp4` and
+`flashinfer.cutedsl.prims_ts.w4a8_mxfp4_mxfp8`. The backend consumes the existing
+TRTLLM quantized weight layout and uses the external communication scheduler.
+Native routing supplies a token map through `moe_sort(return_token_map=True)` or
+`moe_topk_sort(return_token_map=True)`; their default still supplies an
+expanded-index map. Logits routing emits BF16 weights independently of the
+correction bias dtype, including FP32 biases. PrimTS executes both
+grouped GEMMs and the fused activation/requantization, followed by native
+weighted unpermutation. Kimi K3 rejects degradation when this backend is selected.
+
+For K3's NVFP4 and MXFP4 SiTU shape (896 experts, top-16, routed hidden size 3584),
+the backend fuses top-k with sorting for a single token or at least 1024 tokens.
+Intermediate batches use separate top-k and sorting. This follows measured
+Blackwell routing costs: fusion saves launches in single-token decode and
+avoids the separate top-k pass in long prefill, while the native fused routing
+kernel is slower at intermediate batches. Layouts requiring precomputed
+routes and `TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING` retain separated routing.
+
+The source is pinned by `flashinfer-prims-ts-moe` in
+`3rdparty/vendor_sources.lock.yaml`, with imports adapted through its downstream
+patch. Use `scripts/vendor_sources.py` to update or verify it, as with the
+PrimsTS attention integration. The JSON configuration table is package data.
+CUTLASS DSL primitives and task scheduling are probed once when collecting the
+MoE environment; kernel imports and compilation remain lazy. The vendored
+launchers enable TVM-FFI by default to reduce Python argument-marshalling cost;
+`FLASHINFER_PRIMS_TS_COMPILE_OPTIONS` can override the compilation options.
+
+The shared TRTLLM autotuner profiles the vendored FC1/FC2 tactic pairs, using
+the same token buckets and local/global expert scope as
+TRTLLM-Gen. PDL follows `TRTLLM_ENABLE_PDL`. The exported intermediate workspace
+has a tactic-independent shape so tuning does not change the CUDA Graph or
+FakeTensor contract. Run model warmup before comparing inference performance.
+The profiling hook regenerates routes after token-count expansion, including
+when autotuner shape constraints have already repeated the original indices.
+For routing methods with a correction bias, the PrimsTS op passes the model's
+bias to the profiling hook even when runtime routing is separated. This keeps
+the profiled expert popularity and tile padding closer to inference. The
+runner's cache version excludes tactics measured with repeated single-token
+routes or a synthetic correction bias.
+K3 uses one logits input signature across token buckets. The runner chooses
+fused top-k/sort for one token or at least 1024 tokens, and noaux_tc plus sorting
+for the remaining nonempty buckets, during both profiling and inference. This
+ensures a single-token warmup also tunes the medium-batch routing path.
+
+The current capability gate requires BF16 model activations, per-rank
+intermediate sizes aligned to 128, and SwiGLU or SiTU. The shared weight loader
+requires MXFP4 hidden sizes aligned to 512; NVFP4 requires 128, or 256 for
+hidden sizes above 1024. Expert bias, MoE LoRA, EPLB, DWDP, and fused
+shared experts are not enabled for this backend. Numerical comparisons and
+CUDA Graph replay coverage live in `test_prims_ts_moe.py`; the Kimi SiTU tests
+also exercise its NVFP4 path against the activation reference.
 
 ### Design Documents
 

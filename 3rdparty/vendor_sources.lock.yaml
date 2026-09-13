@@ -11,3 +11,38 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:ba917f330d8281781ce30ddb89f1772ee8f9017264d948b588b881a92f511e45
     digest: sha256-tree-v1:fa65b674a9ec6121b4158069d5585cc56df28243d1ac1199eb97003d81135d76
+  flashinfer-prims-ts-moe:
+    url: https://github.com/flashinfer-ai/flashinfer.git
+    commit: bc00583287cad89af09d10a9880c538fa037ebd8
+    source: flashinfer
+    destination: tensorrt_llm/_torch/moe/flashinfer
+    include:
+    - prims_ts/batched_gemm/__init__.py
+    - prims_ts/batched_gemm/batched_gemm_config.py
+    - prims_ts/batched_gemm/batched_gemm_kernel.py
+    - prims_ts/batched_gemm/batched_gemm_quant.py
+    - prims_ts/batched_gemm/batched_gemm_resources.py
+    - prims_ts/batched_gemm/batched_gemm_run.py
+    - prims_ts/batched_gemm/batched_gemm_tasks.py
+    - prims_ts/batched_gemm/gmem_ab_resources.py
+    - prims_ts/batched_gemm/gmem_c_resources.py
+    - prims_ts/batched_gemm/gmem_sf_resources.py
+    - prims_ts/batched_gemm/smem_ab_resources.py
+    - prims_ts/batched_gemm/smem_deepseek_sf_resources.py
+    - prims_ts/batched_gemm/smem_misc_resources.py
+    - prims_ts/batched_gemm/smem_sf_resources.py
+    - prims_ts/batched_gemm/tmem_c_resources.py
+    - prims_ts/batched_gemm/tmem_sf_resources.py
+    - prims_ts/__init__.py
+    - prims_ts/cutlass_dsl.py
+    - prims_ts/utils.py
+    - tllm_enums.py
+    - prims_ts/moe/__init__.py
+    - prims_ts/moe/support.py
+    - prims_ts/moe/config_mapper.py
+    - prims_ts/moe/tensor_adapter.py
+    - prims_ts/moe/compile_cache.py
+    - prims_ts/moe/prims_ts_moe_configs.json
+    patch: 3rdparty/vendor_patches/flashinfer-prims-ts-moe.patch
+    patch_digest: sha256:82f6aeb5d21358969a19b23eea85a3630322a0856060439981fc559197d60ca9
+    digest: sha256-tree-v1:5f3ef60d7734f7334f6f4d29dbb54521db254ba35eb87371b338d4d64676943f

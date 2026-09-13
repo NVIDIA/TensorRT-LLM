@@ -35,6 +35,7 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
+from .fused_moe_prims_ts import PrimsTSMxfp4Mxfp8FusedMoE, PrimsTSNvfp4FusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -86,6 +87,8 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     MegaMoECuteDsl,
     CuteDslFusedMoE,
     TRTLLMGenFusedMoE,
+    PrimsTSNvfp4FusedMoE,
+    PrimsTSMxfp4Mxfp8FusedMoE,
     DeepgemmCudaFp8BlockScalesImpl,
     DenseGEMMFusedMoE,
     MarlinFusedMoE,
@@ -105,6 +108,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "DEEPGEMM": frozenset({DeepgemmCudaFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
     "TRTLLM": frozenset({TRTLLMGenFusedMoE}),
+    "PRIMS_TS": frozenset({PrimsTSNvfp4FusedMoE, PrimsTSMxfp4Mxfp8FusedMoE}),
     "TRITON": frozenset({TritonFusedMoE}),
     "MEGAMOE_DEEPGEMM": frozenset({DeepgemmCudaW4a8Mxfp4Mxfp8Impl}),
     "MEGAMOE_CUTEDSL": frozenset({MegaMoECuteDsl}),

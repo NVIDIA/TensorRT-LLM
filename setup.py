@@ -213,6 +213,7 @@ package_data += [
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
     'usage/schemas/*.json',
+    '_torch/moe/flashinfer/prims_ts/moe/*.json',
 ]
 
 
