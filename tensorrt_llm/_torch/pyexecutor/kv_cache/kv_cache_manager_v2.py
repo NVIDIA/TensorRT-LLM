@@ -1662,6 +1662,35 @@ class KVCacheManagerV2(BaseResourceManager):
                 continue
             yield layer_idx, buffer
 
+    def _resolve_guard_candidate(
+        self, candidate: Tuple[int, torch.Tensor]
+    ) -> Tuple[object, torch.Tensor, Sequence[int]]:
+        """Resolve one guard candidate to ``(key, buffer, page_indices)``.
+
+        ``key`` is what ``_guard_page_by_layer`` records the reserved page
+        under; ``page_indices`` are the guard request's pages in ``buffer``.
+        The base has one buffer and one page-index scale per ``layer_idx``,
+        resolves the pages through the ``(layer_idx, Role.KEY)`` page-index
+        path and keys by ``layer_idx``. Subclasses whose buffers are not
+        identified by a bare ``layer_idx`` -- e.g. DeepSeekV4's
+        per-(layer, attn-type) buffers, which allocate no generic ``Role.KEY``
+        buffer -- override this to resolve the page indices for that specific
+        buffer and to key by a buffer-unique value, so one buffer cannot
+        clobber another's guard page.
+        """
+        layer_idx, buffer = candidate
+        pages = self.get_batch_cache_indices([_GUARD_PAGE_REQUEST_ID], layer_idx=layer_idx)[0]
+        return layer_idx, buffer, pages
+
+    def _guard_reservation_detail(self) -> str:
+        """Sample ``layer -> page`` tail for the guard-reservation warning.
+
+        Subclasses whose guard keys are not a bare ``layer_idx`` override this
+        so the message stays accurate instead of reporting ``page None``.
+        """
+        first = self.pp_layers[0]
+        return f"(layer {first} -> page {self._guard_page_by_layer.get(first)})"
+
     def _reserve_guard_page(self) -> None:
         """Diagnostic: park masked-out page-table entries on a page nobody owns.
 
@@ -1713,8 +1742,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self._guard_page_fill = ""
             return
         unfillable_dtype = False
-        for layer_idx, buffer in self._iter_guard_candidate_buffers():
-            pages = self.get_batch_cache_indices([_GUARD_PAGE_REQUEST_ID], layer_idx=layer_idx)[0]
+        for candidate in self._iter_guard_candidate_buffers():
+            key, buffer, pages = self._resolve_guard_candidate(candidate)
             page = next((int(p) for p in pages if p != BAD_PAGE_INDEX), None)
             if page is None or not 0 <= page < buffer.shape[0]:
                 continue
@@ -1723,7 +1752,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # whatever it held before, so publishing it as a guard would be a
             # false claim.
             if _fill_kv_pages(buffer, [page], value):
-                self._guard_page_by_layer[layer_idx] = page
+                self._guard_page_by_layer[key] = page
             else:
                 unfillable_dtype = True
         torch.cuda.synchronize()
@@ -1750,7 +1779,7 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.warning(
             f"KVCacheManagerV2: TRTLLM_KV_GUARD_PAGE={setting} reserved a page on "
             f"{len(self._guard_page_by_layer)} layers "
-            f"(layer {self.pp_layers[0]} -> page {self._guard_page_by_layer.get(self.pp_layers[0])})"
+            f"{self._guard_reservation_detail()}"
         )
 
     def guard_page_index(self, layer_idx: int) -> Optional[int]:

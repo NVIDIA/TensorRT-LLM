@@ -20,7 +20,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import GPU_LEVEL, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _GUARD_PAGE_REQUEST_ID,
+    _RESERVED_REQUEST_IDS,
+    GPU_LEVEL,
+    KVCacheManagerV2,
+    _fill_kv_pages,
+)
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -721,10 +727,15 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         return self.impl.get_page_index_upper_bound(swa_layer_id, DeepseekV4AttentionType.SWA.role)
 
     def get_num_free_blocks(self) -> int:
-        # This method reports primary-pool capacity while the manager is empty.
-        # DSV4 does not allocate the generic Role.KEY buffer, so use SWA's
-        # model-specific DataRole for warmup capacity estimation.
-        assert len(self.kv_cache_map) == 0, (
+        # This method reports primary-pool capacity while the manager holds no
+        # request. The guard page, when enabled, is held by a permanent
+        # reservation made at construction (not by a request), so exclude it
+        # from the emptiness check and subtract the pages it owns -- a caller
+        # sizing off this number must not plan to use the guard's page (mirrors
+        # the base get_num_free_blocks). DSV4 allocates no generic Role.KEY
+        # buffer, so use SWA's model-specific DataRole for the estimate.
+        reserved = set(self.kv_cache_map) & _RESERVED_REQUEST_IDS
+        assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
         max_num_pages = max(
@@ -734,7 +745,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             )
             for layer_idx in self.pp_layers
         )
-        return max_num_pages
+        reserved_pages = sum(int(self.kv_cache_map[req_id].num_blocks) for req_id in reserved)
+        return max_num_pages - reserved_pages
 
     def get_cache_indices(
         self,
@@ -1461,15 +1473,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             swa_size_per_request * max_batch_size,
         )
 
-    def _iter_guard_candidate_buffers(self) -> Iterable[Tuple[int, torch.Tensor]]:
+    def _iter_guard_candidate_buffers(
+        self,
+    ) -> Iterable[Tuple[int, DeepseekV4AttentionType, torch.Tensor]]:
         """Guard-page candidates for DeepSeek-V4's multi-attn-type layers.
 
         The base hook calls ``get_buffers(layer_idx)``, but this subclass's
         ``get_buffers`` requires an ``attn_type``, so the positional base call
         would raise ``TypeError`` while reserving the guard page. Iterate the
-        (layer, attn_type) map instead and pass the required ``attn_type``,
-        de-duplicating physical buffers the same way the invalid-value check
-        does. The base keys the guard page by the yielded ``layer_idx``.
+        (layer, attn_type) map instead and yield the ``attn_type`` too: the
+        guard page-index lookup needs it (see ``_resolve_guard_candidate``)
+        because DSV4 allocates no generic ``Role.KEY`` buffer. De-duplicate
+        physical buffers the same way the invalid-value check does.
         """
         buffers_handled = set()
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
@@ -1480,7 +1495,45 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             buffer = self.get_buffers(layer, attn)
             if buffer is None:
                 continue
-            yield layer, buffer
+            yield layer, attn, buffer
+
+    def _resolve_guard_candidate(
+        self, candidate: Tuple[int, DeepseekV4AttentionType, torch.Tensor]
+    ) -> Tuple[Tuple[int, DataRole], torch.Tensor, List[int]]:
+        """Resolve a DeepSeek-V4 guard candidate to ``(key, buffer, pages)``.
+
+        The base path resolves the page index through
+        ``get_batch_cache_indices(layer_idx)`` ->
+        ``get_page_index_scale(layer_offsets[layer_idx], Role.KEY)``, but DSV4
+        allocates no generic ``Role.KEY`` buffer and keys offsets/pools per
+        (layer, attn_type), so that lookup raises "Unknown buffer id". Use the
+        attn-specific ``get_cache_indices`` instead, which resolves the pool,
+        converter and page-index mode from ``_layer_attn_to_layer_id`` and
+        ``attn_type.role``.
+
+        Key by ``(layer_id, attn_type.role)`` -- the physical-buffer identity
+        the candidate iterator de-duplicates on -- so two distinct attn buffers
+        on the SAME model layer do not clobber each other's guard page in
+        ``_guard_page_by_layer`` (a bare ``layer_idx`` key would).
+        """
+        layer, attn, buffer = candidate
+        pages = self.get_cache_indices(_GUARD_PAGE_REQUEST_ID, layer, attn)
+        layer_id = self._layer_attn_to_layer_id[(layer, attn)]
+        return (layer_id, attn.role), buffer, pages
+
+    def _guard_reservation_detail(self) -> str:
+        # Report the DSV4-specific shape: guard pages are keyed per physical
+        # (layer_id, role) buffer, and one model layer can host several such
+        # buffers -- the clobber case the per-buffer key exists to avoid.
+        buffers_per_layer: Dict[int, set] = defaultdict(set)
+        for layer, attn in self._layer_attn_to_layer_id:
+            buffers_per_layer[layer].add((self._layer_attn_to_layer_id[(layer, attn)], attn.role))
+        multi = sum(1 for bufs in buffers_per_layer.values() if len(bufs) > 1)
+        return (
+            f"({len(self._guard_page_by_layer)} attn buffers guarded across "
+            f"{len(buffers_per_layer)} model layers; {multi} model layers host "
+            f">1 attn buffer)"
+        )
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         some_checks_unavailable = False
@@ -1507,6 +1560,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
+                # Warmup scrubs the cache with fill_with_zero before inference;
+                # restore this buffer's guard-page sentinel so the startup
+                # warning does not claim a guard that was just wiped (mirrors
+                # the base check_invalid_values_in_kv_cache). The guard key is
+                # this buffer's (layer_id, role) identity == buffer_key.
+                guard_page = self._guard_page_by_layer.get(buffer_key)
+                if guard_page is not None and self._guard_page_value is not None:
+                    _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
             buffers_handled.add(buffer_key)
         torch.cuda.synchronize()
 
