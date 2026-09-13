@@ -158,6 +158,25 @@ def is_gen_only_no_context(benchmark_mode: Optional[str], config: Optional[dict]
     return GEN_ONLY_NO_CONTEXT_MODE in str(benchmark.get("mode", ""))
 
 
+def gen_only_no_context_server_counts() -> Tuple[int, int]:
+    """The (num_ctx_servers, num_gen_servers) this mode launches, always (0, 1).
+
+    The mode overrides *both* counts from the config YAML, not just the ctx one.
+    Both describe the disaggregated fleet the file was written for; this mode reads
+    the same file to measure one gen worker's decode loop in isolation, and the
+    per-worker shape (tp/pp/cp) is identical across replicas, so one replica is a
+    faithful sample of a ``num_gen_servers: 4`` fleet.
+
+    Duplicated from jenkins/scripts/perf/benchmark_utils.py for the reason given
+    at GEN_ONLY_NO_CONTEXT_MODE above; the copies are pinned equal by
+    tests/unittest/scripts/test_perf_sanity_helpers.py. The two generators size the
+    Slurm allocation from this and the runner expects exactly this on disk -- if
+    they disagree the job is sized for one fleet while the proxy waits on urls that
+    never bind.
+    """
+    return 0, 1
+
+
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
 BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
 BENCH_SERVING_DIR = "/tmp/bench_serving"
@@ -3883,8 +3902,11 @@ class PerfSanityTestConfig:
         ctx_only and gen_only_no_context.
         For ctx_only: output is on par with _parse_aggr_config_file (single ServerConfig),
                      OSL is set to 1, and cache_transceiver_config is ignored.
-        For gen_only_no_context: num_ctx_servers is forced to 0 -- the gen worker
-                     fabricates its own KV blocks, so no ctx fleet is launched. The
+        For gen_only_no_context: both server counts come from
+                     gen_only_no_context_server_counts() rather than the YAML --
+                     num_ctx_servers 0 because the gen worker fabricates its own KV
+                     blocks, num_gen_servers 1 because one pytest hosts one worker
+                     and the per-worker shape is what the mode measures. The
                      (ctx, gen, disagg) tuple shape is kept anyway, so every
                      downstream consumer (db upload, metric gating, the disagg
                      server config emitter) is unchanged; the runner simply never
@@ -3922,7 +3944,10 @@ class PerfSanityTestConfig:
         # question with the identical predicate, and must agree with this -- they
         # size the allocation, this sizes what the runner expects to find.
         if is_gen_only_no_context(benchmark_mode, config):
-            hardware["num_ctx_servers"] = 0
+            (
+                hardware["num_ctx_servers"],
+                hardware["num_gen_servers"],
+            ) = gen_only_no_context_server_counts()
 
         worker_env_var = environment.get("worker_env_var", "")
         # Optional per-role env vars appended to the shared worker_env_var so
@@ -4371,19 +4396,20 @@ class PerfSanityTestConfig:
             numa_bind = disagg_config.numa_bind
             timeout = disagg_config.timeout
 
-            # The same guard the launch-script generators apply
-            # (gen_only_no_context_world_size), repeated here because a local run
-            # can reach the runner without them. One pytest process hosts exactly
-            # one gen worker, so a config asking for several needs the four-role
-            # srun split this mode exists to avoid. Refused here rather than
-            # silently launching one: the proxy would be told to expect
-            # num_gen_servers urls, get one, and never become ready.
-            if disagg_config.num_gen_servers != 1:
+            # Defensive, not a policy check: _parse_disagg_config_file already
+            # forced this to gen_only_no_context_server_counts()[1] whatever the
+            # YAML said, so this can only fire if some future path builds the
+            # config tuple without going through that parser. Kept because the
+            # failure it guards is silent -- one pytest process hosts exactly one
+            # gen worker, and a proxy told to expect several would sit waiting on
+            # urls that never bind until the ready timeout, which reads as a hung
+            # worker rather than a mis-sized fleet.
+            if disagg_config.num_gen_servers != gen_only_no_context_server_counts()[1]:
                 raise ValueError(
-                    f"{GEN_ONLY_NO_CONTEXT_MODE} requires num_gen_servers == 1, got "
-                    f"{disagg_config.num_gen_servers}: the aggregated launch path hosts "
-                    f"one gen worker under one pytest process. Run this config as "
-                    f"gen_only instead."
+                    f"{GEN_ONLY_NO_CONTEXT_MODE} launches exactly "
+                    f"{gen_only_no_context_server_counts()[1]} gen server, got "
+                    f"{disagg_config.num_gen_servers}: the config tuple was built "
+                    f"without _parse_disagg_config_file's override."
                 )
 
             # "GEN" so the worker's config filename, log names and db rows are
@@ -4999,12 +5025,12 @@ def get_disagg_test_cases() -> List[str]:
             test_cases.append(f"{test_type}-ctx_only-{config_yml}")
             # gen_only_no_context is emitted for every disagg config, exactly as
             # gen_only is, so the two are two ids over one file and can be
-            # compared without a duplicate YAML that silently drifts. Emitted even
-            # for configs it cannot run (num_gen_servers > 1): one pytest hosts one
-            # gen worker, so such a case fails loudly at launch-script generation
-            # (gen_only_no_context_world_size) instead of being quietly absent
-            # from collection, which is indistinguishable from a typo in a
-            # test-db list. Which ids CI runs is decided by the test-db lists.
+            # compared without a duplicate YAML that silently drifts. Emitted for
+            # every config including those whose fleet replicates the gen server
+            # (num_gen_servers > 1): the mode overrides that count to 1 the same
+            # way it overrides num_ctx_servers to 0, since the per-worker shape is
+            # what the measurement is about (gen_only_no_context_server_counts).
+            # Which ids CI runs is decided by the test-db lists.
             test_cases.append(f"{test_type}-{GEN_ONLY_NO_CONTEXT_MODE}-{config_yml}")
             # Allowlisted, for the same reason the e2e ids are.
             if config_yml in CTX_ONLY_TIME_BREAKDOWN_CONFIGS:

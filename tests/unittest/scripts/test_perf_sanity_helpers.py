@@ -1455,6 +1455,17 @@ def test_is_gen_only_no_context_copies_agree() -> None:
     assert benchmark_utils.DISAGG_BENCHMARK_MODES == perf_sanity.DISAGG_BENCHMARK_MODES
     assert benchmark_utils.DISAGG_CONFIG_MODES == perf_sanity.DISAGG_CONFIG_MODES
 
+    # The other duplicated expression, and the one that decides the Slurm
+    # allocation. A drift here is worse than a drift in the predicate: the
+    # generator would size the job for the config's own num_gen_servers while the
+    # proxy is handed a different count in server_config.<idx>.yaml, so it waits on
+    # urls that never bind and the run reads as a hung worker.
+    assert (
+        benchmark_utils.gen_only_no_context_server_counts()
+        == perf_sanity.gen_only_no_context_server_counts()
+        == (0, 1)
+    )
+
 
 @pytest.mark.parametrize("prefix", ["aggr", "aggr_upload"])
 def test_parse_test_string_accepts_gen_only_no_context(prefix: str) -> None:
