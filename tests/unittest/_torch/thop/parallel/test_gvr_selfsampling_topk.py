@@ -56,7 +56,8 @@ _DEV = "cuda"
 
 
 def _varlen_cache_key(*parts: int) -> tuple[int, ...]:
-    return (*parts, ss_host._device_num_sms(torch.cuda.current_device()))
+    device = torch.cuda.current_device()
+    return (*parts, ss_host._device_profile_key(device))
 
 
 def _make_case(batch_size, n_valid, top_k, seed, hit_ratio=0.6):
@@ -727,30 +728,116 @@ def test_selfsampling_route_sms_factorization() -> None:
                     )
 
 
-def test_selfsampling_device_num_sms_is_cached_per_device(monkeypatch) -> None:
-    """The device-property query is cold-path-only and cached per CUDA device."""
-    counts = {0: 160, 1: 208}
+def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
+    """The B300 tuning is architecture- and shape-exact."""
+    baseline = ss_host.route(512, 8192, 8192, 2048, 148)
+    tuned = ss_host.route(512, 8192, 8192, 2048, 148, sm_version=103)
+    assert baseline["kernel"] == "main"
+    assert tuned["kernel"] == "reg"
+    assert tuned["tpl"] == (512, 4, 2, 1, True, True, False, 1024)
+    assert ss_host.route(1024, 8192, 8192, 2048, 148, 103)["kernel"] == "reg"
+
+    # Nearby K, batch, topology and architecture points retain the baseline.
+    for rows, top_k, num_sms, sm_version in (
+        (512, 1024, 148, 103),
+        (384, 2048, 148, 103),
+        (448, 2048, 148, 103),
+        (1025, 2048, 148, 103),
+        (512, 2048, 160, 103),
+        (512, 2048, 148, 100),
+    ):
+        assert ss_host.route(rows, 8192, 8192, top_k, num_sms, sm_version) == ss_host.route(
+            rows, 8192, 8192, top_k, num_sms
+        )
+
+    assert ss_host.route_split(512, 8192, 8192, 2048, 148, 103) == tuned
+
+    # The integer-divided n4 rung starts at n=4100 and ends at n=8195.
+    assert ss_host.route(512, 4099, 4160, 2048, 148, 103) == ss_host.route(
+        512, 4099, 4160, 2048, 148
+    )
+    assert ss_host.route(512, 4100, 4160, 2048, 148, 103)["kernel"] == "reg"
+    assert ss_host.route(512, 8195, 8256, 2048, 148, 103)["kernel"] == "reg"
+    assert ss_host.route(512, 8196, 8256, 2048, 148, 103) == ss_host.route(
+        512, 8196, 8256, 2048, 148
+    )
+
+
+@pytest.mark.skipif(getSMVersion() != 103, reason="requires an SM103 GPU")
+def test_selfsampling_sm103_b512_k2048_cuda_graph() -> None:
+    """Exercise the B300-only register plan through warmup and graph replay."""
+    rows, n, npad, top_k = 512, 4111, 4160, 2048
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    plan = ss_host.route(
+        rows,
+        n,
+        npad,
+        top_k,
+        properties.multi_processor_count,
+        properties.major * 10 + properties.minor,
+    )
+    assert plan["kernel"] == "reg"
+    assert tuple(plan["tpl"][:3]) == (512, 4, 2)
+
+    ss_host.warmup_varlen(
+        top_k,
+        n,
+        num_rows_list=(rows,),
+        row_stride=npad,
+    )
+    generator = torch.Generator(device=_DEV).manual_seed(103_512_2048)
+    logits = torch.randn((rows, npad), generator=generator, dtype=torch.float32, device=_DEV)
+    kv_lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    kv_lens[1] = top_k - 5
+    kv_lens[2] = 0
+    output = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(logits, kv_lens, output, max_seq_len=n)
+    key = _varlen_cache_key(rows, npad, top_k, n, 1, 1)
+    assert ss_host._VARLEN_CACHE[key][0] == "reg"
+
+    reference = _reference_varlen_indices(logits, kv_lens, 1, 1, top_k)
+    for _ in range(2):
+        output.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        for row in range(rows):
+            if (reference[row] >= 0).any():
+                got = logits[row, output[row].long().clamp_min(0)].sort().values
+                want = logits[row, reference[row].long().clamp_min(0)].sort().values
+                assert torch.equal(got, want), f"row {row} value multiset mismatch"
+                assert torch.equal(output[row] < 0, reference[row] < 0)
+            else:
+                assert torch.equal(output[row], reference[row])
+
+
+def test_selfsampling_device_profile_is_cached_per_device(monkeypatch) -> None:
+    """The SM-count and architecture query is cold-path-only and cached."""
+    profiles = {0: (160, 10, 0), 1: (148, 10, 3)}
     queries = []
 
     class Properties:
-        def __init__(self, multi_processor_count: int) -> None:
+        def __init__(self, multi_processor_count: int, major: int, minor: int) -> None:
             self.multi_processor_count = multi_processor_count
+            self.major = major
+            self.minor = minor
 
     def get_device_properties(device: int) -> Properties:
         queries.append(device)
-        return Properties(counts[device])
+        return Properties(*profiles[device])
 
-    monkeypatch.setattr(ss_host, "_DEVICE_NUM_SMS", {})
+    monkeypatch.setattr(ss_host, "_DEVICE_PROFILE", {})
     monkeypatch.setattr(ss_host, "_get_device_properties", get_device_properties)
-    assert ss_host._device_num_sms(0) == 160
-    assert ss_host._device_num_sms(1) == 208
-    counts[0] = 148
+    assert ss_host._unpack_device_profile(ss_host._device_profile_key(0)) == (160, 100)
+    assert ss_host._unpack_device_profile(ss_host._device_profile_key(1)) == (148, 103)
+    profiles[0] = (148, 10, 3)
     assert ss_host._device_num_sms(0) == 160
     assert queries == [0, 1]
 
 
-def test_selfsampling_launcher_cache_identity_includes_num_sms(monkeypatch) -> None:
-    """Uniform and varlen launchers compiled for different SM counts never alias."""
+def test_selfsampling_launcher_cache_identity_includes_device_profile(monkeypatch) -> None:
+    """Uniform and varlen launchers compiled for different profiles never alias."""
 
     class FakeCudaTensor:
         is_cuda = True
@@ -768,15 +855,26 @@ def test_selfsampling_launcher_cache_identity_includes_num_sms(monkeypatch) -> N
         def get_device(self) -> int:
             return 0
 
-    current_sms = [148]
+    current_profile = [148, 100]
     builds = []
 
-    def build_launcher(batch_size: int, n_valid: int, npad: int, top_k: int, num_sms: int) -> tuple:
-        builds.append((batch_size, n_valid, npad, top_k, num_sms))
+    def build_launcher(
+        batch_size: int,
+        n_valid: int,
+        npad: int,
+        top_k: int,
+        num_sms: int,
+        sm_version: int,
+    ) -> tuple:
+        builds.append((batch_size, n_valid, npad, top_k, num_sms, sm_version))
         return (lambda *args: None, (), False)
 
     monkeypatch.setattr(ss_host, "_LAUNCH_CACHE", {})
-    monkeypatch.setattr(ss_host, "_device_num_sms", lambda device: current_sms[0])
+    monkeypatch.setattr(
+        ss_host,
+        "_device_profile_key",
+        lambda device: ss_host._pack_device_profile(*current_profile),
+    )
     monkeypatch.setattr(ss_host, "_build_launcher", build_launcher)
     logits = FakeCudaTensor((160, 8192), torch.float32)
     pre_idx = FakeCudaTensor((160, 512), torch.int32)
@@ -784,24 +882,34 @@ def test_selfsampling_launcher_cache_identity_includes_num_sms(monkeypatch) -> N
 
     ss_host._run_impl(logits, pre_idx, 8192, indices, None)
     ss_host._run_impl(logits, pre_idx, 8192, indices, None)
-    current_sms[0] = 160
+    current_profile[1] = 103
     ss_host._run_impl(logits, pre_idx, 8192, indices, None)
-    assert builds == [(160, 8192, 8192, 512, 148), (160, 8192, 8192, 512, 160)]
+    current_profile[:] = [160, 100]
+    ss_host._run_impl(logits, pre_idx, 8192, indices, None)
+    assert builds == [
+        (160, 8192, 8192, 512, 148, 100),
+        (160, 8192, 8192, 512, 148, 103),
+        (160, 8192, 8192, 512, 160, 100),
+    ]
     assert set(ss_host._LAUNCH_CACHE) == {
-        (160, 8192, 8192, 512, 148),
-        (160, 8192, 8192, 512, 160),
+        (160, 8192, 8192, 512, ss_host._pack_device_profile(148, 100)),
+        (160, 8192, 8192, 512, ss_host._pack_device_profile(148, 103)),
+        (160, 8192, 8192, 512, ss_host._pack_device_profile(160, 100)),
     }
 
     shape = (160, 8192, 512, 8192, 1, 1)
-    launcher_148 = ("sms148",)
-    launcher_160 = ("sms160",)
+    launcher_sm100 = ("sm100",)
+    launcher_sm103 = ("sm103",)
     monkeypatch.setattr(
         ss_host,
         "_VARLEN_CACHE",
-        {(*shape, 148): launcher_148, (*shape, 160): launcher_160},
+        {
+            (*shape, ss_host._pack_device_profile(148, 100)): launcher_sm100,
+            (*shape, ss_host._pack_device_profile(148, 103)): launcher_sm103,
+        },
     )
-    assert ss_host._varlen_launcher(*shape, num_sms=148) is launcher_148
-    assert ss_host._varlen_launcher(*shape, num_sms=160) is launcher_160
+    assert ss_host._varlen_launcher(*shape, num_sms=148) is launcher_sm100
+    assert ss_host._varlen_launcher(*shape, num_sms=148, sm_version=103) is launcher_sm103
 
 
 def test_selfsampling_topk_varlen_rejects_non_fp32():

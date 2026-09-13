@@ -18,12 +18,12 @@ Companion to ``gvr_topk_decode_self_sampling.py`` (the device module).
 Three sections:
 
 1. dispatch — the CUDA host dispatch as a pure function
-   ``route(b, n, npad, k, num_sms=148)``;
+   ``route(b, n, npad, k, num_sms=148, sm_version=100)``;
 2. workspace — one zero-initialised per-device slab (20,973,568 B) via the
    torch caching allocator, with keep-alive + double-checked locking;
 3. operator entry — ``run(logits, pre_idx, n_valid, indices)`` /
    ``run_ws(..., workspace)`` DPS forms with input hardening and a
-   bind-once launch cache keyed on ``(b, n, npad, k, num_sms)``.
+   bind-once launch cache keyed on shape plus a packed device route profile.
 
 OPERATOR CONTRACT (batch-uniform entries): ``n_valid`` is one host python
 int for the whole batch — every row shares the same valid prefix, in
@@ -72,7 +72,7 @@ def _device():
 # ===========================================================================
 """Pure-Python mirror of the GVR CUDA host dispatch (gvr_topk_launch).
 
-route(b, n, npad, k, num_sms) is a PURE function of its five ints -- no env
+route(b, n, npad, k, num_sms, sm_version) is a PURE function of its arguments -- no env
 knobs, no GPU, stdlib only.  It returns the kernel family, its compile-time
 template tuple, the runtime scalar pack `rt`, grid/cluster/block geometry,
 smem size, and whether the family needs the workspace.
@@ -107,7 +107,14 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 
-def route(b: int, n: int, npad: int, k: int, num_sms: int = 148) -> dict[str, object]:
+def route(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
 
     Deviations from the CUDA reference (self-sampling only): the 4K < n <= 8K
@@ -238,7 +245,15 @@ def route(b: int, n: int, npad: int, k: int, num_sms: int = 148) -> dict[str, ob
     if n4 <= 2048:
         if wide:
             return _reg(1024, 2, 1, 2 * NB)
-        if b <= 2 * num_sms:
+        # On SM103 with 148 SMs, the existing register plan remains faster
+        # across the measured b=512..1024, k=2048 range. Keep the exception
+        # architecture- and shape-exact: smaller K and nearby lower batches
+        # have different winners, while SM100 retains its original streaming
+        # route byte-for-byte.
+        sm103_large_batch_k2048 = (
+            sm_version == 103 and num_sms == 148 and 512 <= b <= 1024 and k == 2048
+        )
+        if b <= 2 * num_sms or sm103_large_batch_k2048:
             return _reg(512, 4, 2, NB)
 
     if n4 <= 4096 and wide:
@@ -448,8 +463,8 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # two-time-scale dispatch split (per-row varlen / CUDA-graph groundwork)
 # ---------------------------------------------------------------------------
-# route(b, n, npad, k, num_sms) factored into
-#   route_static(b, n, npad, k, num_sms) — everything frozen per launch:
+# route(b, n, npad, k, num_sms, sm_version) factored into
+#   route_static(...) — everything frozen per launch:
 #       family, compile tuple, grid, cluster, block, and the rt scalars that
 #       change only at discrete n-thresholds;
 #   route_dynamic(static, n)     — the n-continuous scalars a per-row kernel
@@ -472,11 +487,18 @@ _DYN_RT = {
 _DYN_SMEM = ("reg", "regimg")  # smem depends on CMP/IMGW -> recomputed per n
 
 
-def route_static(b: int, n: int, npad: int, k: int, num_sms: int = 148) -> dict[str, object]:
+def route_static(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> dict[str, object]:
     """route() with the n-continuous fields redacted (see _DYN_RT/_DYN_SMEM).
     Constant on maximal n-intervals ("bands"); every redacted field is
     reconstructible from (static, n) by route_dynamic."""
-    plan = route(b, n, npad, k, num_sms)
+    plan = route(b, n, npad, k, num_sms, sm_version)
     st = {key: (dict(val) if isinstance(val, dict) else val) for key, val in plan.items()}
     for f in _DYN_RT[st["kernel"]]:
         st["rt"].pop(f)
@@ -562,10 +584,17 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     )
 
 
-def route_split(b: int, n: int, npad: int, k: int, num_sms: int = 148) -> dict[str, object]:
+def route_split(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = 148,
+    sm_version: int = 100,
+) -> dict[str, object]:
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
-    st = route_static(b, n, npad, k, num_sms)
+    st = route_static(b, n, npad, k, num_sms, sm_version)
     dyn, smem = route_dynamic(st, n)
     plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
     plan["rt"].update(dyn)
@@ -703,7 +732,7 @@ def route_streaming(
     return _main(256, 4, 8, False)
 
 
-# (rows, npad, k, n_env, next_n, cr, num_sms) -> compiled launcher
+# (rows, npad, k, n_env, next_n, cr, packed device profile) -> compiled launcher
 _VARLEN_CACHE = {}
 
 # ---- prefill launcher cache ------------------------------------------------
@@ -788,12 +817,14 @@ def _varlen_launcher(
     next_n: int,
     cr: int,
     num_sms: int = 148,
+    sm_version: int = 100,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
-    key = (num_rows, npad, k, n_env, next_n, cr, num_sms)
+    profile = _pack_device_profile(num_sms, sm_version)
+    key = (num_rows, npad, k, n_env, next_n, cr, profile)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -810,7 +841,7 @@ def _varlen_launcher(
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_route, npad, k, num_sms)
+    plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
@@ -910,6 +941,7 @@ def route_bands(
     n_lo: int | None = None,
     n_hi: int | None = None,
     num_sms: int = 148,
+    sm_version: int = 100,
 ) -> list[tuple[int, int, dict[str, object]]]:
     """Enumerate maximal n-intervals on which route_static is constant.
     Dense O(n_hi - n_lo) scan of the pure host dispatch — an offline /
@@ -920,7 +952,7 @@ def route_bands(
     bands = []
     cur_key, cur_lo, cur_plan = None, lo, None
     for n in range(lo, hi + 1):
-        st = route_static(b, n, npad, k, num_sms)
+        st = route_static(b, n, npad, k, num_sms, sm_version)
         key = repr(st)
         if key != cur_key:
             if cur_key is not None:
@@ -1069,10 +1101,10 @@ Hardening checks run in a fixed order with fixed predicates:
  12. n_valid >= 0
  13. n = min(nv, npad) clamped in unbounded ints BEFORE any narrowing
 
-Dispatch: route(b, n, npad, k, num_sms) -> compile cache keyed on (kernel family,
-constexpr tuple) in the device module -> bind-once launch cache keyed on the
-shape key (b, n, npad, k, num_sms): caches the compiled callable + the prebuilt
-runtime-scalar arg pack as plain Python ints (never pre-wrapped
+Dispatch: route(b, n, npad, k, num_sms, sm_version) -> compile cache keyed on
+(kernel family, constexpr tuple) in the device module -> bind-once launch
+cache keyed on shape plus a packed device route profile: caches the compiled
+callable + the prebuilt runtime-scalar arg pack as plain Python ints (never pre-wrapped
 cutlass.Int32 -- the FFI per-argument cost is paid every call regardless;
 pre-binding removes only route()/marshal-prep work).
 
@@ -1086,10 +1118,12 @@ builder in _build_launcher; only the main family takes the workspace.
 """
 
 
-# shape key (b, n, npad, k, num_sms) -> (fn, args tuple, needs_ws)
+# shape key (b, n, npad, k, packed device profile) -> (fn, args tuple, needs_ws)
 _LAUNCH_CACHE = {}
 _DUMMY_KV = {}
-_DEVICE_NUM_SMS = {}
+_DEVICE_PROFILE = {}
+_DEVICE_PROFILE_SHIFT = 16
+_DEVICE_NUM_SMS_MASK = (1 << _DEVICE_PROFILE_SHIFT) - 1
 
 
 def _dummy_kv(dev_index, device):
@@ -1114,22 +1148,45 @@ _GVR_MAX_DEV = GVR_MAX_DEV
 _get_device_properties = torch.cuda.get_device_properties
 
 
+def _pack_device_profile(num_sms: int, sm_version: int) -> int:
+    """Pack route topology into one cache-key integer."""
+    if not 1 <= num_sms <= _DEVICE_NUM_SMS_MASK:
+        raise RuntimeError(f"invalid SM count for device profile: {num_sms}")
+    if sm_version < 1:
+        raise RuntimeError(f"invalid SM version for device profile: {sm_version}")
+    return (sm_version << _DEVICE_PROFILE_SHIFT) | num_sms
+
+
+def _unpack_device_profile(profile: int) -> tuple[int, int]:
+    """Return ``(SM count, SM version)`` from a packed cache key."""
+    return profile & _DEVICE_NUM_SMS_MASK, profile >> _DEVICE_PROFILE_SHIFT
+
+
+def _device_profile_key(dev_index: int) -> int:
+    """Return the packed route profile, cached per CUDA device."""
+    profile = _DEVICE_PROFILE.get(dev_index)
+    if profile is None:
+        properties = _get_device_properties(dev_index)
+        num_sms = int(properties.multi_processor_count)
+        sm_version = int(properties.major) * 10 + int(properties.minor)
+        try:
+            profile = _pack_device_profile(num_sms, sm_version)
+        except RuntimeError as error:
+            raise RuntimeError(f"device {dev_index} reports an invalid profile: {error}") from error
+        _DEVICE_PROFILE[dev_index] = profile
+    return profile
+
+
 def _device_num_sms(dev_index: int) -> int:
-    """Return the CUDA runtime-reported SM count, cached per device."""
-    num_sms = _DEVICE_NUM_SMS.get(dev_index)
-    if num_sms is None:
-        num_sms = int(_get_device_properties(dev_index).multi_processor_count)
-        if num_sms < 1:
-            raise RuntimeError(f"device {dev_index} reports invalid SM count {num_sms}")
-        _DEVICE_NUM_SMS[dev_index] = num_sms
-    return num_sms
+    """Return the cached CUDA runtime-reported SM count."""
+    return _unpack_device_profile(_device_profile_key(dev_index))[0]
 
 
 # ---------------------------------------------------------------------------
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
-def _build_launcher(b, n, npad, k, num_sms):
-    rd = route(b, n, npad, k, num_sms)
+def _build_launcher(b, n, npad, k, num_sms, sm_version=100):
+    rd = route(b, n, npad, k, num_sms, sm_version)
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
@@ -1307,11 +1364,13 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
                 values[:, n:] = torch.finfo(_F32).min  # -FLT_MAX pad
         return
 
-    num_sms = _device_num_sms(logits.get_device())
-    key = (b, n, npad, k, num_sms)
+    dev_index = logits.get_device()
+    profile = _device_profile_key(dev_index)
+    key = (b, n, npad, k, profile)
     lc = _LAUNCH_CACHE.get(key)
     if lc is None:
-        lc = _build_launcher(b, n, npad, k, num_sms)
+        num_sms, sm_version = _unpack_device_profile(profile)
+        lc = _build_launcher(b, n, npad, k, num_sms, sm_version)
         _LAUNCH_CACHE[key] = lc
     fn, args, needs_ws = lc
     try:
@@ -1520,15 +1579,16 @@ def run_varlen(
         # R increment (bounded plans, bounded _VARLEN_CACHE)
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
-    num_sms = _device_num_sms(d)
-    key = (num_rows, npad, k, n_env, nn, cr, num_sms)
+    profile = _device_profile_key(d)
+    key = (num_rows, npad, k, n_env, nn, cr, profile)
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
             raise RuntimeError(
                 "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
             )
-        lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, num_sms)
+        num_sms, sm_version = _unpack_device_profile(profile)
+        lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, num_sms, sm_version)
     idx = indices
     if idx.shape[1] != k:
         idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
@@ -1732,7 +1792,8 @@ def warmup_varlen(
 
     """
     dev = torch.cuda.current_device()
-    num_sms = _device_num_sms(dev)
+    profile = _device_profile_key(dev)
+    num_sms, sm_version = _unpack_device_profile(profile)
     nn = max(1, int(next_n))
     # round each request down to a next_n multiple (min next_n) and dedup
     req_rows = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
@@ -1757,6 +1818,7 @@ def warmup_varlen(
             npad_c,
             int(top_k),
             num_sms,
+            sm_version,
         )
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))
@@ -1794,7 +1856,7 @@ def warmup_varlen(
         nn,
         tuple(rows_list),
         npad,
-        num_sms,
+        profile,
     )
     # The done key covers the GPU band launches only (one per engine compile
     # key). The exact-row launcher population below is keyed by the requested
@@ -1836,6 +1898,7 @@ def warmup_varlen(
             nn,
             int(compress_ratio),
             num_sms,
+            sm_version,
         )
     if not bands_done:
         with _VARLEN_WARMUP_LOCK:
