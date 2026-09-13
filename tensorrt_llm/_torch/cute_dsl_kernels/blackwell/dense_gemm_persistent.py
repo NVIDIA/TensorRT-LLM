@@ -1542,6 +1542,59 @@ class PersistentDenseGemmKernel:
         )
 
     @cute.jit
+    def wrapper_strided_c(
+        self,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
+        k: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        a_stride_m: cutlass.Int32,
+        a_stride_batch: cutlass.Int32,
+        b_stride_n: cutlass.Int32,
+        b_stride_batch: cutlass.Int32,
+        c_stride_m: cutlass.Int32,
+        c_stride_batch: cutlass.Int32,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """``wrapper_strided`` with C also built from a raw pointer plus explicit
+        (M, batch) strides; the N stride is 1. The C element type comes from
+        ``c_ptr`` (e.g. FP8, which DLPack cannot carry), and C may be a column
+        slice of a wider buffer.
+        """
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_layout(
+                (m, k, batch_size),
+                stride=(a_stride_m, 1, a_stride_batch),
+            ),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_layout(
+                (n, k, batch_size),
+                stride=(b_stride_n, 1, b_stride_batch),
+            ),
+        )
+        c_tensor = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_layout(
+                (m, n, batch_size),
+                stride=(c_stride_m, 1, c_stride_batch),
+            ),
+        )
+        self(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            max_active_clusters,
+            stream,
+        )
+
+    @cute.jit
     def wrapper_strided(
         self,
         m: cutlass.Int32,
