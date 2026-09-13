@@ -197,8 +197,7 @@ python ../../../llm-api/quickstart_advanced.py \
     --moe_ep_size 8 \
     --enable_attention_dp \
     --spec_decode_algo MTP \
-    --spec_decode_max_draft_len N \
-    --use_one_model
+    --spec_decode_max_draft_len N
 ```
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.

@@ -80,8 +80,7 @@ def test_gpt_oss_one_model_eagle3_keeps_v2():
     assert _resolve_gpt_oss_kv_cache_manager_v2(
         speculative_config=Eagle3DecodingConfig(
             max_draft_len=3,
-            speculative_model="/tmp/dummy_eagle_model",
-            eagle3_one_model=True)) is True
+            speculative_model="/tmp/dummy_eagle_model")) is True
 
 
 def dump_config_json(dst_dir):
