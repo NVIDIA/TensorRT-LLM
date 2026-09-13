@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import itertools
 import json
@@ -41,6 +44,9 @@ parser.add_argument("--scaled-from", type=int)
 parser.add_argument("--max-batch-size", type=int)
 parser.add_argument("--tokens-per-block", type=int)
 parser.add_argument("--max-seq-len", type=int)
+parser.add_argument(
+    "--use-kv-cache-manager-v2", action=argparse.BooleanOptionalAction, default="auto"
+)
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--enable-attention-dp", action="store_true", dest="enable_attention_dp")
 group.add_argument("--no-enable-attention-dp", action="store_false", dest="enable_attention_dp")
@@ -212,6 +218,7 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
     spec_config=spec_config,
     vision_config=args.vision_config,
+    use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
