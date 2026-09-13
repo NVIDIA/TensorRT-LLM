@@ -110,7 +110,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter
+from .scheduler.adp_router import ADPRouter, count_retiring_requests
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -721,6 +721,8 @@ class PyExecutor:
         # can receive the transfer-manager reference at construction time.
         self.adp_router: ADPRouter = ADPRouter.create(
             dist=self.dist,
+            has_seq_slot_headroom=getattr(model_engine,
+                                          "_enable_overlap_headroom", False),
             kv_cache_manager=self.kv_cache_manager,
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,
@@ -5806,7 +5808,7 @@ class PyExecutor:
         self._validate_request_budget(request)
 
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
-                                    total_num_active_requests: int) -> None:
+                                    total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
         # Block new requests while control requests are pending
         if len(self.control_requests) != 0:
@@ -5817,7 +5819,7 @@ class PyExecutor:
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
-        idle = (total_num_active_requests == 0 and len(waiting_queue) == 0
+        idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not self.is_shutdown)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
@@ -6025,14 +6027,16 @@ class PyExecutor:
                 s.num_active_requests for s in all_rank_states
             ]
             total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_num_live_requests = total_num_active_requests + sum(
+                s.num_retiring_requests for s in all_rank_states)
         else:
             total_num_active_requests = len(active_requests)
+            total_num_live_requests = total_num_active_requests
             all_ranks_num_active_requests = None
             all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
-        self._fetch_and_enqueue_requests(waiting_queue,
-                                         total_num_active_requests)
+        self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
 
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
@@ -7064,7 +7068,11 @@ class PyExecutor:
             return
 
         expected_num_active_requests = self.expected_num_active_requests
-        if expected_num_active_requests < len(self.active_requests):
+        num_routable_active_requests = len(self.active_requests)
+        if self.adp_router.exclude_retiring_requests:
+            num_routable_active_requests -= count_retiring_requests(
+                self.active_requests)
+        if expected_num_active_requests < num_routable_active_requests:
             # Not fatal, and not a capacity violation. The router derives this
             # value as
             #   min(max(ceil(multiplier * fair_share), max(per_rank_loads)),
@@ -7085,11 +7093,12 @@ class PyExecutor:
             # event loop on every affected rank at once, leaving the survivors
             # to HangDetector-abort.
             logger.warning(
-                f"active_requests ({len(self.active_requests)}) exceeds "
+                f"routable active_requests "
+                f"({num_routable_active_requests}) exceeds "
                 f"expected_num_active_requests "
                 f"({expected_num_active_requests}); tolerating (a busy rank "
                 f"needs no attention-DP dummy).")
-            expected_num_active_requests = len(self.active_requests)
+            expected_num_active_requests = num_routable_active_requests
 
         num_active_request = self._count_schedulable_active_requests()
 

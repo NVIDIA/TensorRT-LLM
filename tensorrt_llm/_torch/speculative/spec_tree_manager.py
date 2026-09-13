@@ -1,7 +1,7 @@
 import logging
 import math
 from itertools import accumulate
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -231,10 +231,14 @@ class SpecTreeManager:
     retrieve_next_sibling: torch.Tensor = None
     slot_storage: 'DynamicTreeSlotStorage | None' = None
 
-    def __init__(self, max_num_requests: int, use_dynamic_tree: bool,
-                 max_total_draft_tokens: int, max_draft_len: int,
+    def __init__(self,
+                 max_num_requests: int,
+                 use_dynamic_tree: bool,
+                 max_total_draft_tokens: int,
+                 max_draft_len: int,
                  eagle_choices: List[List[int]] | None,
-                 dynamic_tree_max_topK: int):
+                 dynamic_tree_max_topK: int,
+                 num_seq_slots: Optional[int] = None):
 
         self.use_dynamic_tree = use_dynamic_tree
         self.max_total_draft_tokens = max_total_draft_tokens
@@ -251,6 +255,15 @@ class SpecTreeManager:
             self._internal_buf_dim = max_total_draft_tokens + 1
         self.eagle_choices = eagle_choices
         self.num_trees = max_num_requests if use_dynamic_tree else 1
+        # ``num_trees`` sizes the per-forward *work* buffers, which are indexed by
+        # batch position and so correctly stay at max_batch_size -- the micro-batch
+        # scheduler caps every forward there. ``num_slots`` sizes DynamicTreeSlotStorage,
+        # which is indexed by ``py_seq_slot`` and must therefore span the executor's
+        # sequence-slot pool: the attention-DP overlap headroom makes that
+        # 2 * max_batch_size so a retiring request can keep its slot for one more
+        # iteration while its replacement is admitted (nvbug-6627795).
+        # None preserves the historical max_batch_size sizing.
+        self.num_slots = max(num_seq_slots or 0, max_num_requests)
         self.dynamic_tree_max_topK = dynamic_tree_max_topK
         self.cur_draft_layer_idx = 0
         self.top_k_list = []
@@ -334,7 +347,7 @@ class SpecTreeManager:
 
         mask_width = math.ceil(num_draft_with_root / 32)
         self.slot_storage = DynamicTreeSlotStorage(
-            num_slots=self.num_trees,
+            num_slots=self.num_slots,
             n_dt=num_draft_with_root,
             mask_width=mask_width,
             top_k=self.dynamic_tree_max_topK,

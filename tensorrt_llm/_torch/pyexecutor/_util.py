@@ -121,6 +121,13 @@ def _resolve_disagg_transceiver_route(
     return backend, runtime
 
 
+def is_disagg_enabled(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> bool:
+    """Whether this executor participates in disaggregated serving."""
+    return (cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None)
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -687,6 +694,7 @@ class KvCacheCreator:
             model_engine)
         self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
                                                   KVCacheManagerV2)
+        self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
@@ -1501,6 +1509,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_events_config=None
             if estimating_kv_cache or model_engine.is_draft_model else
             self._llm_args.kv_cache_config.kv_events_config,
@@ -1721,6 +1730,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
@@ -2097,6 +2107,7 @@ class KvCacheCreator:
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
             CacheType.CROSS,
         )
@@ -2416,6 +2427,7 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
+        disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False) -> KVCacheManager:
@@ -2569,6 +2581,8 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs[
+            "disable_overlap_scheduler"] = disable_overlap_scheduler
         # V2 builds the block-reuse cache key of a multimodal token run from
         # the vocabulary size. Resolve it here rather than per-branch: the
         # manager needs it whenever block reuse can meet multimodal input,
@@ -3111,11 +3125,25 @@ def compute_max_num_sequences(mapping: Mapping,
                               enable_overlap_headroom: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    ``enable_overlap_headroom`` is intentionally opt-in. Disaggregated
-    attention-DP needs a second non-PP slot set because the V2 scheduler can
+    ``enable_overlap_headroom`` is intentionally opt-in, and
+    ``should_enable_overlap_headroom`` is the only thing that should set it:
+    attention DP needs a second non-PP slot set because the V2 scheduler can
     backfill seats before the overlap scheduler releases the previous
     iteration's terminal slots. Pipeline parallelism already sizes the pool
     by ``pp_size``.
+
+    Disaggregation deliberately does **not** appear here. Its ``2x`` is an
+    IndexMapper-local concern: a request awaiting its KV transfer holds an
+    *index* lease while holding no seat at all --
+    ``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``
+    requests outright and only seats them once the transmission completes -- and
+    ``PyExecutor``'s admission arithmetic bounds ``active_requests`` at
+    ``max_batch_size * pp_size`` either way (``_fetch_new_requests``, which
+    subtracts ``len(active_requests)`` outside attention DP). So the index pool
+    legitimately runs ahead of the seat pool, and propagating that factor here
+    would double sampler state, the eagerly allocated
+    ``[seats, draft_len, vocab]`` draft-probability tensors and the pinned-host
+    block-offset tables for leases that never occupy a seat.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
@@ -3123,6 +3151,37 @@ def compute_max_num_sequences(mapping: Mapping,
         num_micro_batches = (2 if enable_overlap_headroom
                              and not disable_overlap_scheduler else 1)
     return max_batch_size * num_micro_batches
+
+
+def resolve_max_num_sequences(model_engine,
+                              mapping: Mapping,
+                              max_batch_size: int,
+                              llm_args,
+                              max_num_sequences: Optional[int] = None) -> int:
+    """Resolve the seat-pool size for a consumer, without re-deriving it.
+
+    Order of preference, and the order matters:
+
+    1. an explicitly supplied value -- the caller already has the number the
+       engine published;
+    2. ``model_engine.max_num_seq_slots`` -- the engine's own pool, which is
+       what every seat-keyed pool was sized against;
+    3. only then a fresh ``compute_max_num_sequences``, reusing the engine's
+       headroom gate so the fallback cannot size the pool below the engine's.
+    """
+    if max_num_sequences is not None:
+        return max_num_sequences
+    engine_seats = getattr(model_engine, "max_num_seq_slots", None)
+    if engine_seats is not None:
+        return engine_seats
+    # Engines that predate the attribute (unit-test stubs, mm-encoder-only
+    # engines): recompute, but with the same gate the engine would have used.
+    return compute_max_num_sequences(mapping,
+                                     max_batch_size,
+                                     llm_args.disable_overlap_scheduler,
+                                     enable_overlap_headroom=getattr(
+                                         model_engine,
+                                         "_enable_overlap_headroom", False))
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
@@ -3149,15 +3208,98 @@ def should_enable_non_overlap_adp_forward_intent(
             and disable_overlap_scheduler)
 
 
-def should_enable_disagg_adp_overlap_headroom(
-        mapping: Mapping,
-        cache_transceiver_config: Optional[CacheTransceiverConfig],
-        disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to non-PP disaggregated attention-DP."""
-    is_disagg = (cache_transceiver_config is not None
-                 and cache_transceiver_config.backend is not None)
-    return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
+def should_enable_overlap_headroom(mapping: Mapping,
+                                   disable_overlap_scheduler: bool,
+                                   kv_cache_manager_is_v2: bool,
+                                   is_hybrid: bool = False) -> bool:
+    """Gate the extra micro-batch of sequence slots (and its ADP counterpart).
+
+    True exactly where residency can exceed ``max_batch_size * pp_size``, and
+    that is a narrow set. The mechanism is ``ADPRouter``'s
+    ``exclude_retiring_requests``: it drops ``GENERATION_TO_COMPLETE`` requests
+    from the per-rank active counts that ``_fetch_new_requests`` subtracts from
+    the admission capacity, so a replacement cohort is admitted while the
+    retiring cohort still holds its seats. Each condition rules out a
+    configuration where that cannot happen:
+
+    * ``enable_attention_dp`` -- outside attention DP ``_fetch_new_requests``
+      subtracts ``len(active_requests)``, retirees included, so residency is
+      capped at ``max_batch_size * pp_size`` and the extra seats could never be
+      occupied. Disaggregation does not change this: its ``2x`` lives in
+      ``KVCacheManagerV2``'s index pool, where a transfer-phase request holds a
+      lease and no seat.
+    * ``not has_pp()`` -- pipeline parallelism already carries ``pp_size``
+      micro-batches, and its interaction with the retirement filter is
+      unvalidated. Out of scope here.
+    * ``kv_cache_manager_is_v2`` -- only ``KVCacheV2Scheduler`` stops counting a
+      request at ``GENERATION_TO_COMPLETE``. The V1 capacity schedulers (C++
+      ``BindCapacityScheduler`` and ``PyCapacityScheduler``) hardcode
+      ``GENERATION_COMPLETE``, so under V1 the retiring cohort is still inside
+      the capacity budget and the headroom would only inflate seat-keyed pools.
+    * ``not is_hybrid`` -- SSM/Mamba state is sized by ``max_batch_size`` in
+      every manager, and ``_max_resident_sequences()`` is the floor a hybrid
+      manager can serve; extra seats there would let residency outrun the SSM
+      slots. (Hybrid state is not ``py_seq_slot``-indexed, so the failure is
+      exhaustion rather than an out-of-bounds write -- still a hang.)
+    """
+    if is_hybrid or not kv_cache_manager_is_v2:
+        return False
+    return (mapping.enable_attention_dp and not mapping.has_pp()
             and not disable_overlap_scheduler)
+
+
+def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
+                                            kv_cache_manager) -> None:
+    """Fail at startup if the KV index pool cannot cover the seat pool.
+
+    One direction is a bug and the other is by design, so the check is
+    deliberately one-sided rather than an equality:
+
+    * **index pool < seat pool -- always a bug.** ``_create_kv_cache`` warns
+      ``No free IndexMapper slots``, returns ``None`` and the scheduler defers
+      the request. Silent: costs throughput, raises nothing (nvbug 6627795). A
+      one-sided ``seats >= index pool`` guard is exactly what let this ship, and
+      this is the direction that guard could not see.
+    * **index pool > seat pool -- permitted.** The index pool is intentionally
+      the more generous of the two, for two independent reasons the seat pool
+      must not inherit. Under disaggregation a request awaiting its KV transfer
+      holds an index lease and no seat at all
+      (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``).
+      And ``KVCacheManagerV2`` widens the pool for any non-PP overlap
+      configuration, while the seat pool widens only where residency can
+      actually exceed ``max_batch_size * pp_size``
+      (``should_enable_overlap_headroom``) -- so a plain TP deployment carries
+      spare index leases that no seat will ever claim. Spare leases cost a few
+      page-table rows; spare seats would cost sampler state, the eagerly
+      allocated ``[seats, draft_len, vocab]`` draft-probability tensors and the
+      pinned-host block-offset tables.
+
+    The cost of the asymmetry is that an *undersized seat pool* is no longer
+    distinguishable from a legitimately generous index pool, so it is not caught
+    here. ``compute_max_num_sequences`` being the single seat-pool definition is
+    what covers that side.
+
+    Managers that do not publish ``max_admissible_sequences`` (V1, non-V2
+    hybrid) are skipped rather than guessed at. ``isinstance`` rather than
+    ``is not None``: the V1/C++ manager does not publish the attribute at all,
+    and neither do the ``Mock`` stubs that stand in for a cache manager in other
+    modules' tests -- a ``Mock`` auto-creates it, so an ``is None`` opt-in would
+    fall through to the comparison and raise ``TypeError`` instead of skipping
+    the check.
+    """
+    admissible = getattr(kv_cache_manager, "max_admissible_sequences", None)
+    if not isinstance(admissible, int):
+        return
+    if admissible >= max_num_sequences:
+        return
+    raise ValueError(
+        f"{type(kv_cache_manager).__name__} can lease KV cache indices for "
+        f"{admissible} concurrent sequences but the executor's sequence-slot "
+        f"pool holds {max_num_sequences}: the index pool is smaller than the "
+        "seat pool, so admitted requests would be silently deferred one at a "
+        "time (nvbug 6627795). The seat pool must come from "
+        "_util.compute_max_num_sequences and the index pool must cover it; a "
+        "shortfall means one of them was re-derived from max_batch_size.")
 
 
 def create_py_executor_instance(
@@ -3195,15 +3337,18 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
-    if max_num_sequences is None:
-        max_num_sequences = compute_max_num_sequences(
-            mapping, max_batch_size, llm_args.disable_overlap_scheduler)
+    is_disagg = is_disagg_enabled(cache_transceiver_config)
+
+    max_num_sequences = resolve_max_num_sequences(
+        model_engine,
+        mapping,
+        max_batch_size,
+        llm_args,
+        max_num_sequences=max_num_sequences)
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
-    is_disagg = (cache_transceiver_config is not None
-                 and cache_transceiver_config.backend is not None)
     for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
@@ -3361,6 +3506,11 @@ def create_py_executor_instance(
         if isinstance(model_engine, PyTorchModelEngine):
             model_engine._init_cuda_graph_lora_manager(lora_config)
 
+    # The seat pool and the KV index pool are sized independently and indexed by
+    # the same request identity, so an index pool narrower than the seat pool is
+    # always a bug. Check it here rather than at first use: a startup ValueError
+    # names both numbers, while the runtime symptom is a silent throughput loss.
+    validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
@@ -3392,8 +3542,10 @@ def create_py_executor_instance(
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
-    # V1 scheduler handles overlap via two_step_lookahead, so skip the
-    # slot-pool overlap factor here.
+    # V1 scheduler handles overlap via two_step_lookahead, so the capacity
+    # scheduler's budget stays at the pipeline-depth bound and deliberately does
+    # not follow the sequence-slot pool: the overlap headroom is spare seats for
+    # leases already held, not extra admission.
     scheduler_capacity = max_batch_size * mapping.pp_size
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
@@ -3580,22 +3732,22 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(
-    mapping: Mapping,
     *,
     max_seq_len: int,
-    max_batch_size: int,
     speculative_config: SpeculativeConfig,
     max_beam_width: int,
     disable_overlap_scheduler: bool,
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
-    max_num_sequences: Optional[int] = None,
+    max_num_sequences: int,
 ):
-    # The sampler's per-slot state is indexed by sequence slots, so it must
-    # be sized identically to the executor's slot pool.
-    if max_num_sequences is None:
-        max_num_sequences = compute_max_num_sequences(
-            mapping, max_batch_size, disable_overlap_scheduler)
+    # The sampler's per-slot state is indexed by sequence slots, so it must be
+    # sized identically to the executor's slot pool. `max_num_sequences` is
+    # required, not optional: the old default recomputed the pool from
+    # `mapping`/`max_batch_size` *without* the overlap-headroom gate, so it could
+    # only ever produce a smaller number than the slots it indexes. Those two
+    # parameters are gone with it -- keeping them would leave the raw material
+    # for the same re-derivation lying next to the resolved value.
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
@@ -3627,10 +3779,15 @@ def instantiate_sampler(
     enable_async_worker = (confidential_compute_enabled()
                            or llm_args.sampler_force_async_worker)
 
-    sampler_args = create_torch_sampler_args(
+    max_num_sequences = resolve_max_num_sequences(
+        engine,
         mapping,
+        max_batch_size,
+        llm_args,
+        max_num_sequences=max_num_sequences)
+
+    sampler_args = create_torch_sampler_args(
         max_seq_len=engine.max_seq_len,
-        max_batch_size=max_batch_size,
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
