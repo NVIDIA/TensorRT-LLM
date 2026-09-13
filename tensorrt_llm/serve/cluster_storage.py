@@ -298,9 +298,12 @@ class HttpClusterStorageServer(ClusterStorage):
                          key_prefix: str,
                          keys_only: bool = False) -> List[str]:
         async with self._lock:
+            current_time = key_time()
             return {
                 k: "" if keys_only else v.value
-                for k, v in self._storage.items() if k.startswith(key_prefix)
+                for k, v in self._storage.items()
+                if k.startswith(key_prefix) and (
+                    v.expire_time < 0 or v.expire_time > current_time)
             }
 
     async def watch(self, key_prefix: str) -> WatchEventQueue:
