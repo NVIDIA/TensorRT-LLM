@@ -79,6 +79,12 @@ DIRECT_DEP_LICENSES = {
         "Apache-2.0",
         "https://github.com/flashinfer-ai/flashinfer",
     ),
+    "nvidia-cutlass-dsl": (
+        "CUTLASS DSL",
+        "LicenseRef-NVIDIA-SOFTWARE-LICENSE",
+        "https://github.com/NVIDIA/cutlass",
+    ),
+    "apache-tvm-ffi": ("Apache TVM FFI", "Apache-2.0", "https://github.com/apache/tvm-ffi"),
     "safetensors": ("safetensors", "Apache-2.0", "https://github.com/huggingface/safetensors"),
     "accelerate": ("Accelerate", "Apache-2.0", "https://github.com/huggingface/accelerate"),
     "huggingface-hub": (

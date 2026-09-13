@@ -119,6 +119,10 @@ STANDALONE_DEPS = [
     "pydantic-settings",
     "triton",
     "flashinfer-python",
+    # flashinfer only floors the CuTe DSL toolchain, so pin it explicitly to the
+    # versions requirements.txt validates flashinfer against.
+    "nvidia-cutlass-dsl[cu13]",
+    "apache-tvm-ffi",
     "safetensors",
     "accelerate",
     "huggingface-hub",
