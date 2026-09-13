@@ -14,13 +14,16 @@
 # limitations under the License.
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
 from llmapi.test_llm import get_model_path
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
+from tensorrt_llm.executor import RequestError
+from tensorrt_llm.scaffolding import (ChatTask, GenerationTask,
+                                      StreamGenerationTask, TaskStatus,
                                       TRTLLMWorker, TRTOpenaiWorker,
                                       UserMessage)
 
@@ -72,6 +75,98 @@ def create_trtoai_worker(model_name, async_client):
         async_client=async_client,
         model=model_name,
     )
+
+
+def _generation_result() -> MagicMock:
+    completion = MagicMock(text="ok",
+                           token_ids=[1],
+                           finish_reason="stop",
+                           logprobs=None)
+    return MagicMock(outputs=[completion], context_logits=None)
+
+
+def test_trtllm_worker_copies_finish_reason_from_result() -> None:
+    llm = MagicMock()
+    llm.generate_async = AsyncMock(return_value=_generation_result())
+    worker = TRTLLMWorker(llm, tokenizer=None)
+    task = GenerationTask.create_from_prompt("hello")
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.output_str == "ok"
+    assert task.output_tokens == [1]
+    assert task.finish_reason == "stop"
+
+
+def test_trtllm_worker_returns_length_for_max_num_tokens_error() -> None:
+    error = RequestError(
+        "The sum of prompt length (4), query length (1) should not exceed "
+        "max_num_tokens (4)")
+    llm = MagicMock()
+    llm.generate_async = AsyncMock(side_effect=error)
+    worker = TRTLLMWorker(llm, tokenizer=None)
+    task = GenerationTask.create_from_prompt("hello")
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.output_str == ""
+    assert task.output_tokens == []
+    assert task.finish_reason == "length"
+
+
+def test_trtllm_worker_preserves_unrelated_request_errors() -> None:
+    llm = MagicMock()
+    llm.generate_async = AsyncMock(side_effect=RequestError("bad request"))
+    worker = TRTLLMWorker(llm, tokenizer=None)
+    task = GenerationTask.create_from_prompt("hello")
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.WORKER_EXECEPTION
+    assert task.finish_reason is None
+
+
+def test_trtllm_worker_returns_length_for_streaming_step_error() -> None:
+    error = RequestError(
+        "The sum of prompt length (4), query length (1) should not exceed "
+        "max_num_tokens (4)")
+    request_handle = _generation_result()
+    request_handle._done = False
+    request_handle._aresult_step = AsyncMock(side_effect=error)
+    llm = MagicMock()
+    llm.generate_async.return_value = request_handle
+    worker = TRTLLMWorker(llm, tokenizer=None)
+    task = StreamGenerationTask.create_from_generation_task(
+        GenerationTask.create_from_prompt("hello"), streaming_step=1)
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.end_flag
+    assert task.output_str == ""
+    assert task.output_tokens == []
+    assert task.finish_reason == "length"
+
+
+def test_trtllm_worker_returns_length_for_streaming_start_error() -> None:
+    error = RequestError(
+        "The sum of prompt length (4), query length (1) should not exceed "
+        "max_num_tokens (4)")
+    llm = MagicMock()
+    llm.generate_async.side_effect = error
+    worker = TRTLLMWorker(llm, tokenizer=None)
+    task = StreamGenerationTask.create_from_generation_task(
+        GenerationTask.create_from_prompt("hello"), streaming_step=1)
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.end_flag
+    assert task.output_str == ""
+    assert task.output_tokens == []
+    assert task.finish_reason == "length"
 
 
 def test_trtllm_worker_generation(default_prompt, trtllm_model_path):
