@@ -32,7 +32,7 @@
 /tensorrt_llm/commands/eval.py @NVIDIA/trt-llm-devs
 /tensorrt_llm/evaluate @NVIDIA/trt-llm-devs
 /tensorrt_llm/tools @NVIDIA/trt-llm-devs
-/tests/integration/test_lists/test-db @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
+/tests/integration/test_lists/test-db @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-infra-devs
 # Waiver updates follow the repository's normal review requirements.
 /tests/integration/test_lists/waives.txt
 /tests/test_common @NVIDIA/trt-llm-devs
@@ -96,7 +96,8 @@
 /examples @NVIDIA/trt-llm-doc-owners
 
 # ===== QA =====
-/tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa @NVIDIA/trt-llm-infra-devs
+/tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
+/tests/integration/defs/perf @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-perf @NVIDIA/trt-llm-infra-devs
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
 /tests/integration/test_lists/qa/llm_perf_* @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa/llm_function_* @NVIDIA/trt-llm-qa-function
@@ -396,10 +397,9 @@
 /scripts/check_auto_deploy_imports.py @NVIDIA/trt-llm-torch-autodeploy-devs
 /scripts/check_model_registry.py @NVIDIA/trt-llm-torch-autodeploy-devs
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
 /tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /tests/unittest/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
