@@ -4048,6 +4048,169 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
+                                                     disaggregated_example_root,
+                                                     llm_venv,
+                                                     deepseek_v3_model_root):
+    """
+    Test that the disaggregated server handles request cancellations gracefully.
+
+    This test sends bursts of requests with large contexts and cancels them
+    during prefill to stress test resource cleanup.
+    """
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
+
+    run_disaggregated_cancel_test(disaggregated_example_root,
+                                  "cancel_stress_test",
+                                  env=llm_venv._new_env,
+                                  num_bursts=5,
+                                  requests_per_burst=32,
+                                  model_path=deepseek_v3_model_root,
+                                  cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
+def test_disaggregated_cancel_large_context_requests_long(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        model_path):
+    """Test that disaggregated server handles request cancellations gracefully.
+
+    This test sends bursts of requests with large contexts and cancels them
+    during prefill to stress test resource cleanup.
+    """
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    run_disaggregated_cancel_test(disaggregated_example_root,
+                                  "cancel_stress_test_large",
+                                  env=llm_venv._new_env,
+                                  num_bursts=1000,
+                                  requests_per_burst=32,
+                                  model_path=model_dir,
+                                  cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path",
+                         ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
+def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
+                                                   llm_venv, model_path,
+                                                   benchmark_root,
+                                                   shared_gpt_path):
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    config_file = get_test_config("mamba_conc_greater_than_mbs",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    e2el, ttft = run_disaggregated_benchmark(
+        disaggregated_example_root,
+        config_file,
+        benchmark_root,
+        model_dir,
+        shared_gpt_path,
+        env=env,
+        num_prompts=40,
+        max_concurrency=4,
+        random_input_len=1024,
+        random_output_len=1024,
+        skip_warmup=True,
+        model_path=model_dir,
+        cwd=llm_venv.get_working_directory())
+    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
+
+
+@pytest.mark.parametrize(
+    "test_config",
+    [
+        # Smoke run: 120 requests at 64 concurrency (matching the warmup
+        # count), ~3 min request phase on B200. Used as L0 post-merge gate. A
+        # healthy cluster scores ~1.0 accuracy (every profile validates real
+        # content), so 0.9 leaves margin for a rare flaky request while still
+        # catching a regression.
+        pytest.param(TestConfig(
+            model_path='Qwen3/Qwen3-32B-FP8',
+            test_desc='req120-conc64-qwen3_32b_fp8_mixed_stress',
+            request_count=120,
+            concurrency=64,
+            accuracy_threshold=0.9,
+            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
+                     marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
+        # Full stress run: 10k requests at 512 concurrency.
+        # Estimated wall-clock ~40 min (server startup + ~32 min request
+        # phase); 512 concurrency exercises more in-flight overlap.
+        pytest.param(TestConfig(
+            model_path='Qwen3/Qwen3-32B-FP8',
+            test_desc='req10k-conc512-qwen3_32b_fp8_mixed_stress',
+            request_count=10000,
+            concurrency=512,
+            accuracy_threshold=0.9,
+            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
+                     marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
+    ],
+    ids=lambda x: x.test_desc)
+def test_disaggregated_mixed_stress_test(disaggregated_test_root,
+                                         disaggregated_example_root, llm_venv,
+                                         test_config):
+    model_path = test_config.model_path
+    test_desc = test_config.test_desc
+    model_dir = resolve_llm_model_path(model_path)
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    config_file = get_test_config(test_desc, disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    if test_config.speculative_model_path is not None:
+        spec_model_dir = f"{llm_models_root()}/{test_config.speculative_model_path}"
+        setup_model_symlink(llm_venv, spec_model_dir,
+                            test_config.speculative_model_path)
+        with open(config_file, 'r') as f:
+            patched_config = yaml.safe_load(f)
+        patched_sections = []
+        # Check top-level speculative_config first (current YAML layout), then
+        # fall back to per-server blocks for older config shapes.
+        top_spec = patched_config.get('speculative_config')
+        if isinstance(top_spec, dict) and 'speculative_model' in top_spec:
+            top_spec['speculative_model'] = spec_model_dir
+            patched_sections.append('top-level')
+        else:
+            for section in ('context_servers', 'generation_servers'):
+                spec = patched_config.get(section, {}).get('speculative_config')
+                if spec is not None and 'speculative_model' in spec:
+                    spec['speculative_model'] = spec_model_dir
+                    patched_sections.append(section)
+        if not patched_sections:
+            raise AssertionError(
+                f"{test_desc} sets speculative_model_path, but no "
+                "speculative_config.speculative_model field was patched")
+        patched_path = os.path.join(llm_venv.get_working_directory(),
+                                    f"{test_desc}_patched.yaml")
+        with open(patched_path, 'w') as f:
+            yaml.safe_dump(patched_config, f)
+        config_file = patched_path
+
+    run_disaggregated_mixed_stress(
+        example_dir=disaggregated_example_root,
+        config_file=config_file,
+        model_path=model_dir,
+        total_requests=test_config.request_count,
+        concurrency=test_config.concurrency,
+        accuracy_threshold=test_config.accuracy_threshold,
+        incomplete_threshold=test_config.incomplete_threshold,
+        server_start_timeout=600,
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.skip_less_device(4)
 def test_disaggregated_logprobs_serving(disaggregated_test_root,
                                         disaggregated_example_root, llm_venv):
@@ -4243,166 +4406,3 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         terminate(*ctx_workers, *gen_workers, disagg_server)
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
-
-
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
-                         indirect=True)
-def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
-                                                     disaggregated_example_root,
-                                                     llm_venv,
-                                                     deepseek_v3_model_root):
-    """
-    Test that the disaggregated server handles request cancellations gracefully.
-
-    This test sends bursts of requests with large contexts and cancels them
-    during prefill to stress test resource cleanup.
-    """
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/bf16")
-
-    run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test",
-                                  env=llm_venv._new_env,
-                                  num_bursts=5,
-                                  requests_per_burst=32,
-                                  model_path=deepseek_v3_model_root,
-                                  cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(8)
-@skip_pre_blackwell
-@pytest.mark.parametrize("model_path", ['DeepSeek-V3-0324-FP4'])
-def test_disaggregated_cancel_large_context_requests_long(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        model_path):
-    """Test that disaggregated server handles request cancellations gracefully.
-
-    This test sends bursts of requests with large contexts and cancels them
-    during prefill to stress test resource cleanup.
-    """
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    run_disaggregated_cancel_test(disaggregated_example_root,
-                                  "cancel_stress_test_large",
-                                  env=llm_venv._new_env,
-                                  num_bursts=1000,
-                                  requests_per_burst=32,
-                                  model_path=model_dir,
-                                  cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(8)
-@skip_pre_blackwell
-@pytest.mark.parametrize("model_path",
-                         ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
-def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
-                                                   llm_venv, model_path,
-                                                   benchmark_root,
-                                                   shared_gpt_path):
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    config_file = get_test_config("mamba_conc_greater_than_mbs",
-                                  disaggregated_example_root,
-                                  os.path.dirname(__file__))
-
-    env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    e2el, ttft = run_disaggregated_benchmark(
-        disaggregated_example_root,
-        config_file,
-        benchmark_root,
-        model_dir,
-        shared_gpt_path,
-        env=env,
-        num_prompts=40,
-        max_concurrency=4,
-        random_input_len=1024,
-        random_output_len=1024,
-        skip_warmup=True,
-        model_path=model_dir,
-        cwd=llm_venv.get_working_directory())
-    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
-
-
-@pytest.mark.parametrize(
-    "test_config",
-    [
-        # Smoke run: 120 requests at 64 concurrency (matching the warmup
-        # count), ~3 min request phase on B200. Used as L0 post-merge gate. A
-        # healthy cluster scores ~1.0 accuracy (every profile validates real
-        # content), so 0.9 leaves margin for a rare flaky request while still
-        # catching a regression.
-        pytest.param(TestConfig(
-            model_path='Qwen3/Qwen3-32B-FP8',
-            test_desc='req120-conc64-qwen3_32b_fp8_mixed_stress',
-            request_count=120,
-            concurrency=64,
-            accuracy_threshold=0.9,
-            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
-                     marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
-        # Full stress run: 10k requests at 512 concurrency.
-        # Estimated wall-clock ~40 min (server startup + ~32 min request
-        # phase); 512 concurrency exercises more in-flight overlap.
-        pytest.param(TestConfig(
-            model_path='Qwen3/Qwen3-32B-FP8',
-            test_desc='req10k-conc512-qwen3_32b_fp8_mixed_stress',
-            request_count=10000,
-            concurrency=512,
-            accuracy_threshold=0.9,
-            speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
-                     marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
-    ],
-    ids=lambda x: x.test_desc)
-def test_disaggregated_mixed_stress_test(disaggregated_test_root,
-                                         disaggregated_example_root, llm_venv,
-                                         test_config):
-    model_path = test_config.model_path
-    test_desc = test_config.test_desc
-    model_dir = resolve_llm_model_path(model_path)
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    config_file = get_test_config(test_desc, disaggregated_example_root,
-                                  os.path.dirname(__file__))
-
-    if test_config.speculative_model_path is not None:
-        spec_model_dir = f"{llm_models_root()}/{test_config.speculative_model_path}"
-        setup_model_symlink(llm_venv, spec_model_dir,
-                            test_config.speculative_model_path)
-        with open(config_file, 'r') as f:
-            patched_config = yaml.safe_load(f)
-        patched_sections = []
-        # Check top-level speculative_config first (current YAML layout), then
-        # fall back to per-server blocks for older config shapes.
-        top_spec = patched_config.get('speculative_config')
-        if isinstance(top_spec, dict) and 'speculative_model' in top_spec:
-            top_spec['speculative_model'] = spec_model_dir
-            patched_sections.append('top-level')
-        else:
-            for section in ('context_servers', 'generation_servers'):
-                spec = patched_config.get(section, {}).get('speculative_config')
-                if spec is not None and 'speculative_model' in spec:
-                    spec['speculative_model'] = spec_model_dir
-                    patched_sections.append(section)
-        if not patched_sections:
-            raise AssertionError(
-                f"{test_desc} sets speculative_model_path, but no "
-                "speculative_config.speculative_model field was patched")
-        patched_path = os.path.join(llm_venv.get_working_directory(),
-                                    f"{test_desc}_patched.yaml")
-        with open(patched_path, 'w') as f:
-            yaml.safe_dump(patched_config, f)
-        config_file = patched_path
-
-    run_disaggregated_mixed_stress(
-        example_dir=disaggregated_example_root,
-        config_file=config_file,
-        model_path=model_dir,
-        total_requests=test_config.request_count,
-        concurrency=test_config.concurrency,
-        accuracy_threshold=test_config.accuracy_threshold,
-        incomplete_threshold=test_config.incomplete_threshold,
-        server_start_timeout=600,
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory())
