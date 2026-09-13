@@ -33,6 +33,7 @@ from mpi4py.futures import MPIPoolExecutor
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm._utils import set_mpi_comm
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -71,6 +72,8 @@ REDUCED_DEEPSEEK_LAYERS = 2
 MODEL_PATHS = {
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
     "DeepSeek-V3-Lite": "DeepSeek-V3-Lite/bf16",
+    "Qwen3-8B-eagle3": "Qwen3/qwen3_8b_eagle3",
+    "Qwen3-8B": "Qwen3/Qwen3-8B",
 }
 
 
@@ -635,6 +638,25 @@ def test_chunked_prefill_handoff(model):
 # ---------------------------------------------------------------------------
 
 
+def qwen3_eagle3_config():
+    return {
+        "speculative_config": Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=model_path("Qwen3-8B-eagle3"),
+            eagle3_one_model=True,
+            # TODO: these capture layers were carried over proportionally from
+            # the retired Llama-3.1-8B config (1/32, 15/32, 28/32 through the
+            # stack) and have NOT been validated against Qwen3-8B's actual
+            # layer count on GPU. Re-derive and confirm before relying on this
+            # test's output.
+            eagle3_layers_to_capture={1, 17, 31},
+        ),
+        # Force the Eagle3 draft to match the BF16 Qwen3-8B target. Shared KV
+        # cache management requires matching target and draft KV dtypes.
+        "speculative_model_kwargs": {"torch_dtype": "bfloat16"},
+    }
+
+
 def get_ucx_tls() -> str:
     """Get UCX_TLS value based on GPU architecture.
 
@@ -993,6 +1015,63 @@ def test_async_sharded_generation_handoff():
     )
     assert_context_handoff_metadata(outputs["context"])
     assert outputs["generation"].token_ids
+    assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
+    assert outputs["generation"].text == aggregate_output.text
+    assert outputs["generation"].token_ids == aggregate_output.token_ids
+
+
+@skip_pre_hopper
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.timeout(900)
+def test_async_eagle3_full_model_handoff():
+    """Eagle3 one-model draft-token handoff, compared against an aggregate run.
+
+    Unlike the retired Llama-3.1-8B version of this test, this compares
+    against a freshly-computed aggregate (non-disaggregated) generation using
+    the same speculative_config, instead of hardcoded golden text/token IDs.
+    That avoids needing pre-recorded goldens for the new model pairing, at the
+    cost of also exercising the aggregate Eagle3 one-model path as a
+    dependency. This still needs a real GPU run to confirm Qwen3-8B +
+    Qwen3/qwen3_8b_eagle3 actually produce matching, non-trivial draft-token
+    output under this config (see the eagle3_layers_to_capture TODO in
+    qwen3_eagle3_config).
+    """
+    prompt = "What is the capital of Germany?"
+    sampling_params_kwargs = {
+        "max_tokens": 16,
+        "ignore_eos": True,
+        "top_k": 1,
+        "seed": AUTODEPLOY_DISAGG_SEED,
+    }
+    extra_config = qwen3_eagle3_config()
+
+    aggregate_output = run_aggregate_generation(
+        "Qwen3-8B",
+        world_size=1,
+        prompt=prompt,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_config=extra_config,
+    )
+    outputs = run_context_then_generation_handoff(
+        "Qwen3-8B",
+        worker_world_sizes=(1, 1),
+        generation_overlap=True,
+        prompt=prompt,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_config=extra_config,
+    )
+    context_params = outputs["context"].disaggregated_params
+    assert context_params is not None
+    assert context_params.request_type == "context_only"
+    assert len(outputs["context"].token_ids) == 1
+    assert context_params.ctx_request_id is not None
+    assert context_params.first_gen_tokens is not None
+    assert has_handoff_transport_metadata(context_params)
+    assert outputs["generation"].token_ids
+    assert has_draft_tokens(outputs["context"])
+    assert has_draft_tokens(outputs["generation"])
     assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
     assert outputs["generation"].text == aggregate_output.text
     assert outputs["generation"].token_ids == aggregate_output.token_ids
