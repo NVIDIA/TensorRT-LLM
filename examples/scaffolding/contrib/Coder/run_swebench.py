@@ -237,7 +237,7 @@ def parse_arguments():
     parser.add_argument("--max_tokens", type=int, default=16384)
     parser.add_argument("--max_iterations", type=int, default=100)
 
-    parser.add_argument("--mcp_url", default="http://0.0.0.0:8086/sse")
+    parser.add_argument("--mcp_url", default="http://127.0.0.1:8086/mcp")
     parser.add_argument("--max_mcp_connections", type=int, default=200)
 
     parser.add_argument(

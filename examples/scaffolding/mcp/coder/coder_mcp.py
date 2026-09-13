@@ -12,18 +12,17 @@ import re
 import shlex
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import httpx
 import uvicorn
 from apiary_client import ApiarySessionMux, TaskResult
-from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Mount, Route
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 
 class _ToolFormatError(Exception):
@@ -33,14 +32,15 @@ class _ToolFormatError(Exception):
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
-mcp = FastMCP("coder_tools")
-
 _client_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_client_id",
     default="stdio",
 )
 _session: ApiarySessionMux
 _mcp_auth_token: str | None = os.getenv("MCP_AUTH_TOKEN")
+
+
+mcp = FastMCP("coder_tools")
 
 _GREP_LINE_RE = re.compile(r"^(.*?):(\d+):(.*)$")
 
@@ -437,80 +437,78 @@ async def complete_task(summary: str) -> str:
     return f"Task completed: {summary}"
 
 
-def create_starlette_app(
-    mcp_server: Server,
-    *,
-    debug: bool = False,
-) -> Starlette:
-    """Create the SSE app for the Coder MCP server."""
-    sse = SseServerTransport("/messages/")
+class _ApiarySessionMiddleware:
+    """Bind Streamable HTTP requests to an Apiary sandbox identity."""
 
-    async def handle_sse(request: Request):
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] != "/mcp":
+            await self._app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
         if _mcp_auth_token:
             provided = request.headers.get("authorization", "")
             expected = f"Bearer {_mcp_auth_token}"
             if not hmac.compare_digest(provided.encode(), expected.encode()):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
+                response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                await response(scope, receive, send)
+                return
 
-        cid = request.query_params.get("client_id") or uuid.uuid4().hex[:12]
+        client_id = request.query_params.get("client_id") or uuid.uuid4().hex[:12]
         image = request.query_params.get("image", "")
-        token = _client_id.set(cid)
+        token = _client_id.set(client_id)
         try:
-            await _session.ensure_session(cid, image=image)
-        except httpx.HTTPError as error:
-            _client_id.reset(token)
-            LOGGER.warning("Failed to create sandbox for client %s: %s", cid, error)
-            return JSONResponse(
-                {"error": _format_http_error(error)},
-                status_code=502,
-            )
+            try:
+                await _session.ensure_session(client_id, image=image)
+            except httpx.HTTPError as error:
+                LOGGER.warning("Failed to create sandbox for client %s: %s", client_id, error)
+                response = JSONResponse({"error": _format_http_error(error)}, status_code=502)
+                await response(scope, receive, send)
+                return
 
-        _session.attach(cid)
-        LOGGER.info("Client %s connected (image=%s)", cid, image or "<default>")
-        try:
-            async with sse.connect_sse(
-                request.scope,
-                request.receive,
-                request._send,
-            ) as (read_stream, write_stream):
-                try:
-                    await mcp_server.run(
-                        read_stream,
-                        write_stream,
-                        mcp_server.create_initialization_options(),
-                    )
-                finally:
-                    _session.detach(cid)
-                    LOGGER.info("Client %s disconnected", cid)
+            is_session_stream = request.method == "GET"
+            if is_session_stream:
+                _session.attach(client_id)
+                LOGGER.info("Client %s connected (image=%s)", client_id, image or "<default>")
+            try:
+                await self._app(scope, receive, send)
+            finally:
+                if is_session_stream:
+                    _session.detach(client_id)
+                    LOGGER.info("Client %s disconnected", client_id)
         finally:
             _client_id.reset(token)
 
-        return Response()
 
-    async def handle_health(_: Request):
-        return JSONResponse(
-            {
-                "status": "ok",
-                "sessions": _session.active_sessions,
-            }
-        )
-
-    async def on_startup():
-        _session.start_reaper()
-
-    async def on_shutdown():
-        await _session.shutdown()
-
-    return Starlette(
-        debug=debug,
-        routes=[
-            Route("/health", endpoint=handle_health, methods=["GET"]),
-            Route("/sse", endpoint=handle_sse, methods=["GET"]),
-            Mount("/messages/", app=sse.handle_post_message),
-        ],
-        on_startup=[on_startup],
-        on_shutdown=[on_shutdown],
+@mcp.custom_route("/health", methods=["GET"])
+async def handle_health(_: Request) -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "sessions": _session.active_sessions,
+        }
     )
+
+
+def create_starlette_app() -> ASGIApp:
+    """Create the Streamable HTTP app for the Coder MCP server."""
+    app = mcp.streamable_http_app()
+    mcp_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(starlette_app: Starlette):
+        _session.start_reaper()
+        try:
+            async with mcp_lifespan(starlette_app):
+                yield
+        finally:
+            await _session.shutdown()
+
+    app.router.lifespan_context = lifespan
+    return _ApiarySessionMiddleware(app)
 
 
 def _install_uvloop() -> bool:
@@ -532,8 +530,8 @@ def main() -> None:
     _install_uvloop()
 
     parser = argparse.ArgumentParser(description="Run the Apiary-backed Coder MCP server")
-    parser.add_argument("--host", default="0.0.0.0", help="SSE bind host")
-    parser.add_argument("--port", type=int, default=8083, help="SSE bind port")
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP bind host")
+    parser.add_argument("--port", type=int, default=8083, help="HTTP bind port")
     parser.add_argument(
         "--apiary-url",
         default=os.getenv("APIARY_URL", "http://127.0.0.1:8080"),
@@ -547,12 +545,12 @@ def main() -> None:
     parser.add_argument(
         "--mcp-token",
         default=os.getenv("MCP_AUTH_TOKEN"),
-        help="Require this bearer token on the MCP SSE endpoint",
+        help="Require this bearer token on the MCP endpoint",
     )
     parser.add_argument(
         "--default-image",
         required=True,
-        help="Fallback Docker image for sandbox sessions when an SSE client "
+        help="Fallback Docker image for sandbox sessions when an MCP client "
         "omits the `image` query parameter (must already be registered with the daemon)",
     )
     parser.add_argument(
@@ -568,9 +566,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--transport",
-        choices=["sse", "stdio"],
-        default="sse",
-        help="MCP transport (default: sse)",
+        choices=["streamable-http", "stdio"],
+        default="streamable-http",
+        help="MCP transport (default: streamable-http)",
     )
     parser.add_argument(
         "--backlog",
@@ -600,7 +598,7 @@ def main() -> None:
         mcp.run(transport="stdio")
         return
 
-    app = create_starlette_app(mcp._mcp_server, debug=True)
+    app = create_starlette_app()
     LOGGER.info("Starting Coder MCP server on %s:%s", args.host, args.port)
     uvicorn.run(
         app,

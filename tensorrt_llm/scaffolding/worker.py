@@ -25,8 +25,6 @@ from urllib.parse import urlencode
 
 import httpx
 import openai
-from mcp import ClientSession
-from mcp.client.sse import sse_client
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
@@ -34,6 +32,7 @@ from tensorrt_llm.executor import GenerationExecutor, GenerationResult
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
+from .mcp_client import open_mcp_session
 from .result import ScaffoldingOutput
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, StreamGenerationTask, Task, TaskStatus,
@@ -66,7 +65,7 @@ class Worker(ABC):
     async def on_scope_end(self, scope_id: str) -> None:
         """Called when an :class:`ExecutionScope` finishes.
 
-        Override in subclasses to release resources (SSE connections,
+        Override in subclasses to release resources (MCP sessions,
         sandboxes, etc.) that were acquired under *scope_id*.  The
         default implementation is a no-op.
         """
@@ -735,54 +734,52 @@ class MCPWorker(Worker):
             TOOL_CALL = "tool_call"
             WAIT_QUEUE = "wait_queue"
 
-        async with sse_client(url) as streams:
-            async with ClientSession(*streams) as session:
-                await session.initialize()
-                response = await session.list_tools()
-                tools = response.tools
-                pending_dict = {
-                    asyncio.create_task(self.queues[index].get()):
-                    (TaskType.WAIT_QUEUE, None)
-                }
-                pending = pending_dict.keys()
-                while True:
-                    done, pending = await asyncio.wait(
-                        pending, return_when=asyncio.FIRST_COMPLETED)
+        async with open_mcp_session(url) as session:
+            response = await session.list_tools()
+            tools = response.tools
+            pending_dict = {
+                asyncio.create_task(self.queues[index].get()):
+                (TaskType.WAIT_QUEUE, None)
+            }
+            pending = pending_dict.keys()
+            while True:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED)
 
-                    for task in done:
-                        task_type, obj = pending_dict[task]
-                        if task_type == TaskType.TOOL_CALL:
-                            response = task.result()
-                            tool_call = obj
-                            tool_call.set_result(response.content[0].text)
-                        else:  # TaskType.WAIT_QUEUE
-                            queue_obj = task.result()
-                            if queue_obj is None:
-                                # Shutdown signal received
-                                # Cancel all pending tasks before exit to avoid blocking
-                                for pending_task in pending:
-                                    pending_task.cancel()
-                                if pending:
-                                    await asyncio.gather(*pending,
-                                                         return_exceptions=True)
-                                return
+                for task in done:
+                    task_type, obj = pending_dict[task]
+                    if task_type == TaskType.TOOL_CALL:
+                        response = task.result()
+                        tool_call = obj
+                        tool_call.set_result(response.content[0].text)
+                    else:  # TaskType.WAIT_QUEUE
+                        queue_obj = task.result()
+                        if queue_obj is None:
+                            # Shutdown signal received
+                            # Cancel all pending tasks before exit to avoid blocking
+                            for pending_task in pending:
+                                pending_task.cancel()
+                            if pending:
+                                await asyncio.gather(*pending,
+                                                     return_exceptions=True)
+                            return
+                        else:
+                            tool_name = queue_obj.tool_name
+                            args = queue_obj.args
+                            if tool_name in [tool.name for tool in tools]:
+                                new_task = asyncio.create_task(
+                                    session.call_tool(tool_name, args))
+                                pending_dict[new_task] = (TaskType.TOOL_CALL,
+                                                          queue_obj)
+                                pending.add(new_task)
                             else:
-                                tool_name = queue_obj.tool_name
-                                args = queue_obj.args
-                                if tool_name in [tool.name for tool in tools]:
-                                    new_task = asyncio.create_task(
-                                        session.call_tool(tool_name, args))
-                                    pending_dict[new_task] = (
-                                        TaskType.TOOL_CALL, queue_obj)
-                                    pending.add(new_task)
-                                else:
-                                    queue_obj.set_result(None)
-                                # Wait next queue object
-                                new_wait_queue_task = asyncio.create_task(
-                                    self.queues[index].get())
-                                pending_dict[new_wait_queue_task] = (
-                                    TaskType.WAIT_QUEUE, None)
-                                pending.add(new_wait_queue_task)
+                                queue_obj.set_result(None)
+                            # Wait next queue object
+                            new_wait_queue_task = asyncio.create_task(
+                                self.queues[index].get())
+                            pending_dict[new_wait_queue_task] = (
+                                TaskType.WAIT_QUEUE, None)
+                            pending.add(new_wait_queue_task)
 
     async def init_in_asyncio_event_loop(self):
         for index in range(len(self.urls)):
@@ -819,10 +816,10 @@ class MCPWorker(Worker):
 
 
 class ApiaryMCPWorker(Worker):
-    """MCP worker with per-scope SSE connections for Apiary sandbox isolation.
+    """MCP worker with per-scope sessions for Apiary sandbox isolation.
 
-    Unlike :class:`MCPWorker` which maintains a single shared SSE connection,
-    ``ApiaryMCPWorker`` creates a separate SSE connection (and therefore a
+    Unlike :class:`MCPWorker` which maintains a shared session per server,
+    ``ApiaryMCPWorker`` creates a separate MCP session (and therefore a
     separate Apiary sandbox session) for each :class:`ExecutionScope`.
     The scope is read from the :data:`current_scope` ContextVar that
     :class:`ScaffoldingLlm` sets automatically for every request and
@@ -830,7 +827,7 @@ class ApiaryMCPWorker(Worker):
 
     Usage::
 
-        worker = ApiaryMCPWorker("http://localhost:8082/sse")
+        worker = ApiaryMCPWorker("http://localhost:8082/mcp")
         # No init_in_asyncio_event_loop() needed -- connections are lazy.
     """
 
@@ -873,9 +870,9 @@ class ApiaryMCPWorker(Worker):
 
     def set_scope_params(self, request_id: str,
                          **params: str | list[str]) -> None:
-        """Associate extra SSE URL query parameters with *request_id*.
+        """Associate extra MCP URL query parameters with *request_id*.
 
-        These parameters are appended to the SSE URL when the connection
+        These parameters are appended to the MCP URL when the session
         for this request (or any of its child scopes) is created.  Call
         this **after** :meth:`ScaffoldingLlm.generate_async` returns, using
         ``result.id`` as the *request_id*.
@@ -897,20 +894,17 @@ class ApiaryMCPWorker(Worker):
     async def _conn_loop(self, url: str, queue: asyncio.Queue,
                          ready: asyncio.Event):
         try:
-            async with sse_client(url) as streams:
-                async with ClientSession(*streams) as session:
-                    await session.initialize()
-                    ready.set()
-                    while True:
-                        tc = await queue.get()
-                        if tc is None:
-                            return
-                        try:
-                            resp = await session.call_tool(
-                                tc.tool_name, tc.args)
-                            tc.set_result(resp.content[0].text)
-                        except Exception as exc:
-                            tc.set_result(f"Error: {exc}", error=True)
+            async with open_mcp_session(url) as session:
+                ready.set()
+                while True:
+                    tc = await queue.get()
+                    if tc is None:
+                        return
+                    try:
+                        resp = await session.call_tool(tc.tool_name, tc.args)
+                        tc.set_result(resp.content[0].text)
+                    except Exception as exc:
+                        tc.set_result(f"Error: {exc}", error=True)
         except Exception:
             ready.set()  # unblock waiters even on connection failure
 
@@ -943,7 +937,7 @@ class ApiaryMCPWorker(Worker):
         return conn
 
     async def release_connection(self, scope_id: str) -> None:
-        """Close the SSE connection for *scope_id* and release the slot."""
+        """Close the MCP session for *scope_id* and release the slot."""
         self._ensure_primitives()
         async with self._lock:
             conn = self._conns.pop(scope_id, None)
@@ -983,7 +977,7 @@ class ApiaryMCPWorker(Worker):
         await self.release_connection(scope_id)
 
     async def async_shutdown(self):
-        """Close all SSE connections and wait for background tasks."""
+        """Close all MCP sessions and wait for background tasks."""
         self._ensure_primitives()
         async with self._lock:
             ids = list(self._conns.keys())
