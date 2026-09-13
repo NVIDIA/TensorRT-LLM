@@ -71,7 +71,7 @@ ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.08-py3"
 
 MODEL_EXPRESS_VERSION = "0.5.1"
 MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
@@ -3386,6 +3386,9 @@ def getStartingPortForHost(String hostNodeName, String stageName = "") {
  * Gets the HOST_NODE_NAME from the current environment.
  * Falls back to hostname if HOST_NODE_NAME is not set.
  *
+ * The name must stay distinct per pod: getStartingPortForHost() hands out a
+ * private port section per name.
+ *
  * @return The host node name
  */
 def getHostNodeName() {
@@ -4033,7 +4036,7 @@ def launchTestListCheck(pipeline)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
             // --validate --parity: after --l0/--qa generate the collectable lists, assert every
             // statically-verified parametrize ID is actually collectable (validate<->collection parity).
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.08 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -5013,12 +5016,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-                    mambaArch=\$(uname -m)
-                    pip3 install --no-deps \
-                        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl" \
-                        "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl"
-                """)
+                // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once
+                // upstream publishes wheels built against this base image's torch.
+                // They used to be installed here, from
+                //   causal-conv1d v1.6.2  causal_conv1d-1.6.1+cu13torch26.04cxx11abiTRUE
+                //   mamba v2.3.0          mamba_ssm-2.3.0+cu13torch26.01cxx11abiTRUE
+                // but the newest builds upstream offers target torch 26.07 and 26.04,
+                // so on DLFW 26.08 the extension loads with an undefined c10 symbol,
+                // materialize_cow_storage(StorageImpl&). A broken install is worse
+                // than none: transformers gates its causal_conv1d import on a
+                // package-metadata probe, which a broken install still passes, so
+                // modeling_qwen3_5_moe raises at import and every test collected from
+                // a module that imports it dies as a collection error. Absent, the
+                // gate says no and the model falls back to its Python path -- slower,
+                // and it OOMs on Nemotron-H, which is why
+                // test_llm_update_weights_nemotron_h is waived under nvbugs/6729495.
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
@@ -5027,7 +5039,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
                 // ModelExpress imports nixl._api, while requirements-dev.txt
                 // installs only the nixl-cu13 backend. Install the matching
-                // namespace shim without pulling the unused CUDA 12 backend.
+                // namespace shim without pulling the unused CUDA 12 backend. The
+                // shim only dispatches; which nixl_cu13 it resolves to is decided
+                // by the PYTHONPATH runLLMTestlistOnPlatform sets for this stage.
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")
             }
         }
@@ -5447,7 +5461,40 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        // Open MPI 5 fails a singleton MPI_Comm_spawn -- one per MpiPoolSession
+        // worker -- once the hostname PMIx is handed reaches 31 characters, and the
+        // pod name is 63. PMIX_HOSTNAME replaces only the name PMIx uses, so the pod
+        // keeps its own for logging and for port sectioning in getHostNodeName().
+        // Not inside runLLMTestlistOnPlatformImpl: the SLURM path runs that too, on
+        // the compute node, where one name shared by every node would break locality.
+        // PRRTE also refuses to fork its DVM as root without the ALLOW_RUN_AS_ROOT
+        // pair (Open MPI 4 only checked that in mpirun). An outer `mpirun
+        // --allow-run-as-root` does not cover the DVM a nested MPI_Comm_spawn
+        // starts, so test_mpi_session's spawn dies with MPI_ERR_UNKNOWN.
+        def testEnv = [
+            "OMPI_ALLOW_RUN_AS_ROOT=1",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "PRTE_ALLOW_RUN_AS_ROOT=1",
+            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "PMIX_HOSTNAME=mpi-node0",
+        ]
+        // The NGC 26.08 torch links HPCX's UCX directly (libtorch_cuda.so lists
+        // libucp/libucs/libucc as NEEDED), so plain `import torch` already maps
+        // /opt/hpcx/ucx into the process. The PyPI nixl-cu13 wheel then loads the
+        // second UCX it bundles -- auditwheel renamed those sonames, so nothing
+        // dedups them -- and two UCX runtimes registering ucm hooks in one process
+        // segfault inside uct_md_query_tl_resources. Resolve nixl_cu13 to the
+        // build in the image instead: it links the container UCX, leaving exactly
+        // one stack loaded. Ahead of site-packages, so the PyPI wheel can stay
+        // installed for everything else. Prepended, not overwritten, so whatever
+        // PYTHONPATH the environment already carries survives.
+        if (stageName.contains("-ModelExpress-")) {
+            def nixlPythonPath = "/opt/nvidia/nvda_nixl/lib/python3/dist-packages"
+            testEnv += "PYTHONPATH=" + (env.PYTHONPATH ? "${nixlPythonPath}:${env.PYTHONPATH}" : nixlPythonPath)
+        }
+        withEnv(testEnv) {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -6216,7 +6263,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
+        // Disabled while https://nvbugs/6759612 is open. The verl_setup fixture clones verl and
+        // pip-installs it; verl hard-pins numpy<2.0.0, which is mutually exclusive with the
+        // numpy>=2.0.0 TensorRT-LLM asks for, so the install downgrades numpy out from under
+        // the interpreter. Importing tensorrt_llm then fails and every test in the stage goes
+        // with it, which makes the whole stage noise rather than signal.
+        // "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
@@ -6836,17 +6888,36 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-2")
+                            // Match the CUDA the DLFW base image builds the wheel with.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
                         }
-                        // Extra PyTorch CUDA 13.2 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
+                        // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
-                            echo "###### Extra PyTorch CUDA 13.2 install Start ######"
+                            echo "###### Extra CUDA 13 PyTorch install Start ######"
+                            // cu130 is PyTorch's only CUDA 13 channel; it runs on the toolkit above
+                            // through CUDA minor version compatibility.
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            // This must stay equal to what requirements.txt resolves to from the public
+                            // index, which is the highest public torch its ceiling admits: the wheel under
+                            // test is linked against that libtorch, and a mismatch fails the import with an
+                            // undefined c10 symbol rather than anything that names a version.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
-                        def libEnv = []
+                        // A stock image, so nothing here went through Dockerfile.multi or
+                        // install_base.sh: what a singleton MPI_Comm_spawn needs has to be
+                        // redone by hand, or checkPipInstall's quickstart hangs in
+                        // MpiPoolSession until the timeout. PRRTE will not fork its DVM as
+                        // root without these (Open MPI 4 only checked that in mpirun), and
+                        // PMIX_HOSTNAME is the 31-character limit -- see
+                        // runLLMTestlistOnPlatform.
+                        def libEnv = [
+                            "OMPI_ALLOW_RUN_AS_ROOT=1",
+                            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PMIX_HOSTNAME=mpi-node0",
+                        ]
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {
                                 trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
