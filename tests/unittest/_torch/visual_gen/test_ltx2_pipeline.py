@@ -1287,6 +1287,9 @@ class TestLTX2TwoStageLoRAHelpers:
             def forward(self, x):
                 return self.lin(x)
 
+            def register_cuda_graph_extra_key_fns(self, runner):
+                self.registered_runner = runner
+
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
         # __init__ is bypassed here; BasePipeline.device now reads self._device
         # (set in __init__), so initialize it explicitly for the warmup path.
@@ -1344,8 +1347,13 @@ class TestLTX2TwoStageLoRAHelpers:
         """CUDA graph setup runs before the two-stage model_config is assigned."""
 
         class TinyTransformer:
+            registered_runner = None
+
             def forward(self, *args, **kwargs):
                 return args, kwargs
+
+            def register_cuda_graph_extra_key_fns(self, runner):
+                self.registered_runner = runner
 
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
         pipeline.pipeline_config = DiffusionPipelineConfig(
@@ -1362,6 +1370,9 @@ class TestLTX2TwoStageLoRAHelpers:
         runner = pipeline._cuda_graph_runners["transformer"]
         assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
         assert runner._lora_state_getter() == "original"
+        # Same contract as the single-stage pipeline: the transformer's extra
+        # CUDA-graph keys (skip-softmax / Sol-Attn phase) must be registered.
+        assert pipeline.transformer.registered_runner is runner
         assert pipeline.transformer.forward.__wrapped__.__self__ is pipeline.transformer
 
     def test_cuda_graph_rejects_nonpersistent_lora_bindings(self):
