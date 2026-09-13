@@ -306,6 +306,11 @@ class PrimsTSFusedMoE(TRTLLMGenFusedMoE):
         self._locality_domain_plan = self._plan_locality_domain()
         if not self._locality_domain_plan.enabled:
             return
+        # Locality pools cannot reclaim the primary allocator's cached blocks
+        # on allocation failure. Release old layers' source-weight storage
+        # before migrating another layer into the locality pools.
+        with torch.cuda.device(self.w3_w1_weight.device):
+            torch.cuda.empty_cache()
         runtime = LocalityDomainRuntime(self._locality_domain_plan.num_partitions)
         runtime.prepare_for_capture(self._locality_domain_plan)
         shards = []

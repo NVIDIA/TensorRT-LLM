@@ -141,6 +141,48 @@ rubin = pytest.mark.skipif(get_sm_version() != 107, reason="requires Rubin local
 
 
 @rubin
+def test_prims_ts_locality_releases_stale_primary_pool_storage(monkeypatch):
+    from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+    from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+
+    monkeypatch.delenv("DISABLE_LOCALITY_DOMAINS", raising=False)
+    is_locality_domain_enabled.cache_clear()
+    config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=512, intermediate_size=256),
+        moe_backend="PRIMS_TS",
+        locality_domain_policy=LocalityDomainPolicy(enabled=True),
+    )
+    module = create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=256,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=config,
+        layer_idx=0,
+        activation=SwigluActivation(),
+    ).cuda()
+    # Finish the primary weight layout before simulating storage left behind
+    # by previously migrated layers. The locality transform is still pending.
+    TRTLLMGenFusedMoE.transform_weights(module.backend)
+    torch.cuda.empty_cache()
+    cached_bytes = 512 * 1024**2
+    old_layer_storage = torch.empty(cached_bytes, device="cuda", dtype=torch.uint8)
+    del old_layer_storage
+    torch.cuda.synchronize()
+    unused_before = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    assert unused_before >= cached_bytes
+
+    module.post_load_weights()
+    torch.cuda.synchronize()
+    assert module.backend.uses_locality_domain
+    assert len(module.backend._locality_domain_weight_shards) == 2
+    unused_after = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    assert unused_after < cached_bytes // 2
+
+
+@rubin
 @pytest.mark.parametrize("nvfp4,situ", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("tokens", [1, 8, 64, 257])
 def test_prims_ts_locality_matches_unpartitioned(nvfp4, situ, tokens, monkeypatch):
