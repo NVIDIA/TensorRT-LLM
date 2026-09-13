@@ -90,7 +90,12 @@ if _BACKEND == "python":
         KVCacheUpdatedData,
         UniqueToken,
     )
-    from ._exceptions import CuError, OutOfMemoryError, OutOfPagesError  # noqa: F401
+    from ._exceptions import (  # noqa: F401
+        CorruptedError,
+        CuError,
+        OutOfMemoryError,
+        OutOfPagesError,
+    )
     from ._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -242,6 +247,7 @@ else:
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
     PlannedDropHandle = _cpp.PlannedDropHandle
     CuError = _cpp.CuError
+    CorruptedError = _cpp.CorruptedError
 
     # Symbols added on main that are not yet ported to the C++ backend.
     # TODO(kvCacheManagerV2-cpp): port these and replace the fallbacks.
@@ -377,6 +383,7 @@ __all__ = [
     "TokenIdExt",
     "UniqueToken",
     "AttnLifeCycle",
+    "CorruptedError",
     "CuError",
     "OutOfMemoryError",
     "_KVCache",

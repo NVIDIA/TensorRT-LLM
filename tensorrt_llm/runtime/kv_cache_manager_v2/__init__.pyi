@@ -36,6 +36,21 @@ from typing import (
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
 
+class CorruptedError(Exception):
+    """Raised by every public entry point once a broken invariant has been recorded.
+
+    Only the C++ backend has the latch that raises this; the pure-Python backend never does.
+    """
+
+def poison_reason() -> str | None:
+    """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
+
+def take_poison() -> str | None:
+    """Report the recorded violation and clear it, but only once no manager is alive."""
+
+def num_live_managers() -> int:
+    """Number of constructed, not-yet-destroyed managers."""
+
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
