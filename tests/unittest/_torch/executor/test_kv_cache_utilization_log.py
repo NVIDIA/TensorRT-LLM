@@ -54,8 +54,7 @@ def _profiler(executor, interval, monkeypatch):
 
 @pytest.mark.parametrize("include_pools", [False, True])
 def test_capacity_snapshot_uses_tier_local_pools_without_iteration_stats(include_pools):
-    # GPU and host pool counts differ; exclude disk. Host reports occupancy (1 - free/total)
-    # because offloaded pages are all evictable.
+    # GPU and host pool counts differ; exclude disk. Host counts evictable pages as occupied.
     manager = _manager(
         [CacheTier.GPU_MEM, CacheTier.HOST_MEM, CacheTier.DISK],
         {

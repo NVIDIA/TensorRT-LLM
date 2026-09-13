@@ -3681,10 +3681,9 @@ class KVCacheManagerV2(BaseResourceManager):
             and evictable slots, or ``None`` without GPU capacity. ``pool_utilization`` is empty
             unless ``include_pool_details`` is set; otherwise ``"gpu"`` maps to that ratio per GPU
             pool group and ``"host"`` maps to the occupancy ``1 - free / total`` per host pool
-            group (offloaded pages are all evictable by design, so ``available`` would hide a full
-            host pool), or to ``None`` when there is no host tier. List positions are tier-local
-            pool group ids and a pool group without capacity reads ``None``. Disk tiers are not
-            reported.
+            group, including evictable cached pages, or to ``None`` when there is no host tier.
+            List positions are tier-local pool group ids; zero-capacity groups read ``None``.
+            Disk tiers are not reported.
         """
         gpu_stats = self._get_storage_statistics(GPU_LEVEL)
         total, available = self._sum_capacity(gpu_stats)

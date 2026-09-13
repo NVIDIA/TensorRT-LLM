@@ -165,8 +165,8 @@ tier or a pool group with zero capacity is reported as `N/A`.
 
 `kv_cache_util` and `kv_cache_gpu_pool_util` are `1 - (free + evictable) / total` in
 slots: capacity that is not immediately reclaimable, weighted by slot count rather than
-bytes. Offloaded host pages are all evictable by design, so `kv_cache_host_pool_util`
-reports occupancy, `1 - free / total`. Pool fields are omitted on unsampled iterations
+bytes. `kv_cache_host_pool_util` reports occupancy, `1 - free / total`, including
+evictable cached pages. Pool fields are omitted on unsampled iterations
 rather than repeating old samples, so sampling can miss short-lived peaks.
 
 ## MoE Expert Load Balance Analysis (Perfect Router)
