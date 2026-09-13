@@ -194,6 +194,46 @@ def test_prims_ts_bf16_blackwell_reference(tokens):
 
 @rubin
 @pytest.mark.parametrize("nvfp4", [False, True])
+def test_prims_ts_locality_reuses_compiled_gemm(nvfp4, monkeypatch):
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+    from tensorrt_llm._torch.moe.flashinfer.prims_ts.moe import compile_cache
+
+    monkeypatch.delenv("DISABLE_LOCALITY_DOMAINS", raising=False)
+    is_locality_domain_enabled.cache_clear()
+    # A local intermediate width of 64 is one complete NVFP4 SF group.
+    # Multiple token blocks also exercise the full shared SF leading stride.
+    (baseline, candidate), _ = make_moe_pair(nvfp4, False, intermediate=128)
+    torch.manual_seed(83)
+    x = torch.randn(257, 512, device="cuda", dtype=torch.bfloat16) * 0.5
+    logits = torch.randn(257, 8, device="cuda")
+    with torch.inference_mode(), AutoTuner.get().capture() as capture:
+        expected = baseline(x, logits)
+        candidate(x, logits)
+    context = capture._captured_contexts[-1]
+    runner, inputs = context["runners"][0], context["inputs"]
+    launches = {"fc1": [], "fc2": []}
+    original = compile_cache.get_compiled_gemm
+
+    def record_compiled(config_hash, stage, io, stream):
+        compiled = original(config_hash, stage, io, stream)
+        launches[stage].append((config_hash, compiled))
+        return compiled
+
+    monkeypatch.setattr(compile_cache, "get_compiled_gemm", record_compiled)
+    with torch.inference_mode():
+        actual = torch.empty_like(x)
+        runner(inputs, output=actual)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+    for children in launches.values():
+        assert len(children) == 2
+        assert children[0][0] == children[1][0]
+        assert children[0][1] is children[1][1]
+
+
+@rubin
+@pytest.mark.parametrize("nvfp4", [False, True])
 def test_prims_ts_locality_empty_and_inactive_experts(nvfp4, monkeypatch):
     from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
@@ -283,7 +323,7 @@ def test_prims_ts_locality_concurrent_autotune(nvfp4, monkeypatch):
     assert runner.locality_runtime is not None
     assert len(runner.locality_weights) == 2
     assert not context["tuning_config"].use_cold_l2_cache
-    assert "locality_v1" in runner.unique_id()
+    assert "locality_v2" in runner.unique_id()
     with torch.inference_mode(), autotune():
         actual = candidate(x, logits)
     torch.testing.assert_close(actual, expected, rtol=0.1, atol=0.1)

@@ -324,7 +324,11 @@ split; otherwise execution keeps the ordinary unpartitioned path.
 Both FC1 partitions write their channel ranges directly into one intermediate
 buffer, including NVFP4 scale-factor storage. After joining FC1, both FC2
 partitions consume that full intermediate and write their output ranges before
-one native weighted unpermutation. This path uses separated routing and
+one native weighted unpermutation. Each FC shares one compiled GEMM between
+its partitions: the launch adapter offsets output and scale-factor pointers
+while retaining the full output stride. Keep the partition ID out of the
+compile-time config; separate kernel specializations increase concurrent
+launch latency on Rubin. This path uses separated routing and
 explicit stream dependencies with PDL disabled. The ordinary Blackwell path
 retains its existing routing and PDL selection. PrimsTS NVFP4 locality supports
 SwiGLU and SiTU; BF16 locality supports SwiGLU.

@@ -58,8 +58,15 @@ def _partition_output_hidden(cfg, out_hidden: int) -> int:
     return out_hidden // cfg.output_num_partitions
 
 
-def _partition_output_ptr(cfg, output_buf: torch.Tensor, out_hidden: int) -> int:
+def _partition_output_ptr(
+    cfg, output_buf: torch.Tensor, out_hidden: int, output_partition_id: int
+) -> int:
     """Offset into a full shared output without making a strided tensor view."""
+    if (
+        not isinstance(output_partition_id, int)
+        or not 0 <= output_partition_id < cfg.output_num_partitions
+    ):
+        raise ValueError("output_partition_id must identify an output partition")
     if cfg.output_num_partitions == 1:
         return output_buf.data_ptr()
     local_width = out_hidden // 2 if cfg.has_gated_epilogue else out_hidden
@@ -68,10 +75,26 @@ def _partition_output_ptr(cfg, output_buf: torch.Tensor, out_hidden: int) -> int
         raise ValueError("Partitioned output requires a contiguous full allocation")
     if output_buf.shape[1] != packed_width * cfg.output_num_partitions:
         raise ValueError("Partitioned output must cover the full output width")
-    offset = cfg.output_partition_id * packed_width * output_buf.element_size()
+    offset = output_partition_id * packed_width * output_buf.element_size()
     if offset % 16:
         raise ValueError("Partitioned output pointers must be 16-byte aligned")
     return output_buf.data_ptr() + offset
+
+
+def _partition_output_scale_ptr(
+    cfg, output_scale: torch.Tensor, output_width: int, output_partition_id: int
+) -> int:
+    """Offset a full swizzled SF allocation by whole output-channel groups."""
+    if cfg.output_num_partitions == 1:
+        return output_scale.data_ptr()
+    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
+
+    group_width = cfg.output_sf_block_size_c * 4
+    if output_width % group_width:
+        raise ValueError("Partitioned output width must align to a scale-factor group")
+    sf_rows = 8 if cfg.sf_layout_c == int(SfLayout.R8c4) else 128
+    offset = output_partition_id * (output_width // group_width) * (sf_rows * 4)
+    return output_scale.data_ptr() + offset * output_scale.element_size()
 
 
 def _check_fp8_scale_storage(
@@ -363,6 +386,7 @@ def build_bf16_launch_io(
     fc: Literal["fc1", "fc2"],
     cfg,
     cfg_is_normalized: bool = False,
+    output_partition_id: int = 0,
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm2_weights: torch.Tensor,
@@ -408,7 +432,7 @@ def build_bf16_launch_io(
         output_buf = gemm2_output
 
     out_hidden = _partition_output_hidden(cfg, out_hidden)
-    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden)
+    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden, output_partition_id)
 
     if not cfg_is_normalized:
         cfg = _runtime_config(cfg, in_hidden)
@@ -654,6 +678,7 @@ def build_nvfp4_launch_io(
     fc: Literal["fc1", "fc2"],
     cfg,
     cfg_is_normalized: bool = False,
+    output_partition_id: int = 0,
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -719,7 +744,7 @@ def build_nvfp4_launch_io(
         scale_gate = output2_scale_scalar
 
     out_hidden = _partition_output_hidden(cfg, out_hidden)
-    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden)
+    output_ptr = _partition_output_ptr(cfg, output_buf, out_hidden, output_partition_id)
 
     # The TRTLLM caller caches a private config normalized for this K.
     if not cfg_is_normalized:
@@ -848,7 +873,9 @@ def build_nvfp4_launch_io(
         )
         sf_c_dp = make_ptr(
             sf_dtype,
-            output_scale.data_ptr(),
+            _partition_output_scale_ptr(
+                cfg, output_scale, logical_output_m, output_partition_id
+            ),
             cutlass.AddressSpace.gmem,
             assumed_align=16,
         )

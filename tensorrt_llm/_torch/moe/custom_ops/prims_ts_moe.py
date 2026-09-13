@@ -340,7 +340,6 @@ def _run_prims_ts_moe(
                 if locality_runtime is not None:
                     options.update(
                         output_num_partitions=len(weights),
-                        output_partition_id=partition_id,
                         use_tma_oob_opt=0,
                     )
                 prepared_config, config_hash = _materialize_gemm_config(
@@ -371,6 +370,11 @@ def _run_prims_ts_moe(
                     intermediate_size=intermediate_size,
                     hidden_size=hidden_size,
                 )
+                if locality_runtime is not None:
+                    # The partition selects output addresses, not kernel code.
+                    # Separate specializations add substantial tail latency
+                    # when the two localized GEMMs execute concurrently.
+                    io_kwargs["output_partition_id"] = partition_id
                 if not is_bf16:
                     io_kwargs.update(
                         hidden_states_scale=hidden_states_scale,
@@ -454,7 +458,7 @@ class PrimsTSMoERunner(TunableRunner):
         if get_sm_version() == 107:
             identity += ("rubin_k128_v1",)
         if self.locality_runtime is not None:
-            return identity + ("locality_v1", self.locality_runtime.topology_identity())
+            return identity + ("locality_v2", self.locality_runtime.topology_identity())
         return identity
 
     def should_profile_tactic_in_subprocess(

@@ -44,5 +44,5 @@ vendors:
     - prims_ts/moe/compile_cache.py
     - prims_ts/moe/prims_ts_moe_configs.json
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts-moe.patch
-    patch_digest: sha256:27520eec442967fa3a86a17ce7660ba1aa8bcdf76d5163281e79456e529fc980
-    digest: sha256-tree-v1:79549b92368c3109141e8cadede2501cc303aa127158fe4c8eb08226a3dbb04b
+    patch_digest: sha256:dba714661c767dc8512e74d0377975f493440682fd6d5328518e757976225685
+    digest: sha256-tree-v1:c8c5f3712279075d5147a2603b1ddb34ddc0fe646146f809ff87db0d0f5e87fd

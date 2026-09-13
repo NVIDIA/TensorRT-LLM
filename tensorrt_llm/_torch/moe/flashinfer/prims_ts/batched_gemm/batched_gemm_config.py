@@ -635,9 +635,6 @@ class BatchedGemmConfig:
     output rows and quantization scales use the full output leading dimension.
     """
 
-    output_partition_id: int = 0
-    """Output-channel shard written by this launch, starting at zero."""
-
     tile_scheduler: int = int(TileScheduler.STATIC)
     """CTA scheduling mode, as a :class:`TileScheduler` value.
 
@@ -2883,11 +2880,6 @@ def validate_config(
         or cfg.output_num_partitions not in (1, 2)
     ):
         raise ValueError("output_num_partitions must be 1 or 2")
-    if (
-        not isinstance(cfg.output_partition_id, int)
-        or not 0 <= cfg.output_partition_id < cfg.output_num_partitions
-    ):
-        raise ValueError("output_partition_id must identify an output partition")
     if cfg.output_num_partitions > 1:
         if not cfg.is_swap_ab:
             raise ValueError("Partitioned output requires swapAB")

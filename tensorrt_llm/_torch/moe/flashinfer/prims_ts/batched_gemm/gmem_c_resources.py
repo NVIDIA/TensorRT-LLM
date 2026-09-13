@@ -1729,10 +1729,10 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _sf_c_index(self, m_row, n_col, output_m):
-        # Both FC1 children quantize directly into the shared full-width SF
-        # layout consumed by FC2. Their channel coordinates remain disjoint.
+        # The launch adapter offsets each partition's SF pointer. Both FC1
+        # children use local channel coordinates with the full stride consumed
+        # by FC2, allowing them to share one compiled kernel.
         # Keep separate locals for repeated calls from the unrolled DSL epilogue.
-        global_m_row = m_row + output_m * Int32(self.cfg.output_partition_id)
         global_output_m = output_m * Int32(self.cfg.output_num_partitions)
         block_m = Int32(self.cfg.output_sf_block_size_c)
         group_m = block_m * Int32(4)
@@ -1742,7 +1742,7 @@ class GmemCResource(MemoryResource):
             # semantics into correction branches.
             block_shift = 4 if self.cfg.output_sf_block_size_c == 16 else 5
             group_shift = block_shift + 2
-            m_block = global_m_row >> Int32(block_shift)
+            m_block = m_row >> Int32(block_shift)
             m_groups = (global_output_m + group_m - Int32(1)) >> Int32(group_shift)
             if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
                 return (
@@ -1758,7 +1758,7 @@ class GmemCResource(MemoryResource):
                 + ((n_col >> Int32(5)) & Int32(3)) * Int32(4)
                 + (m_block & Int32(3))
             )
-        m_block = global_m_row // block_m
+        m_block = m_row // block_m
         m_groups = (global_output_m + group_m - Int32(1)) // group_m
         if cutlass.const_expr(self.cfg.sf_layout_c == int(SfLayout.R8c4)):
             return (
