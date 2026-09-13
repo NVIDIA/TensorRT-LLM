@@ -369,6 +369,18 @@ class CachedModelLoader:
         mpi_session: Optional[MpiSession] = None,
         workspace: Optional[str] = None,
     ):
+        """Initialize the loader.
+
+        Args:
+            llm_args: The LLM arguments describing the model, tokenizer and
+                parallelism configuration.
+            llm_build_stats: A weak reference to the build statistics object
+                that records timing and cache information for this build.
+            mpi_session: The MPI session used to dispatch work to all ranks.
+                Required for multi-GPU runs; ignored on a single GPU.
+            workspace: Directory used to hold intermediate artifacts. A
+                temporary directory is created when not provided.
+        """
         self.llm_args = llm_args
         self.mpi_session = mpi_session
         self._workspace = workspace or tempfile.TemporaryDirectory()
@@ -380,6 +392,12 @@ class CachedModelLoader:
 
     @property
     def workspace(self) -> Path:
+        """The workspace directory used for intermediate build artifacts.
+
+        Returns:
+            The path to the workspace, resolved from the temporary directory
+            created at construction time or from the caller-provided path.
+        """
         return Path(self._workspace.name) if isinstance(
             self._workspace, tempfile.TemporaryDirectory) else Path(
                 self._workspace)
@@ -390,6 +408,20 @@ class CachedModelLoader:
         *args,
         **kwargs,
     ) -> List[Any]:
+        """Run a task on every worker and collect the results.
+
+        On multi-GPU runs the task is dispatched through the MPI session and
+        executed on all ranks. On a single GPU it is called directly in the
+        current process.
+
+        Args:
+            task: The callable to execute on each worker.
+            *args: Positional arguments forwarded to ``task``.
+            **kwargs: Keyword arguments forwarded to ``task``.
+
+        Returns:
+            A list holding one result per worker, in rank order.
+        """
         if self.llm_args.parallel_config.is_multi_gpu:
             return self.mpi_session.submit_sync(task, *args, **kwargs)
         else:
@@ -413,7 +445,22 @@ class CachedModelLoader:
         return model_obj.model_dir
 
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
+        """Prepare the model for execution, downloading checkpoints as needed.
 
+        Downloads the speculative (draft) model when one is configured, then
+        downloads the target model and refreshes the quantization config from
+        the checkpoint. The ``_autodeploy`` backend returns early because it
+        does not use :class:`ModelLoader`.
+
+        Returns:
+            A ``(engine_dir, hf_model_dir)`` tuple. ``engine_dir`` is always
+            ``None`` on the supported backends; ``hf_model_dir`` is the local
+            directory holding the Hugging Face checkpoint, or ``""`` for the
+            ``_autodeploy`` backend.
+
+        Raises:
+            ValueError: If the configured backend is not supported.
+        """
         # Download speculative model from HuggingFace if needed (all backends)
         if (self.llm_args.speculative_config is not None and
                 self.llm_args.speculative_config.speculative_model is not None):
