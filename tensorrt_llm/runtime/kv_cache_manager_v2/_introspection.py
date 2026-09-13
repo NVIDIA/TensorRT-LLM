@@ -44,6 +44,14 @@ def _cpp_introspection_module() -> Any | None:
     return getattr(package, "_cpp_introspection", None)
 
 
+def poison_for_testing(reason: str) -> None:
+    """Set the poison latch directly, to exercise the refusal paths."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is None:
+        raise RuntimeError("the poison latch requires the C++ backend")
+    cpp_introspection.poison_for_testing(reason)
+
+
 def create_test_padding_cold_page_codec(
     cold_page_bytes_by_layer: dict[int, int],
 ) -> Any:

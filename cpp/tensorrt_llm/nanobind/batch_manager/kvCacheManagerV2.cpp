@@ -808,6 +808,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
+    static nb::object sCorruptedError = nb::exception<kv::CorruptedError>(m, "CorruptedError");
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 
@@ -1616,7 +1617,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, std::vector<kv::CacheTierConfig> cacheTiers,
                 nb::list layers, float maxUtilForResume, bool enablePartialReuse, int reuseMatchBackoff,
-                std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
+                std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly)
@@ -1648,8 +1649,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("tokens_per_block"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
-            nb::arg("reuse_match_backoff") = 0, nb::arg("typical_step") = std::nullopt,
-            nb::arg("constraints") = std::vector<kv::BatchDesc>{}, nb::arg("initial_pool_ratio").none() = std::nullopt,
+            nb::arg("reuse_match_backoff") = 0, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
+            nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
             nb::arg("enable_stats") = true, nb::arg("text_only") = false)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
@@ -1705,16 +1706,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
             {
-                if (!beamSearchIndices.is_none())
-                {
-                    PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
-                    throw nb::python_error();
-                }
-                // Note: an empty token list with is_end=True must still stop committing,
-                // so we do not early-return on empty; commit() handles it.
+                // An empty token list with is_end=True must still stop committing, so we do not
+                // early-return on empty; commit() handles it. beam_search_indices is only
+                // rejected when there are tokens, matching the reference ordering.
                 withTokens(acceptedInputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
                     {
+                        if (view.size() != 0 && !beamSearchIndices.is_none())
+                        {
+                            PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
+                            throw nb::python_error();
+                        }
                         // commit() sources knownNoDigest from the KvCache's text_only flag. Guard
                         // that claim against the actual tokens: a text_only sequence committing a
                         // digest would silently corrupt the block-key hash.
@@ -1746,7 +1748,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::ndarray<nb::numpy, int const, nb::ndim<1>>(
                     span.ptr, {static_cast<size_t>(span.len)}, nb::handle());
             },
-            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0)
+            nb::arg("layer_group_id"), nb::arg("beam_id") = 0)
         .def(
             "get_ssm_block_base_index",
             [](kv::KvCache const& self, int layerGroupId, int beamId)
@@ -1811,7 +1813,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {
                 return self.getAggregatedPageIndices(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIdx}, validOnly);
             },
-            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0, nb::arg("valid_only") = false,
+            nb::arg("layer_group_id"), nb::arg("beam_id") = 0, nb::arg("valid_only") = false,
             // Takes the shared API lock, so it can block on a writer.
             nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -1849,6 +1851,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // Make Status accessible as _KVCache.Status.
     m.attr("_KVCache").attr("Status") = kvCacheStatus;
 
+    // Reports the first invariant violation KVCM2 recorded, if any. Once set, every manager in
+    // this process refuses further work and raises CorruptedError. Never clears, so a server can
+    // poll it to decide to drain and restart.
+    m.def(
+        "poison_reason", []() -> std::optional<std::string> { return kv::Poison::reason(); },
+        "First recorded KVCM2 invariant violation, or None.");
+
+    // Reports the recorded violation and clears it, but only once no manager is alive: a poisoned
+    // manager skipped its own cleanup, so re-enabling it would resume work on structures known to
+    // be inconsistent. The reason is still returned in that case, and the latch stays set.
+    m.def(
+        "take_poison", []() -> std::optional<std::string> { return kv::takePoison(); },
+        "Report the recorded KVCM2 violation and clear it if no manager is alive.");
+
+    m.def(
+        "num_live_managers", []() { return kv::KvCacheManager::numLiveManagers(); },
+        "Number of constructed, not-yet-destroyed KVCacheManagers in this process.");
+
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
     mIntrospection.def(
@@ -1856,6 +1876,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](std::map<int, size_t> coldPageBytesByLayer) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
         { return std::make_unique<TestPaddingColdPageCodec>(std::move(coldPageBytesByLayer)); },
         nb::arg("cold_page_bytes_by_layer"));
+
+    mIntrospection.def(
+        "poison_for_testing", [](std::string const& reason) { kv::Poison::set("poison_for_testing", reason.c_str()); },
+        nb::arg("reason"), "Set the KVCM2 poison latch directly, to exercise the refusal paths.");
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
 

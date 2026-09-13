@@ -102,6 +102,23 @@ std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 // KvCacheManager
 // ---------------------------------------------------------------------------
 
+std::atomic<uint32_t> KvCacheManager::sLiveManagers{0};
+
+uint32_t KvCacheManager::numLiveManagers() noexcept
+{
+    return sLiveManagers.load(std::memory_order_relaxed);
+}
+
+std::optional<std::string> takePoison() noexcept
+{
+    auto reason = Poison::reason();
+    if (reason.has_value() && KvCacheManager::numLiveManagers() == 0)
+    {
+        Poison::clear();
+    }
+    return reason;
+}
+
 KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink,
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec)
     : mConfig(config)
@@ -125,18 +142,16 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     _resetIterationPeakNumBlocks();
 
     mLastAdjustmentTime = nowSeconds();
+
+    // Last, so a throw above leaves the count untouched: ~KvCacheManager does not run for a
+    // partially constructed object.
+    sLiveManagers.fetch_add(1, std::memory_order_relaxed);
 }
 
 KvCacheManager::~KvCacheManager()
 {
-    try
-    {
-        shutdown();
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_ERROR("%s", e.what());
-    }
+    KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
+    sLiveManagers.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
@@ -147,7 +162,18 @@ void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
 
 void KvCacheManager::shutdown()
 {
+    // Disposal, not work: a caller that detects corruption still has to be able to tear the
+    // manager down, so this succeeds while poisoned instead of rejecting. The cleanup below is
+    // skipped for the same reason every poisoned destructor skips its own -- the structures it
+    // would walk are known to be inconsistent -- so the manager's memory is leaked deliberately.
+    //
+    // The latch is read under the lock because it is normally set by a thread holding it: a read
+    // taken before blocking would only say the cache was intact before this call started waiting.
     auto const apiLock = lockExclusive();
+    if (Poison::poisoned())
+    {
+        return;
+    }
     _checkNoLivingKvCaches("shutdown()");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
@@ -167,6 +193,7 @@ void KvCacheManager::shutdown()
 
 void KvCacheManager::clearReusableBlocks()
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     _checkNoLivingKvCaches("clear_reusable_blocks()");
     TLLM_CHECK_DEBUG(mRadixTree);
@@ -177,6 +204,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats)
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     if (!priorityCb)
     {
@@ -204,11 +232,13 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
+    KVCM2_REJECT_IF_POISONED();
     return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
 }
 
 int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {
+    KVCM2_REJECT_IF_POISONED();
     // Shared: the traversal is read-only and the matched Block* never escape this call.
     auto const apiLock = lockShared();
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
@@ -408,6 +438,7 @@ TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() con
 
 bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     // Same precondition as adjust(): _adjustLevel may defragment, invalidating any page index an
     // ACTIVE cache holds.
@@ -424,6 +455,7 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
     }
     catch (std::exception const& e)
     {
+        TLLM_LOG_WARNING("Failed to resize cache level %d to %zu: %s", level.value(), quota, e.what());
         return false;
     }
 }
@@ -913,6 +945,7 @@ bool KvCacheManager::needAdjustment() const
 
 void KvCacheManager::adjust()
 {
+    KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
     for (KvCache* kvc : mLivingKvCaches)
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,

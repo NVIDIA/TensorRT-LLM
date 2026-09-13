@@ -206,7 +206,7 @@ public:
     // ---- Capacity / history ------------------------------------------------
 
     // Resize capacity and/or history_length.
-    // Returns true if the resize was a no-op shortcut.
+    // Returns true on success, false when the resize ran out of pages and was rolled back.
     bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
 
     // Convenience: set only capacity or history length.
@@ -217,7 +217,6 @@ public:
 
     // Commit tokens: finalises the oldest uncommitted block and makes it
     // available for reuse by other KvCaches.
-    // tokens must contain exactly tokensPerBlock tokens per call (until the last).
     // is_end: if true, records a final reusable snapshot and stops committing.
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
@@ -230,7 +229,9 @@ public:
     // ---- Page index queries ------------------------------------------------
 
     // Get base page indices (slot_id) for beamIdx × layerGroupId.
-    // Returns a non-owning Span into the internal page-index buffer.
+    // Returns a non-owning Span into the page-index buffer (owned by this KvCache, or by the
+    // caller when set via setBasePageIndexBuf). The span is valid until the next resize(),
+    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume().
     Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
@@ -312,7 +313,7 @@ public:
     //
     // The plan covers committed pages in each SWA life cycle's current attention
     // window. Full-attention and attention-sink blocks are excluded because
-    // later turns may still need them. SSM state is not yet supported. Must be
+    // later turns may still need them. An SSM life cycle contributes its final block. Must be
     // called after stopCommitting(). Returns nullptr without creating a plan if
     // any required SWA page is unavailable. Mirrors Python's
     // _KVCache.plan_committed_block_drop().
@@ -508,11 +509,6 @@ private:
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
-
-    void _evictOutOfWindowBlocks(int historyLength)
-    {
-        (void) historyLength;
-    } // handled by _unlockStaleBlocks
 
     // Release stale held uncommitted pages for SWA layers after committing stops.
     // Mirrors Python's _on_stop_committing().

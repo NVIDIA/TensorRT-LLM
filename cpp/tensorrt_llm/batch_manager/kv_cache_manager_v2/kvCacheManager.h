@@ -29,6 +29,7 @@
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/reentrantSharedMutex.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -115,6 +116,9 @@ public:
     // ---- Lifecycle --------------------------------------------------------
 
     void shutdown();
+
+    // Number of constructed, not-yet-destroyed managers in this process.
+    [[nodiscard]] static uint32_t numLiveManagers() noexcept;
 
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
@@ -346,6 +350,8 @@ public:
 private:
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;
+
+    static std::atomic<uint32_t> sLiveManagers;
 
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.

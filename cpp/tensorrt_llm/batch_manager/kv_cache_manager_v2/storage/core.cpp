@@ -52,14 +52,26 @@ SlotAllocator::~SlotAllocator()
     // Mirrors Python SlotAllocator.__del__ (assert_critical checks).
     if (TLLM_UNLIKELY(gDebug))
     {
-        TLLM_CHECK_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
+        KVCM2_CHECK_FATAL_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
             "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
-        TLLM_CHECK_WITH_INFO(mTargetCapacity == mCapacity && mOverflowSlots.empty(),
+        KVCM2_CHECK_FATAL_WITH_INFO(mTargetCapacity == mCapacity && mOverflowSlots.empty(),
             "SlotAllocator destroyed while resize is in progress");
-        TLLM_CHECK_WITH_INFO(
+        KVCM2_CHECK_FATAL_WITH_INFO(
             mOccupiedMask.numSetBits() == 0, "SlotAllocator destroyed with occupied slots still in use");
-        TLLM_CHECK_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots),
+        KVCM2_CHECK_FATAL_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots),
             "SlotAllocator destroyed with some slots not recycled");
+    }
+
+    // Recycled and overflow slots still carry their ids; the allocator owns them, so clear them
+    // here rather than letting ~Slot report each one. A slot that escaped the allocator is not in
+    // the recycle lists and is still reported.
+    for (auto& slot : mRecycledSlots)
+    {
+        slot.resetSlot();
+    }
+    for (auto& slot : mOverflowSlots)
+    {
+        slot.resetSlot();
     }
 }
 
@@ -134,6 +146,9 @@ void SlotAllocator::release(Slot slot)
     SlotId const slotId = slot.slotId();
     if (slotId >= numSlots() || !mOccupiedMask.get(toSizeT(slotId)))
     {
+        // The id is not one this allocator has outstanding, so drop it rather than let the
+        // rejected slot look like an unreleased one.
+        slot.resetSlot();
         throw LogicError("SlotAllocator::release: slot is not occupied");
     }
     mOccupiedMask.clear(toSizeT(slotId));
@@ -209,14 +224,10 @@ bool SlotAllocator::finishShrink()
             }
             TLLM_CHECK_WITH_INFO(ids.size() == mOverflowSlots.size(), "Duplicate slot IDs in overflow slots");
         }
-        // Synchronize overflow events (deduplicated — slots often share events).
-        {
-            std::vector<CachedCudaEvent*> overflowEvents;
-            overflowEvents.reserve(mOverflowSlots.size());
-            for (auto& s : mOverflowSlots)
-                overflowEvents.push_back(&s.readyEvent);
-            synchronizeAll(overflowEvents);
-        }
+        // Synchronize overflow events. Slots often share an event; synchronize() closes it, so
+        // later slots holding the same event return immediately.
+        for (auto& s : mOverflowSlots)
+            s.readyEvent.synchronize();
         for (auto& s : mOverflowSlots)
             s.resetSlot();
         mOverflowSlots.clear();
@@ -433,7 +444,7 @@ void DiskSlotPool::resize(SlotCount newNumSlots)
 
 Address DiskSlotPool::slotAddress(SlotId slot) const
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slot < numSlots(), "DiskSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_WITH_INFO(slot < numSlots(), "DiskSlotPool::slotAddress: slot index out of bounds");
     size_t const byteOffset = toSizeT(slot) * mSlotSize;
     TLLM_CHECK_DEBUG_WITH_INFO(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()),
         "DiskSlotPool::slotAddress: byte offset out of range");
@@ -463,7 +474,7 @@ SlotCount PoolGroupBase::getNumSlotsFromPools() const noexcept
 
 PoolGroupBase::~PoolGroupBase()
 {
-    destroy();
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 SlotCount PoolGroupBase::numSlots() const noexcept
@@ -900,7 +911,9 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
             size_t minGrains = grainsForSlots(minSlotCount, sizeLists[pgIdx], granularity);
             auto [slots, used] = grainsToSlots(minGrains, sizeLists[pgIdx], granularity);
             slotCntList[pgIdx] = slots;
-            TLLM_CHECK_DEBUG(used <= remainingGrains);
+            // remainingGrains is unsigned, so an over-subtraction would wrap past the
+            // `remainingGrains == 0` guard below instead of reporting an exhausted budget.
+            TLLM_CHECK_WITH_INFO(used <= remainingGrains, "Insufficient quota to satisfy min_slots constraints");
             remainingGrains -= used;
         }
 

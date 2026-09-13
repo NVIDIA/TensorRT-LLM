@@ -167,8 +167,7 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
                 break;
             }
         }
-        if (result[lcId].empty())
-            result[lcId].push_back(1); // fallback
+        TLLM_CHECK_WITH_INFO(!result[lcId].empty(), "Lifecycle %d has no SlotDescVariant", lcId.value());
     }
     return result;
 }
@@ -233,7 +232,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
-    , mStorageConfig(config)
     , mSwaScratchReuse(std::move(swaScratchReuse))
     , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createDefaultKvCacheColdPageCodec())
 {
@@ -460,7 +458,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
 StorageManager::~StorageManager()
 {
-    destroy();
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 void StorageManager::destroy()
@@ -1119,6 +1117,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     TLLM_CHECK_DEBUG(defrag || dstLevel != srcLevel);
     if (srcPages.empty())
     {
+        if (migrationRecorder && !defrag)
+        {
+            migrationRecorder(srcPages, {}, srcLevel, dstLevel);
+        }
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::in_place};
     }
 
@@ -1155,15 +1157,15 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 slotIdToPageIndexValue(dstSlots.at(i).slotId()), slotIdToPageIndexValue(srcPages.at(i)->slotId())});
         }
 
-        std::vector<CachedCudaEvent const*> priorEvents;
+        std::vector<CUevent> priorEvents;
         priorEvents.reserve(2 * srcPages.size());
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
-            priorEvents.push_back(&srcPages.at(i)->readyEvent);
-            priorEvents.push_back(&dstSlots.at(i).readyEvent);
+            priorEvents.push_back(srcPages.at(i)->readyEvent.handle());
+            priorEvents.push_back(dstSlots.at(i).readyEvent.handle());
         }
 
-        TemporaryCudaStream tempStream(priorEvents);
+        TemporaryCudaStream tempStream(std::move(priorEvents));
         auto updateReadyEvents = FuncGuard(
             [&]()
             {
@@ -1237,7 +1239,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
 // ---------------------------------------------------------------------------
 
 void StorageManager::batchedMigrateToGpu(
-    std::vector<BatchedLockTarget> const& targets, KvCache& /*kvCache*/, MigrationRecorder const& migrationRecorder)
+    std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder)
 {
     std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> groups;
     for (auto const& t : targets)
@@ -1438,7 +1440,8 @@ TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level)
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(level); ++pgIdx)
     {
         auto const s = getStatistics(level, pgIdx);
-        TLLM_CHECK_DEBUG(s.total > 0);
+        TLLM_CHECK_WITH_INFO(s.total > 0, "getUtilization: pool group %d at level %d has zero capacity",
+            static_cast<int>(pgIdx.value()), static_cast<int>(level.value()));
         result.push_back(static_cast<float>(s.unavailable()) / static_cast<float>(s.total));
     }
     return result;
@@ -1487,10 +1490,9 @@ void StorageManager::shrinkPoolGroup(
     // A16: persistent_pages preconditions.
     TLLM_CHECK_DEBUG_WITH_INFO(
         persistentPages.size() <= slotCountToSizeT(newNumSlots), "Not enough slots to hold all persistent pages");
-    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
-                                   [this, level, pgIdx](auto const& p) {
-                                       return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx;
-                                   }),
+    TLLM_CHECK_WITH_INFO(std::all_of(persistentPages.begin(), persistentPages.end(),
+                             [this, level, pgIdx](auto const& p)
+                             { return p->cacheLevel == level && getPoolGroupIndex(level, p->lifeCycle) == pgIdx; }),
         "Persistent page cache level or pool group mismatch");
 
     // Fast path: when no slot id has ever been issued in the to-be-removed

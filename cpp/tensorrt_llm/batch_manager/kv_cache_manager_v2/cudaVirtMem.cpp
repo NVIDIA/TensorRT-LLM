@@ -135,15 +135,7 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t
 
 VirtMem::~VirtMem() noexcept
 {
-    try
-    {
-        destroy();
-    }
-    catch (...)
-    {
-        // Destructors cannot surface CUDA cleanup failures. Explicit destroy()
-        // still reports them to match Python VirtMem.destroy().
-    }
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)

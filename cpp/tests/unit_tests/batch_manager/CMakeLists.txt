@@ -24,58 +24,71 @@ add_gtest(contextTransferCoordinatorTest contextTransferCoordinatorTest.cpp)
 add_gtest(evictionPolicyTest evictionPolicyTest.cpp)
 add_gtest(kvCacheManagerTest kvCacheManagerTest.cpp)
 add_gtest(kvCacheManagerFabricMemoryTest kvCacheManagerFabricMemoryTest.cpp)
-add_gtest(kvCacheManagerV2DefaultColdPageCodecTest
-          kvCacheManagerV2DefaultColdPageCodecTest.cpp)
+add_gtest(
+  kvCacheManagerV2DefaultColdPageCodecTest
+  "kvCacheManagerV2DefaultColdPageCodecTest.cpp;kvCacheManagerV2PoisonCheck.cpp"
+)
 target_include_directories(
   kvCacheManagerV2DefaultColdPageCodecTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2ColdPageTest kvCacheManagerV2ColdPageTest.cpp)
+add_gtest(kvCacheManagerV2ColdPageTest
+          "kvCacheManagerV2ColdPageTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2ColdPageTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-add_gtest(kvCacheManagerV2ColdPageCopyTest kvCacheManagerV2ColdPageCopyTest.cu)
+add_gtest(kvCacheManagerV2ColdPageCopyTest
+          "kvCacheManagerV2ColdPageCopyTest.cu;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2ColdPageCopyTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(coldPageCodecTest coldPageCodecTest.cpp)
 target_include_directories(
   coldPageCodecTest PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2TypedIndexTest kvCacheManagerV2TypedIndexTest.cpp)
+add_gtest(kvCacheManagerV2TypedIndexTest
+          "kvCacheManagerV2TypedIndexTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2TypedIndexTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2HostMemTest kvCacheManagerV2HostMemTest.cpp)
+add_gtest(kvCacheManagerV2HostMemTest
+          "kvCacheManagerV2HostMemTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2HostMemTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2StagingBufferTest
-          kvCacheManagerV2StagingBufferTest.cu)
+add_gtest(
+  kvCacheManagerV2StagingBufferTest
+  "kvCacheManagerV2StagingBufferTest.cu;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2StagingBufferTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2StatsTest kvCacheManagerV2StatsTest.cpp)
+add_gtest(kvCacheManagerV2StatsTest
+          "kvCacheManagerV2StatsTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2StatsTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-add_gtest(kvCacheManagerV2SlotAllocatorTest
-          kvCacheManagerV2SlotAllocatorTest.cpp)
+add_gtest(
+  kvCacheManagerV2SlotAllocatorTest
+  "kvCacheManagerV2SlotAllocatorTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2SlotAllocatorTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2ReentrantSharedMutexTest
-          kvCacheManagerV2ReentrantSharedMutexTest.cpp)
+add_gtest(
+  kvCacheManagerV2ReentrantSharedMutexTest
+  "kvCacheManagerV2ReentrantSharedMutexTest.cpp;kvCacheManagerV2PoisonCheck.cpp"
+)
 target_include_directories(
   kvCacheManagerV2ReentrantSharedMutexTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-add_gtest(kvCacheManagerV2ConcurrencyTest kvCacheManagerV2ConcurrencyTest.cpp)
+add_gtest(kvCacheManagerV2ConcurrencyTest
+          "kvCacheManagerV2ConcurrencyTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2ConcurrencyTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
-add_gtest(kvCacheManagerV2DigestPoolTest kvCacheManagerV2DigestPoolTest.cpp)
+add_gtest(kvCacheManagerV2DigestPoolTest
+          "kvCacheManagerV2DigestPoolTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
   kvCacheManagerV2DigestPoolTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager

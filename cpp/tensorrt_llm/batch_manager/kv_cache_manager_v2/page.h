@@ -50,7 +50,9 @@ public:
     StorageManager* manager;
     LifeCycleId lifeCycle;
     CacheLevel cacheLevel;
-    Priority priority;
+    // Immutable: PrioritizedEvictionPolicy locates a scheduled page's sub-queue by this value,
+    // so changing it while the page is scheduled would erase from the wrong list.
+    Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
 
@@ -229,9 +231,9 @@ public:
     // Explicitly release the lock (called by destructor if not already released).
     SharedPtr<Page> unlock();
 
-    SharedPtr<Page> const& page() const;
+    [[nodiscard]] SharedPtr<Page> const& page() const;
 
-    bool isValid() const noexcept
+    [[nodiscard]] bool isValid() const noexcept
     {
         return mUniqLock != nullptr;
     }
