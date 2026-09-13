@@ -112,6 +112,33 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
+def normalizeReleaseTargets(rawReleaseTarget)
+{
+    def supportedTargets = ["wheel", "container"]
+    def releaseTarget = rawReleaseTarget?.toString()?.trim()
+    if (!releaseTarget || releaseTarget.equalsIgnoreCase("all")) {
+        return supportedTargets
+    }
+
+    def requestedTargets = releaseTarget.split(",", -1).collect {
+        it.trim().toLowerCase()
+    }
+    if (requestedTargets.any { !it }) {
+        error "Invalid release_target '${rawReleaseTarget}': empty entries are not allowed"
+    }
+    if (requestedTargets.contains("all")) {
+        error "Invalid release_target '${rawReleaseTarget}': all cannot be combined with other targets"
+    }
+
+    def invalidTargets = requestedTargets.findAll {
+        !supportedTargets.contains(it)
+    }.unique()
+    if (invalidTargets) {
+        error "Invalid release_target '${rawReleaseTarget}': supported values are all, wheel, and container"
+    }
+    return supportedTargets.findAll { requestedTargets.contains(it) }
+}
+
 @Field
 def REUSE_TEST = "reuse_test"   // Determine if the pipeline should reuse test results in a stage from the previous pipelines.
 @Field
@@ -233,6 +260,8 @@ def RUN_MODE = "run_mode"
 def BUILD_BRANCH = "build_branch"
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def RELEASE_TARGET = "release_target"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -241,6 +270,8 @@ def globalVars = [
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
+    (RELEASE_TARGET): runMode == "nightly_release" ?
+        normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -1901,6 +1932,9 @@ def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, i
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
+    def releaseTargets = globalVars[RELEASE_TARGET] ?: []
+    def wheelSelected = releaseTargets.contains("wheel")
+    def containerSelected = releaseTargets.contains("container")
     stages = [
         "Release-Check": {
             script {
@@ -1971,7 +2005,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "x86_64-Linux": {
             script {
                 // CBTS deliberately does NOT short-circuit at the arch / Build
-                // layer. Build always runs so a wheel exists for sanity checks
+                // layer. Build normally runs so a wheel exists for sanity checks
                 // and post-merge consumers; case-level narrowing happens later
                 // in L0_Test.groovy::launchTestJobs (Layer 2) and renderTestDB
                 // (Layer 3).
@@ -2379,9 +2413,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'triggerType': runMode == "nightly_release" ?
                                 "nightly-release" :
                                 (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
-                            'runSanityCheck':
-                                runMode == "nightly_release" ||
-                                env.JOB_NAME ==~ /.*PostMerge.*/,
+                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
                             // Canonical images carry BOLT profiles: the raw build is
@@ -2399,6 +2431,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
+                                'useWheelFromBuildStage': false,
                                 'wait_success_seconds': "",
                             ]
                         }
@@ -2424,20 +2457,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         }
     ]
-
-    if ((env.JOB_NAME ==~ /.*PostMerge.*/) &&
-        !GEN_POST_MERGE_BUILDS_ONLY) {
-        stages += dockerBuildJob
-    }
-    if (!GEN_POST_MERGE_BUILDS_ONLY && (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
-        stages += dockerBuildJob
-        testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
-        testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
-        echo "Will run Build-Docker-Images job"
-        stages.remove("x86_64-Linux")
-        stages.remove("SBSA-Linux")
-        echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
-    }
 
     def plcContainerScanningJob = [
         "PLC Container Scanning": {
@@ -2539,13 +2558,39 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             }
         }
     ]
-    if (runMode == "nightly_release" && !GEN_POST_MERGE_BUILDS_ONLY) {
-        stages += plcContainerScanningJob
-    }
-    if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
-        stages += plcContainerScanningJob
-        testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
-        echo "Will run job to build ngc containers and running in-pipeline scanning for them"
+    if (runMode == "nightly_release") {
+        testFilter[TEST_STAGE_LIST] = null
+        testFilter[EXTRA_STAGE_LIST] = null
+        stages.remove("Release-Check")
+        stages.remove("OSS-Compliance-Check")
+        if (!wheelSelected) {
+            stages.remove("x86_64-Linux")
+            stages.remove("SBSA-Linux")
+        }
+        if (containerSelected) {
+            stages += dockerBuildJob
+        }
+    } else {
+        if ((env.JOB_NAME ==~ /.*PostMerge.*/) &&
+            !GEN_POST_MERGE_BUILDS_ONLY) {
+            stages += dockerBuildJob
+        }
+        if (!GEN_POST_MERGE_BUILDS_ONLY &&
+            (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") ||
+             testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
+            stages += dockerBuildJob
+            testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
+            testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
+            echo "Will run Build-Docker-Images job"
+            stages.remove("x86_64-Linux")
+            stages.remove("SBSA-Linux")
+            echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
+        }
+        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+            stages += plcContainerScanningJob
+            testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
+            echo "Will run job to build ngc containers and running in-pipeline scanning for them"
+        }
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
@@ -2608,7 +2653,9 @@ pipeline {
         }
         always {
             script {
-                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!isReleaseCheckMode &&
+                    !GEN_POST_MERGE_BUILDS_ONLY &&
+                    runMode != "nightly_release") {
                     collectTestResults(this, testFilter, globalVars)
                 }
             }
