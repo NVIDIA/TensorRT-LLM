@@ -236,6 +236,7 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
     from tensorrt_llm._torch.pyexecutor import _util
 
     checkpoint_config = SimpleNamespace(
+        vocab_size=151936,
         hidden_size=2560,
         num_attention_heads=24,
         num_key_value_heads=2,

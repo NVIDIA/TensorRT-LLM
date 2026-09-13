@@ -273,6 +273,12 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
         return storage.size();
     }
 
+    //! Latest digest token in this block's prefix, when requested by the event sink.
+    std::shared_ptr<Digest const> const& getLastTokenDigest() const noexcept
+    {
+        return mLastTokenDigest;
+    }
+
     bool isFull() const noexcept
     {
         return static_cast<int>(tokens.size()) == tokensPerBlock();
@@ -336,6 +342,9 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
 private:
     BlockOrdinal mOrdinal;
+    // Share an immutable value through descendants without retaining any ancestor block.
+    // Unlike prev, this context remains valid while the block is detached from the tree.
+    std::shared_ptr<Digest const> mLastTokenDigest;
 };
 
 // ---------------------------------------------------------------------------

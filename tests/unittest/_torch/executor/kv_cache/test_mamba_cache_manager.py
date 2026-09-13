@@ -237,6 +237,7 @@ def _kimi_model_config() -> SimpleNamespace:
     config = SimpleNamespace(
         architectures=["KimiLinearForCausalLM"],
         model_type="kimi_linear",
+        vocab_size=163840,
         hidden_size=64,
         num_attention_heads=4,
         num_key_value_heads=4,
@@ -320,6 +321,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert kwargs["num_kv_heads"] == 1
     assert kwargs["head_dim"] == 40
     assert kwargs["max_num_tokens"] == 256
+    assert kwargs["vocab_size"] == 163840
     assert "kda_replay_num_spec" not in kwargs
 
 
@@ -386,6 +388,7 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
         is_draft=False,
     )
     kwargs = captured["kwargs"]
+    assert "vocab_size" not in kwargs
     assert kwargs["model_type"] == "qwen3_next"
     assert "conv_state_layout" not in kwargs
     assert "kda_replay_num_spec" not in kwargs
@@ -462,6 +465,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
 
     pretrained_config = SimpleNamespace(
         architectures=["Qwen3_5MoeForCausalLM"],
+        vocab_size=151936,
         hidden_size=32,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -532,16 +536,81 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert captured_cpp["use_replay_state_update"] is True
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_cpp["max_num_tokens"] == 256
+    assert "vocab_size" not in captured_cpp
     assert captured_mixed["use_replay_state_update"] is False
     assert captured_mixed["model_type"] == "qwen3_next"
     assert captured_mixed["max_num_tokens"] == 256
+    assert "vocab_size" not in captured_mixed
     assert captured_v2["use_replay_state_update"] is True
     assert captured_v2["max_num_tokens"] == 256
+    assert captured_v2["vocab_size"] == pretrained_config.vocab_size
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
     assert any("RecordingMixedManager was selected" in log for log in fallback_logs)
     assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
+
+
+@pytest.mark.parametrize(
+    "manager_cls",
+    [CppMambaHybridCacheManager, MixedMambaHybridCacheManager, MambaHybridCacheManagerV2],
+)
+def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls):
+    captured = {}
+
+    class RecordingManager(manager_cls):
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    config = SimpleNamespace(
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="M*",
+        vocab_size=131072,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+    )
+    mamba_params = MambaKVCacheParams(
+        state_size=8,
+        conv_kernel=4,
+        num_heads=4,
+        n_groups=1,
+        head_dim=8,
+        mamba_layer_mask=[True, False],
+        target_full_attention_layer_mask=[False, True],
+        num_mamba_layers=1,
+        num_draft_layers=0,
+        dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 90)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
+        lambda *args, **kwargs: mamba_params,
+    )
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingManager,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=SimpleNamespace(pretrained_config=config, quant_config=None),
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    if manager_cls is MambaHybridCacheManagerV2:
+        assert captured["vocab_size"] == config.vocab_size
+    else:
+        assert "vocab_size" not in captured
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(

@@ -265,6 +265,7 @@ class KVCacheEventManager:
         attention_dp_gather: AttentionDpGatherFn | None = None,
         hash_algo: str = ...,
         window_size_by_layer_group: dict[int, int] | None = None,
+        mm_token_id_offset: int | None = None,
     ) -> None: ...
     def add_created_event(
         self,

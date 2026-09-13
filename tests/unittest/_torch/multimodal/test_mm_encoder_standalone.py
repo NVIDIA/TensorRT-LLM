@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import functools
 import json
@@ -15,7 +29,8 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
+from tensorrt_llm.inputs.multimodal import apply_mm_hashes
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
@@ -99,6 +114,7 @@ def _create_mm_disagg_llm(
     model_dir: Path,
     enable_block_reuse: bool,
     disable_overlap_scheduler: bool = False,
+    force_kv_cache_manager_v2: bool = False,
 ) -> LLM:
     kv_cache_kwargs = {
         "enable_block_reuse": enable_block_reuse,
@@ -106,10 +122,19 @@ def _create_mm_disagg_llm(
     }
     if enable_block_reuse:
         kv_cache_kwargs["event_buffer_max_size"] = 1024
+    if force_kv_cache_manager_v2:
+        kv_cache_kwargs["use_kv_cache_manager_v2"] = True
 
     kv_cache_config = KvCacheConfig(**kv_cache_kwargs)
-    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
-                                                   max_tokens_in_buffer=10240)
+    if force_kv_cache_manager_v2:
+        cache_transceiver_cfg = CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            max_tokens_in_buffer=10240,
+        )
+    else:
+        cache_transceiver_cfg = CacheTransceiverConfig(
+            backend="DEFAULT", max_tokens_in_buffer=10240)
     return LLM(model=model_dir,
                kv_cache_config=kv_cache_config,
                trust_remote_code=True,
@@ -220,6 +245,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,  # Enable KV cache events
+        use_kv_cache_manager_v2=True,
     )
     moe_config = _get_moe_config_for_blackwell()
 
@@ -271,24 +297,25 @@ def model_dir(request, tmp_path_factory: pytest.TempPathFactory) -> Path:
     return request.param
 
 
-@pytest.mark.parametrize(
-    "use_uuids,expected_hash_type",
-    [
-        # Without UUIDs: mm_key hash should be a 64-char hex string
-        (False, "hex"),
-        # With UUIDs: mm_key hash should be the original UUID string
-        (True, "uuid"),
-    ])
-def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
-    """Test mm_keys in KV cache events return UUID when provided.
+def _expected_mm_event_hashes(inp: TextPrompt,
+                              use_kv_cache_manager_v2: bool) -> set[str]:
+    """Return item digests for V2 events and optional UUID labels for V1."""
+    result = apply_mm_hashes(inp["multi_modal_data"],
+                             inp.get("multi_modal_uuids"))
+    expected = set()
+    for modality, hashes in result.hashes.items():
+        uuids = result.uuids[modality] if result.uuids is not None else None
+        for index, digest in enumerate(hashes):
+            uuid = uuids[index] if uuids is not None else None
+            expected.add(
+                digest if use_kv_cache_manager_v2 or uuid is None else uuid)
+    return expected
 
-    This test verifies that when multi_modal_uuids is provided:
-    1. The KV cache event mm_keys 'hash' field contains the original UUID string
-    2. Without UUIDs, the hash field contains a 64-char hex string
 
-    The UUID feature allows users to provide stable identifiers for multimodal
-    items, which are returned in KV cache events for external cache management.
-    """
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+@pytest.mark.parametrize("use_uuids", [False, True])
+def test_kv_event_mm_keys_with_uuid(use_uuids, use_kv_cache_manager_v2):
+    """V2 emits item digests; V1 preserves the optional UUID event label."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -306,6 +333,7 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -319,6 +347,11 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
         inputs = _load_inputs_with_uuids(llm, prompts, media, [test_uuid])
     else:
         inputs = _load_inputs(llm, prompts, media)
+
+    expected_hashes = set().union(*[
+        _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
+        for inp in inputs
+    ])
 
     with llm:
         for inp in inputs:
@@ -338,19 +371,7 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
     # Verify mm_keys were found (multimodal model should have them)
     assert len(mm_keys_found) > 0, "Expected mm_keys in stored events"
 
-    # Verify the hash field matches expected type
-    for mm_key in mm_keys_found:
-        hash_value = mm_key["hash"]
-        if expected_hash_type == "uuid":
-            # Should be the original UUID string
-            assert hash_value == test_uuid, (
-                f"Expected UUID '{test_uuid}', got '{hash_value}'")
-        else:
-            # Should be a 64-char hex string
-            assert len(hash_value) == 64, (
-                f"Expected 64-char hex hash, got {len(hash_value)} chars")
-            # Verify it's valid hex (fromhex will raise ValueError if invalid)
-            bytes.fromhex(hash_value)
+    assert {mm_key["hash"] for mm_key in mm_keys_found} == expected_hashes
 
 
 def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
@@ -369,24 +390,14 @@ def _load_inputs_with_uuids(llm: LLM, prompts, media, uuids):
     return inputs
 
 
-@pytest.mark.parametrize(
-    "uuids,expected_patterns",
-    [
-        # First image has UUID, second uses content hash
-        (["custom-uuid-first", None], ["custom-uuid-first", "hex"]),
-        # Both have UUIDs
-        (["uuid-img-a", "uuid-img-b"], ["uuid-img-a", "uuid-img-b"]),
-        # Both use content hash (None)
-        ([None, None], ["hex", "hex"]),
-    ])
-def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
-    """Test mm_keys with partial UUIDs (some items with UUID, some without).
-
-    This test verifies the mixed UUID scenario where:
-    1. Some multimodal items have user-provided UUIDs
-    2. Other items fall back to content-based hashing
-    3. KV cache events correctly return UUID or hex hash based on input
-    """
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+@pytest.mark.parametrize("uuids", [
+    ["custom-uuid-first", None],
+    ["uuid-img-a", "uuid-img-b"],
+    [None, None],
+])
+def test_kv_event_mm_keys_with_partial_uuids(uuids, use_kv_cache_manager_v2):
+    """Check each item's event identity when only some items have UUIDs."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -401,6 +412,7 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -425,6 +437,7 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
     # Add multi_modal_uuids to the processed input
     inputs[0]["multi_modal_uuids"] = {"image": uuids}
     inp = inputs[0]
+    expected_hashes = _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
 
     with llm:
         _ = llm.generate([inp], sampling_params=sampling_params)
@@ -445,29 +458,12 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
-    # Verify each expected pattern appears in the results
-    for pattern in expected_patterns:
-        if pattern == "hex":
-            # Should find at least one 64-char hex string
-            hex_found = any(
-                len(h) == 64 and all(c in '0123456789abcdef' for c in h)
-                for h in mm_key_hashes)
-            assert hex_found, f"Expected hex hash pattern but got: {mm_key_hashes}"
-        else:
-            # Should find the exact UUID string
-            assert pattern in mm_key_hashes, (
-                f"Expected UUID '{pattern}' in mm_keys, got: {mm_key_hashes}")
+    assert mm_key_hashes == expected_hashes
 
 
-def test_kv_event_mm_keys_with_uuid_multiple_prompts():
-    """Test mm_keys with UUIDs across multiple prompts, each with its own image.
-
-    This test verifies that when multiple prompts are processed, each with its own
-    multimodal data and UUID:
-    1. Each prompt's mm_keys correctly return the associated UUID
-    2. Different UUIDs are preserved for different prompts
-    3. KV cache events correctly associate UUIDs with their respective blocks
-    """
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_kv_event_mm_keys_with_uuid_multiple_prompts(use_kv_cache_manager_v2):
+    """Check MM event identities across multiple requests with distinct UUIDs."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -487,6 +483,7 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=2048,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -500,6 +497,11 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
     # Add multi_modal_uuids to each input
     for inp, uuid in zip(inputs, uuids):
         inp["multi_modal_uuids"] = {"image": [uuid]}
+
+    expected_hashes = set().union(*[
+        _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
+        for inp in inputs
+    ])
 
     with llm:
         # Generate for each input separately
@@ -522,21 +524,12 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
-    # Verify each UUID appears in the results
-    for uuid in uuids:
-        assert uuid in mm_key_hashes, (
-            f"Expected UUID '{uuid}' in mm_keys, got: {mm_key_hashes}")
+    assert mm_key_hashes == expected_hashes
 
 
-def test_kv_event_mm_keys_with_very_long_uuid():
-    """Test mm_keys with UUIDs that exceed 64 bytes.
-
-    This test verifies that the system correctly handles UUIDs that are longer
-    than the typical 64-character hex hash representation:
-    1. Very long UUIDs (>64 bytes) are preserved and returned correctly
-    2. No truncation or corruption occurs for long UUID strings
-    3. The full UUID is returned in KV cache events
-    """
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+def test_kv_event_mm_keys_with_very_long_uuid(use_kv_cache_manager_v2):
+    """Long UUIDs remain intact in V1 labels and contribute to V2 digests."""
     encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
@@ -564,6 +557,7 @@ def test_kv_event_mm_keys_with_very_long_uuid():
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -588,6 +582,7 @@ def test_kv_event_mm_keys_with_very_long_uuid():
     # Add very long UUIDs
     inputs[0]["multi_modal_uuids"] = {"image": uuids}
     inp = inputs[0]
+    expected_hashes = _expected_mm_event_hashes(inp, use_kv_cache_manager_v2)
 
     with llm:
         _ = llm.generate([inp], sampling_params=sampling_params)
@@ -608,22 +603,7 @@ def test_kv_event_mm_keys_with_very_long_uuid():
     # Verify we got mm_keys
     assert len(mm_key_hashes) > 0, "Expected mm_keys in stored events"
 
-    # Verify the 80-char UUID is present and not truncated
-    assert long_uuid_80 in mm_key_hashes, (
-        f"Expected 80-char UUID '{long_uuid_80}' in mm_keys, got: {mm_key_hashes}"
-    )
-
-    # Verify the 200-char UUID is present and not truncated
-    assert very_long_uuid_200 in mm_key_hashes, (
-        f"Expected 200-char UUID '{very_long_uuid_200}' in mm_keys, got: {mm_key_hashes}"
-    )
-
-    # Verify the UUIDs are exactly as provided (no truncation)
-    for uuid in uuids:
-        matching = [h for h in mm_key_hashes if h == uuid]
-        assert len(matching) == 1, (
-            f"UUID '{uuid}' (len={len(uuid)}) should appear exactly once, "
-            f"found {len(matching)} times in {mm_key_hashes}")
+    assert mm_key_hashes == expected_hashes
 
 
 @pytest.fixture(scope="module",
@@ -1178,7 +1158,8 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
 
     create_llm = functools.partial(_create_mm_disagg_llm,
                                    encoder_model_dir,
-                                   enable_block_reuse=True)
+                                   enable_block_reuse=True,
+                                   force_kv_cache_manager_v2=True)
 
     llm_prefill, encoder, llm_decode = _instantiate_models(
         functools.partial(create_llm, disable_overlap_scheduler=True),

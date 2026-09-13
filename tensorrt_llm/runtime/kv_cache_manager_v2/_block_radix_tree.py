@@ -351,11 +351,12 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("__rawref__", "_prev", "key", "next", "reuse_scope")
+    __slots__ = ("__rawref__", "_needs_token_digest_context", "_prev", "key", "next", "reuse_scope")
     key: BlockKey
     reuse_scope: ReuseScope
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
+    _needs_token_digest_context: bool
     __rawref__: rawref.ref["RootBlock"]
 
     def __init__(self, reuse_scope: ReuseScope, prev: "BlockRadixTree") -> None:
@@ -365,6 +366,10 @@ class RootBlock:
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
+        event_manager = prev.event_manager
+        self._needs_token_digest_context = (
+            event_manager is not None and event_manager.needs_token_digest_context()
+        )
         prev.next[self.key] = self
 
     def __del__(self) -> None:
@@ -396,10 +401,22 @@ class Block:
     A block of tokens. Manages data for all layers.
     """
 
-    __slots__ = ("__rawref__", "_prev", "key", "next", "ordinal", "storage", "tokens")
+    __slots__ = (
+        "__rawref__",
+        "_needs_token_digest_context",
+        "_prev",
+        "key",
+        "last_token_digest",
+        "next",
+        "ordinal",
+        "storage",
+        "tokens",
+    )
     key: BlockKey
     tokens: Sequence[TokenIdExt]
+    last_token_digest: bytes | None
     ordinal: BlockOrdinal
+    _needs_token_digest_context: bool
     _prev: rawref.ref["Block | RootBlock"]
     next: Children["Block"]
     __rawref__: rawref.ref["Block"]
@@ -420,6 +437,8 @@ class Block:
         self.next = {}
         self.storage = filled_list(None, prev.num_life_cycles)
         self.__rawref__ = rawref.NULL
+        self._needs_token_digest_context = prev._needs_token_digest_context
+        self.last_token_digest = None
         # a Block is useless if all its tokens are covered by a sibling block. Raise UselessBlockError if so.
         if self.key in prev.next:
             raise UselessBlockError(prev.next[self.key])
@@ -429,6 +448,14 @@ class Block:
             for b in prev.next.values():
                 if b.tokens[: len(tokens)] == tokens:
                     raise UselessBlockError(b)
+        if self._needs_token_digest_context:
+            # Share the last digest through text-only descendants, including ancestors
+            # without committable pages that never publish a stored event themselves.
+            self.last_token_digest = prev.last_token_digest if isinstance(prev, Block) else None
+            for token in reversed(tokens):
+                if isinstance(token, bytes):
+                    self.last_token_digest = token
+                    break
         # A later turn may extend a partial endpoint to this longer block, replacing the
         # partial sibling. That turn may not have a committable SWA page for this block:
         # commit_min_snapshot releases out-of-window pages, while SWA scratch reuse uses

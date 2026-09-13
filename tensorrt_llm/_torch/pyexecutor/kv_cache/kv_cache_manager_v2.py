@@ -1153,12 +1153,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     attention_dp_rank=mapping.rank,
                     attention_dp_gather=Distributed.get(mapping).allgather,
                     hash_algo=kv_cache_event_hash_algo,
+                    mm_token_id_offset=vocab_size,
                 )
             elif mpi_rank() == 0:
                 self.event_manager = KVCacheEventManager(
                     self.event_buffer_max_size,
                     window_size=event_window_size,
                     hash_algo=kv_cache_event_hash_algo,
+                    mm_token_id_offset=vocab_size,
                 )
 
         if isinstance(num_kv_heads, int):
