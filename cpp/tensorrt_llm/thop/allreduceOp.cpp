@@ -563,19 +563,29 @@ private:
             inputPtr = windowBuffer0.ptr;
         }
 
-        // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
-        torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
-        void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
-        if (!windowBuffer1.isValid())
+        // Request an output window only when the message meets the same
+        // registration threshold used by the input path. Smaller messages use a
+        // regular output tensor and skip the window allocation path.
+        torch::Tensor outputTensor;
+        if (bufferSizeBytes >= minRegistrationThreshold)
+        {
+            auto [windowOutput, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
+            if (windowBuffer1.isValid())
+            {
+                outputTensor = windowOutput;
+            }
+        }
+        if (!outputTensor.defined())
         {
             TLLM_LOG_DEBUG(
                 "[runNCCLAllReduceSymmetric] No valid symmetric buffer available; "
                 "using plain CUDA tensor for output");
+            outputTensor = torch::empty_like(inputTensor);
         }
 
         // Perform allreduce
-        NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
+        NCCLCHECK_THROW(
+            ncclAllReduce(inputPtr, outputTensor.data_ptr(), size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
         if (mOp == AllReduceFusionOp::NONE)
         {
