@@ -969,7 +969,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
-        enable_overlap_headroom: bool = False,
+        disable_overlap_scheduler: bool = False,
         kv_events_config: Optional[KVEventsConfig] = None,
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
@@ -1514,40 +1514,44 @@ class KVCacheManagerV2(BaseResourceManager):
         # Reserve stable slots for persistent request IDs such as CUDA-graph
         # padding requests. The default preserves the main-branch allocation.
         #
-        # Two independent reasons to hold more index leases than that:
+        # Two independent reasons to hold twice that many index leases, and they
+        # do not compose -- a request is either awaiting a transfer or retiring,
+        # never both -- so this is one doubling, not two:
         #
         # * Disaggregation: at any moment up to `max_num_sequences` requests can
         #   be actively generating while another up to `max_num_sequences` are
         #   still in KV transfer (TRANS_IN_PROGRESS) and continue to hold their
         #   index slots. The extra capacity lets the next batch acquire slots
-        #   without waiting for the previous batch's transfers to finish. This
-        #   factor is index-local: a transfer-phase request holds no sequence
-        #   slot at all (SeqSlotManager.prepare_resources skips
-        #   DISAGG_GENERATION_INIT), so it must not reach the seat pool.
-        # * Overlap headroom: attention DP admits a replacement cohort while the
-        #   retiring one still holds its slots, so the index pool has to widen by
-        #   exactly the micro-batch the seat pool widened by. The flag is
-        #   resolved once in _util.should_enable_overlap_headroom and passed in
-        #   rather than re-derived here, because the two pools disagreeing is the
-        #   bug validate_seq_slot_pool_covers_admission exists to catch.
+        #   without waiting for the previous batch's transfers to finish.
+        # * The overlap scheduler: a terminal request's resources are released
+        #   one iteration after it leaves the batch, so with overlap enabled a
+        #   retiring cohort and its replacement hold index leases at the same
+        #   time. Pipeline parallelism is excluded because `pp_size` micro-batches
+        #   are already covered above.
         #
-        # max() rather than a sum: each term covers one extra cohort of
-        # in-flight sequences, so they overlap rather than compose.
+        # Both factors are index-local and must not reach the seat pool. A
+        # transfer-phase request holds no sequence slot at all
+        # (SeqSlotManager.prepare_resources skips DISAGG_GENERATION_INIT), and a
+        # retiring request only outlives its seat where attention DP drops it
+        # from the per-rank counts admission subtracts from
+        # (_util.should_enable_overlap_headroom, which is the narrower gate the
+        # seat pool uses). So this pool is deliberately the more generous of the
+        # two: `validate_seq_slot_pool_covers_admission` requires it to cover the
+        # seat pool, not to equal it. Spare index leases cost a few page-table
+        # rows; spare seats would cost sampler and speculative-decoding state.
         max_num_sequences = max_batch_size * mapping.pp_size
-        extra_index_slots = max(
-            max_num_sequences if is_disagg else 0,
-            max_batch_size if enable_overlap_headroom else 0,
-        )
+        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
         # Admission bound for real requests, excluding the reserved slots that
         # only ever hold persistent dummies. Published so the sequence-slot pool
         # can be checked against it at startup.
-        self.max_admissible_sequences = max_num_sequences + extra_index_slots
+        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
         index_mapper_capacity = self.max_admissible_sequences + num_reserved_index_slots
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
-            f"enable_overlap_headroom={enable_overlap_headroom}, "
+            f"disable_overlap_scheduler={disable_overlap_scheduler}, "
+            f"pp_size={mapping.pp_size}, "
             f"num_reserved_index_slots={num_reserved_index_slots}, "
             f"max_beam_width={max_beam_width})"
         )

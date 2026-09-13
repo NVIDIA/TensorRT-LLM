@@ -1158,10 +1158,10 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator._is_disagg = False
     creator._mapping = Mock()
     creator._speculative_config = Mock()
-    # Every V2 manager is now told whether the seat pool carries the overlap
-    # headroom, so this hand-built creator has to carry the attribute the real
-    # one resolves in __init__. The value does not move this test's assertions.
-    creator._enable_overlap_headroom = False
+    # Every V2 manager is told whether the overlap scheduler is on, so it can size
+    # its index-lease pool; this hand-built creator has to carry the attribute the
+    # real one sets in __init__. The value does not move this test's assertions.
+    creator._disable_overlap_scheduler = False
 
     effective_draft_config = Mock()
     effective_draft_config.pretrained_config.torch_dtype = "bfloat16"

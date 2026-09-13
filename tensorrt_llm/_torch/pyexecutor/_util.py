@@ -694,8 +694,7 @@ class KvCacheCreator:
             model_engine)
         self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
                                                   KVCacheManagerV2)
-        self._enable_overlap_headroom = self._resolve_overlap_headroom(
-            model_engine)
+        self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
@@ -703,35 +702,6 @@ class KvCacheCreator:
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
         self._maybe_enable_fabric_memory_for_python_transceiver()
-
-    def _resolve_overlap_headroom(self, model_engine) -> bool:
-        """Consume the engine's headroom gate, reconciled with the real manager.
-
-        The index pool has to widen exactly where the seat pool did, so the flag
-        is read from the engine rather than re-derived here -- a second copy of
-        the predicate would disagree with the first and trip
-        ``validate_seq_slot_pool_covers_admission`` at startup.
-
-        The one fact the engine cannot know is which manager class was finally
-        selected: it gates on ``kv_cache_config.use_kv_cache_manager_v2``, the
-        resolved *request*, while ``_get_model_kv_cache_manager_cls`` gives the
-        answer. When they disagree the engine has already sized its seat pool, so
-        clear the flag rather than widen the index pool to match a scheduler that
-        cannot overcommit: surplus seats are inert (V1 publishes no admission
-        bound, so the validator skips it), whereas a wider index pool would be a
-        real allocation for leases that can never be taken.
-        """
-        enable_overlap_headroom = getattr(model_engine,
-                                          "_enable_overlap_headroom", False)
-        if enable_overlap_headroom and not self._is_kv_cache_manager_v2:
-            logger.warning(
-                "Sequence-slot headroom was sized for KV cache manager V2 but "
-                f"{self._kv_cache_manager_cls.__name__} was selected; the extra "
-                "seats will go unused. Harmless, but it means the gate in "
-                "_util.should_enable_overlap_headroom disagrees with "
-                "KvCacheCreator._get_model_kv_cache_manager_cls.")
-            return False
-        return enable_overlap_headroom
 
     def _maybe_enable_fabric_memory_for_python_transceiver(self) -> None:
         maybe_enable_fabric_memory_for_python_transceiver(
@@ -1539,7 +1509,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
-            enable_overlap_headroom=self._enable_overlap_headroom,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_events_config=None
             if estimating_kv_cache or model_engine.is_draft_model else
             self._llm_args.kv_cache_config.kv_events_config,
@@ -1760,7 +1730,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
-            enable_overlap_headroom=self._enable_overlap_headroom,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
@@ -2137,7 +2107,7 @@ class KvCacheCreator:
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            enable_overlap_headroom=self._enable_overlap_headroom,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
             CacheType.CROSS,
         )
@@ -2457,7 +2427,7 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
-        enable_overlap_headroom: bool = False,
+        disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False) -> KVCacheManager:
@@ -2612,7 +2582,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
-            "enable_overlap_headroom"] = enable_overlap_headroom
+            "disable_overlap_scheduler"] = disable_overlap_scheduler
         # V2 builds the block-reuse cache key of a multimodal token run from
         # the vocabulary size. Resolve it here rather than per-branch: the
         # manager needs it whenever block reuse can meet multimodal input,
@@ -3155,18 +3125,12 @@ def compute_max_num_sequences(mapping: Mapping,
                               enable_overlap_headroom: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    This is *the* definition of how many sequences can be simultaneously
-    **seated**. Every pool keyed by seat identity -- the sampler's per-slot
-    state, the guided decoder, the spec-decoding managers -- must consume this
-    number rather than re-deriving it from ``max_batch_size``, because any two
-    formulas that disagree are a bug: too few seats raises ``NoFreeSlotsError``
-    on the executor's event-loop thread, and a KV index pool narrower than the
-    seat pool silently defers admitted requests (nvbug 6627795).
-
-    The terms are **additive, not multiplicative**. Pipeline depth puts
-    ``pp_size`` micro-batches structurally in flight; the overlap headroom adds
-    one more micro-batch, because the retiring cohort still holds its seats when
-    the replacement cohort is admitted.
+    ``enable_overlap_headroom`` is intentionally opt-in, and
+    ``should_enable_overlap_headroom`` is the only thing that should set it:
+    attention DP needs a second non-PP slot set because the V2 scheduler can
+    backfill seats before the overlap scheduler releases the previous
+    iteration's terminal slots. Pipeline parallelism already sizes the pool
+    by ``pp_size``.
 
     Disaggregation deliberately does **not** appear here. Its ``2x`` is an
     IndexMapper-local concern: a request awaiting its KV transfer holds an
@@ -3181,11 +3145,12 @@ def compute_max_num_sequences(mapping: Mapping,
     ``[seats, draft_len, vocab]`` draft-probability tensors and the pinned-host
     block-offset tables for leases that never occupy a seat.
     """
-    # Pipeline depth: pp_size micro-batches are structurally in flight.
-    num_seats = max_batch_size * mapping.pp_size
-    if enable_overlap_headroom and not disable_overlap_scheduler:
-        num_seats += max_batch_size
-    return num_seats
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = (2 if enable_overlap_headroom
+                             and not disable_overlap_scheduler else 1)
+    return max_batch_size * num_micro_batches
 
 
 def resolve_max_num_sequences(model_engine,
@@ -3284,60 +3249,57 @@ def should_enable_overlap_headroom(mapping: Mapping,
 
 
 def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
-                                            kv_cache_manager,
-                                            is_disagg: bool = False) -> None:
-    """Fail at startup if the seat pool and the KV index pool disagree.
+                                            kv_cache_manager) -> None:
+    """Fail at startup if the KV index pool cannot cover the seat pool.
 
-    The invariant is ``index pool >= seat pool``, and the two bounds have
-    different characters -- which is why the check is asymmetric rather than a
-    plain equality:
+    One direction is a bug and the other is by design, so the check is
+    deliberately one-sided rather than an equality:
 
-    * index pool < seat pool -- **always a bug.** ``_create_kv_cache`` warns
+    * **index pool < seat pool -- always a bug.** ``_create_kv_cache`` warns
       ``No free IndexMapper slots``, returns ``None`` and the scheduler defers
-      the request. Silent: costs throughput, no error (nvbug 6627795). A
-      one-sided ``seats >= index pool`` guard is exactly what let this ship.
-    * index pool > seat pool -- a bug **when aggregated**, because there every
-      indexed sequence is also a seated one, so the surplus can only come from
-      one of the two numbers having been re-derived; a request would be admitted
-      that cannot be seated and ``SlotManager.add_slot`` would raise on the
-      executor's event-loop thread. Under disaggregation it is **by design**: a
-      request awaiting its KV transfer holds an index lease and no seat
-      (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``),
-      so the index pool carries a ``2x`` that the seat pool must not.
+      the request. Silent: costs throughput, raises nothing (nvbug 6627795). A
+      one-sided ``seats >= index pool`` guard is exactly what let this ship, and
+      this is the direction that guard could not see.
+    * **index pool > seat pool -- permitted.** The index pool is intentionally
+      the more generous of the two, for two independent reasons the seat pool
+      must not inherit. Under disaggregation a request awaiting its KV transfer
+      holds an index lease and no seat at all
+      (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``).
+      And ``KVCacheManagerV2`` widens the pool for any non-PP overlap
+      configuration, while the seat pool widens only where residency can
+      actually exceed ``max_batch_size * pp_size``
+      (``should_enable_overlap_headroom``) -- so a plain TP deployment carries
+      spare index leases that no seat will ever claim. Spare leases cost a few
+      page-table rows; spare seats would cost sampler state, the eagerly
+      allocated ``[seats, draft_len, vocab]`` draft-probability tensors and the
+      pinned-host block-offset tables.
 
-    Managers that do not publish ``max_admissible_sequences`` (V1, hybrid) are
-    skipped rather than guessed at.
+    The cost of the asymmetry is that an *undersized seat pool* is no longer
+    distinguishable from a legitimately generous index pool, so it is not caught
+    here. ``compute_max_num_sequences`` being the single seat-pool definition is
+    what covers that side.
 
-    ``isinstance`` rather than ``is not None``: the V1/C++ manager does not
-    publish the attribute at all, and neither do the ``Mock`` stubs that stand
-    in for a cache manager in other modules' tests -- a ``Mock`` auto-creates
-    it, so an ``is None`` opt-in would fall through to the comparison and raise
-    ``TypeError`` instead of skipping the check.
+    Managers that do not publish ``max_admissible_sequences`` (V1, non-V2
+    hybrid) are skipped rather than guessed at. ``isinstance`` rather than
+    ``is not None``: the V1/C++ manager does not publish the attribute at all,
+    and neither do the ``Mock`` stubs that stand in for a cache manager in other
+    modules' tests -- a ``Mock`` auto-creates it, so an ``is None`` opt-in would
+    fall through to the comparison and raise ``TypeError`` instead of skipping
+    the check.
     """
     admissible = getattr(kv_cache_manager, "max_admissible_sequences", None)
     if not isinstance(admissible, int):
         return
-    if admissible == max_num_sequences:
+    if admissible >= max_num_sequences:
         return
-    if admissible > max_num_sequences:
-        if is_disagg:
-            # Expected: transfer-phase requests hold index leases, not seats.
-            return
-        direction, consequence = (
-            "larger",
-            "a request could be admitted with no sequence slot to seat it, and "
-            "SlotManager.add_slot would raise on the executor's event loop")
-    else:
-        direction, consequence = (
-            "smaller", "admitted requests would be silently deferred one at a "
-            "time (nvbug 6627795)")
     raise ValueError(
-        f"{type(kv_cache_manager).__name__} can seat {admissible} concurrent "
-        f"sequences but the executor's sequence-slot pool holds "
-        f"{max_num_sequences}: the index pool is {direction} than the seat "
-        f"pool, so {consequence}. The seat pool must come from "
-        "_util.compute_max_num_sequences and the index pool must be sized from "
-        "it; a mismatch means one of them was re-derived from max_batch_size.")
+        f"{type(kv_cache_manager).__name__} can lease KV cache indices for "
+        f"{admissible} concurrent sequences but the executor's sequence-slot "
+        f"pool holds {max_num_sequences}: the index pool is smaller than the "
+        "seat pool, so admitted requests would be silently deferred one at a "
+        "time (nvbug 6627795). The seat pool must come from "
+        "_util.compute_max_num_sequences and the index pool must cover it; a "
+        "shortfall means one of them was re-derived from max_batch_size.")
 
 
 def create_py_executor_instance(
@@ -3546,13 +3508,9 @@ def create_py_executor_instance(
 
     # The seat pool and the KV index pool are sized independently and indexed by
     # the same request identity, so an index pool narrower than the seat pool is
-    # always a bug and a wider one is a bug unless disaggregation explains it.
-    # Check it here rather than at first use: a startup ValueError names both
-    # numbers, while the runtime symptoms are a silent throughput loss in one
-    # direction and a raise inside the event loop in the other.
-    validate_seq_slot_pool_covers_admission(max_num_sequences,
-                                            kv_cache_manager,
-                                            is_disagg=is_disagg)
+    # always a bug. Check it here rather than at first use: a startup ValueError
+    # names both numbers, while the runtime symptom is a silent throughput loss.
+    validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 

@@ -5,11 +5,11 @@
 Two pools are sized here, and keeping them distinct is the whole point:
 
 The **seat pool** (``compute_max_num_sequences``) is how many sequences the
-executor can seat at once. Baseline ``max_batch_size * pp_size``, plus one extra
-micro-batch under the overlap headroom. Under the overlap scheduler, requests
-finished in the previous iteration still hold their sequence slots when the next
-iteration's ``prepare_resources`` runs, while the V2 capacity scheduler has
-already dropped them from its budget
+executor can seat at once: ``max_batch_size * pp_size`` under pipeline
+parallelism, and otherwise ``max_batch_size`` doubled by the overlap headroom.
+Under the overlap scheduler, requests finished in the previous iteration still
+hold their sequence slots when the next iteration's ``prepare_resources`` runs,
+while the V2 capacity scheduler has already dropped them from its budget
 (``no_schedule_after_state=GENERATION_TO_COMPLETE``) and the ADP router has
 already excluded them from the counts admission subtracts from its capacity --
 so a replacement cohort is admitted while the retiring one is still resident.
@@ -19,12 +19,15 @@ deliberately narrow: attention DP only (outside it, admission subtracts
 capacity schedulers hardcode ``GENERATION_COMPLETE``), non-hybrid only (SSM state
 is sized from ``max_batch_size``).
 
-The **index pool** (``KVCacheManagerV2.max_admissible_sequences``) carries the
-same headroom term *plus* a disaggregation term the seat pool must not have: a
-request awaiting its KV transfer holds an index lease and no seat at all, because
-``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``. That is
-why ``validate_seq_slot_pool_covers_admission`` is asymmetric rather than an
-equality.
+The **index pool** (``KVCacheManagerV2.max_admissible_sequences``) is
+deliberately the more generous of the two, for two reasons the seat pool must not
+inherit. A request awaiting its KV transfer holds an index lease and no seat at
+all, because ``SeqSlotManager.prepare_resources`` skips
+``DISAGG_GENERATION_INIT``. And the manager doubles for *any* non-PP overlap
+configuration, not just the narrow set that can actually overcommit seats, so a
+plain TP deployment carries spare leases no seat will claim. Hence
+``validate_seq_slot_pool_covers_admission`` requires the index pool to *cover*
+the seat pool rather than to equal it.
 
 ``compute_max_num_sequences`` is the single seat-pool implementation used both
 for the executor's ``SeqSlotManager`` pool (``create_py_executor_instance``) and
@@ -56,28 +59,26 @@ from tensorrt_llm.mapping import Mapping
 
 # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
 #
-# The terms are additive, not multiplicative: pipeline depth costs pp_size
-# micro-batches of seats, and the overlap deferral costs exactly one more
-# generation on top -- not one more per stage. At pp_size == 1 the two readings
-# coincide at 2x, which is why the headroom used to be expressible as a factor of
-# 2; the pp>1 rows are where they part company (5x, not 8x, at pp=4). The gate
-# never turns the headroom on under PP, so those rows only pin the arithmetic.
+# The two terms are mutually exclusive rather than combined: pipeline depth
+# already puts pp_size micro-batches in flight, so the PP branch takes pp_size
+# and ignores the headroom entirely. The gate never turns the headroom on under
+# PP (see test_overlap_headroom_gate), so the pp>1 rows only pin that the branch
+# cannot start compounding.
 #
 # Disaggregation is absent from this table on purpose -- see
 # test_seat_pool_has_no_disagg_term.
 SIZING_CASES = [
-    # No PP: aggregated baseline, then the one extra micro-batch.
+    # No PP: aggregated baseline, then the extra micro-batch.
     (1, False, False, 1),
     (1, False, True, 2),
     # The headroom is a no-op with the overlap scheduler off: the retiring cohort
     # is torn down in-line, so it never coexists with its replacement.
     (1, True, True, 1),
-    # PP without the headroom.
+    # PP: sized by pp_size, with or without the flag set.
     (4, False, False, 4),
     (4, True, True, 4),
-    # PP with the headroom: additive, not per-stage.
-    (2, False, True, 3),
-    (4, False, True, 5),
+    (2, False, True, 2),
+    (4, False, True, 4),
 ]
 
 
@@ -230,12 +231,15 @@ def test_sizing_matches_kv_manager_admission_bound(
 ):
     """The two pools are computed in different modules; hold them in step.
 
-    ``KVCacheManagerV2`` sizes its index pool from ``max_batch_size``, ``pp_size``,
-    ``is_disagg`` and the *same* resolved headroom flag the seat pool uses.
     Asserting the two expressions against each other rather than against literals
     means a drift in either one fails here rather than at startup in
     ``validate_seq_slot_pool_covers_admission`` -- and the assertion is exactly
     that validator's invariant.
+
+    The manager's predicate is deliberately looser than the seat gate's (it does
+    not consult attention DP or the model architecture), so the two are equal
+    only where the manager does not double. Where it does, the index pool runs
+    ahead, which is permitted; what must never happen is the reverse.
     """
     max_batch_size = 8
     mapping = Mapping(
@@ -258,14 +262,12 @@ def test_sizing_matches_kv_manager_admission_bound(
     )
 
     # Mirrors the arithmetic in KVCacheManagerV2.__init__.
-    admission_bound = max_batch_size * pp_size + max(
-        max_batch_size * pp_size if is_disagg else 0,
-        max_batch_size if enable_overlap_headroom else 0,
-    )
+    extra_leases = is_disagg or (not disable_overlap_scheduler and pp_size == 1)
+    admission_bound = max_batch_size * pp_size * (2 if extra_leases else 1)
 
-    # The invariant the startup validator enforces, in both its directions.
+    # The invariant the startup validator enforces.
     assert admission_bound >= seats
-    if not is_disagg:
+    if not extra_leases:
         assert admission_bound == seats
 
 
@@ -276,42 +278,40 @@ class _FakeManager:
         self.max_admissible_sequences = max_admissible_sequences
 
 
-@pytest.mark.parametrize("is_disagg", [False, True])
-def test_validator_accepts_the_matching_pair(is_disagg):
-    validate_seq_slot_pool_covers_admission(16, _FakeManager(16), is_disagg=is_disagg)
+def test_validator_accepts_the_matching_pair():
+    validate_seq_slot_pool_covers_admission(16, _FakeManager(16))
 
 
-@pytest.mark.parametrize("is_disagg", [False, True])
-def test_validator_always_rejects_an_index_pool_below_the_seat_pool(is_disagg):
+def test_validator_rejects_an_index_pool_below_the_seat_pool():
     """The direction that shipped as nvbug 6627795, and it is never legitimate.
 
     A one-sided ``seats >= admissible`` guard is what let it through: the seat
     pool grew to 2B while the index pool stayed at B+1, which satisfies the
     one-sided form and silently defers admitted requests one at a time.
-    Disaggregation is no excuse here -- its 2x makes the index pool *larger*, so
-    a shortfall under disagg means the two numbers were derived separately.
     """
     with pytest.raises(ValueError, match="smaller than the seat"):
-        validate_seq_slot_pool_covers_admission(16, _FakeManager(8), is_disagg=is_disagg)
+        validate_seq_slot_pool_covers_admission(16, _FakeManager(8))
 
 
-def test_validator_rejects_a_larger_index_pool_only_when_aggregated():
-    """The other direction is a bug when aggregated and by design under disagg.
+def test_validator_permits_an_index_pool_above_the_seat_pool():
+    """A surplus of index leases is the design, in two independent ways.
 
-    Aggregated, every indexed sequence is also a seated one, so a surplus can
-    only mean one of the two numbers was re-derived -- and a request would be
-    admitted that cannot be seated, with ``SlotManager.add_slot`` raising on the
-    executor's event-loop thread. Under disaggregation the surplus *is* the
-    mechanism: a request in KV transfer holds its index lease with no seat
-    (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``), so
-    the index pool carries a 2x that must not reach the seat pool. Admission is
-    bounded independently at ``max_batch_size * pp_size`` either way, so the
-    surplus is never extra concurrency.
+    Under disaggregation a request in KV transfer holds its index lease with no
+    seat (``SeqSlotManager.prepare_resources`` skips
+    ``DISAGG_GENERATION_INIT``). Aggregated, ``KVCacheManagerV2`` doubles for any
+    non-PP overlap configuration while the seat pool doubles only under the
+    narrower ``should_enable_overlap_headroom`` gate, so a plain TP run carries
+    spare leases too. Admission is bounded independently at
+    ``max_batch_size * pp_size``, so the surplus is never extra concurrency --
+    and it is the cheap direction: spare leases cost page-table rows, spare seats
+    would cost sampler and speculative-decoding state.
+
+    Asserting on the signature as well: ``is_disagg`` used to select which
+    surplus was tolerated, and its absence is what stops the validator from
+    growing a second copy of the manager's predicate.
     """
-    with pytest.raises(ValueError, match="larger than the seat"):
-        validate_seq_slot_pool_covers_admission(16, _FakeManager(32), is_disagg=False)
-
-    validate_seq_slot_pool_covers_admission(16, _FakeManager(32), is_disagg=True)
+    validate_seq_slot_pool_covers_admission(16, _FakeManager(32))
+    assert "is_disagg" not in inspect.signature(validate_seq_slot_pool_covers_admission).parameters
 
 
 def test_validate_seq_slot_pool_ignores_managers_without_a_bound():
@@ -448,7 +448,7 @@ def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
     assert args.max_num_sequences == max_num_sequences
 
 
-def _make_kv_cache_creator(engine_headroom_flag, is_v2: bool = True) -> KvCacheCreator:
+def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) -> KvCacheCreator:
     """Minimal creator whose only job is to reach _create_kv_cache_manager."""
     c = object.__new__(KvCacheCreator)
     c._mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
@@ -464,7 +464,7 @@ def _make_kv_cache_creator(engine_headroom_flag, is_v2: bool = True) -> KvCacheC
     c._execution_stream = None
     c._is_disagg = False
     c._is_kv_cache_manager_v2 = is_v2
-    c._enable_overlap_headroom = engine_headroom_flag
+    c._disable_overlap_scheduler = disable_overlap_scheduler
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True
     c._get_model_kv_cache_manager_cls = Mock(return_value=Mock())
@@ -473,19 +473,18 @@ def _make_kv_cache_creator(engine_headroom_flag, is_v2: bool = True) -> KvCacheC
     return c
 
 
-@pytest.mark.parametrize("enable_overlap_headroom", [False, True])
-def test_kv_cache_manager_receives_the_resolved_headroom_flag(enable_overlap_headroom):
-    """The manager consumes the gate's answer instead of re-deriving it.
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_kv_cache_manager_receives_the_overlap_scheduler_flag(disable_overlap_scheduler):
+    """The index pool needs the overlap flag, and only the creator can supply it.
 
-    It used to take ``disable_overlap_scheduler`` and rebuild
-    ``enable_attention_dp and not disable_overlap and not has_pp`` for itself.
-    Once the seat-pool gate also excludes V1 and hybrid, that second copy
-    disagrees: hybrid V2 + attention DP + overlap would size the index pool at
-    ``2 * B * pp`` against a seat pool of ``B * pp``, and
-    ``validate_seq_slot_pool_covers_admission`` would raise at startup on an
-    aggregated server. One resolved flag, passed down.
+    ``KVCacheManagerV2`` derives its own lease headroom from
+    ``is_disagg or (overlap on and not has_pp)`` -- deliberately looser than the
+    seat gate, since over-leasing is cheap and under-leasing hangs. That makes
+    ``disable_overlap_scheduler`` load-bearing on the constructor: drop it and
+    every aggregated V2 deployment silently reverts to a single cohort of leases,
+    which is the nvbug 6627795 shortfall.
     """
-    creator = _make_kv_cache_creator(enable_overlap_headroom)
+    creator = _make_kv_cache_creator(disable_overlap_scheduler)
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=SimpleNamespace(is_generation=True)),
     )
@@ -496,37 +495,4 @@ def test_kv_cache_manager_receives_the_resolved_headroom_flag(enable_overlap_hea
     ) as create:
         creator._create_kv_cache_manager(model_engine)
 
-    assert create.call_args.kwargs["enable_overlap_headroom"] is enable_overlap_headroom
-    assert "disable_overlap_scheduler" not in create.call_args.kwargs
-
-
-@pytest.mark.parametrize(
-    "engine_flag,is_v2,expected",
-    [
-        (True, True, True),
-        # The engine gates on kv_cache_config.use_kv_cache_manager_v2 -- the
-        # resolved request -- while the creator knows the class that was actually
-        # selected. When they disagree the seat pool has already been sized, so
-        # the surplus seats are accepted (inert: V1 publishes no admission bound,
-        # so the startup validator skips it) and the index pool is left alone.
-        (True, False, False),
-        (False, True, False),
-        (False, False, False),
-    ],
-)
-def test_creator_reconciles_the_headroom_flag_with_the_selected_manager(
-    engine_flag, is_v2, expected
-):
-    creator = _make_kv_cache_creator(engine_flag, is_v2=is_v2)
-    creator._kv_cache_manager_cls = type("FakeManager", (), {})
-    engine = SimpleNamespace(_enable_overlap_headroom=engine_flag)
-
-    assert creator._resolve_overlap_headroom(engine) is expected
-
-
-def test_creator_treats_a_headroom_free_engine_as_no_headroom():
-    """mm-encoder-only engines and test stubs predate the attribute."""
-    creator = _make_kv_cache_creator(False)
-    creator._kv_cache_manager_cls = type("FakeManager", (), {})
-
-    assert creator._resolve_overlap_headroom(SimpleNamespace()) is False
+    assert create.call_args.kwargs["disable_overlap_scheduler"] is disable_overlap_scheduler
