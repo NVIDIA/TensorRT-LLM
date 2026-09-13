@@ -5479,9 +5479,13 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 {
     cacheErrorAndUploadResult(stageName, {
         // Open MPI 5 fails a singleton MPI_Comm_spawn -- one per MpiPoolSession
-        // worker -- once the hostname PMIx is handed reaches 31 characters, and the
-        // pod name is 63. PMIX_HOSTNAME replaces only the name PMIx uses, so the pod
-        // keeps its own for logging and for port sectioning in getHostNodeName().
+        // worker -- when the hostname PMIx is handed is too long for MPI, despite
+        // being a perfectly valid hostname: the generated singleton ID
+        // "singleton.{hostname}.{pid}.{rank}" has to fit a 50-byte buffer, so how
+        // long a hostname is too long depends on the system-assigned pid. Our pod
+        // names are 63 characters, well past any of it. PMIX_HOSTNAME replaces only
+        // the name PMIx uses, so the pod keeps its own for logging and for port
+        // sectioning in getHostNodeName().
         // Not inside runLLMTestlistOnPlatformImpl: the SLURM path runs that too, on
         // the compute node, where one name shared by every node would break locality.
         // PRRTE also refuses to fork its DVM as root without the ALLOW_RUN_AS_ROOT
@@ -6925,7 +6929,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         // redone by hand, or checkPipInstall's quickstart hangs in
                         // MpiPoolSession until the timeout. PRRTE will not fork its DVM as
                         // root without these (Open MPI 4 only checked that in mpirun), and
-                        // PMIX_HOSTNAME is the 31-character limit -- see
+                        // PMIX_HOSTNAME is the hostname-too-long-for-MPI one -- see
                         // runLLMTestlistOnPlatform.
                         def libEnv = [
                             "OMPI_ALLOW_RUN_AS_ROOT=1",
