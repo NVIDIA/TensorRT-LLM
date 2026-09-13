@@ -423,9 +423,7 @@ DiskSlotPool::~DiskSlotPool()
 
 SlotCount DiskSlotPool::numSlots() const noexcept
 {
-    TLLM_CHECK_DEBUG(mFd != kBadFileDescriptor);
-    off_t sz = ::lseek(mFd, 0, SEEK_END);
-    return (sz < 0 || mSlotSize == 0) ? 0 : slotCountValueFromSize(static_cast<size_t>(sz) / mSlotSize);
+    return mNumSlots;
 }
 
 void DiskSlotPool::destroy()
@@ -435,11 +433,14 @@ void DiskSlotPool::destroy()
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }
+    mNumSlots = SlotCount{0};
 }
 
 void DiskSlotPool::resize(SlotCount newNumSlots)
 {
+    // Recorded only once the file really changed size: resizeFile throws without resizing.
     resizeFile(mFd, slotCountToSizeT(newNumSlots) * mSlotSize);
+    mNumSlots = newNumSlots;
 }
 
 Address DiskSlotPool::slotAddress(SlotId slot) const

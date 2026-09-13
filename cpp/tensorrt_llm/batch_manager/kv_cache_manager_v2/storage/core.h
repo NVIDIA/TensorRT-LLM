@@ -296,6 +296,11 @@ public:
 
 private:
     int mFd = kBadFileDescriptor;
+    // Tracks the file size, which only resize() changes: the file is created unlinked and owned
+    // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
+    // slotAddress() bounds-checks against it on every call, and querying the file would make that
+    // an lseek per page of a migration.
+    SlotCount mNumSlots{0};
 };
 
 // ---------------------------------------------------------------------------
