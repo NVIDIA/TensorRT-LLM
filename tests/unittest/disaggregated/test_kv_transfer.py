@@ -1,5 +1,6 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import ast
 import os
 import random
 import time
@@ -21,6 +22,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # transfer-engine threading.
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -50,6 +52,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, T
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -97,6 +100,77 @@ class KvCacheConfigV2:
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
+    # Mirrors the KvCacheConfig.kv_pool_rebalance_* defaults in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads all of them unconditionally.
+    kv_pool_rebalance_min_sampled_kv_caches: int = 2000
+    kv_pool_rebalance_cooldown_secs: float = 120.0
+    kv_pool_rebalance_target_ratio_update_interval: int = 100
+    kv_pool_rebalance_ratio_threshold: float = 1.25
+    kv_pool_rebalance_moving_average_decay: float = 0.9999
+
+
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parents[2]
+
+# Every KvCacheConfigV2 stub in the repo: the duck-typed stand-ins handed to
+# KVCacheManagerV2 in place of the real pydantic KvCacheConfig. The example
+# driver lives outside the test tree and may be absent from a tests-only
+# checkout, hence the existence check in the test body.
+_CTT_EXAMPLE_DIR = _REPO_ROOT / "examples/disaggregated/slurm/cache_transceiver_test"
+_KV_CACHE_CONFIG_V2_STUBS = (
+    _THIS_DIR / "test_kv_transfer.py",
+    _THIS_DIR / "test_cache_transceiver_single_process.py",
+    _CTT_EXAMPLE_DIR / "run_cache_transceiver_test.py",
+)
+
+
+def _config_attrs_read_by_manager() -> set:
+    """Return the ``kv_cache_config.<attr>`` names KVCacheManagerV2 reads.
+
+    Parsed from the source rather than from the real ``KvCacheConfig`` because
+    the stubs only have to cover what the manager actually touches, not the
+    full (and much larger) public config surface.
+    """
+    source = Path(kv_cache_manager_v2.__file__).read_text()
+    return {
+        node.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "kv_cache_config"
+    }
+
+
+def _stub_fields(path: Path) -> set:
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ClassDef) and node.name == "KvCacheConfigV2":
+            return {stmt.target.id for stmt in node.body if isinstance(stmt, ast.AnnAssign)}
+    raise AssertionError(f"no KvCacheConfigV2 class found in {path}")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("stub_path", _KV_CACHE_CONFIG_V2_STUBS, ids=lambda p: p.name)
+def test_kv_cache_config_v2_stub_covers_manager_reads(stub_path: Path):
+    """Guard the duck-typed KvCacheConfigV2 stubs against config drift.
+
+    KVCacheManagerV2 reads its settings straight off the config object, so a
+    field added to the real ``KvCacheConfig`` and consumed by
+    ``_build_base_config()`` turns into an ``AttributeError`` at manager
+    construction time for every caller passing one of these stubs. That has
+    now bitten repeatedly (``kv_cache_event_hash_algo``, ``pool_ratio``,
+    ``kv_pool_rebalance_*``), each time as a wave of red disaggregated tests
+    rather than as an obvious config error, so check the coverage directly.
+    """
+    if not stub_path.exists():
+        pytest.skip(f"{stub_path} not present in this checkout")
+
+    missing = sorted(_config_attrs_read_by_manager() - _stub_fields(stub_path))
+    assert not missing, (
+        f"{stub_path.relative_to(_REPO_ROOT)}: KvCacheConfigV2 is missing {missing}, "
+        "which KVCacheManagerV2 reads off kv_cache_config. Add the field(s) with the "
+        "same default as tensorrt_llm.llmapi.llm_args.KvCacheConfig."
+    )
 
 
 @pytest.mark.cpu_only

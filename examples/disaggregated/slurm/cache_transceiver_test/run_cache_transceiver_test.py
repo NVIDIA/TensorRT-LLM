@@ -115,6 +115,14 @@ class KvCacheConfigV2:
     enable_swa_scratch_reuse: bool = False
     disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
+    # Mirrors the KvCacheConfig.kv_pool_rebalance_* defaults in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads all of them unconditionally.
+    kv_pool_rebalance_min_sampled_kv_caches: int = 2000
+    kv_pool_rebalance_cooldown_secs: float = 120.0
+    kv_pool_rebalance_target_ratio_update_interval: int = 100
+    kv_pool_rebalance_ratio_threshold: float = 1.25
+    kv_pool_rebalance_moving_average_decay: float = 0.9999
 
 
 class _Timeout(Exception):

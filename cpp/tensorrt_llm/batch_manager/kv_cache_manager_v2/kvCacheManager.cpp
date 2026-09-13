@@ -107,9 +107,9 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     : mConfig(config)
     , mLifeCycles(config)
     , mEventSink(std::move(eventSink))
-    , mAvgReusedLength(0.9999)
-    , mAvgSqrCapacity(0.9999)
-    , mAvgSqrHistoryLength(0.9999)
+    , mAvgReusedLength(config.rebalanceMovingAverageDecay)
+    , mAvgSqrCapacity(config.rebalanceMovingAverageDecay)
+    , mAvgSqrHistoryLength(config.rebalanceMovingAverageDecay)
 {
     mConfig.validate();
 
@@ -825,7 +825,7 @@ void KvCacheManager::unregisterKvCache(KvCache* kvc)
 
 void KvCacheManager::tryUpdateTargetRatios()
 {
-    if (mNumSampledKvCaches - mLastUpdateNumSampledKvCaches < 100)
+    if (mNumSampledKvCaches - mLastUpdateNumSampledKvCaches < mConfig.rebalanceTargetRatioUpdateInterval)
         return;
     mLastUpdateNumSampledKvCaches = mNumSampledKvCaches;
 
@@ -888,7 +888,7 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
 {
     auto const& target = _getTargetRatioList(level);
     auto current = (level == kHotLevel) ? _currentHotRatio() : _currentColdRatios();
-    constexpr float kThreshold = 1.25f;
+    float const kThreshold = mConfig.rebalanceRatioThreshold;
     for (PoolGroupIndex pgIdx{0}; pgIdx < target.size() && pgIdx < current.size(); ++pgIdx)
     {
         TLLM_CHECK_DEBUG_WITH_INFO(current[pgIdx] > 0.f && target[pgIdx] > 0.f, "ratios must not be zero");
@@ -902,10 +902,10 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
 bool KvCacheManager::needAdjustment() const
 {
     auto const apiLock = lockShared();
-    if (mNumSampledKvCaches < 2000)
+    if (mNumSampledKvCaches < mConfig.rebalanceMinSampledKvCaches)
         return false;
     double now = nowSeconds();
-    if (now - mLastAdjustmentTime < 120.0)
+    if (now - mLastAdjustmentTime < mConfig.rebalanceCooldownSecs)
         return false;
     CacheLevel lastLevel = mStorage->numCacheLevels() - 1;
     return _needAdjustment(kHotLevel) || _needAdjustment(lastLevel);

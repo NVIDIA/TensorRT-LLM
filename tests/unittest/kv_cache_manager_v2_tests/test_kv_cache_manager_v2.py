@@ -4869,11 +4869,15 @@ class TestPoolRebalance(TestKVCacheManagerV2):
     _PROMPT_LEN = 64
     _DECODE_LEN = 96
 
-    def prepare_two_pool_groups(self, gpu_quota: int = 256 << 20) -> None:
+    def prepare_two_pool_groups(self, gpu_quota: int = 256 << 20, **rebalance_overrides) -> None:
         """Two attention life cycles with different slot sizes -> two pool groups.
 
         Pool groups are formed per distinct slot layout, so differing window
         sizes alone are not enough -- the buffer sizes have to differ too.
+
+        ``rebalance_overrides`` forwards to ``KVCacheManagerConfig`` (e.g.
+        ``rebalance_min_sampled_kv_caches=...``) for tests that exercise
+        non-default auto-tuner gating.
         """
         self.cfg = KVCacheManagerConfig(
             tokens_per_block=self._TOKENS_PER_BLOCK,
@@ -4899,6 +4903,7 @@ class TestPoolRebalance(TestKVCacheManagerV2):
             ],
             typical_step=BatchDesc(kv_caches=[KVCacheDesc(capacity=160, history_length=0)]),
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=160, history_length=0)])],
+            **rebalance_overrides,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -4979,6 +4984,115 @@ class TestPoolRebalance(TestKVCacheManagerV2):
         slots_after = self._slot_totals()
         self.assertGreater(slots_after[0], slots_before[0], f"{slots_before} -> {slots_after}")
         self.assertLess(slots_after[1], slots_before[1], f"{slots_before} -> {slots_after}")
+
+    def _skew_target_ratio(self, skew: float = 2.0) -> None:
+        """Perturb the target GPU ratio without touching the sample/cooldown gates."""
+        current = self._gpu_ratios()
+        skewed = [current[0] * skew] + current[1:]
+        total = sum(skewed)
+        _introspection.set_target_ratio_list_gpu(self.manager, [x / total for x in skewed])
+
+    def test_custom_min_sampled_kv_caches_gates_adjustment(self) -> None:
+        """A non-default rebalance_min_sampled_kv_caches must move the sample-count gate."""
+        self.prepare_two_pool_groups(rebalance_min_sampled_kv_caches=5000)
+        self._run_sequence()
+        self._skew_target_ratio()
+        _introspection.set_last_adjustment_time(self.manager, 0.0)
+
+        # Above the default threshold (2000) but below this config's custom one.
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "need_adjustment fired below the configured rebalance_min_sampled_kv_caches",
+        )
+
+        _introspection.set_num_sampled_kv_caches(self.manager, 5001)
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "need_adjustment did not fire once rebalance_min_sampled_kv_caches was reached",
+        )
+
+    def test_custom_cooldown_secs_gates_adjustment(self) -> None:
+        """A non-default rebalance_cooldown_secs must move the cooldown gate."""
+        self.prepare_two_pool_groups(rebalance_cooldown_secs=10_000.0)
+        self._run_sequence()
+        self._skew_target_ratio()
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+
+        # Recent adjustment: still within this config's long custom cooldown.
+        _introspection.set_last_adjustment_time(self.manager, time.monotonic())
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "need_adjustment fired inside the configured rebalance_cooldown_secs",
+        )
+
+        # Long-past adjustment: clears even a long custom cooldown.
+        _introspection.set_last_adjustment_time(self.manager, 0.0)
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "need_adjustment did not fire once rebalance_cooldown_secs elapsed",
+        )
+
+    def test_custom_ratio_threshold_gates_adjustment(self) -> None:
+        """A non-default rebalance_ratio_threshold must move the deviation gate."""
+        self.prepare_two_pool_groups(rebalance_ratio_threshold=10.0)
+        self._run_sequence()
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+        _introspection.set_last_adjustment_time(self.manager, 0.0)
+
+        # A 2x skew is well under this config's 10x threshold.
+        self._skew_target_ratio(skew=2.0)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "need_adjustment fired below the configured rebalance_ratio_threshold",
+        )
+
+        # A 20x skew clears the 10x threshold.
+        self._skew_target_ratio(skew=20.0)
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "need_adjustment did not fire once rebalance_ratio_threshold was exceeded",
+        )
+
+    def test_invalid_rebalance_settings_raise_on_python_backend(self) -> None:
+        """Pure-Python KVCacheManagerConfig.__post_init__ must reject invalid rebalance_* values.
+
+        The native backend's equivalent checks live in
+        KVCacheManagerConfig::validate() (C++); this covers the parallel
+        pure-Python assertions directly, since the two implementations are
+        independent and only one is exercised per TLLM_KV_CACHE_MANAGER_V2_BACKEND.
+        """
+        if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "python":
+            self.skipTest(
+                "pure-Python KVCacheManagerConfig validation only runs under the Python backend"
+            )
+
+        base_kwargs = dict(
+            tokens_per_block=self._TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=Role.KEY, size=1024)],
+                ),
+            ],
+        )
+        invalid_overrides = {
+            "negative_min_sampled_kv_caches": dict(rebalance_min_sampled_kv_caches=-1),
+            "negative_cooldown_secs": dict(rebalance_cooldown_secs=-1.0),
+            "non_finite_cooldown_secs": dict(rebalance_cooldown_secs=math.inf),
+            "non_positive_target_ratio_update_interval": dict(
+                rebalance_target_ratio_update_interval=0
+            ),
+            "ratio_threshold_not_greater_than_one": dict(rebalance_ratio_threshold=1.0),
+            "non_finite_ratio_threshold": dict(rebalance_ratio_threshold=math.inf),
+            "moving_average_decay_zero": dict(rebalance_moving_average_decay=0.0),
+            "moving_average_decay_one": dict(rebalance_moving_average_decay=1.0),
+        }
+        for name, override in invalid_overrides.items():
+            with self.subTest(name):
+                with self.assertRaises(AssertionError):
+                    KVCacheManagerConfig(**base_kwargs, **override)
 
     def _close_one_cache(self, capacity: int, *, dummy: bool, cache_id: int) -> None:
         """Create, size and close one KV cache, optionally marked as a dummy.
