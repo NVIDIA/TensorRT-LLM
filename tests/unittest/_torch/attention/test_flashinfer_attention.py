@@ -1412,3 +1412,190 @@ def test_no_generations_clears_the_recorded_page_tuple():
 
     assert meta.replanned == []
     assert cache[params].fa2_plan_num_blocks is None
+
+
+class TestSplitKVScratchReset(unittest.TestCase):
+    """CPU-only checks for FlashInferAttentionMetadata.zero_planned_split_kv_scratch.
+
+    The method only reads the wrapper's plan info and writes into the
+    workspace buffer, so it can be exercised with a stub metadata object and a
+    host tensor -- no GPU, no planned FlashInfer wrapper.
+    """
+
+    NUM_QO_HEADS = 2
+    HEAD_DIM = 8
+    PADDED_BATCH_SIZE = 3
+    CTA_TILE_Q = 4
+    V_OFFSET = 4096
+    S_OFFSET = 65536
+    FILL = 0xAB
+
+    def _plan_info(self, split_kv: bool = True) -> List[int]:
+        plan_info = [0] * flashinfer_backend._FI_PREFILL_PLAN_INFO_LEN
+        plan_info[flashinfer_backend.
+                  _FI_PLAN_PADDED_BATCH_SIZE] = self.PADDED_BATCH_SIZE
+        plan_info[flashinfer_backend._FI_PLAN_CTA_TILE_Q] = self.CTA_TILE_Q
+        plan_info[flashinfer_backend._FI_PLAN_V_OFFSET] = self.V_OFFSET
+        plan_info[flashinfer_backend._FI_PLAN_S_OFFSET] = self.S_OFFSET
+        plan_info[flashinfer_backend._FI_PLAN_SPLIT_KV] = int(split_kv)
+        return plan_info
+
+    def _decode_plan_info(self, split_kv: bool = True) -> List[int]:
+        plan_info = [0] * flashinfer_backend._FI_DECODE_PLAN_INFO_LEN
+        plan_info[flashinfer_backend.
+                  _FI_DECODE_PLAN_PADDED_BATCH_SIZE] = self.PADDED_BATCH_SIZE
+        plan_info[flashinfer_backend._FI_DECODE_PLAN_V_OFFSET] = self.V_OFFSET
+        plan_info[flashinfer_backend._FI_DECODE_PLAN_S_OFFSET] = self.S_OFFSET
+        plan_info[flashinfer_backend._FI_DECODE_PLAN_SPLIT_KV] = int(split_kv)
+        return plan_info
+
+    def _reset(self, workspace: torch.Tensor, wrapper, *,
+               is_decode: bool) -> None:
+        # Unbound call: the method needs nothing from the metadata but the
+        # workspace buffer, and constructing one requires a GPU.
+        FlashInferAttentionMetadata.zero_planned_split_kv_scratch(
+            SimpleNamespace(workspace_buffer=workspace),
+            wrapper,
+            self.NUM_QO_HEADS,
+            self.HEAD_DIM,
+            is_decode=is_decode)
+
+    def _assert_reset_extent(self, workspace: torch.Tensor, num_rows: int):
+        v_bytes = num_rows * self.HEAD_DIM * flashinfer_backend._FI_SIZEOF_FLOAT
+        s_bytes = num_rows * flashinfer_backend._FI_SIZEOF_FLOAT
+
+        # tmp_v is zeroed; tmp_s holds the neutral log-sum-exp, which must be
+        # finite so the merge cannot produce NaN from -inf minus -inf.
+        self.assertTrue(workspace[self.V_OFFSET:self.V_OFFSET +
+                                  v_bytes].eq(0).all())
+        lse = workspace[self.S_OFFSET:self.S_OFFSET + s_bytes].view(
+            torch.float32)
+        self.assertTrue(torch.isfinite(lse).all())
+        self.assertTrue(lse.eq(flashinfer_backend._FI_NEUTRAL_LSE).all())
+
+        # Nothing outside the two ranges is touched.
+        for boundary in (self.V_OFFSET - 1, self.V_OFFSET + v_bytes,
+                         self.S_OFFSET - 1, self.S_OFFSET + s_bytes):
+            self.assertEqual(int(workspace[boundary]), self.FILL)
+
+    def test_resets_exactly_the_planned_prefill_extent(self):
+        workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
+        self._reset(workspace,
+                    SimpleNamespace(_plan_info=self._plan_info()),
+                    is_decode=False)
+        # The prefill plan sizes the scratch per query tile:
+        # padded_batch_size * cta_tile_q * num_qo_heads rows.
+        self._assert_reset_extent(
+            workspace,
+            self.PADDED_BATCH_SIZE * self.CTA_TILE_Q * self.NUM_QO_HEADS)
+
+    def test_resets_exactly_the_planned_decode_extent(self):
+        workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
+        self._reset(workspace,
+                    SimpleNamespace(_plan_info=self._decode_plan_info()),
+                    is_decode=True)
+        # The decode plan has one query row per request, so there is no
+        # cta_tile_q factor: padded_batch_size * num_qo_heads rows.
+        self._assert_reset_extent(workspace,
+                                  self.PADDED_BATCH_SIZE * self.NUM_QO_HEADS)
+
+    def test_no_op_without_a_split_kv_plan(self):
+        untouched = torch.full((1 << 16, ), self.FILL, dtype=torch.uint8)
+        for wrapper, is_decode in (
+                # Non-splitting prefill and decode plans have no partials.
+            (SimpleNamespace(_plan_info=self._plan_info(split_kv=False)), False
+             ),
+            (SimpleNamespace(_plan_info=self._decode_plan_info(split_kv=False)),
+             True),
+                # A prefill wrapper on another backend (e.g. the 9-entry SM90
+                # prefill plan) has a length these offsets do not describe and
+                # must be left alone.
+            (SimpleNamespace(_plan_info=[1] * 9), False),
+            (SimpleNamespace(_plan_info=None), False),
+            (SimpleNamespace(), True),
+        ):
+            self._reset(untouched, wrapper, is_decode=is_decode)
+            self.assertTrue(untouched.eq(self.FILL).all())
+
+    def test_plan_info_layout_matches_flashinfer_0_6_18(self):
+        # The fixtures above build plan vectors from the production layout
+        # constants, so a wrong constant would corrupt fixture and
+        # implementation alike and the extent tests would still pass. Pin the
+        # layout here with the literal FlashInfer 0.6.18 values (PrefillPlanInfo
+        # and DecodePlanInfo::ToVector order in scheduler.cuh) so a constant
+        # edit fails this test instead.
+        self.assertEqual(flashinfer_backend._FI_PREFILL_PLAN_INFO_LEN, 15)
+        self.assertEqual(flashinfer_backend._FI_PLAN_PADDED_BATCH_SIZE, 0)
+        self.assertEqual(flashinfer_backend._FI_PLAN_CTA_TILE_Q, 3)
+        self.assertEqual(flashinfer_backend._FI_PLAN_V_OFFSET, 10)
+        self.assertEqual(flashinfer_backend._FI_PLAN_S_OFFSET, 11)
+        self.assertEqual(flashinfer_backend._FI_PLAN_SPLIT_KV, 14)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_INFO_LEN, 10)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_PADDED_BATCH_SIZE,
+                         0)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_V_OFFSET, 1)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_S_OFFSET, 2)
+        self.assertEqual(flashinfer_backend._FI_DECODE_PLAN_SPLIT_KV, 9)
+
+    def test_out_of_range_extent_raises_and_leaves_workspace_untouched(self):
+        # An extent past the workspace end means the pinned plan-info layout
+        # no longer matches the FlashInfer build; the reset must fail loudly
+        # instead of zeroing bytes outside the plan's ranges.
+        for plan_info, is_decode, num_rows in (
+            (self._plan_info(), False,
+             self.PADDED_BATCH_SIZE * self.CTA_TILE_Q * self.NUM_QO_HEADS),
+            (self._decode_plan_info(), True,
+             self.PADDED_BATCH_SIZE * self.NUM_QO_HEADS),
+        ):
+            s_bytes = num_rows * flashinfer_backend._FI_SIZEOF_FLOAT
+            # One byte short of tmp_s's planned end.
+            workspace = torch.full((self.S_OFFSET + s_bytes - 1, ),
+                                   self.FILL,
+                                   dtype=torch.uint8)
+            with self.assertRaisesRegex(RuntimeError, "out of range"):
+                self._reset(workspace,
+                            SimpleNamespace(_plan_info=plan_info),
+                            is_decode=is_decode)
+            self.assertTrue(workspace.eq(self.FILL).all())
+
+    def test_post_init_zeroes_workspace_and_checks_version(self):
+        # The helper tests above would keep passing if
+        # _post_init_with_buffers() stopped zeroing the fresh workspace or
+        # stopped invoking the version guard when the reset is enabled. Drive
+        # the real method with a stub metadata up to the workspace block, then
+        # cut it off at the first CUDA allocation that follows.
+        class _Stop(Exception):
+            pass
+
+        dirty = torch.full((1024, ), self.FILL, dtype=torch.uint8)
+        stub = SimpleNamespace(is_cuda_graph=False,
+                               workspace_buffer=None,
+                               max_num_requests=1,
+                               get_empty=lambda *args, **kwargs: dirty)
+        with mock.patch.object(flashinfer_backend, "_FI_SPLIT_KV_RESET_ENABLED",
+                               True), \
+             mock.patch.object(flashinfer_backend,
+                               "_assert_split_kv_reset_supported") as guard, \
+             mock.patch.object(torch, "empty", side_effect=_Stop):
+            with self.assertRaises(_Stop):
+                FlashInferAttentionMetadata._post_init_with_buffers(stub, None)
+        self.assertIs(stub.workspace_buffer, dirty)
+        self.assertTrue(dirty.eq(0).all())
+        guard.assert_called_once_with()
+
+    def test_version_guard_rejects_unpinned_flashinfer(self):
+        # The opt-in per-pass reset pins the plan-info offsets to a known
+        # FlashInfer version; an unrecognized version must fail loudly rather
+        # than zero the wrong workspace bytes.
+        original = flashinfer_backend.flashinfer
+        try:
+            flashinfer_backend.flashinfer = SimpleNamespace(
+                __version__="0.0.0-unpinned")
+            with self.assertRaises(RuntimeError):
+                flashinfer_backend._assert_split_kv_reset_supported()
+            flashinfer_backend.flashinfer = SimpleNamespace(
+                __version__=flashinfer_backend.
+                _FI_SPLIT_KV_SUPPORTED_VERSIONS[0])
+            flashinfer_backend._assert_split_kv_reset_supported()
+        finally:
+            flashinfer_backend.flashinfer = original
