@@ -4469,10 +4469,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             f"Question: what was the code word? Answer in one word."
             for n in needles
         ]
-        # Long generation so each suspend/resume round trip spans many decode
-        # steps and the suspended requests are held across a long active run of
-        # the request that owns the pool
-        sampling = SamplingParams(max_tokens=128, temperature=0.0)
+        # Keep every request resident for the full decode length. An early EOS
+        # can release enough pages to avoid the suspend/resume path. GPT-OSS
+        # has multiple EOS IDs, so min_tokens alone does not prevent early stops.
+        sampling = SamplingParams(max_tokens=128,
+                                  ignore_eos=True,
+                                  temperature=0.0)
 
         def _drain_stats() -> tuple[int, int, int, int, int]:
             # Single drain: llm.get_stats() consumes the per-iteration records,
@@ -4538,11 +4540,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             # Checked against the *measured* pool, never against max_tokens --
             # the manager inflates that knob by 1 / max_util_for_resume, so a
             # config-derived bound is wrong by ~1.43x (see the sizing note on
-            # kv_cache_config). Under VSWA the pool holds far more tokens per
-            # byte than a full-attention model, so it takes twelve requests to
-            # overflow it: observed on B200 at concurrent_peak ~4764 vs
-            # pool_tokens ~3328, a ~1.4x margin that reliably suspends/resumes a
-            # couple of in-flight requests. Failing here means the workload
+            # kv_cache_config). The allocated pool also depends on page-aligned
+            # window retention. Failing here means the workload
             # stopped being contended, NOT that the KV path broke.
             assert concurrent_peak > pool_tokens, (
                 f"workload precondition failed: the pool ({pool_tokens} tokens) "
@@ -4573,6 +4572,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
               f"common_prefix_tokens={prefixes}")
         for i in range(len(prompts)):
             print(f"[I-10 out {i}] needle={needles[i]} "
+                  f"ref_tokens={len(ref_ids[i])} con_tokens={len(con_ids[i])} "
                   f"ref_recall={needles[i] in ref_txt[i].upper()} "
                   f"con_recall={needles[i] in con_txt[i].upper()} "
                   f"ref={ref_txt[i]!r} con={con_txt[i]!r}")
@@ -4584,6 +4584,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         assert all(len(ids) > 0 for ids in con_ids), (
             "a request produced no tokens under suspend/resume contention "
             "(possible V2 scheduler deadlock or illegal-memory-access crash)")
+        assert all(len(ids) == sampling.max_tokens for ids in con_ids), (
+            "fixed-length contention workload ended early: "
+            f"expected {sampling.max_tokens} tokens per request, "
+            f"got {[len(ids) for ids in con_ids]}")
         # (2) The ACTIVE<->SUSPENDED state machine genuinely fired (not mere
         # queuing): an in-flight request was suspended under pressure and later
         # recovered. These per-iteration manager counters are the direct signal;
