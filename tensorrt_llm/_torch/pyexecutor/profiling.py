@@ -62,6 +62,21 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_glo
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+KV_POOL_LOG_INTERVAL_ENV_VAR_NAME = "TLLM_KV_POOL_LOG_INTERVAL"
+
+
+def load_kv_pool_log_interval(env_var: str = KV_POOL_LOG_INTERVAL_ENV_VAR_NAME) -> int:
+    """Parse the per-pool KV cache log interval; unset or empty means disabled (``0``)."""
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return 0
+    try:
+        interval = int(raw)
+    except ValueError as e:
+        raise ValueError(f"Cannot parse environment variable `{env_var}`: {e}") from e
+    if interval < 0:
+        raise ValueError(f"Environment variable `{env_var}` must be non-negative, got {interval}")
+    return interval
 
 
 @functools.cache
@@ -115,6 +130,10 @@ class PyExecutorProfileManager:
 
     def __init__(self, executor: "PyExecutor") -> None:  # noqa: F821
         self._executor_ref = weakref.ref(executor)
+        # Parsed here so a malformed value fails at construction (like
+        # ``TLLM_PROFILE_START_STOP``) instead of on the executor thread.
+        self._kv_pool_log_interval = load_kv_pool_log_interval()
+        self._kv_pool_last_sampled_iter: Optional[int] = None
 
     # ---- helpers ---------------------------------------------------
 
@@ -579,6 +598,60 @@ class PyExecutorProfileManager:
             )
         return cancelled_pending_start
 
+    @staticmethod
+    def _format_utilization(value: Optional[float]) -> str:
+        return f"{value:.3f}" if value is not None else "N/A"
+
+    def _kv_cache_log_fields(self) -> List[str]:
+        """Return the ``name = value`` KV cache fields of the iteration log.
+
+        Always includes the aggregate ``kv_cache_util``. With KV Cache Manager V2
+        and ``TLLM_KV_POOL_LOG_INTERVAL`` > 0, sampled iterations also get one
+        per-pool-group field per tier.
+        """
+        executor = self._executor
+        manager = executor.kv_cache_manager
+        if manager is None:
+            return ["kv_cache_util = N/A"]
+        if not executor._is_kv_manager_v2:
+            kv_stats = manager.get_kv_cache_stats()
+            utilization = (
+                1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks
+                if kv_stats.max_num_blocks > 0
+                else None
+            )
+            return [f"kv_cache_util = {self._format_utilization(utilization)}"]
+
+        interval = self._kv_pool_log_interval
+        iter_counter = executor.iter_counter
+        # No pool samples during warmup / KV estimation (temporary manager), and
+        # at most one per iteration: retry paths re-enter without advancing
+        # ``iter_counter``.
+        sample_pools = (
+            interval > 0
+            and not executor.is_warmup
+            and iter_counter % interval == 0
+            and iter_counter != self._kv_pool_last_sampled_iter
+        )
+        utilization, pools = manager.get_kv_cache_utilization(include_pool_details=sample_pools)
+        fields = [f"kv_cache_util = {self._format_utilization(utilization)}"]
+        if sample_pools:
+            self._kv_pool_last_sampled_iter = iter_counter
+            for tier, values in pools.items():
+                if values is None:
+                    formatted = "N/A"
+                else:
+                    formatted = (
+                        "["
+                        + ";".join(
+                            f"{pool_id}:{self._format_utilization(value)}"
+                            for pool_id, value in enumerate(values)
+                        )
+                        + "]"
+                    )
+                fields.append(f"kv_cache_{tier}_pool_util = {formatted}")
+        return fields
+
     # ---- per-iteration driver (executor thread) --------------------
 
     @contextmanager
@@ -648,6 +721,18 @@ class PyExecutorProfileManager:
         else:
             log_all_ranks = False
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
+
+        pool_log_interval = self._kv_pool_log_interval
+        if (
+            pool_log_interval
+            and not executor.is_warmup
+            and not (executor._is_kv_manager_v2 and executor.print_log)
+        ):
+            logger.warning(
+                f"{KV_POOL_LOG_INTERVAL_ENV_VAR_NAME}={pool_log_interval} has no effect: "
+                "per-pool KV cache logging requires KV Cache Manager V2 and "
+                "print_iter_log=True."
+            )
 
         calibrator = get_calibrator()
 
@@ -737,13 +822,7 @@ class PyExecutorProfileManager:
                         prev_device_step_time_str = "N/A"  # first iteration
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
-                    kv_util_str = "N/A"
-                    if executor.kv_cache_manager is not None:
-                        kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
-                        if kv_stats.max_num_blocks > 0:
-                            kv_util_str = (
-                                f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
-                            )
+                    kv_fields = ", ".join(self._kv_cache_log_fields())
                     import datetime
 
                     formatted_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -754,7 +833,7 @@ class PyExecutorProfileManager:
                         f"num_scheduled_requests = {executor.num_scheduled_requests}, "
                         f"adp_dummy_ctx_tokens = {executor._iter_adp_dummy_ctx_tokens}, "
                         f"adp_dummy_gen_tokens = {executor._iter_adp_dummy_gen_tokens}, "
-                        f"kv_cache_util = {kv_util_str}, "
+                        f"{kv_fields}, "
                         f"currank_total_requests = {executor.num_fetch_requests_cur_rank}/"
                         f"{executor.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "

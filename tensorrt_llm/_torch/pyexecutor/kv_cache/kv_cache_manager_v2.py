@@ -58,6 +58,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     CacheLevel,
+    CacheTier,
     CacheTierConfig,
     CuError,
     DataRole,
@@ -1945,6 +1946,17 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"{type(self).__name__} role-to-pool/lifecycle mapping:")
         for entry in entries:
             logger.info(entry)
+        # Cold levels number their pool groups independently of the hot level, so log
+        # the shared cold mapping too; per-pool offload logs are indexed by these ids.
+        if len(self.impl.cache_tier_list) > 1:
+            cold_mapping = {
+                pool_group_id: sorted(layer_group_ids)
+                for pool_group_id, layer_group_ids in self._cold_pool_group_membership()
+            }
+            logger.info(
+                f"{self.impl.cache_tier_list[1].name} pool_group_id -> layer_group_ids = "
+                f"{cold_mapping}"
+            )
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         pool_ids = torch.empty(
@@ -3688,11 +3700,59 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
         )
 
+    @staticmethod
+    def _sum_capacity(pool_group_stats) -> tuple[int, int]:
+        """Return ``(total, available)`` slot counts summed over pool groups."""
+        return (
+            sum(stat.total for stat in pool_group_stats),
+            sum(stat.available for stat in pool_group_stats),
+        )
+
+    @staticmethod
+    def _utilization(total: int, remaining: int) -> float | None:
+        """Return ``1 - remaining / total``, or ``None`` for a pool without capacity."""
+        return 1.0 - remaining / total if total else None
+
+    def get_kv_cache_utilization(
+        self, include_pool_details: bool = False
+    ) -> tuple[float | None, dict[str, list[float | None] | None]]:
+        """Read capacity utilization from CPU-side counters without collecting iteration stats.
+
+        Args:
+            include_pool_details: Also return per-pool-group utilization for the GPU tier and,
+                when present, the host tier. The host counters are only read when ``True``.
+
+        Returns:
+            A ``(gpu_utilization, pool_utilization)`` tuple. ``gpu_utilization`` is
+            ``1 - available / total`` over all GPU pool groups, where ``available`` counts free
+            and evictable slots, or ``None`` without GPU capacity. ``pool_utilization`` is empty
+            unless ``include_pool_details`` is set; otherwise ``"gpu"`` maps to that ratio per GPU
+            pool group and ``"host"`` maps to the occupancy ``1 - free / total`` per host pool
+            group, including evictable cached pages, or to ``None`` when there is no host tier.
+            List positions are tier-local pool group ids; zero-capacity groups read ``None``.
+            Disk tiers are not reported.
+        """
+        gpu_stats = self._get_storage_statistics(GPU_LEVEL)
+        total, available = self._sum_capacity(gpu_stats)
+        gpu_utilization = self._utilization(total, available)
+        pool_utilization: dict[str, list[float | None] | None] = {}
+        if include_pool_details:
+            pool_utilization["gpu"] = [
+                self._utilization(stat.total, stat.available) for stat in gpu_stats
+            ]
+            pool_utilization["host"] = None
+            for level, tier in enumerate(self.impl.cache_tier_list):
+                if tier == CacheTier.HOST_MEM:
+                    pool_utilization["host"] = [
+                        self._utilization(stat.total, stat.free)
+                        for stat in self._get_storage_statistics(CacheLevel(level))
+                    ]
+        return gpu_utilization, pool_utilization
+
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
         pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
-        max_num_blocks = sum(stat.total for stat in pool_group_stats)
-        free_num_blocks = sum(stat.available for stat in pool_group_stats)
+        max_num_blocks, free_num_blocks = self._sum_capacity(pool_group_stats)
         committed_stats = self.impl.get_committed_stats()
 
         kv_cache_stats.max_num_blocks = max_num_blocks

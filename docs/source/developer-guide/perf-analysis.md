@@ -130,6 +130,45 @@ The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight 
 
 The PyTorch profiler results will be saved to `trace.json`. Use `chrome://tracing/` to inspect the saved profile.
 
+## Lightweight KV cache pool logging
+
+The per-iteration log (`print_iter_log: true`) prints one line per iteration on the
+ranks selected by `TLLM_PROFILE_LOG_RANKS` (default `0`; a comma-separated list of
+ranks, or `all`), including the aggregate `kv_cache_util`. With KV Cache Manager V2
+(`kv_cache_config.use_kv_cache_manager_v2`, resolved automatically for most models),
+`TLLM_KV_POOL_LOG_INTERVAL=N` appends per-pool-group utilization for the GPU and host
+tiers every `N` iterations:
+
+```bash
+TLLM_KV_POOL_LOG_INTERVAL=50 TLLM_PROFILE_LOG_RANKS=0 \
+trtllm-serve <model> --config config.yaml
+```
+
+```yaml
+# config.yaml (alongside your model's other serving options)
+print_iter_log: true
+```
+
+The interval defaults to `0` (disabled); `1` logs every iteration for short diagnostic
+runs. A warning is logged when the interval is set but cannot take effect (legacy cache
+manager, or `print_iter_log` disabled). Sampled iteration lines look like:
+
+```text
+kv_cache_util = 0.600, kv_cache_gpu_pool_util = [0:0.900;1:0.500], kv_cache_host_pool_util = [0:0.750],
+```
+
+Pool-group IDs are tier-local: GPU pool `0` need not correspond to host pool `0`, and
+the tiers may have different numbers of groups. The cache manager logs each tier's
+mapping from pool-group IDs to layer-group IDs at construction (the
+`role-to-pool/lifecycle mapping` lines). Disk tiers are not included. A missing host
+tier or a pool group with zero capacity is reported as `N/A`.
+
+`kv_cache_util` and `kv_cache_gpu_pool_util` are `1 - (free + evictable) / total` in
+slots: capacity that is not immediately reclaimable, weighted by slot count rather than
+bytes. `kv_cache_host_pool_util` reports occupancy, `1 - free / total`, including
+evictable cached pages. Pool fields are omitted on unsampled iterations
+rather than repeating old samples, so sampling can miss short-lived peaks.
+
 ## MoE Expert Load Balance Analysis (Perfect Router)
 
 For Mixture-of-Experts (MoE) models, performance can vary significantly based on how tokens are routed to experts. Uneven expert load distribution can cause some GPUs to be overloaded while others are underutilized, leading to suboptimal throughput.
