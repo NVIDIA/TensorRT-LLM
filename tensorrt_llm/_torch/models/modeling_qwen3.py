@@ -85,6 +85,13 @@ class Qwen3Attention(QKNormRoPEAttention):
             mapping_with_cp=mapping_with_cp,
         )
 
+        extra_attrs = model_config.extra_attrs
+        if extra_attrs.get("nanojet_enabled") and "nanojet_rope_table" not in extra_attrs:
+            assert self.rotary_emb is not None
+            extra_attrs["nanojet_rope_table"] = self.rotary_emb.rotary_cos_sin.flatten(1).to(
+                torch.bfloat16
+            )
+
 
 class Qwen3DecoderLayer(DecoderLayer):
 
@@ -207,6 +214,8 @@ class Qwen3Model(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
         self.mapping_with_cp = mapping_with_cp
+        if model_config.extra_attrs.get("nanojet_enabled"):
+            self._weights_transformed = False
 
         self.embed_tokens = Embedding(
             config.pretrained_config.vocab_size,
@@ -228,6 +237,23 @@ class Qwen3Model(DecoderModel):
             eps=config.pretrained_config.rms_norm_eps,
             dtype=config.pretrained_config.torch_dtype,
         )
+
+    def transform_weights(self) -> None:
+        if not self.model_config.extra_attrs.get("nanojet_enabled") or getattr(
+            self, "_weights_transformed", False
+        ):
+            return
+
+        with torch.no_grad():
+            for layer in self.layers:
+                gate_weight, up_weight = layer.mlp.gate_up_proj.weight.chunk(2, dim=0)
+                gate_buffer = gate_weight.clone()
+                gate_weight.copy_(up_weight)
+                up_weight.copy_(gate_buffer)
+        self._weights_transformed = True
+
+    def post_load_weights(self) -> None:
+        self.transform_weights()
 
     def forward(
         self,
