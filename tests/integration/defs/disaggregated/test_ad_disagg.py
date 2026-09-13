@@ -67,32 +67,13 @@ OMPI_COMM_WORLD_ENV_KEYS = (
 AUTODEPLOY_DISAGG_SEED = 1234
 REDUCED_TINYLLAMA_LAYERS = 2
 REDUCED_DEEPSEEK_LAYERS = 2
-LLAMA_EAGLE3_EXPECTED_TEXT = " Berlin\nWhat is the capital of France? Paris\nWhat is the capital of"
-LLAMA_EAGLE3_EXPECTED_TOKEN_IDS = [
-    20437,
-    198,
-    3923,
-    374,
-    279,
-    6864,
-    315,
-    9822,
-    30,
-    12366,
-    198,
-    3923,
-    374,
-    279,
-    6864,
-    315,
-]
 
 
 MODEL_PATHS = {
-    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
-    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
     "DeepSeek-V3-Lite": "DeepSeek-V3-Lite/bf16",
+    "Qwen3-8B-eagle3": "Qwen3/qwen3_8b_eagle3",
+    "Qwen3-8B": "Qwen3/Qwen3-8B",
 }
 
 
@@ -657,15 +638,20 @@ def test_chunked_prefill_handoff(model):
 # ---------------------------------------------------------------------------
 
 
-def llama_eagle3_config():
+def qwen3_eagle3_config():
     return {
         "speculative_config": Eagle3DecodingConfig(
             max_draft_len=3,
-            speculative_model=model_path("EAGLE3-LLaMA3.1-Instruct-8B"),
+            speculative_model=model_path("Qwen3-8B-eagle3"),
             eagle3_one_model=True,
-            eagle3_layers_to_capture={1, 15, 28},
+            # TODO: these capture layers were carried over proportionally from
+            # the retired Llama-3.1-8B config (1/32, 15/32, 28/32 through the
+            # stack) and have NOT been validated against Qwen3-8B's actual
+            # layer count on GPU. Re-derive and confirm before relying on this
+            # test's output.
+            eagle3_layers_to_capture={1, 17, 31},
         ),
-        # Force the Eagle3 draft to match the BF16 Llama 3.1 target. Shared KV
+        # Force the Eagle3 draft to match the BF16 Qwen3-8B target. Shared KV
         # cache management requires matching target and draft KV dtypes.
         "speculative_model_kwargs": {"torch_dtype": "bfloat16"},
     }
@@ -1040,18 +1026,39 @@ def test_async_sharded_generation_handoff():
 @pytest.mark.skip_less_device(2)
 @pytest.mark.timeout(900)
 def test_async_eagle3_full_model_handoff():
+    """Eagle3 one-model draft-token handoff, compared against an aggregate run.
+
+    Unlike the retired Llama-3.1-8B version of this test, this compares
+    against a freshly-computed aggregate (non-disaggregated) generation using
+    the same speculative_config, instead of hardcoded golden text/token IDs.
+    That avoids needing pre-recorded goldens for the new model pairing, at the
+    cost of also exercising the aggregate Eagle3 one-model path as a
+    dependency. This still needs a real GPU run to confirm Qwen3-8B +
+    Qwen3/qwen3_8b_eagle3 actually produce matching, non-trivial draft-token
+    output under this config (see the eagle3_layers_to_capture TODO in
+    qwen3_eagle3_config).
+    """
+    prompt = "What is the capital of Germany?"
     sampling_params_kwargs = {
         "max_tokens": 16,
         "ignore_eos": True,
         "top_k": 1,
         "seed": AUTODEPLOY_DISAGG_SEED,
     }
-    extra_config = llama_eagle3_config()
+    extra_config = qwen3_eagle3_config()
+
+    aggregate_output = run_aggregate_generation(
+        "Qwen3-8B",
+        world_size=1,
+        prompt=prompt,
+        sampling_params_kwargs=sampling_params_kwargs,
+        extra_config=extra_config,
+    )
     outputs = run_context_then_generation_handoff(
-        "Llama-3.1-8B-Instruct",
+        "Qwen3-8B",
         worker_world_sizes=(1, 1),
         generation_overlap=True,
-        prompt="What is the capital of Germany?",
+        prompt=prompt,
         sampling_params_kwargs=sampling_params_kwargs,
         extra_config=extra_config,
     )
@@ -1065,7 +1072,6 @@ def test_async_eagle3_full_model_handoff():
     assert outputs["generation"].token_ids
     assert has_draft_tokens(outputs["context"])
     assert has_draft_tokens(outputs["generation"])
-    assert outputs["context"].text == " Berlin"
-    assert outputs["context"].token_ids == LLAMA_EAGLE3_EXPECTED_TOKEN_IDS[:1]
-    assert outputs["generation"].text == LLAMA_EAGLE3_EXPECTED_TEXT
-    assert outputs["generation"].token_ids == LLAMA_EAGLE3_EXPECTED_TOKEN_IDS
+    assert outputs["context"].token_ids == aggregate_output.token_ids[:1]
+    assert outputs["generation"].text == aggregate_output.text
+    assert outputs["generation"].token_ids == aggregate_output.token_ids

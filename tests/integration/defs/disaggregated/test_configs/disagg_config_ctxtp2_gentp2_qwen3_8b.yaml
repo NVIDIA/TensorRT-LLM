@@ -1,5 +1,5 @@
 hostname: localhost
-model: llama-3.1-model/Llama-3.1-8B-Instruct
+model: Qwen3/Qwen3-8B
 free_gpu_memory_fraction: 0.25
 backend: pytorch
 disable_overlap_scheduler: true
