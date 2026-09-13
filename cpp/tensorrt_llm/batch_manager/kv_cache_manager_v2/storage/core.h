@@ -147,6 +147,13 @@ public:
         return mCapacity;
     }
 
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
+    // here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
+    }
+
     Slot allocate();
     std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
@@ -213,6 +220,13 @@ public:
     }
 
     virtual SlotCount numSlots() const noexcept = 0;
+
+    // SlotId is signed, so a bare `slot < numSlots()` admits negatives, which then convert to a
+    // huge size_t offset. Both ends are checked here so no caller has to remember the lower one.
+    [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
+    {
+        return slot >= SlotId{0} && slot < numSlots();
+    }
 
     size_t numBytes() const noexcept
     {

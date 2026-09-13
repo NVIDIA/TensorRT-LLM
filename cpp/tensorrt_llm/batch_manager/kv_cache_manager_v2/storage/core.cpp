@@ -144,7 +144,7 @@ void SlotAllocator::release(Slot slot)
         throw LogicError("SlotAllocator::release: slot has no valid id");
     }
     SlotId const slotId = slot.slotId();
-    if (slotId >= numSlots() || !mOccupiedMask.get(toSizeT(slotId)))
+    if (!isValidSlotId(slotId) || !mOccupiedMask.get(toSizeT(slotId)))
     {
         // The id is not one this allocator has outstanding, so drop it rather than let the
         // rejected slot look like an unreleased one.
@@ -346,7 +346,7 @@ SlotCount GpuSlotPool::extendByOnePhysMem()
 
 Address GpuSlotPool::slotAddress(SlotId slot) const
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slot < numSlots(), "GpuSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "GpuSlotPool::slotAddress: slot index out of bounds");
     return MemAddress(mVirtMem.address() + mSlotSize * toSizeT(slot));
 }
 
@@ -382,7 +382,7 @@ void HostSlotPool::resize(SlotCount newNumSlots)
 
 Address HostSlotPool::slotAddress(SlotId slot) const
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slot < numSlots(), "HostSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "HostSlotPool::slotAddress: slot index out of bounds");
     return MemAddress(mHostMem.address() + mSlotSize * toSizeT(slot));
 }
 
@@ -445,7 +445,7 @@ void DiskSlotPool::resize(SlotCount newNumSlots)
 
 Address DiskSlotPool::slotAddress(SlotId slot) const
 {
-    TLLM_CHECK_WITH_INFO(slot < numSlots(), "DiskSlotPool::slotAddress: slot index out of bounds");
+    TLLM_CHECK_WITH_INFO(isValidSlotId(slot), "DiskSlotPool::slotAddress: slot index out of bounds");
     size_t const byteOffset = toSizeT(slot) * mSlotSize;
     TLLM_CHECK_DEBUG_WITH_INFO(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()),
         "DiskSlotPool::slotAddress: byte offset out of range");
