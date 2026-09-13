@@ -38,7 +38,8 @@ from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
+from ..llmapi.utils import (_SyncQueue, acquire_cpu_affinity, logger_debug,
+                            release_cpu_affinity)
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
@@ -137,6 +138,7 @@ class BaseWorker(GenerationExecutor):
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
         self._resource_governor_queue = None
+        self._cpu_affinity_lease = None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -153,11 +155,23 @@ class BaseWorker(GenerationExecutor):
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
 
-        configure_cpu_affinity(device_id)
+        if self._cpu_affinity_lease is None:
+            self._cpu_affinity_lease = acquire_cpu_affinity(device_id)
 
         return comm_ranks, device_ids
 
+    def _release_cpu_affinity(self):
+        release_cpu_affinity(self._cpu_affinity_lease)
+        self._cpu_affinity_lease = None
+
     def setup_engine(self):
+        try:
+            self._setup_engine()
+        except Exception:
+            self._release_cpu_affinity()
+            raise
+
+    def _setup_engine(self):
         """
         Setup the engine for the worker.
         """
@@ -1031,13 +1045,16 @@ class BaseWorker(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
-        if self.engine is not None:
-            can_shutdown = getattr(self.engine, "can_shutdown", None)
-            if can_shutdown is None:
-                can_shutdown = self.engine.can_enqueue_requests
-            if can_shutdown():
-                self.engine.shutdown()
-                self.engine = None
+        try:
+            if self.engine is not None:
+                can_shutdown = getattr(self.engine, "can_shutdown", None)
+                if can_shutdown is None:
+                    can_shutdown = self.engine.can_enqueue_requests
+                if can_shutdown():
+                    self.engine.shutdown()
+                    self.engine = None
+        finally:
+            self._release_cpu_affinity()
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:
