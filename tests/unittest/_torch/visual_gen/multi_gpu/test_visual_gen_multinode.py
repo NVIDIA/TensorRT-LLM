@@ -6,6 +6,7 @@
 All tests run without GPU — CUDA/dist operations are mocked out.
 """
 
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -133,6 +134,13 @@ class TestRunDiffusionWorkerDeviceAssignment:
             patch("torch.cuda.set_device", mock_set_device),
             patch("torch.distributed.init_process_group"),
             patch("torch.distributed.destroy_process_group"),
+            patch(
+                "tensorrt_llm._torch.visual_gen.executor.acquire_cpu_affinity",
+                return_value=7,
+            ) as acquire_affinity,
+            patch(
+                "tensorrt_llm._torch.visual_gen.executor.release_cpu_affinity"
+            ) as release_affinity,
             patch.object(DiffusionExecutor, "__new__", return_value=mock_exec),
             patch.object(DiffusionExecutor, "__init__", return_value=None),
         ):
@@ -146,6 +154,10 @@ class TestRunDiffusionWorkerDeviceAssignment:
                 visual_gen_args=VisualGenArgs(model="/tmp/model"),
                 local_rank=local_rank,
             )
+
+        expected_device = local_rank if local_rank is not None else int(os.environ["LOCAL_RANK"])
+        acquire_affinity.assert_called_once_with(expected_device)
+        release_affinity.assert_called_once_with(7)
 
     def test_explicit_local_rank_overrides_env(self, monkeypatch):
         """Regression: explicit local_rank=3 must be used even when LOCAL_RANK=0 in env.

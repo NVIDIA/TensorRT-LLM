@@ -32,7 +32,7 @@ from tensorrt_llm.executor.ray.utils import control_action_decorator
 from ... import TorchLlmArgs
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
-from ...llmapi.utils import configure_cpu_affinity
+from ...llmapi.utils import acquire_cpu_affinity
 from ...sampling_params import BatchedLogitsProcessor
 from ..base_worker import BaseWorker
 from ..postproc_worker import PostprocWorkerConfig
@@ -356,6 +356,13 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         else:
             self.doing_shutdown = True
 
+        try:
+            self._shutdown()
+        finally:
+            self._release_cpu_affinity()
+
+    def _shutdown(self):
+
         logger.debug(f'Worker {self.rank} shutting down...')
 
         if hasattr(self, 'shutdown_event'):
@@ -401,7 +408,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         torch.distributed.all_gather_object(comm_ranks, global_rank)
         torch.distributed.all_gather_object(device_ids, self.device_id)
 
-        configure_cpu_affinity(self.device_id)
+        if self._cpu_affinity_lease is None:
+            self._cpu_affinity_lease = acquire_cpu_affinity(self.device_id)
 
         return comm_ranks, device_ids
 
