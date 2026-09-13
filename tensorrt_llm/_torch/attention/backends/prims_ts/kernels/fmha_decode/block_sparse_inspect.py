@@ -20,10 +20,10 @@ same semantic ``max_blocks_per_row`` bound that reusable plans receive from
 their caller. Token-mask contents belong to the run-time prepare kernel and
 are not read here.
 
-Paged inspection first validates live sequence lengths and page rows, then
-four warps validate four BSR Q-block rows per CTA. Both publish one validation
-status plus the maximum row width in one Int64 summary; no route payload is
-constructed.
+Paged inspection first validates live sequence lengths and the live prefix of
+every page-table row, then four warps validate four BSR Q-block rows per CTA.
+Both publish one validation status plus the maximum row width in one Int64
+summary; no route payload is constructed.
 """
 
 import functools
@@ -51,9 +51,7 @@ _BSR_ERROR_NOT_STRICTLY_INCREASING = 1
 _BSR_ERROR_INDEX_OUT_OF_RANGE = 2
 _BSR_ERROR_INVALID_INDPTR = 3
 _ERROR_INVALID_SEQ_LEN = 4
-_ERROR_INVALID_PAGE_INDPTR = 5
-_ERROR_INSUFFICIENT_PAGE_CAPACITY = 6
-_ERROR_INVALID_PHYSICAL_PAGE_ID = 7
+_ERROR_INVALID_PHYSICAL_PAGE_ID = 5
 
 
 @cute.jit
@@ -296,7 +294,7 @@ class _InspectBlockSparseBsr:
 
 
 class _InspectPagedKvMetadata:
-    """Validate live lengths and page rows with one warp per request."""
+    """Validate live lengths and page-table rows with one warp per request."""
 
     def __init__(
         self,
@@ -314,16 +312,16 @@ class _InspectPagedKvMetadata:
     @cute.jit
     def __call__(
         self,
-        paged_kv_indptr: cute.Tensor,
-        paged_kv_indices: cute.Tensor,
+        block_tables: cute.Tensor,
+        block_table_row_stride: cutlass.Int64,
         seq_lens_kv: cute.Tensor,
         num_physical_kv_pages: cutlass.Int64,
         summary: cute.Tensor,
         stream: cuda_drv.CUstream,
     ) -> None:
         self.kernel(
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
+            block_table_row_stride,
             seq_lens_kv,
             num_physical_kv_pages,
             summary,
@@ -340,8 +338,8 @@ class _InspectPagedKvMetadata:
     @cute.kernel
     def kernel(
         self,
-        paged_kv_indptr: cute.Tensor,
-        paged_kv_indices: cute.Tensor,
+        block_tables: cute.Tensor,
+        block_table_row_stride: cutlass.Int64,
         seq_lens_kv: cute.Tensor,
         num_physical_kv_pages: cutlass.Int64,
         summary: cute.Tensor,
@@ -353,9 +351,7 @@ class _InspectPagedKvMetadata:
         batch_idx = block_idx * _WARPS_PER_CTA + warp_idx
         request_is_valid = batch_idx < self.batch_size
 
-        request_begin = cutlass.Int32(0)
-        request_end = cutlass.Int32(0)
-        request_range_is_valid = cutlass.Int32(0)
+        live_pages = cutlass.Int32(0)
         error_code = cutlass.Int32(_BSR_ERROR_NONE)
         if lane_idx == 0 and request_is_valid:
             seq_len_kv = cutlass.Int32(seq_lens_kv[batch_idx])
@@ -363,38 +359,20 @@ class _InspectPagedKvMetadata:
                 seq_len_kv >= cutlass.Int32(self.minimum_seq_len_kv)
                 and seq_len_kv <= cutlass.Int32(self.max_seq_len_kv)
             )
-            if not seq_len_is_valid:
-                error_code = cutlass.Int32(_ERROR_INVALID_SEQ_LEN)
-
-            request_begin = cutlass.Int32(paged_kv_indptr[batch_idx])
-            request_end = cutlass.Int32(paged_kv_indptr[batch_idx + 1])
-            num_page_indices = cutlass.Int32(cute.size(paged_kv_indices))
-            request_range_is_valid = cutlass.Int32(
-                paged_kv_indptr[cutlass.Int32(0)] == cutlass.Int32(0)
-                and request_begin >= cutlass.Int32(0)
-                and request_begin <= request_end
-                and request_end <= num_page_indices
-            )
-            if request_range_is_valid == cutlass.Int32(0):
-                error_code = cutlass.Int32(_ERROR_INVALID_PAGE_INDPTR)
-            elif seq_len_is_valid:
-                required_pages = (seq_len_kv - cutlass.Int32(1)) // cutlass.Int32(
+            if seq_len_is_valid:
+                live_pages = (seq_len_kv - cutlass.Int32(1)) // cutlass.Int32(
                     self.page_size
                 ) + cutlass.Int32(1)
-                if request_end - request_begin < required_pages:
-                    error_code = cutlass.Int32(_ERROR_INSUFFICIENT_PAGE_CAPACITY)
+            else:
+                error_code = cutlass.Int32(_ERROR_INVALID_SEQ_LEN)
 
-        request_begin = _warp_broadcast_i32(request_begin, 0)
-        request_end = _warp_broadcast_i32(request_end, 0)
-        request_range_is_valid = _warp_broadcast_i32(request_range_is_valid, 0)
-        if request_is_valid and request_range_is_valid != cutlass.Int32(0):
+        live_pages = _warp_broadcast_i32(live_pages, 0)
+        if request_is_valid:
+            row_begin = cutlass.Int64(batch_idx) * block_table_row_stride
             page_offset = cutlass.Int64(lane_idx)
-            request_page_count = cutlass.Int64(request_end) - cutlass.Int64(
-                request_begin
-            )
-            while page_offset < request_page_count:
-                page_position = cutlass.Int64(request_begin) + page_offset
-                physical_page_id = cutlass.Int32(paged_kv_indices[page_position])
+            while page_offset < cutlass.Int64(live_pages):
+                page_position = cutlass.Int64(row_begin + page_offset)
+                physical_page_id = cutlass.Int32(block_tables.iterator[page_position])
                 if (
                     physical_page_id < cutlass.Int32(0)
                     or cutlass.Int64(physical_page_id) >= num_physical_kv_pages
@@ -433,16 +411,16 @@ class _InspectPagedBlockSparseMetadata:
         self,
         block_indptr: cute.Tensor,
         block_indices: cute.Tensor,
-        paged_kv_indptr: cute.Tensor,
-        paged_kv_indices: cute.Tensor,
+        block_tables: cute.Tensor,
+        block_table_row_stride: cutlass.Int64,
         seq_lens_kv: cute.Tensor,
         num_physical_kv_pages: cutlass.Int64,
         summary: cute.Tensor,
         stream: cuda_drv.CUstream,
     ) -> None:
         self.inspect_requests(
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
+            block_table_row_stride,
             seq_lens_kv,
             num_physical_kv_pages,
             summary,
@@ -532,8 +510,9 @@ def compile_paged_block_sparse_metadata_inspection(
     """Compile one paged metadata entry that launches request then live-BSR."""
 
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
-    logical_page_capacity = cute.sym_int()
     logical_nnz = cute.sym_int()
+    runtime_page_columns = cute.sym_int()
+    runtime_page_row_stride = cute.sym_int64(divisibility=1)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     inspect_requests = _InspectPagedKvMetadata(
@@ -564,8 +543,13 @@ def compile_paged_block_sparse_metadata_inspection(
                 alignment=4,
             ),
             _fake_compact(cutlass.Int32, (logical_nnz,), alignment=4),
-            _fake_compact(cutlass.Int32, (batch_size + 1,), alignment=4),
-            _fake_compact(cutlass.Int32, (logical_page_capacity,), alignment=4),
+            cute.runtime.make_fake_tensor(
+                cutlass.Int32,
+                (batch_size, runtime_page_columns),
+                stride=(runtime_page_row_stride, 1),
+                assumed_align=4,
+            ),
+            cutlass.Int64(1),
             _fake_compact(cutlass.Int32, (batch_size,), alignment=4),
             cutlass.Int64(1),
             _fake_compact(cutlass.Int64, (_SUMMARY_FIELDS,), alignment=8),

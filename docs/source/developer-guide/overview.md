@@ -82,7 +82,7 @@ For diffusion-based visual generation (image/video), TensorRT-LLM provides a sep
 
 TensorRT-LLM log messages include a fixed-width module tag that identifies which subsystem produced the message:
 
-```txt
+```text
 [TRT-LLM] [I] [runtime ] Loading model weights...
 [TRT-LLM] [W] [_torch  ] FlashAttention not available, falling back to default
 [TRT-LLM] [I] [serve   ] Server listening on port 8000

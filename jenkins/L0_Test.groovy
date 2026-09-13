@@ -1623,6 +1623,8 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
+    extraInternalEnv += " TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1"
     // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
     // that repeated tactic profiling is reused across testcases within one stage.
     // /tmp lives on the container overlay (srun --no-container-mount-home / fresh
@@ -2106,7 +2108,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'BUILD_URL',
                     'JOB_NAME',
                     'globalVars',
-                    'gitlabCommit'
+                    'gitlabCommit',
+                    'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
                 ]
                 def envVarsToExport = [:]
                 envVarNames.each { varName ->
@@ -4994,38 +4997,20 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // Gateway adapters are opt-in extras excluded from requirements.txt;
-            // each gateway declares its pins in a dedicated
-            // requirements-<gateway>.txt, and a test stage installs exactly
-            // zero or one gateway file so every adapter is tested under the
-            // dependency set its real opt-in users receive. A gateway whose
-            // pins co-resolve with the default environment (SMG today) is
-            // installed in the shared stages so its unit tests run from the
-            // regular shard pool instead of being skipped at collection; a
-            // gateway whose pins conflict with the default environment (for
-            // example a protobuf major-version floor or a custom package
-            // index) must instead install its file behind a dedicated stage
-            // guard and skip this one (see the Ray install below for the
-            // stage-scoped pattern).
+            // Gateway adapters (SMG, OpenEngine) are opt-in extras excluded
+            // from requirements.txt, each declaring its pins in a dedicated
+            // requirements-<gateway>.txt so it is tested under the dependency
+            // set its real opt-in users receive. Both are installed on every
+            // stage: their pins co-resolve, so no stage-name guard is needed to
+            // keep them apart, and no stage silently loses a gateway's coverage
+            // to an `importorskip` at collection.
             //
-            // OpenEngine takes that second branch: its bindings resolve only
-            // from a custom index (--extra-index-url https://buf.build/gen/python),
-            // so it owns the CPU-Generic stages -- the only stages whose test
-            // list carries unittest/grpc/openengine/ -- and SMG steps aside
-            // there. No test in l0_cpu.yml imports tensorrt_llm.grpc.smg, so
-            // the swap costs no coverage. The guard is on the stage name and
-            // never on the CBTS scope: `scopes` is the union of every fired
-            // rule's scope, so a mixed selection (openengine source + any other
-            // narrowing change) would push these pins into every shard it runs.
-            // Matched as a substring, like the Ray guard below: a stage name that
-            // picks up a prefix or suffix must keep matching, because a missed
-            // match here is a silent `importorskip` skip rather than a failure.
-            if (stageName.contains("CPU-Generic")) {
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
-            } else {
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
-            }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
+            // OpenEngine's bindings resolve only from a custom index
+            // (--extra-index-url https://buf.build/gen/python), but that flag is
+            // scoped to this one pip invocation and does not affect how any
+            // other package resolves.
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: """
@@ -6468,7 +6453,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 5 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
         2,
         20,
@@ -6505,9 +6490,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
-        2,
+        3,
         36,
         9
     )
@@ -6516,16 +6501,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16",
-        2,
+        3,
         40,
         10
     )
     // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
-        2,
+        3,
         44,
         11
     )
@@ -6534,7 +6519,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8",
-        2,
+        3,
         56,
         14
     )
@@ -6550,7 +6535,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen6_node1_gpu4",
         2,
         28,
@@ -6559,7 +6544,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 50k2k con178: ctx5 (5 nodes, 4 GPUs each) + gen1 dep4 (1 node, 4 GPUs) = 24 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX5-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4",
         2,
         24,
@@ -6570,12 +6555,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
     // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
     // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
-    // wall-clock duration instead of a fixed prompt count, so they are pinned to
-    // aws-cmh where the DSpark checkpoint and the trace corpus are staged.
+    // wall-clock duration instead of a fixed prompt count. They require the
+    // DSpark checkpoint and the trace corpus to be staged on whichever
+    // gb300-flex cluster the stage lands on.
     // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
         1,
         24,
@@ -6584,7 +6570,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 10 Nodes: ctx3 (2 nodes, 8 GPUs each) + gen1 (4 nodes, 16 GPUs) = 40 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX3-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node2_gpu8_gen1_node4_gpu16",
         1,
         40,

@@ -373,8 +373,9 @@ def test_exact_create_check_digest_and_sync(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     fake_git.chmod(0o755)
+    # Prepend the Git trap so CI coverage's MPI startup can still find ssh.
     fake_git_environment = {
-        "PATH": str(fake_bin),
+        "PATH": os.pathsep.join((str(fake_bin), os.environ.get("PATH", os.defpath))),
         "VENDOR_GIT_SENTINEL": str(sentinel),
     }
     for mode in ([], ["--offline"]):

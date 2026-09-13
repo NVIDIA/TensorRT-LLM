@@ -392,17 +392,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
-        if (
-            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
-            and not cls.supports_skip_correction
-        ):
-            logger.debug(
-                "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-correction is "
-                "enabled and unsupported."
-            )
-            return False
-
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -537,7 +527,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
@@ -621,22 +611,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 "small-batch BF16 context attention uses the fallback FMHA for "
                 "performance because the FlashInfer TRTLLM-Gen context path "
                 "regresses TTFT due to per-layer host overhead."
-            )
-
-        if (
-            has_context_phase
-            and not has_low_precision_kv_cache
-            and q.dtype in (torch.float16, torch.bfloat16)
-            and meta.num_contexts > 0
-            and get_sm_version() == 103
-        ):
-            # NVBugs 6641268 and 6668773: on SM103, the FlashInfer
-            # TRTLLM-Gen persistent context path can read unused paged-KV tail
-            # elements, so stale values can corrupt valid FP16/BF16 output.
-            return False, (
-                "FP16/BF16 context attention uses the fallback FMHA on SM103 "
-                "because the FlashInfer TRTLLM-Gen persistent context path can "
-                "read unused paged-KV cache tails."
             )
 
         sparse_params = attn.sparse_params

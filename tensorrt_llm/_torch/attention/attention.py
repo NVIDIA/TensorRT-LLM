@@ -938,6 +938,7 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        output_gate: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if self.sparse_attn_hooks is not None:
@@ -955,6 +956,7 @@ class Attention(nn.Module):
                 relative_attention_bias,
                 relative_attention_max_distance,
                 has_lora,
+                output_gate,
                 **kwargs,
             )
             if sparse_output is not None:
@@ -1014,6 +1016,8 @@ class Attention(nn.Module):
             )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
+        if output_gate is not None:
+            output = self.apply_output_gate(output, output_gate)
 
         return output
 
@@ -1099,11 +1103,9 @@ class Attention(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
+            output_gate=gate,
             **kwargs,
         )
-
-        if self.attn_output_gate:
-            attn_output = self.apply_output_gate(attn_output, gate)
 
         if self.sparse_attn_hooks is not None:
             sparse_output = self.sparse_attn_hooks.project_output(

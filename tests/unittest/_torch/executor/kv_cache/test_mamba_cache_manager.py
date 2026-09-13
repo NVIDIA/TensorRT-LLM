@@ -3866,6 +3866,7 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
     mgr.intermediate_state_indices = torch.arange(batch_size, dtype=torch.int32)
     mgr._dummy_request_mask = torch.zeros(batch_size, dtype=torch.bool)
     mgr.all_conv_states = [torch.empty(0)]
+    mgr._stacked_conv_states = None
     mgr.intermediate_conv_states = torch.empty(0)
 
     events = []
@@ -3913,6 +3914,7 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
     mgr.intermediate_state_indices = torch.arange(4, dtype=torch.int32)
     mgr.all_ssm_states = []
     mgr.all_conv_states = [torch.empty(0)]
+    mgr._stacked_conv_states = None
     mgr.intermediate_conv_states = torch.empty(0)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
@@ -3943,6 +3945,8 @@ def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
     mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
     mgr.all_ssm_states = [torch.empty(0)]
     mgr.all_conv_states = [torch.empty(0)]
+    mgr._stacked_ssm_states = None
+    mgr._stacked_conv_states = None
     mgr.intermediate_ssm_states = torch.empty((1, 2, 8))
     mgr.intermediate_conv_states = torch.empty((1, 2, 8))
 
@@ -4346,3 +4350,24 @@ def test_cpp_hybrid_zero_local_mamba_layers():
         )
     )
     assert metadata.state_indices[0].item() == 0
+
+
+@skip_no_cuda
+def test_v2_stack_state_views_detects_affine_layout():
+    pool = torch.zeros(3, 4, 8, device="cuda")
+    layers = [pool[i] for i in range(3)]
+
+    stacked = MambaHybridCacheManagerV2._stack_state_views(layers)
+
+    assert stacked.shape == (3, 4, 8)
+    stacked[2, 1, 3] = 5.0
+    assert layers[2][1, 3] == 5.0
+
+
+def test_v2_stack_state_views_rejects_non_affine_layout():
+    pool = torch.zeros(4, 4, 8)
+    stack = MambaHybridCacheManagerV2._stack_state_views
+
+    assert stack([pool[0], pool[1], pool[3]]) is None
+    assert stack([pool[0], torch.zeros(5, 8)]) is None
+    assert stack([]) is None

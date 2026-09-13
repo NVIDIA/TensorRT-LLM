@@ -62,7 +62,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import PageIndexMode, Role
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
@@ -459,6 +459,7 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.max_num_sequences = 2
     metadata.max_num_tokens = 4
     metadata.num_sparse_topk = 3
+    metadata._radix_rows_per_sequence = 1
     metadata.num_sms = 1
     metadata.cuda_graph_buffers = None
     metadata.kv_cache_manager = SimpleNamespace(max_blocks_per_seq=2)
@@ -693,6 +694,60 @@ def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, exp
     assert indexer._indexer_bf16 is (flag_value == "1")
     assert indexer.wk.dtype == expected_dtype
     assert indexer.weights_proj.dtype == expected_dtype
+
+
+@pytest.mark.parametrize(
+    "is_tree,is_dynamic,max_draft_len,max_total_draft_tokens,spec_tree_manager,rows_per_sequence",
+    [
+        (False, False, 7, 7, None, 8),
+        (True, False, 3, 7, None, 8),
+        (
+            True,
+            True,
+            6,
+            31,
+            SimpleNamespace(_internal_buf_dim=60, dynamic_tree_max_topK=10),
+            60,
+        ),
+    ],
+)
+def test_metadata_spec_update_resizes_radix_workspace(
+    is_tree,
+    is_dynamic,
+    max_draft_len,
+    max_total_draft_tokens,
+    spec_tree_manager,
+    rows_per_sequence,
+):
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.max_num_sequences = 2
+    metadata.max_draft_tokens = 0
+    metadata._radix_rows_per_sequence = 1
+    metadata.num_sparse_topk = 2
+    metadata.is_cuda_graph = True
+    metadata.nvfp4_mla_fp8_scratch = None
+    metadata.kv_lens_cuda_2d = torch.empty(2, 1)
+    metadata.kv_lens_expanded_host = torch.empty(2)
+    metadata._create_kv_lens_2d_buffer = Mock()
+    metadata.create_expanded_buffers = Mock()
+    metadata._create_radix_aux_buffers = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata."
+        "TrtllmAttentionMetadata.update_spec_dec_param"
+    ):
+        metadata.update_spec_dec_param(
+            batch_size=2,
+            is_spec_decoding_enabled=True,
+            is_spec_dec_tree=is_tree,
+            is_spec_dec_dynamic_tree=is_dynamic,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            spec_tree_manager=spec_tree_manager,
+        )
+
+    assert metadata._radix_rows_per_sequence == rows_per_sequence
+    metadata._create_radix_aux_buffers.assert_called_once_with(True)
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -1246,6 +1301,97 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         assert cache_manager.get_cache_bytes_per_token() == expected_cache_bytes
         with pytest.raises(AssertionError, match="shared-indexer layer"):
             cache_manager.get_indexer_k_cache_buffers(1)
+    finally:
+        cache_manager.shutdown()
+
+
+def test_dsa_cache_manager_v2_remaps_indexer_after_empty_layers() -> None:
+    """Keep global buffer access aligned after masked and empty layers are removed."""
+    head_dim = 128
+    tokens_per_block = 16
+    layer_mask = [False, True, True, True, True, True, True]
+    pretrained_config = SimpleNamespace(
+        num_hidden_layers=len(layer_mask),
+        index_topk_pattern=["F", "S", "F", "S", "F", "S", "F"],
+    )
+    # Layer 0 is masked out before cache construction. Empty shared-indexer
+    # layers 1 and 3 must then be removed without shifting the surviving roles.
+    cache_manager = DSACacheManagerV2(
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=64,
+            host_cache_size=0,
+        ),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=sum(layer_mask),
+        num_kv_heads=[1, 0, 1, 0, 1, 1, 1],
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=64,
+        max_batch_size=1,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        layer_mask=layer_mask,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=head_dim),
+        pretrained_config=pretrained_config,
+    )
+
+    try:
+        retained_layers = [2, 4, 5, 6]
+        indexer_mask = [True, True, False, True]
+        assert cache_manager.num_layers == len(layer_mask)
+        assert cache_manager.pp_layers == retained_layers
+        assert cache_manager.num_local_layers == len(retained_layers)
+        assert cache_manager.layer_offsets == {2: 0, 4: 1, 5: 2, 6: 3}
+        assert cache_manager.indexer_k_cache_local_layer_mask == indexer_mask
+        assert cache_manager.indexer_k_cache_page_scale == sum(indexer_mask)
+
+        indexer_bytes_per_token = head_dim + 4
+        key_bytes_per_token = head_dim * 2
+        primary_pool = cache_manager.get_unique_primary_pool()
+        indexer_addresses = []
+        for local_layer_idx, global_layer_idx in enumerate(retained_layers):
+            has_indexer = indexer_mask[local_layer_idx]
+            layer_config = cache_manager.kv_cache_manager_py_config.layers[local_layer_idx]
+            assert int(layer_config.layer_id) == local_layer_idx
+            assert {buffer.role for buffer in layer_config.buffers} == (
+                {Role.KEY, Role.INDEX_KEY} if has_indexer else {Role.KEY}
+            )
+            assert cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.ALL) == (
+                key_bytes_per_token + (indexer_bytes_per_token if has_indexer else 0)
+            )
+
+            key = cache_manager.get_buffers(global_layer_idx)
+            assert key.data_ptr() == int(
+                cache_manager.impl.get_mem_pool_base_address(
+                    local_layer_idx, Role.KEY, PageIndexMode.SHARED
+                )
+            )
+            key[0, 0, 0, 0, 0] = global_layer_idx
+            assert primary_pool[0, local_layer_idx, 0, 0].item() == global_layer_idx
+            if has_indexer:
+                indexer = cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
+                assert indexer.shape[1:] == (tokens_per_block, 1, indexer_bytes_per_token)
+                assert indexer.data_ptr() == int(
+                    cache_manager.impl.get_mem_pool_base_address(
+                        local_layer_idx, Role.INDEX_KEY, PageIndexMode.SHARED
+                    )
+                )
+                indexer_addresses.append(indexer.data_ptr())
+                indexer[0, 0, 0, 0] = global_layer_idx
+            else:
+                with pytest.raises(AssertionError, match="shared-indexer layer"):
+                    cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
+
+        assert len(set(indexer_addresses)) == sum(indexer_mask)
+        for global_layer_idx in (2, 4, 6):
+            indexer = cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
+            assert indexer[0, 0, 0, 0].item() == global_layer_idx
+        for global_layer_idx in (0, 1, 3):
+            with pytest.raises(KeyError):
+                cache_manager.get_buffers(global_layer_idx)
+            with pytest.raises(KeyError):
+                cache_manager.get_indexer_k_cache_buffers(global_layer_idx)
     finally:
         cache_manager.shutdown()
 

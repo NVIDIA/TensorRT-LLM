@@ -1150,7 +1150,9 @@ class MLA(nn.Module):
         # use fake cached_cu_seq_len for chunked loop
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
         origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
-        origin_ctx_total_kv_len = attn_metadata.host_total_kv_lens[0]
+        # host_total_kv_lens is updated in place below, so copy the value out;
+        # a 0-d view would alias it and make the restore a no-op.
+        origin_ctx_total_kv_len = attn_metadata.host_total_kv_lens[0].item()
 
         for loop_idx in range(chunked_loop_num):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
@@ -1397,10 +1399,23 @@ class MLA(nn.Module):
         )
 
     def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
-        """BMM with optional CuTe DSL bf16 acceleration on Blackwell."""
+        """BMM with optional CuTe DSL bf16 acceleration on Blackwell/SM107."""
         if self.use_cute_dsl_bf16_bmm and is_sm_100f():
-            torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(a, b_no_transpose, output)
+            bf16_bmm_op = (
+                torch.ops.trtllm.cute_dsl_bf16_bmm_rubin
+                if get_sm_version() == 107
+                else torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell
+            )
+            bf16_bmm_op(a, b_no_transpose, output)
         else:
+            if get_sm_version() in (120, 121):
+                # `a` is a head-major transpose of a [tokens, heads, dim] buffer, so its
+                # batch stride is the token count rather than the tile extent. cuBLAS picks
+                # a TMA-based nvjet kernel for that layout on SM120/121, and
+                # cuTensorMapEncodeTiled cannot describe it -- the kernel then faults with
+                # an MMU page fault (surfaced as CUBLAS_STATUS_INTERNAL_ERROR or a later
+                # illegal memory access). Densify so a non-TMA kernel is selected.
+                a = a.contiguous()
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
     def forward_absorption_generation(

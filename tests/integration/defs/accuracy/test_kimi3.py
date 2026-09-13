@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-
 import pytest
 
 from tensorrt_llm import LLM
@@ -31,15 +29,14 @@ from tensorrt_llm.llmapi import (
     SchedulingParams,
 )
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import (
     GSM8K,
     ForceTokenLogitsProcessor,
     LlmapiAccuracyTestHarness,
-    assert_acceptance_length,
-    compute_acceptance_length,
+    assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
 )
 
 
@@ -47,6 +44,7 @@ from .accuracy_core import (
 class TestKimiK3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K3"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+    DSPARK_MODEL_PATH = f"{llm_models_root()}/Kimi-K3-DSpark"
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(16)
@@ -58,7 +56,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # schedule these tests on B300; that exclusion is enforced by QA's
     # platform selection, not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
-    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
+    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa", "dspark"])
     def test_w4a16_mxfp4(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
         """Verify Kimi K3 accuracy and its key model-feature matrix entries.
 
@@ -66,8 +64,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         mode also exercises attention DP, the overlap scheduler, CUDA graphs,
         chunked prefill, Torch sampling, a logits processor, and guided
         decoding. The reuse mode requires an observed hybrid-cache hit. The SA
-        mode remains an acceptance-length guard; SA is supported but is not a
-        column in the model-feature matrix.
+        and DSpark modes also guard acceptance length for the two speculative
+        decoding techniques advertised in the model-feature matrix.
         """
         if mode == "baseline":
             monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
@@ -112,10 +110,25 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 max_batch_size=8,
                 disable_overlap_scheduler=True,
                 enable_chunked_prefill=False,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-                speculative_config=SADecodingConfig(max_draft_len=2),
                 max_stats_len=-1,
             )
+            if mode == "sa":
+                llm_kwargs.update(
+                    cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+                    speculative_config=SADecodingConfig(max_draft_len=2),
+                )
+            else:
+                # Kimi K3 DSpark verification has only been qualified in eager
+                # mode. The external drafter and its captured target states
+                # also need more headroom than suffix automaton.
+                kv_cache_kwargs["free_gpu_memory_fraction"] = 0.20
+                llm_kwargs.update(
+                    cuda_graph_config=None,
+                    speculative_config=DSparkDecodingConfig(
+                        max_draft_len=7,
+                        speculative_model=self.DSPARK_MODEL_PATH,
+                    ),
+                )
             # Log corpus-aggregate acceptance length and rate at evaluation
             # end. QA records these values from the test log.
             monkeypatch.setenv("TLLM_EVAL_SPEC_STATS", "1")
@@ -129,21 +142,16 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             if mode == "baseline":
                 self._assert_attention_dp(llm)
                 self._assert_logits_processor(llm)
-                self._assert_guided_decoding(llm)
+                assert_guided_decoding_regex(llm)
             elif mode == "reuse":
                 self._assert_kv_cache_reuse(llm)
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            if mode == "sa":
-                acceptance_length = compute_acceptance_length(llm)
-                print(
-                    "[AL] TestKimiK3::test_w4a16_mxfp4[sa] "
-                    f"acceptance_length = {acceptance_length:.3f}"
-                )
-                assert_acceptance_length(
-                    "TestKimiK3::test_w4a16_mxfp4",
-                    acceptance_length,
+            if mode in ("sa", "dspark"):
+                assert_acceptance_length_for_llm(
+                    f"TestKimiK3::test_w4a16_mxfp4[{mode}]",
+                    llm,
                 )
 
     def _assert_checkpoint_routing(self) -> None:
@@ -162,9 +170,16 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         # K3's routed-expert quantization is nested in the composite checkpoint
         # and is not represented by the modelopt-style args quant_algo field.
         assert llm.args.quant_config.quant_algo is None
-        if mode == "sa":
+        if mode in ("sa", "dspark"):
             assert llm.args.disable_overlap_scheduler is True
             assert llm.args.enable_chunked_prefill is False
+            if mode == "dspark":
+                assert llm.args.cuda_graph_config is None
+                assert llm.args.speculative_config.decoding_type == "DSpark"
+                assert (
+                    str(llm.args.speculative_config.speculative_model)
+                    == TestKimiK3.DSPARK_MODEL_PATH
+                )
         else:
             assert llm.args.disable_overlap_scheduler is False
             assert llm.args.enable_chunked_prefill is True
@@ -274,22 +289,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         assert len(outputs) == 1
         assert outputs[0].outputs[0].token_ids == [forced_token_id] * output_length
 
-    @staticmethod
-    def _assert_guided_decoding(llm: LLM) -> None:
-        prompt_token_ids = llm.tokenizer.encode("Return exactly two decimal digits:")
-        outputs = llm.generate(
-            [prompt_token_ids],
-            sampling_params=SamplingParams(
-                max_tokens=8,
-                guided_decoding=GuidedDecodingParams(regex=r"[0-9]{2}"),
-            ),
-            use_tqdm=False,
-        )
-
-        assert isinstance(outputs, list)
-        assert len(outputs) == 1
-        assert re.fullmatch(r"[0-9]{2}", outputs[0].outputs[0].text)
-
 
 @pytest.mark.timeout(3600)
 # TP8 leaves ~182 GiB of weights per GPU before any KV cache, past what a
@@ -359,9 +358,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = compute_acceptance_length(llm)
-            print(
-                f"[AL] TestKimiK3DSpark::test_gsm8k_tep8 "
-                f"acceptance_length = {acceptance_length:.3f}"
+            assert_acceptance_length_for_llm(
+                "TestKimiK3DSpark::test_gsm8k_tep8",
+                llm,
             )
-            assert_acceptance_length("TestKimiK3DSpark::test_gsm8k_tep8", acceptance_length)

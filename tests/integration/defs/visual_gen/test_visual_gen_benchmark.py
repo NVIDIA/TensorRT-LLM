@@ -62,6 +62,7 @@ _SMALL_GEN_PARAMS = {
     "num_inference_steps": "4",
     "seed": "42",
 }
+_BENCHMARK_TIMEOUT_S = 1800
 
 
 def _make_visual_gen_options(**extra) -> dict:
@@ -243,6 +244,7 @@ def test_online_benchmark(
         stderr=subprocess.PIPE,
         text=True,
         check=True,
+        timeout=_BENCHMARK_TIMEOUT_S,
     )
 
     assert result.returncode == 0
@@ -308,6 +310,7 @@ def test_offline_benchmark(tmp_path):
         stderr=subprocess.PIPE,
         text=True,
         check=True,
+        timeout=_BENCHMARK_TIMEOUT_S,
     )
 
     assert result.returncode == 0
