@@ -61,6 +61,19 @@ def _gemm_pair(
         has_gemm1_clamp_limit=has_clamp,
         enable_pdl=enable_pdl,
     )
+    if (
+        is_nvfp4
+        and num_tokens == 1
+        and enable_pdl
+        and pair.fc1.cfg.kwargs.get("do_pdl_wait_for_num_non_exiting_ctas") == 1
+    ):
+        # FC1 waits for routing before any CTA can trigger FC2. The shared
+        # routing tables are therefore ready when FC2 starts. Keep FC2's
+        # activation-load wait for FC1, but overlap its independent weight
+        # loads and initialization with FC1's epilogue during decode.
+        fc2_options = dict(pair.fc2.cfg.kwargs)
+        fc2_options.update(do_pdl_wait_for_num_non_exiting_ctas=0, routing_metadata_ready=1)
+        pair = replace(pair, fc2=replace(pair.fc2, cfg=replace(pair.fc2.cfg, kwargs=fc2_options)))
     return pair
 
 

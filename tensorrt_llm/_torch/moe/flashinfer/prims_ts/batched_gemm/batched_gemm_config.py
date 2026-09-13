@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -567,6 +568,16 @@ class BatchedGemmConfig:
     load; the TS schedule then assumes the wait has completed. ``0``/``1``.
 
     Requires :attr:`use_pdl` and :attr:`use_early_exit` (:func:`validate_config`).
+    """
+
+    routing_metadata_ready: int = 0
+    """Caller guarantees routing tables and the active CTA count are ready.
+
+    Allows PDL early exit before waiting for the immediately preceding GEMM;
+    activation loads still wait through the TS dependency graph. ``0``/``1``.
+    The MoE FC2 caller can establish this when FC1 has already waited for
+    their common routing producer. A GEMM directly following routing cannot.
+    Requires PDL and early exit, and excludes the kernel-entry routing wait.
     """
 
     per_token_sf_dtype: int = int(DType.FP32)
@@ -2859,6 +2870,14 @@ def validate_config(
             f"{cfg.do_pdl_wait_for_num_non_exiting_ctas}"
         )
 
+    if cfg.routing_metadata_ready not in (0, 1):
+        raise ValueError(f"routing_metadata_ready must be 0 or 1, got {cfg.routing_metadata_ready}")
+    if cfg.routing_metadata_ready:
+        if not cfg.use_pdl or not cfg.use_early_exit:
+            raise ValueError("routing_metadata_ready requires PDL and early exit")
+        if cfg.do_pdl_wait_for_num_non_exiting_ctas:
+            raise ValueError("routing_metadata_ready excludes the kernel-entry routing wait")
+
     if cfg.do_pdl_wait_for_num_non_exiting_ctas:
         if not cfg.use_pdl:
             raise ValueError("do_pdl_wait_for_num_non_exiting_ctas requires use_pdl=1")
@@ -2866,10 +2885,10 @@ def validate_config(
             raise ValueError(
                 "do_pdl_wait_for_num_non_exiting_ctas requires use_early_exit=1"
             )
-    elif cfg.use_pdl and cfg.use_early_exit:
+    elif cfg.use_pdl and cfg.use_early_exit and not cfg.routing_metadata_ready:
         raise ValueError(
             "PDL early exit requires do_pdl_wait_for_num_non_exiting_ctas=1 "
-            "before reading the routing-produced active CTA count"
+            "or already-ready routing metadata before reading the active CTA count"
         )
 
     if cfg.use_global_scales not in (0, 1):

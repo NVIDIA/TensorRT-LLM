@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+
 # MoE Developer Guide
 
 ## Architecture
@@ -275,6 +277,11 @@ the same token buckets and local/global expert scope as
 TRTLLM-Gen. PDL follows `TRTLLM_ENABLE_PDL`. The exported intermediate workspace
 has a tactic-independent shape so tuning does not change the CUDA Graph or
 FakeTensor contract. Run model warmup before comparing inference performance.
+For single-token NVFP4 decode, FC1 waits for routing before any CTA can trigger
+FC2. FC2 can therefore read the shared routing metadata before waiting for
+FC1's output. Its activation loads still wait for FC1; independent weight loads
+and initialization can overlap FC1's epilogue. The vendored configuration
+requires an explicit `routing_metadata_ready` contract to defer that entry wait.
 The profiling hook regenerates routes after token-count expansion, including
 when autotuner shape constraints have already repeated the original indices.
 For routing methods with a correction bias, the PrimsTS op passes the model's

@@ -85,10 +85,16 @@ index e3b54583922a70d63c8ff16b54e01fdb0f770788..00000000000000000000000000000000
 -
 -"""Prims-TS MoE backend."""
 diff --git a/prims_ts/batched_gemm/batched_gemm_config.py b/prims_ts/batched_gemm/batched_gemm_config.py
-index 087e8e2000d5a8e7e727b4063b623c17741e300d..f06a59163a88fc702731a5ff90f546a4a964ca37 100644
+index 087e8e2000d5a8e7e727b4063b623c17741e300d..23685afd0c77b053e6c8a76f12bdfdcbdbf09aa8 100644
 --- a/prims_ts/batched_gemm/batched_gemm_config.py
 +++ b/prims_ts/batched_gemm/batched_gemm_config.py
-@@ -24,7 +24,7 @@ from dataclasses import dataclass, fields
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -24,7 +25,7 @@ from dataclasses import dataclass, fields
  from enum import IntEnum
  from cutlass.experimental import primitives as prims
  
@@ -97,7 +103,24 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..f06a59163a88fc702731a5ff90f546a4
  
  
  # `SmemSfLdgstsResource._tail_cp_async_wait_group` lowers the runtime
-@@ -1184,7 +1184,7 @@ class BatchedGemmConfig:
+@@ -569,6 +570,16 @@ class BatchedGemmConfig:
+     Requires :attr:`use_pdl` and :attr:`use_early_exit` (:func:`validate_config`).
+     """
+ 
++    routing_metadata_ready: int = 0
++    """Caller guarantees routing tables and the active CTA count are ready.
++
++    Allows PDL early exit before waiting for the immediately preceding GEMM;
++    activation loads still wait through the TS dependency graph. ``0``/``1``.
++    The MoE FC2 caller can establish this when FC1 has already waited for
++    their common routing producer. A GEMM directly following routing cannot.
++    Requires PDL and early exit, and excludes the kernel-entry routing wait.
++    """
++
+     per_token_sf_dtype: int = int(DType.FP32)
+     """Element type of per-token FP8 scale factors, as a :class:`DType` value.
+ 
+@@ -1184,7 +1195,7 @@ class BatchedGemmConfig:
  
      @property
      def weight_layout_kind(self) -> int:
@@ -106,6 +129,34 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..f06a59163a88fc702731a5ff90f546a4
          return int(self.weight_layout)
  
      @property
+@@ -2859,6 +2870,14 @@ def validate_config(
+             f"{cfg.do_pdl_wait_for_num_non_exiting_ctas}"
+         )
+ 
++    if cfg.routing_metadata_ready not in (0, 1):
++        raise ValueError(f"routing_metadata_ready must be 0 or 1, got {cfg.routing_metadata_ready}")
++    if cfg.routing_metadata_ready:
++        if not cfg.use_pdl or not cfg.use_early_exit:
++            raise ValueError("routing_metadata_ready requires PDL and early exit")
++        if cfg.do_pdl_wait_for_num_non_exiting_ctas:
++            raise ValueError("routing_metadata_ready excludes the kernel-entry routing wait")
++
+     if cfg.do_pdl_wait_for_num_non_exiting_ctas:
+         if not cfg.use_pdl:
+             raise ValueError("do_pdl_wait_for_num_non_exiting_ctas requires use_pdl=1")
+@@ -2866,10 +2885,10 @@ def validate_config(
+             raise ValueError(
+                 "do_pdl_wait_for_num_non_exiting_ctas requires use_early_exit=1"
+             )
+-    elif cfg.use_pdl and cfg.use_early_exit:
++    elif cfg.use_pdl and cfg.use_early_exit and not cfg.routing_metadata_ready:
+         raise ValueError(
+             "PDL early exit requires do_pdl_wait_for_num_non_exiting_ctas=1 "
+-            "before reading the routing-produced active CTA count"
++            "or already-ready routing metadata before reading the active CTA count"
+         )
+ 
+     if cfg.use_global_scales not in (0, 1):
 diff --git a/prims_ts/batched_gemm/batched_gemm_kernel.py b/prims_ts/batched_gemm/batched_gemm_kernel.py
 index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc8ce04fd8 100644
 --- a/prims_ts/batched_gemm/batched_gemm_kernel.py

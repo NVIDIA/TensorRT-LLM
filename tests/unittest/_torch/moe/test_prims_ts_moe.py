@@ -455,6 +455,101 @@ def test_logits_routing_bias_dtype_and_map_contract(tokens, bias_dtype, return_t
 
 
 @blackwell
+def test_nvfp4_decode_pdl_requires_ready_routing() -> None:
+    from tensorrt_llm._torch.moe.custom_ops.prims_ts_moe import _gemm_pair
+    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        validate_config,
+    )
+
+    pair = _gemm_pair(1, 4, 8, 10, True, True, True, False, (8, 0), True)
+    fc1, fc2 = pair.fc1.cfg.build(), pair.fc2.cfg.build()
+    validate_config(fc1)
+    validate_config(fc2)
+    assert fc1.do_pdl_wait_for_num_non_exiting_ctas == 1
+    assert fc1.routing_metadata_ready == 0
+    assert fc2.do_pdl_wait_for_num_non_exiting_ctas == 0
+    assert fc2.routing_metadata_ready == 1
+    with pytest.raises(ValueError, match="PDL early exit requires"):
+        validate_config(replace(fc2, routing_metadata_ready=0))
+    with pytest.raises(ValueError, match="requires PDL and early exit"):
+        validate_config(replace(fc2, use_pdl=0))
+
+
+@blackwell
+def test_nvfp4_decode_pdl_graph_with_changing_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoEInputs
+    from tensorrt_llm._torch.moe.custom_ops import prims_ts_moe as ops
+    from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
+
+    torch.manual_seed(37)
+    gate = _make_test_gate(top_k=4)
+    bank = _make_nvfp4_expert_bank(8, _TP_INTERMEDIATE, _TP_HIDDEN)
+    for expert in bank:
+        for name in ("w1.weight_scale", "w2.weight_scale", "w3.weight_scale"):
+            expert[name] = (expert[name].float() * 64).to(torch.float8_e4m3fn)
+    moe = _make_nvfp4_moe(gate, moe_backend="PRIMS_TS")
+    _load_nvfp4_bank_for(moe, bank, "PRIMS_TS")
+    x = torch.randn(1, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
+    with torch.inference_mode(), AutoTuner.get().capture() as capture:
+        moe(x, gate.compute_logits(x))
+    kwargs = vars(FP4BlockScaleMoEInputs(*capture._captured_contexts[-1]["inputs"])).copy()
+    for key in ("routing_logits", "gemm1_bias", "gemm2_bias"):
+        kwargs.pop(key)
+    logits = torch.zeros(1, 16, dtype=torch.float32, device="cuda")
+    kwargs.update(
+        router_logits=logits,
+        routing_bias=torch.zeros(16, dtype=torch.float32, device="cuda"),
+        topk_ids=None,
+        topk_weights=None,
+        top_k=4,
+        num_experts=16,
+        local_expert_offset=0,
+        activation_type=10,
+        do_finalize=True,
+        tactic=(8, 0),
+        enable_pdl=True,
+        routing_method_type=int(RoutingMethodType.DeepSeekV3),
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+    )
+    pair_factory = ops._gemm_pair
+
+    def entry_wait_pair(*args, **options):
+        pair = pair_factory(*args, **options)
+        fc2_options = dict(pair.fc2.cfg.kwargs)
+        fc2_options.update(do_pdl_wait_for_num_non_exiting_ctas=1, routing_metadata_ready=0)
+        return replace(pair, fc2=replace(pair.fc2, cfg=replace(pair.fc2.cfg, kwargs=fc2_options)))
+
+    outputs = [torch.empty_like(x), torch.empty_like(x)]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    for factory, output, graph in zip((entry_wait_pair, pair_factory), outputs, graphs):
+        kwargs["output"] = output
+        with torch.inference_mode(), monkeypatch.context() as patch:
+            patch.setattr(ops, "_gemm_pair", factory)
+            ops._run_prims_ts_moe(**kwargs)
+            with torch.cuda.graph(graph):
+                ops._run_prims_ts_moe(**kwargs)
+
+    # Reuse the captured pointers while changing both FC1 inputs and routing.
+    # Empty local shards must not read stale workspaces from a previous replay.
+    with torch.inference_mode():
+        for local_count in (0, 4, 1, 0, 2, 4) * 5:
+            logits.fill_(-10)
+            logits[:, :local_count] = 10
+            logits[:, 8 : 8 + 4 - local_count] = 10
+            x.normal_(std=0.5)
+            hidden, scales = moe.backend.quantize_input(x)
+            kwargs["hidden_states"].copy_(hidden)
+            kwargs["hidden_states_scale"].copy_(scales.reshape_as(kwargs["hidden_states_scale"]))
+            for graph in graphs:
+                graph.replay()
+            torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+            assert bool(torch.count_nonzero(outputs[1])) == bool(local_count)
+
+
+@blackwell
 @pytest.mark.parametrize("tokens", [1, 16])
 @pytest.mark.parametrize("use_hybrid_routing", [False, True])
 @pytest.mark.parametrize("is_nvfp4", [False, True])
