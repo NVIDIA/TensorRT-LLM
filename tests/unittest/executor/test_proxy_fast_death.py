@@ -15,6 +15,7 @@
 """EngineDeadError, the pending-result broadcast, and queue-step fast-fail (no GPU)."""
 
 import asyncio
+import pickle
 import queue as _queue
 import time as _time
 from concurrent.futures import Future as _Future
@@ -40,6 +41,39 @@ def test_engine_dead_error_is_importable_and_carries_root_cause():
     assert "MPI worker exited unexpectedly" in str(err)
     # No root cause is also fine.
     assert "Engine has died" in str(EngineDeadError())
+
+
+def test_engine_dead_error_pickle_roundtrip():
+    cause = RuntimeError("MPI worker exited unexpectedly")
+    err = EngineDeadError(cause)
+
+    # 1 hop
+    unpickled = pickle.loads(pickle.dumps(err))
+    assert isinstance(unpickled, EngineDeadError)
+    assert isinstance(unpickled, RuntimeError)
+    assert str(unpickled) == str(err)
+    assert str(unpickled) == "Engine has died: RuntimeError: MPI worker exited unexpectedly"
+    assert isinstance(unpickled.root_cause, RuntimeError)
+    assert str(unpickled.root_cause) == "MPI worker exited unexpectedly"
+
+    # Multiple hops (crossing process boundaries repeatedly)
+    hop2 = pickle.loads(pickle.dumps(unpickled))
+    assert str(hop2) == str(err)
+    assert "Engine has died: str:" not in str(hop2)
+
+    hop3 = pickle.loads(pickle.dumps(hop2))
+    assert str(hop3) == str(err)
+
+
+def test_engine_dead_error_pickle_roundtrip_no_cause():
+    err = EngineDeadError()
+    unpickled = pickle.loads(pickle.dumps(err))
+    assert isinstance(unpickled, EngineDeadError)
+    assert str(unpickled) == "Engine has died"
+    assert unpickled.root_cause is None
+
+    hop2 = pickle.loads(pickle.dumps(unpickled))
+    assert str(hop2) == "Engine has died"
 
 
 class _FakeResult:

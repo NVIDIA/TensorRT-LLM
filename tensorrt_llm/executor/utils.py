@@ -154,6 +154,9 @@ class EngineDeadError(RuntimeError):
         super().__init__(msg)
         self.root_cause = root_cause
 
+    def __reduce__(self):
+        return (self.__class__, (self.root_cause,))
+
 
 class ProcessPoolExecutorSession(MpiSession):
     # This process pool is introduced for better recoverable exceptions handling.
