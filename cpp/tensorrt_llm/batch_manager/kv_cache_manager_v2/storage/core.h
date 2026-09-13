@@ -53,7 +53,7 @@ struct Slot
     ~Slot()
     {
         KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(
-            !hasValidSlot(), "Slot %d destroyed without being released", toSizeT(mSlotId.value()));
+            !hasValidSlot(), "Slot %zu destroyed without being released", toSizeT(mSlotId.value()));
     }
 
     // A slot id has exactly one owner: transferring a Slot empties the source, so it cannot be

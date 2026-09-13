@@ -251,8 +251,6 @@ inline void cuCheck(CUresult result)
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
-// Runs cleanup that must not throw. On failure, or if KVCM2 is already poisoned, the callable is
-// abandoned and the cache is marked unusable. Variadic so the callable may contain commas.
 // Rejects the call if KVCM2 has been poisoned. For public API entry points.
 #define KVCM2_REJECT_IF_POISONED()                                                                                     \
     ::tensorrt_llm::batch_manager::kv_cache_manager_v2::rejectIfPoisoned(__PRETTY_FUNCTION__)
@@ -266,6 +264,8 @@ inline void cuCheck(CUresult result)
         __PRETTY_FUNCTION__                                                                                            \
     }
 
+// Runs cleanup that must not throw. On failure, or if KVCM2 is already poisoned, the callable is
+// abandoned and the cache is marked unusable. Variadic so the callable may contain commas.
 #define KVCM2_POISON_ON_EXCEPT(...)                                                                                    \
     ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
 
