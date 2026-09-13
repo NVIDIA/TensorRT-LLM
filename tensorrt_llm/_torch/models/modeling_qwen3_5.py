@@ -25,7 +25,9 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ...inputs import (
     ContentFormat,
@@ -34,6 +36,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
+from ..modules.linear import nvfp4_scaling_vector_size
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from ..utils import is_nvfp4_marlin_supported_sm
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
@@ -461,6 +464,16 @@ def _lm_head_nvfp4_enabled(model_config):
     )
 
 
+def _has_nvfp4_gemm_block_width(cfg: QuantConfig | None) -> bool:
+    """Whether a W4A16_NVFP4 entry can be promoted to the W4A4 NVFP4 GEMMs.
+
+    The GEMMs are hardware-bound to 16-element scale blocks; ModelOpt's
+    ``nvfp4_*_weight_only`` recipes may export 32-element blocks, which must
+    stay on the W4A16 dequantization path.
+    """
+    return nvfp4_scaling_vector_size(cfg) == NVFP4_SF_VEC_SIZE
+
+
 def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
     """Normalize NVFP4/FP8 exclude_modules from HF naming to TRT-LLM naming.
 
@@ -532,9 +545,12 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     On SM100/SM103, W4A16_NVFP4 routed experts AND dense MLP projections
     (gate_proj/up_proj/down_proj) are promoted to NVFP4 so the CuteDSL/TRTLLM
     GEMM path can consume the checkpoint's packed FP4 weights and static input
-    scales. Dense MLP keys are additionally re-pathed to the doubled
-    ``.mlp.mlp.`` form to match the ``_DenseMlpAdapter`` runtime module tree.
-    Other W4A16_NVFP4 modules retain their original algorithm.
+    scales -- provided the checkpoint uses 16-element scale blocks. 32-element
+    weight-only exports (``group_size=32``) stay on the W4A16 dequantization
+    path because the W4A4 GEMMs cannot consume them. Dense MLP keys are
+    additionally re-pathed to the doubled ``.mlp.mlp.`` form to match the
+    ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4 modules retain
+    their original algorithm.
 
     Mutates ``quant_config_dict`` in place (model_config is frozen).
 
@@ -547,8 +563,9 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     sets get no fused entry, and the mapper dequantizes them to bf16 instead.
 
     The ``lm_head`` entry is kept when ``keep_lm_head_quant`` (see
-    _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103, left
-    W4A16_NVFP4 on SM120 -- and dropped otherwise:
+    _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103 for 16-element
+    blocks, left W4A16_NVFP4 otherwise (SM120, or 32-element blocks) -- and
+    dropped otherwise:
     a leftover entry would make DecoderModelForCausalLM build a quantized
     LMHead whose weights the mapper had already dequantized to bf16.
     """
@@ -568,8 +585,9 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
             continue
         if name == "lm_head":
             if keep_lm_head_quant:
-                # SM120 keeps W4A16_NVFP4 (Marlin); SM100/103 promotes to W4A4.
-                if convert_to_nvfp4:
+                # SM120 keeps W4A16_NVFP4 (Marlin); SM100/103 promotes to W4A4
+                # when the blocks are 16 wide (32-wide stays on W4A16 dequant).
+                if convert_to_nvfp4 and _has_nvfp4_gemm_block_width(cfg):
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 normalized[name] = cfg
             else:
@@ -604,6 +622,7 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
             convert_to_nvfp4
             and name.endswith(".mlp.experts")
             and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+            and _has_nvfp4_gemm_block_width(cfg)
         ):
             cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
         else:
@@ -622,7 +641,11 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
                 QuantAlgo.W4A16_NVFP4,
                 QuantAlgo.NVFP4,
             ):
-                if convert_to_nvfp4 and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
+                if (
+                    convert_to_nvfp4
+                    and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+                    and _has_nvfp4_gemm_block_width(cfg)
+                ):
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 proj = dense_mlp_match.group(1)
                 name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
