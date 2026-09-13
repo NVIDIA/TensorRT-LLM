@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import tempfile
 import time
@@ -70,6 +71,24 @@ class Result(GenerationResultBase):
 DuckLLM = namedtuple('DuckLLM',
                      ['args', 'tokenizer', 'generate_async', 'serve_url'],
                      defaults=(None, ))
+
+
+def pick_distinct_free_ports(count: int) -> List[int]:
+    """``count`` distinct free TCP ports, held open until all are chosen.
+
+    Binding every socket before closing any of them is what makes the ports
+    distinct; picking them one at a time can hand back the same port twice.
+    """
+    socks = []
+    try:
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("", 0))
+            socks.append(sock)
+        return [sock.getsockname()[1] for sock in socks]
+    finally:
+        for sock in socks:
+            sock.close()
 
 
 def compute_disagg_acceptance_length(serve_url: str) -> float:
@@ -2376,14 +2395,30 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
+        # MegaMoE CuTe DSL builds its EP ProcessGroup by reusing MASTER_ADDR
+        # / MASTER_PORT when both are set (mega_moe_cute_dsl.py
+        # _pick_rendezvous), and only falls back to picking a free port when
+        # they are not. Under a launcher that exports them -- Slurm in CI --
+        # the context and generation workers are two independent 4-rank jobs
+        # on one node that both inherit the *same* endpoint, so neither group
+        # ever forms: CI showed 68 failed bootstraps against a single
+        # host:port and the generation worker never registered. Hand each
+        # worker its own port so the two rendezvous cannot collide. The
+        # DeepGEMM sibling avoids this by requiring RANK/WORLD_SIZE to be set
+        # too before trusting the launcher's endpoint.
+        ctx_master_port, gen_master_port = pick_distinct_free_ports(2)
+
         # Same long-init reason as TestDeepSeekV4Flash above, plus DSpark
         # makes generation startup substantially slower than context startup.
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      model_path,
-                                      server_waiting_timeout=3600,
-                                      max_workers=64) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                model_path,
+                server_waiting_timeout=3600,
+                max_workers=64,
+                extra_env={"MASTER_PORT": str(ctx_master_port)},
+                gen_extra_env={"MASTER_PORT": str(gen_master_port)}) as llm:
             # launch_disaggregated_llm builds a bare LlmArgs for the DuckLLM,
             # so the specs behind the accuracy reference lookup have to be
             # filled in to match the registered entry. MIXED_PRECISION is what
