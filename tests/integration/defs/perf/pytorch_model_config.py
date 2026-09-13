@@ -89,6 +89,28 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # Kimi K3 TEP8 serving recipe.
+        {
+            'patterns': ['kimi_k3-serve-pytorch'],
+            'config': {
+                'trust_remote_code': True,
+                'max_seq_len': 9344,
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': False,
+                    'max_batch_size': 16,
+                },
+                'kv_cache_config': {
+                    'dtype': 'auto',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.25,
+                    'tokens_per_block': 64,
+                },
+                'stream_interval': 10,
+            }
+        },
         # DeepSeek V4 Flash uses TRTLLM for MXFP4 routed experts.
         {
             'patterns': ['deepseek_v4_flash-bench'],
@@ -111,6 +133,75 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'enable_attention_dp': True,
                 'max_seq_len': 10240,
+            }
+        },
+        # DeepSeek V4 Pro-Base FP8 throughput settings for single-node 8xB300.
+        {
+            'patterns': [
+                'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_lm_head_tp_in_adp': True,
+                'attention_dp_config': {
+                    'enable_balance': True,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 24, 32],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # DeepSeek V4 Pro-Base FP8 latency settings for single-node 8xB300.
+        {
+            'patterns': [
+                'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'enable_lm_head_tp_in_adp': False,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.9,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding':
+                    True,
+                    'batch_sizes': [
+                        1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,
+                        104, 112, 120, 128
+                    ],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
             }
         },
         # DeepSeek V4 Pro DSpark mirrors the upstream 8-GPU accuracy configuration.
@@ -138,6 +229,42 @@ def get_model_yaml_config(model_label: str,
                     5,
                     'speculative_model':
                     f'{llm_models_root()}/DeepSeek-V4-Pro-DSpark',
+                },
+            }
+        },
+        # Single-node experimental adaptation of the NVFP4 DSpark generation
+        # recipe in tests/scripts/perf/disaggregated/
+        # gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml.
+        # Keep TP8/EP8 in the case ID, but allow a full 8K monolithic prefill.
+        # The blog does not provide a tuned single-node NVFP4 DSpark config.
+        {
+            'patterns': ['deepseek_v4_pro_nvfp4_dspark'],
+            'config': {
+                'attn_backend': 'TRTLLM',
+                'enable_attention_dp': True,
+                'enable_lm_head_tp_in_adp': True,
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 10240,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'tokens_per_block': 128,
+                    'enable_block_reuse': False,
+                },
+                'enable_chunked_prefill': False,
+                'disable_overlap_scheduler': True,
+                'custom_tokenizer': 'deepseek_v4',
+                'speculative_config': {
+                    'decoding_type':
+                    'DSpark',
+                    'max_draft_len':
+                    3,
+                    'block_size':
+                    3,
+                    'speculative_model':
+                    f'{llm_models_root()}/DeepSeek-V4-Pro-nvfp4-DSpark',
                 },
             }
         },
@@ -217,7 +344,7 @@ def get_model_yaml_config(model_label: str,
         },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
-        # backend (see accuracy/test_llm_api_pytorch.py::TestGLM52).
+        # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).
         # Spec decoding is intentionally left off so the sweep measures kernel
         # time rather than MTP acceptance rate.
         {
@@ -314,6 +441,28 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Qwen3.6-35B-A3B NVFP4 one-model MTP drafting
+        {
+            'patterns': ['qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming'],
+            'config': {
+                'trust_remote_code': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'dtype': 'fp8',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
+                },
+            }
+        },
         # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
         {
             'patterns': ['minimax_m3_mxfp8'],
@@ -362,20 +511,6 @@ def get_model_yaml_config(model_label: str,
                 'kv_cache_config': {
                     'enable_block_reuse': False,
                 },
-            }
-        },
-        # Llama-v4 Scout FP4 with cuda graph padding
-        {
-            'patterns': ['llama_v4_scout_17b_16e_instruct_fp4'],
-            'config': {
-                'cuda_graph_config': {
-                    'enable_padding':
-                    True,
-                    'batch_sizes': [
-                        1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048,
-                        4096, 8192
-                    ]
-                }
             }
         },
         # GPT-OSS 120B max throughput test

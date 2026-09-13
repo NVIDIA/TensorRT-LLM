@@ -18,7 +18,7 @@ log_markers:
   - "use the original pytorch implementation"   # is_fused=False fallback warning
 eligibility:
   - "model uses the noaux_tc router (sigmoid gating + per-expert correction bias, grouped top-k)"
-  - "fused-path bounds live in tensorrt_llm/_torch/modules/fused_moe/routing.py::Deepseekv3RoutingImpl.noaux_tc (the is_fused guard) — read them from YOUR checkout before judging eligibility"
+  - "fused-path bounds live in tensorrt_llm/_torch/moe/fused_moe/routing.py::Deepseekv3RoutingImpl.noaux_tc (the is_fused guard) — read them from YOUR checkout before judging eligibility"
   - "as of 84926bcb6f14, n_group > 1: requires top_k <= 8 and num_experts <= 256 and experts_per_group <= 32 and experts_per_group * topk_group <= 256"
   - "as of 84926bcb6f14, n_group == 1: requires num_experts <= 1024 and top_k <= 32"
 interactions:
@@ -105,7 +105,7 @@ measured: []
   must stay in sync with the kernel's supported bounds — a mismatch errors
   instead of falling back.
 - **Prior art:** PRs #7761 (`[TRTLLM-8637]`), #13186 (widens fused-path
-  eligibility; `tensorrt_llm/_torch/modules/fused_moe/routing.py`
+  eligibility; `tensorrt_llm/_torch/moe/fused_moe/routing.py`
   `Deepseekv3RoutingImpl`);
   `cpp/tensorrt_llm/kernels/noAuxTcKernels.cu`, `moeTopKFuncs.cuh`,
   `cpp/tensorrt_llm/thop/noAuxTcOp.cpp`,

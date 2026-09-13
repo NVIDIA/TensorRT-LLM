@@ -64,7 +64,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100 and getSMVersion() != 89 and getSMVersion() != 120,
+    getSMVersion() not in (100, 107, 89, 120),
     reason="The test is for Blackwell and Ada only. Current SM is %d." %
     getSMVersion(),
 )
@@ -447,7 +447,7 @@ def test_fp8_blockscale_gemm_reference():
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() not in (100, 107),
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
@@ -493,7 +493,8 @@ def run_test_in_subprocess(env, test_file):
     result = subprocess.run([sys.executable, '-m', 'pytest', test_file, '-v'],
                             capture_output=True,
                             text=True,
-                            env=process_env)
+                            env=process_env,
+                            timeout=600)
 
     # Print the output
     print(result.stdout)

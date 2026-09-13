@@ -35,7 +35,8 @@ HOST=${HOST:-"127.0.0.1"}
 PORT=${PORT:-8000}
 
 # Generation defaults
-SIZE=${SIZE:-"720x1280"}
+WIDTH=${WIDTH:-720}
+HEIGHT=${HEIGHT:-1280}
 NUM_FRAMES=${NUM_FRAMES:-81}
 FPS=${FPS:-16}
 NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS:-50}
@@ -47,6 +48,10 @@ NUM_PROMPTS=${NUM_PROMPTS:-3}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
 PROMPT=${PROMPT:-"A cat walks through a field of flowers, with the wind blowing gently"}
 
+# Server lifecycle defaults
+SERVER_TIMEOUT=${SERVER_TIMEOUT:-3600}
+SERVER_SHUTDOWN_TIMEOUT=${SERVER_SHUTDOWN_TIMEOUT:-60}
+
 # Output
 RESULT_DIR=${RESULT_DIR:-"./benchmark_results"}
 
@@ -56,7 +61,7 @@ RESULT_DIR=${RESULT_DIR:-"./benchmark_results"}
 
 wait_for_server() {
     local url="http://${HOST}:${PORT}/health"
-    local max_wait=${SERVER_TIMEOUT:-3600}  # 60 minutes for model loading + warmup on NFS
+    local max_wait=$SERVER_TIMEOUT  # 60 minutes for model loading + warmup on NFS
     local elapsed=0
     local interval=5
 
@@ -77,11 +82,27 @@ wait_for_server() {
 }
 
 cleanup() {
+    local exit_code=$?
+    local elapsed=0
+
+    trap - EXIT
+    trap '' INT TERM
+
     if [ -n "${SERVER_PID:-}" ]; then
         echo "Stopping server (PID: $SERVER_PID)..."
         kill "$SERVER_PID" 2>/dev/null || true
+        while kill -0 "$SERVER_PID" 2>/dev/null && [ "$elapsed" -lt "$SERVER_SHUTDOWN_TIMEOUT" ]; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        if kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "Server did not stop within ${SERVER_SHUTDOWN_TIMEOUT}s; sending SIGKILL..."
+            kill -KILL "$SERVER_PID" 2>/dev/null || true
+        fi
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+
+    return "$exit_code"
 }
 
 # ---------------------------------------------------------------------------
@@ -94,7 +115,7 @@ echo "============================================"
 echo "Model:               $MODEL"
 echo "Backend:             $BACKEND"
 echo "Server:              http://${HOST}:${PORT}"
-echo "Size:                $SIZE"
+echo "Size:                ${WIDTH}x${HEIGHT}"
 if [ "$BACKEND" = "openai-videos" ]; then
 echo "Num frames:          $NUM_FRAMES"
 echo "FPS:                 $FPS"
@@ -119,9 +140,16 @@ echo "  Command: ${SERVER_CMD}"
 SERVER_LOG="${RESULT_DIR}/server.log"
 mkdir -p "${RESULT_DIR}"
 
+# Route SIGINT and SIGTERM through exit instead of Bash's signal-dependent
+# default handling. This guarantees the EXIT cleanup and preserves the
+# conventional caller-visible statuses, 130 and 143.
+SERVER_PID=
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 $SERVER_CMD > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
-trap cleanup EXIT
 
 echo "  Server PID: $SERVER_PID"
 echo "  Server log: $SERVER_LOG"
@@ -132,26 +160,38 @@ wait_for_server
 echo ""
 echo "Step 2: Running benchmark..."
 
+WORKLOAD_FILE="${RESULT_DIR}/workload.yaml"
+mkdir -p "${RESULT_DIR}"
+{
+  echo "backend: ${BACKEND}"
+  echo "common_params:"
+  echo "  width: ${WIDTH}"
+  echo "  height: ${HEIGHT}"
+  echo "  num_inference_steps: ${NUM_INFERENCE_STEPS}"
+  echo "  guidance_scale: ${GUIDANCE_SCALE}"
+  echo "  seed: ${SEED}"
+  if [ "$BACKEND" = "openai-videos" ]; then
+    echo "  num_frames: ${NUM_FRAMES}"
+    echo "  frame_rate: ${FPS}"
+  fi
+  echo "requests:"
+  # YAML single-quoted: ' is the only character needing an escape, by doubling.
+  for _ in $(seq 1 "${NUM_PROMPTS}"); do
+    echo "  - prompt: '${PROMPT//\'/\'\'}'"
+  done
+} > "${WORKLOAD_FILE}"
+
 BENCHMARK_CMD="python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
     --model ${MODEL} \
     --backend ${BACKEND} \
     --host ${HOST} \
     --port ${PORT} \
-    --prompt \"${PROMPT}\" \
-    --num-prompts ${NUM_PROMPTS} \
-    --size ${SIZE} \
-    --num-inference-steps ${NUM_INFERENCE_STEPS} \
-    --guidance-scale ${GUIDANCE_SCALE} \
-    --seed ${SEED} \
+    --workload ${WORKLOAD_FILE} \
     --max-concurrency ${MAX_CONCURRENCY} \
     --save-result \
     --save-detailed \
     --result-dir ${RESULT_DIR} \
     --metric-percentiles 50,90,99"
-
-if [ "$BACKEND" = "openai-videos" ]; then
-    BENCHMARK_CMD="${BENCHMARK_CMD} --num-frames ${NUM_FRAMES} --fps ${FPS}"
-fi
 
 BENCHMARK_LOG="${RESULT_DIR}/benchmark.log"
 

@@ -29,6 +29,8 @@ slurm_launch.sh  (generated)
 - `--test-list`: Test string, e.g., `perf/test_perf_sanity.py::test_e2e[aggr-config-test_name]`. If both `--test-list` and `--config-file` are provided, `--test-list` takes precedence.
 - `--config-file`: Path to config YAML file.
 - `--test-name`: Test name (only used for aggregated mode when `--config-file` is provided).
+- `--benchmark-mode`: `e2e` | `gen_only` | `ctx_only` (only used for a disagg `--config-file`; with `--test-list` the mode is read off the test id).
+- `--time-breakdown`: Also record the per-request lifecycle breakdown. This adds the `time_breakdown` modifier segment to the generated test id (`disagg-e2e-time_breakdown-<yaml-stem>`); the modifier is orthogonal to `--benchmark-mode` and does not change the workload.
 - `--time`: SLURM time limit (default: `02:00:00`).
 - `--mounts`: Container mounts.
 - `--work-dir`: Work directory (used for both workdir and container-workdir).
@@ -99,3 +101,106 @@ python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb2
     --mounts $mounts \
     --llm-models-root $llm_models_path
 ```
+
+---
+
+## Running the AgentX perf-sanity lane
+
+The AgentX client replays a recorded multi-turn conversation corpus for a fixed
+wall-clock window (`AGENTX_DURATION`, default 3600 s) rather than a fixed number of
+fixed-shape prompts, so `isl`/`osl`/`iterations` in the config are descriptive and
+the run is judged on duration coverage, not a request count. Example test id
+(`_upload` is stripped for local runs, so nothing reaches OpenSearch):
+
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL]
+```
+
+### Environment variables
+
+`submit.py` reads `EXTRA_CONTAINER_EXPORTS` -- a `;`-separated `KEY=VALUE` list --
+at **generation time** and splices it into the four per-role env prefixes
+(`CTX_WORKER_ENV_VARS`, `GEN_WORKER_ENV_VARS`, `SERVER_ENV_VARS`,
+`BENCHMARK_ENV_VARS`). Export it before running `submit.py`, not at `sbatch` time:
+
+```bash
+export EXTRA_CONTAINER_EXPORTS="HF_HOME=$hf_cache;HF_HUB_CACHE=$hf_cache/hub;HF_DATASETS_CACHE=$hf_cache/datasets;PIP_CACHE_DIR=$work_dir/.pip-cache"
+```
+
+Set all three HF variables, not just `HF_HOME`: `submit.py` appends its own
+`HF_HOME=/tmp/hf_home` **after** the splice for the ctx and gen worker roles, and
+the later assignment wins. `HF_HUB_CACHE` and `HF_DATASETS_CACHE` are never
+overridden and outrank `HF_HOME` in `huggingface_hub` / `datasets`, making the
+result independent of splice order.
+
+`dataset_file` in the config is an aiperf `--public-dataset` loader name, not a
+path, and is fetched from Hugging Face at runtime. Either warm the cache above
+before submitting, or confirm the compute nodes can reach the HF CDN.
+
+The `AGENTX_*` knobs are not `submit.py` flags -- they come from `client_env_var`
+in the config YAML, so exporting them in your shell has no effect. Edit the YAML
+to change one. `AGENTX_DURATION` is the main cost knob; keep `AGENTX_SEED`
+(default 42) fixed when comparing runs.
+
+```yaml
+client_env_var: 'AGENTX_MAX_CTX=996579 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3'
+```
+
+### Generate and submit
+
+```bash
+python3 submit.py \
+    --test-list "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL]" \
+    --draft-launch-sh $trtllm/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh \
+    --launch-sh $work_dir/slurm_launch.sh \
+    --install-sh $trtllm/jenkins/scripts/perf/local/slurm_install.sh \
+    --run-sh $trtllm/jenkins/scripts/perf/local/slurm_run.sh \
+    --llm-src $trtllm \
+    --work-dir $work_dir \
+    --llm-models-root $llm_models_path \
+    --partition $partition \
+    --account $account \
+    --job-name agentx_test \
+    --image $image \
+    --mounts $mounts \
+    --install-mode wheel \
+    --wheel-path $wheel \
+    --cluster-name $cluster
+
+cd $work_dir && sbatch slurm_launch.sh
+```
+
+`--cluster-name` selects the UCX and env rules in `cluster_env.py`; an unmatched
+(cluster, GPU) pair falls through to a catch-all that pins no transport, changing
+performance silently. Use a fresh `--work-dir` every run -- a reused disaggregated
+work directory reads stale hostname files and hangs. This lane takes 6 nodes /
+24 GPUs and roughly 2.5 h including the wheel install, so allow a 4 h limit.
+
+### Viewing the perf results
+
+Artifacts land under `$work_dir/<case-name>/`:
+
+| Path | Contents |
+|---|---|
+| `agentx.0.0/concurrency_1156/profile_export_aiperf.json` | metrics, percentiles, `submission_valid`, duration coverage (client log alongside in `logs/aiperf.log`) |
+| `trtllm-benchmark.0.0.log` | human-readable metric block |
+| `{ctx,gen}_server_*.log`, `disagg_server.log` | server logs |
+
+Gate on the export rather than on the pytest exit status:
+
+```bash
+python3 -c "
+import json
+d = json.load(open('$work_dir/<case>/agentx.0.0/concurrency_1156/profile_export_aiperf.json'))
+m = d['metadata']
+print('submission_valid', m.get('submission_valid'))
+print('was_cancelled   ', m.get('was_cancelled'))
+print('errors          ', m.get('error_summary'))
+for p in m.get('metric_duration_coverage') or []:
+    print('coverage', p)
+"
+```
+
+Coverage reports the TTFT and ITL sample ratios against the requested window, so a
+run that only partly covered it is detectable instead of quietly averaging a
+truncated segment. A green pytest summary alone is not a passing stage.

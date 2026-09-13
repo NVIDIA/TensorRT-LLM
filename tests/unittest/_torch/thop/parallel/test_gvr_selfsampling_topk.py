@@ -228,20 +228,123 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
-def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="auto"):
+@pytest.mark.parametrize("n_valid", [3072, 4096], ids=["n3072", "n4096"])
+def test_selfsampling_topk_high_anchor_hint_completeness(n_valid):
+    """Anchor-only hints whose gathered values all sit ABOVE the true k-th
+    value (an argmax anchor over the all-zero cold-start buffer, with a high
+    row head) bracket the sampling band so it contains fewer than top_k
+    entries. The classify histogram then never reaches k and the crossing
+    scan pins its bin-0 fallback as a fake crossing; the register-family
+    whole-bin emit must escape to the key-space ranking instead of
+    stopping at the histogram total (regression: rows exited with
+    out[tot:k) unwritten -- a prefix-only write). Deterministic worst case:
+    row[0] = second-max, so the bracket holds exactly two entries. The
+    cells pin the vulnerable reg variant (hint-driven bracket + no-clamp
+    classify: BRL variants clamp out-of-bracket values into bin 0 and
+    cannot under-count, so batch/shape are chosen to compile BRL off).
+
+    The production hint-free bracket cannot under-count (its k source
+    values sit inside the band by construction), so this exercises the
+    hinted codegen through the batch-uniform TESTING/BENCH entry."""
+    top_k = 512
+    bs = 256
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    v2 = torch.topk(logits, 2, dim=1).values[:, 1]
+    logits[:, 0] = v2  # row head = second-max: bracket = [second-max, max]
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device=_DEV)
+    pre_idx[:, 0] = logits.argmax(dim=1).to(torch.int32)
+    indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run(logits, pre_idx, n_valid, indices)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots (prefix-only emit)"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+def test_selfsampling_topk_neginf_tail_completeness():
+    """The DEG bracket arm folds the row tail element (the last n % 4
+    columns live outside the float4 register batch) into the bracket
+    without the > -inf guard the vector loop has: a single in-window -inf
+    there drags the bracket low edge to -inf, every classify product
+    becomes NaN, the histogram total is zero, and the row exited having
+    written nothing (regression: hint-independent zero-write rows). The
+    escape such rows now take must also not double-count the tail element
+    when the tie class is the -inf key itself (regression: duplicate
+    indices from the -inf fill lanes of the last partial float4) -- odd
+    rows keep fewer than top_k finite entries to exercise that lane
+    bound."""
+    top_k = 1024
+    bs, npad, n_valid = 256, 4096, 4093  # n_valid % 4 = 1: one tail column
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, npad), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, n_valid:] = 3e38  # poison past the window
+    logits[:, n_valid - 1] = float("-inf")  # in-window -inf in the tail column
+    logits[1::2, 500:n_valid] = float("-inf")  # odd rows: n_finite < top_k
+    masked = logits.clone()
+    masked[:, n_valid:] = float("-inf")
+    ref_vals, _ = torch.topk(masked, top_k, dim=1)
+    indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((bs,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv, indices, max_seq_len=npad)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots (zero-write rows)"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+@pytest.mark.parametrize("pos", [1000, 3000], ids=["in_window", "out_of_window"])
+def test_selfsampling_topk_posinf_completeness(pos):
+    """A +inf in the register-family fold window drives the bracket max to
+    +inf, so the bracket width GMAX-Tv=+inf and SC=rcp(+inf)=0 fold every
+    value into bin 0; the whole-bin emit then drops the +inf from the top-k
+    (regression, DKG issue #58). The infinite-width bracket must be rejected
+    by the collapse guard and take the key-space escape, where fkey(+inf) is
+    the maximum key. Both an in-window and an out-of-window +inf are pinned;
+    N=4096 k=1024 keeps the register 'reg' family (not the streaming tiers,
+    which never collapse this way)."""
+    top_k = 1024
+    n_valid = 4096
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((1, n_valid), generator=gen, dtype=torch.float32, device=_DEV) * 2.0
+    logits[0, pos] = float("inf")
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    indices = torch.full((1, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((1,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv, indices, max_seq_len=n_valid)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots"
+    assert torch.isinf(logits[0][indices[0].long()]).any(), "+inf dropped from the top-k"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+def test_selfsampling_topk_posinf_regclus_completeness() -> None:
+    """A collapsed reg_clus bracket must use its whole-row key-space
+    fallback instead of emitting from the lossy float-space histogram."""
+    batch_size, n_valid, top_k = 4, 32768, 1024
+    assert ss_host.route(batch_size, n_valid, n_valid, top_k)["kernel"] == "reg_clus"
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    logits = torch.randn((batch_size, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, 1000] = float("inf")
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    indices = torch.full((batch_size, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((batch_size,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv, indices, max_seq_len=n_valid)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots"
+    assert torch.isposinf(logits.gather(1, indices.long())).any(dim=1).all()
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
+def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
-    batch, rows = len(kv), len(kv) * next_n
+    rows = len(kv) * next_n
     n_r = [(kv[r // next_n] - next_n + (r % next_n) + 1) // cr for r in range(rows)]
     npad = (max(n_r) + 63) // 64 * 64
     gen = torch.Generator(device=_DEV).manual_seed(seed)
     logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
     for r in range(rows):
         logits[r, n_r[r] :] = 3e38  # poison beyond each row's OWN n_r
-    pre_idx = torch.empty((batch, top_k), dtype=torch.int32, device=_DEV)
-    for q in range(batch):
-        nmin = max(min(n_r[q * next_n : (q + 1) * next_n]), 1)
-        pre_idx[q] = torch.randint(0, nmin, (top_k,), generator=gen, dtype=torch.int32, device=_DEV)
     indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     values = (
         torch.full((rows, top_k), 7.0, dtype=torch.float32, device=_DEV) if with_values else None
@@ -249,13 +352,11 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
     kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(
         logits,
-        pre_idx,
         kv_lens,
         indices,
         next_n=next_n,
         compress_ratio=cr,
         values=values,
-        engine=engine,
     )
     torch.cuda.synchronize()
     fmin = torch.finfo(torch.float32).min
@@ -281,7 +382,28 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
                 assert torch.equal(values[r], torch.gather(logits[r], 0, idx))
 
 
-@pytest.mark.parametrize("engine", ["auto", "reference"])
+def _reference_varlen_indices(logits, kv_lens, next_n, compress_ratio, top_k):
+    """Build a simple torch reference for the hint-free varlen contract."""
+    reference = torch.full((logits.shape[0], top_k), -1, dtype=torch.int32, device=logits.device)
+    lengths = kv_lens.tolist()
+    for row in range(logits.shape[0]):
+        valid = (
+            max(
+                lengths[row // next_n] - next_n + row % next_n + 1,
+                0,
+            )
+            // compress_ratio
+        )
+        valid = min(valid, logits.shape[1])
+        if valid <= 0:
+            continue
+        if valid <= top_k:
+            reference[row, :valid] = torch.arange(valid, dtype=torch.int32, device=logits.device)
+        else:
+            reference[row] = torch.topk(logits[row, :valid], top_k).indices.to(torch.int32)
+    return reference
+
+
 @pytest.mark.parametrize(
     "kv,next_n,cr,top_k",
     [
@@ -294,50 +416,9 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
     ],
     ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4", "cr4_mtp3"],
 )
-def test_selfsampling_topk_varlen(kv, next_n, cr, top_k, engine):
-    """run_varlen production contract: per-row n from device kv_lens with the
-    MTP window formula, request-level hints, per-row short path — on BOTH the
-    per-row in-kernel engine ("auto") and the b=1 reference loop."""
-    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr, engine=engine)
-
-
-def test_selfsampling_topk_varlen_engine_matches_reference():
-    """Differential: the in-kernel engine's per-row value multisets must
-    equal the reference loop's on a mixed batch (deep SPLIT rows, tsh band,
-    short rows, compressed space)."""
-    kv = [524288, 131075, 32800, 2000, 65540, 8192, 262144, 900]
-    top_k, cr = 1024, 4
-    rows = len(kv)
-    n_r = [(v - 1 + 1) // cr for v in kv]
-    npad = (max(n_r) + 63) // 64 * 64
-    gen = torch.Generator(device=_DEV).manual_seed(77)
-    logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
-    for r in range(rows):
-        logits[r, n_r[r] :] = 3e38
-    pre_idx = torch.empty((rows, top_k), dtype=torch.int32, device=_DEV)
-    for q in range(rows):
-        pre_idx[q] = torch.randint(
-            0, max(n_r[q], 1), (top_k,), generator=gen, dtype=torch.int32, device=_DEV
-        )
-    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
-    out_a = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    out_r = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(logits, pre_idx, kv_lens, out_a, compress_ratio=cr)
-    ss_host.run_varlen(logits, pre_idx, kv_lens, out_r, compress_ratio=cr, engine="reference")
-    torch.cuda.synchronize()
-    for r in range(rows):
-        if n_r[r] <= top_k:
-            assert torch.equal(out_a[r], out_r[r]) or torch.equal(
-                torch.sort(out_a[r]).values, torch.sort(out_r[r]).values
-            )
-        else:
-            ga = torch.sort(
-                torch.gather(logits[r], 0, out_a[r].to(torch.int64)) + 0.0, descending=True
-            ).values
-            gr = torch.sort(
-                torch.gather(logits[r], 0, out_r[r].to(torch.int64)) + 0.0, descending=True
-            ).values
-            assert torch.equal(ga, gr), f"row {r}: engine != reference"
+def test_selfsampling_topk_varlen(kv, next_n, cr, top_k):
+    """Validate the hint-free per-row KV-length and MTP window contract."""
+    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr)
 
 
 def test_selfsampling_topk_varlen_values():
@@ -361,90 +442,46 @@ def test_selfsampling_topk_varlen_launch_modes(rows, base, step, top_k):
 
 def test_selfsampling_topk_varlen_zero_kv_slot():
     """Padded / evicted CUDA-graph request slots can carry kv_len < next_n
-    (even 0): both engines must emit the empty short row (all -1), not raise —
+    (even 0): the engine must emit the empty short row (all -1), not raise —
     mixed with live MTP rows of another request in the same launch."""
-    for engine in ("auto", "reference"):
-        gen = torch.Generator(device=_DEV).manual_seed(9)
-        logits = torch.randn((8, 8192), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
-        pre_idx = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
-        kv_lens = torch.tensor([0, 8192], dtype=torch.int32, device=_DEV)
-        indices = torch.full((8, 512), -7, dtype=torch.int32, device=_DEV)
-        for r in range(4, 8):
-            n = 8192 - 4 + (r - 4) + 1
-            logits[r, n:] = 3e38
-        ss_host.run_varlen(
-            logits, pre_idx, kv_lens, indices, next_n=4, compress_ratio=1, engine=engine
-        )
-        torch.cuda.synchronize()
-        assert bool((indices[:4] == -1).all()), f"{engine}: kv=0 rows must be all -1"
-        for r in range(4, 8):
-            n = 8192 - 4 + (r - 4) + 1
-            idx = indices[r].to(torch.int64)
-            assert int(idx.min()) >= 0 and int(idx.max()) < n
-            ref = torch.topk(logits[r, :n], 512).values
-            got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
-            assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values)
-
-
-def test_selfsampling_topk_varlen_wide_buffers_flat_packed():
-    """indices wider than k follow the CUDA flat-packed contract (rows at
-    stride k from the tensor base) IDENTICALLY on both engines."""
-    kv = [9000, 300]
-    top_k, width = 512, 512 + 64
-    gen = torch.Generator(device=_DEV).manual_seed(21)
-    logits = torch.randn((2, 9024), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
-    logits[0, 9000:] = 3e38
-    logits[1, 300:] = 3e38
-    pre_idx = torch.randint(0, 300, (2, top_k), generator=gen, dtype=torch.int32, device=_DEV)
-    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
-    outs = {}
-    for engine in ("auto", "reference"):
-        wide = torch.full((2, width), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(logits, pre_idx, kv_lens, wide, compress_ratio=1, engine=engine)
-        torch.cuda.synchronize()
-        outs[engine] = wide.reshape(-1)[: 2 * top_k].view(2, top_k).clone()
-    packed_a, packed_r = outs["auto"], outs["reference"]
-    # row 0 (kernel row): same value multiset via the SAME packed convention
-    ga = torch.sort(
-        torch.gather(logits[0], 0, packed_a[0].to(torch.int64)) + 0.0, descending=True
-    ).values
-    gr = torch.sort(
-        torch.gather(logits[0], 0, packed_r[0].to(torch.int64)) + 0.0, descending=True
-    ).values
-    assert torch.equal(ga, gr), "wide-buffer packing convention diverged between engines"
-    # row 1 (short row): identity + -1 tail at the packed location, bit-equal
-    expect = torch.cat(
-        [
-            torch.arange(300, dtype=torch.int32, device=_DEV),
-            torch.full((top_k - 300,), -1, dtype=torch.int32, device=_DEV),
-        ]
-    )
-    assert torch.equal(torch.sort(packed_a[1, :300]).values, expect[:300])
-    assert bool((packed_a[1, 300:] == -1).all())
-    assert torch.equal(torch.sort(packed_r[1, :300]).values, expect[:300])
-    assert bool((packed_r[1, 300:] == -1).all())
+    gen = torch.Generator(device=_DEV).manual_seed(9)
+    logits = torch.randn((8, 8192), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+    kv_lens = torch.tensor([0, 8192], dtype=torch.int32, device=_DEV)
+    indices = torch.full((8, 512), -7, dtype=torch.int32, device=_DEV)
+    for r in range(4, 8):
+        n = 8192 - 4 + (r - 4) + 1
+        logits[r, n:] = 3e38
+    ss_host.run_varlen(logits, kv_lens, indices, next_n=4, compress_ratio=1)
+    torch.cuda.synchronize()
+    assert bool((indices[:4] == -1).all()), "kv=0 rows must be all -1"
+    for r in range(4, 8):
+        n = 8192 - 4 + (r - 4) + 1
+        idx = indices[r].to(torch.int64)
+        assert int(idx.min()) >= 0 and int(idx.max()) < n
+        ref = torch.topk(logits[r, :n], 512).values
+        got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
+        assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values)
 
 
 def test_selfsampling_topk_varlen_guards():
     logits = torch.randn((2, 8192), dtype=torch.float32, device=_DEV)
-    pre_idx = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
     indices = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
     kv = torch.tensor([8192, 8192], dtype=torch.int32, device=_DEV)
     with pytest.raises(RuntimeError, match="kv_lens length"):
-        ss_host.run_varlen(logits, pre_idx, kv[:1], indices)
+        ss_host.run_varlen(logits, kv[:1], indices)
     with pytest.raises(RuntimeError, match="not divisible"):
-        ss_host.run_varlen(logits, pre_idx, kv, indices, next_n=3)
+        ss_host.run_varlen(logits, kv, indices, next_n=3)
     with pytest.raises(RuntimeError, match="compress_ratio"):
-        ss_host.run_varlen(logits, pre_idx, kv, indices, compress_ratio=2)
+        ss_host.run_varlen(logits, kv, indices, compress_ratio=2)
     with pytest.raises(RuntimeError, match="CUDA tensor"):
-        ss_host.run_varlen(logits, pre_idx, kv.cpu(), indices)
+        ss_host.run_varlen(logits, kv.cpu(), indices)
     with pytest.raises(RuntimeError, match="num_rows"):
         # request-level-shaped indices under MTP: MUST be rejected (the
         # kernel grid comes from logits rows — silent OOB writes otherwise)
-        ss_host.run_varlen(logits, pre_idx[:1], kv[:1], indices[:1], next_n=2)
+        ss_host.run_varlen(logits, kv[:1], indices[:1], next_n=2)
     with pytest.raises(RuntimeError, match="contiguous"):
         strided = torch.zeros((2, 2), dtype=torch.int32, device=_DEV)[:, 0]
-        ss_host.run_varlen(logits, pre_idx, strided, indices)
+        ss_host.run_varlen(logits, strided, indices)
 
 
 def test_selfsampling_topk_varlen_cuda_graph():
@@ -456,7 +493,6 @@ def test_selfsampling_topk_varlen_cuda_graph():
     rows, top_k, msl = 4, 512, 262144
     npad = msl
     logits = torch.randn((rows, npad), dtype=torch.float32, device=_DEV) - 2.0
-    pre_idx = torch.zeros((rows, top_k), dtype=torch.int32, device=_DEV)
     kv_lens = torch.tensor([100, 4099, 131070, 200000], dtype=torch.int32, device=_DEV)
     indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
 
@@ -470,17 +506,14 @@ def test_selfsampling_topk_varlen_cuda_graph():
         for r in range(rows):
             n = min(kv[r], npad)
             logits[r, n:] = 3e38
-            pre_idx[r] = torch.randint(
-                0, max(n, 1), (top_k,), generator=gen, dtype=torch.int32, device=_DEV
-            )
         return kv
 
     refresh(0)
-    ss_host.run_varlen(logits, pre_idx, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
+    ss_host.run_varlen(logits, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ss_host.run_varlen(logits, pre_idx, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
+        ss_host.run_varlen(logits, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
     for step in range(1, 6):
         kv = refresh(step)
         indices.fill_(-7)
@@ -603,10 +636,9 @@ def test_selfsampling_topk_varlen_rejects_non_fp32():
     the loud contract message instead of a CuTe typing failure)."""
     logits = torch.randn(1, 8192, device=_DEV, dtype=torch.bfloat16)
     kv = torch.tensor([8000], dtype=torch.int32, device=_DEV)
-    pre = torch.zeros(1, 512, dtype=torch.int32, device=_DEV)
     out = torch.empty(1, 512, dtype=torch.int32, device=_DEV)
     with pytest.raises(RuntimeError, match="float32"):
-        ss_host.run_varlen(logits, pre, kv, out, next_n=1, compress_ratio=4, max_seq_len=32768)
+        ss_host.run_varlen(logits, kv, out, next_n=1, compress_ratio=4, max_seq_len=32768)
 
 
 def test_selfsampling_topk_varlen_zero_window_rows():
@@ -620,9 +652,8 @@ def test_selfsampling_topk_varlen_zero_window_rows():
     rows = kv.numel() * nn
     npad = (msl // cr + 63) // 64 * 64
     logits = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-    pre = torch.zeros(kv.numel(), k, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(logits, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
+    ss_host.run_varlen(logits, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
     torch.cuda.synchronize()
     assert (out[nn:] == -1).all().item(), "n<=0 rows must be fully -1-padded"
     for r in range(nn):
@@ -647,11 +678,10 @@ def test_selfsampling_warmup_row_stride_matches_arena():
     arena = torch.randn(rows, stride, dtype=torch.float32, device=_DEV)
     logits = arena[:, :msl]  # non-contiguous column slice, like serving
     kv = torch.full((rows,), msl, dtype=torch.int32, device=_DEV)
-    pre = torch.zeros(rows, k, dtype=torch.int32, device=_DEV)
     out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        ss_host.run_varlen(logits, pre, kv, out, max_seq_len=msl)
+        ss_host.run_varlen(logits, kv, out, max_seq_len=msl)
     g.replay()
     torch.cuda.synchronize()
     ref = torch.topk(arena[:, :msl], k, dim=1).values.sort(dim=1).values
@@ -672,24 +702,13 @@ def test_selfsampling_varlen_regclus_parity_and_oracle():
     rows = batch * nn
     torch.manual_seed(7)
     lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
     kv = torch.tensor([msl_c * cr, 900, nn - 1], dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     key = (rows, npad, k, msl_c, nn, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
-    ss_host.run_varlen(
-        lg,
-        pre,
-        kv,
-        ref,
-        next_n=nn,
-        compress_ratio=cr,
-        max_seq_len=msl_c * cr,
-        engine="reference",
-    )
     torch.cuda.synchronize()
+    ref = _reference_varlen_indices(lg, kv, nn, cr, k)
     for r in range(rows):
         if (ref[r] >= 0).any():
             row = lg[r].float()
@@ -708,15 +727,14 @@ def test_selfsampling_varlen_regclus_cuda_graph():
     rows = 8
     torch.manual_seed(11)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
     kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
     with torch.cuda.graph(g):
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
     for _ in range(2):
         out.fill_(-7)
@@ -749,24 +767,13 @@ def test_selfsampling_varlen_reg_parity_and_oracle():
         assert fam == want, (fam, want, k, msl_c)
         msl = msl_c * cr
         lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-        pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
         kv = torch.tensor([msl, max((k - 3) * cr, nn), nn - 1], dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
+        ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
         key = (rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
-        ss_host.run_varlen(
-            lg,
-            pre,
-            kv,
-            ref,
-            next_n=nn,
-            compress_ratio=cr,
-            max_seq_len=msl,
-            engine="reference",
-        )
         torch.cuda.synchronize()
+        ref = _reference_varlen_indices(lg, kv, nn, cr, k)
         for r in range(rows):
             if (ref[r] >= 0).any():
                 row = lg[r].float()
@@ -797,27 +804,16 @@ def test_selfsampling_varlen_clus_parity_and_oracle():
         assert plan["kernel"] == "clus" and plan["cluster"] == want_cs, plan
         batch = rows // nn
         lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
-        pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
         lens = [msl_c * cr, 900, nn - 1, 20000, 40000, 300000, msl_c * cr // 2, 5000]
         kv = torch.tensor(
             [lens[i % len(lens)] for i in range(batch)], dtype=torch.int32, device=_DEV
         )
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
         key = (rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
-        ss_host.run_varlen(
-            lg,
-            pre,
-            kv,
-            ref,
-            next_n=nn,
-            compress_ratio=cr,
-            max_seq_len=msl_c * cr,
-            engine="reference",
-        )
         torch.cuda.synchronize()
+        ref = _reference_varlen_indices(lg, kv, nn, cr, k)
         for r in range(rows):
             if (ref[r] >= 0).any():
                 row = lg[r].float()
@@ -837,17 +833,16 @@ def test_selfsampling_varlen_clus_cuda_graph():
     rows = 32
     torch.manual_seed(29)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
     kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
     key = (rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
     with torch.cuda.graph(g):
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
     for _ in range(2):
         out.fill_(-7)
@@ -864,17 +859,16 @@ def test_selfsampling_varlen_reg_cuda_graph():
     rows = 16
     torch.manual_seed(17)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
     kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
     key = (rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
     with torch.cuda.graph(g):
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
     for _ in range(2):
         out.fill_(-7)
@@ -893,10 +887,9 @@ def test_selfsampling_varlen_full_row_range():
     torch.manual_seed(3)
     for rows in (304, 1024):
         lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-        pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
         kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
         torch.cuda.synchronize()
         key = (rows, msl_c, k, msl_c, 1, cr)
         assert key in ss_host._VARLEN_CACHE, "row count must dispatch in-engine"
@@ -935,14 +928,13 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
     rows = batch * nn  # 304 -> route_streaming main family
     torch.manual_seed(5)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
-    pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
     kv = torch.randint(1, msl_c * cr, (batch,), dtype=torch.int32, device=_DEV)
     kv[0] = msl_c * cr  # full length
     kv[1] = 900  # short (n <= k)
     kv[2] = nn - 1  # zero-window (every row of the request empty)
     kv[3] = k * cr + nn  # just above the short path
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
     kl = kv.tolist()
     for r in range(rows):
@@ -959,3 +951,374 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
         ref_v = torch.topk(row, k).values.sort().values
         got = row[out[r].long()].sort().values
         assert torch.equal(got, ref_v), f"row {r}: value multiset mismatch (n={n_r})"
+
+
+def test_selfsampling_varlen_narrow_logits_clamps_envelope_to_row_width() -> None:
+    """Logits narrower than k + 1 with kv lengths beyond k: the launch
+    envelope must be the physical row width, so every row takes the in-kernel
+    short path (identity + -1 tail) instead of reading k + 1 elements across
+    the row stride (DKG issue #60, item 1)."""
+    rows, n, k = 2, 256, 512
+    lg = torch.randn(rows, n, dtype=torch.float32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    lc = ss_host._varlen_launcher(rows, n, k, n, 1, 1)
+    if lc[0] != "main":  # main derives the envelope from npad in-kernel
+        env = lc[2] if not isinstance(lc[2], tuple) else lc[2][0]
+        assert env == n, (lc[0], env)
+    want = torch.full((rows, k), -1, dtype=torch.int32, device=_DEV)
+    want[:, :n] = torch.arange(n, dtype=torch.int32, device=_DEV)
+    for kv_len in (100000, n):  # kv far beyond the row width, and exactly the row width
+        kv = torch.full((rows,), kv_len, dtype=torch.int32, device=_DEV)
+        out.fill_(-7)
+        ss_host.run_varlen(lg, kv, out, max_seq_len=n)
+        torch.cuda.synchronize()
+        assert torch.equal(out, want), kv_len
+
+
+def test_selfsampling_warmup_incremental_rows_populate_exact_launchers() -> None:
+    """A later warmup_varlen call whose new row count falls inside an already
+    warmed engine band must still create that row count's launcher entry, so a
+    CUDA-graph capture at it finds its key (DKG issue #60, item 2)."""
+    k, msl, cr, nn = 512, 8192, 1, 1
+    npad = (msl + 63) // 64 * 64
+    ss_host.warmup_varlen(k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(64,))
+    key63 = (63, npad, k, min(msl, npad), nn, cr)
+    ss_host._VARLEN_CACHE.pop(key63, None)  # independent of earlier tests in this process
+    ss_host.warmup_varlen(k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(63, 64))
+    assert key63 in ss_host._VARLEN_CACHE
+    lg = torch.randn(63, npad, dtype=torch.float32, device=_DEV)
+    kv = torch.full((63,), msl, dtype=torch.int32, device=_DEV)
+    out = torch.empty(63, k, dtype=torch.int32, device=_DEV)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(lg[:, :msl], kv, out, max_seq_len=msl)
+    g.replay()
+    torch.cuda.synchronize()
+    ref = torch.topk(lg[:, :msl], k, dim=1).values.sort(dim=1).values
+    got = lg.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+    assert torch.equal(ref, got)
+
+
+def test_validate_run_ws_requires_16_byte_alignment() -> None:
+    """The workspace fake declares 16-byte alignment; the host check matches
+    it so an 8-but-not-16-byte workspace fails here instead of at DSL
+    conversion (DKG issue #60, item 3)."""
+    logits = torch.zeros(1, 64, dtype=torch.float32, device=_DEV)
+    base = torch.zeros(ss_host.WS_BYTES // 4 + 4, dtype=torch.int32, device=_DEV)
+    ss_host.validate_run_ws(base[4:], logits)  # +16 B
+    with pytest.raises(RuntimeError, match="16-byte"):
+        ss_host.validate_run_ws(base[2:], logits)  # +8 B
+
+
+# ===========================================================================
+# ==== prefill: per-row [ks, ke) windows (run_prefill) ======================
+# ===========================================================================
+# Contract: Top-K of logits[r, ks:ke] in the local frame (column - ks), -1 pad,
+# identity for nv <= k. ks % 4 in {1,2,3} is exercised with poison written at
+# [ks-3, ks) and [ke, npad).
+
+
+def _prefill_reference(logits, row_starts, row_ends, top_k):
+    rows, ncols = logits.shape
+    out = torch.full((rows, top_k), -1, dtype=torch.int32, device=logits.device)
+    ks, ke = row_starts.tolist(), row_ends.tolist()
+    for r in range(rows):
+        nv = max(min(ke[r], ncols) - ks[r], 0)
+        if nv == 0:
+            continue
+        if nv <= top_k:
+            out[r, :nv] = torch.arange(nv, dtype=torch.int32, device=logits.device)
+        else:
+            out[r] = torch.topk(logits[r, ks[r] : ks[r] + nv], top_k).indices.to(torch.int32)
+    return out
+
+
+def _check_prefill_exact(logits, got, row_starts, row_ends, top_k):
+    """Tie-aware radix-parity check: -1 pad from lengths, unique head in [0, nv),
+    identity for nv <= k; exact set when the k-th value is unique, else the
+    strictly-above set plus a tie-class count. NaN-in-window rows: structure only."""
+    assert got.shape == (logits.shape[0], top_k) and got.dtype == torch.int32
+    ks, ke = row_starts.tolist(), row_ends.tolist()
+    got64 = got.to(torch.int64)
+    dev = logits.device
+    for r in range(logits.shape[0]):
+        nv = max(min(ke[r], logits.shape[1]) - ks[r], 0)
+        m = min(nv, top_k)
+        row = got64[r]
+        assert bool((row[m:] == -1).all()), f"row {r}: pad must be trailing -1 x{top_k - m}"
+        head = row[:m]
+        if m == 0:
+            continue
+        assert bool((head != -1).all()), f"row {r}: -1 inside the valid head"
+        assert int(head.min()) >= 0 and int(head.max()) < nv, f"row {r}: index outside [0,{nv})"
+        assert int(torch.unique(head).numel()) == m, f"row {r}: duplicate indices"
+        win = logits[r, ks[r] : ks[r] + nv]
+        if bool(torch.isnan(win).any()):
+            continue  # NaN out of contract for both kernels; structure only
+        if nv <= top_k:
+            assert torch.equal(torch.sort(head).values, torch.arange(nv, device=dev)), (
+                f"row {r}: short row must be identity"
+            )
+            continue
+        vals = torch.sort(win, descending=True).values
+        v_k, v_next = vals[top_k - 1], vals[top_k]
+        got_vals = win[head]
+        if bool(v_k != v_next):
+            ref = (win >= v_k).nonzero(as_tuple=True)[0]
+            assert ref.numel() == top_k
+            assert torch.equal(torch.sort(head).values, ref), f"row {r}: index set mismatch"
+        else:
+            above = (win > v_k).nonzero(as_tuple=True)[0]
+            got_above = head[got_vals > v_k]
+            assert torch.equal(torch.sort(got_above).values, above), (
+                f"row {r}: strictly-above set mismatch"
+            )
+            assert int((got_vals == v_k).sum()) == top_k - above.numel(), (
+                f"row {r}: wrong number of boundary-tied picks"
+            )
+            assert bool((got_vals >= v_k).all()), f"row {r}: value below k-th selected"
+
+
+def _make_prefill_case(rows, ncols, ks_list, ke_list, *, top_k, seed, dist="randn"):
+    """DeepGEMM-like storage: stride = align(ncols + 256, 256), column slice
+    [:, :ncols]; outside-window columns poisoned so an over-read/frame bug is
+    caught (+inf at [ks-3, ks), rotating NaN/inf/3e38/-inf elsewhere)."""
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    stride = ((ncols + 256 + 255) // 256) * 256
+    if dist == "randn":
+        full = torch.randn((rows, stride), generator=gen, dtype=torch.float32, device=_DEV)
+    elif dist == "equal":
+        full = torch.ones((rows, stride), dtype=torch.float32, device=_DEV)
+    elif dist == "twoval":
+        full = torch.randint(0, 2, (rows, stride), generator=gen, device=_DEV).float()
+    else:
+        raise ValueError(dist)
+    logits = full[:, :ncols]
+    row_starts = torch.tensor(ks_list, dtype=torch.int32, device=_DEV)
+    row_ends = torch.tensor(ke_list, dtype=torch.int32, device=_DEV)
+    cols = torch.arange(stride, device=_DEV).unsqueeze(0)
+    outside = (cols < row_starts.unsqueeze(1)) | (cols >= row_ends.unsqueeze(1))
+    pat = torch.tensor([float("nan"), float("inf"), 3e38, float("-inf")], device=_DEV)[
+        cols % 4
+    ].expand(rows, -1)
+    full.masked_scatter_(outside, pat[outside])
+    for r, ks in enumerate(ks_list):
+        full[r, max(ks - 3, 0) : ks] = float("inf")
+    return logits, row_starts, row_ends
+
+
+@pytest.mark.parametrize("top_k", [512, 1024, 2048], ids=lambda k: f"k{k}")
+def test_prefill_causal_ramp(top_k):
+    """Causal ramp (ks=0), 148 rows with nv = 1..148 < k: one tier-0 launch, all
+    short-row identity. k boundary: test_prefill_short_rows; mixed short/long
+    rows in one launch: test_prefill_packed_misaligned_ks."""
+    rows = 148
+    ks = [0] * rows
+    ke = list(range(1, rows + 1))
+    lg, rs, re = _make_prefill_case(rows, rows, ks, ke, top_k=top_k, seed=top_k)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
+@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+def test_prefill_packed_misaligned_ks(top_k, lead):
+    """Multi-request chunk: request 2 starts at ks % 4 == lead with +inf poison
+    at [ks-lead, ks). A leaked lead lane would become top-1 (wrong)."""
+    a = 300
+    ks1 = ((a + 3) // 4) * 4 + lead
+    n1 = 4096 + 17
+    rows = a + n1
+    ncols = ks1 + n1
+    ks = [0] * a + [ks1] * n1
+    ke = list(range(1, a + 1)) + [ks1 + n1] * n1
+    lg, rs, re = _make_prefill_case(rows, ncols, ks, ke, top_k=top_k, seed=top_k * 100 + lead)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    assert int(out.min()) >= -1, "negative index leaked (missed -lead correction / guard)"
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
+def test_prefill_short_rows(top_k):
+    """nv in {0, 1, k-1, k, k+1}: identity 0..nv-1 + trailing -1 (radix short
+    contract); nv==0 (ks==ke) -> all -1."""
+    for nv in (0, 1, top_k - 1, top_k, top_k + 1):
+        rows = 4
+        ncols = max(nv, 1) + 8
+        ks = [0] * rows
+        ke = [nv] * rows
+        lg, rs, re = _make_prefill_case(rows, ncols, ks, ke, top_k=top_k, seed=nv + top_k)
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_prefill(lg, rs, re, out)
+        torch.cuda.synchronize()
+        _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("dist", ["equal", "twoval"], ids=lambda d: d)
+@pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
+def test_prefill_ties_degenerate(top_k, dist):
+    """All-equal (whole tie class) and two-valued (massive ties) rows drive the
+    degenerate A/B narrowing paths; tie-aware acceptance."""
+    rows = 16
+    n = 4096
+    ks = [0] * rows
+    ke = [n] * rows
+    lg, rs, re = _make_prefill_case(rows, n, ks, ke, top_k=top_k, seed=top_k, dist=dist)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
+@pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
+def test_prefill_neginf_tie_class(top_k, lead):
+    """nv > k with fewer than k finite values -> the k-th boundary is in the
+    -inf tie class (degen B), crossed with misaligned lead. A -inf-valued mask
+    would be emitted here as a negative index (== -lead); assert none leaks."""
+    n_finite = top_k - 100
+    nv = top_k + 400
+    ks1 = ((37 + 3) // 4) * 4 + lead
+    ncols = ks1 + nv
+    rows = 5
+    gen = torch.Generator(device=_DEV).manual_seed(top_k * 10 + lead)
+    stride = ((ncols + 256 + 255) // 256) * 256
+    full = torch.full((rows, stride), float("-inf"), dtype=torch.float32, device=_DEV)
+    for r in range(rows):
+        full[r, ks1 : ks1 + n_finite] = torch.randn(n_finite, generator=gen, device=_DEV)
+        full[r, :ks1] = float("inf")
+        full[r, ks1 + nv :] = 3e38
+    logits = full[:, :ncols]
+    rs = torch.tensor([ks1] * rows, dtype=torch.int32, device=_DEV)
+    re = torch.tensor([ks1 + nv] * rows, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(logits, rs, re, out)
+    torch.cuda.synchronize()
+    assert int(out.min()) >= -1, "negative index leaked in a -inf tie class"
+    _check_prefill_exact(logits, out, rs, re, top_k)
+
+
+@pytest.mark.parametrize("top_k, n", [(512, 4099), (2048, 131075)], ids=lambda v: f"n{v}")
+def test_prefill_deepgemm_single_row_odd_width(top_k, n):
+    """A 1-row tile with an odd num_k_tokens on a DeepGEMM-strided view must
+    use stride(0) (not shape[1]) and stay exact — the fully-cached follow-up
+    turn that the varlen 1-row rule would wrongly reject."""
+    rows = 1
+    ks = [0]
+    ke = [n]
+    lg, rs, re = _make_prefill_case(rows, n, ks, ke, top_k=top_k, seed=n)
+    assert lg.stride(0) % 256 == 0 and lg.shape[1] == n  # DeepGEMM-like view
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+def test_prefill_slab_over_gridy_limit():
+    """> 65535 rows in one call must be slabbed (gridDim.y <= 65535)."""
+    k = 512
+    rows = 70000
+    n = 2048
+    stride = ((n + 256 + 255) // 256) * 256
+    lg = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)[:, :n]
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    re = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    idx = torch.tensor([0, 1, 32767, 32768, 65535, 65536, 69999], device=_DEV)
+    _check_prefill_exact(lg[idx], out[idx].contiguous(), rs[idx], re[idx], k)
+
+
+def test_prefill_engine_key_distinct_from_decode():
+    """The prefill compile shares the DSv3.2 decode varlen tuple (next_n=1,
+    cr_shift=0) but has a distinct prologue, so the compile keys must differ."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling as dev,
+    )
+
+    tpl = (256, 8, 4, 256, 2, False, False, 1, 0, 1)
+    a = dev.get_compiled(tpl, hint_free=True)
+    b = dev.get_compiled(tpl, hint_free=True, prefill=True)
+    assert a is not b
+
+
+def test_prefill_guards():
+    k = 512
+    n = 4096
+    stride = ((n + 256 + 255) // 256) * 256
+    lg = torch.randn((3, stride), dtype=torch.float32, device=_DEV)[:, :n]
+    rs = torch.zeros((3,), dtype=torch.int32, device=_DEV)
+    re = torch.full((3,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((3, k), -7, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="float32"):
+        ss_host.run_prefill(lg.to(torch.bfloat16), rs, re, out)
+    with pytest.raises(RuntimeError, match="row_starts"):
+        ss_host.run_prefill(lg, rs.to(torch.int64), re, out)
+    with pytest.raises(RuntimeError, match="row_starts/row_ends length"):
+        ss_host.run_prefill(lg, rs[:2], re, out)
+    with pytest.raises(RuntimeError, match="multiple of 4"):
+        ss_host.run_prefill(lg, rs, re, torch.full((3, k + 2), -7, dtype=torch.int32, device=_DEV))
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        ss_host.run_prefill(lg[:, 1:], rs, re, out)  # base offset by 1 float
+
+
+def test_prefill_warmup_idempotent_and_no_rejit():
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling as dev,
+    )
+
+    k = 512
+    ss_host.warmup_prefill(k, 32768)
+    before = len(ss_host._PREFILL_WARMUP_DONE)
+    ss_host.warmup_prefill(k, 32768)
+    assert len(ss_host._PREFILL_WARMUP_DONE) == before, "warmup not idempotent"
+    orig = dev.get_compiled
+    calls = {"n": 0}
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return orig(*a, **kw)
+
+    dev.get_compiled = counting
+    try:
+        for rows in (1, 8, 37, 74, 100, 296, 297, 4096):
+            for nkv in (4096, 16384, 32768):
+                stride = ((nkv + 256 + 255) // 256) * 256
+                lg = torch.zeros((rows, stride), dtype=torch.float32, device=_DEV)[:, :nkv]
+                rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+                re = torch.full((rows,), nkv, dtype=torch.int32, device=_DEV)
+                out = torch.empty((rows, k), dtype=torch.int32, device=_DEV)
+                ss_host.run_prefill(lg, rs, re, out, max_row_len=nkv)
+    finally:
+        dev.get_compiled = orig
+    assert calls["n"] == 0, f"warmup missed keys: {calls['n']} live compiles"
+    # the capture-time readiness query agrees with the cache: warmed shape
+    # ready, an unwarmed k (4 is valid but never compiled) not ready
+    assert ss_host.prefill_ready(lg, out)
+    assert not ss_host.prefill_ready(lg[:1], torch.empty((1, 4), dtype=torch.int32, device=_DEV))
+
+
+def test_prefill_capture_no_host_sync():
+    """After warmup, a run_prefill call captures under a CUDA graph (proves no
+    .item()/.max() host read)."""
+    k = 512
+    n = 8192
+    ss_host.warmup_prefill(k, max(n, 32768))
+    stride = ((n + 256 + 255) // 256) * 256
+    lg = torch.randn((64, stride), dtype=torch.float32, device=_DEV)[:, :n]
+    rs = torch.zeros((64,), dtype=torch.int32, device=_DEV)
+    re = torch.full((64,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((64, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out, max_row_len=n)  # compile outside capture
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, k)

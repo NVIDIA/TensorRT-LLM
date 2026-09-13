@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import datetime
 import os
@@ -282,18 +296,6 @@ def llama_v2_tokenizer_model_root():
 
 
 @pytest.fixture(scope="session")
-def gpt_tokenizer_model_root(llm_backend_venv):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_tokenizer_model_root = os.path.join(models_root, "gpt2")
-
-    assert os.path.exists(
-        gpt_tokenizer_model_root
-    ), f"{gpt_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
 def gptj_tokenizer_model_root(llm_backend_venv):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -303,18 +305,6 @@ def gptj_tokenizer_model_root(llm_backend_venv):
         gptj_tokenizer_model_root
     ), f"{gptj_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return gptj_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def gpt2_medium_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_tokenizer_model_root = os.path.join(models_root, "gpt2-medium")
-
-    assert os.path.exists(
-        gpt_tokenizer_model_root
-    ), f"{gpt_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_tokenizer_model_root
 
 
 @pytest.fixture(scope="session")
@@ -407,45 +397,6 @@ def mllama_model_root():
         mllama_model_root
     ), f"{mllama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return mllama_model_root
-
-
-@pytest.fixture(scope="session")
-def llama_v3_8b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                    "llama-v3-8b-instruct-hf")
-
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
-
-
-@pytest.fixture(scope="session")
-def llama3_v1_8b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                    "Meta-Llama-3.1-8B")
-
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
-
-
-@pytest.fixture(scope="session")
-def llama_v3_70b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                    "Llama-3-70B-Instruct-Gradient-1048k")
-
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
 
 
 @pytest.fixture(scope="session")

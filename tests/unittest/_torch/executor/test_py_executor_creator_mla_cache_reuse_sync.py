@@ -126,6 +126,7 @@ class _DummyModelEngine:
         *,
         attn_runtime_features,
         kv_cache_quant_algo,
+        sparse_algorithm=None,
         enable_flash_mla=False,
         max_seq_len=128,
     ):
@@ -134,13 +135,16 @@ class _DummyModelEngine:
         Args:
             attn_runtime_features: AttentionRuntimeFeatures instance.
             kv_cache_quant_algo: Quantization algorithm for KV cache.
+            sparse_algorithm: Optional sparse-attention algorithm name.
             enable_flash_mla: Whether to emulate the FlashMLA block-size override.
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.attn_runtime_features = attn_runtime_features
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
-        self.sparse_attention_config = None
+        self.sparse_attention_config = (
+            SimpleNamespace(algorithm=sparse_algorithm) if sparse_algorithm is not None else None
+        )
         self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -200,7 +204,6 @@ def _make_llm_args():
             calibration_file_path=None,
             calibration_layer_indices=None,
         ),
-        sampler_type=None,
         cuda_graph_config=None,
         parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
         get_runtime_sizes=lambda: (1, 128, 128, 4),
@@ -212,6 +215,7 @@ def _run_create_py_executor(
     *,
     sm_version,
     kv_cache_quant_algo,
+    sparse_algorithm=None,
     attn_backend="TRTLLM",
     cache_transceiver_config=None,
     enable_flash_mla=False,
@@ -230,6 +234,7 @@ def _run_create_py_executor(
         monkeypatch: pytest fixture for mocking.
         sm_version: CUDA SM version to simulate (e.g., 89, 90).
         kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        sparse_algorithm: Optional sparse-attention algorithm name.
         attn_backend: Attention backend to configure.
         cache_transceiver_config: Optional transceiver configuration to mutate.
         enable_flash_mla: Whether to emulate the FlashMLA block-size override.
@@ -298,6 +303,7 @@ def _run_create_py_executor(
         return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
+            sparse_algorithm=sparse_algorithm,
             enable_flash_mla=enable_flash_mla,
             max_seq_len=model_max_seq_len,
         )
@@ -370,6 +376,23 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is False
     assert runtime_cache_reuse is False
+
+
+@pytest.mark.parametrize(
+    "sparse_algorithm, expected_cache_reuse",
+    [("dsa", True), ("deepseek_v4", False), (None, False)],
+)
+def test_mla_nvfp4_cache_reuse_requires_dsa(monkeypatch, sparse_algorithm, expected_cache_reuse):
+    """Verify that NVFP4 MLA cache reuse is enabled only for the supported DSA path."""
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
+        monkeypatch,
+        sm_version=100,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        sparse_algorithm=sparse_algorithm,
+    )
+
+    assert kv_cache_reuse is expected_cache_reuse
+    assert runtime_cache_reuse is expected_cache_reuse
 
 
 @pytest.mark.parametrize("sm_version", _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)

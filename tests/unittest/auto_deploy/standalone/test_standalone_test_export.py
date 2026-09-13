@@ -47,7 +47,6 @@ GENERATED_TEST_RENAMES = {
     "test_ad_build_small_single.py": "test_paragraf_trtllm_build_small_single.py",
     "test_ad_guided_decoding_regex.py": "test_paragraf_trtllm_guided_decoding_regex.py",
     "test_ad_trtllm_bench.py": "test_paragraf_trtllm_bench.py",
-    "test_ad_trtllm_sampler.py": "test_paragraf_trtllm_sampler.py",
     "test_ad_trtllm_serve.py": "test_paragraf_trtllm_serve.py",
 }
 
@@ -59,6 +58,7 @@ def _tracked_autodeploy_tests() -> set[Path]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     return {
         Path(path)

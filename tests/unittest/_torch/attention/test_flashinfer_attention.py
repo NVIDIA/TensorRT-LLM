@@ -13,13 +13,13 @@ import torch
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
-                                                   FlashInferAttentionMetadata)
-from tensorrt_llm._torch.attention_backend import \
+from tensorrt_llm._torch.attention.backends import (FlashInferAttention,
+                                                    FlashInferAttentionMetadata)
+from tensorrt_llm._torch.attention.backends import \
     flashinfer as flashinfer_backend
-from tensorrt_llm._torch.attention_backend.flashinfer import (
+from tensorrt_llm._torch.attention.backends.flashinfer import (
     FlashInferWrappers, PlanParams)
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -27,6 +27,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
@@ -71,6 +72,107 @@ class CUDAGraphTestScenario:
 
 class TestFlashInferAttention(unittest.TestCase):
 
+    def test_swa_page_sanitization_uses_local_window_order(self) -> None:
+        metadata = object.__new__(FlashInferAttentionMetadata)
+        metadata.kv_cache_manager = SimpleNamespace(
+            layer_offsets={
+                4: 0,
+                5: 1,
+                6: 2
+            },
+            max_attention_window_vec=[128, None, 128],
+        )
+
+        sliding_page_indices = torch.tensor([BAD_PAGE_INDEX, 3],
+                                            dtype=torch.int32)
+        metadata._sanitize_swa_page_indices(sliding_page_indices, layer_idx=4)
+        torch.testing.assert_close(sliding_page_indices,
+                                   torch.tensor([0, 3], dtype=torch.int32))
+
+        full_page_indices = torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32)
+        metadata._sanitize_swa_page_indices(full_page_indices, layer_idx=5)
+        torch.testing.assert_close(
+            full_page_indices,
+            torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32),
+        )
+
+    def test_attention_layer_indices_ignore_zero_kv_layers(self) -> None:
+
+        class FakeHybridManager:
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1, 30: 2}
+                self.num_kv_heads_per_layer = [8, 0, 8]
+
+            def is_attention_layer(self, layer_idx: int) -> bool:
+                return layer_idx != 20
+
+        self.assertEqual(
+            flashinfer_backend._get_attention_layer_indices(
+                FakeHybridManager()), [10, 30])
+
+    def test_attention_layer_indices_support_v1_manager(self) -> None:
+
+        class FakeV1Manager:
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1}
+
+        self.assertEqual(
+            flashinfer_backend._get_attention_layer_indices(FakeV1Manager()),
+            [10, 20])
+
+    def test_hybrid_v2_metadata_uses_first_attention_layer_for_prepare(
+            self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        class FakeHybridManager:
+            blocks_in_primary_pool = 4
+            max_blocks_per_seq = 4
+            tokens_per_block = 32
+            is_vswa = False
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1}
+                self.layer_to_pool_mapping_dict = {0: 0, 1: 0}
+
+            def is_attention_layer(self, layer_idx: int) -> bool:
+                return layer_idx == 20
+
+            def get_layer_page_index_scale(self, layer_idx: int) -> int:
+                return 1
+
+        manager = FakeHybridManager()
+        manager.get_buffers = mock.Mock(
+            side_effect=lambda layer_idx: torch.empty(4) if layer_idx == 20 else
+            self.fail("recurrent layer queried for KV buffers"))
+        manager.get_batch_cache_indices_flat = mock.Mock(
+            return_value=torch.tensor([2], dtype=torch.int32))
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.zeros(1, dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[1],
+            ),
+            max_num_requests=1,
+            max_num_tokens=1,
+            kv_cache_manager=manager,
+            request_ids=[7],
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
+            mamba_metadata=False,
+        )
+
+        self.assertEqual(metadata._primary_kv_layer_idx, 20)
+        manager.get_buffers.assert_called_once_with(20)
+
+        metadata.prepare()
+
+        manager.get_batch_cache_indices_flat.assert_called_once_with(
+            [7], [1], layer_idx=20)
+
     def test_generation_page_table_uses_reserved_block_count(self):
         manager = SimpleNamespace(get_batch_cache_indices=mock.Mock(
             return_value=[list(range(325))]))
@@ -83,7 +185,7 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         manager.get_batch_cache_indices.assert_called_once_with([99])
 
-    def test_decode_launch_shape_is_part_of_plan_params(self):
+    def test_decode_query_width_is_part_of_plan_params(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
@@ -113,6 +215,39 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
+            metadata.seq_lens = torch.tensor([1, 1, 1], dtype=torch.int32)
+            larger_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([1, 1], dtype=torch.int32)
+            metadata._uses_full_generation_page_table = True
+            full_page_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._uses_full_generation_page_table = False
+            metadata._is_shared_kv_draft_view = True
+            shared_draft_single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata._is_shared_kv_draft_view = False
             metadata.seq_lens = torch.tensor([6, 6], dtype=torch.int32)
             multi_token_plan = metadata.plan(
                 num_heads=32,
@@ -135,11 +270,16 @@ class TestFlashInferAttention(unittest.TestCase):
             )
 
         self.assertEqual(single_token_plan.q_len_per_req, 1)
+        self.assertEqual(larger_single_token_plan.q_len_per_req, 1)
+        self.assertEqual(single_token_plan, larger_single_token_plan)
+        self.assertEqual(single_token_plan, full_page_single_token_plan)
+        self.assertEqual(single_token_plan, shared_draft_single_token_plan)
         self.assertEqual(multi_token_plan.q_len_per_req, 6)
         self.assertNotEqual(single_token_plan, multi_token_plan)
-        self.assertEqual(multi_token_plan.num_generations, 2)
-        self.assertEqual(larger_batch_plan.num_generations, 3)
-        self.assertNotEqual(multi_token_plan, larger_batch_plan)
+        # The live generation batch size deliberately does not key the cache. Eager metadata
+        # replans every wrapper on each prepare() and sizes their block tables by
+        # max_num_requests, so keying on it would allocate a fresh wrapper per batch size seen.
+        self.assertEqual(multi_token_plan, larger_batch_plan)
 
         metadata.seq_lens = torch.tensor([6, 5], dtype=torch.int32)
         with self.assertRaisesRegex(ValueError, "uniform query length"):
@@ -152,6 +292,41 @@ class TestFlashInferAttention(unittest.TestCase):
                 attention_mask_type=AttentionMaskType.causal.value,
                 flashinfer_backend="trtllm-gen",
             )
+
+    def test_cuda_graph_metadata_owns_a_private_plan_cache(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=4,
+            max_num_tokens=16,
+        )
+        plan_params = PlanParams(
+            num_heads=32,
+            num_kv_heads=4,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            attention_mask_type=AttentionMaskType.causal,
+        )
+        eager_wrappers = FlashInferWrappers(is_planned=True)
+        metadata._plan_params_to_wrappers[plan_params] = eager_wrappers
+
+        graph_metadata = metadata.create_cuda_graph_metadata(2)
+
+        # Wrappers belong to a metadata instance, and the runner builds one metadata per captured
+        # batch size. That partitioning -- not the cache key -- is what keeps a graph wrapper from
+        # being reused across batch sizes, so PlanParams need not carry the generation batch size.
+        self.assertTrue(graph_metadata.is_cuda_graph)
+        self.assertIsNot(graph_metadata._plan_params_to_wrappers,
+                         metadata._plan_params_to_wrappers)
+        self.assertEqual(graph_metadata._plan_params_to_wrappers, {})
+        self.assertIs(metadata._plan_params_to_wrappers[plan_params],
+                      eager_wrappers)
 
     def test_generation_page_table_keeps_logical_positions(self):
         if not torch.cuda.is_available():
@@ -1139,3 +1314,101 @@ class TestFlashInferAttention(unittest.TestCase):
 
         graph.replay()
         torch.testing.assert_close(result_actual, result_ref, atol=1e-2, rtol=0)
+
+
+# --------------------------------------------------------------------------
+# FlashInfer decode plan refresh under CUDA graphs
+#
+# Graph replay never re-enters ``forward_impl``: whatever split-KV schedule
+# ``plan()`` computed at capture time is what every replay runs. A model with
+# more than one decode wrapper (per-layer sliding window plus global attention)
+# defers its plan to ``forward_impl``, so the recorded page tuple and
+# ``_refresh_fa2_cuda_graph_plans()`` are the only things that keep a replayed
+# plan current. This is plan bookkeeping rather than kernel maths, so it is
+# testable without a GPU. (Relocated from test_flashinfer_plan_refresh.py.)
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, eq=False)
+class _FakePlanParams:
+    """Only the two fields ``_refresh_fa2_cuda_graph_plans`` looks at.
+
+    ``eq=False`` keeps identity semantics, so two default instances are two
+    distinct cache keys -- as two real per-layer plan params are.
+    """
+
+    attention_mask_data: Optional[object] = None
+    multi_item_params: Optional[object] = None
+
+
+class _FakeMetadata:
+    """The three attributes the refresh reads, plus a recording re-plan.
+
+    Constructing real metadata needs a KV cache manager and a device, and the
+    method under test touches none of that: it reads ``num_blocks``,
+    ``num_contexts`` and the plan cache, and calls ``_plan_with_params``.
+    """
+
+    def __init__(self, num_blocks, num_contexts, wrappers_by_params):
+        self.num_blocks = num_blocks
+        self.num_contexts = num_contexts
+        self._plan_params_to_wrappers = wrappers_by_params
+        self.replanned = []
+
+    def _plan_with_params(self, plan_params):
+        self.replanned.append(plan_params)
+        wrappers = self._plan_params_to_wrappers[plan_params]
+        wrappers.fa2_plan_num_blocks = tuple(
+            self.num_blocks[self.num_contexts:])
+        wrappers.is_planned = True
+
+    refresh = FlashInferAttentionMetadata._refresh_fa2_cuda_graph_plans
+
+
+def _refresh_wrappers(page_tuple):
+    return FlashInferWrappers(is_planned=True, fa2_plan_num_blocks=page_tuple)
+
+
+def test_page_table_change_replans_every_recorded_wrapper():
+    """The multi-wrapper (variable sliding window) case the fix was written for.
+
+    Every decode wrapper that was graph-captured now carries a page tuple, so a
+    change to the generation page counts must re-plan all of them -- not just
+    the first, and not just the tensor-core one.
+    """
+    windowed, global_ = _FakePlanParams(), _FakePlanParams()
+    cache = {
+        windowed: _refresh_wrappers((3, 3)),
+        global_: _refresh_wrappers((3, 3))
+    }
+    # num_contexts=1: the first entry is a context request and is not part of
+    # the generation page tuple.
+    meta = _FakeMetadata([9, 4, 4], 1, cache)
+
+    meta.refresh()
+
+    assert meta.replanned == [windowed, global_]
+    assert cache[windowed].fa2_plan_num_blocks == (4, 4)
+    assert all(w.is_planned for w in cache.values())
+
+
+def test_an_unchanged_page_table_does_not_replan():
+    """The plan and its stream sync run only on a page-count change."""
+    params = _FakePlanParams()
+    cache = {params: _refresh_wrappers((4, 4))}
+    meta = _FakeMetadata([4, 4], 0, cache)
+
+    meta.refresh()
+
+    assert meta.replanned == []
+    assert cache[params].is_planned is True
+
+
+def test_no_generations_clears_the_recorded_page_tuple():
+    """A context-only step has no decode plan to keep current."""
+    params = _FakePlanParams()
+    cache = {params: _refresh_wrappers((4, 4))}
+    meta = _FakeMetadata([7], 1, cache)
+
+    meta.refresh()
+
+    assert meta.replanned == []
+    assert cache[params].fa2_plan_num_blocks is None

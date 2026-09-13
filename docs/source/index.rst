@@ -69,8 +69,10 @@ Welcome to TensorRT LLM's Documentation!
    features/attention.md
    features/disagg-serving.md
    features/disagg-serving-aws-efa.md
+   features/subagent-routing.md
    features/embeddings.md
    features/kvcache.md
+   features/kv-cache-compression.md
    features/long-sequence.md
    features/lora.md
    features/multi-modality.md
@@ -92,6 +94,7 @@ Welcome to TensorRT LLM's Documentation!
    features/helix.md
    features/kv-cache-connector.md
    features/sparse-attention.md
+   features/visual-generation.md
 
 
 .. toctree::
@@ -106,8 +109,9 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/api-change.md
    developer-guide/kv-transfer.md
    developer-guide/kv-cache-cold-page-codec.md
-   developer-guide/telemetry.md
+   developer-guide/kv-cache-compression-development.md
    developer-guide/sparse-attention-development-guide.md
+   developer-guide/telemetry.md
 
 
 .. toctree::

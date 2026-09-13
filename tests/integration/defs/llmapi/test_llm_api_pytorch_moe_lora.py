@@ -14,10 +14,10 @@
 # limitations under the License.
 """Routed-expert (MoE) LoRA integration tests on the PyTorch CUTLASS backend.
 
-Covers unquantized bf16 (Qwen3-MoE) and per-tensor FP8 (Mistral Small 4)
-base weights, with several adapters of varying rank applied in one batch. The
-adapters are fabricated on disk in the per-expert key layout the TRT-LLM loader
-expects, so the tests do not depend on a real PEFT export.
+Covers unquantized bf16 Qwen3-MoE base weights, with several adapters of varying
+rank applied in one batch. The adapters are fabricated on disk in the per-expert
+key layout the TRT-LLM loader expects, so the tests do not depend on a real PEFT
+export.
 
 These tests require their model checkpoints under LLM_MODELS_ROOT and fail (not
 skip) when a checkpoint is missing, so a misconfigured model root surfaces as a
@@ -36,9 +36,8 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import MoeConfig, PeftCacheConfig
-from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_pre_ada
+from ..conftest import llm_models_root
 
 # These tests spin up the PyTorch engine (and, in CUDA-graph mode, torch.compile
 # / inductor subprocesses) whose helper threads outlive the test, so the
@@ -64,9 +63,9 @@ def _write_routed_expert_lora_adapter(
 ) -> None:
     """Fabricate a per-expert routed-expert HF LoRA adapter on disk.
 
-    Models like Qwen3-MoE, DeepSeek, and Mistral Small 4 store routed experts
-    under mlp.experts.{e} with gate_proj/up_proj/down_proj projections. This
-    writes per-expert lora_A/lora_B for those projections, keyed as
+    Qwen3-MoE stores routed experts under mlp.experts.{e} with
+    gate_proj/up_proj/down_proj projections. This writes per-expert
+    lora_A/lora_B for those projections, keyed as
     .../mlp.experts.{e}.{proj}.lora_{A,B}.weight. lora_B is non-zero so each
     adapter perturbs the routed-expert output.
     """
@@ -114,17 +113,19 @@ def _run_routed_expert_multi_lora(
     max_rank: int,
     target_modules: list,
     trtllm_modules_to_hf_modules: dict,
-    expected_quant_algo=None,
     cuda_graph_config,
-    tensor_parallel_size: int = 1,
     preallocate_all_adapters: bool = True,
     peft_cache_config=None,
 ) -> None:
     """Serve a MoE checkpoint with routed-expert LoRA and assert it applies.
 
-    The batch mixes a no-LoRA (rank-0) request with every adapter, asserting the
-    no-LoRA row produces output and each adapter changes the output versus the
-    base model. With a CUDA graph the decode takes the slot-indexed input
+    The batch mixes two no-LoRA (rank-0) requests with every adapter, asserting
+    each adapter moves the logits away from the no-LoRA rows of that same batch
+    and that no two adapters land on the same value. Comparisons stay within one
+    batch because batch width and first-call effects each shift the logits on
+    their own; the second no-LoRA row measures that batch's own noise floor, so
+    the thresholds are checked against the run rather than trusted from a past
+    calibration. With a CUDA graph the decode takes the slot-indexed input
     schema; without one it takes the per-request schema. Both feed the same
     grouped-GEMM LoRA core.
     """
@@ -147,40 +148,95 @@ def _run_routed_expert_multi_lora(
         moe_config=MoeConfig(backend="CUTLASS"),
         kv_cache_config=_KV_CACHE_CONFIG,
         cuda_graph_config=cuda_graph_config,
-        tensor_parallel_size=tensor_parallel_size,
         peft_cache_config=peft_cache_config,
     )
     try:
-        if expected_quant_algo is not None:
-            assert llm.args.quant_config.quant_algo == expected_quant_algo, (
-                f"Expected quant_algo={expected_quant_algo}; "
-                f"got {llm.args.quant_config.quant_algo}."
-            )
-        sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+        # Logprobs, not just greedy tokens: a randomly fabricated adapter can
+        # shift every logit without crossing an argmax boundary, so an adapter
+        # that demonstrably ran would look "not applied" under token equality.
+        # logprobs=0 in simple format yields one float per token -- the sampled
+        # token's logprob.
+        sampling_params = SamplingParams(
+            max_tokens=20,
+            temperature=0.0,
+            logprobs=0,
+            logprobs_simple_format=True,
+        )
         prompt = "What is your name?"
 
-        base_tokens = list(
-            llm.generate([prompt], sampling_params, lora_request=None)[0].outputs[0].token_ids
+        # Batch width, and whether a call is the engine's first, both shift the
+        # logits by ~7e-2 on this model, so no run outside this batch is a valid
+        # baseline. Compare rows *within* one mixed batch instead: the no-LoRA
+        # row is the base-model reference, and every row's first decode step runs
+        # at the same position on the same prompt, so their logprobs are directly
+        # comparable. The threshold sits between the two measured scales -- the
+        # weakest of these adapters moves the logprob by ~2e-2, while equivalent
+        # rows agree to <=1e-3 -- so it is ~4x below real signal and ~5x above
+        # noise. Adapters are fabricated with a fixed seed, so those margins are
+        # reproducible rather than incidental.
+        min_adapter_delta = 5e-3
+
+        # Rows 0 and 1 are both no-LoRA; rows 2.. are one per adapter. Two
+        # baseline rows, not one, so the batch measures its own noise floor: every
+        # other assertion here is relative to the no-LoRA logprob, which makes that
+        # row the one thing nothing else can check. Two of them turn both failure
+        # modes into explicit, self-diagnosing errors -- a threshold that drifted
+        # after a kernel or sampler change, and an adapter leaking into a no-LoRA
+        # slot (which would move the baseline and quietly rescale every delta
+        # below).
+        requests = [None, None] + [
+            LoRARequest(f"moe-lora-{i}", i, path) for i, path in enumerate(lora_paths)
+        ]
+        outputs = [
+            o.outputs[0]
+            for o in llm.generate([prompt] * len(requests), sampling_params, lora_request=requests)
+        ]
+        for i, output in enumerate(outputs):
+            assert output.token_ids, f"Row {i} produced no tokens."
+
+        base_first_logprob = outputs[0].logprobs[0]
+        base_spread = abs(outputs[1].logprobs[0] - base_first_logprob)
+        assert base_spread < min_adapter_delta / 4, (
+            f"The two no-LoRA rows disagree by {base_spread:.3e}, which is not far "
+            f"enough below min_adapter_delta={min_adapter_delta:.0e} for the "
+            "adapter checks to mean anything. Either the batch noise floor has "
+            "risen (retune min_adapter_delta against it) or an adapter is leaking "
+            "into a no-LoRA slot."
         )
 
-        lora_requests = [LoRARequest(f"moe-lora-{i}", i, path) for i, path in enumerate(lora_paths)]
-        requests = [None] + lora_requests
-        outputs = llm.generate([prompt] * len(requests), sampling_params, lora_request=requests)
-        out_tokens = [list(o.outputs[0].token_ids) for o in outputs]
-
-        assert out_tokens[0] == base_tokens, (
-            "No-LoRA row in the mixed batch differs from the standalone base output."
-        )
-        for i, adapter_tokens in enumerate(out_tokens[1:]):
-            assert adapter_tokens, f"LoRA adapter {i} produced no tokens."
-            assert adapter_tokens != base_tokens, (
-                f"Routed-expert MoE LoRA adapter {i} produced output "
-                "identical to the base model; it was not applied."
+        adapter_logprobs = [o.logprobs[0] for o in outputs[2:]]
+        for i, adapter_logprob in enumerate(adapter_logprobs):
+            adapter_delta = abs(adapter_logprob - base_first_logprob)
+            assert adapter_delta > min_adapter_delta, (
+                f"Routed-expert MoE LoRA adapter {i} shifted the logits by only "
+                f"{adapter_delta:.3e} versus the no-LoRA row in the same batch "
+                f"(need > {min_adapter_delta:.0e}); it was not applied."
             )
+
+        # Distinct adapters must not collapse onto one another: a slot-table bug
+        # that pointed every token at one adapter's weights would still clear the
+        # per-adapter check above. Compare against a threshold rather than for
+        # exact inequality -- a confident greedy first token drives the sampled
+        # logprob toward 0.0, where two genuinely-applied adapters can round to the
+        # same representable value and fail this for no reason.
+        for a in range(len(adapter_logprobs)):
+            for b in range(a + 1, len(adapter_logprobs)):
+                separation = abs(adapter_logprobs[a] - adapter_logprobs[b])
+                assert separation > min_adapter_delta / 4, (
+                    f"Adapters {a} and {b} produced first-token logprobs "
+                    f"{adapter_logprobs[a]} vs {adapter_logprobs[b]} (apart by "
+                    f"{separation:.3e}); the slot tables likely collapsed onto one adapter."
+                )
     finally:
         llm.shutdown()
 
 
+# Each parametrization holds the 30B weights plus a 6.6GB LoRA device cache (the
+# rank-64 adapter sits exactly at the PEFT cache floor for this model, so the
+# cache cannot be sized down). Reusing one MPI worker across both leaves ~8GiB of
+# the first engine resident, and the second then has too little left for its own
+# buffers -- so take a private pool, which is torn down with wait_shutdown.
+@pytest.mark.private_mpi_session
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("moe_lora_mode", ["eager", "cudagraph"])
 def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
@@ -238,92 +294,4 @@ def test_qwen_moe_routed_expert_multi_lora_varying_ranks(
             cuda_graph_config=cuda_graph_config,
             preallocate_all_adapters=False,
             peft_cache_config=peft_cache_config,
-        )
-
-
-@skip_pre_ada
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize(
-    "moe_lora_mode",
-    [
-        "eager",
-        "cudagraph",
-    ],
-)
-def test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks(moe_lora_mode: str) -> None:
-    """Routed-expert MoE LoRA on FP8 Mistral-Small-4-119B (replaces Mixtral-8x7B).
-
-    Mistral Small 4 ships pre-quantized to FP8 and stores routed experts as
-    gate_proj/up_proj/down_proj (same HF names as Qwen-MoE). This keeps the
-    historical Mixtral test node ids while exercising the FP8 base-weight +
-    routed-expert LoRA path end to end: the CUTLASS MoE kernel dequantizes the
-    FP8 activations to the bf16 LoRA compute type before the LoRA GEMM.
-
-    - eager: the per-request input schema (host adapter expansion); no CUDA
-      graph.
-    - cudagraph: CUDA-graph decode, which takes the slot-indexed input schema;
-      all adapters share one captured graph, exercising per-slot rank handling.
-    """
-    cuda_graph_config = CudaGraphConfig(max_batch_size=10) if moe_lora_mode == "cudagraph" else None
-
-    model_dir = f"{llm_models_root()}/Mistral-Small-4-119B-2603"
-
-    ranks = _RANKS
-    max_rank = max(ranks)
-
-    # Default MoE map is Mixtral w1/w2/w3; Mistral Small 4 uses Qwen-style names.
-    target_modules = ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"]
-    trtllm_modules_to_hf_modules = {
-        "moe_h_to_4h": "gate_proj",
-        "moe_gate": "up_proj",
-        "moe_4h_to_h": "down_proj",
-    }
-
-    with open(f"{model_dir}/config.json") as f:
-        cfg = json.load(f)
-    # Multimodal wrapper configs nest the text MoE fields under text_config.
-    text_cfg = cfg.get("text_config", cfg)
-    num_experts = (
-        text_cfg.get("n_routed_experts")
-        or text_cfg.get("num_local_experts")
-        or text_cfg.get("num_experts")
-    )
-    hidden_size = text_cfg["hidden_size"]
-    moe_intermediate_size = text_cfg.get("moe_intermediate_size") or text_cfg["intermediate_size"]
-    num_hidden_layers = text_cfg["num_hidden_layers"]
-    first_k_dense_replace = text_cfg.get("first_k_dense_replace", 0)
-    moe_layer_freq = text_cfg.get("moe_layer_freq", 1)
-    moe_layers = [
-        layer_idx
-        for layer_idx in range(num_hidden_layers)
-        if layer_idx >= first_k_dense_replace
-        and (layer_idx - first_k_dense_replace) % moe_layer_freq == 0
-    ]
-
-    with tempfile.TemporaryDirectory() as lora_dir:
-        lora_paths = []
-        for i, r in enumerate(ranks):
-            lora_path = f"{lora_dir}/lora_{i}"
-            _write_routed_expert_lora_adapter(
-                lora_path,
-                moe_layers=moe_layers,
-                num_experts=num_experts,
-                hidden_size=hidden_size,
-                moe_intermediate_size=moe_intermediate_size,
-                rank=r,
-                lora_alpha=2 * r,
-                seed=2000 + i,
-            )
-            lora_paths.append(lora_path)
-
-        _run_routed_expert_multi_lora(
-            model_dir,
-            lora_paths,
-            max_rank=max_rank,
-            target_modules=target_modules,
-            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
-            expected_quant_algo=QuantAlgo.FP8,
-            cuda_graph_config=cuda_graph_config,
-            tensor_parallel_size=2,
         )

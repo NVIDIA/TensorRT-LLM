@@ -51,22 +51,21 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import (maybe_allgather_for_helix_cp,
+                                   maybe_slice_for_helix_cp)
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.mla import MLA
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (maybe_allgather_for_helix_cp,
-                                 maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe,
-                                 is_moe_weight_owner)
-from ..modules.mla import MLA
+from ..moe.fused_moe import (DeepSeekV3MoeRoutingMethod, MoEWeightLoadingMode,
+                             create_moe, is_moe_weight_owner)
 
 # isort: off
-from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
+from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightsLoadingConfig,
@@ -897,8 +896,10 @@ class DeepseekV3Gate(nn.Module):
                                  n,
                                  dtype=torch.float32,
                                  device=hidden_states.device)
-            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
-                input_2d.contiguous(), self.weight, output)
+            bf16_gemm_op = (torch.ops.trtllm.cute_dsl_bf16_gemm_rubin
+                            if get_sm_version() == 107 else
+                            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
+            bf16_gemm_op(input_2d.contiguous(), self.weight, output)
             logits = output.view(*hidden_states.shape[:-1], n)
         else:
             logits = torch.ops.trtllm.dsv3_router_gemm_op(

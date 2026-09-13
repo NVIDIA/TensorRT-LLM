@@ -19,7 +19,7 @@ import torch
 
 from ...._utils import nvtx_range
 from ....logger import logger
-from ...attention_backend.interface import AttentionMetadata
+from ...attention.backends.interface import AttentionMetadata
 from ...pyexecutor.resource_manager import PeftCacheManager
 from ...pyexecutor.scheduler import ScheduledRequests
 from .adapter_slot_manager import AdapterSlotManager
@@ -44,6 +44,7 @@ class CudaGraphLoraManager:
         max_lora_rank: int,
         model: torch.nn.Module,
         lora_model_config: Optional[LoraModelConfig],
+        max_num_tokens: int,
         overlap_lora_and_base: bool = False,
         device: str = "cuda",
         max_tokens_per_seq: int = 1,
@@ -57,6 +58,7 @@ class CudaGraphLoraManager:
             max_lora_rank: Maximum LoRA rank across all layers
             model: Model to get layerwise LoRA info
             lora_model_config: LoRA model configuration
+            max_num_tokens: Engine-wide token capacity, including eager prefill
             overlap_lora_and_base: Whether to overlap LoRA and base model computations.
             device: Device to allocate tensors on
             max_tokens_per_seq: Maximum number of tokens per sequence (>1 for spec decode)
@@ -67,6 +69,7 @@ class CudaGraphLoraManager:
         self.device = device
 
         self.max_tokens_per_seq = max_tokens_per_seq
+        self.max_num_tokens = max_num_tokens
         self.adapter_slot_manager = AdapterSlotManager(max_lora_size)
         self.lora_model_config = lora_model_config
         self.lora_aux_stream = torch.cuda.Stream(device=device) if overlap_lora_and_base else None
@@ -112,19 +115,24 @@ class CudaGraphLoraManager:
         happen before any CUDA graph capture so the buffer addresses baked into
         the graph remain valid across replays.
         """
-        # Worst-case tokens in a single captured forward.
-        max_num_tokens = self.max_batch_size * self.max_tokens_per_seq
+        # Captured decode and eager prefill share the same cached runner. Once a
+        # graph records its scratch addresses, a later prefill must not grow
+        # them, so reserve the larger of the two engine-wide limits.
+        reserve_num_tokens = max(
+            self.max_batch_size * self.max_tokens_per_seq,
+            self.max_num_tokens,
+        )
         reserved = 0
         for _, module in model.named_modules():
             reserve_fn = getattr(module, "reserve_moe_lora_cuda_graph_workspace", None)
             if reserve_fn is None:
                 continue
-            reserve_fn(max_num_tokens, self.max_lora_rank, self.max_lora_size)
+            reserve_fn(reserve_num_tokens, self.max_lora_rank, self.max_lora_size)
             reserved += 1
         if reserved:
             logger.info(
                 f"Reserved routed-expert MoE-LoRA CUDA-graph workspace for "
-                f"{reserved} MoE layer(s) (max_num_tokens={max_num_tokens}, "
+                f"{reserved} MoE layer(s) (max_num_tokens={reserve_num_tokens}, "
                 f"max_lora_rank={self.max_lora_rank}, "
                 f"max_lora_size={self.max_lora_size})."
             )

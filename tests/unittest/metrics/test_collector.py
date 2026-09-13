@@ -217,8 +217,8 @@ class TestConfigInfoMetrics:
 
     def test_model_config_info(self, collector):
         model_config = {
-            "model": "meta-llama/Llama-3-8B",
-            "served_model_name": "Llama-3-8B",
+            "model": "meta-llama/Llama-3.1-8B-Instruct",
+            "served_model_name": "Llama-3.1-8B-Instruct",
             "dtype": "float16",
             "quantization": "none",
             "max_model_len": "4096",

@@ -638,6 +638,74 @@ class TestClaudeBackend:
         assert events[0].usage.context_tokens is None
         assert events[0].usage.context_percentage is None
 
+    async def test_client_lists_skills_from_server_info_without_a_turn(self):
+        # The whole point of sourcing skills from ``get_server_info``: it
+        # is a control request, so nothing is queried and no turn is spent.
+        sdk_client = MagicMock()
+        sdk_client.query = AsyncMock()
+        sdk_client.get_server_info = AsyncMock(
+            return_value={
+                "commands": [
+                    {"name": "trtllm-agent-toolkit:internal-perf-sol-analysis"},
+                    {"name": "perf-analyze", "description": "(project) ..."},
+                    {"name": "clear"},
+                ],
+                "agents": [{"name": "Explore"}],
+            }
+        )
+        client = ClaudeCodeClient(sdk_client)
+
+        skills = await client.list_available_skills()
+
+        assert skills == [
+            "trtllm-agent-toolkit:internal-perf-sol-analysis",
+            "perf-analyze",
+            "clear",
+        ]
+        sdk_client.query.assert_not_awaited()
+
+    async def test_client_skips_command_entries_without_a_name(self):
+        sdk_client = MagicMock()
+        sdk_client.get_server_info = AsyncMock(
+            return_value={"commands": [{"name": "kept"}, {"description": "no name"}, "junk"]}
+        )
+        client = ClaudeCodeClient(sdk_client)
+
+        assert await client.list_available_skills() == ["kept"]
+
+    @pytest.mark.parametrize(
+        "server_info",
+        [
+            None,
+            "not-a-dict",
+            {"agents": []},
+            {"commands": "not-a-list"},
+        ],
+    )
+    async def test_client_reports_no_skill_list_when_server_info_is_unusable(self, server_info):
+        # ``None`` means "we did not learn what is installed" — callers
+        # must not read an empty list as evidence of an empty environment.
+        sdk_client = MagicMock()
+        sdk_client.get_server_info = AsyncMock(return_value=server_info)
+        client = ClaudeCodeClient(sdk_client)
+
+        assert await client.list_available_skills() is None
+
+    async def test_client_reports_no_skill_list_when_server_info_raises(self):
+        sdk_client = MagicMock()
+        sdk_client.get_server_info = AsyncMock(side_effect=RuntimeError("boom"))
+        client = ClaudeCodeClient(sdk_client)
+
+        assert await client.list_available_skills() is None
+
+    async def test_client_reports_no_skill_list_when_sdk_lacks_server_info(self):
+        # An older SDK without the control request degrades to "cannot
+        # say" rather than raising on the workflow's launch path.
+        sdk_client = MagicMock(spec=["query", "receive_response"])
+        client = ClaudeCodeClient(sdk_client)
+
+        assert await client.list_available_skills() is None
+
     async def test_client_emits_thinking_event_from_thinking_block(self):
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
@@ -815,6 +883,72 @@ class TestClaudeBackend:
         events = [event async for event in client.send_message("hi")]
         assert any(isinstance(e, ResultEvent) for e in events)
 
+    async def test_client_error_message_names_the_adjacent_sdk_fields(self):
+        # ``AssistantMessage.error`` is frequently the bare string
+        # "unknown", which tells an operator nothing. The raised message
+        # must carry the surrounding fields so a dead campaign stage is
+        # diagnosable from the run log alone.
+
+        sdk_client = MagicMock()
+        sdk_client.query = AsyncMock()
+
+        async def receive_response():
+            yield AssistantMessage(
+                content=[TextBlock(text="partial answer")],
+                model="claude-test",
+                error="unknown",
+                stop_reason="max_tokens",
+                usage={"input_tokens": 12},
+                uuid="msg-uuid",
+                session_id="sess-1",
+            )
+
+        sdk_client.receive_response = receive_response
+        client = ClaudeCodeClient(sdk_client)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            async for _ in client.send_message("hi"):
+                pass
+
+        message = str(excinfo.value)
+        assert "Claude Code turn failed: unknown" in message
+        assert "model='claude-test'" in message
+        assert "stop_reason='max_tokens'" in message
+        assert "uuid='msg-uuid'" in message
+        assert "session_id='sess-1'" in message
+        assert "input_tokens" in message
+        assert "content_blocks=['TextBlock']" in message
+        assert "partial answer" in message
+
+    def test_assistant_error_detail_truncates_partial_text(self):
+        # A failed turn can carry a large partial answer; the run log
+        # gets a bounded excerpt, not the whole thing.
+        message = AssistantMessage(
+            content=[TextBlock(text="x" * 1000)],
+            model="claude-test",
+            error="unknown",
+        )
+        detail = cc_mod._assistant_error_detail(message)
+        assert "x" * 400 in detail
+        assert "x" * 401 not in detail
+
+    def test_assistant_error_detail_reports_block_kinds_without_text(self):
+        # A turn that died mid-tool-call has no text to quote, but the
+        # block kinds still say how far it got.
+        message = AssistantMessage(
+            content=[_make_tool_use_block("Bash", {"command": "ls"})],
+            model="claude-test",
+            error="unknown",
+        )
+        detail = cc_mod._assistant_error_detail(message)
+        assert "content_blocks=['ToolUseBlock']" in detail
+        assert "partial_text" not in detail
+
+    def test_assistant_error_detail_empty_when_no_context(self):
+        # Nothing to add beyond the bare error string, so no trailing
+        # parenthetical is appended at all.
+        assert cc_mod._assistant_error_detail(SimpleNamespace()) == ""
+
     async def test_client_threads_error_fields_through_result_event(self):
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
@@ -915,12 +1049,12 @@ class TestClaudeBackendCreateClient:
             monkeypatch,
             tools=[object()],
             extra_mcp_servers={
-                "Glean": {"type": "http", "url": "https://example.test/mcp"},
+                "knowledge-base": {"type": "http", "url": "https://example.test/mcp"},
             },
         )
-        assert set(options.mcp_servers.keys()) == {"Glean", "agent-tools"}
-        # The external Glean entry passes through verbatim.
-        assert options.mcp_servers["Glean"] == {
+        assert set(options.mcp_servers.keys()) == {"knowledge-base", "agent-tools"}
+        # The external knowledge-base entry passes through verbatim.
+        assert options.mcp_servers["knowledge-base"] == {
             "type": "http",
             "url": "https://example.test/mcp",
         }
@@ -937,10 +1071,10 @@ class TestClaudeBackendCreateClient:
         options = await self._capture_options(
             monkeypatch,
             extra_mcp_servers={
-                "Glean": {"type": "http", "url": "https://example.test/mcp"},
+                "knowledge-base": {"type": "http", "url": "https://example.test/mcp"},
             },
         )
-        assert set(options.mcp_servers.keys()) == {"Glean"}
+        assert set(options.mcp_servers.keys()) == {"knowledge-base"}
 
     async def test_create_client_rejects_reserved_agent_tools_key(self, monkeypatch):
         # The ``agent-tools`` key is reserved for the in-process MCP
@@ -1495,7 +1629,7 @@ class TestCodexBackend:
             system_prompt="hi",
             model="gpt-5.4",
             extra_mcp_servers={
-                "Glean": {
+                "knowledge-base": {
                     "type": "http",
                     "url": "https://example.test/mcp",
                 },
@@ -1562,6 +1696,22 @@ class TestCodexBackend:
         init = next(e for e in events if isinstance(e, SessionInitEvent))
         assert init.skills == ["skill-a"]
         assert init.plugins == ["plugin-a", "plugin-b"]
+
+    async def test_client_lists_skills_from_the_creation_time_session_init(self):
+        # ``skills_list`` already ran when the client was created, so the
+        # answer is in hand — reading it must not start a turn.
+        thread = MagicMock()
+        thread.turn = AsyncMock()
+        client = CodexClient(
+            thread,
+            session_init=SessionInitEvent(skills=["skill-a"], plugins=["plugin-a"]),
+        )
+
+        assert await client.list_available_skills() == ["skill-a"]
+        thread.turn.assert_not_awaited()
+
+    async def test_client_reports_no_skill_list_without_a_session_init(self):
+        assert await CodexClient(MagicMock()).list_available_skills() is None
 
 
 class TestCodexApprovalBypass:

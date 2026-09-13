@@ -14,6 +14,8 @@ These examples show how to interact with the visual generation server using both
   - Multipart/form-data support for file uploads
 - **Video Management**: Retrieving and deleting generated videos
 
+For online benchmarking, see [Benchmarking VisualGen](../../../tensorrt_llm/serve/scripts/BENCHMARKING_VISUAL_GEN.md).
+
 ## Prerequisites
 
 Before running these examples, ensure you have:
@@ -286,17 +288,35 @@ You can customize these by:
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
-- `input_reference`: Reference image (I2V/TI2V) or video (V2V), accepted as a base64-encoded string in JSON or as a file in multipart form-data
+- `image_reference`, `video_reference`, `audio_reference`: reference image(s) for I2V/TI2V, video(s) for V2V, audio(s). In JSON each takes a `{content, format, role}` object or a list of them; a multipart file upload needs no `format`.
+  - `format` declares how to read `content`: `"path"` (a file readable by the server, or a `file://` URI), `"url"` (`http(s)`), or `"base64"` (or a `data:` URI). It is required in JSON, where `"bytes"` is rejected — upload the file instead.
+
+    ```json
+    {"image_reference": {"content": "iVBORw0KGgoAAAANSUhEUg...", "format": "base64"}}
+    ```
+
+  - `"path"` reads a file on the *server*, so it is only meaningful for a co-located client; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject it (the same switch also disables `response_format="path"`). `"url"` is fetched through the SSRF-guarded loader (private-address block, redirect re-validation, timeout, size cap).
+  - `format` here is the *input* wire form; the top-level `format` selects the *output* encoding.
+  - `role` disambiguates a model that accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame. Roles and lists need a JSON body; a multipart upload is a single file with no role.
+
+    ```json
+    {"image_reference": [
+      {"content": "<base64>", "format": "base64", "role": "first_frame"},
+      {"content": "<base64>", "format": "base64", "role": "last_frame"}
+    ]}
+    ```
+
   - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
+- `input_reference` (deprecated): a single image or video reference, routed by content signature to I2V or V2V. A JSON request carries base64 bytes and a multipart request uploads the file; it is ignored when `image_reference` / `video_reference` is also given. Prefer the typed fields.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
-- `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
+- `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries every generated tensor, including video, audio, or action, plus scalar metadata in one payload).
 
-> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400.
+> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400. One switch covers both directions: it also rejects a reference sent with `format="path"`.
 
 #### Tensor-format consumer contract
 
-When `format="safetensors"` or `format="pt"`, the payload bundles every populated media tensor (`image` / `video` / `audio`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.
+When `format="safetensors"` or `format="pt"`, the payload bundles every populated tensor (`image` / `video` / `audio` / `action`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.
 
 - **`pt`**: `torch.load(buf, weights_only=True)` returns a dict with the tensor keys and the scalars as native Python values.
 - **`safetensors`**: `safetensors.torch.load(bytes)` returns a dict with the tensor keys and each scalar as a 0-d tensor under the same key — call `.item()` to unbox (e.g. `loaded["frame_rate"].item()`). The same scalars are also written to the safetensors file header as strings; `safe_open(path, framework="pt").metadata()` exposes them in that form for consumers that prefer header access.
@@ -318,7 +338,7 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
 
 ##### Cosmos3 transfer hints
 
@@ -384,7 +404,7 @@ curl -X POST "http://localhost:8000/v1/videos" \
 ```bash
 curl -X POST "http://localhost:8000/v1/videos" \
   -F "prompt=She turns around and smiles" \
-  -F "input_reference=@./media/woman_skyline_original_720p.jpeg" \
+  -F "image_reference=@./media/woman_skyline_original_720p.jpeg" \
   -F "seconds=4.0" \
   -F "fps=24" \
   -F "size=256x256" \
@@ -393,15 +413,37 @@ curl -X POST "http://localhost:8000/v1/videos" \
 
 ### Video-to-Video (Multipart with File Upload, Cosmos3)
 ```bash
-# The reference is classified by content: image -> I2V, video -> V2V.
+# Modality comes from the field name: image_reference -> I2V, video_reference -> V2V.
 # V2V conditioning knobs ride in extra_params (values below are the defaults).
 curl -X POST "http://localhost:8000/v1/videos" \
   -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
-  -F "input_reference=@./media/reference.mp4" \
+  -F "video_reference=@./media/reference.mp4" \
   -F "num_frames=189" \
   -F "fps=24" \
   -F 'extra_params={"condition_video_latent_indexes": [0, 1], "condition_video_keep": "first"}'
 ```
+
+### Cosmos3 Edge Policy DROID (Multipart with File Upload)
+
+The checkpoint selects Policy mode and its DROID defaults. The prompt remains a
+string: this example serializes the caller-owned nested caption instead of
+asking the server to construct or validate it. The current state contains seven
+joint positions followed by the gripper value in the model's convention.
+
+```bash
+prompt=$(jq -c '.prompt' ../models/cosmos3/prompts/action_edge_policy_droid.json)
+curl -X POST "http://localhost:8000/v1/videos/sync" \
+  -F "prompt=${prompt}" \
+  -F "image_reference=@./droid_observation.png" \
+  -F 'extra_params={"action": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}' \
+  -o droid_policy.safetensors
+```
+
+The tensor payload contains both `video` and `action`; `action` has shape
+`[32, 8]` for one request. The checkpoint-selected Policy default is applied
+before format resolution, so omitting both `action_mode` and `format` still
+resolves `format=auto` to `safetensors`. An explicit `-F 'format=safetensors'`
+is optional.
 
 ### Check Video Status
 ```bash

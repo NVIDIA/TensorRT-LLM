@@ -154,20 +154,31 @@ def test_in_proj_perm_quantized_dtypes():
 # ---- Tests for the multi-row gated RMSNorm ----
 
 
-def _ref_gated_rmsnorm(x, w, z, eps):
+def _ref_gated_rmsnorm(x, w, z, eps, gate_activation):
     xf = x.float()
     rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     y = xf * rstd * w.float()
     zf = z.float()
-    return (y * zf * torch.sigmoid(zf)).to(x.dtype)
+    gate = torch.sigmoid(zf)
+    if gate_activation == "silu":
+        gate *= zf
+    return (y * gate).to(x.dtype)
 
 
 @skip_no_cuda
+@pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize(
     "num_tokens,heads,N",
-    [(8192, 32, 128), (7, 32, 128), (1, 1, 128), (333, 4, 64), (1024, 16, 256)],
+    [
+        (8192, 32, 128),
+        (7, 32, 128),
+        (1, 1, 128),
+        (333, 4, 64),
+        (1024, 16, 256),
+        (5, 3, 512),
+    ],
 )
-def test_rms_norm_gated_token_major(num_tokens, heads, N):
+def test_rms_norm_gated_token_major(gate_activation, num_tokens, heads, N):
     """Token-major z (a column-slice view of a wider projection) must match
     the reference on both the multi-row fast path and the generic fallback."""
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import (
@@ -183,8 +194,8 @@ def test_rms_norm_gated_token_major(num_tokens, heads, N):
     wide = torch.randn(num_tokens, heads * N + 512, dtype=torch.bfloat16, device=device)
     z = wide[:, 512:].view(num_tokens, heads, N)
 
-    y = rms_norm_gated_token_major(x, z, w, 1e-6)
-    ref = _ref_gated_rmsnorm(x, w, z.reshape(M, N), 1e-6)
+    y = rms_norm_gated_token_major(x, z, w, 1e-6, gate_activation=gate_activation)
+    ref = _ref_gated_rmsnorm(x, w, z.reshape(M, N), 1e-6, gate_activation)
     torch.testing.assert_close(y, ref, rtol=1e-2, atol=1e-2)
 
     # The dense-z dispatch of the generic entry point must agree bitwise.
@@ -196,6 +207,7 @@ def test_rms_norm_gated_token_major(num_tokens, heads, N):
         z=z.reshape(M, N).contiguous(),
         norm_before_gate=True,
         is_rms_norm=True,
+        gate_activation=gate_activation,
     )
     assert torch.equal(y, y_dense)
 
@@ -214,7 +226,8 @@ def test_rms_norm_gated_token_major_custom_op_is_functional():
 
 @skip_no_cuda
 @pytest.mark.parametrize("output_fp8", [False, True])
-def test_rms_norm_gated_token_major_compiles_fullgraph(output_fp8):
+@pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
+def test_rms_norm_gated_token_major_compiles_fullgraph(output_fp8, gate_activation):
     """The functional custom op must remain opaque to torch.compile."""
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
 
@@ -227,9 +240,9 @@ def test_rms_norm_gated_token_major_compiles_fullgraph(output_fp8):
     z = wide[:, 64:].view(num_tokens, heads, N)
     fp8_scale = torch.tensor(0.13, device="cuda") if output_fp8 else None
 
-    expected = rms_norm_gated_token_major(x, z, weight, 1e-6, fp8_scale)
+    expected = rms_norm_gated_token_major(x, z, weight, 1e-6, fp8_scale, gate_activation)
     compiled = torch.compile(rms_norm_gated_token_major, fullgraph=True)
-    actual = compiled(x, z, weight, 1e-6, fp8_scale)
+    actual = compiled(x, z, weight, 1e-6, fp8_scale, gate_activation)
 
     assert torch.equal(actual, expected)
 
@@ -618,3 +631,58 @@ def test_gdn_attaches_only_static_fp8_scale():
     layer.out_proj.force_dynamic_quantization = True
     layer.cache_derived_state()
     assert layer.norm.fp8_scale is None
+
+
+def test_verify_intermediate_state_indices_reuses_buffers():
+    """The verify path's row-index vector is built once, not per GDN layer.
+
+    With a cache-manager-owned ``intermediate_state_indices`` the helper must
+    return a view of it (no copy, no allocation); without one it must fall back
+    to a process-cached arange sized to the pool, again returned as a view.
+    """
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
+        _cached_arange,
+        _verify_intermediate_state_indices,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pool_size = 8
+    expected = torch.arange(3, dtype=torch.int32, device=device)
+
+    owned = torch.arange(pool_size, dtype=torch.int32, device=device)
+    manager = SimpleNamespace(
+        intermediate_state_indices=owned,
+        get_max_resource_count=lambda: pool_size,
+    )
+    indices = _verify_intermediate_state_indices(manager, 3, device)
+    assert torch.equal(indices, expected)
+    assert indices.data_ptr() == owned.data_ptr()  # a view, not a copy
+
+    # No manager-owned buffer (non-speculative manager types): cached fallback.
+    manager = SimpleNamespace(
+        intermediate_state_indices=None, get_max_resource_count=lambda: pool_size
+    )
+    first = _verify_intermediate_state_indices(manager, 3, device)
+    second = _verify_intermediate_state_indices(manager, 5, device)
+    assert torch.equal(first, expected)
+    assert torch.equal(second, torch.arange(5, dtype=torch.int32, device=device))
+    assert first.data_ptr() == second.data_ptr()  # same cached storage
+    assert first.data_ptr() == _cached_arange(pool_size, device).data_ptr()
+
+    # A batch larger than the pool still yields a full index vector: the cached
+    # fallback is sized to max(pool, num_decodes), not to the pool alone.
+    large = _verify_intermediate_state_indices(manager, pool_size + 4, device)
+    assert large.shape[0] == pool_size + 4
+    assert torch.equal(large, torch.arange(pool_size + 4, dtype=torch.int32, device=device))
+
+    # A manager-owned buffer shorter than the batch is abandoned for the cached
+    # fallback rather than silently returning a short index vector.
+    short_owned = torch.arange(2, dtype=torch.int32, device=device)
+    manager = SimpleNamespace(
+        intermediate_state_indices=short_owned,
+        get_max_resource_count=lambda: pool_size,
+    )
+    widened = _verify_intermediate_state_indices(manager, 5, device)
+    assert widened.shape[0] == 5
+    assert torch.equal(widened, torch.arange(5, dtype=torch.int32, device=device))
+    assert widened.data_ptr() != short_owned.data_ptr()

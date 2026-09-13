@@ -23,6 +23,9 @@ SPDX-License-Identifier: Apache-2.0
 For the internals of the component that actually moves the KV blocks, see
 [Introduction to KV Cache Transmission](../developer-guide/kv-transfer.md).
 
+For placing sub-agents with their parent while retaining independent conversation
+histories, see [Sub-agent Routing](subagent-routing.md).
+
 ## Motivation
 
 LLM inference has two stages: context (prefill) and generation (decode) phases. The context phase computes KV cache for prompt tokens whereas the generation phase generates tokens one by one using cached values. These phases have different compute characteristics.
@@ -356,6 +359,8 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
+
+* `TRTLLM_GPU_KEEPALIVE`: If set to `1`, a generation worker that is waiting at the benchmark fill gate (`TLLM_BENCHMARK_REQ_QUEUES_SIZE`) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is `0`.
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 

@@ -39,12 +39,11 @@ from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
-from ..conftest import (get_device_count, get_sm_version, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper,
-                        skip_pre_blackwell, skip_pre_hopper)
+from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
+                        skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail,
-                            LlmapiAccuracyTestHarness, get_accuracy_task)
+from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
+                            get_accuracy_task)
 
 
 class Result(GenerationResultBase):
@@ -89,7 +88,8 @@ def has_nvlink():
         result = subprocess.run(['nvidia-smi', 'nvlink', '-s'],
                                 capture_output=True,
                                 text=True,
-                                check=False)
+                                check=False,
+                                timeout=60)
 
         # Check if the command executed successfully
         if result.returncode != 0:
@@ -108,38 +108,6 @@ def has_nvlink():
     except Exception:
         # Any other unexpected error
         return False
-
-
-def get_disagg_ucx_tls() -> str:
-    """UCX transports for the disaggregated worker processes.
-
-    Without NVLink, cuda_ipc is excluded (preserving the pre-existing
-    behavior, which leaves IB allowed there). With NVLink on Hopper (SM90),
-    IB is allowed: KVCacheManagerV2 KV pools are VMM allocations that CUDA
-    IPC cannot map without fabric handles, so KV transfers need IB GPUDirect
-    RDMA to avoid falling back to slow non-IPC emulation. gdr_copy is
-    intentionally excluded on SM90, matching the get_ucx_tls() helpers under
-    disaggregated/. On the remaining NVLink architectures IB stays excluded
-    to avoid hangs on the CI B200 cluster.
-
-    Returns:
-        str: The UCX_TLS transport selection string.
-    """
-    if not has_nvlink():
-        return "^cuda_ipc"
-    if get_sm_version() == 90:
-        return "^gdr_copy"
-    return "^ib"
-
-
-# get_disagg_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -351,7 +319,8 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        env["UCX_TLS"] = get_disagg_ucx_tls()
+        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+        env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
@@ -360,6 +329,8 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += ctx_total_gpus
 
         ctx_server_args = ctx_args + [
@@ -385,7 +356,8 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        env["UCX_TLS"] = get_disagg_ucx_tls()
+        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+        env["UCX_TLS"] = "^ib"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         if cache_transceiver_config_backend == "NIXL":
@@ -393,6 +365,8 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
@@ -504,6 +478,7 @@ def launch_disaggregated_llm(
                 kwargs.update(
                     max_tokens=sampling_params.max_tokens,
                     n=sampling_params.n,
+                    best_of=sampling_params.best_of,
                     # NB: 'LLM' (cf. SamplingParams) and OpenAI API
                     #     defaults differ (top_p=0 vs. top_p=1).
                     # FIXME: Because 'LLM' does not permit expressly setting
@@ -609,7 +584,11 @@ def run_parallel_test(model_name: str,
                       test_sets: List[LlmapiAccuracyTestHarness],
                       ctx_model: str = None,
                       gen_model: str = None,
-                      cache_transceiver_backend: str = "DEFAULT"):
+                      cache_transceiver_backend: str = "DEFAULT",
+                      trust_remote_code: bool = False,
+                      quant_algo: str = None,
+                      kv_cache_quant_algo: str = None,
+                      max_batch_size: int = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -641,6 +620,12 @@ def run_parallel_test(model_name: str,
             "max_tokens_in_buffer": 4096
         }
     }
+    if max_batch_size is not None:
+        ctx_server_config["max_batch_size"] = max_batch_size
+        gen_server_config["max_batch_size"] = max_batch_size
+    if trust_remote_code:
+        ctx_server_config["trust_remote_code"] = True
+        gen_server_config["trust_remote_code"] = True
 
     # No need to generate URLs - workers will register via service discovery
     disaggregated_server_config = {
@@ -659,411 +644,11 @@ def run_parallel_test(model_name: str,
                                   model_path,
                                   ctx_model=ctx_model,
                                   gen_model=gen_model) as llm:
+        if quant_algo is not None:
+            llm.args.quant_config.quant_algo = quant_algo
+        if kv_cache_quant_algo is not None:
+            llm.args.quant_config.kv_cache_quant_algo = kv_cache_quant_algo
         run_accuracy_test(llm, model_name, test_sets)
-
-
-@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    # Literal NIXL bypasses the harness's legacy UCX fallback. Omitting the
-    # runtime then exercises Llama's automatic preference for Python V2.
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device(2)
-    # overlap scheduler is token-invariant (unit-tested); only block-reuse changes which KV is transferred
-    # The mismatched pair is kept on purpose: it is the only combination where
-    # the two servers disagree about which blocks are already resident, so it
-    # exercises a different transfer path than either symmetric case.
-    @pytest.mark.parametrize(
-        "ctx_enable_block_reuse,gen_enable_block_reuse", [(True, True),
-                                                          (True, False),
-                                                          (False, False)],
-        ids=["block_reuse", "ctx_block_reuse_only", "no_block_reuse"])
-    def test_auto_dtype(self, ctx_enable_block_reuse, gen_enable_block_reuse):
-        ctx_server_config = {
-            "disable_overlap_scheduler": False,
-            "kv_cache_config": {
-                "enable_block_reuse": ctx_enable_block_reuse
-            }
-        }
-        ctx_server_config["cache_transceiver_config"] = {
-            "backend": "NIXL",
-            "max_tokens_in_buffer": 4096
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": False,
-            "kv_cache_config": {
-                "enable_block_reuse": gen_enable_block_reuse
-            }
-        }
-        gen_server_config["cache_transceiver_config"] = {
-            "backend": "NIXL",
-            "max_tokens_in_buffer": 4096
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_device(2)
-    def test_beam_search(self):
-        max_beam_width = 2
-        sampling_params = SamplingParams(n=max_beam_width,
-                                         best_of=max_beam_width,
-                                         use_beam_search=True)
-        kv_cache_config = {
-            "free_gpu_memory_fraction": 0.5,
-            "enable_block_reuse": True,
-            "enable_partial_reuse": True,
-            "use_kv_cache_manager_v2": False,
-        }
-        cache_transceiver_config = {
-            "backend": "NIXL",
-            "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
-        }
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "max_beam_width": max_beam_width,
-            "kv_cache_config": kv_cache_config,
-            "cache_transceiver_config": cache_transceiver_config,
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": True,
-            "max_beam_width": max_beam_width,
-            "kv_cache_config": kv_cache_config,
-            "cache_transceiver_config": cache_transceiver_config,
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm,
-                              self.MODEL_NAME, [CnnDailymail],
-                              extra_acc_spec=f"beam_width={max_beam_width}",
-                              sampling_params=sampling_params)
-
-    @pytest.mark.skip_less_device(2)
-    def test_ngram(self):
-        speculative_decoding_config = {
-            "decoding_type": "NGram",
-            "max_draft_len": 4,
-            "max_matching_ngram_size": 4,
-            "is_keep_all": True,
-            "is_use_oldest": True,
-            "is_public_pool": True
-        }
-        kv_cache_config = {
-            "free_gpu_memory_fraction": 0.5,
-            "enable_block_reuse": False
-        }
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "kv_cache_config": kv_cache_config,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": True,
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": kv_cache_config,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
-    @pytest.mark.skip_less_device(2)
-    @skip_pre_hopper
-    @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3(self, overlap_scheduler, eagle3_one_model):
-        speculative_decoding_config = {
-            "decoding_type": "Eagle",
-            "max_draft_len": 4,
-            "speculative_model":
-            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": eagle3_one_model
-        }
-        ctx_server_config = {
-            "disable_overlap_scheduler":
-            True,  # BS=1 does not need overlap scheduling
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": True  # reuse on context requests
-            },
-            "max_num_tokens": 13393 * 2,
-            "max_batch_size": 1,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            },
-            "cuda_graph_config": None,
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": not overlap_scheduler,
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": False
-            },
-            "max_num_tokens": 13393 * 2,
-            "max_batch_size": 16,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            },
-            "cuda_graph_config": None,
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
-    @pytest.mark.skip_less_device(2)
-    @skip_pre_hopper
-    def test_gen_only_spec_dec(self):
-        speculative_decoding_config = {
-            "decoding_type": "Eagle",
-            "max_draft_len": 4,
-            "speculative_model":
-            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": True,
-        }
-        ctx_server_config = {
-            "disable_overlap_scheduler":
-            True,  # BS=1 does not need overlap scheduling
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": True  # reuse on context requests
-            },
-            "max_num_tokens": 13393 * 2,
-            "max_batch_size": 1,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096,
-            },
-            "cuda_graph_config": None,
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": False,
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": False
-            },
-            "max_num_tokens": 13393 * 2,
-            "max_batch_size": 16,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096,
-            },
-            "cuda_graph_config": None,
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(32000)
-    # grammar backend is disagg-agnostic (runs on gen worker); backend correctness is covered by aggregated tests
-    @pytest.mark.parametrize("backend", ["xgrammar"])
-    def test_guided_decoding(self, backend: str, mocker):
-        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "guided_decoding_backend": backend,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        gen_server_config = {
-            "guided_decoding_backend": backend,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["JsonModeEval"])
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(48000)
-    @parametrize_with_ids("eagle3_one_model", [True, False])
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_with_eagle3(self, backend: str,
-                                         eagle3_one_model: bool, mocker):
-        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        speculative_decoding_config = {
-            "decoding_type": "Eagle",
-            "max_draft_len": 3,
-            "speculative_model":
-            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": eagle3_one_model
-        }
-
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-            "guided_decoding_backend": backend,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        gen_server_config = {
-            # Two-model eagle3 does not support overlap scheduler
-            "disable_overlap_scheduler": not eagle3_one_model,
-            "speculative_config": speculative_decoding_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-            "guided_decoding_backend": backend,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["JsonModeEval"])
-
-    @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
-                             ids=["tp1pp2", "tp2pp1", "tp2pp2"])
-    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
-    def test_tp_pp_symmetric(self, tp, pp, testset):
-        if tp * pp * 2 > get_device_count():
-            pytest.skip(f"Not enough devices for tp={tp}*pp={pp} test")
-        return run_parallel_test(self.MODEL_NAME,
-                                 self.MODEL_PATH,
-                                 ctx_pp=pp,
-                                 ctx_tp=tp,
-                                 gen_pp=pp,
-                                 gen_tp=tp,
-                                 ctx_instances=1,
-                                 gen_instances=1,
-                                 test_sets=[get_accuracy_task(testset)],
-                                 cache_transceiver_backend="NIXL")
-
-    @parametrize_with_ids("ctx_pp", [2, 4])
-    @parametrize_with_ids("gen_tp", [1, 2])
-    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
-    def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
-        if ctx_pp + gen_tp > get_device_count():
-            pytest.skip(
-                f"Not enough devices for ctx_pp={ctx_pp}+gen_tp={gen_tp} test")
-        return run_parallel_test(self.MODEL_NAME,
-                                 self.MODEL_PATH,
-                                 ctx_pp=ctx_pp,
-                                 ctx_tp=1,
-                                 gen_pp=1,
-                                 gen_tp=gen_tp,
-                                 ctx_instances=1,
-                                 gen_instances=1,
-                                 test_sets=[get_accuracy_task(testset)],
-                                 cache_transceiver_backend="NIXL")
-
-    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
-    def test_multi_instance(self, testset):
-        return run_parallel_test(self.MODEL_NAME,
-                                 self.MODEL_PATH,
-                                 ctx_pp=1,
-                                 ctx_tp=1,
-                                 gen_pp=1,
-                                 gen_tp=1,
-                                 ctx_instances=2,
-                                 gen_instances=2,
-                                 test_sets=[get_accuracy_task(testset)],
-                                 cache_transceiver_backend="NIXL")
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
@@ -1202,9 +787,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # DEFAULT drops the per-test UCX pinning but still runs UCX, since
             # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
             # backend but NIXL. Transport coverage is unchanged by this move.
+            # CPP is explicit: this test runs on UCX (see the DEFAULT note
+            # above), and DeepSeek's Python preference would otherwise be
+            # adopted verbatim and fail at creation on a non-NIXL backend.
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "CPP",
             },
         }
         gen_server_config = {
@@ -1225,6 +814,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "CPP",
             },
             "enable_attention_dp": enable_attention_dp,
         }
@@ -1406,110 +996,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
-@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-1b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
-
-    # Literal NIXL bypasses the harness's legacy UCX fallback. Omitting the
-    # runtime then exercises Gemma's automatic preference for Python V2.
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("block_reuse", [False, True])
-    @skip_pre_hopper
-    def test_auto_dtype(self, block_reuse):
-
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": False,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
-            }
-        }
-        ctx_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": block_reuse,
-        }
-        gen_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": block_reuse,
-            "enable_partial_reuse": block_reuse,
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
-                             ids=["cache_mgr_v1", "cache_mgr_v2"])
-    @skip_pre_hopper
-    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
-        """Test with KV cache manager v1 and v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
-        ctx_server_config = {
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
-            },
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON"
-            }
-        }
-        gen_server_config = {
-            "disable_overlap_scheduler": True,
-            "cuda_graph_config": None,
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
-            },
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON"
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "port": 8000,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
-            },
-            "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
-
-
-@skip_pre_blackwell
+@skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     extra_evaluator_kwargs = {
@@ -1519,6 +1006,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
 
+    # Class relaxed to skip_pre_hopper so test_eagle3 can run on H100; this
+    # pre-existing case stays Blackwell-only as before.
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("block_reuse", [False, True])
     def test_auto_dtype(self, block_reuse, mocker):
@@ -1575,6 +1065,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 test_sets=["GSM8K"],
                 extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
+    # Class relaxed to skip_pre_hopper so test_eagle3 can run on H100; this
+    # pre-existing case stays Blackwell-only as before.
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
                              ids=["cache_mgr_v1", "cache_mgr_v2"])
@@ -1626,6 +1119,86 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            run_accuracy_test(
+                llm,
+                model_name,
+                test_sets=["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
+
+    @pytest.mark.skip_less_device(8)
+    # Two-model eagle3 (eagle3_one_model=False) is being removed (#18721),
+    # so only the one-model path is covered here.
+    @parametrize_with_ids("overlap_scheduler", [True, False])
+    # Dual TP4 120B-model startup (weights + Eagle3 draft checkpoint loaded
+    # on both ctx and gen servers) plus a full, unmocked GSM8K eval (1319
+    # samples, up to 8192 output tokens each) needs the 90-minute timeout.
+    # Without an explicit max_workers, launch_disaggregated_llm's default of
+    # 16 client threads badly underutilizes the servers' much larger
+    # max_batch_size, so the eval was throughput-bound on client concurrency
+    # rather than on the servers -- 128 workers (matching other full-eval
+    # disagg tests in this file) lets the eval actually finish in that time.
+    @pytest.mark.timeout(5400)
+    def test_eagle3(self, overlap_scheduler, mocker):
+        # Eagle3 disagg coverage kept on GPT-OSS; Qwen3.5 has no Eagle3 draft
+        # checkpoint yet, so it cannot replace the Llama-3.1-8B Eagle3 case.
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+        speculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 3,
+            "speculative_model":
+            f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
+            "eagle3_one_model": True
+        }
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 4,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": True,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "speculative_config": speculative_decoding_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 4,
+            "kv_cache_config": {
+                "max_attention_window": [128, 32768],
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cuda_graph_config": None,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
             model_name = "GPT-OSS/120B-MXFP4"
             run_accuracy_test(
                 llm,
@@ -1714,6 +1287,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     def test_nixl_backend(self):
+        # transceiver_runtime is left at 'auto', which resolves to the Python
+        # transceiver (the global default) on the NIXL backend.
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
@@ -2040,6 +1615,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_mixed_ctx_gen_model(self, ctx_pp, gen_tp):
         ctx_model = self.FP4_MODEL
         gen_model = self.FP8_MODEL
+        # Explicit NIXL so the launcher does not force the UCX env fallback;
+        # with the NIXL backend, transceiver_runtime='auto' resolves to the
+        # Python transceiver (the global default).
         return run_parallel_test("Qwen3/Qwen3-30B-A3B",
                                  ctx_model,
                                  ctx_pp=ctx_pp,
@@ -2050,7 +1628,153 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  ctx_model=ctx_model,
                                  gen_model=gen_model,
                                  ctx_instances=1,
-                                 gen_instances=1)
+                                 gen_instances=1,
+                                 cache_transceiver_backend="NIXL")
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_hopper
+class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
+    # Restores disagg coverage removed by the Llama-3.1-8B prune (mismatched
+    # block reuse, asymmetric PP/TP) with a small model. Eagle3 coverage
+    # stays on GPT-OSS until a Qwen3.5 Eagle3 draft checkpoint lands. Beam
+    # search coverage moved to TestGPTOSS20B: Qwen3.5 is a hybrid-linear
+    # model that always prefers KVCacheManagerV2
+    # (Qwen3_5ForCausalLM.get_preferred_kv_cache_manager_version), and V2
+    # hybrid Mamba cache managers reject max_beam_width > 1 with no V1
+    # fallback (_util.py's _validate_or_fallback_kv_cache_manager_v2).
+    MODEL_NAME = "Qwen/Qwen3.5-4B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+
+    @pytest.mark.skip_less_device(2)
+    def test_mismatched_block_reuse(self, mocker):
+        mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "enable_block_reuse": True
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "trust_remote_code": True,
+            "kv_cache_config": {
+                "enable_block_reuse": False
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            # MODEL_PATH is the FP8 block-scales checkpoint; the gsm8k.yaml
+            # reference for this quant_algo differs from the unquantized one.
+            llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(4)
+    def test_ctx_pp_gen_tp_asymmetric(self, mocker):
+        # Replaces the waived TestQwen3_30B_A3B::test_mixed_ctx_gen_model
+        # asymmetric PP/TP configuration with a smaller model.
+        mocker.patch.object(GSM8K, "NUM_SAMPLES", 100)
+        return run_parallel_test(
+            self.MODEL_NAME,
+            self.MODEL_PATH,
+            ctx_pp=2,
+            ctx_tp=1,
+            gen_pp=1,
+            gen_tp=2,
+            ctx_instances=1,
+            gen_instances=1,
+            test_sets=[GSM8K],
+            cache_transceiver_backend="NIXL",
+            trust_remote_code=True,
+            quant_algo="FP8_BLOCK_SCALES",
+            kv_cache_quant_algo="FP8",
+            # Qwen3.5 is a hybrid-Mamba model: the V2
+            # cache manager's live-state quota scales
+            # with max_batch_size * pp_size, so the
+            # default max_batch_size=2048 combined with
+            # ctx_pp=2 overflows the KV cache quota.
+            # Other Qwen3.5-4B tests cap this at 32
+            # (see test_llm_api_pytorch.py).
+            max_batch_size=32)
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_hopper
+class TestGPTOSS20B(LlmapiAccuracyTestHarness):
+    # Beam-search disagg coverage: GPT-OSS is not a hybrid-Mamba model, so
+    # (unlike Qwen3.5, see TestQwen3_5_4B) it never hits the hybrid-linear
+    # max_beam_width > 1 rejection in
+    # _util.py's _validate_or_fallback_kv_cache_manager_v2. That gate still
+    # rejects KVCacheManagerV2 with max_beam_width > 1 in general, so V2 is
+    # disabled explicitly below.
+    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
+
+    @pytest.mark.skip_less_device(2)
+    def test_beam_search(self):
+        max_beam_width = 2
+        kv_cache_config = {"use_kv_cache_manager_v2": False}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_beam_width": max_beam_width,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_beam_width": max_beam_width,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "max_tokens_in_buffer": 4096
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        sampling_params = SamplingParams(best_of=max_beam_width,
+                                         n=1,
+                                         temperature=0.0,
+                                         use_beam_search=True,
+                                         max_tokens=64)
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            output = llm.generate_async(
+                "The capital of France is",
+                sampling_params=sampling_params).result()
+            assert len(output.outputs) == 1
+            assert output.outputs[0].text
 
 
 @pytest.mark.timeout(10800)

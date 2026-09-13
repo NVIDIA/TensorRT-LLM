@@ -27,9 +27,9 @@ class BackendConfig:
     # Currently only the ``claude-code`` backend consumes this — values
     # are forwarded verbatim into ``ClaudeAgentOptions.mcp_servers``
     # alongside the in-process ``agent-tools`` server built from
-    # ``tools``. Typical use: wiring an HTTP MCP server (Glean, etc.)
-    # into a single agent's session via
-    # ``{"Glean": {"type": "http", "url": "..."}}``. Other backends
+    # ``tools``. Typical use: wiring an HTTP MCP server into a single
+    # agent's session via
+    # ``{"knowledge-base": {"type": "http", "url": "..."}}``. Other backends
     # accept and ignore the field.
     extra_mcp_servers: dict[str, Any] | None = None
     # Working directory the backend runs the agent in. Forwarded to the
@@ -81,3 +81,29 @@ class AgentLayerConfig:
     # Code's built-in ``AskUserQuestion`` so the agent's questions reach
     # the human via stdin instead of being silently auto-defaulted.
     human_input_enabled: bool = False
+    # Tool names this layer must not be able to call, on top of whatever
+    # the layer bans for its own reasons.
+    #
+    # Needed because the Claude Code backend runs with
+    # ``permission_mode="bypassPermissions"`` and the sandbox off — the
+    # right default for a layer whose whole job is to edit a checkout and
+    # run benchmarks, and the wrong one for a layer whose INPUT is
+    # untrusted. A layer that reads text a stranger pasted into a web form
+    # and only has to produce YAML should not also be able to run ``Bash``
+    # on the host: the paste would be a path to arbitrary execution.
+    #
+    # Names are the tool names the model sees (``Bash``, ``Write``,
+    # ``WebFetch``, ...). Empty means "no extra bans", which is the
+    # historical behaviour for every existing layer.
+    disallowed_tools: tuple[str, ...] = ()
+    # Called once per backend event as ``on_activity(kind, event)``, where
+    # ``kind`` is a short tag (``tool``, ``text``, ``thinking``, ...).
+    #
+    # Separate from ``print_activity``, which writes to a console. A layer
+    # driven by something with no console — a web request waiting on a
+    # spinner, a queue worker — needs the same events somewhere it can
+    # forward them from, and turning printing on would not give it that.
+    #
+    # Exceptions raised by the callback are swallowed: it is an observer,
+    # and an observer must not be able to fail the run it is watching.
+    on_activity: Any | None = None

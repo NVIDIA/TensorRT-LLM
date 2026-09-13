@@ -229,6 +229,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -261,6 +262,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -344,6 +346,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -377,6 +380,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -479,6 +483,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {
@@ -515,6 +520,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "UCX",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "moe_config": {

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from torch import nn
@@ -15,6 +17,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
 from tensorrt_llm._torch.models.modeling_utils import \
     CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
 from tensorrt_llm.logger import logger
@@ -68,6 +72,12 @@ class BaseCheckpointLoader(ABC):
                                                mapping=mapping,
                                                **kwargs)
 
+    @contextmanager
+    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
+                            **kwargs) -> Iterator[dict[str, Any]]:
+        """Keep loader-specific work alive while weights are materialized."""
+        yield self.load_weights(checkpoint_dir, mapping=mapping, **kwargs)
+
     def is_weights_preloaded(self) -> bool:
         """Whether the last load wrote weights directly into the model."""
         return False
@@ -81,6 +91,11 @@ class BaseCheckpointLoader(ABC):
         verified and the incoming bytes can safely skip module transform hooks.
         """
         return False
+
+    def build_checkpoint_catalog(self, checkpoint_dir: str,
+                                 **kwargs) -> CheckpointCatalog | None:
+        """Return source metadata for shadow planning when available."""
+        return None
 
     def post_load_apply(self,
                         model: nn.Module,

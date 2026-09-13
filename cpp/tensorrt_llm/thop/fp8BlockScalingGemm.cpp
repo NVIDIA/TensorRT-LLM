@@ -244,14 +244,25 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
-    switch (sm)
+    if (tensorrt_llm::common::isSM100Family(sm))
     {
-    case 103: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
-    case 100: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
-    case 90: return fp8_block_scaling_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale);
-    case 89: return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);
-    case 120: return fp8_block_scale_gemm_blackwell_geforce(mat1, mat2, mat1Scale, mat2Scale);
-    default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling GEMM");
+        return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
+    }
+    else if (sm == 90)
+    {
+        return fp8_block_scaling_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale);
+    }
+    else if (sm == 89)
+    {
+        return fp8_block_scaling_gemm_ada(mat1, mat2, mat1Scale, mat2Scale);
+    }
+    else if (sm == 120)
+    {
+        return fp8_block_scale_gemm_blackwell_geforce(mat1, mat2, mat1Scale, mat2Scale);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling GEMM");
     }
 }
 

@@ -3,7 +3,7 @@ from functools import partial
 from pathlib import Path
 from subprocess import run
 
-from tests.unittest.utils.util import getSMVersion
+from .conftest import get_sm_version
 
 
 def test_fmha():
@@ -16,7 +16,7 @@ def test_fmha():
     try:
         os.chdir(fmha_v2_dir)
 
-        test_arch = getSMVersion()
+        test_arch = get_sm_version()
         # SM70 is deprecated in TRTLLM, so we don't need to test it
         all_archs = [80, 86, 89, 90, 100, 120]
 

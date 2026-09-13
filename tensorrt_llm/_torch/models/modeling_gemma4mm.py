@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from itertools import groupby
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
+import numpy as np
 import torch
 import transformers
 from packaging.version import Version
@@ -78,6 +79,9 @@ from transformers import (  # noqa: E402
     Gemma4Config,
     PretrainedConfig,
     PreTrainedModel,
+)
+from transformers.models.gemma4.image_processing_gemma4 import (  # noqa: E402
+    get_aspect_ratio_preserving_size,
 )
 
 
@@ -152,8 +156,6 @@ def _normalize_audio_inputs(audios, target_sr: int = 16000):
     3. Downmix multi-channel audio to mono by averaging channels.
     4. Resample to ``target_sr`` if the source rate differs and is known.
     """
-    import numpy as np
-
     normalized = []
     for a in audios:
         src_sr = None
@@ -336,6 +338,42 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         n_samples = len(normalized[0])
         return self.get_num_multimodal_tokens(audio_lengths=[n_samples])["num_audio_tokens"][0]
 
+    def get_num_tokens_per_video(self, *, video, **kwargs) -> int:
+        # Gemma4 uses different token geometry for images and video frames, so the base class's
+        # image-based fallback overestimates video tokens.
+        # We therefore mirror the video processor's resize and patch-grid arithmetic without
+        # materializing the processed pixels a second time.
+        frames = getattr(video, "frames", video)
+        if len(frames) == 0:
+            raise ValueError("Got an empty frame list for a Gemma4 video input.")
+
+        first_frame = frames[0]
+        # MediaIO represents individual torch frames as CHW and NumPy frames as HWC, while PIL
+        # reports `size` as (width, height).
+        if isinstance(first_frame, torch.Tensor):
+            height, width = (int(size) for size in first_frame.shape[-2:])
+        elif isinstance(first_frame, np.ndarray):
+            height, width = (int(size) for size in first_frame.shape[:2])
+        else:
+            width, height = first_frame.size
+
+        video_processor = self._processor.video_processor
+        patch_size = int(video_processor.patch_size)
+        pooling_kernel_size = int(video_processor.pooling_kernel_size)
+        if video_processor.do_resize:
+            height, width = get_aspect_ratio_preserving_size(
+                height=height,
+                width=width,
+                patch_size=patch_size,
+                max_patches=int(video_processor.max_soft_tokens) * pooling_kernel_size**2,
+                pooling_kernel_size=pooling_kernel_size,
+            )
+
+        tokens_per_frame = (height // patch_size // pooling_kernel_size) * (
+            width // patch_size // pooling_kernel_size
+        )
+        return len(frames) * tokens_per_frame
+
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
@@ -393,7 +431,13 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                     frames = [to_pil_image(f.cpu()) for f in frames]
                 norm_videos.append(list(frames))
 
-            video_out = self._processor.video_processor(videos=norm_videos, return_metadata=True)
+            # VideoMediaIO already sampled these decoded frames. Keep the HF processor from
+            # sampling them again; callers should control sampling with `media_io_kwargs`.
+            video_out = self._processor.video_processor(
+                videos=norm_videos,
+                do_sample_frames=False,
+                return_metadata=True,
+            )
             pixel_values_videos = video_out.get("pixel_values_videos")
             video_position_ids = video_out.get("video_position_ids")
             num_soft_tokens = video_out.get("num_soft_tokens_per_video", [])
@@ -562,9 +606,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {
-            "attn_backend": "FLASHINFER",
-        }
+        return Gemma4ForCausalLM.get_model_defaults(llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
@@ -855,11 +897,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
+        attn_backend = model_config.attn_backend if name == "text_config" else "TRTLLM"
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
-            attn_backend=preferred_backend,
+            attn_backend=attn_backend,
             quant_config=quant_config,
         )
         if (

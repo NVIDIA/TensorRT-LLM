@@ -390,8 +390,8 @@ class Fusions:
             presence_prefix_cuda[prefix_slots, prefix_tokens] = True
 
     # --- Beam-search occurrence counts --------------------------------------
-    # Counterpart of the per-beam workspace handling in the C++ ``batchApplyPenalty``
-    # kernel (``penaltyKernels.cu:151-171``): a beam does not re-walk its history,
+    # Counterpart of the per-beam workspace handling in the former C++
+    # ``batchApplyPenalty`` kernel: a beam does not re-walk its history,
     # it inherits its parent beam's counts and appends the single token it just
     # emitted. ``counts_cuda`` is flat ``[num_slots * max_beam_width, vocab_size]``;
     # beam ``b`` of slot ``s`` owns row ``s * max_beam_width + b``, which collapses to

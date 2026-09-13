@@ -61,7 +61,8 @@ from coverage_tier import (  # noqa: E402
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.agent_flow_rule import AgentFlowRule  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
-from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
+from rules.base import PRInputs, Rule, RuleResult, format_reason  # noqa: E402
+from rules.openengine_rule import OpenEngineRule  # noqa: E402
 from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
 from rules.spec_dec_rule import SpecDecRule  # noqa: E402
 from rules.test_list_rule import TestListRule  # noqa: E402
@@ -83,6 +84,7 @@ RULE_CLASSES: list[type[Rule]] = [
     VisualGenRule,
     SpecDecRule,
     AgentFlowRule,
+    OpenEngineRule,
     OutOfScopeRule,
 ]
 
@@ -100,6 +102,7 @@ def build_rules(
         VisualGenRule(yaml_index, stages),
         SpecDecRule(yaml_index, stages),
         AgentFlowRule(yaml_index, stages),
+        OpenEngineRule(yaml_index, stages),
         OutOfScopeRule(yaml_index, stages),
     ]
 
@@ -208,15 +211,6 @@ def _rule_reason(rule, r) -> dict:
     }
 
 
-def _fmt_reason(r) -> str:
-    """Render a structured reason dict as one human line: `[source] k=v, ...`."""
-    if not isinstance(r, dict):
-        return str(r)
-    src = r.get("source", "?")
-    rest = ", ".join(f"{k}={v}" for k, v in r.items() if k != "source")
-    return f"[{src}] {rest}" if rest else f"[{src}]"
-
-
 # Scopes that compose: a PR mixing waive + test-def + test-list edits
 # combines to a single "testsonly" scope rather than falling back.
 _TESTSONLY_FAMILY: frozenset[str] = frozenset(
@@ -228,6 +222,7 @@ _TESTSONLY_FAMILY: frozenset[str] = frozenset(
         "visualgenonly",
         "specdeconly",
         "agentflowonly",
+        "openengineonly",
     }
 )
 
@@ -599,7 +594,7 @@ def _log_decision_to_stderr(
     if result.reasons:
         print("  reasons:", file=out)
         for r in result.reasons:
-            print(f"    - {_fmt_reason(r)}", file=out)
+            print(f"    - {format_reason(r)}", file=out)
     print(f"  block_filters ({len(result.block_filters)} blocks):", file=out)
     for (yaml_stem, idx), prefix_to_waives in sorted(result.block_filters.items()):
         print(f"    - {yaml_stem}#{idx}:", file=out)
