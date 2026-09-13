@@ -102,21 +102,9 @@ std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 // KvCacheManager
 // ---------------------------------------------------------------------------
 
-std::atomic<uint32_t> KvCacheManager::sLiveManagers{0};
-
 uint32_t KvCacheManager::numLiveManagers() noexcept
 {
-    return sLiveManagers.load(std::memory_order_relaxed);
-}
-
-std::optional<std::string> takePoison() noexcept
-{
-    auto reason = Poison::reason();
-    if (reason.has_value() && KvCacheManager::numLiveManagers() == 0)
-    {
-        Poison::clear();
-    }
-    return reason;
+    return PoisonHold::count();
 }
 
 KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink,
@@ -142,16 +130,11 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     _resetIterationPeakNumBlocks();
 
     mLastAdjustmentTime = nowSeconds();
-
-    // Last, so a throw above leaves the count untouched: ~KvCacheManager does not run for a
-    // partially constructed object.
-    sLiveManagers.fetch_add(1, std::memory_order_relaxed);
 }
 
 KvCacheManager::~KvCacheManager()
 {
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
-    sLiveManagers.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const

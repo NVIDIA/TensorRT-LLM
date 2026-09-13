@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/poison.h"
 #include "kv_cache_manager_v2/utils/reentrantSharedMutex.h"
 
 #include <atomic>
@@ -117,7 +118,8 @@ public:
 
     void shutdown();
 
-    // Number of constructed, not-yet-destroyed managers in this process.
+    // Number of not-yet-destroyed managers in this process. A manager counts from the start of its
+    // construction, so one whose constructor throws is counted for the duration of that attempt.
     [[nodiscard]] static uint32_t numLiveManagers() noexcept;
 
     // Clear all reusable (committed) blocks from the radix tree.
@@ -348,10 +350,12 @@ public:
     friend class KvCacheIntrospection;
 
 private:
+    // First member, so the registration covers the whole lifetime: it is taken before any state
+    // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
+    PoisonHold mPoisonHold;
+
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;
-
-    static std::atomic<uint32_t> sLiveManagers;
 
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.

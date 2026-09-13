@@ -40,6 +40,10 @@ std::string& reasonStorage()
     return reason;
 }
 
+// Live PoisonHold registrations. Mutated and read under reasonMutex() so that the latch and the
+// registrations move together; atomic only so a failed lock can still raise it safely.
+std::atomic<uint32_t> sHolders{0};
+
 } // namespace
 
 std::atomic<bool> Poison::sPoisoned{false};
@@ -84,17 +88,64 @@ std::optional<std::string> Poison::reason()
     return reasonStorage();
 }
 
-void Poison::clear() noexcept
+PoisonHold::PoisonHold() noexcept
 {
     try
     {
         std::lock_guard<std::mutex> lock(reasonMutex());
-        reasonStorage().clear();
-        sPoisoned.store(false, std::memory_order_release);
+        sHolders.fetch_add(1, std::memory_order_relaxed);
     }
     catch (...)
     {
-        // Locking failed; leaving the latch set is the safe outcome.
+        // Locking failed. Registering anyway only blocks clearing, which is the safe outcome; the
+        // alternative is a latch cleared while this owner is live.
+        sHolders.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+PoisonHold::~PoisonHold()
+{
+    try
+    {
+        std::lock_guard<std::mutex> lock(reasonMutex());
+        sHolders.fetch_sub(1, std::memory_order_relaxed);
+    }
+    catch (...)
+    {
+        sHolders.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+uint32_t PoisonHold::count() noexcept
+{
+    return sHolders.load(std::memory_order_relaxed);
+}
+
+std::optional<std::string> takePoison() noexcept
+{
+    try
+    {
+        // The reason, the registration count and the clear are read and written under one lock:
+        // an owner registering concurrently either precedes the count and blocks the clear, or
+        // follows the clear and starts on a latch it can trust.
+        std::lock_guard<std::mutex> lock(reasonMutex());
+        if (!Poison::sPoisoned.load(std::memory_order_acquire))
+        {
+            return std::nullopt;
+        }
+        std::optional<std::string> reason = reasonStorage();
+        if (sHolders.load(std::memory_order_relaxed) == 0)
+        {
+            reasonStorage().clear();
+            Poison::sPoisoned.store(false, std::memory_order_release);
+        }
+        return reason;
+    }
+    catch (...)
+    {
+        // Locking or copying the reason failed; leaving the latch set is the safe outcome, and a
+        // following Poison::reason() still reports the violation.
+        return std::nullopt;
     }
 }
 
