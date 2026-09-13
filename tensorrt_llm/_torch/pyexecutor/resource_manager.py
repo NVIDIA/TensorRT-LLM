@@ -65,6 +65,8 @@ PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheMana
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.attention.backends.interface import \
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
@@ -2808,8 +2810,14 @@ class KVCacheCompressionManager(BaseResourceManager):
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
 
-    def __init__(self, config: "KvCacheCompressionConfig") -> None:
+    def __init__(
+        self,
+        config: "KvCacheCompressionConfig",
+        *,
+        pretrained_config: Optional["PretrainedConfig"] = None,
+    ) -> None:
         self.config = config
+        self.pretrained_config = pretrained_config
         self.kv_cache_manager: Optional["KVCacheManagerV2"] = None
         self.draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
 

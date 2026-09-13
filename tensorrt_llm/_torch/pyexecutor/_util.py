@@ -3083,7 +3083,10 @@ def create_kv_cache_compression_manager(
         from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import \
             Nvfp4ColdPageQuantizationCompression
 
-        return Nvfp4ColdPageQuantizationCompression(config)
+        return Nvfp4ColdPageQuantizationCompression(
+            config,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
+        )
 
     if config.algorithm == "triattention":
         validate_kv_cache_compression_compatibility(config, kv_cache_config,
