@@ -294,9 +294,17 @@ rerunning the test.
 **A receipt is only valid if it post-dates the last write to every file in the
 entry.** Recording the receipt, syncing the index, and linting all write to
 the entry after the test last ran, and `ruff format` rewrites the test file
-itself. So re-run the full test file as the *last* action and check the claim
-mechanically against file mtimes rather than by recollection: a receipt that
-predates its own test file has shipped here before, and it read as green.
+itself. A receipt that predates its own test file has shipped here before,
+and it read as green.
+
+There are two ways to satisfy this, and the first is much cheaper:
+
+- **Structurally**, by running format, lint and test in that order inside one
+  job. The ordering then holds by construction and there is nothing to check
+  afterwards. Prefer this.
+- **By inspection**, when a step was run on its own: compare the receipt
+  against the mtime of every file in the entry, mechanically rather than by
+  recollection.
 """
 
 # ---------------------------------------------------------------------------
@@ -738,6 +746,46 @@ record has a one-line purpose and the exact bash command confirmed to run
 successfully from the login node. The file starts empty and is built up as
 the team verifies commands. Use `Edit`/`Write` directly. Do not store
 secrets.
+
+### One job per entry, not one job per step
+
+**Roughly 90 seconds of every GPU job here is fixed overhead** — queue wait
+plus the container start plus `import tensorrt_llm` — measured on a lint job
+whose actual work takes seconds. So the unit of a cached command is **one
+entry's whole verification**, not one step of it. Running format, lint, probe
+and test as four jobs pays that overhead four times for the same result, and
+it is also what puts receipt freshness at risk, since `ruff format` rewrites
+the test file after the test ran.
+
+Batch them into a single job in the order format -> lint -> probe -> test,
+and let every requested step run even when an earlier one failed, so one
+round trip reports everything. Measured here: three steps as separate jobs
+took about 320 seconds; the same three in one job took 120, of which 49 was
+the test itself.
+
+Split a step out into its own job only when you are re-running that one step
+in isolation and nothing has been rewritten since.
+
+### A persistent allocation, when one is up
+
+If the run's scripts offer a persistent-allocation path, prefer it: holding
+an allocation removes the queue wait and lets later containers reuse the
+node's image cache. Measured here: 91 seconds through a fresh per-command
+allocation, 43 through a warm persistent one.
+
+Three things about it that are not optional:
+
+- **Re-check the allocation on every command, never assume it.** It expires
+  and it can be preempted. A stale one fails in a way that reads like the
+  entry is broken rather than like the allocation is gone, and that
+  misdiagnosis is expensive.
+- **Fall back rather than fail.** A missing allocation must route the command
+  through the ordinary per-command path and still produce a verdict. Nothing
+  about a result may depend on which path produced it.
+- **Keep anything that holds the allocation open off the measurement GPU.**
+  The autotuner picks GEMM tactics by timing them and the contracts pin
+  cold-autotuner bits, so a keepalive kernel sharing a device with the
+  measurement could silently move what a receipt certifies.
 
 **Always read it first** before writing or running any command. If the entry
 you need is there, run it as-is.

@@ -236,3 +236,31 @@ def test_importing_the_package_spawns_no_backend_session():
         "importing staircase_bringup pulled in modeling_bringup — the Slurm "
         "borrow regressed to a module-scope import and now probes at import time"
     )
+
+
+def test_cache_rule_batches_steps_into_one_job():
+    """Four jobs per entry pays the ~90s fixed overhead four times for one result."""
+    coder = _flat(build_staircase_prompts(include_slurm_environment=True).coder)
+    assert "One job per entry, not one job per step" in coder
+    assert "format -> lint -> probe -> test" in coder
+    # The measured numbers are what make the rule persuasive rather than arbitrary.
+    assert "320 seconds" in coder and "120" in coder
+
+
+def test_persistent_allocation_rules_are_stated():
+    """The fast path is an optimization; all three guards are load-bearing."""
+    coder = _flat(build_staircase_prompts(include_slurm_environment=True).coder)
+    assert "Re-check the allocation on every command" in coder
+    assert "Fall back rather than fail" in coder
+    # A keepalive sharing the measurement GPU could move what a receipt certifies.
+    assert "off the measurement GPU" in coder
+
+
+def test_receipt_freshness_prefers_the_structural_route():
+    """Ordering inside one job beats checking mtimes afterwards."""
+    for role in ("coder", "reviewer"):
+        p = _flat(getattr(STAIRCASE_PROMPTS, role))
+        assert "Structurally" in p, role
+        assert "nothing to check afterwards" in p, role
+        # The inspection route must survive for single-step reruns.
+        assert "By inspection" in p, role
