@@ -43,6 +43,8 @@ class MoEDep(str, Enum):
     #: The installed CuTe DSL exposes the Rubin helpers the SM107 CuteDSL
     #: kernels are written against.
     CUTEDSL_RUBIN = "cutedsl_rubin"
+    #: Vendored PrimsTS kernels can import the CUTLASS DSL experimental ABI.
+    PRIMS_TS = "prims_ts"
     #: Locality-domain execution is usable here: SM107, driver support, and
     #: ``DISABLE_LOCALITY_DOMAINS`` unset.
     LOCALITY_DOMAIN = "locality_domain"
@@ -108,6 +110,17 @@ def _probe_cutedsl_rubin() -> Tuple[bool, str]:
     return False, "installed CuTe DSL lacks Rubin helpers"
 
 
+def _probe_prims_ts() -> Tuple[bool, str]:
+    from ..flashinfer.prims_ts.cutlass_dsl import (
+        ensure_cutlass_dsl_experimental,
+        get_cutlass_dsl_bootstrap_error,
+    )
+
+    if ensure_cutlass_dsl_experimental():
+        return True, ""
+    return False, str(get_cutlass_dsl_bootstrap_error())
+
+
 def _probe_locality_domain() -> Tuple[bool, str]:
     from ...locality_domain_utils import is_locality_domain_enabled
 
@@ -132,6 +145,7 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
     MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
+    MoEDep.PRIMS_TS: _probe_prims_ts,
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 

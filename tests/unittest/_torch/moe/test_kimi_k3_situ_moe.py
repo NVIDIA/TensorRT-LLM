@@ -524,7 +524,9 @@ def test_kimi_k3_moe_split_selection() -> None:
     assert KimiK3MoERuntime._select_moe_tp_ep(tep) == (4, 2)
 
 
-@pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"])
+@pytest.mark.parametrize(
+    "backend", ["CUTLASS", "TRTLLM", "PRIMS_TS", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+)
 def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -1600,6 +1602,7 @@ def _quantize_expert_to_nvfp4(w1, w2, w3, input_scale):
     [
         pytest.param("CUTLASS", 1.0, id="CUTLASS-static_1.0"),
         pytest.param("TRTLLM", 1.0, id="TRTLLM-static_1.0"),
+        pytest.param("PRIMS_TS", 1.0, id="PRIMS_TS-static_1.0"),
         # derived_act_scale is a CUTLASS-path finding (see the reason below),
         # so it stays pinned to CUTLASS rather than becoming a strict xfail the
         # TRTLLM-Gen path would have to reproduce.
@@ -1717,7 +1720,7 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
 
 
 @nvfp4_moe_supported
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "PRIMS_TS"])
 def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     """Which activation does the QUANTIZED kernel actually run?
 

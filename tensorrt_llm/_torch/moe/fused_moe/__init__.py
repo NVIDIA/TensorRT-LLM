@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from .activation import (ACTIVATION_PAYLOAD, DEFAULT_MOE_ACTIVATION,
                          ActivationParamShape, MoEActivation,
                          MoEActivationSupport, SimpleActivation, SiTuActivation,
@@ -9,6 +23,7 @@ from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
+from .fused_moe_prims_ts import PrimsTSMxfp4Mxfp8FusedMoE, PrimsTSNvfp4FusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -75,5 +90,7 @@ __all__ = [
     "StaticMoeRoutingMethod",
     "TritonFusedMoE",
     "TRTLLMGenFusedMoE",
+    "PrimsTSNvfp4FusedMoE",
+    "PrimsTSMxfp4Mxfp8FusedMoE",
     "VanillaMoE",
 ]

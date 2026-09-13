@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -239,6 +239,62 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
 #endif
 }
 
+// Split the hidden dimension across CTAs when a token-only grid would leave
+// most SMs idle. Keep the reduction order identical to moeUnpermuteKernel.
+template <typename InputType, typename TopKScaleType, int32_t kThreadsPerBlock, int32_t kTopK>
+__global__ void moeUnpermuteSmallTokenKernel(InputType const* permutedInput, InputType* output,
+    int32_t const* expandedMap, TopKScaleType const* topkScales, int32_t const hiddenSize, int32_t const)
+{
+    static_assert(sizeof(InputType) == 2);
+    int32_t constexpr kElementsPerThread = 2;
+    int32_t const token = blockIdx.x;
+    int32_t const column = (blockIdx.y * kThreadsPerBlock + threadIdx.x) * kElementsPerThread;
+    int32_t rows[kTopK];
+    float scales[kTopK];
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+#pragma unroll
+    for (int32_t k = 0; k < kTopK; ++k)
+    {
+        rows[k] = expandedMap[token * kTopK + k];
+        scales[k] = static_cast<float>(topkScales[token * kTopK + k]);
+    }
+    if (column < hiddenSize)
+    {
+        float accum[kElementsPerThread] = {};
+#pragma unroll
+        for (int32_t k = 0; k < kTopK; ++k)
+        {
+            if (rows[k] >= 0)
+            {
+                InputType values[kElementsPerThread];
+                auto const* source = permutedInput + static_cast<int64_t>(rows[k]) * hiddenSize + column;
+                *reinterpret_cast<uint32_t*>(values) = *reinterpret_cast<uint32_t const*>(source);
+#pragma unroll
+                for (int32_t j = 0; j < kElementsPerThread; ++j)
+                {
+                    accum[j] += static_cast<float>(values[j]) * scales[k];
+                }
+            }
+        }
+        InputType result[kElementsPerThread];
+#pragma unroll
+        for (int32_t j = 0; j < kElementsPerThread; ++j)
+        {
+            result[j] = static_cast<InputType>(accum[j]);
+        }
+        auto* destination = output + static_cast<int64_t>(token) * hiddenSize + column;
+        *reinterpret_cast<uint32_t*>(destination) = *reinterpret_cast<uint32_t const*>(result);
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 template <typename InputType, typename TopKScaleType>
 void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t const* expanded_idx_to_permuted_idx,
     TopKScaleType const* topk_scales, int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
@@ -252,9 +308,15 @@ void moeUnpermute(InputType const* permuted_input, InputType* output, int32_t co
     int32_t const threads = kThreadsPerBlock;
 
     auto kernel = &moeUnpermuteKernel<InputType, TopKScaleType, kThreadsPerBlock>;
+    int32_t hiddenTiles = 1;
+    if (num_tokens <= 16 && top_k == 16 && hidden_size >= 2048)
+    {
+        kernel = &moeUnpermuteSmallTokenKernel<InputType, TopKScaleType, kThreadsPerBlock, 16>;
+        hiddenTiles = (hidden_size + 2 * kThreadsPerBlock - 1) / (2 * kThreadsPerBlock);
+    }
 
     cudaLaunchConfig_t config;
-    config.gridDim = blocks;
+    config.gridDim = dim3(blocks, hiddenTiles);
     config.blockDim = threads;
     config.dynamicSmemBytes = 0;
     config.stream = stream;

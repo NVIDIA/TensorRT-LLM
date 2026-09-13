@@ -1,0 +1,425 @@
+diff --git a/attention/prims_ts/__init__.py b/attention/prims_ts/__init__.py
+deleted file mode 100644
+index 3cb31497cefacc21e56970d0e844266719980309..0000000000000000000000000000000000000000
+--- a/attention/prims_ts/__init__.py
++++ /dev/null
+@@ -1,59 +0,0 @@
+-# Copyright (c) 2026 by FlashInfer team.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#   http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-"""Experimental task-scheduled attention entry points."""
+-
+-from .block_sparse import (
+-    BlockSparsePagedTSWrapper,
+-    BlockSparseTSWrapper,
+-    block_sparse_attention,
+-    block_sparse_attention_with_paged_kv_cache,
+-)
+-from .decode import (
+-    BatchDecodePagedTSWrapper,
+-    batch_decode_with_paged_kv_cache,
+-    get_prims_ts_batch_decode_workspace_size,
+-    prims_ts_batch_decode_with_kv_cache,
+-)
+-from .context import (
+-    BatchPrefillPagedTSWrapper,
+-    BatchPrefillTSWrapper,
+-    batch_prefill,
+-    batch_prefill_with_paged_kv_cache,
+-)
+-from .mla_decode import (
+-    BatchMLADecodePagedTSWrapper,
+-    batch_mla_decode_with_paged_kv_cache,
+-    get_prims_ts_batch_mla_decode_workspace_size,
+-    prims_ts_batch_mla_decode_with_kv_cache,
+-)
+-
+-__all__ = [
+-    "BlockSparseTSWrapper",
+-    "BlockSparsePagedTSWrapper",
+-    "block_sparse_attention",
+-    "block_sparse_attention_with_paged_kv_cache",
+-    "BatchPrefillTSWrapper",
+-    "BatchPrefillPagedTSWrapper",
+-    "batch_prefill",
+-    "batch_prefill_with_paged_kv_cache",
+-    "BatchDecodePagedTSWrapper",
+-    "batch_decode_with_paged_kv_cache",
+-    "get_prims_ts_batch_decode_workspace_size",
+-    "prims_ts_batch_decode_with_kv_cache",
+-    "BatchMLADecodePagedTSWrapper",
+-    "batch_mla_decode_with_paged_kv_cache",
+-    "get_prims_ts_batch_mla_decode_workspace_size",
+-    "prims_ts_batch_mla_decode_with_kv_cache",
+-]
+diff --git a/fused_moe/backends/prims_ts/__init__.py b/fused_moe/backends/prims_ts/__init__.py
+deleted file mode 100644
+index e3b54583922a70d63c8ff16b54e01fdb0f770788..0000000000000000000000000000000000000000
+--- a/fused_moe/backends/prims_ts/__init__.py
++++ /dev/null
+@@ -1,15 +0,0 @@
+-# Copyright (c) 2026 by FlashInfer team.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#   http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-"""Prims-TS MoE backend."""
+diff --git a/prims_ts/batched_gemm/batched_gemm_config.py b/prims_ts/batched_gemm/batched_gemm_config.py
+index 087e8e2000d5a8e7e727b4063b623c17741e300d..f06a59163a88fc702731a5ff90f546a4a964ca37 100644
+--- a/prims_ts/batched_gemm/batched_gemm_config.py
++++ b/prims_ts/batched_gemm/batched_gemm_config.py
+@@ -24,7 +24,7 @@ from dataclasses import dataclass, fields
+ from enum import IntEnum
+ from cutlass.experimental import primitives as prims
+ 
+-from flashinfer.tllm_enums import WeightLayout
++from tensorrt_llm._torch.moe.flashinfer.tllm_enums import WeightLayout
+ 
+ 
+ # `SmemSfLdgstsResource._tail_cp_async_wait_group` lowers the runtime
+@@ -1184,7 +1184,7 @@ class BatchedGemmConfig:
+ 
+     @property
+     def weight_layout_kind(self) -> int:
+-        """Integer :class:`~flashinfer.tllm_enums.WeightLayout` value."""
++        """Integer :class:`~tensorrt_llm._torch.moe.flashinfer.tllm_enums.WeightLayout` value."""
+         return int(self.weight_layout)
+ 
+     @property
+diff --git a/prims_ts/batched_gemm/batched_gemm_kernel.py b/prims_ts/batched_gemm/batched_gemm_kernel.py
+index d92fc09e3e88c663984dad337fa9795601eff589..a7a297b6925ffbb7b59addc4028596cc8ce04fd8 100644
+--- a/prims_ts/batched_gemm/batched_gemm_kernel.py
++++ b/prims_ts/batched_gemm/batched_gemm_kernel.py
+@@ -2537,6 +2537,8 @@ def gemm(
+     validate_config(cfg, problem_mnk=(m, n, k))
+     from cutlass.experimental.cuda import TensorMapDataFormat
+ 
++    # TensorMap lowers element strides through bit strides. Keep products
++    # in 64 bits so large routed workspaces do not overflow int32 there.
+     # Typed pointers passed from host-side make_ptr (cute.runtime.make_ptr)
+     a_ptr = a_raw_ptr
+     b_ptr = b_raw_ptr
+@@ -2558,7 +2560,7 @@ def gemm(
+                 1,
+                 a_block_k,
+                 cute.assume(m * a_block_k, 32),
+-                cute.assume(m * k, 32),
++                cute.assume(cutlass.Int64(m) * cutlass.Int64(k), 32),
+             ),
+         )
+         a_tensor = cute.make_tensor(a_ptr, a_layout)
+@@ -2570,7 +2572,7 @@ def gemm(
+     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
+         a_layout = cute.make_layout(
+             (64, m, cute.assume(k // 64, 1), num_experts_dim),
+-            stride=(1, cute.assume(k, 32), 64, cute.assume(m * k, 32)),
++            stride=(1, cute.assume(k, 32), 64, cute.assume(cutlass.Int64(m) * cutlass.Int64(k), 32)),
+         )
+         a_tensor = cute.make_tensor(a_ptr, a_layout)
+     elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
+@@ -2582,7 +2584,7 @@ def gemm(
+     else:
+         a_layout = cute.make_layout(
+             (cute.assume(k, 32), m, num_experts_dim),
+-            stride=(1, cute.assume(k, 32), cute.assume(m * k, 32)),
++            stride=(1, cute.assume(k, 32), cute.assume(cutlass.Int64(m) * cutlass.Int64(k), 32)),
+         )
+         a_tensor = cute.make_tensor(a_ptr, a_layout)
+ 
+@@ -2594,7 +2596,7 @@ def gemm(
+                 1,
+                 b_block_k,
+                 cute.assume(n * b_block_k, 32),
+-                cute.assume(n * k, 32),
++                cute.assume(cutlass.Int64(n) * cutlass.Int64(k), 32),
+             ),
+         )
+     elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
+@@ -2609,7 +2611,7 @@ def gemm(
+     else:
+         b_layout = cute.make_layout(
+             (cute.assume(k, 32), n, num_experts_dim),
+-            stride=(1, cute.assume(k, 32), cute.assume(n * k, 32)),
++            stride=(1, cute.assume(k, 32), cute.assume(cutlass.Int64(n) * cutlass.Int64(k), 32)),
+         )
+     b_tensor = cute.make_tensor(b_ptr, b_layout)
+ 
+diff --git a/prims_ts/batched_gemm/batched_gemm_run.py b/prims_ts/batched_gemm/batched_gemm_run.py
+index f554101fc1f6d80a84ec4eae66ef97335a5dd652..6150fd0d01b450c6f87f9b8c8a295bafca480eb9 100644
+--- a/prims_ts/batched_gemm/batched_gemm_run.py
++++ b/prims_ts/batched_gemm/batched_gemm_run.py
+@@ -30,7 +30,7 @@ from ..cutlass_dsl import task_scheduling_scope
+ 
+ 
+ def _cute_compile_options() -> str:
+-    return os.environ.get("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2")
++    return os.environ.get("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2 --enable-tvm-ffi")
+ 
+ 
+ def _env_flag_enabled(name: str, default: bool = False) -> bool:
+diff --git a/prims_ts/moe/compile_cache.py b/prims_ts/moe/compile_cache.py
+index 9d2da158ac1eac930995f2231c17a1736b7303cc..b760edd62aa7c6ee8f9f313035597043e55eb6b7 100644
+--- a/prims_ts/moe/compile_cache.py
++++ b/prims_ts/moe/compile_cache.py
+@@ -24,7 +24,7 @@ from dataclasses import asdict, is_dataclass
+ from typing import Any
+ 
+ from flashinfer.jit.cute_dsl_core import _get_compile_arch
+-from flashinfer.prims_ts.utils import get_prims_ts_compile_options
++from tensorrt_llm._torch.moe.flashinfer.prims_ts.utils import get_prims_ts_compile_options
+ 
+ 
+ def stable_config_hash(cfg: Any, **constexpr_args: Any) -> str:
+@@ -87,7 +87,7 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) ->
+     )
+     if key in _COMPILED_GEMM_CACHE:
+         return _COMPILED_GEMM_CACHE[key]
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch
+ 
+     compiled = _compile_for_launch(io, stream)
+     _COMPILED_GEMM_CACHE[key] = compiled
+diff --git a/prims_ts/moe/config_mapper.py b/prims_ts/moe/config_mapper.py
+index 707e06b056f58e1eea55f6e803b4988abc9dacef..7231297f87dd8273192ddbd082fc4a0f278da0a8 100644
+--- a/prims_ts/moe/config_mapper.py
++++ b/prims_ts/moe/config_mapper.py
+@@ -26,7 +26,7 @@ from importlib import resources
+ import math
+ from typing import Sequence
+ 
+-from flashinfer.tllm_enums import ActivationType, WeightLayout
++from tensorrt_llm._torch.moe.flashinfer.tllm_enums import ActivationType, WeightLayout
+ 
+ SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 256)
+ SUPPORTED_NVFP4_TILE_N = (8, 16, 32, 64, 128, 256)
+@@ -99,7 +99,7 @@ class PrimsTsConfigSpec:
+     kwargs: dict[str, int]
+ 
+     def build(self) -> object:
+-        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
++        from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+ 
+         return make_config(**self.kwargs)
+ 
+@@ -1203,7 +1203,7 @@ def _ensure_config_task_manager_buildable(
+     top_k: int | None = None,
+     num_experts: int | None = None,
+ ) -> None:
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+         build_batched_gemm_task_manager,
+     )
+ 
+diff --git a/prims_ts/moe/support.py b/prims_ts/moe/support.py
+index 5707aa4e7a8614bf9be711c6f08bcb2044167a7b..e8d8d62721c3999699dc525b8a625dc4b144aad8 100644
+--- a/prims_ts/moe/support.py
++++ b/prims_ts/moe/support.py
+@@ -23,8 +23,8 @@ from typing import Any, Sequence
+ 
+ import torch
+ 
+-from flashinfer.prims_ts.utils import is_prims_ts_available
+-from flashinfer.tllm_enums import (
++from tensorrt_llm._torch.moe.flashinfer.prims_ts.utils import is_prims_ts_available
++from tensorrt_llm._torch.moe.flashinfer.tllm_enums import (
+     ActivationType,
+     DtypeTrtllmGen,
+     Fp8QuantizationType,
+@@ -175,7 +175,7 @@ def _gemm1_oa_flags(kwargs: dict[str, Any]) -> dict[str, bool]:
+ 
+ 
+ def _per_token_sf_dtype_value(tensor: torch.Tensor) -> int:
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+ 
+     if tensor.dtype == torch.bfloat16:
+         return int(DType.BF16)
+diff --git a/prims_ts/moe/tensor_adapter.py b/prims_ts/moe/tensor_adapter.py
+index 9ca4cccb67a9750d72454bc38ebc9ee94b7c4da7..91f986bd5f20c6b18068564ae45618cc09e24d5c 100644
+--- a/prims_ts/moe/tensor_adapter.py
++++ b/prims_ts/moe/tensor_adapter.py
+@@ -22,7 +22,7 @@ from typing import Literal
+ 
+ import torch
+ 
+-from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType, WeightLayout
++from tensorrt_llm._torch.moe.flashinfer.tllm_enums import ActivationType, Fp8QuantizationType, WeightLayout
+ 
+ 
+ _expert_scale_ones: dict[tuple[torch.device, int], torch.Tensor] = {}
+@@ -187,7 +187,7 @@ def _launch_early_exit_max_token_ctas(
+     if not cfg.use_early_exit:
+         return 0
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+         compute_max_num_ctas_in_token_dim_for_moe,
+     )
+ 
+@@ -366,7 +366,7 @@ def build_bf16_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -625,6 +625,7 @@ def build_nvfp4_launch_io(
+     *,
+     fc: Literal["fc1", "fc2"],
+     cfg,
++    cfg_is_normalized: bool = False,
+     hidden_states: torch.Tensor,
+     hidden_states_scale: torch.Tensor,
+     gemm1_weights: torch.Tensor,
+@@ -661,10 +662,10 @@ def build_nvfp4_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+ 
+     if fc == "fc1":
+         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
+@@ -689,7 +690,9 @@ def build_nvfp4_launch_io(
+         scale_c = output2_scale_scalar
+         scale_gate = output2_scale_scalar
+ 
+-    cfg = _runtime_config(cfg, in_hidden)
++    # The TRTLLM caller caches a private config normalized for this K.
++    if not cfg_is_normalized:
++        cfg = _runtime_config(cfg, in_hidden)
+     _validate_weight_storage(
+         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
+         tensor=weights,
+@@ -986,6 +989,7 @@ def build_mxfp4_mxfp8_launch_io(
+     *,
+     fc: Literal["fc1", "fc2"],
+     cfg,
++    cfg_is_normalized: bool = False,
+     hidden_states: torch.Tensor,
+     hidden_states_scale: torch.Tensor,
+     gemm1_weights: torch.Tensor,
+@@ -1020,7 +1024,7 @@ def build_mxfp4_mxfp8_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -1047,7 +1051,9 @@ def build_mxfp4_mxfp8_launch_io(
+         scale_c = output2_scale_scalar
+         scale_gate = output2_scale_scalar
+ 
+-    cfg = _runtime_config(cfg, in_hidden)
++    # The TRTLLM caller caches a private config normalized for this K.
++    if not cfg_is_normalized:
++        cfg = _runtime_config(cfg, in_hidden)
+     _validate_weight_storage(
+         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
+         tensor=weights,
+@@ -1358,7 +1364,7 @@ def build_fp8_block_scale_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -1752,7 +1758,7 @@ def build_mxfp4_bf16_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -2061,10 +2067,10 @@ def build_fp8_per_tensor_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
++    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+ 
+     if fc == "fc1":
+         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
+diff --git a/prims_ts/utils.py b/prims_ts/utils.py
+index 33701c5174429c8f3de80077d4bab24bec967ab5..626c10d9f0e5d3ad18c129500cf7078e002b0267 100644
+--- a/prims_ts/utils.py
++++ b/prims_ts/utils.py
+@@ -49,4 +49,4 @@ def is_prims_ts_available() -> bool:
+ 
+ 
+ def get_prims_ts_compile_options() -> str:
+-    return os.environ.get("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2")
++    return os.environ.get("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2 --enable-tvm-ffi")
+diff --git a/tllm_enums.py b/tllm_enums.py
+index 160fdb04bdc4b0da2b79fb7669185bd729343e80..3a1b947a738f54251ec83c4140e6e482b29d58ed 100644
+--- a/tllm_enums.py
++++ b/tllm_enums.py
+@@ -1,8 +1,22 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+ from enum import IntEnum
+ import torch
+ from typing import Optional, Union
+ 
+-from .api_logging import flashinfer_api
++from flashinfer.api_logging import flashinfer_api
+ 
+ 
+ # The type of method in top-K routing, for use in torch custom op
+@@ -142,7 +156,7 @@ def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
+ 
+     Examples
+     --------
+-    >>> from flashinfer.tllm_enums import ActivationType, is_gated_activation
++    >>> from tensorrt_llm._torch.moe.flashinfer.tllm_enums import ActivationType, is_gated_activation
+     >>> is_gated_activation(ActivationType.Swiglu)
+     True
+     >>> is_gated_activation(ActivationType.Relu)

@@ -1158,6 +1158,7 @@
         "CUTLASS",
         "CUTEDSL",
         "TRTLLM",
+        "PRIMS_TS",
         "DEEPGEMM",
         "DENSEGEMM",
         "VANILLA",
@@ -1166,7 +1167,7 @@
         "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'PRIMS_TS', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"

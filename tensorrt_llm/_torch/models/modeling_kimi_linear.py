@@ -1125,12 +1125,10 @@ class KimiK3MoERuntime(nn.Module):
                 gate_softcap=situ_beta,
                 linear_softcap=situ_linear_beta,
             ),
-            # A MegaMoE request that silently degraded to CUTLASS would be
-            # benchmarked as if it were MegaMoE, and the decline is easy to
-            # trigger (EP-only, own token / top-k limits). Fail in the resolver
-            # instead, which reports the rejection trail.
+            # Fail with the rejection trail if a requested specialized backend
+            # is unavailable, so benchmarks measure the selected implementation.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"),
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "PRIMS_TS"),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
@@ -1316,12 +1314,13 @@ class KimiK3MoERuntime(nn.Module):
         supported_backends = {
             "CUTLASS",
             "TRTLLM",
+            "PRIMS_TS",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
-                "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
+                "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, PRIMS_TS, "
                 "MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
