@@ -26,8 +26,11 @@ Three test shapes are supported (all flow through the same parsing logic):
         runtime_mode = "aggregated", benchmark_mode = "ctx_only"
         (reads disagg yaml, but launches via the aggregated single-pytest path
          using the ctx worker's parallel sizes)
-  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only}[-{modifier}]-{config_base}
-        runtime_mode = "disaggregated", benchmark_mode in {"e2e", "gen_only"}
+  3. Multi-node disagg e2e/gen:    disagg[_upload]-{e2e|gen_only|gen_only_no_context}
+                                     [-{modifier}]-{config_base}
+        runtime_mode = "disaggregated", benchmark_mode in DISAGG_BENCHMARK_MODES
+        (gen_only_no_context launches zero ctx workers and tells the gen worker
+         to fabricate its KV blocks; it is still a disaggregated topology)
 
 The optional {modifier} segment is an instrumentation flag that is orthogonal to
 the benchmark mode; the only one today is "time_breakdown", which launches
@@ -48,7 +51,11 @@ import sys
 from typing import List, Optional, Tuple
 
 import yaml
-from benchmark_utils import parse_positive_concurrency
+from benchmark_utils import (
+    DISAGG_BENCHMARK_MODES,
+    is_gen_only_no_context,
+    parse_positive_concurrency,
+)
 from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
 
 
@@ -388,12 +395,14 @@ def parse_test_case_name(
         if len(parts) < 3:
             raise ValueError(
                 f"Invalid disagg test format. Expected disagg[_upload]-"
-                f"{{e2e|gen_only}}[-{{modifier}}]-{{config_base}}, got: {bracket_content}"
+                f"{{{'|'.join(DISAGG_BENCHMARK_MODES)}}}[-{{modifier}}]-{{config_base}}, "
+                f"got: {bracket_content}"
             )
         benchmark_mode = parts[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
             raise ValueError(
-                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected 'e2e' or 'gen_only'."
+                f"Invalid disagg benchmark_mode: {benchmark_mode}. Expected one of "
+                f"{', '.join(repr(mode) for mode in DISAGG_BENCHMARK_MODES)}."
             )
         runtime_mode = "disaggregated"
         server_name = None
@@ -487,12 +496,15 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
         ctx_config = worker_config.get("ctx", {}) or {}
         gen_config = worker_config.get("gen", {}) or {}
 
-        # gen_only_no_context comes from the yaml's benchmark.mode, not the
-        # test name (test name is always "gen_only" for both gen_only and
-        # gen_only_no_context tests). When set, ctx workers are not launched.
-        yaml_mode = (config.get("benchmark", {}) or {}).get("mode", "")
-        is_gen_only_no_context = benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode
-        num_ctx_servers = 0 if is_gen_only_no_context else hardware.get("num_ctx_servers")
+        # No ctx fleet in gen_only_no_context: the gen worker fabricates its KV
+        # blocks. Selected either by the test id naming the mode or by the legacy
+        # yaml benchmark.mode opt-in -- one predicate for both, shared with the
+        # env injection below, because sizing the job for zero ctx servers
+        # without also exporting TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 leaves the
+        # gen worker waiting forever for KV that no one will send.
+        num_ctx_servers = (
+            0 if is_gen_only_no_context(benchmark_mode, config) else hardware.get("num_ctx_servers")
+        )
         num_gen_servers = hardware.get("num_gen_servers")
 
         ctx_tp = ctx_config.get("tensor_parallel_size", 1)
@@ -944,10 +956,9 @@ def main():
         gen_worker_env_vars = f"{base_prefix} {env_config['gen_worker_env_var']}".rstrip()
         server_env_vars = env_config["server_env_var"]
 
-        # gen_only_no_context comes from yaml's benchmark.mode, not the test
-        # name — see get_hardware_config.
-        yaml_mode = benchmark_config.get("mode", "")
-        if benchmark_mode == "gen_only" and "gen_only_no_context" in yaml_mode:
+        # Same predicate that zeroed num_ctx_servers in get_hardware_config; the
+        # two must never disagree.
+        if is_gen_only_no_context(benchmark_mode, config):
             gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
             server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")

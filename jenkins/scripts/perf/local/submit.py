@@ -27,7 +27,12 @@ from datetime import datetime
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from benchmark_utils import parse_positive_concurrency  # noqa: E402
+from benchmark_utils import (  # noqa: E402
+    DISAGG_BENCHMARK_MODES,
+    DISAGG_CONFIG_MODES,
+    is_gen_only_no_context,
+    parse_positive_concurrency,
+)
 from cluster_env import get_ucx_tls_cmd, gpu_type_from_supported_gpus  # noqa: E402
 
 
@@ -116,6 +121,7 @@ def parse_test_string(test_case_name: str):
     - Disagg e2e: disagg_upload-e2e-{config_base}
     - Disagg e2e + lifecycle breakdown: disagg_upload-e2e-time_breakdown-{config_base}
     - Disagg gen_only: disagg_upload-gen_only-{config_base}
+    - Disagg gen_only, no ctx fleet: disagg_upload-gen_only_no_context-{config_base}
     - ctx_only: aggr_upload-ctx_only-{config_base} (runs aggr mode but reads disagg config)
     - ctx_only + lifecycle breakdown: aggr_upload-ctx_only-time_breakdown-{config_base}
     - Regular aggr: aggr_upload-{config}-{server_name}
@@ -127,7 +133,7 @@ def parse_test_string(test_case_name: str):
         tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode,
                 time_breakdown)
             - runtime_mode: "aggregated" or "disaggregated"
-            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (normal aggr)
+            - benchmark_mode: a DISAGG_CONFIG_MODES member, or None (normal aggr)
             - time_breakdown: True when the "time_breakdown" modifier is present
     """
     labels = test_case_name.split("-")
@@ -165,11 +171,11 @@ def parse_test_string(test_case_name: str):
     time_breakdown = False
 
     if is_disagg_prefix:
-        # Disagg format: disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
+        # disagg_upload-{e2e|gen_only|gen_only_no_context}[-{modifier}]-{config_base}
         if len(labels) <= 2:
             raise ValueError(f"Disagg test must have benchmark_mode and config: {test_case_name}")
-        benchmark_mode = labels[1]  # e2e or gen_only
-        if benchmark_mode not in ("e2e", "gen_only"):
+        benchmark_mode = labels[1]
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
             raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
         runtime_mode = "disaggregated"
         time_breakdown, config_base_name = split_modifiers(labels[2:], benchmark_mode)
@@ -202,12 +208,12 @@ def get_config_yaml_path(llm_src, config_base_name, benchmark_mode):
     Args:
         llm_src: Path to LLM source code
         config_base_name: Base name of config file (without .yaml extension)
-        benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+        benchmark_mode: a DISAGG_CONFIG_MODES member, or None (for normal aggr)
 
     Returns:
         str: Full path to config yaml file
     """
-    if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+    if benchmark_mode in DISAGG_CONFIG_MODES:
         config_dir = DISAGG_CONFIG_FOLDER
     else:
         config_dir = AGG_CONFIG_FOLDER
@@ -285,14 +291,14 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
             "total_gpus": total_gpus,
         }
     else:
-        # Disaggregated mode (e2e or gen_only)
+        # Disaggregated mode (e2e, gen_only or gen_only_no_context)
         worker_config = config.get("worker_config", {})
 
+        # Shared with the env injection in generate_slurm_launch_script: sizing the
+        # allocation for zero ctx servers and exporting
+        # TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 must be decided by one expression.
         num_ctx_servers = (
-            0
-            if benchmark_mode == "gen_only"
-            and "gen_only_no_context" in config.get("benchmark", {}).get("mode", "")
-            else hardware.get("num_ctx_servers")
+            0 if is_gen_only_no_context(benchmark_mode, config) else hardware.get("num_ctx_servers")
         )
         num_gen_servers = hardware.get("num_gen_servers")
 
@@ -402,14 +408,22 @@ def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
 
 
 def get_benchmark_config(config, benchmark_mode):
-    """Get benchmark config based on mode."""
+    """Get benchmark config based on mode.
+
+    Deliberately does *not* carry a "mode" key. It used to hold the mode parsed
+    out of the **test id**, while the same key in the CI generator's namesake
+    (jenkins/scripts/perf/submit.py) holds the mode read from the **config
+    yaml**. Two dicts, one key name, opposite meanings -- and the caller that
+    reached for it to detect gen_only_no_context could therefore never match.
+    Callers that need the mode already have `benchmark_mode` and `config` in
+    scope, and should ask `is_gen_only_no_context` rather than string-match here.
+    """
     if benchmark_mode is None:
         return {}
     benchmark = config.get("benchmark", {})
     concurrency = parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
 
     return {
-        "mode": benchmark_mode,
         "concurrency": concurrency,
     }
 
@@ -713,7 +727,7 @@ def main():
     parser.add_argument(
         "--benchmark-mode",
         default="",
-        choices=["", "e2e", "gen_only", "ctx_only"],
+        choices=[""] + list(DISAGG_CONFIG_MODES),
         help="Benchmark mode for disagg config (when --config-file is provided)",
     )
     parser.add_argument(
@@ -1094,13 +1108,21 @@ def main():
         )
         server_env_vars = f"{_extra_inline_prefix}{env_config.get('server_env_var', '')}"
         benchmark_env_var = f"{_extra_inline_prefix}{env_config.get('benchmark_env_var', '')}"
-        # Handle gen only mode
-        if "gen_only_no_context" in bm_config.get("mode", ""):
+        # Handle gen only mode.
+        #
+        # The shared predicate, i.e. the same expression get_hardware_config used
+        # to zero num_ctx_servers. This used to test `bm_config["mode"]`, which
+        # held the mode parsed from the *test id* and so could never contain
+        # "gen_only_no_context" -- dead code. The elif therefore always won, and
+        # a legacy yaml opt-in had its ctx fleet removed by get_hardware_config
+        # while never being told to fabricate KV blocks, leaving every request
+        # stuck in DISAGG_GENERATION_INIT. See get_benchmark_config.
+        if is_gen_only_no_context(benchmark_mode, config):
             gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
             server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
-        elif "gen_only" in bm_config.get("mode", ""):
+        elif benchmark_mode == "gen_only":
             concurrency = bm_config.get("concurrency", 1)
             queue_size = get_benchmark_request_queue_size(config, concurrency)
             # GEN worker only: the same flag on the CTX worker has been seen to

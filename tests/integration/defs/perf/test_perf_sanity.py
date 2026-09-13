@@ -74,6 +74,59 @@ def wants_warmup(benchmark_mode: str) -> bool:
     return benchmark_mode in WARMUP_BENCHMARK_MODES
 
 
+# The disaggregated benchmark mode that runs generation with no context workers at
+# all: the gen worker fabricates its own KV blocks rather than receiving them over
+# the cache transceiver (the product side keys this off
+# TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1, injected by the launch-script generators).
+# Still a *disaggregated* topology -- disagg proxy plus N gen workers plus zero ctx
+# workers -- because the fake-KV shortcut is only reachable from the disagg gen
+# path and the proxy is what synthesises the "context already done" signal. It is
+# therefore not an aggregated case and must not be wired behind an `aggr-` prefix
+# the way ctx_only legitimately is.
+#
+# Duplicated from jenkins/scripts/perf/benchmark_utils.py, which the two
+# launch-script generators import; this tree cannot import from jenkins/scripts,
+# and TIME_BREAKDOWN_MODIFIER is already triplicated the same way.
+# tests/unittest/scripts/test_perf_sanity_helpers.py pins the copies equal.
+GEN_ONLY_NO_CONTEXT_MODE = "gen_only_no_context"
+
+# Every benchmark mode a disaggregated test id may name.
+DISAGG_BENCHMARK_MODES = ("e2e", "gen_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+# Every benchmark mode whose config YAML lives in DISAGG_CONFIG_FOLDER. ctx_only
+# belongs here even though it *runs* aggregated: it reads a disagg yaml and
+# synthesises an aggregated case out of the ctx worker section.
+DISAGG_CONFIG_MODES = DISAGG_BENCHMARK_MODES + ("ctx_only",)
+
+# The modes whose gen worker does pure decode with no context phase of its own,
+# i.e. every mode a `gen_only` special case has to cover. Compare against this
+# tuple rather than spelling `== "gen_only"`: the two modes must stay treated
+# identically everywhere except the ctx fleet and the injected env vars, or an
+# A/B between them measures the harness rather than the mode.
+GEN_ONLY_MODES = ("gen_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+
+def is_gen_only_no_context(benchmark_mode: Optional[str], config: Optional[dict]) -> bool:
+    """Return True when this case must run with zero context workers.
+
+    Two ways in, and they must agree everywhere:
+
+    1. The test id names the mode (``disagg-gen_only_no_context-<stem>``). This is
+       the primary mechanism, and the only one that lets a single config YAML be
+       benchmarked both ways -- which is what makes a gen_only vs
+       gen_only_no_context comparison possible without duplicating the YAML.
+    2. Legacy opt-in: the id says ``gen_only`` and the config YAML's
+       ``benchmark.mode`` contains ``gen_only_no_context``. Preserved for
+       back-compat; no checked-in config uses it.
+    """
+    if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+        return True
+    if benchmark_mode != "gen_only":
+        return False
+    benchmark = (config or {}).get("benchmark") or {}
+    return GEN_ONLY_NO_CONTEXT_MODE in str(benchmark.get("mode", ""))
+
+
 BENCH_SERVING_REPO = "https://github.com/kedarpotdar-nv/bench_serving.git"
 BENCH_SERVING_COMMIT = "f3ea022a5780de5d0babc5fffa53634e2023d28f"
 BENCH_SERVING_DIR = "/tmp/bench_serving"
@@ -314,12 +367,19 @@ TEST_ID_MODIFIERS = (TIME_BREAKDOWN_MODIFIER,)
 # runs the same mode, so it uploads (and gates) exactly as its unmodified
 # sibling does.
 #
-# Only gen_only gates on these (GEN_ONLY_REGRESSION_METRICS); for e2e they are
-# uploaded and baselined but cannot fail a build. In e2e the gen worker still
-# does pure decode -- the ctx workers do the prefill -- so the statistic means
-# the same thing it does in gen_only and is comparable within its own
+# Only the gen_only modes gate on these (GEN_ONLY_REGRESSION_METRICS); for e2e
+# they are uploaded and baselined but cannot fail a build. In e2e the gen worker
+# still does pure decode -- the ctx workers do the prefill -- so the statistic
+# means the same thing it does in gen_only and is comparable within its own
 # s_test_case_name series.
-DEVICE_STEP_TIME_MODES = ("gen_only", "e2e")
+#
+# gen_only_no_context is in here because the gen-worker device step time is the
+# *whole* point of that mode: with no ctx fleet it is the only performance signal
+# the run produces. Its numbers get their own baseline lineage automatically --
+# s_benchmark_mode is a match key and the record name embeds the mode -- which
+# matters because the fabricated KV blocks are allocated but never populated, so
+# the decode loop it measures is not interchangeable with gen_only's.
+DEVICE_STEP_TIME_MODES = GEN_ONLY_MODES + ("e2e",)
 
 # Config stems that get a time_breakdown test id. Deliberately an allowlist
 # rather than "every disagg yaml": get_disagg_test_cases is a cartesian product,
@@ -3199,10 +3259,14 @@ def parse_test_string(test_case_name: str):
     """Parse test case name to get config base name, select pattern, runtime, and benchmark_mode.
 
     Test name formats:
-    - Disagg: disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
+    - Disagg: disagg_upload-{e2e|gen_only|gen_only_no_context}[-{modifier}]-{config_base}
     - ctx_only: aggr_upload-ctx_only[-{modifier}]-{config_base} (runs aggr mode
       but reads disagg config)
     - Regular aggr: aggr_upload-{config}-{server_name}
+
+    gen_only_no_context keeps the disagg prefix on purpose: it is a disaggregated
+    topology with zero ctx workers, not an aggregated run. See
+    GEN_ONLY_NO_CONTEXT_MODE.
 
     The modifier segment is optional and drawn from the closed TEST_ID_MODIFIERS
     vocabulary, so mode and instrumentation are orthogonal. It is unambiguous
@@ -3213,7 +3277,7 @@ def parse_test_string(test_case_name: str):
         tuple: (config_base_name, select_pattern, runtime_mode, benchmark_mode,
                 time_breakdown)
             - runtime_mode: "aggregated" or "disaggregated"
-            - benchmark_mode: "e2e", "gen_only", "ctx_only", or None (normal aggr)
+            - benchmark_mode: a DISAGG_CONFIG_MODES member, or None (normal aggr)
             - time_breakdown: True when the time_breakdown modifier is present
     """
     labels = test_case_name.split("-")
@@ -3239,12 +3303,15 @@ def parse_test_string(test_case_name: str):
         return time_breakdown, "-".join(rest)
 
     if is_disagg_prefix:
-        # disagg_upload-{e2e|gen_only}[-{modifier}]-{config_base}
+        # disagg_upload-{e2e|gen_only|gen_only_no_context}[-{modifier}]-{config_base}
         if len(labels) <= 2:
             raise ValueError(f"Disagg test must have benchmark_mode and config: {test_case_name}")
         benchmark_mode = labels[1]
-        if benchmark_mode not in ("e2e", "gen_only"):
-            raise ValueError(f"Invalid benchmark_mode for disagg: {benchmark_mode}")
+        if benchmark_mode not in DISAGG_BENCHMARK_MODES:
+            raise ValueError(
+                f"Invalid benchmark_mode for disagg: {benchmark_mode}. Expected one of "
+                f"{', '.join(repr(mode) for mode in DISAGG_BENCHMARK_MODES)}."
+            )
         runtime_mode = "disaggregated"
         time_breakdown, config_base_name = split_modifiers(labels[2:])
         select_pattern = None
@@ -3274,12 +3341,12 @@ def get_config_dir(benchmark_mode: Optional[str]) -> str:
     """Get config directory based on benchmark_mode.
 
     Args:
-        benchmark_mode: "e2e", "gen_only", "ctx_only", or None (for normal aggr)
+        benchmark_mode: a DISAGG_CONFIG_MODES member, or None (for normal aggr)
 
     Returns:
         str: Absolute config directory path
     """
-    if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+    if benchmark_mode in DISAGG_CONFIG_MODES:
         config_dir = DISAGG_CONFIG_FOLDER
     else:
         config_dir = AGG_CONFIG_FOLDER
@@ -3356,10 +3423,17 @@ class PerfSanityTestConfig:
         config_file_path = os.path.join(self.config_dir, self.config_file)
 
         # benchmark_mode determines which parser to use:
-        # - e2e, gen_only, ctx_only: use _parse_disagg_config_file (reads disagg
-        #   config)
+        # - every DISAGG_CONFIG_MODES member (e2e, gen_only, gen_only_no_context,
+        #   ctx_only): use _parse_disagg_config_file, which reads a disagg config.
+        #   ctx_only is included even though it runs aggregated -- it synthesises an
+        #   aggregated case out of the disagg yaml's ctx worker section.
         # - None (normal aggr): use _parse_aggr_config_file
-        if self.benchmark_mode in ("e2e", "gen_only", "ctx_only"):
+        #
+        # This must stay in step with get_config_dir, which resolves the *folder*
+        # from the same tuple. Listing the modes here by hand is how a new mode
+        # silently reaches the aggregated parser: it would be handed a disagg yaml
+        # that has no `server_configs` key at all.
+        if self.benchmark_mode in DISAGG_CONFIG_MODES:
             self._parse_disagg_config_file(config_file_path, self.config_file)
         else:
             # Normal aggregated mode
@@ -3432,9 +3506,12 @@ class PerfSanityTestConfig:
     def _parse_disagg_config_file(self, config_file_path: str, config_file: str):
         """Parse YAML config file for disaggregated server.
 
-        This method handles e2e, gen_only, and ctx_only modes.
+        This method handles every DISAGG_CONFIG_MODES member: e2e, gen_only,
+        gen_only_no_context and ctx_only.
         For ctx_only: output is on par with _parse_aggr_config_file (single ServerConfig),
                      OSL is set to 1, and cache_transceiver_config is ignored.
+        For gen_only_no_context: num_ctx_servers is forced to 0 -- the gen worker
+                     fabricates its own KV blocks, so no ctx fleet is launched.
         """
         disagg_serving_type = os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK")
 
@@ -3462,11 +3539,13 @@ class PerfSanityTestConfig:
         # The mode segments of the test id, reused verbatim as the config name so
         # s_test_case_name reverses back into a runnable pytest id.
         test_label = format_test_label(benchmark_mode, self.time_breakdown)
-        if benchmark_mode == "gen_only":
-            # Check if it's gen_only_no_context from config
-            config_mode = benchmark.get("mode", "e2e")
-            if "gen_only_no_context" in config_mode:
-                hardware["num_ctx_servers"] = 0
+        # No ctx fleet: the gen worker fabricates its KV blocks. Selected either by
+        # the test id naming gen_only_no_context or by the legacy yaml
+        # benchmark.mode opt-in; the launch-script generators decide the identical
+        # question with the identical predicate, and must agree with this -- they
+        # size the allocation, this sizes what the runner expects to find.
+        if is_gen_only_no_context(benchmark_mode, config):
+            hardware["num_ctx_servers"] = 0
 
         worker_env_var = environment.get("worker_env_var", "")
         # Optional per-role env vars appended to the shared worker_env_var so
@@ -3500,7 +3579,7 @@ class PerfSanityTestConfig:
             concurrency_values = [int(concurrency_str)]
 
         # Gen only mode only runs the first concurrency
-        if benchmark_mode == "gen_only":
+        if benchmark_mode in GEN_ONLY_MODES:
             concurrency_values = [concurrency_values[0]]
 
         # Handle ctx_only mode specially - output should be on par with _parse_aggr_config_file
@@ -3658,7 +3737,7 @@ class PerfSanityTestConfig:
             client_config_data = {
                 "concurrency": concurrency,
                 "iterations": 1
-                if benchmark_mode == "gen_only"
+                if benchmark_mode in GEN_ONLY_MODES
                 else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
@@ -4079,17 +4158,18 @@ class PerfSanityTestConfig:
                 # the mean alone is sufficient: all five statistics come from the same
                 # _DeviceStepTimeStats, so the mean is absent only if all of them are.
                 #
-                # Deliberately gen_only and not every mode in
-                # DEVICE_STEP_TIME_MODES. In gen_only this family is the only
-                # regression signal, so losing it makes the run pointless. In e2e
-                # it is diagnostic and throughput still gates, so an absent value
-                # costs five columns on one row; hard-failing there would turn a
-                # diagnostic addition into a new red-build mode for every e2e
-                # case on every cluster, gated on log-scrape plumbing rather than
-                # on performance.
+                # Deliberately GEN_ONLY_MODES and not every mode in
+                # DEVICE_STEP_TIME_MODES. In the gen_only modes this family is the
+                # only regression signal, so losing it makes the run pointless --
+                # doubly so for gen_only_no_context, which produces no other
+                # comparable number at all. In e2e it is diagnostic and throughput
+                # still gates, so an absent value costs five columns on one row;
+                # hard-failing there would turn a diagnostic addition into a new
+                # red-build mode for every e2e case on every cluster, gated on
+                # log-scrape plumbing rather than on performance.
                 if (
                     self.runtime == "multi_node_disagg_server"
-                    and self.server_configs[server_idx][2].benchmark_mode == "gen_only"
+                    and self.server_configs[server_idx][2].benchmark_mode in GEN_ONLY_MODES
                     and (
                         not metrics
                         or metrics.get("mean_gen_worker_per_iter_device_step_time") is None
@@ -4309,12 +4389,15 @@ class PerfSanityTestConfig:
         # process_and_upload_test_results does not flip it back on for pre-merge.
         fail_on_regression = False if "FUNCTIONAL-ONLY" in stage_name else None
 
-        # gen_only tests are gated solely on per-iter prev_device_step_time, not
-        # token throughput (token-based numbers are dominated by KV cache transfer
-        # time in gen_only mode and are not a useful regression signal there).
+        # The gen_only modes are gated solely on per-iter prev_device_step_time,
+        # not token throughput (token-based numbers are dominated by KV cache
+        # transfer time in gen_only mode and are not a useful regression signal
+        # there). Throughput is even less usable in gen_only_no_context: with no
+        # prefill in the wall-clock denominator its token rates are not comparable
+        # to any other mode's, so gating on them would compare unlike quantities.
         # For all other modes, d_al is added when any client runs spec decoding.
         if self.runtime == "multi_node_disagg_server" and any(
-            sc[2].benchmark_mode == "gen_only" for sc in self.server_configs
+            sc[2].benchmark_mode in GEN_ONLY_MODES for sc in self.server_configs
         ):
             # See GEN_ONLY_REGRESSION_METRICS for why the median is gated too.
             # It has no baseline history yet, and check_regression skips any
@@ -4427,7 +4510,13 @@ def get_disagg_test_cases() -> List[str]:
         # Disagg e2e and gen_only test cases
         for test_type in DISAGG_TEST_TYPES:
             test_cases.append(f"{test_type}-{format_test_label('e2e')}-{config_yml}")
-            test_cases.append(f"{test_type}-{format_test_label('gen_only')}-{config_yml}")
+            # Both gen modes, for every disagg config, with no YAML edit. That is
+            # the point: gen_only and gen_only_no_context become two ids over one
+            # file, so they can be compared without maintaining a duplicate YAML
+            # that silently drifts. Which of them CI actually runs is decided by
+            # the test-db lists, not here.
+            for gen_mode in GEN_ONLY_MODES:
+                test_cases.append(f"{test_type}-{format_test_label(gen_mode)}-{config_yml}")
             # Allowlisted rather than universal; see E2E_TIME_BREAKDOWN_CONFIGS.
             if config_yml in E2E_TIME_BREAKDOWN_CONFIGS:
                 label = format_test_label("e2e", time_breakdown=True)
