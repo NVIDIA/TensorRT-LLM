@@ -15,7 +15,7 @@
 
 from collections import defaultdict
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -1460,6 +1460,27 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             non_sliding_attn_size_per_token + swa_size_per_token,
             swa_size_per_request * max_batch_size,
         )
+
+    def _iter_guard_candidate_buffers(self) -> Iterable[Tuple[int, torch.Tensor]]:
+        """Guard-page candidates for DeepSeek-V4's multi-attn-type layers.
+
+        The base hook calls ``get_buffers(layer_idx)``, but this subclass's
+        ``get_buffers`` requires an ``attn_type``, so the positional base call
+        would raise ``TypeError`` while reserving the guard page. Iterate the
+        (layer, attn_type) map instead and pass the required ``attn_type``,
+        de-duplicating physical buffers the same way the invalid-value check
+        does. The base keys the guard page by the yielded ``layer_idx``.
+        """
+        buffers_handled = set()
+        for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
+            buffer_key = (layer_id, attn.role)
+            if buffer_key in buffers_handled:
+                continue
+            buffers_handled.add(buffer_key)
+            buffer = self.get_buffers(layer, attn)
+            if buffer is None:
+                continue
+            yield layer, buffer
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         some_checks_unavailable = False
