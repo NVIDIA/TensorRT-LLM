@@ -904,7 +904,9 @@ class KimiKDALinearAttention(nn.Module):
         # so drafted batches always take the verify path.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
-        return out.squeeze(1)
+        # Match prefill's token/head/dimension core for mixed batches. The
+        # FLA output gate flattens token and head axes into a two-dimensional tensor.
+        return self._store_core(out, output)
 
     def forward_verify(
         self,

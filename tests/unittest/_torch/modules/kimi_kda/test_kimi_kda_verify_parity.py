@@ -221,6 +221,53 @@ def _prefill_metadata(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("num_heads", [1, 12])
+@torch.no_grad()
+def test_kda_fallback_mixed_batch_matches_separate_execution(num_heads):
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch
+
+    torch.manual_seed(37)
+    cfg = _K3Cfg()
+    cfg.linear_attn_config = {**cfg.linear_attn_config, "num_heads": num_heads}
+    attention = KimiKDALinearAttention(cfg, layer_idx=0).cuda()
+    attention._dispatch = KDAKernelDispatch(False, False, False)
+    attention._build_mtp_conv_weights()
+    head_dim = attention.head_dim
+    conv_seed = (
+        torch.randn(7, 3 * attention.proj_size, 3, device="cuda", dtype=torch.bfloat16) * 0.02
+    )
+    state_seed = torch.randn(7, num_heads, head_dim, head_dim, device="cuda") * 0.01
+    hidden = torch.randn(8, cfg.hidden_size, device="cuda", dtype=torch.bfloat16) * 0.05
+    slots = torch.tensor([3, 1, 4, 0, 6], device="cuda", dtype=torch.long)
+    cu_seqlens = torch.tensor([0, 3, 5], device="cuda", dtype=torch.long)
+
+    def make_cache():
+        return SimpleNamespace(
+            conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+        )
+
+    actual_cache, expected_cache = make_cache(), make_cache()
+    mixed = _prefill_metadata(actual_cache, slots[:2], cu_seqlens)
+    mixed.num_tokens = 8
+    mixed.seq_lens = torch.tensor([3, 2, 1, 1, 1], device="cuda", dtype=torch.int32)
+    mixed.mamba_metadata.state_indices = slots.to(torch.int32)
+    actual = attention._forward_impl(hidden, mixed)
+
+    prefill = attention._forward_impl(
+        hidden[:5], _prefill_metadata(expected_cache, slots[:2], cu_seqlens)
+    )
+    decode = attention._forward_impl(hidden[5:], _decode_metadata(expected_cache, slots[2:]))
+    assert prefill.shape == (5, num_heads, head_dim)
+    assert decode.shape == (3, num_heads, head_dim)
+    assert actual.shape == (8, num_heads, head_dim)
+    expected = torch.cat((prefill, decode), dim=0)
+    assert torch.count_nonzero(expected) > 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=0, atol=0)
+    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=0, atol=0)
+
+
 @torch.no_grad()
 def test_kda_prefill_matches_reference():
     if not torch.cuda.is_available():
