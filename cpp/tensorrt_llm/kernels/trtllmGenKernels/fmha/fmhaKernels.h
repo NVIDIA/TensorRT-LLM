@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <tuple>
 #include <unistd.h>
@@ -120,6 +121,26 @@ inline void checkTrtllmSkipCorrThreshold(fmha::FmhaOptions const& options, float
     {
         TLLM_CHECK_WITH_INFO(skipCorrThreshold <= 32.0F, "skipCorrThreshold must be <= 32 for BF16 BMM2.");
     }
+}
+
+// Identity of the work runJITWarmupGridIfRequested would perform for these params: the three bounds
+// that size the candidate grid, plus every field that reaches kernel selection (via
+// parseOptionsFromRunnerParams, or via TllmGenSelectKernelParams for mFp16Softmax/mUsesSpcompress).
+// Excludes what the grid cannot depend on: buffer pointers, the stream, mLayerIdx, and the
+// per-invocation shapes (mBatchSize, mMaxSeqLenKv, mSumOfSeqLens*) that the grid itself overwrites.
+// mMaxSeqLenQ only counts when !mUseGenKernelForPrefill, where it is the sole Q candidate rather than
+// a bound; otherwise a second Q length would be skipped against the first one's grid.
+inline auto warmupGridIdentity(TllmGenFmhaRunnerParams const& params)
+{
+    return std::make_tuple(params.mJITWarmupMaxNumRequests, params.mJITWarmupMaxSeqLenQ, params.mJITWarmupMaxSeqLenKv,
+        params.mUseGenKernelForPrefill, params.mUseGenKernelForPrefill ? 0 : params.mMaxSeqLenQ, params.mQkvLayout,
+        params.mMaskType, params.mKernelType, params.mTileScheduler, params.mMultiCtasKvMode,
+        params.mUseBlockSparseAttention, params.mHeadDimQk, params.mHeadDimV, params.mNumHeadsQ, params.mNumHeadsKv,
+        params.mNumHeadsQPerKv, params.mAttentionWindowSize, params.mChunkedAttentionSize, params.mSparseAttention,
+        params.mSparseTopK, params.mMaxNumPagesPerSeqKv, params.mNumTokensPerPage, params.mNumPagesInMemPool,
+        params.mMultiProcessorCount, params.mSkipSoftmaxThresholdScaleFactor, params.mSkipCorrThreshold,
+        params.mIsSpecDecTree, params.mSpecDecodingTargetMaxGenLen, params.mDsv4EpilogueFusion.enabled,
+        params.mDsv4EpilogueFusion.scaleBufM, params.mFp16Softmax, params.mUsesSpcompress);
 }
 
 class TllmGenFmhaKernel
@@ -464,6 +485,18 @@ private:
             maxBatchSize, maxSeqLenKv, useGenKernelForPrefill, maxSeqLenQ);
         TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
             "TRTLLM-Gen Fmha Warmup Param is invalid.");
+
+        // The kernel object is shared by every attention layer with the same (dtype, sm) -- see
+        // TllmFmhaKernelFactory::getKernels -- but warmup is driven per layer, so without this the whole
+        // grid is re-walked once per layer. Keyed on the grid identity rather than a plain once-flag so
+        // that a layer whose configuration genuinely differs still warms up instead of losing coverage.
+        {
+            std::lock_guard<std::mutex> lock(mWarmupGridMutex);
+            if (!mWarmedUpGrids.insert(warmupGridIdentity(runnerParams)).second)
+            {
+                return;
+            }
+        }
 
         std::vector<int> batchSizeCandidates
             = makeWarmupCandidateSizes(kDefaultWarmupBatchSizeCandidates, maxBatchSize);
@@ -1406,6 +1439,11 @@ private:
     int mNumEltsPerSageAttnBlkP;
     int mNumEltsPerSageAttnBlkV;
     std::unordered_map<unsigned char const*, CUmodule> mModules;
+
+    // Warmup grids already walked on this kernel object. Guarded because the object is shared across
+    // layers and reachable from more than one host thread.
+    std::mutex mWarmupGridMutex;
+    std::set<decltype(warmupGridIdentity(RunnerParams{}))> mWarmedUpGrids;
 
     struct KernelInfo
     {
