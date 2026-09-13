@@ -259,9 +259,9 @@ class SpecTreeManager:
         # batch position and so correctly stay at max_batch_size -- the micro-batch
         # scheduler caps every forward there. ``num_slots`` sizes DynamicTreeSlotStorage,
         # which is indexed by ``py_seq_slot`` and must therefore span the executor's
-        # sequence-slot pool: the attention-DP overlap headroom makes that
-        # 2 * max_batch_size so a retiring request can keep its slot for one more
-        # iteration while its replacement is admitted (nvbug-6627795).
+        # sequence-slot pool: the overlap headroom makes that 2 * max_batch_size
+        # so a retiring request can keep its slot for one more iteration while
+        # its replacement is admitted (nvbug-6627795).
         # None preserves the historical max_batch_size sizing.
         self.num_slots = max(num_seq_slots or 0, max_num_requests)
         self.dynamic_tree_max_topK = dynamic_tree_max_topK

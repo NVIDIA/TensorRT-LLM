@@ -4,10 +4,10 @@
 sized by the sequence-slot pool, not by max_batch_size.
 
 The two differ whenever ``compute_max_num_sequences`` widens the pool: under
-pipeline depth, and under the attention-DP overlap headroom where a finished
-request holds its slot for one more iteration while its replacement is already
-admitted (nvbug-6627795). Two distinct families follow from that, and only the
-first needs the pool size:
+pipeline depth, and under the overlap headroom where a finished request holds its
+slot for one more iteration while its replacement is already admitted
+(nvbug-6627795). Two distinct families follow from that, and only the first needs
+the pool size:
 
 * keyed by ``py_seq_slot`` / a per-request ``SlotManager`` slot -- must span the
   pool. ``SpecMetadata.num_seq_slots`` (draft_probs, full_draft_probs,
@@ -406,10 +406,10 @@ def test_an_explicit_sa_pool_is_a_floor_not_a_rejection():
 
     ``TorchLlmArgs.validate_speculative_config`` accepts any
     ``global_pool_size >= max_batch_size``, so rejecting a value between
-    max_batch_size and the seat count would make merely enabling attention DP turn
-    an already-validated config into a startup error. The last assertion is the
-    negative control: without the headroom the configured value is used verbatim,
-    so this is a floor and not an unconditional bump.
+    max_batch_size and the seat count would make merely enabling the overlap
+    scheduler turn an already-validated config into a startup error. The last
+    assertion is the negative control: without the headroom the configured value
+    is used verbatim, so this is a floor and not an unconditional bump.
     """
     assert _sa_manager(POOL, enable_global_pool=True, global_pool_size=64).pool_size == 64
     assert _sa_manager(POOL, enable_global_pool=True, global_pool_size=R).pool_size == POOL

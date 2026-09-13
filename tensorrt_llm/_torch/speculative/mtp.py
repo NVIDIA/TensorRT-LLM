@@ -53,10 +53,10 @@ class MTPHiddenStatesManager(BaseResourceManager):
         # add_slot runs on a request's first context chunk and the slot is only
         # returned by free_resources. So the pool must cover every request that
         # can be resident at once, which is the SeqSlotManager pool size
-        # (``num_seq_slots``) rather than max_batch_size -- under the attention-DP
-        # overlap headroom the two differ by 2x, because a finished request holds
-        # its slot for one more iteration while its replacement is already
-        # admitted (nvbug-6627795). Sizing this at max_num_requests instead makes
+        # (``num_seq_slots``) rather than max_batch_size -- under the overlap
+        # headroom the two differ by 2x, because a finished request holds its slot
+        # for one more iteration while its replacement is already admitted
+        # (nvbug-6627795). Sizing this at max_num_requests instead makes
         # SlotManager.add_slot raise NoFreeSlotsError. Falls back to
         # max_num_requests when the caller does not know the pool size.
         # Reserve one extra slot for the CUDA graph padding dummy request,

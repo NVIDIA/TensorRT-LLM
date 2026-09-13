@@ -556,11 +556,12 @@ class PyTorchModelEngine(ModelEngine):
         self._enable_non_overlap_adp_forward_intent = (
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler))
-        # Attention DP drops retiring requests from the per-rank active counts
-        # that admission subtracts from its capacity, so a replacement cohort can
-        # be admitted while the retiring one still holds its sequence slots. The
-        # gate needs the pretrained config (hybrid SSM state is sized by
-        # max_batch_size and cannot absorb the extra cohort), so it is resolved
+        # With the overlap scheduler on, a retiring request keeps its sequence
+        # slot for one more iteration while its replacement is admitted (under
+        # attention DP the router drops it from the per-rank counts admission
+        # subtracts from, so residency actually reaches the extra cohort). The
+        # gate needs the pretrained config -- hybrid SSM state is sized by
+        # max_batch_size and cannot absorb the extra cohort -- so it is resolved
         # here rather than before the model load.
         self._enable_overlap_headroom = should_enable_overlap_headroom(
             mapping,

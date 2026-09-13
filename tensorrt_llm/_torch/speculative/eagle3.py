@@ -54,9 +54,9 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.sa_manager = sa_manager
         # ``slot_manager`` hands out slots keyed by request id and holds them for
         # the request's whole lifetime, so the pool must span the executor's
-        # sequence-slot pool -- 2 * max_batch_size under the attention-DP overlap
-        # headroom, where a retiring request keeps its slot for one more iteration
-        # while its replacement is admitted (nvbug-6627795). None means no headroom.
+        # sequence-slot pool -- 2 * max_batch_size under the overlap headroom,
+        # where a retiring request keeps its slot for one more iteration while its
+        # replacement is admitted (nvbug-6627795). None means no headroom.
         self.num_seq_slots = max(num_seq_slots or 0, max_num_requests)
         # There could be dummy request for padding batch when using CUDA graph.
         # Reserve one more slot for the dummy request.

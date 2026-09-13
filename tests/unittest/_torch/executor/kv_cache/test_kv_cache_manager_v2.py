@@ -1799,11 +1799,12 @@ def _index_mapper_capacity_for(
 # The overlap rows are the nvbug 6627795 case: the overlap scheduler defers a
 # terminal request's teardown past the point where its replacement is admitted,
 # so both cohorts hold index slots at once and a mapper sized at B+1 silently
-# defers requests one at a time. The predicate here is deliberately looser than
-# _util.should_enable_overlap_headroom, which gates the *seat* pool: leasing an
-# index nobody claims costs a few page-table rows, while a seat nobody claims
-# costs sampler and speculative-decoding state. So the index pool covers the seat
-# pool rather than equalling it (validate_seq_slot_pool_covers_admission).
+# defers requests one at a time. The overlap half of this predicate is shared
+# with _util.should_enable_overlap_headroom, which gates the *seat* pool, so the
+# two pools are equal on those rows. The is_disagg half is index-local and has no
+# seat-pool counterpart, which is why the startup check requires the index pool to
+# cover the seat pool rather than to equal it
+# (validate_seq_slot_pool_covers_admission).
 _INDEX_MAPPER_CAPACITY_CASES = [
     # Overlap on, no PP: both cohorts are resident, so the mapper needs 2B.
     pytest.param(2, 1, False, False, 1, 5, id="overlap_on"),

@@ -1529,16 +1529,19 @@ class KVCacheManagerV2(BaseResourceManager):
         #   time. Pipeline parallelism is excluded because `pp_size` micro-batches
         #   are already covered above.
         #
-        # Both factors are index-local and must not reach the seat pool. A
+        # The overlap term is shared with the seat pool by construction:
+        # _util.should_enable_overlap_headroom uses the same `not has_pp() and
+        # overlap on` shape, so a retiring cohort that outlives its seat is
+        # covered on both sides and the two pools stay equal in the ordinary case.
+        # The disagg term has no seat-pool counterpart on purpose -- a
         # transfer-phase request holds no sequence slot at all
-        # (SeqSlotManager.prepare_resources skips DISAGG_GENERATION_INIT), and a
-        # retiring request only outlives its seat where attention DP drops it
-        # from the per-rank counts admission subtracts from
-        # (_util.should_enable_overlap_headroom, which is the narrower gate the
-        # seat pool uses). So this pool is deliberately the more generous of the
-        # two: `validate_seq_slot_pool_covers_admission` requires it to cover the
-        # seat pool, not to equal it. Spare index leases cost a few page-table
-        # rows; spare seats would cost sampler and speculative-decoding state.
+        # (SeqSlotManager.prepare_resources skips DISAGG_GENERATION_INIT) -- and
+        # the seat gate additionally suppresses itself for hybrid/SSM models and
+        # under the V1 capacity schedulers. So where the two disagree this pool is
+        # the more generous one: `validate_seq_slot_pool_covers_admission` requires
+        # it to cover the seat pool, not to equal it. Spare index leases cost a
+        # few page-table rows; spare seats would cost sampler and
+        # speculative-decoding state.
         max_num_sequences = max_batch_size * mapping.pp_size
         needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"

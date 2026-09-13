@@ -543,10 +543,10 @@ def seat_pool_or_none(model_engine) -> Optional[int]:
     indexed by *batch position* deliberately keep max_batch_size: the
     micro-batch scheduler caps every forward at max_batch_size.
 
-    Read unconditionally rather than behind the attention-DP headroom gate.
+    Read unconditionally rather than behind the headroom gate.
     ``max_num_seq_slots`` already exceeds max_batch_size for three independent
-    reasons -- pipeline depth, the attention-DP overlap headroom (nvbug-6627795)
-    and disaggregation -- and the buffers here cannot tell them apart. Gating on
+    reasons -- pipeline depth, the overlap headroom (nvbug-6627795) and
+    disaggregation -- and the buffers here cannot tell them apart. Gating on
     one of the three sized them at max_batch_size under the other two while
     ``_set_up_spec_metadata`` sized the metadata at the full pool, so a
     high-numbered slot indexed past the end of the allocation.

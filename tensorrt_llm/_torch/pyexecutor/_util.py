@@ -3126,9 +3126,9 @@ def compute_max_num_sequences(mapping: Mapping,
     """Size the sequence-slot pool (and the sampler state it indexes).
 
     ``enable_overlap_headroom`` is intentionally opt-in, and
-    ``should_enable_overlap_headroom`` is the only thing that should set it:
-    attention DP needs a second non-PP slot set because the V2 scheduler can
-    backfill seats before the overlap scheduler releases the previous
+    ``should_enable_overlap_headroom`` is the only thing that should set it: a
+    non-PP overlap-enabled run needs a second slot set because the V2 scheduler
+    can backfill seats before the overlap scheduler releases the previous
     iteration's terminal slots. Pipeline parallelism already sizes the pool
     by ``pp_size``.
 
@@ -3214,23 +3214,22 @@ def should_enable_overlap_headroom(mapping: Mapping,
                                    is_hybrid: bool = False) -> bool:
     """Gate the extra micro-batch of sequence slots (and its ADP counterpart).
 
-    True exactly where residency can exceed ``max_batch_size * pp_size``, and
-    that is a narrow set. The mechanism is ``ADPRouter``'s
-    ``exclude_retiring_requests``: it drops ``GENERATION_TO_COMPLETE`` requests
-    from the per-rank active counts that ``_fetch_new_requests`` subtracts from
-    the admission capacity, so a replacement cohort is admitted while the
-    retiring cohort still holds its seats. Each condition rules out a
-    configuration where that cannot happen:
+    The predicate is deliberately the same shape as the one
+    ``KVCacheManagerV2`` uses for its index leases -- non-PP and overlap-on --
+    so the seat pool and the index pool move together instead of the seat pool
+    tracking a narrower condition that has to be re-derived and kept in step.
+    The mechanism it pays for is ``ADPRouter``'s ``exclude_retiring_requests``:
+    it drops ``GENERATION_TO_COMPLETE`` requests from the per-rank active counts
+    that ``_fetch_new_requests`` subtracts from the admission capacity, so a
+    replacement cohort is admitted while the retiring cohort still holds its
+    seats.
 
-    * ``enable_attention_dp`` -- outside attention DP ``_fetch_new_requests``
-      subtracts ``len(active_requests)``, retirees included, so residency is
-      capped at ``max_batch_size * pp_size`` and the extra seats could never be
-      occupied. Disaggregation does not change this: its ``2x`` lives in
-      ``KVCacheManagerV2``'s index pool, where a transfer-phase request holds a
-      lease and no seat.
     * ``not has_pp()`` -- pipeline parallelism already carries ``pp_size``
       micro-batches, and its interaction with the retirement filter is
       unvalidated. Out of scope here.
+    * ``not disable_overlap_scheduler`` -- with the overlap scheduler off a
+      terminal request is torn down in-line, so it never coexists with its
+      replacement.
     * ``kv_cache_manager_is_v2`` -- only ``KVCacheV2Scheduler`` stops counting a
       request at ``GENERATION_TO_COMPLETE``. The V1 capacity schedulers (C++
       ``BindCapacityScheduler`` and ``PyCapacityScheduler``) hardcode
@@ -3241,11 +3240,21 @@ def should_enable_overlap_headroom(mapping: Mapping,
       manager can serve; extra seats there would let residency outrun the SSM
       slots. (Hybrid state is not ``py_seq_slot``-indexed, so the failure is
       exhaustion rather than an out-of-bounds write -- still a hang.)
+
+    Attention DP is deliberately *not* a condition, even though it is the only
+    deployment where the extra seats are ever occupied: outside attention DP
+    ``_fetch_new_requests`` subtracts ``len(active_requests)`` with retirees
+    included, so residency stays at ``max_batch_size * pp_size`` and the surplus
+    seats sit idle. Including it would make the seat pool narrower than the index
+    pool on the ordinary TP overlap path, which is the asymmetry that has to be
+    tolerated by ``validate_seq_slot_pool_covers_admission`` and re-justified at
+    every reader. Disaggregation is not a condition either, for the opposite
+    reason: its ``2x`` is genuinely index-local, since a transfer-phase request
+    holds a lease and no seat at all.
     """
     if is_hybrid or not kv_cache_manager_is_v2:
         return False
-    return (mapping.enable_attention_dp and not mapping.has_pp()
-            and not disable_overlap_scheduler)
+    return not mapping.has_pp() and not disable_overlap_scheduler
 
 
 def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
@@ -3260,19 +3269,19 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
       the request. Silent: costs throughput, raises nothing (nvbug 6627795). A
       one-sided ``seats >= index pool`` guard is exactly what let this ship, and
       this is the direction that guard could not see.
-    * **index pool > seat pool -- permitted.** The index pool is intentionally
-      the more generous of the two, for two independent reasons the seat pool
-      must not inherit. Under disaggregation a request awaiting its KV transfer
+    * **index pool > seat pool -- permitted.** The two predicates agree on the
+      overlap term (non-PP and overlap-on widens both), so the common case is
+      equality; where they differ the index pool is the more generous one, and
+      that is by design. Under disaggregation a request awaiting its KV transfer
       holds an index lease and no seat at all
-      (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``).
-      And ``KVCacheManagerV2`` widens the pool for any non-PP overlap
-      configuration, while the seat pool widens only where residency can
-      actually exceed ``max_batch_size * pp_size``
-      (``should_enable_overlap_headroom``) -- so a plain TP deployment carries
-      spare index leases that no seat will ever claim. Spare leases cost a few
-      page-table rows; spare seats would cost sampler state, the eagerly
-      allocated ``[seats, draft_len, vocab]`` draft-probability tensors and the
-      pinned-host block-offset tables.
+      (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``), so
+      the manager's ``is_disagg`` term has no seat-pool counterpart. And a hybrid
+      model suppresses the seat headroom -- SSM state is sized from
+      ``max_batch_size`` -- while a V2 index pool behind it still widens. Spare
+      leases cost a few page-table rows; spare seats would cost sampler state,
+      the eagerly allocated ``[seats, draft_len, vocab]`` draft-probability
+      tensors and the pinned-host block-offset tables, which is why the surplus
+      is kept on this side.
 
     The cost of the asymmetry is that an *undersized seat pool* is no longer
     distinguishable from a legitimately generous index pool, so it is not caught
