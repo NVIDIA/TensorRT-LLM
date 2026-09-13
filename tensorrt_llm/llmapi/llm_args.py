@@ -71,6 +71,7 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
+from ..tokenizer import TOKENIZER_ALIASES
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -1636,12 +1637,12 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
-# Short aliases for built-in custom tokenizers.
-# Maps alias → full import path (module.ClassName).
-TOKENIZER_ALIASES = {
-    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-    'deepseek_v4': 'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
-}
+# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) is
+# imported from `tensorrt_llm.tokenizer`, which is where the built-in custom
+# tokenizers live. It used to be duplicated here, and the copy drifted: it was
+# missing every alias added after it, so `--custom_tokenizer <alias>` failed
+# with "not enough values to unpack" for those while the identical alias worked
+# through `load_custom_tokenizer`.
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
@@ -2305,16 +2306,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         description=
         "Static tree structure for draft token generation. Each sublist represents a path in the tree. Mutually exclusive with use_dynamic_tree."
     )
-    greedy_sampling: Optional[bool] = Field(
-        default=True,
-        description=
-        "Whether to use greedy sampling (Top-1 with token equality acceptance) or typical acceptance with multinomial sampling."
-    )
-    posterior_threshold: Optional[float] = Field(
-        default=None,
-        description=
-        "Minimum token probability threshold for typical acceptance. Corresponds to epsilon in https://arxiv.org/pdf/2401.10774."
-    )
     use_dynamic_tree: Optional[bool] = Field(
         default=False,
         description=
@@ -2334,12 +2325,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
-    eagle3_one_model: Optional[bool] = Field(
-        default=True,
-        description=
-        "Always uses the one-model implementation (draft as submodule). "
-        "Setting False is ignored and falls back to True; the two-model path "
-        "is deprecated and will be removed in a future release.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2369,13 +2354,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        if not self.eagle3_one_model:
-            logger.warning(
-                "Eagle3 2-model (eagle3_one_model=False) is deprecated and "
-                "ignored; falling back to eagle3_one_model=True. "
-                "2-model will be removed in a future release.")
-            self.eagle3_one_model = True
-
         self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
@@ -2476,9 +2454,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.eagle3_one_model:
-            return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
-        return TorchSpeculativeDecodingMode.EAGLE3
+        return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
@@ -2733,7 +2709,6 @@ class SADecodingConfig(DecodingBaseConfig):
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = Field(default="Draft_Target")
-    _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
@@ -2752,9 +2727,7 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self._draft_target_one_model:
-            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
-        return TorchSpeculativeDecodingMode.DRAFT_TARGET
+        return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -2779,14 +2752,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "Force vanilla MTP mode (sequential MTP layers). When False, uses EAGLE-style MTP for single-layer checkpoints."
     )
-    mtp_eagle_one_model: bool = Field(
-        default=True,
-        description=
-        "When using EAGLE-style MTP, always uses the one-model implementation "
-        "(drafter as submodule). Setting False is ignored and falls back to "
-        "True; the two-model path is deprecated and will be removed in a "
-        "future release.")
-
     use_dynamic_tree: bool = Field(
         default=False,
         description=
@@ -2887,16 +2852,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
-    @model_validator(mode="after")
-    def log_two_model_deprecation_warning(self):
-        if not self.mtp_eagle_one_model:
-            logger.warning(
-                "2-model style MTP (mtp_eagle_one_model=False) is deprecated "
-                "and ignored; falling back to mtp_eagle_one_model=True. "
-                "2-model will be removed in a future release.")
-            self.mtp_eagle_one_model = True
-        return self
-
     def supports_backend(self, backend: str) -> bool:
         return backend in ("pytorch", "_autodeploy")
 
@@ -2910,7 +2865,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # both gated on self.is_mtp_eagle), so no capture buffer is needed
         # and we should skip allocation to avoid disabling post-MLP/MoE
         # fusion via the layer-capture hook.
-        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
+        return 0
 
     @property
     def spec_dec_mode(self):
@@ -2920,10 +2875,8 @@ class MTPDecodingConfig(DecodingBaseConfig):
         # num_nextn_predict_layers is set from the model's pretrained config by
         # update_spec_config_from_model_config. Treat None (before model load) as 1.
         n = self.num_nextn_predict_layers if self.num_nextn_predict_layers is not None else 1
-        if n == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
+        if n == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif n == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
-            return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 
 
@@ -3010,15 +2963,15 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
-    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
+    attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
         default="VANILLA",
         description=
-        "Attention backend for DFlash pooled-context cross-attention. This is "
-        "independent of the backend used to construct the drafter's standard "
-        "attention modules. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
-        "GPU with SM100 or SM103, and uses generated FMHA kernels with a private "
-        "paged context cache; VANILLA uses FlashAttention with a contiguous cache."
-    )
+        "Attention backend for DFlash pooled-context cross-attention, independent "
+        "of the drafter's standard attention modules. VANILLA uses FlashAttention "
+        "with a contiguous context K/V cache and runs anywhere. TRTLLM uses "
+        "TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache "
+        "and supports SM100/SM103 only. FA4 uses the flash-attn CuTe DSL kernels "
+        "on the same paged cache and supports SM90 only.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -4054,6 +4007,59 @@ class MambaStateConfig(StrictBaseModel):
         "Requires KV cache manager V2.")
 
 
+class KVEventsConfig(StrictBaseModel):
+    """Configuration for streaming (push-based) KV cache event publishing."""
+
+    enable_kv_cache_events: bool = Field(
+        default=False,
+        description=
+        "Whether to produce and publish KV cache events over the streaming (push) path."
+    )
+    publisher: Optional[Literal["null", "zmq"]] = Field(
+        default=None,
+        description=
+        "Publisher implementation. Defaults to 'zmq' when events are enabled and 'null' otherwise."
+    )
+    endpoint: str = Field(
+        default="tcp://*:5557",
+        min_length=1,
+        description=
+        "Base ZeroMQ endpoint the publisher binds. Each attention-DP rank binds "
+        "base_port+rank, so co-located engines (e.g. disaggregated prefill and "
+        "decode on one host) must use distinct base ports.")
+    replay_endpoint: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=
+        "Optional base ZeroMQ endpoint used to replay KV cache events. Ranks apply "
+        "the same global base_port+rank convention as `endpoint`. Only ranks sharing a "
+        "host contend for a port, so the two base ports must be at least "
+        "ranks-per-host apart or a rank's replay bind collides with another rank's "
+        "publish bind on that host.")
+    buffer_steps: int = Field(
+        default=10_000,
+        gt=0,
+        description="Number of previously published batches retained for replay."
+    )
+    hwm: int = Field(default=100_000,
+                     gt=0,
+                     description="ZeroMQ publisher socket high-water mark. "
+                     "0 means unlimited in ZeroMQ, so it is disallowed here.")
+    max_queue_size: int = Field(
+        default=100_000,
+        gt=0,
+        description="Maximum number of batches queued for background publishing. "
+        "Must be positive; 0 would make the queue unbounded.")
+    topic: str = Field(
+        default="",
+        description="ZeroMQ subscription topic used for KV cache event batches."
+    )
+
+    def model_post_init(self, __context) -> None:
+        if self.publisher is None:
+            self.publisher = "zmq" if self.enable_kv_cache_events else "null"
+
+
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
 
@@ -4158,6 +4164,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The period in milliseconds to gather attention DP events across ranks."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    kv_events_config: Optional[KVEventsConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, "
+        "each rank publishes its own events directly (e.g. over ZeroMQ) instead "
+        "of the buffered event_buffer_max_size gather/poll path.")
     enable_partial_reuse: bool = Field(
         default=True,
         description=

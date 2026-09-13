@@ -1,6 +1,8 @@
 Model Recipes
 ================
 
+.. _preconfigured-recipes:
+
 Preconfigured Recipes
 ---------------------
 

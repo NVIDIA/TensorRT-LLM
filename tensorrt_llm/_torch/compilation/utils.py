@@ -217,6 +217,12 @@ def inplace_info():
         "fp8_block_scaling_bmm_out": {
             1: "out"
         },
+        "cute_dsl_bf16_bmm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_rubin": {
+            1: "output"
+        },
         "gate_forward": {
             1: "out_weights",
             2: "out_indices"

@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Supply the checkpoint with --model. Small media projections stay in FP32.
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+
+cuda_graph_config:
+  enable: false
+
+attention_config:
+  backend: VANILLA
+
+compilation_config:
+  skip_warmup: false
+  resolutions:
+    - [544, 960]
+  num_frames:
+    - 124

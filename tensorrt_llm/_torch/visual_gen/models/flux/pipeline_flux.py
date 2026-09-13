@@ -19,6 +19,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
 from .transformer_flux import FluxTransformer2DModel
@@ -313,7 +314,7 @@ class FluxPipeline(BasePipeline):
             raise ValueError(f"num_images_per_prompt must be >= 1, got {num_images_per_prompt}")
         batch_size = len(prompt) * num_images_per_prompt
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         # Encode prompt
         logger.info("Encoding prompt...")

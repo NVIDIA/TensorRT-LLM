@@ -142,7 +142,7 @@ srun -N 4 \
 
 TensorRT LLM will load weights and select the best kernels during startup. The server is successfully launched when the following log is shown:
 
-```log
+```text
 INFO:     Started server process [xxxxx]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
