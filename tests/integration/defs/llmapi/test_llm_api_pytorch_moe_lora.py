@@ -128,6 +128,17 @@ def _run_routed_expert_multi_lora(
     calibration. With a CUDA graph the decode takes the slot-indexed input
     schema; without one it takes the per-request schema. Both feed the same
     grouped-GEMM LoRA core.
+
+    Those within-batch comparisons only hold if the rows really do share one
+    iteration, and that is not the default: `llm.generate` submits the rows
+    asynchronously and batch accumulation is off unless asked for, so the
+    scheduler admits whichever rows have arrived. The first row then lands in an
+    iteration of its own, where a different permuted-MoE tile partition and the
+    first call's autotuner tactic move its logprob ~1.5e-2 -- larger than the
+    weakest adapter's own delta, which makes the deltas below meaningless. That
+    is a property of the base bf16 MoE batch, not of LoRA: it reproduces
+    unchanged with every row rank-0. So hold the rows for one iteration and
+    compare them where the docstring above claims to.
     """
     cache_config = {}
     if preallocate_all_adapters:
@@ -149,6 +160,15 @@ def _run_routed_expert_multi_lora(
         kv_cache_config=_KV_CACHE_CONFIG,
         cuda_graph_config=cuda_graph_config,
         peft_cache_config=peft_cache_config,
+        # Hold the first iteration until every row of the batch has arrived (see
+        # the note above). This is the request-queue timeout, not the
+        # scheduler-side batch_wait_timeout_iters, which is skipped while no
+        # generation request is in flight -- exactly the first iteration these
+        # tests measure. It costs a one-off wait per generate() call, since these
+        # batches are far narrower than max_batch_size, which is deliberately
+        # left at its default: the CUDA-graph MoE LoRA scratch is reserved from
+        # it and a batch-width value under-sizes that.
+        batch_wait_timeout_ms=5000,
     )
     try:
         # Logprobs, not just greedy tokens: a randomly fabricated adapter can
