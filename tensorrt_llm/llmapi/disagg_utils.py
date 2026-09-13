@@ -16,7 +16,7 @@ from .._utils import global_mpi_rank, global_mpi_size
 __all__ = [
     'ServerConfig',
     'parse_disagg_config_file',
-    'extract_server_configs',
+    'extract_disagg_cfg',
     'split_world_comm',
     'get_usage_tokens_from_ctx',
     'rewrite_usage_info_from_ctx',
