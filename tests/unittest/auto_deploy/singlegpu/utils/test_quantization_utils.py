@@ -133,3 +133,47 @@ def test_fp8_load_hook_maps_prequantized_scales_with_prefix():
     )
     assert prefix + "layer.proj.activation_scale" not in mock_state_dict
     assert prefix + "layer.proj.weight_scale_inv" not in mock_state_dict
+
+
+def test_nvfp4_load_hook_maps_scale_only_shard_with_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
+        NVFP4LinearQuantizationFromConfig,
+    )
+
+    expected_weight_scale = torch.arange(128 * 4, dtype=torch.int16).to(torch.uint8)
+
+    def _mock_block_scale_interleave(weight_scale: torch.Tensor) -> torch.Tensor:
+        assert tuple(weight_scale.shape) == (128, 4)
+        assert weight_scale.dtype == torch.uint8
+        return expected_weight_scale
+
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "block_scale_interleave",
+        _mock_block_scale_interleave,
+        raising=False,
+    )
+
+    config = TransformConfig(stage="pattern_matcher")
+    nvfp4_imp = NVFP4LinearQuantizationFromConfig(config)
+
+    weight_name = "layer.proj.weight"
+    prefix = "nested."
+    mock_state_dict = {
+        prefix + weight_name + "_scale_2": torch.tensor(2.0, dtype=torch.float32),
+        prefix + weight_name + "_scale": torch.ones(128, 4, dtype=torch.float8_e4m3fn),
+        prefix + "layer.proj.input_scale": torch.tensor(3.0, dtype=torch.float32),
+    }
+
+    nvfp4_imp.load_hook(mock_state_dict, prefix, None, weight_name=weight_name)
+
+    assert mock_state_dict[prefix + "layer.proj.alpha"] == torch.tensor(6.0)
+    assert mock_state_dict[prefix + "layer.proj.input_scale"] == torch.tensor(1.0 / 3.0)
+    stored_weight_scale = mock_state_dict[prefix + weight_name + "_scale"]
+    assert tuple(stored_weight_scale.shape) == (128, 4)
+    assert torch.equal(
+        stored_weight_scale.view(torch.uint8).reshape(-1),
+        expected_weight_scale,
+    )
