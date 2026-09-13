@@ -94,15 +94,6 @@ Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
 unified pool, so `use_kv_cache_manager_v2` does not apply to them.
 
-Two-model speculative decoding (for example Eagle3 with
-`eagle3_one_model=False`) is not supported by V2: the draft model runs in a
-separate engine with its own KV cache manager, and V2 sizes both managers from
-the full `max_gpu_total_bytes` budget instead of partitioning it between them.
-Under `auto`, a model default of V2 falls back to V1 for that combination;
-setting `use_kv_cache_manager_v2: true` explicitly raises an error. This
-applies to every model that selects its manager through
-`use_kv_cache_manager_v2`, not just GPT-OSS.
-
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 

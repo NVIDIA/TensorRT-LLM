@@ -643,7 +643,6 @@ def qwen3_eagle3_config():
         "speculative_config": Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=model_path("Qwen3-8B-eagle3"),
-            eagle3_one_model=True,
             # TODO: these capture layers were carried over proportionally from
             # the retired Llama-3.1-8B config (1/32, 15/32, 28/32 through the
             # stack) and have NOT been validated against Qwen3-8B's actual
