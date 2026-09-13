@@ -17,8 +17,10 @@ from dataclasses import replace
 from typing import Optional, Tuple, Union
 
 import torch
+from packaging.version import Version
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
@@ -53,6 +55,97 @@ _ACTIVATION_MAP = {
     ActivationType.Relu2: "relu2",
     ActivationType.Swiglu: "silu",
 }
+
+# FlashInfer's SM12x W4A16 fused MoE (0.6.17 and 0.6.18) selects a TC-decode
+# "ultra-wide" FC2 tile of tile_n=512 / tile_k=32 for small m whenever that
+# collapses FC2 to FC1's wave count (m=3 and m=4 for Qwen3.6-35B-A3B on the
+# 188-SM RTX PRO 6000). tile_k=32 sits below the tile_k>=64 floor of its
+# generic ``_candidate_tile_fits`` check, which the auto-selection skips but
+# the ``force_tile_config`` re-pin across the custom-op boundary does not, so
+# the kernel it just selected is rejected with "force_tile_config fc2 tile
+# (tile_k=32, tile_n=512) does not fit ..." and CUDA-graph warmup aborts
+# executor init (nvbug 6721561). Accepting the ultra tile in the re-validation
+# under the same rule that produced it is the upstream fix; this shim mirrors
+# it so the pinned wheel behaves like the fixed one. Drop it once the
+# flashinfer pin carries ``_ultra_wide_fc2_tile_fits``.
+_FLASHINFER_W4A16_ULTRA_WIDE_FC2_TILE = (512, 32, 256)  # (tile_n, tile_k, cta_threads)
+_FLASHINFER_W4A16_ULTRA_WIDE_FC2_SINCE = Version("0.6.17")
+
+
+def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
+    """Make flashinfer's W4A16 ``force_tile_config`` re-validation accept the
+    ultra-wide FC2 tile its own auto-selection produces.
+
+    Idempotent. Returns True when the shim is active, False when flashinfer is
+    absent, predates the ultra-wide override, or already ships the fix.
+    """
+    try:
+        import flashinfer
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_w4a16_kernel as kernel
+    except ImportError:
+        return False
+    if Version(flashinfer.__version__) < _FLASHINFER_W4A16_ULTRA_WIDE_FC2_SINCE:
+        return False
+    if hasattr(kernel, "_ultra_wide_fc2_tile_fits"):
+        return False
+    upstream_fits = getattr(kernel, "_candidate_tile_fits", None)
+    smem_footprint = getattr(kernel, "_shared_memory_footprint", None)
+    scale_group_size = getattr(kernel, "_scale_group_size", None)
+    if upstream_fits is None or smem_footprint is None or scale_group_size is None:
+        return False
+    if getattr(upstream_fits, "_trtllm_ultra_wide_fc2_shim", False):
+        return True
+
+    def candidate_tile_fits(
+        *,
+        problem_n: int,
+        problem_k: int,
+        cta_m_blocks: int,
+        tile_n: int,
+        tile_k: int,
+        cta_threads: int,
+        max_shared_mem: int,
+        scale_format: str = "e4m3_k16",
+        weight_layout: str = "packed",
+        allow_logical_tail: bool = False,
+    ) -> bool:
+        if (int(tile_n), int(tile_k), int(cta_threads)) != _FLASHINFER_W4A16_ULTRA_WIDE_FC2_TILE:
+            return upstream_fits(
+                problem_n=problem_n,
+                problem_k=problem_k,
+                cta_m_blocks=cta_m_blocks,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                cta_threads=cta_threads,
+                max_shared_mem=max_shared_mem,
+                scale_format=scale_format,
+                weight_layout=weight_layout,
+                allow_logical_tail=allow_logical_tail,
+            )
+        # Same rule as the auto-selection override: exact N/K tiling, one scale
+        # group per k-tile, and shared-memory fit.
+        if int(problem_n) % int(tile_n) != 0 or int(problem_k) % int(tile_k) != 0:
+            return False
+        if int(tile_k) % int(scale_group_size(scale_format)) != 0:
+            return False
+        smem_bytes = smem_footprint(
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            scale_format=scale_format,
+            weight_layout=weight_layout,
+        )
+        return int(smem_bytes) <= int(max_shared_mem)
+
+    candidate_tile_fits._trtllm_ultra_wide_fc2_shim = True
+    candidate_tile_fits._trtllm_upstream_fits = upstream_fits
+    kernel._candidate_tile_fits = candidate_tile_fits
+    logger.info_once(
+        f"flashinfer {flashinfer.__version__}: accepting the SM12x W4A16 ultra-wide FC2 "
+        "tile (tile_n=512, tile_k=32) in force_tile_config re-validation (nvbug 6721561).",
+        key="flashinfer_w4a16_ultra_wide_fc2_tile_shim",
+    )
+    return True
 
 
 class CuteDslB12xFusedMoE(CutlassFusedMoE):
@@ -195,6 +288,10 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         self._b12x_use_cuda_graph = bool(getattr(model_config, "use_cuda_graph", False))
 
         super().__init__(*args, **kwargs)
+
+        # Only the W4A16 decode path reaches flashinfer's W4A16 tile selector.
+        if self.quant_config is not None and self.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+            _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation()
 
         # No alltoall guard here: alltoall is picked by the wrapper's
         # communication strategy, and ``can_implement`` already rejects the
