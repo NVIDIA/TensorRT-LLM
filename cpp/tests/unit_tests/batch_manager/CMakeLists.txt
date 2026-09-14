@@ -64,6 +64,17 @@ add_gtest(kvCacheManagerV2SlotAllocatorTest
 target_include_directories(
   kvCacheManagerV2SlotAllocatorTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2ReentrantSharedMutexTest
+          kvCacheManagerV2ReentrantSharedMutexTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ReentrantSharedMutexTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2ConcurrencyTest kvCacheManagerV2ConcurrencyTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ConcurrencyTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+
 add_gtest(kvCacheManagerV2DigestPoolTest kvCacheManagerV2DigestPoolTest.cpp)
 target_include_directories(
   kvCacheManagerV2DigestPoolTest

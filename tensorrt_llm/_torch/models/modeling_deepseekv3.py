@@ -896,8 +896,10 @@ class DeepseekV3Gate(nn.Module):
                                  n,
                                  dtype=torch.float32,
                                  device=hidden_states.device)
-            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
-                input_2d.contiguous(), self.weight, output)
+            bf16_gemm_op = (torch.ops.trtllm.cute_dsl_bf16_gemm_rubin
+                            if get_sm_version() == 107 else
+                            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
+            bf16_gemm_op(input_2d.contiguous(), self.weight, output)
             logits = output.view(*hidden_states.shape[:-1], n)
         else:
             logits = torch.ops.trtllm.dsv3_router_gemm_op(

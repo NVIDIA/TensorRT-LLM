@@ -99,7 +99,7 @@ For this particular workload max num tokens of 2048 provides the best performanc
 
 Previously we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Having now understood the TensorRT-LLM scheduler we can now explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
 
-The [visualization](#understanding-the-trt-llm-scheduler) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However with context chunking, this is no longer the case, and the first chunk of Request 3 would be able to be scheduled.
+The [visualization](#understanding-the-tensorrt-llm-scheduler) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However with context chunking, this is no longer the case, and the first chunk of Request 3 would be able to be scheduled.
 
 ![TRT-LLM Scheduler Visualization Chunked Context 1](../../../media/TRTLLM_Scheduler_Vis_Chunked_Context_1.svg)
 

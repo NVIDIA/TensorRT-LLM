@@ -77,32 +77,32 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | MTP                        | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
 | `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `GlmMoeDsaForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | No               | Yes            | N/A                      | Yes                   | Yes             |
-| `DeepseekV4ForCausalLM` [^11]    | Yes               | Yes        | Yes                        | Untested              | Yes             | MTP                        | Yes           | Yes              | Untested       | Yes                      | Untested              | Untested        |
+| `DeepseekV4ForCausalLM` [^11]    | Yes               | Yes        | Yes                        | Untested              | Yes             | MTP                        | Yes           | Yes              | Untested       | Yes                      | Untested              | Yes             |
 | `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | MTP                        | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes [^16]       |
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear, Dynamic)  | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
-| `Qwen3NextForCausalLM` [^3]      | Yes               | Yes        | Yes                        | Untested              | Yes             | No                         | Yes           | Yes              | No             | No                       | Untested              | Untested        |
-| `Qwen3_5MoeForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Untested         | Yes            | N/A                      | Untested              | Untested        |
-| `Qwen4ExpForCausalLM`            | Yes               | Yes        | Yes                        | No                    | Yes             | MTP                        | Yes           | Untested         | No             | N/A                      | Yes                   | Untested        |
+| `Qwen3NextForCausalLM` [^3]      | Yes               | Yes        | Yes                        | Untested              | Yes             | No                         | Yes           | Yes              | No             | No                       | Untested              | Yes             |
+| `Qwen3_5MoeForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Untested         | Yes            | N/A                      | Untested              | Yes             |
+| `Qwen4ExpForCausalLM`            | Yes               | Yes        | Yes                        | No                    | Yes             | MTP                        | Yes           | Untested         | No             | N/A                      | Yes                   | Yes             |
 | `Llama4ForConditionalGeneration` | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear, Dynamic)  | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `GptOssForCausalLM`              | Yes               | Yes        | Yes                        | Yes                   | Yes             | EAGLE-3 (Linear), DFlash   | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `KimiK3ForConditionalGeneration` [^15] [^17] | Yes               | Yes        | Yes                        | Yes                   | Yes             | DSpark                     | Yes           | No               | Yes            | N/A                      | Yes                   | Yes             |
-| `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No                         | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
-| `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes              | Yes            | N/A                      | Untested              | Untested        |
-| `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | MTP                        | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
-| `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested                   | No                    | Yes             | No                         | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
-| `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No                         | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
+| `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No                         | Yes           | Untested         | Untested       | N/A                      | Untested              | Yes             |
+| `NemotronHForCausalLM`           | Yes               | Yes        | Yes                        | Yes                   | Yes             | MTP                        | Yes           | Yes              | Yes            | N/A                      | Untested              | Yes             |
+| `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | MTP                        | Yes           | Untested         | No             | Yes                      | Untested              | Yes             |
+| `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested                   | No                    | Yes             | No                         | Yes           | Untested         | No             | Yes                      | Untested              | Yes             |
+| `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | Untested         | Untested       | Yes                      | Untested              | Yes             |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No                         | Yes           | Untested         | No             | N/A                      | Untested              | Yes             |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120/SM121 and in BF16/FP8 KV cache dtype.
 [^3]: Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.
-[^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](../../../examples/auto_deploy/model_registry/configs).
+[^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](source:examples/auto_deploy/model_registry/configs).
 [^6]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^7]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^8]: Supports text and image inputs. The vision tower runs in BF16 even when the text decoder is quantized (FP8 block-scale or NVFP4). The text decoder is also usable standalone (text-only) via the `Step3p5ForCausalLM` architecture.
 [^9]: Audio modality only supported on E2B/E4B variants.
 [^10]: Audio requires a checkpoint with a `sound_config` and is supported only on the full (non-disaggregated) model path, not the EPD disaggregated path.
-[^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](../../../examples/models/core/deepseek_v4/README.md) for setup and parallelism.
+[^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](source:examples/models/core/deepseek_v4/README.md) for setup and parallelism.
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
 [^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
@@ -214,6 +214,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+| `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -228,15 +229,13 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 
 | Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
 |---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
+| **MiniMax-H3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image-Layered** [^vg2] | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
+| **Qwen-Image-Layered** | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
-
-[^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
-[^vg2]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing. By default it returns one RGBA image per generated layer; set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, and attention-parallel backends are not enabled yet.

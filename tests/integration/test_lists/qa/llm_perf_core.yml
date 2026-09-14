@@ -271,6 +271,15 @@ llm_perf_core:
   tests:
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  # NVFP4 DSpark: experimental single-node adaptation of the GB300 disagg recipe.
+  # Hold workload/parallelism fixed; only override MoE (including the draft).
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:AUTO] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:TRTLLM] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:CUTEDSL] TIMEOUT(120)
+  #deepseek_v4_pro_base_fp8 (1.6T MoE, FP8 block-scale, B300 DEP8 throughput and TEP8 latency)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:8192,1024-reqs:1024-con:512-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:1000,2000-reqs:512-con:256-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448-kv_frac:0.9-input_output_len:8192,1024-reqs:10-con:1-ep:8-tp:8-gpus:8] TIMEOUT(120) #min_latency
   #kimi_k3 (TEP8 interactive serving, 8-GPU)
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT (120)
   - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency

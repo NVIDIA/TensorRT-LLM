@@ -493,7 +493,8 @@ def run_test_in_subprocess(env, test_file):
     result = subprocess.run([sys.executable, '-m', 'pytest', test_file, '-v'],
                             capture_output=True,
                             text=True,
-                            env=process_env)
+                            env=process_env,
+                            timeout=600)
 
     # Print the output
     print(result.stdout)
