@@ -241,14 +241,15 @@ def test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior(
 @pytest.mark.parametrize("sm_version", [100, 103])
 def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int) -> None:
     """32-element weight-only scale blocks cannot feed the W4A4 NVFP4 GEMMs, so
-    the SM100/103 promotion must leave dense MLP, expert and lm_head entries on
-    the W4A16 dequantization path."""
+    the SM100/103 promotion must leave dense MLP and lm_head entries on the
+    W4A16 dequantization path. The dense Qwen3.5-27B checkpoint (recipe
+    nvfp4_mlp_weight_only) has no MoE experts, and the MoE methods reject
+    group_size=32 outright, so only dense Linear paths are exercised here."""
     cfg = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32)
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(num_hidden_layers=64),
         quant_config_dict={
             "model.language_model.layers.0.mlp.gate_proj": cfg,
-            "model.language_model.layers.1.mlp.experts": cfg,
             "lm_head": cfg,
         },
     )
@@ -261,7 +262,6 @@ def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int
 
     assert set(model_config.quant_config_dict) == {
         "model.layers.0.mlp.mlp.gate_proj",
-        "model.layers.1.mlp.experts",
         "lm_head",
     }
     assert all(
