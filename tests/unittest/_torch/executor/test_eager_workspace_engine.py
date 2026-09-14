@@ -49,6 +49,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def test_forward_scope_and_warmup_bypass(self) -> None:
         self.freeze()
         self.reclaimer_class.assert_called_once_with(self.metadata)
+        self.assertIs(self.engine._eager_workspace_reclaimer, self.reclaimer_class.return_value)
         scope = self.reclaimer_class.return_value.forward
         self.engine._is_warmup = True
         self.assertEqual(self.call(), 42)
@@ -64,12 +65,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
-    def test_supported_warmup_enables_reclamation_by_default(self) -> None:
-        self.freeze()
-        self.reclaimer_class.assert_called_once_with(self.metadata)
-        self.assertIs(self.engine._eager_workspace_reclaimer, self.reclaimer_class.return_value)
-
-    def test_unsupported_modes_do_not_create_reclaimer(self) -> None:
+    def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
         for name, value in [
             ("is_spec_decode", True),
             ("_torch_compile_backend", object()),
@@ -79,11 +75,9 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             with self.subTest(mode=name), patch.object(self.engine, name, value):
                 self.freeze()
                 self.assertIsNone(self.engine._eager_workspace_reclaimer)
-        self.engine.mapping.cp_size = 2
-        self.freeze()
-        self.assertIsNone(self.engine._eager_workspace_reclaimer)
-
-    def test_empty_or_nonreclaimable_warmup_is_not_enabled(self) -> None:
+        with patch.object(self.engine.mapping, "cp_size", 2):
+            self.freeze()
+            self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.metadata.workspace_reclaimable = False
         self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
