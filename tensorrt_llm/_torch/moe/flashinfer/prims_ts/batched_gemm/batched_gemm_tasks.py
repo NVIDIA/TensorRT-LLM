@@ -78,7 +78,39 @@ class _MmaGroupTask(Task):
         )
 
 
+class _MulticastGatherTask(Task):
+    """Keep only the barrier-signaling warp in multicast receiver groups."""
+
+    def __init__(self, cta_group_size: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.cta_group_size = cta_group_size
+
+    @cute.jit
+    def run_body(self) -> None:
+        if self.is_selected():
+            # Idle receiver warps still participate in register redistribution.
+            self._set_max_register()
+            warp = cute.arch.warp_idx()
+            rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            # Every source warp issues TMA, but receivers only need the first
+            # warp of each MMA group to arm the full barrier. Other receiver
+            # warps have no transfer or arrival that constrains pipeline
+            # progress: waiting on the ring can miss a complete phase cycle.
+            if (rank < self.cta_group_size) | (
+                (rank % self.cta_group_size == 0) & (warp == self.warp_start)
+            ):
+                if cutlass.const_expr(self.is_persistent):
+                    self._run_task_body_persistent()
+                else:
+                    self._run_task_body_non_persistent()
+                self.dummy = cutlass.Boolean(True)
+
+
 def _make_task(cfg, **kwargs) -> Task:
+    if cfg.cluster_reuse_m > 1 and cfg.has_tma_route:
+        activation_task = "LoadBTask" if cfg.is_swap_ab else "LoadATask"
+        if kwargs.get("name") == activation_task:
+            return _MulticastGatherTask(cfg.cluster_m, **kwargs)
     if cfg.cluster_reuse_m > 1 and kwargs.get("run_only_on_cta_id") == 0:
         return _MmaGroupTask(cfg.cluster_m, **kwargs)
     return Task(**kwargs)

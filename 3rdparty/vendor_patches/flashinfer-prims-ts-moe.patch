@@ -1435,7 +1435,7 @@ index f554101fc1f6d80a84ec4eae66ef97335a5dd652..65ffab16467206280969283a522fe05b
              io["launch_early_exit_max_token_ctas"],
              stream,
 diff --git a/prims_ts/batched_gemm/batched_gemm_tasks.py b/prims_ts/batched_gemm/batched_gemm_tasks.py
-index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05e4de79fd 100644
+index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..02f4e2ab3abf7f5602a8a0a4a526463a9b74f78a 100644
 --- a/prims_ts/batched_gemm/batched_gemm_tasks.py
 +++ b/prims_ts/batched_gemm/batched_gemm_tasks.py
 @@ -1,4 +1,5 @@
@@ -1457,7 +1457,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
      work_tile_loop,
  )
  from cutlass.experimental.task_scheduling.task import Task
-@@ -40,6 +42,48 @@ from .smem_misc_resources import BatchedGemmWorkQueue
+@@ -40,6 +42,80 @@ from .smem_misc_resources import BatchedGemmWorkQueue
  Constexpr = cutlass.Constexpr
  
  
@@ -1497,7 +1497,39 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
 +        )
 +
 +
++class _MulticastGatherTask(Task):
++    """Keep only the barrier-signaling warp in multicast receiver groups."""
++
++    def __init__(self, cta_group_size: int, **kwargs) -> None:
++        super().__init__(**kwargs)
++        self.cta_group_size = cta_group_size
++
++    @cute.jit
++    def run_body(self) -> None:
++        if self.is_selected():
++            # Idle receiver warps still participate in register redistribution.
++            self._set_max_register()
++            warp = cute.arch.warp_idx()
++            rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
++            # Every source warp issues TMA, but receivers only need the first
++            # warp of each MMA group to arm the full barrier. Other receiver
++            # warps have no transfer or arrival that constrains pipeline
++            # progress: waiting on the ring can miss a complete phase cycle.
++            if (rank < self.cta_group_size) | (
++                (rank % self.cta_group_size == 0) & (warp == self.warp_start)
++            ):
++                if cutlass.const_expr(self.is_persistent):
++                    self._run_task_body_persistent()
++                else:
++                    self._run_task_body_non_persistent()
++                self.dummy = cutlass.Boolean(True)
++
++
 +def _make_task(cfg, **kwargs) -> Task:
++    if cfg.cluster_reuse_m > 1 and cfg.has_tma_route:
++        activation_task = "LoadBTask" if cfg.is_swap_ab else "LoadATask"
++        if kwargs.get("name") == activation_task:
++            return _MulticastGatherTask(cfg.cluster_m, **kwargs)
 +    if cfg.cluster_reuse_m > 1 and kwargs.get("run_only_on_cta_id") == 0:
 +        return _MmaGroupTask(cfg.cluster_m, **kwargs)
 +    return Task(**kwargs)
@@ -1506,7 +1538,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
  def _is_persistent(cfg: BatchedGemmConfig) -> bool:
      return cfg.is_persistent
  
-@@ -204,7 +248,8 @@ def create_load_a_task(
+@@ -204,7 +280,8 @@ def create_load_a_task(
      if is_persistent:
          extra_resources.append(work_queue)
      captured_schedule = load_a_schedule(gmem_a, smem_a, *extra_resources)
@@ -1516,7 +1548,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=(
              [gmem_a]
              + _pdl_wait_resources(pdl_wait_resource)
-@@ -289,7 +334,8 @@ def create_load_b_task(
+@@ -289,7 +366,8 @@ def create_load_b_task(
      if is_persistent:
          extra_resources.append(work_queue)
      captured_schedule = load_b_schedule(gmem_b, smem_b, *extra_resources)
@@ -1526,7 +1558,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=(
              [gmem_b]
              + _pdl_wait_resources(pdl_wait_resource)
-@@ -389,7 +435,8 @@ def create_gather_task(
+@@ -389,7 +467,8 @@ def create_gather_task(
      if is_persistent:
          extra_resources.append(work_queue)
      captured_schedule = gather_schedule(gmem_act, smem_gather, *extra_resources)
@@ -1536,7 +1568,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=(
              [gmem_act]
              + _pdl_wait_resources(pdl_wait_resource)
-@@ -404,6 +451,47 @@ def create_gather_task(
+@@ -404,6 +483,47 @@ def create_gather_task(
      )
  
  
@@ -1584,7 +1616,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
  def create_fused_load_a_sfa_task(
      cfg,
      gmem_a,
-@@ -488,7 +576,8 @@ def create_fused_load_a_sfa_task(
+@@ -488,7 +608,8 @@ def create_fused_load_a_sfa_task(
          smem_sfa,
          *extra_resources,
      )
@@ -1594,7 +1626,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[gmem_a, gmem_sfa] + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[smem_a, smem_sfa]
          + ([work_throttle] if has_work_throttle else []),
-@@ -642,7 +731,8 @@ def create_fused_gather_sfb_task(
+@@ -642,7 +763,8 @@ def create_fused_gather_sfb_task(
          smem_sfb,
          *extra_resources,
      )
@@ -1604,7 +1636,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=(
              [gmem_b, gmem_sfb]
              + _pdl_wait_resources(pdl_wait_resource)
-@@ -699,7 +789,8 @@ def create_sync_task(
+@@ -699,7 +821,8 @@ def create_sync_task(
          gather_smem,
          tma_smem,
      )
@@ -1614,7 +1646,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[gather_smem, tma_smem]
          + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[proxy_cluster],
-@@ -794,7 +885,8 @@ def create_load_sfa_task(
+@@ -794,7 +917,8 @@ def create_load_sfa_task(
      if is_persistent:
          extra_resources.append(work_queue)
      captured_schedule = load_sfa_schedule(gmem_sfa, smem_sfa, *extra_resources)
@@ -1624,7 +1656,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=(
              [gmem_sfa]
              + _pdl_wait_resources(pdl_wait_resource)
-@@ -893,7 +985,8 @@ def create_load_sfb_task(
+@@ -893,7 +1017,8 @@ def create_load_sfb_task(
      if is_persistent:
          extra_resources.append(work_queue)
      captured_schedule = load_sfb_schedule(gmem_sfb, smem_sfb, *extra_resources)
@@ -1634,7 +1666,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=(
              [gmem_sfb]
              + _pdl_wait_resources(pdl_wait_resource)
-@@ -943,7 +1036,8 @@ def create_copy_sfa_task(
+@@ -943,7 +1068,8 @@ def create_copy_sfa_task(
      captured_schedule = _call_schedule_with_optional_work_queue(
          copy_sfa_schedule, is_persistent, work_queue, smem_sfa, tmem_sfa
      )
@@ -1644,7 +1676,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[smem_sfa] + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[tmem_sfa],
          warp_idx=cfg.copy_sfa_warp_idx,
-@@ -986,7 +1080,8 @@ def create_copy_sfb_task(
+@@ -986,7 +1112,8 @@ def create_copy_sfb_task(
      captured_schedule = _call_schedule_with_optional_work_queue(
          copy_sfb_schedule, is_persistent, work_queue, smem_sfb, tmem_sfb
      )
@@ -1654,7 +1686,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[smem_sfb] + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[tmem_sfb],
          warp_idx=cfg.copy_sfb_warp_idx,
-@@ -1059,7 +1154,8 @@ def create_copy_sfab_task(
+@@ -1059,7 +1186,8 @@ def create_copy_sfab_task(
          smem_sfb,
          tmem_sfab,
      )
@@ -1664,7 +1696,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[smem_sfa, smem_sfb]
          + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[tmem_sfab],
-@@ -1123,7 +1219,8 @@ def create_cast_a_task(
+@@ -1123,7 +1251,8 @@ def create_cast_a_task(
          smem_sfa,
          tmem_cast_a,
      )
@@ -1674,7 +1706,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[smem_a, smem_sfa] + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[tmem_cast_a],
          warp_idx=cfg.cast_a_warp_idx_first,
-@@ -1162,12 +1259,20 @@ def create_mma_task(
+@@ -1162,12 +1291,20 @@ def create_mma_task(
  
      Only one of (smem_sfa, tmem_sfa) should be set for each operand.
      """
@@ -1698,7 +1730,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
      has_separate_sf = tmem_sfa is not None
      has_combined_sf = tmem_sfab is not None
      has_cast_a = tmem_cast_a is not None
-@@ -1177,6 +1282,7 @@ def create_mma_task(
+@@ -1177,6 +1314,7 @@ def create_mma_task(
              ("fused", has_fused_sf),
              ("separate", has_separate_sf),
              ("combined", has_combined_sf),
@@ -1706,7 +1738,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          )
          if enabled
      ]
-@@ -1188,6 +1294,7 @@ def create_mma_task(
+@@ -1188,6 +1326,7 @@ def create_mma_task(
      if has_cast_a and active_sf_modes:
          raise ValueError("create_mma_task forbids tmem_cast_a with SF modes")
      has_proxy = proxy_cluster is not None
@@ -1714,7 +1746,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
      is_persistent = _is_persistent(cfg)
  
      @schedule
-@@ -1206,12 +1313,14 @@ def create_mma_task(
+@@ -1206,12 +1345,14 @@ def create_mma_task(
          idx += 1 if has_fused_sf else 0
          tmem_sfa_res = extra[idx] if has_separate_sf else None
          idx += 1 if has_separate_sf else 0
@@ -1731,7 +1763,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          wq = extra[idx] if is_persistent else None
  
          if not has_cast_a:
-@@ -1249,6 +1358,7 @@ def create_mma_task(
+@@ -1249,6 +1390,7 @@ def create_mma_task(
                          tmem_sfb_res,
                          tmem_sfab_res,
                          tmem_cast_a_res,
@@ -1739,7 +1771,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
                          release_sources=False,
                      )
                      tmem_c_res.commit()
-@@ -1262,6 +1372,7 @@ def create_mma_task(
+@@ -1262,6 +1404,7 @@ def create_mma_task(
                          tmem_sfb_res,
                          tmem_sfab_res,
                          tmem_cast_a_res,
@@ -1747,7 +1779,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
                      )
              else:
                  tmem_c_res.try_acquire()
-@@ -1279,6 +1390,7 @@ def create_mma_task(
+@@ -1279,6 +1422,7 @@ def create_mma_task(
                              tmem_sfb_res,
                              tmem_sfab_res,
                              tmem_cast_a_res,
@@ -1755,7 +1787,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
                          )
                  else:
                      with domain_loop(0, num_k_tiles, 1):
-@@ -1293,6 +1405,7 @@ def create_mma_task(
+@@ -1293,6 +1437,7 @@ def create_mma_task(
                              tmem_sfb_res,
                              tmem_sfab_res,
                              tmem_cast_a_res,
@@ -1763,7 +1795,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
                          )
                  tmem_c_res.commit()
                  if cfg.use_tile256_tmem_overlap and cfg.num_epilogue_warps == 4:
-@@ -1309,6 +1422,7 @@ def create_mma_task(
+@@ -1309,6 +1454,7 @@ def create_mma_task(
          tmem_sfb_res,
          tmem_sfab_res,
          tmem_cast_a_res,
@@ -1771,7 +1803,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          *,
          release_sources: bool = True,
      ) -> None:
-@@ -1320,6 +1434,8 @@ def create_mma_task(
+@@ -1320,6 +1466,8 @@ def create_mma_task(
              proxy_stage_idx = proxy.consumer_work()
          elif has_cast_a:
              smem_b_res.try_wait()
@@ -1780,7 +1812,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          else:
              smem_a_res.try_wait()
              smem_b_res.try_wait()
-@@ -1329,6 +1445,8 @@ def create_mma_task(
+@@ -1329,6 +1477,8 @@ def create_mma_task(
          if has_separate_sf:
              tmem_sfa_res.try_wait()
              tmem_sfb_res.try_wait()
@@ -1789,7 +1821,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          if has_combined_sf:
              tmem_sfab_res.try_wait()
          if has_cast_a:
-@@ -1336,6 +1454,8 @@ def create_mma_task(
+@@ -1336,6 +1486,8 @@ def create_mma_task(
          if not has_proxy:
              if has_cast_a:
                  smem_b_res.wait()
@@ -1798,7 +1830,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
              else:
                  smem_a_res.wait()
                  smem_b_res.wait()
-@@ -1345,6 +1465,8 @@ def create_mma_task(
+@@ -1345,6 +1497,8 @@ def create_mma_task(
          if has_separate_sf:
              tmem_sfa_res.wait()
              tmem_sfb_res.wait()
@@ -1807,7 +1839,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          if has_combined_sf:
              tmem_sfab_res.wait()
          if has_cast_a:
-@@ -1370,7 +1492,19 @@ def create_mma_task(
+@@ -1370,7 +1524,19 @@ def create_mma_task(
              else:
                  desc_a_mma_base, smem_a_stage_ptr = smem_a_res.build_mma_desc_a()
                  desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
@@ -1828,7 +1860,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
                  desc_a_s2t_base, smem_sfa_stage_ptr = smem_sfa_res.build_sfa_s2t_desc()
                  desc_b_s2t_base = smem_sfb_res.build_sfb_s2t_desc()
                  tmem_c_res.mma_fused_sf(
-@@ -1423,6 +1557,7 @@ def create_mma_task(
+@@ -1423,6 +1589,7 @@ def create_mma_task(
                  tmem_sfb_res,
                  tmem_sfab_res,
                  tmem_cast_a_res,
@@ -1836,7 +1868,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
              )
  
      def _release_mma_sources(
-@@ -1435,10 +1570,13 @@ def create_mma_task(
+@@ -1435,10 +1602,13 @@ def create_mma_task(
          tmem_sfb_res,
          tmem_sfab_res,
          tmem_cast_a_res,
@@ -1850,7 +1882,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          else:
              smem_a_res.release()
              smem_b_res.release()
-@@ -1450,12 +1588,16 @@ def create_mma_task(
+@@ -1450,12 +1620,16 @@ def create_mma_task(
          if has_separate_sf:
              tmem_sfa_res.release()
              tmem_sfb_res.release()
@@ -1867,7 +1899,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
      if has_fused_sf:
          src_resources += [smem_sfa, smem_sfb]
      if has_separate_sf:
-@@ -1467,6 +1609,8 @@ def create_mma_task(
+@@ -1467,6 +1641,8 @@ def create_mma_task(
      extra_resources = []
      if has_proxy:
          extra_resources.append(proxy_cluster)
@@ -1876,7 +1908,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
      if has_fused_sf:
          extra_resources += [smem_sfa, smem_sfb]
      if has_separate_sf:
-@@ -1475,11 +1619,14 @@ def create_mma_task(
+@@ -1475,11 +1651,14 @@ def create_mma_task(
          extra_resources.append(tmem_sfab)
      if has_cast_a:
          extra_resources.append(tmem_cast_a)
@@ -1892,7 +1924,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=src_resources,
          dst_resources=[tmem_c],
          warp_idx=cfg.mma_warp_idx,
-@@ -1574,7 +1721,8 @@ def create_epilogue_task(
+@@ -1574,7 +1753,8 @@ def create_epilogue_task(
          tmem_c,
          gmem_c,
      )
@@ -1902,7 +1934,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[tmem_c] + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[gmem_c],
          warp_idx=cfg.epilogue_warp_idx,
-@@ -1638,7 +1786,8 @@ def create_load_sfab_task(
+@@ -1638,7 +1818,8 @@ def create_load_sfab_task(
      if is_persistent:
          extra_resources.append(work_queue)
      captured_schedule = load_sfab_schedule(smem_dsfp8_sfab, *extra_resources)
@@ -1912,7 +1944,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=(
              _pdl_wait_resources(pdl_wait_resource)
              + ([work_queue] if cfg.is_persistent else [])
-@@ -1737,7 +1886,8 @@ def create_epilogue_task_dsfp8(
+@@ -1737,7 +1918,8 @@ def create_epilogue_task_dsfp8(
          smem_dsfp8_sfab,
          gmem_c,
      )
@@ -1922,7 +1954,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[tmem_c, smem_dsfp8_sfab]
          + ([work_queue] if cfg.is_persistent else []),
          dst_resources=[gmem_c],
-@@ -1788,7 +1938,8 @@ def create_workid_task(
+@@ -1788,7 +1970,8 @@ def create_workid_task(
          captured_schedule = workid_schedule(work_queue, work_throttle)
      else:
          captured_schedule = workid_schedule(work_queue)
@@ -1932,7 +1964,7 @@ index 08cf508e55eea69ab3d8539dad798ce6e245c4fa..17309986a08315a9760964fa0cfe9f05
          src_resources=[work_queue]
          + ([work_throttle] if work_throttle is not None else []),
          dst_resources=[work_queue],
-@@ -1821,7 +1972,8 @@ def create_padding_task(
+@@ -1821,7 +2004,8 @@ def create_padding_task(
      captured_schedule = (
          padding_schedule(work_queue) if is_persistent else padding_schedule()
      )

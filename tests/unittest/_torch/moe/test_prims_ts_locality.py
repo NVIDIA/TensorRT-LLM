@@ -226,6 +226,50 @@ def test_prims_ts_partitioned_persistent_graph(nvfp4, tactic, reuse, tokens, mon
             _assert_locality_close(actual, expected)
 
 
+@pytest.mark.skipif(get_sm_version() not in (100, 103, 107), reason="requires Blackwell or Rubin")
+@pytest.mark.parametrize("reuse", [2, 4])
+def test_prims_ts_multicast_receiver_pipeline_wrap(reuse, monkeypatch):
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.moe.custom_ops import prims_ts_moe as ops
+
+    torch.manual_seed(3207)
+    monkeypatch.setattr(ops, "_full_device_cluster_budget", lambda *args: 1)
+    (_, module), _ = make_moe_pair(
+        True, True, hidden=3584, intermediate=3072, experts=8, top_k=2, localize=False
+    )
+    x = torch.randn(256, 3584, device="cuda", dtype=torch.bfloat16) * 0.5
+    logits = torch.randn(256, 8, device="cuda")
+    with torch.inference_mode(), AutoTuner.get().capture() as capture:
+        module(x, logits)
+    context = next(
+        c for c in capture._captured_contexts if isinstance(c["runners"][0], ops.PrimsTSMoERunner)
+    )
+    runner, inputs = context["runners"][0], context["inputs"]
+    candidate = copy(runner)
+    candidate.fuse_finalize = True
+    actual, expected = torch.empty_like(x), torch.empty_like(x)
+    with torch.inference_mode():
+        runner(inputs, tactic=(32, 137), output=expected)
+        candidate(inputs, tactic=(32, 137, reuse), output=actual)
+        torch.cuda.synchronize()
+        _assert_locality_close(actual, expected, fused=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(4):
+                candidate(inputs, tactic=(32, 137, reuse), output=actual)
+        # Fourteen K tiles exceed the nine-stage ring. One resident cluster
+        # revisits many expert tiles so inactive receiver warps can otherwise
+        # miss a complete empty-barrier phase while their peers make progress.
+        for _ in range(5):
+            inputs[-1].add_(1).remainder_(8)
+            inputs[-2].uniform_(0.1, 0.9)
+            runner(inputs, tactic=(32, 137), output=expected)
+            for _ in range(1000):
+                graph.replay()
+            torch.cuda.synchronize()
+            _assert_locality_close(actual, expected, fused=True)
+
+
 @pytest.mark.skipif(get_sm_version() != 107, reason="requires Rubin locality domains")
 @pytest.mark.parametrize("nvfp4,mma_group", [(False, 2), (True, 1), (True, 2)])
 @pytest.mark.parametrize("reuse", [2, 4])
