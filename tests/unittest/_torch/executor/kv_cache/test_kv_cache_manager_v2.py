@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import array
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -2149,11 +2150,24 @@ class _FakeLogger:
 
 
 class _FakeWindowedKVCache:
+    """Matches the production contract: get_base_page_indices() is padded to
+    max_blocks_per_seq with BAD_PAGE_INDEX, and num_blocks bounds the entries
+    that belong to the sequence."""
+
+    _MAX_BLOCKS_PER_SEQ = 256
+
     def __init__(self, page_indices: dict[int, list[int]]) -> None:
         self._page_indices = page_indices
 
+    @property
+    def num_blocks(self) -> int:
+        return max(len(indices) for indices in self._page_indices.values())
+
     def get_base_page_indices(self, layer_group_id, beam_id=DEFAULT_BEAM_INDEX):
-        return self._page_indices[int(layer_group_id)]
+        indices = self._page_indices[int(layer_group_id)]
+        return array.array(
+            "i", indices + [BAD_PAGE_INDEX] * (self._MAX_BLOCKS_PER_SEQ - len(indices))
+        )
 
 
 def _make_window_crossing_manager() -> KVCacheManagerV2:

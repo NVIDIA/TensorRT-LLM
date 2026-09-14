@@ -2274,7 +2274,14 @@ class KVCacheManagerV2(BaseResourceManager):
     def _describe_page_indices(self, kv_cache: _KVCache, layer_group_id: int) -> str:
         """Block ids backing a layer group, abbreviated to a count and a range."""
         try:
-            indices = list(kv_cache.get_base_page_indices(layer_group_id))
+            # get_base_page_indices() pads to max_blocks_per_seq with BAD_PAGE_INDEX;
+            # only the first num_blocks entries belong to the sequence, and recycled
+            # (windowed) blocks within that range are BAD_PAGE_INDEX too.
+            indices = [
+                p
+                for p in kv_cache.get_base_page_indices(layer_group_id)[: kv_cache.num_blocks]
+                if p != BAD_PAGE_INDEX
+            ]
         except Exception as exc:  # pragma: no cover - diagnostics must never break a run
             return f"<unavailable: {exc}>"
         if not indices:
