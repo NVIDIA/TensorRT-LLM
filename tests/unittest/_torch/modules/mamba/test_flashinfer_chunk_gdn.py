@@ -137,12 +137,14 @@ def test_preallocated_state_workspace(num_seqs, inplace):
     )
     expected_pool = initial.clone()
     expected, expected_state = chunk_gated_delta_rule(initial_state=expected_pool, **args)
-    workspace = torch.empty(
-        (2, max(32, num_seqs), *initial.shape[1:]),
+    state_in = torch.empty(
+        (max(32, num_seqs), *initial.shape[1:]),
         device=q.device,
         dtype=q.dtype if is_sm_100f() else torch.float32,
     )
-    workspace.fill_(float("nan"))
+    workspace = (state_in, torch.empty_like(state_in))
+    for buffer in workspace:
+        buffer.fill_(float("nan"))
     with patch.object(
         flashinfer, "chunk_gated_delta_rule", wraps=flashinfer.chunk_gated_delta_rule
     ) as call:
@@ -152,7 +154,7 @@ def test_preallocated_state_workspace(num_seqs, inplace):
     if inplace and is_sm_100f():
         assert call.call_args.kwargs["initial_state"].data_ptr() == initial.data_ptr()
         assert call.call_args.kwargs["output_state"].data_ptr() == initial.data_ptr()
-        assert torch.isnan(workspace).all()
+        assert all(torch.isnan(buffer).all() for buffer in workspace)
     else:
         assert call.call_args.kwargs["initial_state"].data_ptr() == workspace[0].data_ptr()
         assert call.call_args.kwargs["output_state"].data_ptr() == workspace[1].data_ptr()
@@ -161,8 +163,25 @@ def test_preallocated_state_workspace(num_seqs, inplace):
     if not inplace:
         torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
         # Returned state must not alias scratch reused by another layer.
-        assert actual_state.untyped_storage().data_ptr() != workspace.untyped_storage().data_ptr()
-    assert torch.isnan(workspace[:, num_seqs:]).all()
+        assert all(
+            actual_state.untyped_storage().data_ptr() != buffer.untyped_storage().data_ptr()
+            for buffer in workspace
+        )
+    assert all(torch.isnan(buffer[num_seqs:]).all() for buffer in workspace)
+
+
+@pytest.mark.parametrize("with_workspace", [False, True])
+def test_state_workspace_dispatch(monkeypatch, with_workspace):
+    """Do not pass the FlashInfer-only option to the Triton fallback."""
+    from unittest.mock import Mock
+
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
+
+    impl = Mock()
+    monkeypatch.setattr(mixer, "_resolve_chunk_gated_delta_rule", lambda: impl)
+    workspace = (torch.empty(1), torch.empty(1)) if with_workspace else None
+    mixer.chunk_gated_delta_rule(state_workspace=workspace)
+    assert impl.call_args.kwargs == ({"state_workspace": workspace} if with_workspace else {})
 
 
 @pytest.mark.parametrize("native_state", [False, True])
@@ -194,13 +213,20 @@ def test_state_workspace_warmup_and_reuse(
         assert workspace is None
         assert config.extra_attrs == {}
     else:
-        assert workspace.shape == (2, capacity, 2, 4, 4)
-        assert workspace.dtype == torch.float32
+        assert isinstance(workspace, tuple) and len(workspace) == 2
+        assert all(buffer.shape == (capacity, 2, 4, 4) for buffer in workspace)
+        assert all(buffer.dtype == torch.float32 for buffer in workspace)
+        assert (
+            workspace[0].untyped_storage().data_ptr() != workspace[1].untyped_storage().data_ptr()
+        )
     metadata.is_warmup = False
     other_layer = SimpleNamespace(model_config=config)
     with monkeypatch.context() as context:
         context.setattr(
             torch, "empty", lambda *args, **kwargs: pytest.fail("unexpected allocation")
+        )
+        context.setattr(
+            torch, "empty_like", lambda *args, **kwargs: pytest.fail("unexpected allocation")
         )
         assert get_workspace(layer, metadata, state) is workspace
         assert get_workspace(other_layer, metadata, state) is workspace
@@ -274,7 +300,8 @@ def test_state_workspace_maximum_batch_and_cuda_graph():
     for _ in range(3):
         # Simulate another layer overwriting the shared scratch between replays.
         if workspace is not None:
-            workspace.fill_(float("nan"))
+            for buffer in workspace:
+                buffer.fill_(float("nan"))
         pool.zero_()
         graph.replay()
         torch.cuda.synchronize()

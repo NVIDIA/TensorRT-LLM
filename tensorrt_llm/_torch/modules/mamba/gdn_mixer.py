@@ -73,7 +73,11 @@ def _resolve_chunk_gated_delta_rule():
 
 
 @torch.compiler.disable
-def chunk_gated_delta_rule(*args, **kwargs):
+def chunk_gated_delta_rule(
+    *args, state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None, **kwargs
+):
+    if state_workspace is not None:
+        kwargs["state_workspace"] = state_workspace
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
 
 
@@ -741,9 +745,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_prefill = kwargs["num_prefill"]
         num_decodes = kwargs["num_decodes"]
 
-        state_workspace = kwargs.get("state_workspace")
-        chunk_kwargs = {"state_workspace": state_workspace} if state_workspace is not None else {}
-
         conv_states_to_use = conv_states
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
@@ -894,7 +895,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     head_first=False,
                     use_qk_l2norm_in_kernel=False,
                     output=output_p,
-                    **chunk_kwargs,
+                    state_workspace=kwargs.get("state_workspace"),
                 )
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
@@ -1010,33 +1011,32 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             head_first=False,
             use_qk_l2norm_in_kernel=False,
             output=output,
-            **chunk_kwargs,
+            state_workspace=kwargs.get("state_workspace"),
         )
 
         return core_attn_out
 
     def _get_prefill_state_workspace(
         self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         # Blackwell uses indexed pool I/O directly, without state scratch.
         if not _use_flashinfer_gdn_prefill() or is_sm_100f():
             return None
-        dtype = torch.float32
-        key = (ssm_states.device, dtype, tuple(ssm_states.shape[1:]))
-        # Layers execute sequentially and share one pair of state I/O buffers.
-        # Keep them alive after profiling instead of allocating a pair per layer.
+        key = (ssm_states.device, ssm_states.shape[1:])
+        # Sequential layers share persistent input/output scratch, sized at warmup.
         workspaces = self.model_config.extra_attrs.setdefault("gdn_state_workspaces", {})
         workspace = workspaces.get(key)
-        if attn_metadata.is_warmup:
-            capacity = min(
-                attn_metadata.max_num_sequences or attn_metadata.max_num_requests,
-                attn_metadata.max_num_tokens,
+        if not attn_metadata.is_warmup:
+            return workspace
+        capacity = min(
+            attn_metadata.max_num_sequences or attn_metadata.max_num_requests,
+            attn_metadata.max_num_tokens,
+        )
+        if workspace is None or workspace[0].shape[0] < capacity:
+            state_in = torch.empty(
+                (capacity, *ssm_states.shape[1:]), dtype=torch.float32, device=ssm_states.device
             )
-            if workspace is None or workspace.shape[1] < capacity:
-                workspace = torch.empty(
-                    (2, capacity, *ssm_states.shape[1:]), dtype=dtype, device=ssm_states.device
-                )
-                workspaces[key] = workspace
+            workspace = workspaces[key] = (state_in, torch.empty_like(state_in))
         return workspace
 
     def forward(
