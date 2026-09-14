@@ -293,7 +293,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.dynamic_tree_max_topK` | `int\|none` | `value` |  |
 | `speculative_config.eagle3_layers_to_capture` | `none\|set[int]` | `value` |  |
 | `speculative_config.eagle3_model_arch` | `literal` | `categorical` | `llama3`, `mistral_large3` |
-| `speculative_config.eagle_choices` | `list[list[int]]\|none` | `value` |  |
 | `speculative_config.enable_global_pool` | `bool` | `value` |  |
 | `speculative_config.enable_penalty` | `bool` | `value` |  |
 | `speculative_config.end_thinking_phase_token` | `int` | `value` |  |

@@ -94,15 +94,11 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.is_first_draft = True
         self.spec_tree_manager = None
 
-        if isinstance(config,
-                      EagleDecodingConfig) and (config.eagle_choices is not None
-                                                or config.use_dynamic_tree):
+        if isinstance(config, EagleDecodingConfig) and config.use_dynamic_tree:
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
-                use_dynamic_tree=config.use_dynamic_tree,
                 max_draft_len=self.max_draft_len,
                 max_total_draft_tokens=self.max_total_draft_tokens,
-                eagle_choices=config.eagle_choices,
                 dynamic_tree_max_topK=config.dynamic_tree_max_topK,
             )
 
@@ -174,10 +170,8 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
         )
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
-            use_dynamic_tree=config.use_dynamic_tree,
             max_draft_len=config.max_draft_len,
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
-            eagle_choices=config.eagle_choices,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
         )
 
@@ -224,7 +218,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     spec_resource_manager: Optional[Eagle3ResourceManager] = None
     # Dynamic tree flags
     use_dynamic_tree: bool = False
-    eagle_choices: Optional[List[List[int]]] = None
     # Slot IDs for each request; populated in prepare() when spec_resource_manager
     # is present (required for relaxed acceptance, mirrors MTPSpecMetadata.slot_ids).
     slot_ids: Optional[torch.Tensor] = None
@@ -312,15 +305,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         )
 
         # Set tree flags based on config
-        if self.use_dynamic_tree:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = True
-        elif self.eagle_choices is not None:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = False
-        else:
-            self.is_spec_dec_tree = False
-            self.is_spec_dec_dynamic_tree = False
+        self.is_spec_dec_tree = self.use_dynamic_tree
+        self.is_spec_dec_dynamic_tree = self.use_dynamic_tree
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
