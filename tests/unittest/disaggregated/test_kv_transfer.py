@@ -1653,7 +1653,7 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=0,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
