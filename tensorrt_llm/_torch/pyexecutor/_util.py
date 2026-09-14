@@ -2897,8 +2897,7 @@ def _create_kv_cache_manager(
 
         # Tree attention: replay assumes linear token sequence.
         if (spec_config is not None
-                and (getattr(spec_config, 'eagle_choices', None) is not None
-                     or getattr(spec_config, 'use_dynamic_tree', False))):
+                and getattr(spec_config, 'use_dynamic_tree', False)):
             logger.info("Replay kernel incompatible with tree attention; "
                         "using legacy MTP path")
             use_replay = False
@@ -3006,8 +3005,7 @@ def _create_kv_cache_manager(
 
         # Tree attention: replay assumes a linear token sequence.
         if (spec_config is not None
-                and (getattr(spec_config, 'eagle_choices', None) is not None
-                     or getattr(spec_config, 'use_dynamic_tree', False))):
+                and getattr(spec_config, 'use_dynamic_tree', False)):
             logger.info("GDN replay kernel incompatible with tree attention; "
                         "using legacy MTP path")
             use_replay = False

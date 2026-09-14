@@ -6098,7 +6098,6 @@ class PyTorchModelEngine(ModelEngine):
 
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
-                    and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
                     execution_requests.context_requests,
