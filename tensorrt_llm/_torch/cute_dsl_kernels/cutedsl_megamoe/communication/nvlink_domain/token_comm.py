@@ -112,7 +112,7 @@ class _MetadataPushRouter(KernelComponent):
     sorted_metadata_region = "nvlink.token_comm.sorted_metadata"
     sorted_scores_region = "nvlink.token_comm.sorted_scores"
     pool_expert_base_region = "nvlink.token_comm.pool_expert_base"
-    token_src_metadata_region = "nvlink.token_comm.token_src_metadata"
+    token_src_metadata_region = "nvlink.token_comm.token_src_metadata"  # nosec B105
     fc1_topk_scores_region = "nvlink.token_comm.fc1_topk_scores"
     source_expert_base_region = "nvlink.token_comm.source_expert_base"
     push_destination_base_region = "nvlink.token_comm.push_destination_base"
@@ -1294,15 +1294,15 @@ class TokenCommNonDeterministic(KernelComponent):
     fc2_activation_sf_region = "nvlink.token_comm.fc2_activation_sf"
     pre_reduced_activation_region = "nvlink.token_comm.pre_reduced_activation"
     pre_reduced_activation_sf_region = "nvlink.token_comm.pre_reduced_activation_sf"
-    token_back_schedule_region = "nvlink.token_comm.token_back_schedule"
+    token_back_schedule_region = "nvlink.token_comm.token_back_schedule"  # nosec B105
 
-    token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"
-    token_back_mbarrier_region = "nvlink.token_comm.main_smem.token_back_mbarriers"
+    token_in_mbarrier_region = "nvlink.token_comm.main_smem.token_in_mbarriers"  # nosec B105
+    token_back_mbarrier_region = "nvlink.token_comm.main_smem.token_back_mbarriers"  # nosec B105
     expert_sizes_smem_region = "nvlink.token_comm.main_smem.expert_sizes"
-    token_in_activation_smem_region = "nvlink.token_comm.main_smem.token_in_activation"
-    token_in_sf_smem_region = "nvlink.token_comm.main_smem.token_in_sf"
-    token_back_activation_smem_region = "nvlink.token_comm.main_smem.token_back_activation"
-    token_back_sf_smem_region = "nvlink.token_comm.main_smem.token_back_sf"
+    token_in_activation_smem_region = "nvlink.token_comm.main_smem.token_in_activation"  # nosec B105
+    token_in_sf_smem_region = "nvlink.token_comm.main_smem.token_in_sf"  # nosec B105
+    token_back_activation_smem_region = "nvlink.token_comm.main_smem.token_back_activation"  # nosec B105
+    token_back_sf_smem_region = "nvlink.token_comm.main_smem.token_back_sf"  # nosec B105
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -1456,7 +1456,7 @@ class TokenCommNonDeterministic(KernelComponent):
 
     @property
     def token_back_push_data(self) -> bool:
-        return self.token_back_mode != "epi_warps"
+        return self.token_back_mode != "epi_warps"  # nosec B105
 
     @property
     def token_back_push_sf(self) -> bool:
@@ -1680,7 +1680,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 buffer_space="local",
                 byte_alignment=128,
             )
-        if self.token_back_enabled and self.token_back_schedule_mode == "atomic_counter":
+        if self.token_back_enabled and self.token_back_schedule_mode == "atomic_counter":  # nosec B105
             workspace.register(
                 self.token_back_schedule_region,
                 cutlass.Int32,
@@ -1739,14 +1739,14 @@ class TokenCommNonDeterministic(KernelComponent):
         if not self.token_back_enabled:
             return
 
-        if self.token_back_mode == "standalone_warps":
+        if self.token_back_mode == "standalone_warps":  # nosec B105
             token_back_lifetime = workspace.create_overlay(
                 "nvlink.token_comm.main_smem.standalone_token_back"
             ).add_lifetime("token_back")
         else:
             token_back_lifetime = transfer_overlay.add_lifetime("token_back")
 
-        if self.token_back_mode == "standalone_warps":
+        if self.token_back_mode == "standalone_warps":  # nosec B105
             available_bytes_per_warp = self.standalone_chunk_bytes
         else:
             activation_bytes = self.bytes_per_token
@@ -1757,14 +1757,14 @@ class TokenCommNonDeterministic(KernelComponent):
             bytes_per_output_token = (
                 self.hidden_size * int(self.combine_format.act_dtype.width) // 8
             )
-            if self.token_back_mode == "standalone_warps":
+            if self.token_back_mode == "standalone_warps":  # nosec B105
                 chunk_bytes = self.standalone_chunk_bytes
             elif available_bytes_per_warp < bytes_per_output_token:
                 chunk_bytes = self.bytes_per_token
             else:
                 chunk_bytes = bytes_per_output_token
             if (
-                self.token_back_mode != "standalone_warps"
+                self.token_back_mode != "standalone_warps"  # nosec B105
                 and bytes_per_output_token % chunk_bytes != 0
             ):
                 raise ValueError("Token-back data chunk bytes must divide one row.")
@@ -1935,7 +1935,7 @@ class TokenCommNonDeterministic(KernelComponent):
         )
         token_in_size_barrier.arrive_and_wait()
         iket.range_pop()
-        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):
+        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
             sizes_ready_barrier = pipeline.NamedBarrier(
                 barrier_id=self.standalone_size_barrier_id,
                 num_threads=2 * self.transfer_thread_count,
@@ -2098,7 +2098,7 @@ class TokenCommNonDeterministic(KernelComponent):
         cute.arch.sync_warp()
         iket.range_pop()
         if cutlass.const_expr(
-            self.token_back_enabled and self.token_back_mode != "standalone_warps"
+            self.token_back_enabled and self.token_back_mode != "standalone_warps"  # nosec B105
         ):
             iket.range_push("token_in.transfer_barrier")
             transfer_lifetime_barrier = pipeline.NamedBarrier(
@@ -2185,7 +2185,7 @@ class TokenCommNonDeterministic(KernelComponent):
         cute.arch.sync_warp()
 
         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
-        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):
+        if cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
             sizes_ready_barrier = pipeline.NamedBarrier(
                 barrier_id=self.standalone_size_barrier_id,
                 num_threads=2 * self.transfer_thread_count,
@@ -2201,7 +2201,7 @@ class TokenCommNonDeterministic(KernelComponent):
             activation_chunk_count = ceil_div(output_token_bytes, activation_chunk_bytes)
             data_window_unit = activation_chunk_bytes * 2
             reuse_data_pacing_enabled = (
-                self.token_back_mode == "reuse_dispatch_warps"
+                self.token_back_mode == "reuse_dispatch_warps"  # nosec B105
                 and data_window_unit > self.minimum_pacing_window_cycles
             )
             # Preserve the empirical low:initial:high ratio of 1:2.5:5.
@@ -2216,7 +2216,7 @@ class TokenCommNonDeterministic(KernelComponent):
             sf_chunk_count = ceil_div(output_sf_bytes, sf_chunk_bytes)
             sf_window_unit = ceil_div(sf_chunk_bytes * 2, 3)
             reuse_sf_pacing_enabled = (
-                self.token_back_mode == "reuse_dispatch_warps"
+                self.token_back_mode == "reuse_dispatch_warps"  # nosec B105
                 and sf_window_unit > self.minimum_pacing_window_cycles
             )
             sf_average_window = Int32(sf_window_unit)
@@ -2224,7 +2224,7 @@ class TokenCommNonDeterministic(KernelComponent):
             sf_high_window = sf_window_unit * 2
 
         next_dense_token = global_worker_idx - global_worker_count
-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
             next_dense_token = Int32(0)
         next_dense_token = self.next_token(next_dense_token)
         expert_valid_begin = Int32(0)
@@ -2292,7 +2292,7 @@ class TokenCommNonDeterministic(KernelComponent):
                         current_chunk_bytes = Int32(chunk_bytes_this_round)
                         current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
                         stateless_data_pacing_enabled = (
-                            self.token_back_mode != "reuse_dispatch_warps"
+                            self.token_back_mode != "reuse_dispatch_warps"  # nosec B105
                             and current_window_unit > self.minimum_pacing_window_cycles
                         )
                         round_start_clock = Int64(0)
@@ -2381,7 +2381,7 @@ class TokenCommNonDeterministic(KernelComponent):
                         current_chunk_bytes = Int32(chunk_bytes_this_round)
                         current_window_unit = ceil_div(chunk_bytes_this_round * 2, 3)
                         stateless_sf_pacing_enabled = (
-                            self.token_back_mode != "reuse_dispatch_warps"
+                            self.token_back_mode != "reuse_dispatch_warps"  # nosec B105
                             and current_window_unit > self.minimum_pacing_window_cycles
                         )
                         round_start_clock = Int64(0)
@@ -2443,9 +2443,9 @@ class TokenCommNonDeterministic(KernelComponent):
     def next_token(self, current_token: Int32) -> Int32:
         global_worker_count = self.promised_launchable_sm_count * self.transfer_warp_count
         schedule_counter = None
-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
             schedule_counter = self._device_workspace.ptr(self.token_back_schedule_region)
-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
             claimed_token = Int32(0)
             if self._lane_idx == Int32(0):
                 claimed_token = cute.arch.atomic_add(

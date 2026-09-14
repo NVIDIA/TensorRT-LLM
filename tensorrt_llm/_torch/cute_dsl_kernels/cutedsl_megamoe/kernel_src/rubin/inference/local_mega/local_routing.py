@@ -181,7 +181,7 @@ class _MetadataPushRouter(KernelComponent):
     sorted_metadata_region = "local_mega.routing.sorted_metadata"
     sorted_scores_region = "local_mega.routing.sorted_scores"
     pool_expert_base_region = "local_mega.routing.pool_expert_base"
-    token_src_metadata_region = "local_mega.routing.token_src_metadata"
+    token_src_metadata_region = "local_mega.routing.token_src_metadata"  # nosec B105
     fc1_topk_scores_region = "local_mega.routing.fc1_topk_scores"
     source_expert_base_region = "local_mega.routing.source_expert_base"
     sorted_metadata_ready_region = "local_mega.routing.sorted_metadata_ready"
@@ -1219,9 +1219,9 @@ class LocalRouting(KernelComponent):
     fc1_activation_sf_region = "local_mega.routing.fc1_activation_sf"
     pre_reduced_activation_region = "local_mega.routing.pre_reduced_activation"
 
-    token_in_mbarrier_region = "local_mega.routing.main_smem.token_in_mbarriers"
+    token_in_mbarrier_region = "local_mega.routing.main_smem.token_in_mbarriers"  # nosec B105
     expert_sizes_smem_region = "local_mega.routing.main_smem.expert_sizes"
-    token_in_sf_smem_region = "local_mega.routing.main_smem.token_in_sf"
+    token_in_sf_smem_region = "local_mega.routing.main_smem.token_in_sf"  # nosec B105
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:

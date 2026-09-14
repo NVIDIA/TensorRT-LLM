@@ -154,7 +154,7 @@ class NonClcMixedCgaSchedulerWorker:
     cluster_broadcast_region = "non_clc_mixed_cga.cluster_broadcast"
     work_id_counter_region = "non_clc_mixed_cga.work_id_counters"
     fallback_registration_counter_region = "non_clc_mixed_cga.fallback_registration_counter"
-    fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"
+    fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"  # nosec B105
 
     def __init__(
         self,
