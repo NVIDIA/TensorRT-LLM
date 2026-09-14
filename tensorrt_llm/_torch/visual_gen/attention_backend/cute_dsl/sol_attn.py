@@ -139,7 +139,6 @@ class SolAttention(AttentionBackend):
         cfg = sparse_attention_config
         self.tau = getattr(cfg, "tau", 1.0)
         self.thresh_type = getattr(cfg, "thresh_type", "diag")
-        self.kv_splits = getattr(cfg, "kv_splits", "auto")
         self.disabled_until_timestep = getattr(cfg, "disabled_until_timestep", None)
         self.dense_layers = _parse_dense_layers(getattr(cfg, "dense_layers", None))
 
@@ -312,7 +311,6 @@ class SolAttention(AttentionBackend):
             v,
             tau=self.tau,
             thresh_type=self.thresh_type,
-            kv_splits=self.kv_splits,
             # Shape/dtype/arch ineligibility is only detectable inside the
             # wrapper, so that last delegation happens through this hook.
             dense_fn=lambda a, b, c: self._delegate(a, b, c, **kwargs),
