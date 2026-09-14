@@ -2732,6 +2732,10 @@ def _create_kv_cache_manager(
         # Glm5NextCacheManager. Must come before the is_mla(...) route: the
         # glm5_next text config carries MLA fields, but only 11 of its 45
         # layers are sparse MLA.
+        if kv_cache_dtype == tensorrt_llm.bindings.DataType.FP8:
+            raise ValueError(
+                "glm5_next does not support FP8 KV cache; use "
+                "kv_cache_config.dtype='auto' with a BF16 latent cache.")
         if max_beam_width > 1:
             raise ValueError("glm5_next + beam search is not supported yet.")
         if not estimating_kv_cache and kv_connector_manager is not None:

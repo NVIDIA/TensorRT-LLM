@@ -141,6 +141,57 @@ def test_cache_manager_routing_guards(route, monkeypatch):
             get_kv_cache_manager_cls(config, kv, True, transceiver)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fp8_kv_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
+def test_fp8_kv_cache_rejected_before_manager_construction(fp8_kv_cache):
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextCacheManager
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization import QuantAlgo
+
+    config = ModelConfig(
+        pretrained_config=_config().text_config,
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+            kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv_cache else None,
+        ),
+    )
+
+    class AllocationReached(Exception):
+        pass
+
+    with patch.object(Glm5NextCacheManager, "__new__", side_effect=AllocationReached) as allocate:
+        expected = ValueError if fp8_kv_cache else AllocationReached
+        message = "glm5_next does not support FP8 KV cache" if fp8_kv_cache else None
+        with pytest.raises(expected, match=message):
+            _create_kv_cache_manager(
+                model_engine=None,
+                kv_cache_manager_cls=Glm5NextCacheManager,
+                model_config=config,
+                mapping=Mapping(),
+                kv_cache_config=KvCacheConfig(
+                    use_kv_cache_manager_v2=True, enable_block_reuse=False
+                ),
+                tokens_per_block=32,
+                max_seq_len=128,
+                max_batch_size=1,
+                spec_config=None,
+                sparse_attention_config=None,
+                max_num_tokens=64,
+                max_beam_width=1,
+                kv_connector_manager=None,
+                dtype=torch.bfloat16,
+                is_draft=False,
+            )
+        if fp8_kv_cache:
+            allocate.assert_not_called()
+        else:
+            allocate.assert_called_once()
+            assert allocate.call_args.kwargs["dtype"] == DataType.BF16
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("deferred", [False, True])
 def test_encoder_only_factory_materializes_attention_weights(deferred):
