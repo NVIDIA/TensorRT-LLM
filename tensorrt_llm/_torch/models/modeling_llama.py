@@ -1135,6 +1135,14 @@ class LlamaModel(DecoderModel):
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
     @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Llama."""
+        return "V2"
+
+    @classmethod
     def get_preferred_transceiver_runtime(
         cls,
         pretrained_config: Any = None,
@@ -1504,6 +1512,22 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Llama4."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver for Llama4 NIXL disaggregated serving."""
+        return "PYTHON"
 
     def __init__(
         self,

@@ -49,10 +49,18 @@ ALL_FIELDS = [
     "primaryMaxNumBlocks",
     "primaryFreeNumBlocks",
     "primaryUsedNumBlocks",
+    "primaryEvictableNumBlocks",
+    "primaryPeakFreeNumBlocks",
+    "primaryPeakUsedNumBlocks",
+    "primaryPeakEvictableNumBlocks",
     # Instantaneous gauges — secondary (host) pool
     "secondaryMaxNumBlocks",
     "secondaryFreeNumBlocks",
     "secondaryUsedNumBlocks",
+    "secondaryEvictableNumBlocks",
+    "secondaryPeakFreeNumBlocks",
+    "secondaryPeakUsedNumBlocks",
+    "secondaryPeakEvictableNumBlocks",
     # Per-iteration deltas — context phase
     "iterAllocTotalBlocks",
     "iterAllocNewBlocks",
@@ -71,7 +79,21 @@ ALL_FIELDS = [
     # Intra-device (GPU → GPU) block copies
     "iterIntraDeviceCopyBlocks",
     "iterIntraDeviceCopyBytes",
+    # Host blocks dropped instead of being copied to another cold tier
+    "iterHostDroppedBlocks",
+    "iterHostDroppedBytes",
 ]
+
+SECONDARY_FIELDS = {
+    "secondaryMaxNumBlocks",
+    "secondaryFreeNumBlocks",
+    "secondaryUsedNumBlocks",
+    "secondaryEvictableNumBlocks",
+    "secondaryPeakFreeNumBlocks",
+    "secondaryPeakUsedNumBlocks",
+    "secondaryPeakEvictableNumBlocks",
+}
+NON_SECONDARY_FIELDS = set(ALL_FIELDS) - SECONDARY_FIELDS
 
 TEST_NAMES = {
     1: "Cold start",
@@ -383,26 +405,36 @@ class TestKvCacheIterationStats:
         assert total_alloc > 0, "iterAllocTotalBlocks = 0 across all entries"
 
     def test_field_completeness(self, llm_instance, all_collected, request):
-        """Field completeness — verify all 18 fields present across all collected stats."""
+        """Field completeness — verify fields in their manager-specific views."""
         # If running standalone (no prior tests), generate some traffic
         if not all_collected:
             llm_instance.generate(["Hello world"], SamplingParams(max_tokens=16))
             collect_stats(llm_instance, all_collected)
 
         entries_with_kv = 0
-        missing_fields = set()
         for s in all_collected:
             ki = s.get("kvCacheIterationStats")
             if ki:
                 entries_with_kv += 1
-                for ws, v in ki.items():
-                    for field in ALL_FIELDS:
-                        if field not in v:
-                            missing_fields.add(field)
+                is_v2 = "kvCacheIterationStatsByPoolGroup" in s
+                expected_fields = NON_SECONDARY_FIELDS if is_v2 else set(ALL_FIELDS)
+                for v in ki.values():
+                    missing_fields = expected_fields - v.keys()
+                    assert not missing_fields, (
+                        f"Missing kvCacheIterationStats fields: {sorted(missing_fields)}"
+                    )
+
+                if is_v2 and "kvCacheIterationStatsByColdPoolGroup" in s:
+                    cold_stats = s["kvCacheIterationStatsByColdPoolGroup"]
+                    for v in cold_stats.values():
+                        missing_fields = SECONDARY_FIELDS - v.keys()
+                        assert not missing_fields, (
+                            "Missing kvCacheIterationStatsByColdPoolGroup fields: "
+                            f"{sorted(missing_fields)}"
+                        )
 
         print(f"  Entries with kvCacheIterationStats: {entries_with_kv}/{len(all_collected)}")
         assert entries_with_kv > 0, "no entries contain kvCacheIterationStats"
-        assert len(missing_fields) == 0, f"Missing fields: {sorted(missing_fields)}"
 
 
 # ---------------------------------------------------------------------------
