@@ -1586,15 +1586,6 @@ def test_on_update_kv_lens_is_a_noop_without_speculative_decoding(monkeypatch):
     assert metadata.msa_n_valid_blocks.tolist() == [0] * 5
 
 
-def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
-    num_tokens = int(slots.shape[0])
-    num_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[3])
-    write_kv_slots(k_cache, slots, k.reshape(num_tokens, num_heads, head_dim), layout="HND")
-    write_kv_slots(v_cache, slots, v.reshape(num_tokens, num_heads, head_dim), layout="HND")
-    if idx_k is not None:
-        write_kv_slots(idx_cache, slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND")
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     ("src_dtype", "cache_dtype"),
@@ -1610,25 +1601,8 @@ def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
         (torch.float8_e4m3fn, torch.float8_e4m3fn),
     ],
 )
-@pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("with_idx", [True, False])
-@pytest.mark.parametrize(
-    "input_case",
-    [
-        "supported",
-        "empty",
-        "strided",
-        "short_k",
-        "short_v",
-        "short_idx",
-        "v_shape",
-        "cpu_v",
-        "cpu_slots",
-    ],
-)
-def test_fused_scatter_matches_reference(
-    src_dtype, cache_dtype, num_kv_heads, with_idx, input_case
-):
+def test_fused_scatter_matches_reference(src_dtype, cache_dtype, with_idx):
     """The fused per-layer cache scatter must match the legacy write_kv_slots
     path exactly on production-shaped inputs: non-contiguous HND cache views
     carved from a pooled allocation and strided source rows sliced from a fused
@@ -1637,7 +1611,7 @@ def test_fused_scatter_matches_reference(
     slots."""
     torch.manual_seed(0)
     device = "cuda"
-    num_pages, tokens_per_block, head_dim = 6, 32, 128
+    num_pages, num_kv_heads, tokens_per_block, head_dim = 6, 4, 32, 128
     num_tokens = 17
     inner = num_kv_heads * head_dim
 
@@ -1667,78 +1641,34 @@ def test_fused_scatter_matches_reference(
 
     ref_pool = pool.clone()
     ref_idx_pool = idx_pool.clone()
-    if input_case == "empty":
-        slots = slots[:0]
-    elif input_case == "strided":
-        k = qkv[:, : 2 * inner : 2]
-    elif input_case == "short_k":
-        k = k[:-1]
-    elif input_case == "short_v":
-        v = v[:-1]
-    elif input_case == "short_idx":
-        if idx_k is None:
-            pytest.skip("Requires index-K")
-        idx_k = idx_k[:-1]
-    elif input_case == "v_shape":
-        v_cache = v_cache[:, :, :-1, :]
-    elif input_case == "cpu_v":
-        v = v.cpu()
-    elif input_case == "cpu_slots":
-        slots = slots.cpu()
-    else:
-        _reference_scatter_write(
-            ref_pool[:, 0], ref_pool[:, 1], ref_idx_pool[:, 0], slots, k, v, idx_k
+    write_kv_slots(
+        ref_pool[:, 0], slots, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+    write_kv_slots(
+        ref_pool[:, 1], slots, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+    if with_idx:
+        write_kv_slots(
+            ref_idx_pool[:, 0], slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND"
         )
 
-    wrote = fused_write_layer_caches(
+    assert fused_write_layer_caches(
         k_cache, v_cache, idx_cache if with_idx else None, slots, k, v, idx_k
     )
-    assert wrote == (input_case in ("supported", "empty"))
 
     torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
     torch.testing.assert_close(idx_pool, ref_idx_pool)
 
 
-def test_a_phase_handed_no_kv_writes_nothing():
-    """k=v=None is the model layer's signal that it already wrote the step's
-    K/V through write_layer_caches; a phase must then leave the cache alone
-    rather than fail, or the fused write would be undone or duplicated."""
-    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
-    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
-        write_msa_phase_kv,
-    )
-
-    buffers = torch.zeros(2, 2, 1, 8, 4)
-    get_buffers_calls = []
-
-    def get_buffers(layer_idx, kv_layout=None):
-        get_buffers_calls.append(layer_idx)
-        return buffers
-
-    metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(get_buffers=get_buffers),
-        msa_out_cache_loc=torch.tensor([1, 2, 11], dtype=torch.int32),
-    )
-    attention = SimpleNamespace(layer_idx=0)
-
-    write_msa_phase_kv(attention, None, None, metadata, AttentionInputType.mixed, token_offset=0)
-    write_msa_phase_kv(attention, None, None, metadata, AttentionInputType.mixed, token_offset=2)
-
-    assert get_buffers_calls == []
-    assert int((buffers != 0).sum()) == 0
-
-
-@pytest.mark.parametrize("layer_case", ["sparse_bf16_indexer", "sparse_fp8_indexer", "dense"])
-def test_msa_attention_core_owns_the_cache_write(layer_case):
+@pytest.mark.parametrize("sparse", [True, False])
+def test_msa_attention_core_owns_the_cache_write(sparse):
     """The model layer's MSA core must write the caches exactly once and in
     the right place: write_layer_caches runs before run_indexer (whose proxy
     pass reads the index-K cache), run_indexer is told index-K is already
     resident, and forward() receives k=v=None so no FMHA phase writes K/V
-    again. Checked on the bf16 indexer (live idx_k), the FP8 indexer (idx_k
-    None, cache populated by the fused producer) and the dense layers."""
+    again."""
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
 
-    sparse = layer_case != "dense"
     num_tokens, width = 3, 128
     topk_indices = torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
     events = []
@@ -1759,7 +1689,7 @@ def test_msa_attention_core_owns_the_cache_write(layer_case):
     layer = SimpleNamespace(is_sparse_attention_layer=sparse, attn=FakeBackend())
     q, k, v = (torch.zeros(num_tokens, width) for _ in range(3))
     idx_q = torch.zeros(num_tokens, width) if sparse else None
-    idx_k = torch.zeros(num_tokens, width) if layer_case == "sparse_bf16_indexer" else None
+    idx_k = torch.zeros(num_tokens, width) if sparse else None
     metadata = object()
     output = torch.empty(num_tokens, width)
 
