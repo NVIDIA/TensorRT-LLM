@@ -257,9 +257,8 @@ class ModelConfig(Generic[TConfig]):
     use_low_precision_moe_combine: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
-    # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
     nvfp4_gemm_allowed_backends: List[str] = field(
-        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
