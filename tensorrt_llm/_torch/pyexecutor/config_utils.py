@@ -797,6 +797,49 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     laguna="LagunaConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
+_NEMOTRON_H_LEGACY_LAYER_TYPES = {
+    "linear_attention": "mamba",
+    "full_attention": "attention",
+}
+
+
+def nemotron_h_legacy_layer_types(config_dict):
+    """``config_dict`` respelled with pre-5.13 Nemotron-H layer names, else None.
+
+    transformers 5.13 renamed the per-layer vocabulary and made
+    ``hybrid_override_pattern`` a derived property that is no longer serialized,
+    so a checkpoint re-saved under a newer transformers cannot be parsed by the
+    pinned one. Restoring the legacy spelling regenerates the pattern, which the
+    Nemotron-H model path reads for its layer counts and mamba/attention masks.
+    """
+    if config_dict.get("model_type") != "nemotron_h":
+        return None
+    patched = dict(config_dict)
+    renamed = False
+    for field in ("layers_block_type", "mtp_layers_block_type"):
+        layer_types = patched.get(field)
+        if not isinstance(layer_types, list):
+            continue
+        renamed |= any(t in _NEMOTRON_H_LEGACY_LAYER_TYPES for t in layer_types)
+        patched[field] = [
+            _NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types
+        ]
+    return patched if renamed else None
+
+
+def match_nemotron_h_layer_types(model_config, layer_types):
+    """``layer_types`` respelled to match ``model_config``'s own vocabulary.
+
+    Assigning to a config bypasses ``__init__``, and with it transformers'
+    legacy-to-modern remap, so a mismatched spelling is stored unvalidated and
+    surfaces only when a pattern is later derived from it.
+    """
+    native = getattr(model_config, "layers_block_type", None) or []
+    if any(t in _NEMOTRON_H_LEGACY_LAYER_TYPES for t in native):
+        modern = {v: k for k, v in _NEMOTRON_H_LEGACY_LAYER_TYPES.items()}
+        return [modern.get(t, t) for t in layer_types]
+    return [_NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types]
+
 
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
@@ -946,8 +989,18 @@ def load_pretrained_config(model_name_or_path: str,
         }
         model_config = CONFIG_MAPPING[model_type].from_dict(patched_dict)
     else:
-        model_config = transformers.AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code)
+        try:
+            model_config = transformers.AutoConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=trust_remote_code)
+        except Exception:
+            # Retried only on failure, so a transformers that parses the
+            # checkpoint itself never reaches this.
+            renamed = nemotron_h_legacy_layer_types(config_dict)
+            if renamed is None:
+                raise
+            from transformers.models.auto.configuration_auto import \
+                CONFIG_MAPPING
+            model_config = CONFIG_MAPPING[model_type].from_dict(renamed)
 
     # Transformers 5.x sets rope_scaling to {"rope_type": "default"} instead
     # of None for models with standard RoPE (no scaling).  Clear it so that
