@@ -787,6 +787,9 @@ class PerfTestConfig:
             f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
         assert self.backend in ["pytorch", "_autodeploy"], \
             f"Unsupported backend '{self.backend}'."
+        if self.runtime == "serve":
+            assert self.backend == "pytorch", \
+                "The serve runtime supports only the pytorch backend."
 
         if self.moe_backend is not None:
             assert self.moe_backend, "moe backend must not be empty!"
