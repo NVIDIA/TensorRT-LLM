@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -671,6 +672,31 @@ def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endp
     body = resp.json()
     _assert_llm_envelope(body, code=400)
     assert "path" in body["message"] and "disabled" in body["message"]
+
+
+def test_the_default_media_storage_path_is_timestamped(monkeypatch):
+    """Without ``TRTLLM_MEDIA_STORAGE_PATH`` each server gets its own
+    timestamped directory, so servers running side by side do not write their
+    media into a shared one."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
+        server = OpenAIServer(
+            generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+            model="test-model",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+
+    assert server.media_storage_path.parent == Path("/tmp/trtllm_generated")
+    # Raises if the directory name is not a yymmdd-hhmmss stamp.
+    datetime.strptime(server.media_storage_path.name, "%y%m%d-%H%M%S")
 
 
 # =========================================================================

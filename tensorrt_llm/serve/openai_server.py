@@ -924,10 +924,15 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
+        # Default to a per-server directory so concurrent servers keep their
+        # media apart. An explicit path is used as given.
+        default_storage_path = (
+            f"/tmp/trtllm_generated/"  # nosec B108
+            f"{datetime.now().strftime('%y%m%d-%H%M%S')}")
         self.media_storage_path = Path(
-            os.getenv("TRTLLM_MEDIA_STORAGE_PATH",
-                      "/tmp/trtllm_generated"))  # nosec B108
+            os.getenv("TRTLLM_MEDIA_STORAGE_PATH", default_storage_path))
         self.media_storage_path.mkdir(exist_ok=True, parents=True)
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
 
     def _supports_image_edit(self) -> bool:
