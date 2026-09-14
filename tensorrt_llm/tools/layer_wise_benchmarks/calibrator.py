@@ -26,6 +26,7 @@ _LAYER_LIST_ATTRS = ("layers", "block", "blocks", "h")
 # `language_model`, and the plain causal-LM wrappers under `model`.
 _INNER_MODEL_ATTRS = ("model", "llm", "language_model")
 
+# Unwraps, not objects examined: the root plus this many levels are searched.
 _MAX_UNWRAP_DEPTH = 4
 
 
@@ -81,7 +82,10 @@ def _decoder_layers(model):
     """
     seen = []
     obj = model
-    for _ in range(_MAX_UNWRAP_DEPTH):
+    # +1: the budget counts UNWRAPS, and the object reached by the last one has
+    # to be examined or it is not an unwrap at all. Plain `range(depth)` looked
+    # at the root and three levels while the name promised four.
+    for _ in range(_MAX_UNWRAP_DEPTH + 1):
         layers = _layer_list(obj)
         if layers is not None:
             return layers
