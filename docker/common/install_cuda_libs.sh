@@ -19,9 +19,10 @@ CUBLAS_VER="13.7.0.27-1"
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"
 CUDA_RUNTIME="13.4.49-1" # rockylinux only
-# rockylinux only. Pin the cuda-compat that ships with CUDA_VER; the DLFW image reports a
-# CUDA_DRIVER_VERSION of its own that is typically never published as an rpm.
-CUDA_DRIVER_VERSION="615.71.09-1.el8"
+# Pin the cuda-compat that ships with CUDA_VER; the DLFW image reports a CUDA_DRIVER_VERSION
+# of its own that is typically never published as a package.
+CUDA_DRIVER_VERSION="615.71.09-1.el8" # rockylinux only
+CUDA_COMPAT_VER="615.71.09-1ubuntu1" # ubuntu only
 
 for i in "$@"; do
     case $i in
@@ -86,6 +87,13 @@ install_ubuntu_requirements() {
     # build needs (CUDA::nvrtc_static) is present. The public CUDA repo package has it.
     apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* || true
     PKGS_TO_INSTALL+=(cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER})
+
+    # Restore the cuda-compat providing libcuda.so.1, which the run-file reinstall purges and
+    # --toolkit does not bring back, and which the NIXL build needs. Test for the library, not
+    # the package: an image that kept its own CUDA also kept a cuda-compat of its own.
+    if [ -z "$(find /usr/local -name libcuda.so.1 -print -quit)" ]; then
+        PKGS_TO_INSTALL+=(cuda-compat-${NVRTC_CUDA_VERSION}=${CUDA_COMPAT_VER})
+    fi
 
     if [ ${#PKGS_TO_INSTALL[@]} -gt 0 ]; then
         apt-get install -y --no-install-recommends "${PKGS_TO_INSTALL[@]}"

@@ -57,7 +57,7 @@ reinstall_rockylinux_cuda() {
 reinstall_ubuntu_cuda() {
     apt-get update
     # install_cuda_libs.sh runs next and puts cuDNN/NCCL/cuBLAS/NVRTC back, along with the
-    # cuda-keyring this purge also takes out.
+    # cuda-keyring and the cuda-compat holding libcuda.so.1 this purge also takes out.
     apt-get remove --purge -y --allow-change-held-packages \
         "cuda*" "*cublas*" "*cufft*" "*cufile*" "*curand*" "*cusolver*" "*cusparse*" \
         "*gds-tools*" "*npp*" "*nvjpeg*" "nsight*" "*nvvm*"
