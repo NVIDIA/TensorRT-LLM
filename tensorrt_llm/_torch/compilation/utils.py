@@ -201,6 +201,21 @@ def inplace_info():
         "gdn_custom_op_inplace": {
             1: "output"
         },
+        # Registered lazily: the op only exists once mamba2_mixer is imported
+        # (Mamba2/NemotronH family). Void boundary op mutating ssm_out:
+        # auto_functionalized returns (None, ssm_out), hence index 1.
+        "mamba2_custom_op_inplace": {
+            1: "ssm_out"
+        },
+        # Registered lazily: the op only exists once mamba2_mixer is
+        # imported (Mamba2/NemotronH family). Void op mutating (state, out):
+        # auto_functionalized returns (None, state, out), hence indices 1/2.
+        # Without this entry the pass leaves the functionalization clone of
+        # the full per-layer SSM state cache in every decode graph.
+        "flashinfer_selective_state_update": {
+            1: "state",
+            2: "out"
+        },
         "minimax_m3_attn_custom_op_inplace": {
             1: "output"
         },
