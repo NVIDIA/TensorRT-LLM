@@ -16,6 +16,7 @@
 import json
 import os
 
+import jinja2
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (
@@ -531,8 +532,8 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 
 @pytest.mark.parametrize("parser", [
-    "deepseek-r1", "deepseek_v4", "qwen3", "qwen3_5", "minimax_m2",
-    "minimax_m3", "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
+    "deepseek-r1", "deepseek_v4", "qwen3_5", "minimax_m2", "minimax_m3",
+    "nemotron-v3", "nano-v3", "gemma4", "kimi_k2", "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
@@ -570,6 +571,56 @@ def test_poolside_v1_mode_resolved_from_prompt(prompt_tail: str,
     result = reasoning_parser.parse(model_output)
     assert result.content == content
     assert result.reasoning_content == reasoning_content
+
+
+def _parse_qwen3(chat_template_kwargs: dict[str, bool] | None, text: str,
+                 streaming: bool) -> tuple[str, str]:
+    """Parse with the `qwen3` parser, one character per delta when streaming."""
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3", chat_template_kwargs)
+    if not streaming:
+        result = reasoning_parser.parse(text)
+        return result.content, result.reasoning_content
+    results = [reasoning_parser.parse_delta(char) for char in text]
+    results.append(reasoning_parser.finish())
+    return ("".join(r.content for r in results), "".join(r.reasoning_content
+                                                         for r in results))
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    ("prompt_tail", "request_kwargs", "model_output", "content",
+     "reasoning_content"),
+    [
+        # Qwen3.8 prefills `<think>`, so the output has no start tag.
+        ("<think>\n", None, f"hidden\n{R1_END}\n\nvisible", "\n\nvisible",
+         "hidden\n"),
+        # Qwen3-8B and Qwen3.8 with `enable_thinking=False` prefill `</think>`.
+        ("<think>\n\n</think>\n\n", None, "visible", "visible", ""),
+        # Qwen3-8B prefills nothing; the model emits `<think>` itself, even
+        # when caller kwargs turn thinking on.
+        ("", None, f"{R1_START}\nhidden\n{R1_END}\n\nvisible", "\n\nvisible",
+         "\nhidden\n"),
+        ("", dict(enable_thinking=True), f"{R1_START}a{R1_END}b", "b", "a"),
+        ("", dict(thinking=True), f"{R1_START}a{R1_END}b", "b", "a"),
+    ])
+def test_qwen3_mode_resolved_from_prompt(prompt_tail: str,
+                                         request_kwargs: dict[str, bool] | None,
+                                         model_output: str, content: str,
+                                         reasoning_content: str,
+                                         streaming: bool) -> None:
+    """Mirror the server path on generation prompts of real Qwen3 templates.
+
+    A resolved mode overrides both keys, as the server does. Otherwise the
+    request kwargs stay, and a `<think>` the model emits must not leak.
+    """
+    prompt = f"<|im_start|>assistant\n{prompt_tail}"
+    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
+        "qwen3", prompt)
+    kwargs = request_kwargs if thinking is None else dict(
+        thinking=thinking, enable_thinking=thinking)
+    assert _parse_qwen3(kwargs, model_output,
+                        streaming) == (content, reasoning_content)
 
 
 TOOL_CALL = "<tool_call>"
@@ -853,6 +904,13 @@ def test_auto_detect_qwen3_hybrid(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "qwen3"
+    assert ReasoningParserFactory.resolves_thinking_from_prompt(result)
+
+    template = jinja2.Environment().from_string(_HYBRID_TEMPLATE)
+    for kwargs, thinking in (({}, True), ({"enable_thinking": False}, False)):
+        prompt = template.render(add_generation_prompt=True, **kwargs)
+        assert ReasoningParserFactory.resolve_prefilled_thinking(
+            result, prompt) is thinking
 
 
 def test_auto_detect_qwen3_forced_thinking(tmp_path):
