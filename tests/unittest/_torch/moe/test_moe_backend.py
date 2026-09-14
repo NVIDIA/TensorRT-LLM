@@ -1889,12 +1889,19 @@ def should_skip_locality_domain_param(
     activation_type: ActivationType,
     swiglu_gptoss_style: bool,
     dtype: torch.dtype,
+    intermediate_size: Optional[int] = None,
 ) -> Optional[str]:
     """Return a static skip reason for locality domain MoE backend params."""
     if backend_type != MoeBackendType.CUTEDSL:
         return "locality domain MoE backend test only supports CuteDSL"
-    if quant_algo not in (QuantAlgo.NVFP4, None):
-        return "locality domain MoE backend test only supports NVFP4 or BF16"
+    if quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.MXFP8, None):
+        return "locality domain MoE backend test only supports NVFP4, MXFP8 or BF16"
+    if (
+        quant_algo == QuantAlgo.MXFP8
+        and intermediate_size is not None
+        and intermediate_size % 256 != 0
+    ):
+        return "MXFP8 locality domain MoE splits the intermediate size into two 128-channel multiples"
     # plan_moe only enables the unquantized path for bfloat16 activations.
     if quant_algo is None and dtype != torch.bfloat16:
         return "unquantized locality domain MoE requires bfloat16"
@@ -2004,7 +2011,7 @@ def generate_test_params() -> List:
         )
         params.append(create_test_param(param_values, test_id))
 
-        if quant_algo in (QuantAlgo.NVFP4, None):
+        if quant_algo in (QuantAlgo.NVFP4, QuantAlgo.MXFP8, None):
             swiglu_gptoss_style = (
                 swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
             )
@@ -2014,6 +2021,7 @@ def generate_test_params() -> List:
                 ActivationType.Swiglu,
                 swiglu_gptoss_style,
                 dtype,
+                intermediate_size=model_config.intermediate_size,
             )
             locality_domain_param_values = (
                 dtype,
@@ -2374,7 +2382,16 @@ def test_moe_backend(
         )
         with torch.inference_mode(), autotune(cache_path=cache_path):
             _ = run_moe()
-        if enable_locality_domains:
+        if enable_locality_domains and quant_algo == QuantAlgo.MXFP8:
+            # The MXFP8 split is a separate autotuned op next to the unchanged
+            # full-GPU op; both are profiled for the admitted decode shapes.
+            expected_tuning_ops = (
+                "CuteDslFusedMoE::run_moe_mxfp8",
+                "CuteDslFusedMoE::run_moe_mxfp8::locality_domain",
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin"
+                "::locality_domain::locality_domain_concurrent",
+            )
+        elif enable_locality_domains:
             quant_name = "nvfp4" if quant_algo == QuantAlgo.NVFP4 else "bf16"
             expected_tuning_ops = (
                 f"CuteDslFusedMoE::run_moe_{quant_name}::locality_domain_end_to_end",
@@ -2384,6 +2401,7 @@ def test_moe_backend(
                 f"trtllm::cute_dsl_{quant_name}_grouped_gemm_finalize_"
                 "inplace_rubin::locality_domain_concurrent",
             )
+        if enable_locality_domains:
             for op_name in expected_tuning_ops:
                 assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
                 assert not autotuner.stats.failed_profiling_count.get(op_name, set())

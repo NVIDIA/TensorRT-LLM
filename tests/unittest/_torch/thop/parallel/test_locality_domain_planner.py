@@ -109,6 +109,7 @@ class TestLocalityDomainPolicy:
         assert "bf16_linear" in policy.allowed_ops
         assert "bf16_bmm" in policy.allowed_ops
         assert "nvfp4_moe" in policy.allowed_ops
+        assert "mxfp8_moe" in policy.allowed_ops
         assert "bf16_moe" in policy.allowed_ops
 
     def test_enabled(self):
@@ -649,12 +650,16 @@ class TestLocalityDomainExecutionPlanner:
 class _FakeMoeQuantMode:
     """Stub for MoE quant_config.quant_mode."""
 
-    def __init__(self, nvfp4: bool = True, any_quant: Optional[bool] = None):
+    def __init__(self, nvfp4: bool = True, any_quant: Optional[bool] = None, mxfp8: bool = False):
         self._nvfp4 = nvfp4
-        self._any_quant = nvfp4 if any_quant is None else any_quant
+        self._mxfp8 = mxfp8
+        self._any_quant = (nvfp4 or mxfp8) if any_quant is None else any_quant
 
     def has_nvfp4(self):
         return self._nvfp4
+
+    def has_mxfp8(self):
+        return self._mxfp8
 
     def has_any_quant(self):
         return self._any_quant
@@ -663,8 +668,8 @@ class _FakeMoeQuantMode:
 class _FakeMoeQuantConfig:
     """Stub for MoE QuantConfig."""
 
-    def __init__(self, nvfp4: bool = True, any_quant: Optional[bool] = None):
-        self.quant_mode = _FakeMoeQuantMode(nvfp4, any_quant)
+    def __init__(self, nvfp4: bool = True, any_quant: Optional[bool] = None, mxfp8: bool = False):
+        self.quant_mode = _FakeMoeQuantMode(nvfp4, any_quant, mxfp8)
 
 
 class TestLocalityDomainMoePlanner:
@@ -689,6 +694,40 @@ class TestLocalityDomainMoePlanner:
         assert plan.enabled
         assert plan.backend == "cutedsl"
         assert plan.merge_kind == "none"
+
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE", True)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    def test_moe_enabled_when_mxfp8(self, mock_locality_domain):
+        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=False, mxfp8=True))
+        assert plan.enabled
+        assert plan.backend == "cutedsl"
+        assert plan.merge_kind == "none"
+
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE", False)
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    def test_moe_disabled_when_mxfp8_without_fused_fc12(self, mock_locality_domain):
+        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=False, mxfp8=True))
+        assert not plan.enabled
+        assert "fused FC12" in plan.reason_if_disabled
+
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
+    @patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE", True)
+    def test_moe_disabled_when_mxfp8_not_in_allowed_ops(self, mock_locality_domain):
+        policy = LocalityDomainPolicy(enabled=True, allowed_ops=frozenset({"nvfp4_moe"}))
+        planner = LocalityDomainExecutionPlanner(policy)
+        plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=False, mxfp8=True))
+        assert not plan.enabled
+        assert "allowed_ops" in plan.reason_if_disabled
 
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True

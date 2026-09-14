@@ -891,6 +891,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         tiles: that keeps the original statically unrolled loop, which is faster
         when every group is live. The caller selects it per launch from the
         routing (only one loop body is ever compiled).
+    :param fc2_stream_weights: Cache policy for the FC2 B (weight) TMA loads
+        alone; ``None`` follows ``stream_weights``.
     :param stream_weights: Give the FC1/FC2 B (weight) TMA loads L2 evict-first
         priority. Intended for decode shapes with little weight reuse across M
         tiles (about seven or more active experts per rank); leave it False
@@ -911,10 +913,18 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         scheduler: str = "static",
         sparse_gather: bool = False,
         stream_weights: bool = False,
+        fc2_stream_weights: bool | None = None,
     ):
         self.sf_vec_size = sf_vec_size
         self.sparse_gather = sparse_gather
         self.stream_weights = stream_weights
+        # The FC2 weight loads may take a cache policy of their own. A
+        # localized inner-channel shard reduces FC2 over a short K, so its
+        # FC2 weight working set is small enough to keep in L2 while the FC1
+        # weights still stream; ``None`` inherits ``stream_weights``.
+        self.fc2_stream_weights = (
+            stream_weights if fc2_stream_weights is None else fc2_stream_weights
+        )
         self.topk = topk
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
@@ -3074,9 +3084,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     # guards) for full tiles, or the dynamic-trip-count loop that
                     # skips wholly padded 16-row groups for decode tiles. Only one
                     # body is traced, so neither variant pays for the other.
-                    if cutlass.const_expr(
-                        not (self.sparse_gather and self.a_dtype.width == 8)
-                    ):
+                    if cutlass.const_expr(not (self.sparse_gather and self.a_dtype.width == 8)):
                         for i in range(self.fc1_a_num_loads):
                             A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
                                 a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
@@ -3389,6 +3397,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             weight_cache_policy = None
             if cutlass.const_expr(self.stream_weights):
                 weight_cache_policy = streaming_weight_cache_policy()
+            fc2_weight_cache_policy = None
+            if cutlass.const_expr(self.fc2_stream_weights):
+                fc2_weight_cache_policy = streaming_weight_cache_policy()
             fc1_b_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -3548,7 +3559,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         tFC2BsB[(None, fc2_b_producer_state.index)],
                         tma_bar_ptr=fc2_b_barrier,
                         mcast_mask=b_full_mcast_mask,
-                        cache_policy=weight_cache_policy,
+                        cache_policy=fc2_weight_cache_policy,
                     )
                     cute.copy(
                         tma_atom_fc2_sfb,

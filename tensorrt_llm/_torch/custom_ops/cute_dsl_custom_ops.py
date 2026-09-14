@@ -16185,11 +16185,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # Gated separately from IS_CUTLASS_DSL_RUBIN_AVAILABLE: the vendored
         # kernel needs a newer internal DSL build (see cute_dsl_utils.py).
         if IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE:
+            from ..cute_dsl_kernels.rubin.moe.fused_fc12_workspace import \
+                reset_fc12_sync_workspace
             from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12 import (
                 Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel,
                 validate_l2_atomic_descriptor_bounds)
-            from ..cute_dsl_kernels.rubin.moe.fused_fc12_workspace import (
-                reset_fc12_sync_workspace)
             from ..cute_dsl_kernels.rubin.moe.utils import TRTLLM_ENABLE_PDL
 
             # MXFP8: E4M3 operands with UE8M0 scales over 32 elements.
@@ -16269,12 +16269,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                   MMA tile M (no B-reuse in the fused kernel).
 
                 Tactic: ``(mma_tiler, mma_inst_shape, cluster_shape_mn,
-                scheduler, stream_weights)`` with ``mma_tiler_m == mma_inst_m ==
-                tile_size``, ``mma_n in {128, 256}``, ``mma_tiler_k in {128,
-                256}`` (``UMMA_K = 64`` for FP8), ``cluster_shape_mn ==
-                (cta_group, 1)``, ``scheduler in {"l2_atomic", "static"}`` and
-                ``stream_weights`` selecting L2 evict-first weight loads (a
-                four-element tactic means ``stream_weights=False``).
+                scheduler, stream_weights, fc2_stream_weights)`` with
+                ``mma_tiler_m == mma_inst_m == tile_size``, ``mma_n in {128,
+                256}``, ``mma_tiler_k in {128, 256}`` (``UMMA_K = 64`` for
+                FP8), ``cluster_shape_mn == (cta_group, 1)``, ``scheduler in
+                {"l2_atomic", "static"}``, ``stream_weights`` selecting L2
+                evict-first weight loads and ``fc2_stream_weights`` the same
+                policy for the FC2 weight loads alone. Shorter tactics from
+                caches normalize: four elements mean ``stream_weights=False``,
+                five mean the FC2 loads follow ``stream_weights``. The FC2
+                policy is only decoupled for locality-domain shards
+                (``decouple_fc2_cache_policy``), so the full-GPU tactic space
+                is unchanged.
                 """
                 kernel_class = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
                 kernel_cache = dict()
@@ -16306,13 +16312,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              local_expert_offset: int,
                              tile_size: int,
                              swiglu_limit: float = float("inf"),
-                             zero_output: bool = False):
+                             zero_output: bool = False,
+                             decouple_fc2_cache_policy: bool = False):
                     super().__init__()
                     self.num_experts = num_experts
                     self.top_k = top_k
                     self.num_local_experts = num_local_experts
                     self.local_expert_offset = local_expert_offset
                     self.tile_size = tile_size
+                    # Locality-domain shards reduce FC2 over half the inner
+                    # channels, where keeping the FC2 weights cached while the
+                    # FC1 weights stream measured best on decode shapes; the
+                    # autotuner then picks per token bucket. Full-GPU runners
+                    # keep one policy for both GEMMs.
+                    self.decouple_fc2_cache_policy = decouple_fc2_cache_policy
                     # Clear the whole output inside the workspace reset launch
                     # instead of a separate memset (dense case only; the caller
                     # keeps its sparse row memset for alltoall with ep > top_k).
@@ -16342,6 +16355,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.tile_size,
                         self.swiglu_limit,
                         self.zero_output,
+                        self.decouple_fc2_cache_policy,
                     )
 
                 @property
@@ -16375,19 +16389,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         (self.cta_group, 1),
                         "l2_atomic",
                         False,
+                        False,
                     )
 
                 @staticmethod
                 def _normalize_tactic(tactic) -> Tuple:
-                    # Four-element tactics (from caches or precomputed strings
-                    # predating ``stream_weights``) keep the default policy.
+                    # Shorter tactics come from caches or precomputed strings
+                    # predating a policy element: four elements keep the
+                    # default policy, five let the FC2 loads follow
+                    # ``stream_weights``.
                     (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
                      *rest) = tactic
                     stream_weights = bool(rest[0]) if rest else False
+                    fc2_stream_weights = (bool(rest[1])
+                                          if len(rest) > 1 else stream_weights)
                     return (tuple(int(v) for v in mma_tiler),
                             tuple(int(v) for v in mma_inst_shape),
                             tuple(int(v) for v in cluster_shape_mn),
-                            str(scheduler), stream_weights)
+                            str(scheduler), stream_weights, fc2_stream_weights)
 
                 def _is_tactic_feasible(
                         self,
@@ -16460,8 +16479,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     valid_tactics = []
                     for (mma_n, mma_tiler_k, scheduler,
                          stream_weights) in itertools.product(
-                             self.mma_n_candidates,
-                             self.mma_tiler_k_candidates,
+                             self.mma_n_candidates, self.mma_tiler_k_candidates,
                              self.scheduler_candidates,
                              self.stream_weights_candidates):
                         # The fused N tile must divide both the FC1 (2*I) and the
@@ -16472,13 +16490,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             continue
                         mma_tiler = (mma_m, mma_n, mma_tiler_k)
                         mma_inst_shape = (mma_m, mma_n, self.mma_inst_k)
-                        if self._is_tactic_feasible(mma_tiler, mma_inst_shape,
-                                                    cluster_shape_mn, scheduler,
-                                                    m, fc1_n, k, l, fc2_n,
-                                                    fc2_k):
+                        if not self._is_tactic_feasible(
+                                mma_tiler, mma_inst_shape, cluster_shape_mn,
+                                scheduler, m, fc1_n, k, l, fc2_n, fc2_k):
+                            continue
+                        # Cached FC2 weights under streaming FC1 weights is the
+                        # one decoupled policy worth profiling; it only exists
+                        # for locality-domain shards.
+                        fc2_policies = [stream_weights]
+                        if self.decouple_fc2_cache_policy and stream_weights:
+                            fc2_policies.append(False)
+                        for fc2_stream_weights in fc2_policies:
                             valid_tactics.append(
                                 (mma_tiler, mma_inst_shape, cluster_shape_mn,
-                                 scheduler, stream_weights))
+                                 scheduler, stream_weights, fc2_stream_weights))
 
                     logger.debug(
                         f"CuteDSL Rubin MXFP8 FusedFC12: Found {len(valid_tactics)} "
@@ -16585,13 +16610,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     assert output.size(1) == fc2_n
                     assert token_final_scales.size() == (num_tokens, self.top_k)
 
-                    if isinstance(tactic, (tuple, list)) and len(tactic) in (4,
-                                                                             5):
+                    if isinstance(tactic,
+                                  (tuple, list)) and len(tactic) in (4, 5, 6):
                         (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
-                         stream_weights) = self._normalize_tactic(tactic)
+                         stream_weights,
+                         fc2_stream_weights) = self._normalize_tactic(tactic)
                     else:
                         (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
-                         stream_weights) = self._default_tactic()
+                         stream_weights,
+                         fc2_stream_weights) = self._default_tactic()
                     assert mma_tiler[0] == self.tile_size, (
                         f"Tactic ({tactic}) is incompatible with tile size "
                         f"({self.tile_size})")
@@ -16613,19 +16640,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # (three allocations + three fill kernels per forward).
                     # Launches on one stream serialize, so sharing the buffers
                     # across calls is safe; CUDA graphs capture fixed addresses.
-                    workspace_key = (fc1_a.device, m // 128)
-                    workspace = self.__class__.workspace_cache.get(workspace_key)
+                    # Locality-domain partitions run concurrently on their own
+                    # streams, so each partition owns a workspace.
+                    workspace_key = (fc1_a.device, m // 128,
+                                     get_current_locality_domain())
+                    workspace = self.__class__.workspace_cache.get(
+                        workspace_key)
                     if workspace is None:
                         workspace = (
                             torch.empty(m // 128,
                                         dtype=torch.int32,
                                         device=fc1_a.device),
-                            torch.empty(1, dtype=torch.int32,
+                            torch.empty(1,
+                                        dtype=torch.int32,
                                         device=fc1_a.device),
-                            torch.empty(1, dtype=torch.int32,
+                            torch.empty(1,
+                                        dtype=torch.int32,
                                         device=fc1_a.device),
                         )
-                        self.__class__.workspace_cache[workspace_key] = workspace
+                        self.__class__.workspace_cache[
+                            workspace_key] = workspace
                     fc1_ready, fc1_scheduler_counter, fc2_scheduler_counter = \
                         workspace
 
@@ -16686,7 +16720,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cache_key = (self.tile_size, self.top_k, mma_tiler,
                                  mma_inst_shape, cluster_shape_mn, scheduler,
                                  self.swiglu_limit, max_active_clusters,
-                                 sparse_gather, stream_weights)
+                                 sparse_gather, stream_weights,
+                                 fc2_stream_weights)
                     if cache_key not in self.__class__.kernel_cache:
                         gemm = self.__class__.kernel_class(
                             self.sf_vec_size,
@@ -16700,6 +16735,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             scheduler=scheduler,
                             sparse_gather=sparse_gather,
                             stream_weights=stream_weights,
+                            fc2_stream_weights=fc2_stream_weights,
                         )
                         sf_vec_cx = self.sf_vec_size
                         tile_size_cx = self.tile_size
@@ -17097,6 +17133,190 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 zero_output: bool = False,
             ) -> None:
                 return None
+
+        _MXFP8_FUSED_FC12_LOCALITY_ARGS = (
+            "(Tensor input, Tensor fc1_weight_0, Tensor fc1_weight_1, "
+            "Tensor input_scale, Tensor fc1_weight_scale_0, Tensor fc1_weight_scale_1, "
+            "Tensor fc1_alpha, Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
+            "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, "
+            "Tensor fc1_norm_const, Tensor fc2_weight_0, Tensor fc2_weight_1, "
+            "Tensor fc2_weight_scale_0, Tensor fc2_weight_scale_1, Tensor fc2_alpha, "
+            "Tensor(a17!) output, Tensor token_final_scales, "
+            "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+            "SymInt local_expert_offset, SymInt tile_size, "
+            f"float swiglu_limit={SWIGLU_LIMIT_SCALAR_DISABLED}) -> ()")
+
+        def _check_locality_shards(name: str, shard_0: torch.Tensor,
+                                   shard_1: torch.Tensor) -> None:
+            if shard_0.shape != shard_1.shape or shard_0.dtype != shard_1.dtype:
+                raise ValueError(
+                    f"locality domain MXFP8 fused FC12 MoE {name} shards must have "
+                    f"identical shapes and dtypes, got {tuple(shard_0.shape)} "
+                    f"{shard_0.dtype} and {tuple(shard_1.shape)} {shard_1.dtype}."
+                )
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin",
+            mutates_args=("output", ),
+            schema=_MXFP8_FUSED_FC12_LOCALITY_ARGS,
+            device_types="cuda")
+        def cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
+            input: torch.Tensor,
+            fc1_weight_0: torch.Tensor,
+            fc1_weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            fc1_weight_scale_0: torch.Tensor,
+            fc1_weight_scale_1: torch.Tensor,
+            fc1_alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            fc1_norm_const: torch.Tensor,
+            fc2_weight_0: torch.Tensor,
+            fc2_weight_1: torch.Tensor,
+            fc2_weight_scale_0: torch.Tensor,
+            fc2_weight_scale_1: torch.Tensor,
+            fc2_alpha: torch.Tensor,
+            output: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        ) -> None:
+            """Tune and launch both locality-domain shards of the MXFP8 fused FC12 MoE.
+
+            Each shard holds half of every expert's inner channels: FC1 weights
+            and scales sliced along N (whole gate/up pairs), FC2 weights and
+            scales sliced along K. Both shards see all local experts and routes,
+            so the routing metadata is shared, and both scatter-add their partial
+            FC2 result into ``output`` through the fused finalize. ``output`` must
+            therefore be zero on entry for the rows this rank produces; the op
+            never clears it itself because the two partitions run concurrently.
+            Splitting FC2 changes the BF16 accumulation order, so results agree
+            with the full-GPU kernel within the MoE tolerances, not bitwise.
+
+            The MoE outer runner invokes this op during preparation so locality
+            domain resources, tactics and kernels are ready before CUDA graph
+            capture. Direct callers must likewise invoke it once before capture.
+            """
+            _check_locality_shards("FC1 weight", fc1_weight_0, fc1_weight_1)
+            _check_locality_shards("FC1 weight-scale", fc1_weight_scale_0,
+                                   fc1_weight_scale_1)
+            _check_locality_shards("FC2 weight", fc2_weight_0, fc2_weight_1)
+            _check_locality_shards("FC2 weight-scale", fc2_weight_scale_0,
+                                   fc2_weight_scale_1)
+            if fc2_weight_0.size(2) * 2 != fc1_weight_0.size(1):
+                raise ValueError(
+                    "locality domain MXFP8 fused FC12 MoE shards must split the "
+                    f"inner channels: FC2 K {fc2_weight_0.size(2)} vs FC1 N "
+                    f"{fc1_weight_0.size(1)}.")
+
+            runtime = LocalityDomainRuntime(num_partitions=2)
+            tuner_key = (
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin::locality_domain"
+            )
+            op_runner = Sm107Mxfp8FusedFc12MoeRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                swiglu_limit=swiglu_limit,
+                zero_output=False,
+                decouple_fc2_cache_policy=True,
+            )
+            # Input order matches Sm107Mxfp8FusedFc12InputsHelper (shard 0).
+            inputs = [
+                input, fc1_weight_0, input_scale, fc1_weight_scale_0, fc1_alpha,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                fc1_norm_const, fc2_weight_0, fc2_weight_scale_0, fc2_alpha,
+                output, token_final_scales
+            ]
+
+            def launch_partition(
+                partition_id: int,
+                partition_inputs: List[torch.Tensor],
+                tactic,
+            ) -> None:
+                fc1_weight = fc1_weight_0 if partition_id == 0 else fc1_weight_1
+                fc1_weight_scale = (fc1_weight_scale_0 if partition_id == 0 else
+                                    fc1_weight_scale_1)
+                fc2_weight = fc2_weight_0 if partition_id == 0 else fc2_weight_1
+                fc2_weight_scale = (fc2_weight_scale_0 if partition_id == 0 else
+                                    fc2_weight_scale_1)
+                torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+                    input=partition_inputs[0],
+                    fc1_weight=fc1_weight,
+                    input_scale=partition_inputs[2],
+                    fc1_weight_scale=fc1_weight_scale,
+                    fc1_alpha=partition_inputs[4],
+                    tile_idx_to_group_idx=partition_inputs[5],
+                    tile_idx_to_mn_limit=partition_inputs[6],
+                    permuted_idx_to_expanded_idx=partition_inputs[7],
+                    num_non_exiting_tiles=partition_inputs[8],
+                    fc1_norm_const=partition_inputs[9],
+                    fc2_weight=fc2_weight,
+                    fc2_weight_scale=fc2_weight_scale,
+                    fc2_alpha=partition_inputs[12],
+                    output=partition_inputs[13],
+                    token_final_scales=partition_inputs[14],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_local_experts=num_local_experts,
+                    local_expert_offset=local_expert_offset,
+                    tile_size=tile_size,
+                    swiglu_limit=swiglu_limit,
+                    precomputed_tactic=repr(tactic),
+                    zero_output=False,
+                )
+
+            runner, best_tactic = tune_locality_domain_concurrent(
+                tuner_key,
+                op_runner,
+                runtime,
+                2,
+                launch_partition,
+                inputs,
+                op_runner.get_tuning_config(),
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin"
+        )
+        def _(
+            input: torch.Tensor,
+            fc1_weight_0: torch.Tensor,
+            fc1_weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            fc1_weight_scale_0: torch.Tensor,
+            fc1_weight_scale_1: torch.Tensor,
+            fc1_alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            fc1_norm_const: torch.Tensor,
+            fc2_weight_0: torch.Tensor,
+            fc2_weight_1: torch.Tensor,
+            fc2_weight_scale_0: torch.Tensor,
+            fc2_weight_scale_1: torch.Tensor,
+            fc2_alpha: torch.Tensor,
+            output: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        ) -> None:
+            return None
 
         # ----------------------------------------------------------------
         # Rubin BF16/FP16 Finalize Fusion (FC2 layer: grouped GEMM + scatter-add)
