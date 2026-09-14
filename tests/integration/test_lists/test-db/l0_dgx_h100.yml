@@ -39,6 +39,7 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8[tp2_ep1]
+  - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph[tp2] TIMEOUT (90)
 - condition:
     ranges:
       system_gpu_count:
@@ -287,6 +288,7 @@ l0_dgx_h100:
     - unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py -m "part3"
     - unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py -m "part4"
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
+    - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp2" TIMEOUT (90)
     - unittest/llmapi/test_async_llm.py -m "gpu2"
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
