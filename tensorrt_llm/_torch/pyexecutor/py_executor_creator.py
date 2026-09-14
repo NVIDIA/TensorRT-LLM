@@ -44,6 +44,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.registry import uses_connector
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
@@ -371,6 +372,19 @@ def _create_py_executor_impl(
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
+        kv_cache_config.enable_partial_reuse = False
+
+    # Must happen before the KV cache manager is built, since the manager reads
+    # enable_partial_reuse to construct its block pools.
+    if (kv_cache_config.enable_partial_reuse
+            and uses_connector(kv_connector_config, "mooncake-store")):
+        logger.warning(
+            "Disabling partial reuse: it is not usable with the mooncake-store "
+            "connector. The store is addressed by whole blocks, so a partial "
+            "device match leaves the matched length off a block boundary and "
+            "the connector declines the lookup rather than resume a block from "
+            "the middle. Partial reuse therefore trades part of one block for "
+            "every stored block of the remaining prefix.")
         kv_cache_config.enable_partial_reuse = False
 
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
@@ -784,10 +798,21 @@ def _create_py_executor_impl(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
 
+        # VSWA allocates one pool per window size, which the V1 connector
+        # registration cannot describe: it hands the worker a single primary
+        # pool tensor. KVCacheManagerV2 has no such limitation -- its layout
+        # describes one region set per layer group -- so only reject here when
+        # V2 is definitively off. `use_kv_cache_manager_v2` is tri-state
+        # (True / False / "auto"), and under "auto" the manager is not chosen
+        # yet, so defer: PyExecutor re-checks against the manager it actually
+        # built (py_executor.py, `_maybe_init_kv_connector_manager`) and rejects
+        # there if the selection landed on V1.
         max_attention_window = kv_cache_config.max_attention_window
-        if uses_vswa_kv_cache_layout(max_attention_window):
+        if (uses_vswa_kv_cache_layout(max_attention_window)
+                and kv_cache_config.use_kv_cache_manager_v2 is False):
             raise NotImplementedError(
-                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
+                "on the V1 KV cache manager. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
         if mapping.enable_attention_dp:
