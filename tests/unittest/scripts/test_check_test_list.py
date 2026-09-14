@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for scripts/check_test_list.py AST-based param-ID validation.
+"""Unit tests for scripts/check_test_list.py validation and CI timeout policy.
 
 These are pure-Python (no GPU, no built wheel) and are marked ``cpu_only`` so
 they run on the CPU CI stage.
@@ -22,7 +22,10 @@ they run on the CPU CI stage.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -45,6 +48,59 @@ def _index(mod, tmp_path, src: str, name: str = "mod_under_test.py"):
     p = tmp_path / name
     p.write_text(src, encoding="utf-8")
     return mod.build_ast_index(str(p))
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".yml", ".yaml"])
+def test_ci_timeout_limit(mod: ModuleType, tmp_path: Path, suffix: str) -> None:
+    ci_dir = tmp_path / "test-db" / "nested"
+    ci_dir.mkdir(parents=True)
+    test_list = ci_dir / f"l0_sample{suffix}"
+    test_list.write_text(
+        "# TIMEOUT (300)\n"
+        "  - test_a.py::test_ok TIMEOUT (120) ISOLATION # TIMEOUT (240)\n"
+        "  - test_a.py::test_default\n"
+        "  - test_a.py::test_short TIMEOUT (60)\n"
+        "  - perf/test_perf.py::test_long TIMEOUT(121)\n"
+        "  - unittest/sample TIMEOUT ( 00180 ) ISOLATION\n",
+        encoding="utf-8",
+    )
+    (ci_dir / "README.md").write_text("Example: TIMEOUT (300)\n", encoding="utf-8")
+    qa_dir = tmp_path / "qa"
+    qa_dir.mkdir()
+    (qa_dir / f"qa_sample{suffix}").write_text(
+        "test_a.py::test_qa TIMEOUT (300)\n", encoding="utf-8"
+    )
+    (tmp_path / "waives.txt").write_text(
+        "perf/test_perf.py::test_long SKIP (nvbugsTBD)\n", encoding="utf-8"
+    )
+
+    assert mod.check_ci_timeouts(str(tmp_path)) == [
+        f"{test_list}:5: TIMEOUT (121) exceeds 120 minutes.",
+        f"{test_list}:6: TIMEOUT (180) exceeds 120 minutes.",
+    ]
+
+
+def test_ci_timeout_missing_directory(mod: ModuleType, tmp_path: Path) -> None:
+    assert mod.check_ci_timeouts(str(tmp_path)) == [
+        f"Missing CI test-list directory: {tmp_path / 'test-db'}"
+    ]
+
+
+@pytest.mark.parametrize("minutes,exit_code", [(120, 0), (121, 1)])
+def test_ci_timeout_cli(tmp_path: Path, minutes: int, exit_code: int) -> None:
+    ci_dir = tmp_path / "test-db"
+    ci_dir.mkdir()
+    test_list = ci_dir / "l0_sample.yml"
+    test_list.write_text(f"test_a.py::test_f TIMEOUT ({minutes})\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--check-timeouts", "--test-lists-dir", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == exit_code
+    if exit_code:
+        assert f"{test_list}:1: TIMEOUT (121) exceeds 120 minutes." in result.stderr
 
 
 def _valid_ids(mod, tmp_path, src: str, func: str = "test_f"):
