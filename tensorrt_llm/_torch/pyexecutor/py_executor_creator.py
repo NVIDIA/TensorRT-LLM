@@ -517,6 +517,9 @@ def _create_py_executor_impl(
                 "MiniMax-M3 Eagle3 on the triton reference backend does not "
                 "support CUDA graphs; use implementation='msa' or set "
                 "cuda_graph_config=None.")
+        if is_m3_eagle3 and not spec_config.is_linear_tree:
+            raise ValueError(
+                "MiniMax-M3 Eagle3 supports the linear draft chain only.")
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(

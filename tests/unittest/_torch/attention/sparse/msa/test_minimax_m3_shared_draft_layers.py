@@ -18,6 +18,7 @@ virtual attention-op pool rooted at its K page inside the mega-slot.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -131,6 +132,25 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch):
     assert manager.num_attention_op_pools == 61
     assert manager._draft_op_pools == ()
     assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
+
+
+def test_update_resources_refuses_tree_relocation(monkeypatch):
+    """Linear acceptance rewinds through the base; tree acceptance is refused."""
+    calls = []
+    monkeypatch.setattr(KVCacheManagerV2, "update_resources", lambda self, *a: calls.append(a))
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    linear = SimpleNamespace(
+        py_num_accepted_draft_tokens=2, py_num_accepted_draft_tokens_indices=[]
+    )
+    tree = SimpleNamespace(
+        py_num_accepted_draft_tokens=2, py_num_accepted_draft_tokens_indices=[0, 2]
+    )
+
+    manager.update_resources(SimpleNamespace(generation_requests=[linear]), None, 2)
+    assert len(calls) == 1
+
+    with pytest.raises(NotImplementedError, match="relocate"):
+        manager.update_resources(SimpleNamespace(generation_requests=[linear, tree]), None, 2)
 
 
 def test_draft_layout_locates_the_appended_tail():

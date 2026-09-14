@@ -421,6 +421,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._stream.cuda_stream,
             )
 
+    def update_resources(self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None):
+        # Only tree acceptance relocates draft KV, which M3's pool layout cannot do.
+        if any(r.py_num_accepted_draft_tokens_indices for r in scheduled_batch.generation_requests):
+            raise NotImplementedError("MiniMax-M3 does not relocate accepted draft tokens.")
+        super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+
     def _extra_buffers_per_layer(self, *, tokens_per_block):
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
 
