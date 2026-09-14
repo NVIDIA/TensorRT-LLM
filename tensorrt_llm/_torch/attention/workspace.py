@@ -84,8 +84,12 @@ class EagerWorkspaceReclaimer:
         capacity_before = metadata.workspace.untyped_storage().nbytes()
         # Protect the consumer if warmup allocated this storage on another stream.
         metadata.workspace.record_stream(self._stream)
-        self._required_bytes.zero_()
-        metadata.workspace_required_bytes = self._required_bytes
+        # At the warmup floor nothing can be reclaimed. A growing forward
+        # resets the policy anyway; start collecting demand on the next one.
+        collect_demand = capacity_before > self.policy.floor_bytes
+        if collect_demand:
+            self._required_bytes.zero_()
+            metadata.workspace_required_bytes = self._required_bytes
         self._active = True
         completed = False
         try:
@@ -94,7 +98,7 @@ class EagerWorkspaceReclaimer:
         finally:
             metadata.workspace_required_bytes = None
             self._active = False
-            if not completed or not metadata.workspace_reclaimable:
+            if not completed or not metadata.workspace_reclaimable or not collect_demand:
                 self.policy.reset()
             else:
                 capacity = metadata.workspace.untyped_storage().nbytes()
