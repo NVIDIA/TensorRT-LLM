@@ -735,7 +735,7 @@ def trtllm_mha_with_cache(
         attention_window_size,
         AttentionMaskType.causal,
         quant_mode,
-        scale * math.sqrt(head_dim) if scale is not None else 1.0,
+        1.0 / (scale * math.sqrt(head_dim)) if scale is not None else 1.0,
         position_embedding_type,
         rotary_embedding_dim,
         _GlobalTrtllmPlanner.is_spec_decoding_enabled,

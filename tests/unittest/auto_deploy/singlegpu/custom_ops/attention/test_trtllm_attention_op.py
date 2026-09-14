@@ -19,11 +19,13 @@ Mirrors the structure of test_flashinfer_attention_op.py but exercises the
 ``trtllm_attention_mha_with_cache`` custom op via ``thop.attention``.
 """
 
+import inspect
 import math
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention import (
     _GlobalTrtllmPlanner,
     prepare_trtllm_metadata_host,
@@ -316,13 +318,48 @@ def test_trtllm_attention_op_decode(prefill_seq_length, batch_size, n_heads, dty
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("scale", [None, 0.0625, 0.25])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_trtllm_attention_q_scaling(scale, head_dim, mocker):
+    _reset_trtllm_planner()
+    signature = inspect.signature(FallbackFmha.run_auto_deploy_mha)
+    run_mha = mocker.patch.object(FallbackFmha, "run_auto_deploy_mha", autospec=True)
+    q = torch.randn(1, 4, 8, head_dim, dtype=torch.float16, device="cuda")
+    kv_cache = torch.zeros(1, 2, 8, 32, head_dim, dtype=q.dtype, device=q.device)
+
+    _prepare_and_run(
+        q,
+        q,
+        q,
+        kv_cache,
+        seq_lens=[4],
+        input_positions=[0],
+        cache_locs=[0],
+        pages_per_seq=[1],
+        max_seq_len=32,
+        max_batch_size=1,
+        num_prefill=1,
+        num_prefill_tokens=4,
+        num_decode=0,
+        device=q.device,
+        scale=scale,
+    )
+
+    run_mha.assert_called_once()
+    args = signature.bind(*run_mha.call_args.args, **run_mha.call_args.kwargs).arguments
+    effective_scale = 1.0 / (args["q_scaling"] * math.sqrt(head_dim))
+    expected_scale = scale if scale is not None else 1.0 / math.sqrt(head_dim)
+    assert effective_scale == pytest.approx(expected_scale)
+
+
+@pytest.mark.parametrize("scale", [None, 0.0625, 0.25])
 @pytest.mark.parametrize("prefill_seq_length", [4, 10, 2047])
 @pytest.mark.parametrize("n_heads", [8])
 @pytest.mark.parametrize("batch_size", [1, 16, 32])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("device", ["cuda"])
 def test_trtllm_attention_context_and_generate(
-    prefill_seq_length, n_heads, batch_size, dtype, device
+    prefill_seq_length, n_heads, batch_size, dtype, device, scale
 ):
     D_HEAD = 64
     MAX_SEQ_LEN = 2048
@@ -354,11 +391,16 @@ def test_trtllm_attention_context_and_generate(
         num_prefill_tokens=batch_size * prefill_seq_length,
         num_decode=0,
         device=device,
+        scale=scale,
     )
 
     # Verify prefill output
     ref_pf = torch.nn.functional.scaled_dot_product_attention(
-        q_pf.transpose(1, 2), k_pf.transpose(1, 2), v_pf.transpose(1, 2), is_causal=True
+        q_pf.transpose(1, 2),
+        k_pf.transpose(1, 2),
+        v_pf.transpose(1, 2),
+        is_causal=True,
+        scale=scale,
     ).transpose(1, 2)
 
     assert torch.allclose(
@@ -387,6 +429,7 @@ def test_trtllm_attention_context_and_generate(
         num_prefill_tokens=0,
         num_decode=batch_size,
         device=device,
+        scale=scale,
     )
 
     # Verify decode output – Q_gen attends to full (prefill + gen) K, V
@@ -397,6 +440,7 @@ def test_trtllm_attention_context_and_generate(
         k_full.transpose(1, 2),
         v_full.transpose(1, 2),
         is_causal=False,
+        scale=scale,
     ).transpose(1, 2)
 
     assert torch.allclose(
