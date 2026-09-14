@@ -1118,24 +1118,28 @@ class DFlashForCausalLM(nn.Module):
             window_size = swa_window
         return causal, window_size
 
-    def validate_block_attention_windows(self, block_size: int) -> None:
+    def validate_block_attention_windows(self) -> None:
+        """Refuse windows the TRTLLM block-decode kernel cannot apply.
+
+        TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
+        rejects ``causal=False`` with any finite ``window_left`` outright. A
+        non-causal windowed layer must therefore run on VANILLA or FA4, which
+        take a two-sided window.
+        """
         if self.dflash_attention_backend != "TRTLLM":
             return
         num_layers = getattr(self.config, "num_hidden_layers", None)
         if num_layers is None:
             num_layers = len(self.model.layers)
         for layer_idx in range(num_layers):
-            causal, (_, window_right) = self._resolve_block_attention(layer_idx)
-            if causal or window_right < 0 or window_right >= block_size - 1:
+            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
+            if causal or window_left < 0:
                 continue
             raise ValueError(
                 f"DFlash draft layer {layer_idx} attends non-causally within a "
-                f"{window_right + 1}-token window, narrower than the "
-                f"{block_size}-token draft block. The TRTLLM DFlash attention "
-                "backend applies only the left bound of the window, so it would "
-                "attend to block positions the drafter masks. Use "
-                "attention_backend=VANILLA or FA4, or lower max_draft_len to at "
-                f"most {window_right}."
+                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
+                "attention backend does not support non-causal sliding-window "
+                "attention. Use attention_backend=VANILLA or FA4."
             )
 
     def _prepare_dflash_trtllm_gen_buffers(

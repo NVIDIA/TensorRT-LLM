@@ -622,46 +622,34 @@ def test_is_causal_is_ignored_for_a_plain_dflash_drafter():
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM block-decode backend: only window_left reaches the kernel
+# TRTLLM block-decode backend: no non-causal sliding window
 # ---------------------------------------------------------------------------
 
-BLOCK_SIZE = RELEASED_DFLASH_CONFIG["block_size"]
 
-
-@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FA4"])
-def test_released_drafter_window_is_honored_on_every_backend(backend):
-    """The released drafter's 2048-token window dwarfs its 8-token block, so
-    dropping the right bound is exact and no backend is ruled out."""
-    _mask_wrapper(_all_sliding_config(2048), backend=backend).validate_block_attention_windows(
-        BLOCK_SIZE
-    )
-
-
-def test_trtllm_backend_rejects_a_window_narrower_than_the_block():
-    """With only window_left applied, a non-causal window narrower than the
-    block would silently attend to block positions the drafter masks."""
-    wrapper = _mask_wrapper(_all_sliding_config(4), backend="TRTLLM")
-    with pytest.raises(ValueError, match=f"narrower than the {BLOCK_SIZE}-token draft block"):
-        wrapper.validate_block_attention_windows(BLOCK_SIZE)
-    # A window exactly the block's width still covers every block position.
-    wrapper.validate_block_attention_windows(4)
-
-
-def test_narrow_window_passes_when_the_backend_or_mask_honors_it():
-    # VANILLA and FA4 hand both bounds to their kernels.
+def test_released_drafter_window_runs_on_two_sided_backends():
+    """VANILLA and FA4 hand both window bounds to their kernels."""
     for backend in ("VANILLA", "FA4"):
-        _mask_wrapper(_all_sliding_config(4), backend=backend).validate_block_attention_windows(
-            BLOCK_SIZE
-        )
-    # A causal layer has no right window to drop.
+        _mask_wrapper(_all_sliding_config(2048), backend=backend).validate_block_attention_windows()
+
+
+def test_trtllm_backend_rejects_the_released_drafter_window():
+    """flashinfer's trtllm-gen context kernel refuses causal=False with any
+    finite window_left, so the released non-causal 2048 window cannot run."""
+    wrapper = _mask_wrapper(_all_sliding_config(2048), backend="TRTLLM")
+    with pytest.raises(ValueError, match="non-causally within a 2048-token sliding window"):
+        wrapper.validate_block_attention_windows()
+
+
+def test_trtllm_backend_accepts_causal_or_unwindowed_layers():
+    # A causal sliding window is supported by the kernel.
     _mask_wrapper(
         _all_sliding_config(4, is_causal=True), backend="TRTLLM"
-    ).validate_block_attention_windows(BLOCK_SIZE)
+    ).validate_block_attention_windows()
     # No window at all, either.
     _mask_wrapper(
         SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
         backend="TRTLLM",
-    ).validate_block_attention_windows(BLOCK_SIZE)
+    ).validate_block_attention_windows()
 
 
 def test_trtllm_window_check_reads_the_use_swa_override():
@@ -671,7 +659,7 @@ def test_trtllm_window_check_reads_the_use_swa_override():
     wrapper = _mask_wrapper(config, backend="TRTLLM", layer_windows=[(3, 3), (3, 3)])
     assert wrapper._resolve_block_attention(0) == (False, (3, 3))
     with pytest.raises(ValueError, match="draft layer 0"):
-        wrapper.validate_block_attention_windows(BLOCK_SIZE)
+        wrapper.validate_block_attention_windows()
 
 
 # ---------------------------------------------------------------------------

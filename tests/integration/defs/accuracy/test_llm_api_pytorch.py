@@ -5986,9 +5986,7 @@ class TestQwen3_8_27B(LlmapiAccuracyTestHarness):
     )
 
     @skip_pre_hopper
-    @pytest.mark.parametrize(
-        "dflash_attention_backend",
-        ["VANILLA", pytest.param("TRTLLM", marks=skip_pre_blackwell)])
+    @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA"])
     def test_dflash2(self, dflash_attention_backend):
         """DFlash 2 drafter (incoai/Qwen3.8-27B-DFlash2) on its bf16 target.
 
@@ -6000,9 +5998,6 @@ class TestQwen3_8_27B(LlmapiAccuracyTestHarness):
         on chat generations, so the harness applies the chat template with
         thinking off, like the other Qwen3.5-family DFlash tests.
         max_draft_len=7 matches the checkpoint's block_size=8.
-
-        Both block-decode backends share one acceptance-length reference:
-        TRTLLM needs SM100+, so Hopper covers VANILLA only.
         """
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         enable_block_reuse=False)
