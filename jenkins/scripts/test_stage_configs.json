@@ -591,13 +591,15 @@
       "runWithSbatch": true
     },
     {
-      "name": "GB200-4_GPUs-PyTorch-PerfSanity",
+      "name": "GB300-4_GPUs-PyTorch-PerfSanity",
       "arch": "SBSA",
       "slurm": true,
-      "platform": "auto:gb200-x4",
-      "testDB": "l0_gb200_multi_gpus_perf_sanity",
+      "platform": "auto:gb300-x4",
+      "testDB": "l0_gb300_multi_gpus_perf_sanity",
       "splits": 1,
-      "gpuCount": 4
+      "gpuCount": 4,
+      "nodeCount": 1,
+      "runWithSbatch": true
     },
     {
       "name": "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge",

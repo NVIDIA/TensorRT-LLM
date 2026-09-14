@@ -6242,7 +6242,7 @@ def computeDynamicSplitCounts(pipeline, specs) {
             sh(label: "Install python3/pyyaml for split sizing", script: "apk add --no-cache python3 py3-yaml")
             output = sh(
                 label: "Compute dynamic split counts",
-                script: "cd ${LLM_ROOT} && python3 scripts/test_to_stage_mapping.py --emit-splits",
+                script: "cd ${LLM_ROOT} && python3 -B scripts/test_to_stage_mapping.py --emit-splits",
                 returnStdout: true,
             ).trim()
         }
