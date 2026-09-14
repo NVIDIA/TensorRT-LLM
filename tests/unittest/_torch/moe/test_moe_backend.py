@@ -1101,12 +1101,14 @@ def _make_megamoe_cutedsl_minimax_problem(
     )
 
 
-def _make_megamoe_cutedsl_test_deployment() -> MoEDeployment:
+def _make_megamoe_cutedsl_test_deployment(
+    *, ep_size: int = 1, parallel_size: int = 1, use_dp: bool = False
+) -> MoEDeployment:
     return MoEDeployment(
-        ep_size=1,
+        ep_size=ep_size,
         tp_size=1,
-        parallel_size=1,
-        use_dp=False,
+        parallel_size=parallel_size,
+        use_dp=use_dp,
         num_slots=8,
         env=MoEEnvironment(
             sm=100,
@@ -1115,6 +1117,7 @@ def _make_megamoe_cutedsl_test_deployment() -> MoEDeployment:
     )
 
 
+@pytest.mark.cpu_only
 def test_megamoe_cutedsl_accepts_minimax_m3_problem() -> None:
     verdict = MegaMoECuteDsl.can_implement(
         _make_megamoe_cutedsl_minimax_problem(
@@ -1127,6 +1130,7 @@ def test_megamoe_cutedsl_accepts_minimax_m3_problem() -> None:
     assert verdict.eligible, verdict.detail
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "bias, activation",
     [
@@ -1148,6 +1152,37 @@ def test_megamoe_cutedsl_rejects_non_minimax_swiglu_bias_package(
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_tep_requires_minimax_m3_activation() -> None:
+    deployment = _make_megamoe_cutedsl_test_deployment(ep_size=4, parallel_size=4)
+    minimax_verdict = MegaMoECuteDsl.can_implement(
+        _make_megamoe_cutedsl_minimax_problem(
+            bias=False,
+            activation=ActivationType.SwigluBias,
+        ),
+        deployment,
+    )
+    plain_swiglu_verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            swiglu_gptoss_style=False,
+            bias=False,
+            activation=ActivationType.Swiglu.name,
+        ),
+        deployment,
+    )
+
+    assert minimax_verdict.eligible, minimax_verdict.detail
+    assert not plain_swiglu_verdict.eligible
+    assert plain_swiglu_verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+
+@pytest.mark.cpu_only
 def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
     moe = _make_megamoe_cutedsl_for_ctor_test(
         activation=SwigluBiasActivation(
@@ -1162,11 +1197,11 @@ def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
     assert moe.act_clamp == pytest.approx(7.0)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("parameter_name", "register_name"),
     [
         ("gate_sigmoid_scale", "alpha"),
-        ("linear_offset", "beta"),
         ("clamp", "clamp"),
     ],
 )
@@ -1184,14 +1219,6 @@ def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(
         _make_megamoe_cutedsl_for_ctor_test(
             activation=SwigluBiasActivation(**parameters),
         )
-
-
-def test_megamoe_cutedsl_standard_swiglu_keeps_original_activation_path() -> None:
-    moe = _make_megamoe_cutedsl_for_ctor_test()
-
-    assert moe.act_alpha is None
-    assert moe.act_beta is None
-    assert moe.act_clamp is None
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(

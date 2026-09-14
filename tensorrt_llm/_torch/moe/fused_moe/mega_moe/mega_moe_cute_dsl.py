@@ -380,6 +380,12 @@ class MegaMoECuteDsl(MoEImplBase):
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """Check static eligibility; runtime providers and tensor values are validated later."""
+        is_minimax_swiglu_bias = (
+            p.swiglu_gptoss_style
+            and p.activation_type == ActivationType.SwigluBias
+            and p.bias is False
+            and p.activation_constants == frozenset({"alpha", "beta", "clamp"})
+        )
         if not is_sm_100f(d.env.sm):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
@@ -391,9 +397,7 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl supports activations in "
                 f"{cls._SUPPORTED_ACTIVATION_DTYPES}, got {p.dtype_act}.",
             )
-        if p.swiglu_gptoss_style and not (
-            p.activation_type == ActivationType.SwigluBias and p.bias is False
-        ):
+        if p.swiglu_gptoss_style and not is_minimax_swiglu_bias:
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
                 "MegaMoECuteDsl supports MiniMax-style SwigluBias without "
@@ -456,9 +460,18 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
+        # The fused kernel returns a globally combined routed output. MiniMax-M3
+        # accounts for that when composing routed and shared experts; the other
+        # current model wrappers would apply a second AllReduce under TEP.
+        if d.parallel_size > 1 and not d.use_dp and not is_minimax_swiglu_bias:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style "
+                "SwigluBias; other model compositions would reduce its already-global "
+                "routed output twice.",
+            )
         # ADP wider than EP would need an outer allgather + reducescatter
-        # wrapper that this backend does not have. Unlike MegaMoEDeepGemm, TEP
-        # itself is fine here, so only the attention-DP case is constrained.
+        # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:
             return _reject(
                 MoERejectReason.TOPOLOGY_UNSUPPORTED,
