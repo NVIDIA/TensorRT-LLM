@@ -29,6 +29,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -83,6 +84,17 @@ struct Slot
         mSlotId = src.mSlotId;
         readyEvent = std::move(src.readyEvent);
         src.mSlotId.reset();
+    }
+
+    // Replace this slot, invalidate replacement, and return the previous slot.
+    [[nodiscard]] Slot exchangeSlot(Slot&& replacement)
+    {
+        TLLM_CHECK(hasValidSlot() && replacement.hasValidSlot());
+        Slot previous;
+        auto replacementId = std::exchange(replacement.mSlotId, std::nullopt);
+        previous.mSlotId = std::exchange(mSlotId, replacementId);
+        previous.readyEvent = std::exchange(readyEvent, std::move(replacement.readyEvent));
+        return previous;
     }
 
 private:
@@ -225,6 +237,11 @@ public:
 
     size_t alignedSize(SlotCount numSlots) const noexcept;
 
+    [[nodiscard]] HostMem const* hostMem() const noexcept
+    {
+        return &mHostMem;
+    }
+
 private:
     HostMem mHostMem;
 };
@@ -338,6 +355,8 @@ class HostPoolGroup : public PoolGroupBase
 {
 public:
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
+
+    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
 };
 
 class DiskPoolGroup : public PoolGroupBase
@@ -482,8 +501,6 @@ public:
     static size_t grainsForSlots(
         SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
 
-    virtual void postResize() {}
-
 protected:
     TypedVec<PoolGroupIndex, std::unique_ptr<PoolGroupBase>> mPoolGroups;
 };
@@ -491,8 +508,8 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    GpuCacheLevelStorage(
-        StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize);
+    GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -501,29 +518,18 @@ public:
 
     size_t poolSizeGranularity() const noexcept override
     {
-        return mPhysMemAllocator->physMemSize();
-    }
-
-    void postResize() override
-    {
-        CacheLevelStorage::postResize();
-        mPhysMemAllocator->clear();
-    }
-
-    void destroy() override
-    {
-        CacheLevelStorage::destroy();
-        mPhysMemAllocator->clear();
+        return mPhysMemAllocator.physMemSize();
     }
 
 private:
-    std::unique_ptr<PooledPhysMemAllocator> mPhysMemAllocator;
+    PooledPhysMemAllocator& mPhysMemAllocator;
 };
 
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    HostCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+    HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -539,8 +545,8 @@ public:
 class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    DiskCacheLevelStorage(StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
-        std::string directory);
+    DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -558,6 +564,7 @@ private:
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
-    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList);
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
+    PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

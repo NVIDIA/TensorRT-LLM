@@ -38,13 +38,24 @@ global_kvcache_config_prompt_logprobs = KvCacheConfig(
 )
 
 
+@pytest.fixture(autouse=True)
+def _dynamo_recompile_headroom():
+    """Recompile headroom for the fullgraph=True beam-search step.
+
+    The beam-search cases here build a fresh engine per parametrization in one
+    process, and Dynamo counts recompiles per code object across the process,
+    so the default limit (8) is exhausted partway through and the rest hard-fail
+    under fullgraph. The limit guards against runaway recompilation and is not a
+    correctness property; a served model has a fixed set of shapes.
+    """
+    import torch._dynamo
+
+    with torch._dynamo.config.patch(recompile_limit=128):
+        yield
+
+
 @pytest.fixture(scope="module", params=[False, True])
 def disable_overlap_scheduler_fixture(request) -> bool:
-    return request.param
-
-
-@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
-def sampler_type_fixture(request) -> str:
     return request.param
 
 
@@ -76,11 +87,9 @@ class CacheSalter:
 
 @pytest.fixture(scope="module")
 def llm(
-    sampler_type_fixture: str,
     disable_overlap_scheduler_fixture: bool,
     enable_early_first_token_response_fixture: bool,
 ):
-    sampler_type = sampler_type_fixture
     disable_overlap_scheduler = disable_overlap_scheduler_fixture
     enable_early_first_token_response = enable_early_first_token_response_fixture
 
@@ -93,7 +102,6 @@ def llm(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
-        sampler_type=sampler_type,
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_early_first_token_response=enable_early_first_token_response,
     )
@@ -1308,14 +1316,14 @@ class TestLogsprobsInBatchedSampling:
             if is_processed_logprobs:
                 # NB: Test considers only temperature + top-k or beam search without temperature
                 if req.sampling_config.temperature is not None:
-                    req_logits = req_logits / req.sampling_config.temperature[0]
+                    req_logits = req_logits / req.sampling_config.temperature
             req_log_probs = req_logits.log_softmax(dim=-1)
             if is_processed_logprobs:
                 # NB: Test considers only temperature + top-k or beam search without temperature
                 if req.sampling_config.top_k is not None:
                     # Computing req_log_probs by renormalizing without masking. This avoids issues
                     # with non-deterministic tie-breaking in top-k.
-                    req_log_probs += torch.topk(req_log_probs, k=req.sampling_config.top_k[0])[
+                    req_log_probs += torch.topk(req_log_probs, k=req.sampling_config.top_k)[
                         0
                     ].log_softmax(dim=-1).amax(dim=-1, keepdim=True) - req_log_probs.amax(
                         dim=-1, keepdim=True
@@ -1362,7 +1370,7 @@ class TestLogsprobsInBatchedSampling:
                             #   There are two factors. First, "rank" is not clearly specified for beam search
                             #   (could be logprob rank within beam or across all beams) and therefore
                             #   'rank=1' is returned for all finished beams
-                            #   via _finalize_beam and convert_logprobs_tensor_to_list. Second,
+                            #   via finalize_beam and convert_logprobs_tensor_to_list. Second,
                             #   during decoding (unfinished beam, in general this is the case in this test),
                             #   request logprobs are set via handle_logprobs and store_logprobs_list_to_request,
                             #   which inspects uninitialized elements of log_probs_store.sampled_log_prob_ranks.
@@ -1386,9 +1394,7 @@ class TestLogsprobsInBatchedSampling:
                             returned_topk_logprobs.pop(sampled_token)
 
                         # validate ranks and suppress masked tokens
-                        req_top_k = None
-                        if (req_top_ks := req.sampling_config.top_k) is not None:
-                            req_top_k = req_top_ks[0]
+                        req_top_k = req.sampling_config.top_k
                         returned_ranks = set()
                         for token, logprob in returned_topk_logprobs.items():
                             assert logprob.rank not in returned_ranks

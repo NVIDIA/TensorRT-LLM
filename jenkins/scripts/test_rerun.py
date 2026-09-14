@@ -22,6 +22,11 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
     # Parse results xml and write failed tests to the appropriate rerun files.
     # Returns a set of all test names that appeared in the xml (ran tests).
     ran_tests = set()
+    if not os.path.exists(xml_filename):
+        # No results were ever flushed (e.g. the only test in this run was
+        # killed before completing) - nothing "ran" as far as this xml goes.
+        print(f"No {xml_filename} found, treating as no tests ran")
+        return ran_tests
     tree = ET.parse(xml_filename)
     root = tree.getroot()
     suite_list = root.findall('testsuite')
@@ -36,10 +41,12 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
                 duration = float(case.attrib.get('time', 0))
                 if duration <= 5 * 60:
                     rerun_2_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will rerun 2 times")
+                    print(test_name +
+                          " will rerun 2 times, because duration <= 5 min")
                 elif duration <= 10 * 60:
                     rerun_1_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will rerun 1 time")
+                    print(test_name +
+                          " will rerun 1 time, because duration <= 10 min")
                 elif any(failSig.lower() in ET.tostring(
                         case, encoding='unicode').lower()
                          for failSig in failSignaturesList):
@@ -48,7 +55,10 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
                           " will rerun 1 time, because of fail signature")
                 else:
                     rerun_0_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will not rerun")
+                    print(
+                        test_name +
+                        " will not rerun, because duration > 10 min and no failure signature matches"
+                    )
     return ran_tests
 
 

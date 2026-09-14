@@ -120,6 +120,8 @@ private:
     nixl_opt_args_t mExtraParams;
     std::string mName;
     std::string mAddress;
+    int mRank{0};
+    int mWorldSize{1};
     std::atomic<bool> mShutdown{false};
 
     /// Serializes (a) wrapper-map mutations vs reads and (b) drain-on-shutdown.

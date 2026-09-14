@@ -98,9 +98,11 @@ ucx_env_sweep:
 
 
 run:
-  # Per (combination, request_length) cell hang threshold; a stuck transfer is reported as
-  # TIMEOUT and the harness moves on. The per-cell watchdog fires shortly after
-  # this and is always clamped below max_sweep_s.
+  # Per (combination, request_length) cell hard limit; must be >5 seconds. The
+  # Python sender deadline is set 5 seconds lower so it can return and complete
+  # the CTX/GEN ownership handshake first. The alarm remains the C++ path's
+  # per-cell bound. If quiescence is still unproven, the harness records the
+  # remaining cells and hard-aborts this sweep without reusing KV memory.
   timeout_per_cell_s: 60
   # Hard wall-clock cap for ONE full sweep (all cases x request lengths). The
   # outer `timeout` around each srun enforces this, so a hung sweep can never

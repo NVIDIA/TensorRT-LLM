@@ -16,6 +16,7 @@
 import asyncio
 import os
 import pickle
+import platform
 import sys
 import traceback
 import uuid
@@ -661,7 +662,6 @@ def llama_eagle3_config():
         "speculative_config": Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=model_path("EAGLE3-LLaMA3.1-Instruct-8B"),
-            eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
         ),
         # Force the Eagle3 draft to match the BF16 Llama 3.1 target. Shared KV
@@ -670,8 +670,17 @@ def llama_eagle3_config():
     }
 
 
-def get_ucx_tls():
-    if get_sm_version() < 90:
+def get_ucx_tls() -> str:
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
+    for UCX_TLS.
+    """
+    sm = get_sm_version()
+    if sm == 103 and "aarch" in platform.machine().lower():
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
     return "^ib,gdr_copy"
 

@@ -1,0 +1,53 @@
+# Canonical → synonym map (pilot).
+#
+# Purpose: QUERY-TIME normalization. Before grepping case frontmatter,
+# translate the terms in your head (or the user's words / profiler output)
+# to the canonical term. Frontmatter itself must contain canonical terms
+# only (tags.yaml); a synonym in frontmatter is a validation error.
+#
+# Namespaces mirror tags.yaml. Every key below must be a canonical term in
+# tags.yaml; no synonym may collide with a canonical term or another
+# synonym (a colliding synonym would make normalization ambiguous).
+
+architectures:
+  sm80: [ampere, a100, sm_80]
+  sm89: [ada, l40, l40s, sm_89]
+  sm90: [hopper, h100, h200, sm_90, sm90a]
+  sm100: [blackwell, b200, gb200, sm_100, sm100a]   # NOT umma: instruction-set term (tcgen05), also on sm103
+  sm103: [b300, gb300, sm_103]
+
+bottleneck:
+  compute: [compute-bound, math-bound, tensor-core-bound, low-mfu]
+  memory: [memory-bound, bandwidth-bound, hbm-bound]
+  launch: [launch-bound, launch-overhead, kernel-launch-overhead]
+  communication: [comm-bound, communication-bound, nccl-bound]
+  sync: [sync-bound, synchronization, stream-serialization, blocking-sync]
+  host-overhead: [host-bound, cpu-bound, cpu-overhead, host-prep-exposed, python-overhead]
+
+model_scope:
+  mla: [multi-head-latent-attention, latent-attention]
+  moe: [mixture-of-experts, fused-moe, expert-parallel]
+  sparse-attention: [dsa, deepseek-sparse-attention, lightning-indexer, block-sparse-attention, nsa]
+  spec-decode: [speculative-decoding, mtp, eagle, mtp-eagle, draft-model]
+  deepseek-v3r1: [deepseek-v3, deepseek-r1, dsv3, dsr1, r1]
+  deepseek-v32: [deepseek-v3.2, dsv32, v3.2]
+  qwen3-moe: [qwen3-235b]   # NOT qwen3-next: distinct arch (hybrid linear-attention MoE, Renormalize routing)
+  kimi-k2: [kimi]
+
+signals:
+  # NB: inter-STEP bubbles (host overhead → overlap scheduler) and inter-KERNEL
+  # gaps within a step (launch-bound → fusion/PDL) are distinct signals.
+  gpu-idle-between-steps: [inter-step-gap, gpu-bubble]
+  host-prep-on-critical-path: [host-prep-exposed-ratio, cpu-on-critical-path]
+  many-small-kernels: [kernel-fragmentation, tiny-kernels, launch-storm, inter-kernel-gap]
+  hbm-roundtrip-between-ops: [materialized-intermediates, extra-memory-pass]
+  kv-reads-dominate: [kv-bandwidth-bound, kv-cache-bound]
+  long-context: [long-isl, long-sequence, large-kv-history]
+  small-batch-decode: [low-concurrency, latency-bound-decode, bs1]
+  allreduce-dominates: [ar-bound, tp-collective-bound]
+  alltoall-dominates: [a2a-bound, dispatch-combine-bound, ep-collective-bound]
+  expert-load-imbalance: [moe-load-imbalance, ragged-experts, eplb]
+  recompilation-churn: [triton-recompile, torch-compile-recompile, jit-churn]
+  slow-path-fallback: [pytorch-fallback, unfused-fallback, is-fused-false]
+  draft-forward-exposed: [draft-not-overlapped, mtp-exposed]
+  memory-capacity-bound: [oom, kv-budget-bound, workspace-bound]

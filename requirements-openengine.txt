@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Source: https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0
+# BSR module: https://buf.build/openengine/openengine
+# Immutable BSR commit: 768a93c7b44e40f28c692ad0b471a8f2
+--extra-index-url https://buf.build/gen/python
+openengine-openengine-grpc-python==1.67.1.2.20260730172104+768a93c7b44e
+openengine-openengine-protocolbuffers-python==31.1.0.2.20260730172104+768a93c7b44e
+openengine-openengine-protocolbuffers-pyi==31.1.0.2.20260730172104+768a93c7b44e
+grpcio>=1.67.1,<2
+protobuf>=6.31.1,<7

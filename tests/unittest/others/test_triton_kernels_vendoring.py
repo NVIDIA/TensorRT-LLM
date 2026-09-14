@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,12 +19,23 @@ optimized kernels. These tests verify that the vendoring mechanism works
 correctly and that our version takes precedence over any external installation.
 """
 
+import re
 import unittest
 from pathlib import Path
 
 import pytest
 
 pytestmark = pytest.mark.cpu_only
+
+# The first specifier is the lower bound for both `triton==X` and `triton>=X,<=Y`.
+# Anchored on `triton` alone so that `triton-kernels==` and `tritonclient==` do not match.
+_TRITON_REQUIREMENT_RE = re.compile(r"^triton[ \t]*[<>~!=]*=[ \t]*([^\s,#]+)", re.MULTILINE)
+
+
+def _triton_lower_bound(requirements_text: str) -> str | None:
+    """Return the triton lower bound declared in a requirements.txt body."""
+    match = _TRITON_REQUIREMENT_RE.search(requirements_text)
+    return match.group(1) if match else None
 
 
 class TestTritonKernelsVendoring(unittest.TestCase):
@@ -48,20 +59,22 @@ class TestTritonKernelsVendoring(unittest.TestCase):
         self.assertTrue(license_file.exists(), f"LICENSE file not found at {license_file}.")
 
     def test_version_matches_requirements(self):
-        """Verify vendored triton_kernels VERSION matches triton version in requirements.txt."""
-        import re
+        """Verify vendored triton_kernels VERSION matches the triton lower bound in requirements.txt.
 
+        The requirement is either an exact pin (``triton==X``) or a range
+        (``triton>=X,<=Y``); the vendored copy tracks the lower bound either way.
+        """
         repo_root = Path(__file__).parent.parent.parent.parent
 
         version_file = repo_root / "triton_kernels" / "VERSION"
         vendored_version = version_file.read_text().strip().split()[0].lstrip("v")
 
         requirements_file = repo_root / "requirements.txt"
-        requirements_text = requirements_file.read_text()
+        requirements_version = _triton_lower_bound(requirements_file.read_text())
 
-        match = re.search(r"^triton==([^\s#]+)", requirements_text, re.MULTILINE)
-        self.assertIsNotNone(match, "Could not find triton version in requirements.txt")
-        requirements_version = match.group(1)
+        self.assertIsNotNone(
+            requirements_version, "Could not find triton version in requirements.txt"
+        )
 
         self.assertEqual(
             vendored_version,
@@ -71,6 +84,26 @@ class TestTritonKernelsVendoring(unittest.TestCase):
             "To update the vendored triton_kernels, run: python scripts/vendor_triton_kernels.py "
             f"--tag v{requirements_version}",
         )
+
+    def test_lower_bound_parsing(self):
+        """Both requirement spellings must yield the same lower bound.
+
+        test_version_matches_requirements only ever sees whichever form
+        requirements.txt currently uses, so exercise the other one here too, along
+        with the neighbouring packages the pattern must not match.
+        """
+        for requirement in (
+            "triton==3.7.0",
+            "triton>=3.7.0,<=3.8.0",
+            "triton >= 3.7.0, <= 3.8.0",
+            "triton==3.7.0 # NOTE: also re-vendor triton_kernels",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertEqual(_triton_lower_bound(f"blake3\n{requirement}\nxdsl\n"), "3.7.0")
+
+        for requirement in ("triton-kernels==1.2.3", "tritonclient==2.60.0"):
+            with self.subTest(requirement=requirement):
+                self.assertIsNone(_triton_lower_bound(f"{requirement}\n"))
 
 
 if __name__ == "__main__":

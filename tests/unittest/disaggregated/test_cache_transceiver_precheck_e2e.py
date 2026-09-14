@@ -118,12 +118,12 @@ def _terminate_process_groups(processes):
                     pass
 
 
-def _disagg_yaml(num_ctx, num_gen, ctx_tp, gen_tp, request_lengths=(64,)):
+def _disagg_yaml(num_ctx, num_gen, ctx_tp, gen_tp, request_lengths=(64,), mtp_draft_len=0):
     """Minimal disagg perf-sanity yaml shaped like the checked-in configs."""
     tokens_per_block = 32
 
     def side(tp):
-        return {
+        config = {
             "tensor_parallel_size": tp,
             "pipeline_parallel_size": 1,
             "kv_cache_config": {
@@ -139,6 +139,12 @@ def _disagg_yaml(num_ctx, num_gen, ctx_tp, gen_tp, request_lengths=(64,)):
                 "max_tokens_in_buffer": 512,
             },
         }
+        if mtp_draft_len:
+            config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "max_draft_len": mtp_draft_len,
+            }
+        return config
 
     return {
         "metadata": {"model_dir_name": "tiny-llama"},
@@ -309,6 +315,17 @@ def test_precheck_passes(tmp_path, num_ctx, num_gen, ctx_tp, gen_tp):
         _, doc = _read_status(work_dir, f"gen_{gj}")
         peers = {c["peer"] for c in doc["cases"] if c["status"] == "PASS"}
         assert peers == {f"ctx_{ci}" for ci in range(num_ctx)}
+
+
+@pytest.mark.timeout(300)
+def test_precheck_passes_mtp_exact_block_boundary(tmp_path):
+    """Reserved MTP tokens must not expand the verified transfer payload."""
+    pytest.importorskip("mpi4py")
+    cfg = _disagg_yaml(1, 1, 1, 1, request_lengths=(64,), mtp_draft_len=3)
+    config_path, models_root = _write_inputs(tmp_path, cfg)
+    work_dir, launched = _launch_instances(tmp_path, _jobs(cfg, config_path), models_root)
+    _wait_all(launched)
+    _assert_all_passed(work_dir, launched)
 
 
 @pytest.mark.timeout(300)

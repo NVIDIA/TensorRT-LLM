@@ -27,10 +27,10 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::compressor
 {
 
-// Decode kernel: write NEXT_N tokens to paged cache + conditional compression
+// Decode kernel: write next_n runtime tokens to paged cache + conditional compression
 // via online softmax. Overlap is derived from compress_ratio (ratio=4).
 //
-// Grid: (batch_size, cdiv(state_dim, block_size))
+// Grid: (batch_size, cdiv(state_dim, block_size), chunk_workers)
 // One thread per state_dim element across all phases.
 // state_dim is a constexpr derived from COMPRESS_RATIO and HEAD_DIM inside the kernel.
 void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or fp32)

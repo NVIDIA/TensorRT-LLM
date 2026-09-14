@@ -10,6 +10,8 @@ import pytest
 
 from tensorrt_llm._torch.visual_gen.models.flux import Flux2Pipeline, FluxPipeline
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
 def test_infer_forwards_num_images_per_prompt(
@@ -28,7 +30,7 @@ def test_infer_forwards_num_images_per_prompt(
             seed=42,
             max_sequence_length=512,
             num_images_per_prompt=2,
-            image=[b"reference"],
+            image_reference=[SimpleNamespace(content=b"reference")],
         ),
     )
 

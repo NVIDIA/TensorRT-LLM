@@ -52,6 +52,8 @@ from tensorrt_llm.visual_gen.args import (
     VisualGenArgs,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _write_minimal_qwen_checkpoint(tmp_path: Path) -> Path:
     """Create the minimum diffusers layout needed by PipelineLoader config code."""
@@ -198,6 +200,13 @@ def test_qwen_pipeline_feature_args(args, expected):
             16,
             True,
             id="dynamic-fp4",
+        ),
+        pytest.param(
+            {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True},
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            None,
+            True,
+            id="dynamic-fp8-rowwise",
         ),
     ],
 )

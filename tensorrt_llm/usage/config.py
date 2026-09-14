@@ -45,6 +45,7 @@ class UsageContext(str, Enum):
     CLI_SERVE = "cli_serve"
     CLI_BENCH = "cli_bench"
     CLI_EVAL = "cli_eval"
+    DISAGGREGATED = "disaggregated"
 
 
 @dataclass(frozen=True)

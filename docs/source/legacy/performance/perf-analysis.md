@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (perf-analysis)=
 
 # Performance Analysis

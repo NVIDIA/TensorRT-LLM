@@ -41,14 +41,18 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
+from click.testing import CliRunner
 
 from tensorrt_llm.evaluate.covost2 import CoVoST2
 from tensorrt_llm.evaluate.lm_eval import (
+    GSM8K,
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
     MAX_IN_FLIGHT_ENV_VAR,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
+    _override_stop_strings,
 )
 from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     is_equiv,
@@ -1620,3 +1624,246 @@ def test_e2e_windowed_matches_final_score(monkeypatch):
     )
     score = results["results"]["toy_arith"]["exact_match,strict-match"]
     assert score == pytest.approx(0.75)
+
+
+# ===========================================================================
+# post_processing — Kimi K3 channel-structured MMMU answer extraction
+# ===========================================================================
+#
+# Kimi K3 emits a channel-structured chat format whose reasoning ends with
+# ``<|close|>think<|sep|>`` (NOT ``</think>``) and whose final answer lives in a
+# ``<|open|>response<|sep|> X <|close|>response<|sep|>`` channel. The K2.5
+# strip_thinking() path keys on ``</think>`` and therefore cannot see the
+# answer, silently dropping ~6-7 MMMU points even when the model is correct
+# (observed on the real checkpoint: full mmmu_val 67.67 -> 74.11 by parsing the
+# channel alone). These tests pin the new extractor and guard that the K2.5
+# path is unchanged.
+
+from tensorrt_llm.evaluate.post_processing import (  # noqa: E402
+    extract_kimi_k3_mmmu_answer,
+    strip_thinking,
+    strip_thinking_and_extract_mmmu_answer,
+)
+
+
+def _k3_output(thinking: str, answer: str) -> str:
+    """Build a well-formed Kimi K3 channel-structured output string."""
+    return (
+        f"{thinking}<|close|>think<|sep|>"
+        f"<|open|>response<|sep|>{answer}<|close|>response<|sep|>"
+        f"<|close|>message<|sep|>"
+    )
+
+
+def test_k3_channel_bare_letter():
+    """Answer is a bare option letter inside the response channel."""
+    out = _k3_output("Reasoning about the options... I'll go with C.", "C")
+    assert extract_kimi_k3_mmmu_answer(out) == "C"
+
+
+def test_k3_channel_real_samples_recovered():
+    """Real committed mmmu_val samples the old parser scored wrong.
+
+    The channel holds the correct letter: accounting doc_id 7->C, 12->D, 21->A.
+    """
+    assert (
+        extract_kimi_k3_mmmu_answer(
+            _k3_output("...Total debits adjusted = 126,925. Final: C.", "C")
+        )
+        == "C"
+    )
+    assert (
+        extract_kimi_k3_mmmu_answer(_k3_output("...Ending = 0. Option D. Final just D.", "D"))
+        == "D"
+    )
+    assert (
+        extract_kimi_k3_mmmu_answer(
+            _k3_output("...commonly known by that name, so True. (A).", "A")
+        )
+        == "A"
+    )
+
+
+def test_k3_channel_parenthesized_answer():
+    """Channel content ``(C) Photos 2 & 3`` reduces to the option letter."""
+    out = _k3_output("Both use negative space.", "(C) Photos 2 & 3")
+    assert extract_kimi_k3_mmmu_answer(out) == "C"
+
+
+def test_k3_channel_answer_is_phrase():
+    """Channel content ``The answer is (D).`` reduces to the option letter."""
+    out = _k3_output("Long derivation here.", "The answer is (D).")
+    assert extract_kimi_k3_mmmu_answer(out) == "D"
+
+
+def test_k3_truncated_after_channel_open():
+    """Truncation right after the channel opened still yields the letter.
+
+    The regex boundary falls back to end-of-text for the unterminated span.
+    """
+    out = (
+        "Some reasoning.<|close|>think<|sep|>"
+        "<|open|>response<|sep|>B"
+    )  # cut off before <|close|>response
+    assert extract_kimi_k3_mmmu_answer(out) == "B"
+
+
+def test_k3_last_channel_wins():
+    """When multiple response channels are present, the final one is the answer."""
+    out = (
+        "r1<|close|>think<|sep|><|open|>response<|sep|>A<|close|>response<|sep|>"
+        "<|open|>response<|sep|>E<|close|>response<|sep|><|close|>message<|sep|>"
+    )
+    assert extract_kimi_k3_mmmu_answer(out) == "E"
+
+
+def test_k3_no_channel_bare_letter_falls_back():
+    """Short direct answers with no channel go through the K2.5 fallback."""
+    assert extract_kimi_k3_mmmu_answer("C") == "C"
+    assert extract_kimi_k3_mmmu_answer("Answer: (B)") == "B"
+
+
+def test_k3_no_channel_truncated_thinking_does_not_crash():
+    """Thinking truncated before the channel opened (finish=length).
+
+    No channel to parse -> fall back; must not raise and must not fabricate.
+    """
+    truncated = (
+        "Let me reason step by step about this very long problem "
+        "that never reaches a final answer channel " * 20
+    )
+    # Should not raise; returns whatever the fallback cascade yields (the model
+    # genuinely did not emit an answer, so the exact value is not asserted).
+    out = extract_kimi_k3_mmmu_answer(truncated)
+    assert isinstance(out, str)
+
+
+def test_k3_empty_input():
+    assert extract_kimi_k3_mmmu_answer("") == ""
+
+
+def test_k3_scrubs_residual_special_tokens():
+    """Residual ``<|...|>`` tokens inside a channel span are scrubbed.
+
+    They must not be returned as part of the answer.
+    """
+    out = (
+        "t<|close|>think<|sep|><|open|>response<|sep|>"
+        "<|reserved|>D<|close|>response<|sep|><|close|>message<|sep|>"
+    )
+    assert extract_kimi_k3_mmmu_answer(out) == "D"
+
+
+def test_k2_5_strip_thinking_path_unchanged():
+    """Guard: the new K3 extractor must not alter the K2.5 </think> behavior."""
+    k25 = "<think>chain of thought here</think>Answer: (C)"
+    # K2.5 path still extracts C directly.
+    assert strip_thinking_and_extract_mmmu_answer(k25) == "C"
+    # strip_thinking still returns content after the last </think>.
+    assert strip_thinking(k25) == "Answer: (C)"
+    # And the K3 extractor, given a </think> blob with no K3 response channel,
+    # defers to the K2.5 cascade and returns the same answer.
+    assert extract_kimi_k3_mmmu_answer(k25) == "C"
+
+
+def test_k3_channel_extracting_to_nothing_falls_back_to_cascade():
+    """A channel whose content extracts to nothing must not mask the fallback.
+
+    "** **" survives the special-token scrub as non-empty text, but the
+    cascade's markdown-bold stripping reduces it to "" — the extractor must
+    keep scanning and recover the letter from the reasoning text instead of
+    returning the empty string.
+    """
+    out = _k3_output("Elimination shows the answer is (B).", "** **")
+    assert extract_kimi_k3_mmmu_answer(out) == "B"
+
+
+# ===========================================================================
+# _override_stop_strings — CLI override of the task yaml's ``until`` list
+# ===========================================================================
+
+
+class _FakeTaskConfig:
+    """Minimal stand-in for lm-eval's ``TaskConfig``."""
+
+    def __init__(self, generation_kwargs):
+        self.generation_kwargs = generation_kwargs
+
+
+class _FakeStopStringTask:
+    """Minimal stand-in for lm-eval's ``ConfigurableTask``."""
+
+    def __init__(self, generation_kwargs=None):
+        self.config = _FakeTaskConfig(generation_kwargs)
+
+    def set_config(self, key, value):
+        setattr(self.config, key, value)
+
+
+def test_override_stop_strings_replaces_until():
+    """The yaml's ``until`` list is replaced, not appended to."""
+    task = _FakeStopStringTask({"until": ["Question:", "</s>"]})
+    _override_stop_strings(task, ["<|im_end|>"])
+    assert task.config.generation_kwargs["until"] == ["<|im_end|>"]
+
+
+def test_override_stop_strings_preserves_other_gen_kwargs():
+    """Only ``until`` changes; max_gen_toks / do_sample survive."""
+    task = _FakeStopStringTask({"until": ["Question:"], "max_gen_toks": 256, "do_sample": False})
+    _override_stop_strings(task, ["</s>"])
+    assert task.config.generation_kwargs == {
+        "until": ["</s>"],
+        "max_gen_toks": 256,
+        "do_sample": False,
+    }
+
+
+def test_override_stop_strings_on_task_without_generation_kwargs():
+    """A task yaml with no gen_kwargs at all still gets an ``until`` list."""
+    task = _FakeStopStringTask(None)
+    _override_stop_strings(task, ["</s>"])
+    assert task.config.generation_kwargs == {"until": ["</s>"]}
+
+
+def test_override_stop_strings_empty_list_disables_stopping():
+    """An explicit empty list is honored, i.e. generate to max_gen_toks."""
+    task = _FakeStopStringTask({"until": ["Question:"]})
+    _override_stop_strings(task, [])
+    assert task.config.generation_kwargs["until"] == []
+
+
+def test_override_stop_strings_does_not_alias_caller_list():
+    """The stored list is a copy; later caller mutation must not leak in."""
+    stop_strings = ["</s>"]
+    task = _FakeStopStringTask({"until": ["Question:"]})
+    _override_stop_strings(task, stop_strings)
+    stop_strings.append("<|im_end|>")
+    assert task.config.generation_kwargs["until"] == ["</s>"]
+
+
+def test_override_stop_strings_does_not_mutate_original_gen_kwargs():
+    """The task's original gen_kwargs dict object is left untouched."""
+    original = {"until": ["Question:"], "max_gen_toks": 256}
+    task = _FakeStopStringTask(original)
+    _override_stop_strings(task, ["</s>"])
+    assert original == {"until": ["Question:"], "max_gen_toks": 256}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param('"</s>"', id="json_string"),
+        pytest.param('{"until": ["</s>"]}', id="json_object"),
+        pytest.param('["</s>", 42]', id="list_with_non_string_member"),
+    ],
+)
+def test_stop_strings_cli_rejects_non_list_of_strings(value):
+    """``--stop_strings`` rejects valid JSON that is not a list of strings.
+
+    Command-level: the real ``gsm8k`` click command is invoked, and the
+    ``_parse_stop_strings`` callback must raise ``click.BadParameter``
+    during parameter processing, before the command body runs.
+    """
+    result = CliRunner().invoke(GSM8K.command, ["--stop_strings", value], standalone_mode=False)
+    assert isinstance(result.exception, click.BadParameter)
+    assert "JSON list of strings" in result.exception.message

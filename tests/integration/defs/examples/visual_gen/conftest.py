@@ -12,20 +12,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fixtures shared by VisualGen example tests."""
 
+import importlib.util
+import os
 import shutil
 
 import pytest
-from defs.examples.visual_gen.visual_gen_test_utils import _prepare_vbench_repo
 from defs.trt_test_alternative import check_call
+
+# Fixtures shared by VisualGen example tests.
 
 
 @pytest.fixture(scope="session")
-def _visual_gen_deps(llm_venv):
-    """Install the Python and system media dependencies once per session."""
-    llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    if shutil.which("ffmpeg") is None:
+def _visual_gen_deps(llm_venv, _auto_install_media_deps):
+    """Ensure PyAV and ffmpeg are available for VisualGen tests.
+
+    Uses packages already on the system when present. Otherwise set
+    ``TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1`` to install them. OpenCV is handled by
+    ``_auto_install_media_deps``.
+    """
+    av_available = importlib.util.find_spec("av") is not None
+    ffmpeg_available = shutil.which("ffmpeg") is not None
+    if av_available and ffmpeg_available:
+        return
+    if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
+        pytest.fail(
+            "PyAV and/or ffmpeg are not installed. Install them manually, or set "
+            "TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1 to auto-install."
+        )
+    if not av_available:
+        llm_venv.run_cmd(["-m", "pip", "install", "av"])
+    if not ffmpeg_available:
         check_call(["apt-get", "update", "-y"], shell=False)
         check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
 
@@ -40,9 +57,3 @@ def _visual_gen_lpips_scorer():
         yield scorer
     finally:
         scorer.close()
-
-
-@pytest.fixture(scope="session")
-def vbench_repo_root(llm_venv):
-    """Prepare the pinned VBench checkout and return its repository root."""
-    return _prepare_vbench_repo(llm_venv)

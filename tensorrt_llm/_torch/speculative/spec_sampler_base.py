@@ -27,8 +27,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
-
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -41,6 +39,9 @@ from ..pyexecutor.sampler import (
     add_token,
     int_tensor,
 )
+from ..pyexecutor.sampler.penalties import has_occurrence_penalty
+from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
+from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
 
 
@@ -95,18 +96,104 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         buffer there, so it would be silently dropped and the request would
         decode from a different distribution than the user asked for. Threading
         it through costs measurable throughput on the rejection path, so reject
-        instead. Raised from validate_request (request admission), so only the
-        offending request fails rather than the whole executor step.
+        instead. This sampler also does not return context logits, generation
+        logits, or log probabilities. Raised from validate_request (request
+        admission), so only the offending request fails rather than the whole
+        executor step.
         """
+        requested_outputs = (
+            ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
+            ("return_generation_logits", request.py_return_generation_logits),
+            ("logprobs", request.py_return_log_probs),
+        )
+        unsupported_outputs = [name for name, requested in requested_outputs if requested]
+        if unsupported_outputs:
+            raise ValueError(
+                "The following output options are not supported with speculative decoding: "
+                f"{', '.join(unsupported_outputs)}. Drop these options from "
+                "the request, or disable speculative decoding."
+            )
+
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
-        # min_p lives on the C++ SamplingConfig as an optional singleton list.
+        # min_p lives on the C++ SamplingConfig as an optional scalar.
         min_p = sampling_config.min_p
-        if min_p and min_p[0] > 0.0:
+        if min_p and min_p > 0.0:
             raise ValueError(
                 "min_p is not supported with one-model speculative decoding. "
                 "Drop min_p from the request, or disable speculative decoding."
+            )
+        self._validate_unsupported_logits_processors(request)
+        # The occurrence penalties need a [slots, vocab_size] workspace that is only
+        # allocated when the deploy opted in, so a request asking for them while the
+        # flag is off cannot be honored. Reject instead of silently decoding from an
+        # unpenalized distribution -- same reasoning as min_p above.
+        if not has_occurrence_penalty(request):
+            return
+        if not self._enable_penalty:
+            raise ValueError(
+                "repetition_penalty / presence_penalty / frequency_penalty require "
+                "'enable_penalty: true' in the speculative decoding config when using "
+                "one-model speculative decoding. Enable that flag, drop the penalties "
+                "from the request, or disable speculative decoding."
+            )
+        # Tree speculation lays each request's logits out as tree nodes, where a
+        # row's history is its root path rather than the rows before it. Applying
+        # the linear mapping there would let sibling branches penalize each other,
+        # so reject until tree-aware prefixes are implemented.
+        if not self._penalty_supported:
+            raise ValueError(
+                "repetition_penalty / presence_penalty / frequency_penalty are not "
+                "supported with tree speculative decoding (eagle_choices / dynamic "
+                "tree) yet. Drop the penalties, use a linear speculation mode, or "
+                "disable speculative decoding."
+            )
+
+    @staticmethod
+    def _validate_unsupported_logits_processors(request: LlmRequest) -> None:
+        """Reject logits-side sampling features the one-model path cannot apply.
+
+        TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
+        embedding_bias and top_p_decay by editing the target logits before
+        sampling. The one-model path has no logits-editing hook, so each is
+        rejected here instead of being silently dropped.
+
+        Each check gates on a non-neutral value rather than on presence, since a
+        frontend may forward a default explicitly.
+        """
+        # py_min_length mirrors the C++ SamplingConfig field, i.e. an optional
+        # scalar. The OpenAI frontend always forwards min_tokens (default 0), so
+        # it is routinely present and holds the neutral value -- gate on the
+        # value, not on its presence.
+        min_length = getattr(request, "py_min_length", None)
+        if min_length and min_length > 0:
+            raise ValueError(
+                "min_length is not supported with one-model speculative decoding. "
+                "Drop min_length from the request, or disable speculative decoding."
+            )
+        if getattr(request, "py_bad_words", None):
+            raise ValueError(
+                "bad_words is not supported with one-model speculative decoding. "
+                "Drop bad_words from the request, or disable speculative decoding."
+            )
+        if getattr(request, "py_no_repeat_ngram_size", None):
+            raise ValueError(
+                "no_repeat_ngram_size is not supported with one-model speculative "
+                "decoding. Drop no_repeat_ngram_size from the request, or disable "
+                "speculative decoding."
+            )
+        if getattr(request, "py_embedding_bias", None) is not None:
+            raise ValueError(
+                "embedding_bias is not supported with one-model speculative decoding. "
+                "Drop embedding_bias from the request, or disable speculative decoding."
+            )
+        # Reuse the handler's own predicate so "active" cannot drift between paths.
+        if top_p_decay_active(_request_get_sampling_params(request)):
+            raise ValueError(
+                "top_p_decay is not supported with one-model speculative decoding. "
+                "Drop top_p_decay / top_p_min from the request, or disable "
+                "speculative decoding."
             )
 
     @dataclass(kw_only=True)
@@ -118,7 +205,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
 
-    def __init__(self, args: TorchSampler.Args, *, accepted_path_len: Optional[int] = None):
+    def __init__(
+        self,
+        args: TorchSampler.Args,
+        *,
+        accepted_path_len: Optional[int] = None,
+        enable_penalty: bool = False,
+        penalty_supported: bool = True,
+    ):
         """
         Initialize the speculative sampler.
 
@@ -128,7 +222,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 can accept, used to size new_tokens. Defaults to
                 ``args.max_draft_len + 1``; see the store comment below for the
                 one mode that has to override it.
+            enable_penalty: whether the deploy enabled the occurrence penalties.
+                Only used to decide whether a request asking for them is admitted;
+                the penalties themselves are applied inside the worker.
+            penalty_supported: whether this speculation mode's row layout is one
+                the penalties can map (linear modes yes, tree modes not yet).
         """
+        self._enable_penalty = enable_penalty
+        self._penalty_supported = penalty_supported
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -176,23 +277,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        if request.py_return_context_logits:
-            logger.warning(
-                "return_context_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_generation_logits:
-            logger.warning(
-                "return_generation_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_log_probs:
-            logger.warning(
-                "return_log_probs not supported with speculative decoding, skipping for request %s",
-                request.py_request_id,
-            )
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
@@ -231,7 +315,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
-                if TorchSampler._handle_stop_criteria(
+                if handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break

@@ -1,14 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List
 
 import torch
 import transformers
 
 from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import interface as attention_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention import attention as trtllm_attention
+from tensorrt_llm._torch.attention.backends import interface as attention_interface
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp
 from tensorrt_llm._torch.modules import rms_norm as trtllm_rmsnorm
 from tensorrt_llm._utils import prefer_pinned
@@ -205,6 +208,14 @@ class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
             model_config.attn_backend
         ).Metadata
 
+    def get_encoder_attention_metadata_capacity(self, max_num_tokens: int) -> dict[str, int]:
+        """Conservatively map each item to one Pixtral attention context.
+
+        Mistral3's processor normally injects the tighter merge-tile-aware
+        token bound into :meth:`setup_attn_metadata`.
+        """
+        return {"attention": max(1, max_num_tokens)}
+
     @torch.inference_mode()
     def forward(
         self,
@@ -277,7 +288,7 @@ class _RopeFunction:
         self._cos, self._sin = position_embeddings
 
     # This signature matches that of
-    # `tensorrt_llm/_torch/modules/rotary_embedding.py::RotaryEmbedding.forward` so that we are
+    # `tensorrt_llm/_torch/attention/rotary_embedding.py::RotaryEmbedding.forward` so that we are
     # able to override the `PixtralAttentionLayer.rotary_embed` attribute.
     @torch.no_grad()
     def __call__(

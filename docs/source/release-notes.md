@@ -28,7 +28,17 @@ All published functionality in the Release Notes has been fully tested and verif
 
 - <span style="color: red">**[BREAKING CHANGE] TensorRT backend removed.**</span> PyTorch is now the sole execution backend. `LLM(backend="tensorrt")` now raises a `ValueError`; `TrtLlmArgs`, `tensorrt_llm._tensorrt_engine.LLM`, the `trtllm-build` / `trtllm-refit` / `trtllm-prune` CLIs, the `--backend tensorrt` CLI choice, and the per-model `convert_checkpoint.py` scripts have all been removed. The `tensorrt` pip dependency is no longer installed. See the [TensorRT Backend Removed migration guide](legacy/tensorrt-backend-removal.md) for details.
 
+- <span style="color: red">**[BREAKING CHANGE] Two-model speculative decoding removed.**</span> The separate draft-engine path behind Eagle3, MTP-Eagle and Draft-Target has been removed; the one-model implementations (draft/drafter as a submodule) are now the only supported paths. The `eagle3_one_model` and `mtp_eagle_one_model` fields are removed from `EagleDecodingConfig` and `MTPDecodingConfig`; both have carried a deprecation warning since #11043/#11761 and have been forced to the one-model path since #17366. Configurations that still set them (including `True`) now fail with a Pydantic `unexpected field` error and should simply drop the field. The `--use_one_model` flag is removed from `examples/llm-api/quickstart_advanced.py`. `EagleDecodingConfig.greedy_sampling` and `EagleDecodingConfig.posterior_threshold`, which had no effect, are also removed.
+
+- <span style="color: red">**[BREAKING CHANGE] C++ executor API: `SpeculativeDecodingFastLogitsInfo::toTensor()` removed.**</span> This is a source and ABI break for downstream code linking against the C++ executor API: the exported symbol `tensorrt_llm::executor::SpeculativeDecodingFastLogitsInfo::toTensor() const` no longer exists, so an unmodified binary fails at link/load time with `undefined symbol`. There is no replacement — it served the fast-logits path of the removed TensorRT-engine flow; call sites should be deleted. The struct's data layout is unchanged (`sizeof` 16, `draftRequestId` at offset 0, `draftParticipantId` at offset 8), so no silent misreads are possible. Speculative-decoding accessors on `runtime::ModelConfig`, `runtime::SpeculativeDecodingMode` and `runtime::SpeculativeDecodingModule` are removed in the same change; these are `inline`/`constexpr` and therefore break at compile time rather than at load time.
+
 - `trtllm-serve`, `trtllm-eval`, `trtllm-bench`: explicit CLI flags now take precedence over values in `--config` / `--extra_llm_api_options` YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.
+
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 `pool_ratio` values are now specified in layer-group ID order, with exactly one normalized hot-tier byte ratio per layer group, instead of hot pool-group order. Cold-tier initialization preserves the implied layer-group slot-count proportions while accounting for cold page sizes.**</span>
+
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 reports cold-tier `secondary*` statistics in `kvCacheIterationStatsByColdPoolGroup`. These keys are no longer present in the hot pool-group or window-size views.**</span>
+
+- <span style="color: red">**[BREAKING CHANGE] VisualGen video `response_format`.**</span> Video generation (`POST /v1/videos/sync`, `POST /v1/videos`) narrows `response_format` to `{file, path}` (default `file`): the old `url` value — which returned raw bytes, not a URL — is renamed to `file`, and `b64_json` is removed. Requests still sending `url` or `b64_json` now get an error that names the replacement. The internal `output_path` is no longer emitted by `GET /v1/videos/{id}` or `GET /v1/videos` (status only); a co-located client obtains the on-disk path via `response_format="path"`. Image `response_format` is unchanged and additively gains `path`. The synchronous route is now `POST /v1/videos/sync`, with `POST /v1/videos/generations` kept as a deprecated alias. `response_format="path"` returns absolute server-side file paths and can be disabled server-side with `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` (enabled by default; paths stay under the media-storage directory).
 
 ### Fixed Issues
 
@@ -1302,7 +1312,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Skywork model support
 - Add example for multimodal models (BLIP with OPT or T5, LlaVA)
 
-Refer to the {ref}`support-matrix-software` section for a list of supported models.
+Refer to the {ref}`support-matrix` section for a list of supported models.
 
 * API
   - Add a set of LLM APIs for end-to-end generation tasks (see examples/llm-api/README.md)

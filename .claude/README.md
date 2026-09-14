@@ -62,7 +62,6 @@ short and not repeat it.
 
 | Prefix | Domain | Definition |
 |---|---|---|
-| `ad-` | AutoDeploy | Model onboarding, pipeline debugging, and execution for the AutoDeploy backend |
 | `exec-` | Execution infra | Environment setup and job execution (compile, run, container) |
 | `kernel-` | Kernel development | Kernel writing, generation, and kernel-specific transforms |
 | `perf-` | Performance work | Profiling, analysis, and tuning above the kernel layer (kernel modifications belong under `kernel-`) |

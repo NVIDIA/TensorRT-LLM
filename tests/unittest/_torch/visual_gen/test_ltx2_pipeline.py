@@ -200,7 +200,7 @@ class TestLTX2Quantization:
     """Test LTX2 quantization loading and FP8 weight verification."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_load_with_quantization(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
         """Test loading LTX2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
@@ -478,6 +478,7 @@ class TestLTX2AttentionBackend:
 class TestLTX2BatchSupport:
     """Test batch support logic without loading the full pipeline."""
 
+    @pytest.mark.cpu_only
     def test_video_pixel_shape_batch_propagation(self):
         """VideoPixelShape(batch=N) propagates through VideoLatentShape."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.types import (
@@ -494,6 +495,7 @@ class TestLTX2BatchSupport:
             torch_shape = video_shape.to_torch_shape()
             assert torch_shape[0] == batch_size
 
+    @pytest.mark.cpu_only
     def test_prompt_normalization(self):
         """forward() normalizes str prompt to List[str] and computes batch_size."""
         # Simulate the normalization logic from forward()
@@ -507,6 +509,7 @@ class TestLTX2BatchSupport:
                 prompt = [prompt]
             assert len(prompt) == expected_batch
 
+    @pytest.mark.cpu_only
     def test_negative_prompt_expansion(self):
         """Negative prompt is expanded to match batch_size."""
         # Simulate the negative prompt expansion logic from forward()
@@ -548,6 +551,7 @@ class TestLTX2BatchSupport:
 class TestTwoStageLoRAHelpers:
     """Test LoRA delta loading and application without checkpoints."""
 
+    @pytest.mark.cpu_only
     def test_bf16_weight_snapshot_gate_uses_cuda_free_memory(self, monkeypatch):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _should_save_bf16_weights,
@@ -570,6 +574,7 @@ class TestTwoStageLoRAHelpers:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         assert not _should_save_bf16_weights()
 
+    @pytest.mark.cpu_only
     def test_bf16_weight_snapshot_saved_when_requested(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _apply_lora_deltas,
@@ -808,6 +813,7 @@ class TestTwoStageLoRAFileLoading:
             os.unlink(tmp_path)
 
 
+@pytest.mark.cpu_only
 class TestTwoStagePipelineVariantResolution:
     """Test that LTX2Pipeline.resolve_variant selects the correct class."""
 
@@ -875,6 +881,7 @@ class TestTwoStagePipelineVariantResolution:
         assert result is LTX2Pipeline
 
 
+@pytest.mark.cpu_only
 class TestLTX2ForceOneStageEnv:
     """Test force-one-stage env-var behavior during LTX2 variant selection."""
 
@@ -1281,6 +1288,9 @@ class TestLTX2TwoStageLoRAHelpers:
                 return self.lin(x)
 
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        # __init__ is bypassed here; BasePipeline.device now reads self._device
+        # (set in __init__), so initialize it explicitly for the warmup path.
+        pipeline._device = torch.device("cuda")
         pipeline.pipeline_config = DiffusionPipelineConfig(
             cuda_graph=CudaGraphConfig(enable=True),
             torch_compile=TorchCompileConfig(enable=False),
@@ -1675,7 +1685,7 @@ class TestLTX2TwoStagePipelineLoading:
             torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_two_stage_with_quantization(self, ltx2_two_stage_assets_exist, quant_algo: str):
         """Two-stage pipeline loads correctly with FP8 quantization."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
@@ -1709,6 +1719,7 @@ class TestLTX2TwoStagePipelineLoading:
             torch.cuda.empty_cache()
 
 
+@pytest.mark.cpu_only
 class TestTwoStageCommonWarmupShapes:
     """Test LTX2TwoStagesPipeline.common_warmup_shapes property."""
 

@@ -72,19 +72,24 @@ CachedCudaEvent CachedCudaEvent::makeNull() noexcept
     return CachedCudaEvent{};
 }
 
-CachedCudaEvent::CachedCudaEvent(CudaStream stream)
-    : mEvent(std::make_shared<CudaEventPool::PoolItem>(CudaEventPool::instance().get()))
+CachedCudaEvent::CachedCudaEvent(CudaStream stream) noexcept
 {
-    cuCheck(cuEventRecord(mEvent->get(), reinterpret_cast<CUstream>(stream)));
+    terminateOnException("Failed to create or record a cached CUDA event",
+        [&]()
+        {
+            mEvent = std::make_shared<PooledEvent>(CudaEventPool::instance().get());
+            cuCheck(cuEventRecord(mEvent->load(), reinterpret_cast<CUstream>(stream)));
+        });
 }
 
-bool CachedCudaEvent::queryComplete()
+bool CachedCudaEvent::queryComplete() const
 {
-    if (isClosed())
+    CUevent event = handle();
+    if (event == nullptr)
     {
         return true;
     }
-    CUresult result = cuEventQuery(mEvent->get());
+    CUresult result = cuEventQuery(event);
     if (result == CUDA_SUCCESS)
     {
         close();
@@ -97,30 +102,32 @@ bool CachedCudaEvent::queryComplete()
     throw CuError(result);
 }
 
-void CachedCudaEvent::synchronize()
+void CachedCudaEvent::synchronize() const
 {
-    if (isClosed())
+    CUevent event = handle();
+    if (event == nullptr)
     {
         return;
     }
-    cuCheck(cuEventSynchronize(mEvent->get()));
+    cuCheck(cuEventSynchronize(event));
     close();
 }
 
 void CachedCudaEvent::waitInStream(CudaStream stream) const
 {
-    if (isClosed())
+    CUevent event = handle();
+    if (event == nullptr)
     {
         return;
     }
-    cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), mEvent->get(), 0));
+    cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), event, 0));
 }
 
-void CachedCudaEvent::close()
+void CachedCudaEvent::close() const noexcept
 {
     if (mEvent)
     {
-        mEvent->reset();
+        mEvent->retire();
     }
 }
 
@@ -133,7 +140,7 @@ CachedCudaStream::CachedCudaStream()
 {
 }
 
-CachedCudaEvent CachedCudaStream::recordEvent()
+CachedCudaEvent CachedCudaStream::recordEvent() noexcept
 {
     return CachedCudaEvent{reinterpret_cast<CudaStream>(handle())};
 }

@@ -40,6 +40,7 @@ from touch_db import (  # noqa: E402
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
     _SERVING_PATH_MARKERS,
+    _UNTRUSTED_STAGE_MARKERS,
     _WORKER_SENTINEL,
     TouchDB,
     db_key,
@@ -93,10 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     sv = db.schema_version()
     commit = db.collection_commit()
-    print(f"  schema_version: {sv or 'MISSING (selector cannot hard-fail on format drift)'}")
-    print(
-        f"  collection commit: {commit or 'MISSING (no staleness gating; zero-touch lever stays off)'}"
-    )
+    print(f"  schema_version: {sv}")
+    print(f"  collection commit: {commit or 'not stored (artifact metadata owns freshness)'}")
 
     # -- Scale --
     print("\n## Scale")
@@ -115,10 +114,20 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Completeness --
     untrusted = db.untrusted_tests(
-        _WORKER_SENTINEL, _LAUNCH_MARKERS, _SERVING_PATH_MARKERS, args.min_funcs
+        _WORKER_SENTINEL,
+        _LAUNCH_MARKERS,
+        _SERVING_PATH_MARKERS,
+        args.min_funcs,
+        _UNTRUSTED_STAGE_MARKERS,
     )
 
+    incomplete = db.incomplete_capture_tests()
+
     def reason(test: str) -> str:
+        if test in incomplete:
+            return "test_case_meta: not passed or a spawned process saved nothing"
+        if any(m in split_stage(test)[0] for m in _UNTRUSTED_STAGE_MARKERS):
+            return "untrusted stage (GPU worker uninstrumented)"
         if any(m in test for m in _SERVING_PATH_MARKERS):
             return "disagg-path (servers uninstrumented)"
         if footprint[test] < args.min_funcs:

@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Suffix-automaton (SA) speculative-decoding evaluation config. Identical
+# to eval_extra_llm_options.yaml except for the SA-specific keys, each
+# marked below: max_batch_size, cuda_graph_config.max_batch_size,
+# disable_overlap_scheduler, enable_chunked_prefill, and
+# speculative_config. Keep every other key in sync with the base file when
+# editing either.
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+# SA-specific: SA allocates per-request speculative state; the evaluated
+# configuration uses a batch size of 8.
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+# SA-specific: the evaluated SA configuration runs with the overlap
+# scheduler off.
+disable_overlap_scheduler: true
+# SA-specific: the evaluated SA configuration runs without chunked
+# prefill (the base config enables it).
+enable_chunked_prefill: false
+cuda_graph_config:
+  # SA-specific: keep the CUDA-graph batch size equal to max_batch_size
+  # above. SA is compatible with CUDA graphs. enable_padding is left at
+  # its default (off) here; the base config turns it on.
+  max_batch_size: 8
+moe_config:
+  max_num_tokens: 33024
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64
+# SA-specific: standalone suffix-automaton speculative decoding. SA is
+# lossless, so GSM8K scores should match the non-SA run within noise.
+speculative_config:
+  decoding_type: SA
+  max_draft_len: 2

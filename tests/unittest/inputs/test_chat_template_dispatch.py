@@ -202,7 +202,7 @@ class TestInterleaveMmPlaceholders:
         assert result == "<image>\nDescribe the image and video\n<video>"
 
     def test_numbered_placeholders(self):
-        """Models like Phi4MM use unique per-item placeholders."""
+        """Some multimodal models use unique per-item placeholders."""
         content_parts = [
             {"type": "image", "media_index": 0},
             "Compare these two images:",

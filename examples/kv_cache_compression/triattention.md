@@ -2,6 +2,9 @@
 
 This document describes enabling TriAttention KV-cache compression in TensorRT-LLM.
 
+For an overview of all available compression methods, see
+[KV Cache Compression](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md).
+
 TriAttention is a training-free, decode-time KV-cache eviction method for long-context LLM inference. During generation it periodically scores the cached tokens by a trigonometric importance measure derived from offline per-head query statistics (calibration), keeps the most important `budget` tokens, and physically compacts the cache — reducing KV-cache memory so more sequences fit on a GPU at once.
 
 For technical details see the paper [TriAttention](https://arxiv.org/abs/2604.04921) and the official implementation [github.com/WeianMao/triattention](https://github.com/WeianMao/triattention).
@@ -17,7 +20,7 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 
 ## Support Matrix
 
-* NVIDIA B200 (SM100; the current validated target)
+* NVIDIA SM100- or SM103-family GPU
 * Paged KV Cache (`KVCacheManagerV2`)
 * PyTorch backend
 
@@ -25,7 +28,7 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 1. TriAttention supports KV-cache block reuse. V2 reuses the committed prompt prefix, while TriAttention preserves that prefix and compacts only the generation suffix.
 2. TriAttention requires the V2 KV-cache manager (`use_kv_cache_manager_v2=True`).
 3. TriAttention does not compute calibration. Bring the official tool's calibration `.pt`; see [Calibration](#calibration).
-4. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window. Native sliding-eviction layouts such as Gemma 4, SSM/hybrid pools, and MLA caches are not supported.
+4. MHA, MLA, SSM/hybrid pools, and native sliding-eviction layouts such as Gemma 4 are not supported. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window.
 5. Speculative decoding is supported for one-model MTP and EAGLE3 with `eviction_mode="union"`. Tensor parallelism beyond TP1, attention DP, and disaggregated serving have not yet been validated end to end.
 
 ## Calibration
@@ -69,7 +72,6 @@ compression_config = TriAttentionKvCacheCompressionConfig(
     beta=64,               # eviction period, in confirmed generation tokens
     eviction_mode="union",
     calibration_path="/path/to/qwen3-8b-calibration.pt",  # official tool's output
-    model_path="<path_to_model>",                # used to derive the RoPE tables
 )
 
 # 2. TriAttention needs the V2 KV-cache manager and supports block reuse.
@@ -100,7 +102,6 @@ kv_cache_compression_config:
   beta: 64
   eviction_mode: union
   calibration_path: /path/to/qwen3-8b-calibration.pt
-  model_path: <path_to_model>
 kv_cache_config:
   enable_block_reuse: true
   use_kv_cache_manager_v2: true
@@ -121,5 +122,4 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
     * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima).
     * `per_layer_perhead`: each head keeps its own set, fully independent per layer.
 * **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default). `union` eviction always z-normalizes: `False` is overridden to `True` with a warning.
-* **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT-LLM does not compute calibration.
-* **`model_path`** (str): Checkpoint path, used to derive the model's RoPE tables when converting the official calibration file and to classify kernel-masked sliding-window (SWA) layers from the model config.
+* **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT-LLM does not compute calibration. The RoPE tables needed for the conversion are derived from the model TensorRT-LLM is loading; no extra model path is required.

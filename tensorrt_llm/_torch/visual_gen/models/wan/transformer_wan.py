@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from typing import Optional, Tuple
 
@@ -15,6 +30,8 @@ from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
+    WanPerTokenAdaLN,
+    WanPerTokenAdaLNRuntime,
     apply_fused_layernorm_adaln_quant,
     apply_fused_layernorm_affine_quant,
     get_nvfp4_input_scale,
@@ -372,6 +389,12 @@ class WanBlock(nn.Module):
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
         self._fused_ln_supported = hidden_size == 5120
 
+        self._pertoken_adaln = WanPerTokenAdaLN(
+            hidden_size,
+            dtype,
+            competing_fusion=self._fused_ln_supported,
+        )
+
         self.ffn = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
@@ -518,23 +541,25 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
-        if temb.ndim == 4:
-            # temb: batch_size, seq_len, 6, hidden_size
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0).float() + temb.float()
-            ).chunk(6, dim=2)
-            # batch_size, seq_len, 1, hidden_size -> batch_size, seq_len, hidden_size
-            shift_msa = shift_msa.squeeze(2)
-            scale_msa = scale_msa.squeeze(2)
-            gate_msa = gate_msa.squeeze(2)
-            c_shift_msa = c_shift_msa.squeeze(2)
-            c_scale_msa = c_scale_msa.squeeze(2)
-            c_gate_msa = c_gate_msa.squeeze(2)
-        else:
-            # temb: batch_size, 6, hidden_size
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.float() + temb.float()
-            ).chunk(6, dim=1)
+        pertoken_adaln = self._pertoken_adaln.prepare(x, temb, self.scale_shift_table)
+        if pertoken_adaln is None:
+            if temb.ndim == 4:
+                # temb: batch_size, seq_len, 6, hidden_size
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    self.scale_shift_table.unsqueeze(0).float() + temb.float()
+                ).chunk(6, dim=2)
+                # batch_size, seq_len, 1, hidden_size -> batch_size, seq_len, hidden_size
+                shift_msa = shift_msa.squeeze(2)
+                scale_msa = scale_msa.squeeze(2)
+                gate_msa = gate_msa.squeeze(2)
+                c_shift_msa = c_shift_msa.squeeze(2)
+                c_scale_msa = c_scale_msa.squeeze(2)
+                c_gate_msa = c_gate_msa.squeeze(2)
+            else:
+                # temb: batch_size, 6, hidden_size
+                shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+                    self.scale_shift_table.float() + temb.float()
+                ).chunk(6, dim=1)
 
         if self._fused_ln_supported:
             # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
@@ -542,6 +567,10 @@ class WanBlock(nn.Module):
                 x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
             )
             normed = self._reshape_fused_output(normed, x.shape)
+        elif pertoken_adaln is not None:
+            normed = self._pertoken_adaln.normalize_input(
+                x, pertoken_adaln, self.norm1.variance_epsilon
+            )
         else:
             normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
             normed = normed.to(x.dtype)
@@ -563,24 +592,36 @@ class WanBlock(nn.Module):
         else:
             attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
 
-        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
-
-        if (
-            self._fused_ln_supported
-            and isinstance(self.norm2, LayerNorm)
-            and self.norm2.weight is not None
-        ):
-            _x_2d = x.reshape(-1, x.shape[-1])
-            norm_x = apply_fused_layernorm_affine_quant(
-                _x_2d,
-                self.norm2.weight.to(x.dtype),
-                self.norm2.bias.to(x.dtype),
-                self._norm2_fp4_scale,
-                eps=self.norm2.variance_epsilon,
+        fused_norm2 = (
+            self._pertoken_adaln.add_self_attention_and_normalize(
+                x, attn1_out, pertoken_adaln, self.norm2
             )
-            norm_x = self._reshape_fused_output(norm_x, x.shape)
+            if pertoken_adaln is not None
+            else None
+        )
+        if fused_norm2 is not None:
+            norm_x, x = fused_norm2
         else:
-            norm_x = self.norm2(x.float()).to(x.dtype)
+            if pertoken_adaln is not None:
+                gate_msa = self._pertoken_adaln.self_attention_gate(pertoken_adaln)
+            x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
+
+            if (
+                self._fused_ln_supported
+                and isinstance(self.norm2, LayerNorm)
+                and self.norm2.weight is not None
+            ):
+                _x_2d = x.reshape(-1, x.shape[-1])
+                norm_x = apply_fused_layernorm_affine_quant(
+                    _x_2d,
+                    self.norm2.weight.to(x.dtype),
+                    self.norm2.bias.to(x.dtype),
+                    self._norm2_fp4_scale,
+                    eps=self.norm2.variance_epsilon,
+                )
+                norm_x = self._reshape_fused_output(norm_x, x.shape)
+            else:
+                norm_x = self.norm2(x.float()).to(x.dtype)
 
         # I2V: Split encoder_hidden_states into image and text parts if needed
         encoder_hidden_states_img = None
@@ -621,11 +662,12 @@ class WanBlock(nn.Module):
             attn2_output = attn2_output + attn_img_output
 
         # Apply to_out once to the combined (text + image) attention output
-        x = x + self.attn2.to_out[0](attn2_output)
+        attn2_proj = self.attn2.to_out[0](attn2_output)
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
         if self._fused_ln_supported:
+            x = x + attn2_proj
             normed = self._fused_adaln_quant(
                 x,
                 c_scale_msa,
@@ -635,11 +677,21 @@ class WanBlock(nn.Module):
                 self.norm3.variance_epsilon,
             )
             normed = self._reshape_fused_output(normed, x.shape)
+        elif pertoken_adaln is not None:
+            normed, x = self._pertoken_adaln.add_cross_attention_and_normalize(
+                x,
+                attn2_proj,
+                pertoken_adaln,
+                self.norm3.variance_epsilon,
+            )
         else:
+            x = x + attn2_proj
             normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
             normed = normed.to(x.dtype)
         ffn_out = self.ffn(normed)
 
+        if pertoken_adaln is not None:
+            c_gate_msa = self._pertoken_adaln.ffn_gate(pertoken_adaln)
         x = (x.float() + ffn_out.float() * c_gate_msa).to(x.dtype)
 
         return x
@@ -704,6 +756,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 "in_channels": in_channels,
                 "out_channels": out_channels,
                 "num_layers": num_layers,
+                "expand_timesteps": getattr(config, "expand_timesteps", False),
             },
         )()
 
@@ -734,6 +787,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 )
                 for i in range(num_layers)
             ]
+        )
+        self._pertoken_adaln_runtime = WanPerTokenAdaLNRuntime(
+            [block._pertoken_adaln for block in self.blocks]
         )
 
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, max_seq_len=1024)
@@ -866,6 +922,10 @@ class WanTransformer3DModel(BaseDiffusionModel):
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
+            if self.config.expand_timesteps:
+                # x is already sequence-sharded; uniform T2V timesteps only need
+                # a local broadcast view for fused AdaLN.
+                temb_proj = temb_proj.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:
@@ -880,6 +940,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
             encoder_hidden_states = torch.cat(
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
+
+        x = self._pertoken_adaln_runtime.prepare(x, temb_proj)
 
         # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:

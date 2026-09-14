@@ -13,15 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    import sys
-    from pathlib import Path
-
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -62,6 +54,10 @@ def _run_multi_gpu(world_size, test_fn):
         pytest.skip("Required modules not available")
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} GPUs, have {torch.cuda.device_count()}")
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _worker,
@@ -77,6 +73,7 @@ def _run_multi_gpu(world_size, test_fn):
 # =============================================================================
 
 
+@pytest.mark.cpu_only
 class TestConstruction:
     def test_single_gpu_defaults(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -191,6 +188,7 @@ class TestConstruction:
             )
 
 
+@pytest.mark.cpu_only
 class TestFlattenCfgRanks:
     """flatten_cfg_ranks is pure layout arithmetic: one rank list per combined
     coordinate of every non-(cfg, ulysses) mesh dim, cfg outermost / ulysses
@@ -217,6 +215,7 @@ class TestFlattenCfgRanks:
         assert vgm.flatten_cfg_ranks() == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
+@pytest.mark.cpu_only
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -248,6 +247,7 @@ class TestSingleGPURanksAndGroups:
         assert vgm.attn2d_col_group is None
 
 
+@pytest.mark.cpu_only
 class TestToLlmMapping:
     def test_single_gpu(self):
         vgm = VisualGenMapping(world_size=1, rank=0)

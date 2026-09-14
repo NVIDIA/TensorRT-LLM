@@ -38,7 +38,7 @@ def _assert_match_counts(backend, expected_match_count_by_pass):
     # - "<pass_name>" for passes that are registered once
     # - "<pass_name>:<allreduce_variant>" for UB passes that are registered
     #   per allreduce backend, where <allreduce_variant> is "allreduce" or
-    #   "tunable_allreduce"
+    #   "tunable_allreduce" or "autotuned_allreduce"
     assert dict(backend.match_count_by_pass) == expected_match_count_by_pass
 
 
@@ -509,10 +509,14 @@ def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 1,
-                "ub_prologue:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
                 "ub_finalize:tunable_allreduce": 0,
                 "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 1,
+                "ub_prologue:autotuned_allreduce": 1,
+                "ub_finalize:autotuned_allreduce": 0,
+                "insert_copy_for_graph_output:autotuned_allreduce": 0,
                 "add_norm_fallback": 0,
             })
 
@@ -563,6 +567,10 @@ def run_single_rank_backend_passes_are_per_instance(tensor_parallel_size):
                 "ub_prologue:tunable_allreduce",
                 "ub_finalize:tunable_allreduce",
                 "insert_copy_for_graph_output:tunable_allreduce",
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce",
+                "ub_prologue:autotuned_allreduce",
+                "ub_finalize:autotuned_allreduce",
+                "insert_copy_for_graph_output:autotuned_allreduce",
                 "add_norm_fallback",
             ]
 
@@ -624,10 +632,14 @@ def run_single_rank_ub_pass(
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
-                "ub_prologue:tunable_allreduce": 3,
-                "ub_finalize:tunable_allreduce": 2,
-                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 2,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
                 "add_norm_fallback": 0,
             })
         torch.cuda.synchronize()
@@ -972,10 +984,14 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
-                "ub_prologue:tunable_allreduce": 3,
-                "ub_finalize:tunable_allreduce": 1,
-                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 1,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
                 "add_norm_fallback": 0,
             })
         torch.cuda.synchronize()
@@ -1223,10 +1239,14 @@ def run_single_rank_ub_pass_fp4(
                 "ub_prologue:allreduce": 0,
                 "ub_finalize:allreduce": 0,
                 "insert_copy_for_graph_output:allreduce": 0,
-                "ub_convert_supported_ar_to_ub:tunable_allreduce": 3,
-                "ub_prologue:tunable_allreduce": 3,
-                "ub_finalize:tunable_allreduce": 2,
-                "insert_copy_for_graph_output:tunable_allreduce": 1,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 2,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
                 "add_norm_fallback": 0,
             })
         torch.cuda.synchronize()

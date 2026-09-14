@@ -1,4 +1,4 @@
-# Torch Compile & Piecewise CUDA Graph
+# Torch Compile & Prefill CUDA Graph
 
 In this guide, we show how to enable torch.compile and Piecewise CUDA Graph in TensorRT LLM. TensorRT LLM uses torch.compile for lightweight vertical fusion and Piecewise CUDA Graph.
 
@@ -6,7 +6,7 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
 
 ## Table of Contents
 
-- [Torch Compile & Piecewise CUDA Graph](#torch-compile--piecewise-cuda-graph)
+- [Torch Compile & Prefill CUDA Graph](#torch-compile--prefill-cuda-graph)
   - [Table of Contents](#table-of-contents)
   - [Usage](#usage)
   - [Tips for Piecewise CUDA Graph](#tips-for-piecewise-cuda-graph)
@@ -41,11 +41,39 @@ To enable torch.compile and Piecewise CUDA Graph, add the following configuratio
 
 ```yaml
 ... # Other extra config
+prefill_cuda_graph_backend: piecewise
+prefill_capture_num_tokens: '${capture_num_tokens}' # e.g. [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]
 torch_compile_config:
-  capture_num_tokens: '${capture_num_tokens}' # List of num tokens to capture. e.g., [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]
   enable_userbuffers: false
-  enable_piecewise_cuda_graph: true
 ```
+
+`TorchCompileConfig.enable_piecewise_cuda_graph` and
+`TorchCompileConfig.capture_num_tokens` are deprecated aliases for these
+prefill-specific options.
+
+The experimental breakable implementation can capture the model body without
+torch.compile:
+
+```yaml
+prefill_cuda_graph_backend: breakable
+prefill_capture_num_tokens: [128, 256, 512]
+```
+
+The breakable backend is experimental. The integration coverage in this change
+includes BF16 Qwen3.5 on one GPU and NVFP4 DeepSeek models on multiple GPUs,
+with both context-only and mixed context/decode batches using the KV cache.
+
+The following restrictions are enforced:
+
+- `torch_compile_config`, LoRA, and multimodal models are rejected during
+  engine initialization.
+- Speculative decoding is supported.
+- Context-logit requests run eagerly instead of replaying a breakable CUDA
+  graph.
+
+Other model families, quantization modes, and parallel configurations are not
+yet covered by this experimental backend's integration tests and should be
+validated before use.
 
 ## Tips for Piecewise CUDA Graph
 
@@ -59,9 +87,10 @@ cuda_graph_config:
   max_batch_size: 1024 # Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it.
 
 torch_compile_config:
-  capture_num_tokens: '${capture_num_tokens}' # Specify capture_num_tokens for piecewise cuda graph
   enable_userbuffers: false
-  enable_piecewise_cuda_graph: true
+
+prefill_cuda_graph_backend: piecewise
+prefill_capture_num_tokens: '${capture_num_tokens}'
 ```
 
 ### Piecewise CUDA Graph Padding
@@ -86,21 +115,8 @@ Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the con
 
 ## Known Issue
 
-Torch compile cannot work with multi-ModelEngine config.
-
-1. Speculative Decoding in Two-Model Style
-
-``` yaml
-speculative_config:
-  decoding_type: "MTP"
-  mtp_eagle_one_model: False # Not supported
-
-speculative_config:
-  decoding_type: "Eagle3"
-  eagle3_one_model: False # Not supported
-```
-
-2. Multimodal Model Family
+Torch compile cannot work with multi-ModelEngine config, which currently means
+the Multimodal Model Family.
 
 ## Development Guide
 

@@ -354,6 +354,8 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
+    // Skip correction when the row-max increase is within this base-2 threshold.
+    float mSkipCorrThreshold{0.0F};
     // Sparse attention type.
     SparseType mSparseAttention;
     // The top k value for sparse attention.
@@ -370,6 +372,10 @@ struct TllmGenFmhaRunnerParams
     int32_t mPackedMaskMaxSeqLenQ = 0;
     int32_t mSpecDecodingTargetMaxGenLen = 0;
     bool mForcePrepareSpecDecTreeMask = false;
+    // Whether the kernel uses fp16 accumulation for the softmax (Rubin FMHA feature).
+    bool mFp16Softmax{false};
+    // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
+    bool mUsesSpcompress{false};
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
@@ -429,6 +435,10 @@ struct TllmGenSelectKernelParams
     bool mUses2CtaMma;
     // Skips softmax or not.
     bool mSkipsSoftmaxWhenPossible;
+    // Whether the kernel uses fp16 accumulation for the softmax (Rubin FMHA feature).
+    bool mFp16Softmax;
+    // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
+    bool mUsesSpcompress;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -445,7 +455,9 @@ struct TllmGenSelectKernelParams
         , mTileSizeQ(128)
         , mTileSizeKv(128)
         , mUses2CtaMma(false)
-        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f){};
+        , mSkipsSoftmaxWhenPossible(params.mSkipSoftmaxThresholdScaleFactor != 0.0f)
+        , mFp16Softmax(params.mFp16Softmax)
+        , mUsesSpcompress(params.mUsesSpcompress){};
 };
 
 } // namespace kernels

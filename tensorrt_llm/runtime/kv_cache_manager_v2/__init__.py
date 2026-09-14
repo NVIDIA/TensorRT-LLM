@@ -22,6 +22,10 @@ from typing import NamedTuple, Optional, Union
 
 _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
+#: Name of the active backend ("cpp" or "python"). Exposed so callers can gate
+#: Python-only extension points, such as duck-typed event sinks, on the selection.
+BACKEND = _BACKEND
+
 if _BACKEND == "python":
     from . import rawref  # noqa: F401
     from ._block_radix_tree import (  # noqa: F401
@@ -169,6 +173,8 @@ else:
     KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+    IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
+    create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
     # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
     # callers (the DeepSeek-V4 cache manager's _build_cache_config and our own
     # host-tier fallback) use dataclasses.replace() on it. dataclasses.replace()
@@ -188,6 +194,7 @@ else:
         layers: object = None
         max_util_for_resume: float = 0.97
         enable_partial_reuse: bool = True
+        reuse_match_backoff: int = 0
         constraints: object = None
         typical_step: object = None
         initial_pool_ratio: object = None
@@ -290,6 +297,7 @@ else:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
+    "BACKEND",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",
@@ -360,3 +368,6 @@ __all__ = [
     "rawref",
     "typed_range",
 ]
+
+if _BACKEND != "python":
+    __all__.extend(["IKvCacheColdPageCodec", "create_default_kv_cache_cold_page_codec"])

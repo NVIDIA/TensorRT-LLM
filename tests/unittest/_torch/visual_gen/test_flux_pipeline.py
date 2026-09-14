@@ -227,7 +227,7 @@ class TestFluxQuantization:
     """Test FLUX quantization loading and FP8 weight verification."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_load_flux1_with_quantization(self, flux1_checkpoint_exists, quant_algo: str):
         """Test loading FLUX.1 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
@@ -254,6 +254,14 @@ class TestFluxQuantization:
                             assert hasattr(module, "weight_scale"), (
                                 f"Linear {name} missing weight_scale"
                             )
+                            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
+                                assert module.weight_scale.dim() == 1, (
+                                    f"Linear {name} rowwise weight_scale should be 1-D, "
+                                    f"got shape {tuple(module.weight_scale.shape)}"
+                                )
+                                assert module.weight_scale.shape[0] == module.weight.shape[0], (
+                                    f"Linear {name} weight_scale length mismatch"
+                                )
                             found_fp8 = True
                             print(
                                 f"\n[{quant_algo}] FP8 layer {name}: weight {module.weight.shape}"
@@ -268,7 +276,7 @@ class TestFluxQuantization:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_load_flux2_with_quantization(self, flux2_checkpoint_exists, quant_algo: str):
         """Test loading FLUX.2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
@@ -294,6 +302,14 @@ class TestFluxQuantization:
                             assert hasattr(module, "weight_scale"), (
                                 f"Linear {name} missing weight_scale"
                             )
+                            if quant_algo == "FP8_PER_CHANNEL_PER_TOKEN":
+                                assert module.weight_scale.dim() == 1, (
+                                    f"Linear {name} rowwise weight_scale should be 1-D, "
+                                    f"got shape {tuple(module.weight_scale.shape)}"
+                                )
+                                assert module.weight_scale.shape[0] == module.weight.shape[0], (
+                                    f"Linear {name} weight_scale length mismatch"
+                                )
                             found_fp8 = True
                             print(
                                 f"\n[{quant_algo}] FP8 layer {name}: weight {module.weight.shape}"
@@ -317,7 +333,7 @@ class TestFluxFP8NumericalCorrectness:
     """Test FP8 vs BF16 numerical accuracy at single-layer and full-transformer levels."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_fp8_vs_bf16_single_layer(self, flux1_checkpoint_exists, quant_algo: str):
         """Test FP8 vs BF16 numerical accuracy on a single Linear layer.
 
@@ -400,7 +416,7 @@ class TestFluxFP8NumericalCorrectness:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_fp8_vs_bf16_full_transformer_e2e(self, flux1_checkpoint_exists, quant_algo: str):
         """End-to-end test: Compare full FLUX.1 transformer FP8 vs BF16 output.
 

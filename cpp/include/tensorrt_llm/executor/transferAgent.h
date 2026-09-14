@@ -381,6 +381,8 @@ struct BaseAgentConfig
     bool useListenThread;
     bool enableTelemetry;
     std::unordered_map<std::string, std::string> backendParams;
+    std::optional<int> rank;
+    std::optional<int> worldSize;
 };
 
 class BaseTransferAgent

@@ -274,10 +274,22 @@ struct KVCacheManagerConfig
     // Try to reuse tokens from partially matched blocks.
     bool enablePartialReuse = true;
 
+    // Tokens dropped from the tail of every prefix match.
+    //
+    // For a pool whose KV at position i is a function of tokens [0, i] this is 0: a match of
+    // m tokens proves all m are reusable. Set it to D when the pool also holds state that
+    // reads D tokens ahead -- one-model speculative decoding draft layers -- where a match
+    // of m only describes the first m - D positions.
+    //
+    // Applied inside the match so a single tree walk yields the usable depth.
+    int reuseMatchBackoff = 0;
+
     // Constraint-based memory partitioning.
-    std::vector<BatchDesc> constraints;                 // batches that must always be supportable
-    std::optional<BatchDesc> typicalStep;               // typical step for initial ratio computation
-    std::optional<std::vector<float>> initialPoolRatio; // explicit initial ratio, overrides inferred sizing inputs
+    std::vector<BatchDesc> constraints;   // batches that must always be supportable
+    std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
+    // One normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
+    // layer-group slot-count proportions while accounting for cold page sizes.
+    std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
 
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
     // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing

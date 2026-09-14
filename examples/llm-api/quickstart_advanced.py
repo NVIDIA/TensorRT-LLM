@@ -78,10 +78,7 @@ def add_llm_args(parser):
     parser.add_argument('--attention_backend',
                         type=str,
                         default='TRTLLM',
-                        choices=[
-                            'VANILLA', 'TRTLLM', 'FLASHINFER',
-                            'FLASHINFER_STAR_ATTENTION'
-                        ])
+                        choices=['VANILLA', 'TRTLLM', 'FLASHINFER'])
     parser.add_argument(
         '--moe_backend',
         type=str,
@@ -103,9 +100,6 @@ def add_llm_args(parser):
     parser.add_argument('--attention_dp_batching_wait_iters',
                         type=int,
                         default=0)
-    parser.add_argument('--sampler_type',
-                        default="auto",
-                        choices=["auto", "TorchSampler", "TRTLLMSampler"])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--orchestrator_type',
@@ -215,9 +209,6 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
-    parser.add_argument('--use_one_model',
-                        default=True,
-                        action=argparse.BooleanOptionalAction)
     parser.add_argument('--eagle_choices', type=str, default=None)
     parser.add_argument('--use_dynamic_tree',
                         default=False,
@@ -306,8 +297,6 @@ def setup_llm(args, **kwargs):
     ) if args.spec_decode_algo is not None else None
 
     if spec_decode_algo == 'MTP':
-        if not args.use_one_model:
-            print("Running MTP eagle with two model style.")
         speculative_model = (args.draft_model_dir if args.draft_model_dir
                              is not None else args.model_dir)
         spec_config = MTPDecodingConfig(
@@ -316,7 +305,6 @@ def setup_llm(args, **kwargs):
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
-            mtp_eagle_one_model=args.use_one_model,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             max_total_draft_tokens=args.max_total_draft_tokens,
@@ -325,7 +313,6 @@ def setup_llm(args, **kwargs):
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir,
-            eagle3_one_model=args.use_one_model,
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
@@ -380,7 +367,6 @@ def setup_llm(args, **kwargs):
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
         moe_config=MoeConfig(backend=args.moe_backend, use_low_precision_moe_combine=args.use_low_precision_moe_combine, load_balancer=args.moe_load_balancer_config),
-        sampler_type=args.sampler_type,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,

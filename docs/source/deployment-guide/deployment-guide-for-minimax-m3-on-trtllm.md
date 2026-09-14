@@ -13,7 +13,7 @@ TensorRT LLM supports two precisions for MiniMax-M3:
 
 The block-sparse attention path does **not** currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.
 
-This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Choosing the Parallelism Strategy](#choosing-the-parallelism-strategy-tep-vs-dep).
+This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Recommended Performance Settings](#recommended-performance-settings).
 
 The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA's accelerated stack.
 
@@ -100,6 +100,20 @@ If you don't have access to the source code locally, you can manually create the
 ````
 
 The configuration uses Data-Expert Parallelism (DEP): `enable_attention_dp: true` runs the attention layers data-parallel across ranks while the MoE experts run expert-parallel, which favors high-throughput / large-batch serving on MiniMax-M3.
+
+For MXFP8 checkpoints, TensorRT LLM selects the GEMM backend automatically.
+`TRTLLM_MXFP8_GEMM_BACKEND` is an advanced override for debugging and
+performance experiments:
+
+* `trtllm` uses the native TensorRT LLM GEMM for eager execution and CUDA graphs.
+* `flashinfer` forces FlashInfer for eligible captured decode CUDA graphs; eager,
+  context/prefill, and piecewise CUDA-graph execution remain on the native GEMM.
+  It requires the pinned `flashinfer-python` package and Blackwell MXFP8 support.
+* `auto` keeps eager execution on the native GEMM and uses FlashInfer in
+  captured decode CUDA graphs after startup tuning.
+
+Leave the variable unset for normal deployments. An explicit value disables
+MiniMax-M3's automatic backend selection and uses the requested policy.
 
 ### Launch the TensorRT LLM Server
 

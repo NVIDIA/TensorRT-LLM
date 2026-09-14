@@ -762,6 +762,14 @@ def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
+    # Pin fp32-matmul arithmetic for scoring, mirroring the generation-side pin
+    # (_lpips_pinned_fp32_matmul_precision in visual_gen_test_utils.py). This
+    # script runs as a subprocess, so the parent's torch flags do not propagate;
+    # without the pin the scorer inherits the host default, which differs
+    # between NGC containers (TF32 on) and PyPI torch (TF32 off).
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.allow_tf32 = True
+
     args = parse_args()
     result = _evaluate(args)
 
