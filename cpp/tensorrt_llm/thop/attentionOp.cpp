@@ -333,10 +333,6 @@ TrtllmGenGenerationWorkspaceViews TrtllmAttentionWorkspaceManager::materializeGe
     return materializeGenerationWorkspace(workspace, layout);
 }
 
-// ===========================================================================
-// AttentionOp implementation.
-// ===========================================================================
-
 template <typename T>
 struct SATypeConverter
 {
