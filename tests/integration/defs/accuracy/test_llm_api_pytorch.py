@@ -201,8 +201,7 @@ def _run_multinode_accuracy(model_path,
     spec_config = None
     if draft_model_path is not None:
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
-                                           speculative_model=draft_model_path,
-                                           eagle3_one_model=True)
+                                           speculative_model=draft_model_path)
 
     with LLM(model_path,
              tensor_parallel_size=tp_size,
@@ -382,25 +381,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(60000)
-    def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
-        pytorch_config = dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(),
-        )
-        mtp_config = MTPDecodingConfig(max_draft_len=3,
-                                       mtp_eagle_one_model=False,
-                                       speculative_model=self.MODEL_PATH)
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 enable_chunked_prefill=False,
-                 max_num_tokens=8192,
-                 **pytorch_config,
-                 speculative_config=mtp_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device_memory(60000)
     # Builds two LLM() instances back-to-back; the MPI-pool-reuse test layer
     # would otherwise hand the second one the first's just-used worker pool.
     @pytest.mark.private_mpi_session
@@ -408,7 +388,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         """TRTLLM-14874 regression on the MTP capture path."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         mtp_config = MTPDecodingConfig(max_draft_len=3,
-                                       mtp_eagle_one_model=False,
                                        speculative_model=self.MODEL_PATH)
 
         def build_llm_kwargs(cuda_graph_config):
@@ -530,7 +509,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             num_nextn_predict_layers=max_draft_len,
             max_draft_len=max_draft_len,
             use_mtp_vanilla=False,
-            mtp_eagle_one_model=True,
             draft_len_schedule=draft_len_schedule,
         )
         with LLM(self.MODEL_PATH,
@@ -3559,11 +3537,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids(
         "eagle3_one_model,enable_chunked_prefill,enable_max_concurrency,enable_draft_len_schedule",
         [
-            # Base coverage: eagle3_one_model x enable_chunked_prefill.
+            # Base coverage: enable_chunked_prefill on/off.
             (True, True, False, False),
             (True, False, False, False),
-            (False, True, False, False),
-            (False, False, False, False),
             # Test max_concurrency control and draft_len_schedule.
             (True, False, False, True),
             (True, False, True, False),
@@ -3582,7 +3558,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         max_draft_len = 4
         pytorch_config = dict(
-            disable_overlap_scheduler=not eagle3_one_model,
+            disable_overlap_scheduler=False,
             cuda_graph_config=cuda_graph_config,
         )
         kv_cache_config = KvCacheConfig(
@@ -3596,7 +3572,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
             speculative_model=eagle_model_dir,
-            eagle3_one_model=eagle3_one_model,
             max_concurrency=max_concurrency,
             draft_len_schedule=draft_len_schedule)
 
@@ -3738,7 +3713,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         spec_config_kwargs = dict(
             max_draft_len=4,
             speculative_model=f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3",
-            eagle3_one_model=True,
         )
         if use_dynamic_tree:
             spec_config_kwargs.update(
@@ -4155,9 +4129,8 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
-                speculative_model=
-                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
-                eagle3_one_model=True)
+                speculative_model=f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/"
+            )
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
@@ -4203,9 +4176,8 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         if eagle3:
             spec_config = Eagle3DecodingConfig(
                 max_draft_len=2,
-                speculative_model=
-                f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
-                eagle3_one_model=True)
+                speculative_model=f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/"
+            )
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
@@ -5007,8 +4979,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("overlap_scheduler", [True, False],
                              ids=["overlap_scheduler", "no_overlap_scheduler"])
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
@@ -5034,11 +5005,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
-        if v2_kv_cache and not one_model:
-            pytest.skip(
-                "KVCacheManagerV2 sizes the target and draft managers from the "
-                "same budget, so two-model Eagle3 is rejected")
-
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
@@ -5049,8 +5015,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5092,8 +5057,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_eagle3_vswa_reuse_4gpus(self, v2_kv_cache, one_model, mocker):
@@ -5106,11 +5070,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
-
-        if v2_kv_cache and not one_model:
-            pytest.skip(
-                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
-            )
 
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
         if v2_kv_cache:
@@ -5129,8 +5088,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5176,8 +5134,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     def test_eagle3_guided_decoding_4gpus(self, one_model, mocker):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -5197,8 +5154,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5221,8 +5177,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(14400)
     @pytest.mark.parametrize("overlap_scheduler", [True, False],
                              ids=["overlap_scheduler", "no_overlap_scheduler"])
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
@@ -5252,8 +5207,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5295,8 +5249,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device_memory(90000)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_pre_blackwell),
@@ -5311,7 +5264,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         pytorch_config = dict(
             max_batch_size=8,
-            disable_overlap_scheduler=not one_model,
+            disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         dtype="auto",
@@ -5320,8 +5273,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 5
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model)
+                                           speculative_model=eagle_model_dir)
         check_acceptance_length = one_model and moe_backend == "CUTLASS"
         stats_args = (dict(max_stats_len=-1, enable_iter_perf_stats=True)
                       if check_acceptance_length else {})
@@ -5744,11 +5696,17 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
-    def test_dflash(self):
+    @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA", "FA4"])
+    def test_dflash(self, dflash_attention_backend):
+        if dflash_attention_backend == "FA4" and get_sm_version() != 90:
+            pytest.skip("FA4 DFlash attention backend is allowed on SM90 only")
+
         target_model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
-        spec_config = DFlashDecodingConfig(max_draft_len=4,
-                                           speculative_model=dflash_model_path)
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=4,
+            speculative_model=dflash_model_path,
+            attention_backend=dflash_attention_backend)
 
         # Use lower threshold for H20
         is_h20_gpu = check_device_contain(
@@ -5759,6 +5717,8 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                  trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=32,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512,
                  kv_cache_config=self.kv_cache_config,
                  cuda_graph_config=self.cuda_graph_config,
                  speculative_config=spec_config,
@@ -5838,10 +5798,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
 
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
 
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
@@ -6646,6 +6603,7 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.private_mpi_session
     def test_nvfp4_4gpus(self):
         model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
         if not os.path.exists(model_dir):
@@ -6725,7 +6683,6 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True,
                 eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/",
@@ -6777,7 +6734,6 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model=
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-Eagle/",
-                eagle3_one_model=True,
                 eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
@@ -7010,8 +6966,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         external-comm dispatch path with scheduler-precomputed routing.
         """
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
-        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn,
-                                       mtp_eagle_one_model=True)
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
         with LLM(model_path,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
@@ -7108,10 +7063,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             pytest.skip(
                 f"Device count {get_device_count()} is less than required {gpu_needed}"
             )
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
@@ -7193,10 +7145,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_8gpus_mtp(self):
         # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
         # This test uses MTP with max_draft_len=3 and one_model mode.
-        mtp_config = MTPDecodingConfig(
-            max_draft_len=3,
-            mtp_eagle_one_model=True,
-        )
+        mtp_config = MTPDecodingConfig(max_draft_len=3, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
@@ -7231,10 +7180,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     def test_nvfp4_4gpu_mtp_ar(self):
         max_draft_len = 7
-        mtp_config = MTPDecodingConfig(
-            max_draft_len=max_draft_len,
-            mtp_eagle_one_model=True,
-        )
+        mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
@@ -7297,10 +7243,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpu_mtp_ar_custom_op(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         max_draft_len = 7
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=max_draft_len,
-            mtp_eagle_one_model=True,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
         llm_common_config = dict(
@@ -7362,10 +7305,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     def test_nvfp4_8gpus_mtp_custom_op(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "1")
         # Test MTP accuracy with nvfp4-fp8kv model using custom op path.
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         with LLM(
                 model_path,
@@ -7549,10 +7489,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      periodic_snapshot_interval, attention_dp,
                                      use_mtp):
-        mtp_config = MTPDecodingConfig(
-            num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
-        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3, )
         max_batch_size = 4 if attention_dp else 32
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
@@ -7657,7 +7594,6 @@ class TestLlama4SpeculativeDecoding(LlmapiAccuracyTestHarness):
             max_draft_len=4,
             speculative_model=(
                 f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"),
-            eagle3_one_model=True,
         )
         if use_dynamic_tree:
             spec_config_kwargs.update(
@@ -7956,3 +7892,104 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(model_name)
             task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("overlap_scheduler", [False, True])
+    @parametrize_with_ids("attention_dp", [False, True])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
+                          overlap_scheduler):
+        # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
+        # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K plus
+        # a chat-GSM8K acceptance probe, since accuracy alone does not notice a
+        # corrupted drafter KV.
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
+            msa_package_available
+        if not msa_package_available():
+            pytest.skip("MSA kernels (fmha_sm100) not available")
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        max_draft_len = 3
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+        )
+        # The MSA path runs an FP8 KV cache, as in test_nvfp4.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False,
+                                        dtype="fp8")
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                    implementation="msa", indexer_kv_dtype="fp8"),
+                moe_config=MoeConfig(backend="CUTLASS"),
+                max_seq_len=4096,
+                # fmha_sm100 caps total_q x heads at 65536; with 4 verify
+                # tokens per row that is 512 (256 with unsharded heads).
+                max_batch_size=256 if attention_dp else 512,
+                speculative_config=spec_config,
+                cuda_graph_config=CudaGraphConfig(
+                    enable_padding=True,
+                    max_batch_size=64 if attention_dp else 128,
+                ),
+                disable_overlap_scheduler=not overlap_scheduler,
+                enable_attention_dp=attention_dp,
+                enable_iter_perf_stats=True,
+                # Keep the whole acceptance probe: the default buffer holds
+                # only the latest 1000 iterations.
+                max_stats_len=5000,
+                trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+
+            def drain_spec_stats(llm):
+                drafted = accepted = steps = 0
+                for s in llm.get_stats(timeout=2):
+                    s = json.loads(s) if isinstance(s, str) else s
+                    sd = s.get("specDecodingStats") or {}
+                    drafted += sd.get("numDraftTokens", 0)
+                    accepted += sd.get("numAcceptedTokens", 0)
+                    steps += sd.get("numRequestsWithDraftTokens", 0)
+                return drafted, accepted, steps
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+            # Acceptance probe: 200 chat-format GSM8K questions, greedy, 512 tokens.
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            drain_spec_stats(llm)
+            llm.generate(chat_prompts,
+                         SamplingParams(max_tokens=512, temperature=0))
+            drafted, accepted, steps = drain_spec_stats(llm)
+            assert steps > 0, "no speculative iterations recorded"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            # Reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
+            # reports 0.839 / 3.518; the GQA head measures 0.838 / 3.515 here.
+            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.80, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
+                f"(threshold 0.80, reference 0.839 from the drafter card)"
+            assert chat_length > 3.4, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
+                f"the drafter card)"

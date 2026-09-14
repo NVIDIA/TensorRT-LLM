@@ -3,9 +3,9 @@
 """trtllm-gen decode attention for MiniMax-M3's dense layers (0-2).
 
 Those layers attend the whole page table, so nothing about them needs MSA;
-they only run there because MsaSparseGqaFmha claims every M3 layer. MSA's
-kernel uses the context schedule, spending a 128-row Q tile on one decode
-token, while trtllm-gen has a generation tile scheduler for exactly this shape.
+they only run there because MsaPrefillFmha claims every M3 layer. MSA's kernel
+uses the context schedule, spending a 128-row Q tile on one decode token, while
+trtllm-gen has a generation tile scheduler for exactly this shape.
 
 FlashInferTrtllmGenFmha cannot be reused as-is. It reaches the pool through
 build_trtllm_gen_kv_cache_metadata, which assumes each layer contributes
@@ -21,7 +21,7 @@ point the generic path calls.
 from __future__ import annotations
 
 import functools
-from typing import Optional
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -45,6 +45,11 @@ def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> i
     return int(_get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
 
 
+def _device_index(device: torch.device) -> int:
+    """Device ordinal of device, resolving the current one where it has none."""
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
 def _counter_buffer(
     device: torch.device, num_heads: int, max_num_requests: int, reserve: bool
 ) -> torch.Tensor:
@@ -55,9 +60,8 @@ def _counter_buffer(
     back uninitialized memory, so the zeroing is per call rather than per
     allocation; a few KB of memset costs nothing next to the kernel it feeds.
     """
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
     counters = get_memory_buffers().get_buffer(
-        [_counter_size(num_heads, max_num_requests, device_index)],
+        [_counter_size(num_heads, max_num_requests, _device_index(device))],
         torch.uint8,
         buffer_name="m3_trtllm_gen_kv_counters",
         reserve_buffer=reserve,
@@ -81,6 +85,88 @@ def _workspace(q_dtype: torch.dtype, num_heads: int, head_dim: int, num_kv_heads
 
     layout = _get_generation_workspace_layout(q_dtype, 1, 1, num_heads, head_dim, num_kv_heads, 0)
     return int(layout["trtllm_gen_workspace_size"])
+
+
+def _workspace_buffer(size: int, reserve: bool) -> torch.Tensor:
+    return get_memory_buffers().get_buffer(
+        [size],
+        torch.uint8,
+        buffer_name="m3_trtllm_gen_workspace",
+        reserve_buffer=reserve,
+    )
+
+
+class DenseDecodeWorkspaceLayout(NamedTuple):
+    """Byte layout of the scratch one dense decode call needs.
+
+    The trtllm-gen slab sits at the front of the buffer and the multi-CTA KV
+    counters behind it, so a caller with one byte buffer can serve both.
+    """
+
+    workspace_bytes: int
+    # Aligned start of the counter block.
+    counter_offset: int
+    total_bytes: int
+
+
+# The alignment torch's own allocations start at, so a counter view taken at
+# this offset is as aligned as a standalone buffer would be.
+_COUNTER_OFFSET_ALIGNMENT = 256
+
+
+def dense_decode_workspace_layout(
+    *,
+    q_dtype: torch.dtype,
+    num_heads: int,
+    head_dim: int,
+    num_kv_heads: int,
+    max_num_requests: int,
+    device: torch.device,
+) -> DenseDecodeWorkspaceLayout:
+    """Lay out the scratch a dense decode call needs inside one buffer.
+
+    Both parts are sized by the head geometry and the request bound alone,
+    none of which move during a run, so a caller that knows those before the
+    phase runs can size its buffer there. See split_dense_decode_workspace for
+    the views this describes.
+    """
+    workspace_bytes = _workspace(q_dtype, num_heads, head_dim, num_kv_heads)
+    counter_bytes = _counter_size(num_heads, max_num_requests, _device_index(device))
+    counter_offset = (
+        (workspace_bytes + _COUNTER_OFFSET_ALIGNMENT - 1)
+        // _COUNTER_OFFSET_ALIGNMENT
+        * _COUNTER_OFFSET_ALIGNMENT
+    )
+    return DenseDecodeWorkspaceLayout(
+        workspace_bytes=workspace_bytes,
+        counter_offset=counter_offset,
+        total_bytes=counter_offset + counter_bytes,
+    )
+
+
+def split_dense_decode_workspace(
+    buffer: torch.Tensor, layout: DenseDecodeWorkspaceLayout
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Take the slab and the zeroed KV counters out of one byte buffer.
+
+    The counters are zeroed on every call because the buffer is shared with
+    the other FMHA libraries, any of which may have written it.
+    """
+    if buffer.dim() != 1 or buffer.element_size() != 1:
+        raise ValueError(
+            "MiniMax-M3 dense decode scratch must come from a flat byte buffer; "
+            f"got {tuple(buffer.shape)} of {buffer.dtype}."
+        )
+    if int(buffer.numel()) < layout.total_bytes:
+        raise ValueError(
+            f"MiniMax-M3 dense decode was handed a {int(buffer.numel())}-byte "
+            f"buffer, but this call needs {layout.total_bytes}. It was sized "
+            "from a different head geometry than the kernel sees."
+        )
+    workspace_bytes = buffer.view(torch.uint8)
+    counters = workspace_bytes[layout.counter_offset : layout.total_bytes]
+    counters.zero_()
+    return workspace_bytes[: layout.workspace_bytes], counters
 
 
 def subpage_block_table(
@@ -148,6 +234,8 @@ def minimax_m3_trtllm_gen_dense_decode(
     max_num_requests: int,
     staged_subpage_table: Optional[torch.Tensor] = None,
     staged_subpages_per_slot: int = 0,
+    workspace: Optional[torch.Tensor] = None,
+    counters: Optional[torch.Tensor] = None,
     enable_pdl: bool = True,
 ) -> None:
     """Full-context decode attention through trtllm-gen, in place into output.
@@ -155,6 +243,12 @@ def minimax_m3_trtllm_gen_dense_decode(
     staged_subpage_table is the expansion of block_table prepare() already
     staged, used when staged_subpages_per_slot matches this layer's factor and
     expanded here otherwise; see subpage_block_table.
+
+    workspace and counters are the scratch a caller already carved out of its
+    own buffer (see split_dense_decode_workspace); both are taken from the
+    arena here when a caller has not, as the standalone kernel tests do. A
+    supplied buffer is checked against the size this call needs, since the
+    caller sizes it from a geometry it derives for itself.
     """
     import flashinfer
 
@@ -168,12 +262,24 @@ def minimax_m3_trtllm_gen_dense_decode(
         q = q.to(torch.float8_e4m3fn)
 
     reserve = torch.cuda.is_current_stream_capturing()
-    workspace = get_memory_buffers().get_buffer(
-        [_workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1]))],
-        torch.uint8,
-        buffer_name="m3_trtllm_gen_workspace",
-        reserve_buffer=reserve,
-    )
+    workspace_size = _workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1]))
+    if workspace is None:
+        workspace = _workspace_buffer(workspace_size, reserve)
+    elif int(workspace.numel()) < workspace_size:
+        raise ValueError(
+            f"MiniMax-M3 dense decode was handed a {int(workspace.numel())}-byte "
+            f"trtllm-gen workspace, but this call needs {workspace_size}. It was "
+            "reserved from a different head geometry than the kernel sees."
+        )
+    counter_size = _counter_size(num_heads, max_num_requests, _device_index(q.device))
+    if counters is None:
+        counters = _counter_buffer(q.device, num_heads, max_num_requests, reserve)
+    elif int(counters.numel()) < counter_size:
+        raise ValueError(
+            f"MiniMax-M3 dense decode was handed {int(counters.numel())} bytes of "
+            f"multi-CTA KV counters, but this call needs {counter_size}. They were "
+            "reserved from a different head or request bound than the kernel sees."
+        )
     if staged_subpage_table is None or staged_subpages_per_slot != subpages_per_slot:
         staged_subpage_table = subpage_block_table(block_table, subpages_per_slot, reserve)
 
@@ -199,18 +305,16 @@ def minimax_m3_trtllm_gen_dense_decode(
         cum_seq_lens_q=None,
         kv_cache_sf=None,  # M3 stores unscaled E4M3
         uses_shared_paged_kv_idx=False,
-        multi_ctas_kv_counter_buffer=_counter_buffer(
-            q.device, num_heads, max_num_requests, reserve
-        ),
+        multi_ctas_kv_counter_buffer=counters,
     )
 
 
 @functools.lru_cache(maxsize=1)
-def _flashinfer_available() -> bool:
+def flashinfer_available() -> bool:
     """Whether flashinfer can be imported, resolved once for the process.
 
-    The verdict below is consulted once per step by prepare() and again per
-    dense layer, so the import statement would otherwise be on the hot path.
+    The verdict below is consulted by ensure_msa_available and again per dense
+    layer, so the import statement would otherwise be on the hot path.
     """
     try:
         import flashinfer  # noqa: F401
@@ -222,21 +326,26 @@ def _flashinfer_available() -> bool:
 def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional[str]:
     """Return None when the geometry is supported, else why it is not.
 
-    Takes head_dim rather than a query tensor so prepare() can reach the same
-    verdict as the call site without one, and so the two cannot drift.
+    Takes head_dim rather than a query tensor so the metadata's up-front
+    validation can reach the same verdict as the call site without one, and so
+    the two cannot drift.
     """
     if not hasattr(kv_cache_manager, "get_kv_subpage_pool"):
         return "the KV cache manager does not expose a flat sub-page pool."
     if int(head_dim) != 128:
         return f"head_dim {int(head_dim)}; only 128 has trtllm-gen H128 cubins."
-    if not _flashinfer_available():
+    if not flashinfer_available():
         return "flashinfer is not installed."
     return None
 
 
 __all__ = [
+    "DenseDecodeWorkspaceLayout",
     "dense_decode_unsupported_reason",
+    "dense_decode_workspace_layout",
+    "flashinfer_available",
     "minimax_m3_trtllm_gen_dense_decode",
+    "split_dense_decode_workspace",
     "subpage_block_table",
     "uniform_subpages_per_slot",
     "write_subpage_block_table",
