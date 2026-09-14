@@ -937,6 +937,7 @@ STARTUP_METADATA_NAMES = (
     "checkpoint_weight_loader_kind",
     "checkpoint_source_kind",
     "load_format",
+    "checkpoint_io_policy_source",
 )
 
 
@@ -1108,6 +1109,35 @@ def parse_checkpoint_io_policies(log_paths: List[str]) -> List[dict]:
     return statuses
 
 
+def _normalize_checkpoint_io_policy(policy: object) -> Optional[dict]:
+    """Validate a finalized primary-model status without inferring activation."""
+    if not isinstance(policy, dict):
+        return None
+    policies = ("native", "rank_striped_read_ahead")
+    if (
+        policy.get("requested") not in (*policies, "auto")
+        or policy.get("selected") not in policies
+        or policy.get("effective") not in policies
+        or not isinstance(policy.get("activated"), bool)
+        or "fallback_reason" not in policy
+        or not isinstance(policy["fallback_reason"], (str, type(None)))
+    ):
+        return None
+    if (policy["activated"] and policy["selected"] != "rank_striped_read_ahead") or (
+        policy["effective"] == "rank_striped_read_ahead" and not policy["activated"]
+    ):
+        return None
+    reason = policy["fallback_reason"] or "none"
+    return {
+        "requested": policy["requested"],
+        "selected": policy["selected"],
+        "activated": policy["activated"],
+        "effective": policy["effective"],
+        "fallback_reason": _bounded_checkpoint_io_fallback_reason(reason),
+        "fallback_category": checkpoint_io_fallback_category(reason),
+    }
+
+
 def make_startup_observation(server_info: dict, log_paths: List[str], role: str) -> dict:
     """Normalize startup data from ``/server_info`` and server logs."""
     startup_metrics = server_info.get("startup_metrics", {})
@@ -1124,7 +1154,12 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
             continue
         for metric_name in STARTUP_METRIC_NAMES:
             value = loader_metrics.get(metric_name)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+            ):
                 metrics[f"{metric_prefix}{metric_name}"] = float(value)
         for metadata_name in STARTUP_METADATA_NAMES:
             value = loader_metrics.get(metadata_name)
@@ -1140,11 +1175,23 @@ def make_startup_observation(server_info: dict, log_paths: List[str], role: str)
                 metrics[f"{metric_prefix}{name}"] for name in DRAFT_CHECKPOINT_PIPELINE_PHASES
             )
 
+    primary_loader = startup_metrics.get("model_loader", {})
+    if isinstance(primary_loader, dict) and "checkpoint_io_policy" in primary_loader:
+        # An explicit unknown status is authoritative. Do not substitute logs
+        # that could describe a draft load or a different initialization phase.
+        policy = _normalize_checkpoint_io_policy(primary_loader["checkpoint_io_policy"])
+        policies = [policy] if policy is not None else []
+        policy_source = "server_info"
+    else:
+        policies = parse_checkpoint_io_policies(log_paths)
+        policy_source = "legacy_logs" if policies else "unknown"
+    metadata["checkpoint_io_policy_source"] = policy_source
+
     return {
         "role": role,
         "metrics": metrics,
         "metadata": metadata,
-        "checkpoint_io_policies": parse_checkpoint_io_policies(log_paths),
+        "checkpoint_io_policies": policies,
     }
 
 
@@ -1339,6 +1386,24 @@ def add_startup_metric_values(
     )
 
     successful = [entry for entry in selected if not entry.get("error")]
+    collection_complete = (
+        expected_server_count > 0 and len(successful) == expected_server_count and not failed
+    )
+    required_timings = (*CHECKPOINT_PIPELINE_PHASES, "total_model_loading_seconds")
+    new_data[f"b_{field_prefix}startup_metrics_timing_complete"] = collection_complete and all(
+        isinstance(value := entry.get("metrics", {}).get(name), (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+        for entry in successful
+        for name in required_timings
+    )
+    new_data[f"b_{field_prefix}checkpoint_io_policy_complete"] = collection_complete and all(
+        entry.get("metadata", {}).get("checkpoint_io_policy_source") == "server_info"
+        and len(entry.get("checkpoint_io_policies", [])) == 1
+        and _normalize_checkpoint_io_policy(entry["checkpoint_io_policies"][0]) is not None
+        for entry in successful
+    )
     metric_names = {name for entry in successful for name in entry.get("metrics", {})}
     for metric_name in metric_names:
         values = [entry.get("metrics", {}).get(metric_name) for entry in successful]
@@ -1407,6 +1472,8 @@ def add_startup_metric_values(
     )
     new_data[f"s_{field_prefix}checkpoint_io_experiment_classification"] = (
         classify_checkpoint_io_experiment(assignment, policies)
+        if collection_complete and all(entry.get("checkpoint_io_policies") for entry in successful)
+        else "unknown"
     )
 
 
