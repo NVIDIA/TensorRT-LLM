@@ -465,6 +465,8 @@
 /.github/tava_architecture_diagram.md @NVIDIA/trt-llm-TAVA-design-change
 /3rdparty/** @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_patches/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/tensorrt_llm/_torch/moe/flashinfer/ @NVIDIA/trt-llm-moe-devs @NVIDIA/trt-llm-oss-compliance
+/3rdparty/vendor_patches/flashinfer-prims-ts-moe.patch @NVIDIA/trt-llm-moe-devs @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_patches/flashinfer-prims-ts.patch @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_sources.lock.yaml @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /ATTRIBUTIONS-*.md @NVIDIA/trt-llm-oss-compliance

@@ -1,0 +1,1157 @@
+{
+    "templates": {
+        "BatchedGemmDefault": {
+            "mma_n": 8,
+            "tile_n": 8,
+            "epi_tile_n": 8,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 4,
+            "num_stages_tmem_sfb": 4,
+            "use_two_tma_load_warps": true,
+            "use_tma_store": true,
+            "use_tma_oob_opt": true
+        },
+        "BatchedGemmNonDsBase": {
+            "_template": "BatchedGemmDefault",
+            "tile_m": 128,
+            "epi_tile_m": 128,
+            "num_stages_tmem_acc": 1,
+            "transpose_mma_output": true,
+            "use_deepseek_fp8": false
+        },
+        "BatchedGemmFp4Base": {
+            "_template": "BatchedGemmNonDsBase",
+            "dtype_a": "e2m1",
+            "dtype_c": "e2m1",
+            "bias_type": "m",
+            "mma_k": 64,
+            "tile_k": 512,
+            "use_global_scales": true
+        },
+        "BatchedGemmFp4LowLatency": {
+            "_template": "BatchedGemmFp4Base",
+            "mma_m": 128,
+            "cluster_m": 1,
+            "sf_layout_b": "8x4",
+            "sf_layout_c": "8x4"
+        },
+        "BatchedGemmFp4HighThroughput": {
+            "_template": "BatchedGemmFp4Base",
+            "mma_m": 256,
+            "cluster_m": 2,
+            "sf_layout_b": "128x4",
+            "sf_layout_c": "128x4"
+        },
+        "BatchedGemmPerTensorScalingFp8Base": {
+            "_template": "BatchedGemmNonDsBase",
+            "dtype_a": "e4m3",
+            "dtype_c": "e4m3",
+            "mma_k": 32,
+            "tile_k": 512,
+            "use_global_scales": true
+        },
+        "BatchedGemmPerTensorScalingFp8LowLatency": {
+            "_template": "BatchedGemmPerTensorScalingFp8Base",
+            "mma_m": 128,
+            "cluster_m": 1
+        },
+        "BatchedGemmPerTensorScalingFp8HighThroughput": {
+            "_template": "BatchedGemmPerTensorScalingFp8Base",
+            "mma_m": 256,
+            "cluster_m": 2
+        },
+        "BatchedGemmDeepSeekFp8LowLatency": {
+            "_template": "BatchedGemmDefault",
+            "dtype_a": "e4m3",
+            "dtype_c": "e4m3",
+            "mma_k": 32,
+            "mma_m": 64,
+            "tile_m": 128,
+            "tile_k": 128,
+            "epi_tile_m": 64,
+            "cluster_m": 1,
+            "transpose_mma_output": true,
+            "use_deepseek_fp8": true,
+            "use_global_scales": true,
+            "num_stages_tmem_acc": 4
+        },
+        "BatchedGemmMxE2m1E4m3LowLatency": {
+            "_template": "BatchedGemmNonDsBase",
+            "mma_m": 128,
+            "cluster_m": 1,
+            "dtype_a": "mxe2m1",
+            "dtype_b": "e4m3",
+            "dtype_c": "e4m3",
+            "mma_k": 32,
+            "tile_k": 512,
+            "sf_layout_b": "8x4",
+            "sf_layout_c": "8x4",
+            "bias_type": "m",
+            "act": "swiglu"
+        },
+        "BatchedGemmMxE2m1MxE4m3Base": {
+            "_template": "BatchedGemmNonDsBase",
+            "dtype_a": "mxe2m1",
+            "dtype_b": "mxe4m3",
+            "dtype_c": "mxe4m3",
+            "mma_k": 32,
+            "tile_k": 512,
+            "sf_layout_b": "8x4",
+            "sf_layout_c": "8x4",
+            "bias_type": "m",
+            "act": "swiglu"
+        },
+        "BatchedGemmMxE2m1MxE4m3LowLatency": {
+            "_template": "BatchedGemmMxE2m1MxE4m3Base",
+            "mma_m": 128,
+            "cluster_m": 1
+        },
+        "BatchedGemmMxE2m1MxE4m3HighThroughput": {
+            "_template": "BatchedGemmMxE2m1MxE4m3Base",
+            "mma_m": 256,
+            "cluster_m": 2,
+            "mma_regs": 96,
+            "load_regs": 96,
+            "load_sf_regs": 96,
+            "copy_sf_regs": 96,
+            "padding_regs": 96,
+            "workid_regs": 96,
+            "gather_regs": 96,
+            "epilogue_regs": 168
+        },
+        "BatchedGemmMxE2m1Bf16LowLatency": {
+            "_template": "BatchedGemmNonDsBase",
+            "mma_m": 128,
+            "cluster_m": 1,
+            "dtype_a": "mxe2m1",
+            "dtype_b": "bf16",
+            "dtype_c": "bf16",
+            "mma_k": 16,
+            "tile_k": 256,
+            "sf_layout_b": "8x4",
+            "sf_layout_c": "8x4",
+            "bias_type": "m",
+            "act": "swiglu"
+        },
+        "BatchedGemmBf16Bf16Base": {
+            "_template": "BatchedGemmNonDsBase",
+            "dtype_a": "bf16",
+            "dtype_b": "bf16",
+            "dtype_c": "bf16",
+            "mma_k": 16,
+            "tile_k": 128,
+            "act": "swiglu"
+        },
+        "BatchedGemmBf16Bf16LowLatency": {
+            "_template": "BatchedGemmBf16Bf16Base",
+            "mma_m": 128,
+            "cluster_m": 1
+        },
+        "BatchedGemmBf16Bf16HighThroughput": {
+            "_template": "BatchedGemmBf16Bf16Base",
+            "mma_m": 256,
+            "cluster_m": 2
+        }
+    },
+    "configs": [
+        {
+            "_comment": "FP4_FC1_LowLatency_LDGSTS",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "dtype_c": "e2m1",
+            "use_per_token_sf_b": false,
+            "mma_m": 128,
+            "mma_n": 8,
+            "tile_n": 8,
+            "epi_tile_n": 8,
+            "tile_k": 512,
+            "cluster_m": 1,
+            "num_stages_a": 5,
+            "num_stages_b": 5,
+            "num_stages_smem_sfa": 5,
+            "num_stages_smem_sfb": 5,
+            "num_stages_tmem_sfa": 5,
+            "num_stages_tmem_sfb": 5,
+            "tile_scheduler,num_stages_tmem_acc,use_clc_fast_drain,use_work_throttle": [
+                ["persistent", 2, true, true]
+            ]
+        },
+        {
+            "_comment": "FP4_FC1_LowLatency",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "dtype_c": "e2m1",
+            "use_per_token_sf_b": [true, false],
+            "per_token_sf_dtype": "fp32",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 8, 8, 512, 5, 5, 5, 5, 5, 5],
+                [16, 16, 16, 512, 5, 5, 5, 5, 5, 5],
+                [32, 32, 32, 512, 4, 4, 4, 4, 4, 4]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "FP4_FC1_MidBatchTile32",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "dtype_c": "e2m1",
+            "use_per_token_sf_b": false,
+            "per_token_sf_dtype": "fp32",
+            "mma_m": 128,
+            "mma_n": 32,
+            "tile_n": 32,
+            "epi_tile_n": 32,
+            "tile_k": 512,
+            "cluster_m": 1,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 4,
+            "num_stages_tmem_sfb": 4,
+            "tile_scheduler": "persistent",
+            "num_stages_tmem_acc": 2,
+            "use_clc_fast_drain": true
+        },
+        {
+            "_comment": "FP4_FC1_LowLatency_TRTLLM",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": "tma",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "swiglu", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "dtype_c": "e2m1",
+            "use_per_token_sf_b": [true, false],
+            "per_token_sf_dtype": "fp32",
+            "mma_m,mma_n,tile_n,epi_tile_n,tile_k,cluster_m,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,route_sfs_act": [
+                [128, 8, 8, 8, 512, 1, 5, 5, 5, 5, 5, 5, "tma"],
+                [128, 8, 8, 8, 256, 1, 9, 9, 9, 9, 9, 9, "ldgsts"],
+                [256, 16, 16, 16, 512, 2, 5, 5, 5, 5, 5, 5, "tma"],
+                [128, 16, 16, 16, 256, 1, 9, 9, 9, 9, 9, 9, "ldgsts"],
+                [256, 32, 32, 32, 512, 2, 5, 5, 5, 5, 5, 5, "tma"],
+                [128, 32, 32, 32, 256, 1, 9, 9, 9, 9, 9, 9, "ldgsts"]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "FP4_FC1_HighThroughput",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "route_act": "tma",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "mma_regs": 48,
+            "load_regs": 48,
+            "load_sf_regs": 48,
+            "copy_sf_regs": 48,
+            "padding_regs": 48,
+            "workid_regs": 48,
+            "gather_regs": 48,
+            "dtype_c": "e2m1",
+            "use_per_token_sf_b": [true, false],
+            "per_token_sf_dtype": "fp32",
+            "tile_scheduler": "persistent",
+            "num_stages_tmem_acc": 2,
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c": [
+                [64, 64, 32, 512, 4, 4, 4, 4, 4, 4, "8x4"],
+                [64, 64, 64, 256, 6, 6, 6, 6, 6, 6, "8x4"],
+                [128, 128, 32, 256, 3, 3, 3, 3, 3, 3, "128x4"]
+            ]
+        },
+        {
+            "_comment": "FP4_FC1_HighThroughputTile128K512",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "sf_layout_c": "128x4",
+            "mma_regs": 48,
+            "load_regs": 48,
+            "load_b_regs": 96,
+            "load_sf_regs": 48,
+            "load_sfb_regs": 128,
+            "copy_sf_regs": 48,
+            "padding_regs": 48,
+            "workid_regs": 48,
+            "gather_regs": 128,
+            "dtype_c": "e2m1",
+            "use_per_token_sf_b": false,
+            "per_token_sf_dtype": "fp32",
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": false,
+            "fuse_sf_copy_to_mma": true,
+            "fuse_operand_sf_loads": true,
+            "use_unroll_loop_2x_for_mma": true,
+            "use_tma_oob_opt": false,
+            "num_stages_tmem_acc": 2,
+            "mma_n": 128,
+            "tile_n": 128,
+            "epi_tile_n": 32,
+            "tile_k": 512,
+            "num_stages_a": 3,
+            "num_stages_b": 3,
+            "num_stages_smem_sfa": 3,
+            "num_stages_smem_sfb": 3,
+            "num_stages_tmem_sfa": 1,
+            "num_stages_tmem_sfb": 3,
+            "num_load_sfb_warps": 4
+        },
+        {
+            "_comment": "FP4_FC1_HighThroughputTile256",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "route_act": "tma",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "dtype_c": "e2m1",
+            "tile_scheduler": "persistent",
+            "num_stages_tmem_acc": 1,
+            "route_sfs_act": "ldgsts",
+            "use_max_tmem_overlap": true,
+            "use_per_token_sf_b": [true, false],
+            "per_token_sf_dtype": "fp32",
+            "num_epilogue_warps": 8,
+            "num_load_b_warps": 8,
+            "num_load_sfb_warps": 4,
+            "mma_regs": 88,
+            "load_regs": 88,
+            "load_sf_regs": 88,
+            "copy_sf_regs": 88,
+            "padding_regs": 88,
+            "workid_regs": 88,
+            "gather_regs": 88,
+            "epilogue_regs": 144,
+            "load_b_regs": 32,
+            "load_sfb_regs": 40,
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c": [
+                [256, 256, 64, 256, 3, 3, 3, 3, 3, 3, "128x4"]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_LowLatency_Tile8K512",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_m": 128,
+            "mma_n": 8,
+            "tile_n": 8,
+            "epi_tile_n": 8,
+            "tile_k": 512,
+            "cluster_m": 1,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 4,
+            "num_stages_tmem_sfb": 4,
+            "tile_scheduler,num_stages_tmem_acc,use_clc_fast_drain,use_work_throttle": [
+                ["static", 1, false, false],
+                ["persistent", 2, false, false]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_LowLatency",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_m,mma_n,tile_n,epi_tile_n,tile_k,cluster_m,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [128, 8, 8, 8, 256, 1, 6, 6, 6, 6, 6, 6],
+                [128, 8, 8, 8, 256, 1, 9, 9, 9, 9, 9, 9],
+                [256, 16, 16, 16, 512, 2, 5, 5, 5, 5, 5, 5],
+                [128, 16, 16, 16, 256, 1, 6, 6, 6, 6, 6, 6],
+                [128, 16, 16, 16, 256, 1, 9, 9, 9, 9, 9, 9],
+                [256, 32, 32, 32, 512, 2, 4, 4, 4, 4, 4, 4],
+                [256, 32, 32, 32, 512, 2, 5, 5, 5, 5, 5, 5],
+                [128, 32, 32, 32, 256, 1, 6, 6, 6, 6, 6, 6],
+                [128, 32, 32, 32, 256, 1, 9, 9, 9, 9, 9, 9],
+                [128, 64, 64, 64, 512, 1, 3, 3, 3, 3, 3, 3]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_MidBatchTile32",
+            "_template": "BatchedGemmFp4LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_m": 256,
+            "mma_n": 32,
+            "tile_n": 32,
+            "epi_tile_n": 32,
+            "tile_k": 512,
+            "cluster_m": 2,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 4,
+            "num_stages_tmem_sfb": 4,
+            "tile_scheduler": "persistent",
+            "num_stages_tmem_acc": 2,
+            "use_clc_fast_drain": true,
+            "use_unroll_loop_2x_for_mma": true
+        },
+        {
+            "_comment": "FP4_FC2_HighThroughput",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_unroll_loop_2x_for_mma": true,
+            "num_stages_tmem_acc": 2,
+            "num_stages_c_smem": 1,
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b": [
+                [64, 64, 64, 512, 4, 4, 4, 4, 4, 4, "8x4"],
+                [128, 128, 128, 256, 6, 6, 6, 6, 6, 6, "128x4"]
+            ]
+        },
+        {
+            "_comment": "FP4_FC2_HighThroughputTile256",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_unroll_loop_2x_for_mma": true,
+            "num_stages_tmem_acc": 1,
+            "use_max_tmem_overlap": true,
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b": [
+                [256, 256, 64, 256, 4, 4, 4, 4, 4, 4, "128x4"]
+            ]
+        },
+        {
+            "_comment": "DS_FP8_FC1",
+            "_template": "BatchedGemmDeepSeekFp8LowLatency",
+            "route_act": "tma",
+            "fused_act": false,
+            "mma_regs": 80,
+            "load_regs": 80,
+            "load_sf_regs": 80,
+            "copy_sf_regs": 80,
+            "padding_regs": 80,
+            "workid_regs": 80,
+            "gather_regs": 80,
+            "dtype_c": "e4m3",
+            "mma_n,tile_n,epi_tile_n,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_load_b_warps,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs": [
+                [8, 8, 8, 8, 8, 8, 8, 8, 8, 2, 160, 48, 48, 48, 48, 48, 48, 48],
+                [16, 16, 16, 6, 6, 6, 6, 6, 6, 2, 160, 48, 48, 48, 48, 48, 48, 48],
+                [32, 32, 32, 6, 6, 6, 6, 6, 6, 2, 160, 48, 48, 48, 48, 48, 48, 48],
+                [64, 64, 64, 6, 6, 6, 6, 6, 6, 4, 160, 48, 48, 48, 48, 48, 48, 48],
+                [128, 128, 128, 5, 5, 5, 5, 5, 5, 4, 152, 80, 80, 80, 80, 80, 80, 80]
+            ],
+            "tile_scheduler,num_stages_tmem_acc,use_work_throttle,use_clc_fast_drain": [
+                ["static", 2, false, false],
+                ["persistent", 4, false, false],
+                ["persistent", 4, true, false],
+                ["persistent", 4, false, true],
+                ["persistent", 4, true, true]
+            ]
+        },
+        {
+            "_comment": "DS_FP8_FC2",
+            "_template": "BatchedGemmDeepSeekFp8LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "num_stages_c_smem": 1,
+            "mma_n,tile_n,epi_tile_n,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs": [
+                [8, 8, 8, 8, 8, 8, 8, 8, 8, 160, 48, 48, 48, 48, 48, 48, 48],
+                [16, 16, 16, 6, 6, 6, 6, 6, 6, 160, 48, 48, 48, 48, 48, 48, 48],
+                [32, 32, 32, 6, 6, 6, 6, 6, 6, 160, 48, 48, 48, 48, 48, 48, 48],
+                [64, 64, 64, 6, 6, 6, 6, 6, 6, 160, 48, 48, 48, 48, 48, 48, 48],
+                [128, 128, 128, 5, 5, 5, 5, 5, 5, 160, 64, 64, 64, 64, 64, 64, 64]
+            ],
+            "tile_scheduler,num_stages_tmem_acc,use_work_throttle,use_clc_fast_drain": [
+                ["static", 2, false, false],
+                ["persistent", 4, false, false],
+                ["persistent", 4, true, false],
+                ["persistent", 4, false, true],
+                ["persistent", 4, true, true]
+            ]
+        },
+        {
+            "_comment": "PerTensor_FP8_FC1_LowLatency",
+            "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
+            "route_act": "tma",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "use_per_token_sf_a,use_per_token_sf_b": [[true, true], [true, false], [false, true], [false, false]],
+            "per_token_sf_dtype": ["fp32", "bf16"],
+            "dtype_c": "e4m3",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 8, 8, 256, 6, 6, 6, 6, 6, 6],
+                [16, 16, 16, 256, 6, 6, 6, 6, 6, 6],
+                [32, 32, 32, 256, 5, 5, 5, 5, 5, 5]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "PerTensor_FP8_FC1_HighThroughput",
+            "_template": "BatchedGemmPerTensorScalingFp8HighThroughput",
+            "route_act": "tma",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "use_per_token_sf_a,use_per_token_sf_b": [[true, true], [true, false], [false, true], [false, false]],
+            "per_token_sf_dtype": ["fp32", "bf16"],
+            "mma_regs": 56,
+            "load_regs": 56,
+            "load_sf_regs": 56,
+            "copy_sf_regs": 56,
+            "padding_regs": 56,
+            "workid_regs": 56,
+            "gather_regs": 56,
+            "epilogue_regs": 128,
+            "num_load_b_warps": 8,
+            "dtype_c": "e4m3",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_epilogue_warps": [
+                [64, 64, 64, 256, 5, 5, 5, 5, 5, 5, 4],
+                [128, 128, 64, 128, 8, 8, 8, 8, 8, 8, 4],
+                [192, 192, 32, 128, 7, 7, 7, 7, 7, 7, 4],
+                [256, 256, 64, 128, 6, 6, 6, 6, 6, 6, 8]
+            ],
+            "num_stages_tmem_acc": 2,
+            "tile_scheduler": "persistent"
+        },
+        {
+            "_comment": "PerTensor_FP8_FC2_LowLatency",
+            "_template": "BatchedGemmPerTensorScalingFp8LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "use_per_token_sf_a,use_per_token_sf_b": [[true, false], [false, false]],
+            "per_token_sf_dtype": ["fp32", "bf16"],
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 8, 8, 256, 6, 6, 6, 6, 6, 6],
+                [16, 16, 16, 256, 6, 6, 6, 6, 6, 6],
+                [32, 32, 32, 256, 5, 5, 5, 5, 5, 5]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "PerTensor_FP8_FC2_HighThroughput",
+            "_template": "BatchedGemmPerTensorScalingFp8HighThroughput",
+            "use_per_token_sf_a,use_per_token_sf_b": [[true, false], [false, false]],
+            "per_token_sf_dtype": ["fp32", "bf16"],
+            "mma_regs": 48,
+            "load_regs": 48,
+            "load_sf_regs": 48,
+            "copy_sf_regs": 48,
+            "padding_regs": 48,
+            "workid_regs": 48,
+            "gather_regs": 48,
+            "epilogue_regs": 128,
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,num_epilogue_warps": [
+                [64, 64, 64, 128, 8, 8, 8, 8, 8, 8, 4],
+                [128, 128, 32, 128, 7, 7, 7, 7, 7, 7, 4],
+                [192, 192, 32, 128, 7, 7, 7, 7, 7, 7, 4],
+                [256, 256, 32, 128, 6, 6, 6, 6, 6, 6, 8]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_LowLatency",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "route_act": "tma",
+            "route_sfs_act": "ldgsts",
+            "dtype_a": ["mxe2m1", "mxe4m3"],
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "mma_m,mma_n,tile_n,epi_tile_n,tile_k,cluster_m,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [128, 8, 8, 8, 512, 1, 3, 3, 3, 3, 3, 3],
+                [128, 8, 8, 8, 256, 1, 3, 3, 3, 3, 3, 3],
+                [128, 8, 8, 8, 256, 1, 4, 4, 4, 4, 4, 4],
+                [128, 8, 8, 8, 256, 1, 5, 5, 5, 5, 5, 5],
+                [128, 8, 8, 8, 256, 1, 6, 6, 6, 6, 6, 6],
+                [128, 16, 16, 16, 256, 1, 3, 3, 3, 3, 3, 3],
+                [128, 16, 16, 16, 256, 1, 4, 4, 4, 4, 4, 4],
+                [128, 16, 16, 16, 256, 1, 5, 5, 5, 5, 5, 5],
+                [256, 16, 16, 16, 256, 2, 3, 3, 3, 3, 3, 3],
+                [256, 16, 16, 16, 256, 2, 4, 4, 4, 4, 4, 4],
+                [256, 16, 16, 16, 256, 2, 5, 5, 5, 5, 5, 5],
+                [256, 16, 16, 16, 256, 2, 6, 6, 6, 6, 6, 6],
+                [128, 32, 32, 32, 256, 1, 3, 3, 3, 3, 3, 3],
+                [128, 32, 32, 32, 256, 1, 4, 4, 4, 4, 4, 4],
+                [128, 32, 32, 32, 256, 1, 5, 5, 5, 5, 5, 5],
+                [256, 32, 32, 32, 256, 2, 3, 3, 3, 3, 3, 3],
+                [256, 32, 32, 32, 256, 2, 4, 4, 4, 4, 4, 4],
+                [256, 32, 32, 32, 256, 2, 5, 5, 5, 5, 5, 5]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_LowLatencyLdgsts",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act": true,
+            "sf_layout_b": "linear",
+            "mma_n": 8,
+            "tile_n": 8,
+            "epi_tile_n": 8,
+            "num_stages_a": 3,
+            "num_stages_b": 3,
+            "num_stages_smem_sfa": 3,
+            "num_stages_smem_sfb": 3,
+            "num_stages_tmem_sfa": 3,
+            "num_stages_tmem_sfb": 3,
+            "num_stages_tmem_acc": 2,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": true
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_HighThroughput",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": "tma",
+            "route_sfs_act": "ldgsts",
+            "dtype_a": ["mxe2m1", "mxe4m3"],
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs,num_stages_tmem_acc,num_load_b_warps,num_load_sfb_warps,load_b_regs,load_sfb_regs": [
+                [64, 64, 64, 256, 4, 4, 4, 4, 4, 4, "8x4", 168, 48, 48, 48, 48, 48, 48, 48, 2, 1, 1, 48, 48],
+                [64, 64, 64, 128, 7, 7, 7, 7, 7, 7, "8x4", 168, 48, 48, 48, 48, 48, 48, 48, 2, 1, 1, 48, 48],
+                [128, 128, 32, 256, 3, 3, 3, 3, 3, 3, "128x4", 152, 48, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48],
+                [128, 128, 32, 128, 3, 3, 3, 3, 3, 3, "128x4", 152, 48, 48, 48, 48, 48, 48, 48, 2, 8, 4, 48, 48]
+            ],
+            "tile_scheduler": "persistent"
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_HighThroughput_tileN_192",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": "tma",
+            "route_sfs_act": "ldgsts",
+            "fused_act": true,
+            "sf_layout_b": "linear",
+            "sf_layout_c": "8x4",
+            "mma_m": 256,
+            "mma_n": 192,
+            "tile_n": 192,
+            "epi_tile_n": 32,
+            "tile_k": 256,
+            "cluster_m": 2,
+            "num_stages_a": 3,
+            "num_stages_b": 3,
+            "num_stages_smem_sfa": 3,
+            "num_stages_smem_sfb": 3,
+            "num_stages_tmem_sfa": 3,
+            "num_stages_tmem_sfb": 3,
+            "num_stages_tmem_acc": 2,
+            "epilogue_regs": 152,
+            "mma_regs": 48,
+            "load_regs": 48,
+            "load_sf_regs": 48,
+            "copy_sf_regs": 48,
+            "padding_regs": 48,
+            "workid_regs": 48,
+            "gather_regs": 48,
+            "num_load_b_warps": 8,
+            "num_load_sfb_warps": 4,
+            "load_b_regs": 48,
+            "load_sfb_regs": 48,
+            "use_unroll_loop_2x_for_mma": true,
+            "use_tma_oob_opt": true,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": false
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_HighThroughput_tileN_192_K128S5NoUnroll",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": "tma",
+            "route_sfs_act": "ldgsts",
+            "fused_act": true,
+            "sf_layout_b": "linear",
+            "sf_layout_c": "8x4",
+            "mma_m": 256,
+            "mma_n": 192,
+            "tile_n": 192,
+            "epi_tile_n": 32,
+            "tile_k": 128,
+            "cluster_m": 2,
+            "num_stages_a": 5,
+            "num_stages_b": 5,
+            "num_stages_smem_sfa": 5,
+            "num_stages_smem_sfb": 5,
+            "num_stages_tmem_sfa": 5,
+            "num_stages_tmem_sfb": 5,
+            "num_stages_tmem_acc": 2,
+            "epilogue_regs": 152,
+            "mma_regs": 48,
+            "load_regs": 48,
+            "load_sf_regs": 48,
+            "copy_sf_regs": 48,
+            "padding_regs": 48,
+            "workid_regs": 48,
+            "gather_regs": 48,
+            "num_load_b_warps": 8,
+            "num_load_sfb_warps": 4,
+            "load_b_regs": 48,
+            "load_sfb_regs": 48,
+            "use_unroll_loop_2x_for_mma": false,
+            "use_tma_oob_opt": true,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": false
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_HighThroughputFusedLdgsts",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act": true,
+            "sf_layout_b": "linear",
+            "sf_layout_c": "128x4",
+            "mma_n": 128,
+            "tile_n": 128,
+            "epi_tile_n": 32,
+            "tile_k": 256,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 1,
+            "num_stages_tmem_sfb": 4,
+            "num_stages_tmem_acc": 2,
+            "gather_regs": 128,
+            "num_load_sfb_warps": 4,
+            "load_sfb_regs": 128,
+            "fuse_sf_copy_to_mma": true,
+            "fuse_operand_sf_loads": true,
+            "use_unroll_loop_2x_for_mma": true,
+            "use_tma_oob_opt": false,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": false
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_HighThroughput_tileN_256",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": "tma",
+            "route_sfs_act": "ldgsts",
+            "dtype_a": ["mxe2m1", "mxe4m3"],
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "use_max_tmem_overlap": true,
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_c,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs,num_load_b_warps,num_load_sfb_warps,load_b_regs,load_sfb_regs": [
+                [256, 256, 64, 128, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56],
+                [256, 256, 64, 256, 3, 3, 3, 3, 3, 3, "128x4", 144, 88, 88, 88, 88, 88, 88, 88, 8, 4, 56, 56]
+            ],
+            "tile_scheduler": "persistent",
+            "num_stages_tmem_acc": 1
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_LowLatency",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_a": ["mxe2m1", "mxe4m3"],
+            "dtype_c": "bf16",
+            "mma_m,mma_n,tile_n,epi_tile_n,tile_k,cluster_m,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [128, 8, 8, 8, 512, 1, 3, 3, 3, 3, 3, 3],
+                [128, 8, 8, 8, 256, 1, 3, 3, 3, 3, 3, 3],
+                [128, 8, 8, 8, 256, 1, 4, 4, 4, 4, 4, 4],
+                [128, 8, 8, 8, 256, 1, 5, 5, 5, 5, 5, 5],
+                [128, 8, 8, 8, 256, 1, 6, 6, 6, 6, 6, 6],
+                [128, 16, 16, 16, 256, 1, 3, 3, 3, 3, 3, 3],
+                [128, 16, 16, 16, 256, 1, 4, 4, 4, 4, 4, 4],
+                [128, 16, 16, 16, 256, 1, 5, 5, 5, 5, 5, 5],
+                [256, 16, 16, 16, 256, 2, 3, 3, 3, 3, 3, 3],
+                [256, 16, 16, 16, 256, 2, 4, 4, 4, 4, 4, 4],
+                [256, 16, 16, 16, 256, 2, 5, 5, 5, 5, 5, 5],
+                [256, 16, 16, 16, 256, 2, 6, 6, 6, 6, 6, 6],
+                [128, 32, 32, 32, 256, 1, 3, 3, 3, 3, 3, 3],
+                [128, 32, 32, 32, 256, 1, 4, 4, 4, 4, 4, 4],
+                [128, 32, 32, 32, 256, 1, 5, 5, 5, 5, 5, 5],
+                [256, 32, 32, 32, 256, 2, 3, 3, 3, 3, 3, 3],
+                [256, 32, 32, 32, 256, 2, 4, 4, 4, 4, 4, 4],
+                [256, 32, 32, 32, 256, 2, 5, 5, 5, 5, 5, 5]
+            ],
+            "tile_scheduler,num_stages_tmem_acc,use_work_throttle": [
+                ["static", 1, false],
+                ["persistent", 2, true]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_HighThroughput",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_a": ["mxe2m1", "mxe4m3"],
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs,num_stages_tmem_acc": [
+                [64, 64, 64, 256, 4, 4, 4, 4, 4, 4, "8x4", 168, 96, 96, 96, 96, 96, 96, 96, 2],
+                [64, 64, 64, 128, 7, 7, 7, 7, 7, 7, "8x4", 168, 96, 96, 96, 96, 96, 96, 96, 2],
+                [128, 128, 64, 256, 3, 3, 3, 3, 3, 3, "128x4", 168, 96, 96, 96, 96, 96, 96, 96, 2],
+                [128, 128, 64, 128, 7, 7, 7, 7, 7, 7, "128x4", 168, 96, 96, 96, 96, 96, 96, 96, 2]
+            ],
+            "tile_scheduler": "persistent"
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_HighThroughput_tileN_192",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "sf_layout_b": "8x4",
+            "mma_m": 256,
+            "mma_n": 192,
+            "tile_n": 192,
+            "epi_tile_n": 64,
+            "tile_k": 256,
+            "cluster_m": 2,
+            "num_stages_a": 3,
+            "num_stages_b": 3,
+            "num_stages_c_smem": 1,
+            "num_stages_smem_sfa": 3,
+            "num_stages_smem_sfb": 3,
+            "num_stages_tmem_sfa": 3,
+            "num_stages_tmem_sfb": 3,
+            "num_stages_tmem_acc": 2,
+            "epilogue_regs": 168,
+            "mma_regs": 96,
+            "load_regs": 96,
+            "load_sf_regs": 96,
+            "copy_sf_regs": 96,
+            "padding_regs": 96,
+            "workid_regs": 96,
+            "gather_regs": 96,
+            "use_unroll_loop_2x_for_mma": true,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": false
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_HighThroughputK256",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "sf_layout_b": "128x4",
+            "mma_n": 128,
+            "tile_n": 128,
+            "epi_tile_n": 64,
+            "tile_k": 256,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_c_smem": 1,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 4,
+            "num_stages_tmem_sfb": 4,
+            "num_stages_tmem_acc": 2,
+            "use_unroll_loop_2x_for_mma": true,
+            "use_clc_fast_drain": true,
+            "tile_scheduler": "persistent"
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_HighThroughput_tileN_256",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_a": ["mxe2m1", "mxe4m3"],
+            "use_max_tmem_overlap": true,
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs": [
+                [256, 256, 64, 128, 5, 5, 5, 5, 5, 5, "128x4", 144, 96, 96, 96, 96, 96, 96, 96]
+            ],
+            "tile_scheduler": "persistent",
+            "num_stages_tmem_acc": 1
+        },
+        {
+            "_comment": "MxFp4xBf16_FC1",
+            "_template": "BatchedGemmMxE2m1Bf16LowLatency",
+            "route_act": "ldgsts",
+            "fused_act": true,
+            "sf_layout_b": "linear",
+            "dtype_c": "bf16",
+            "tile_k": 256,
+            "mma_n,tile_n,epi_tile_n,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 8, 8, 3, 3, 3, 3, 3, 3],
+                [16, 16, 16, 3, 3, 3, 3, 3, 3],
+                [32, 32, 32, 3, 3, 3, 3, 3, 3],
+                [64, 64, 64, 3, 3, 3, 3, 3, 3]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "MxFp4xBf16_FC2",
+            "_template": "BatchedGemmMxE2m1Bf16LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 8, 8, 3, 3, 3, 3, 3, 3],
+                [16, 16, 16, 3, 3, 3, 3, 3, 3],
+                [32, 32, 32, 3, 3, 3, 3, 3, 3],
+                [64, 64, 64, 3, 3, 3, 3, 3, 3]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC1_no_splitK",
+            "_template": "BatchedGemmBf16Bf16LowLatency",
+            "route_act": "ldgsts",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [false, "swiglu", "relu2"],
+                [false, "none", "none"]
+            ],
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 8, 8, 128, 6, 6, 6, 6, 6, 6],
+                [8, 8, 8, 128, 5, 5, 5, 5, 5, 5],
+                [8, 8, 8, 128, 4, 4, 4, 4, 4, 4],
+                [16, 16, 16, 128, 6, 6, 6, 6, 6, 6],
+                [16, 16, 16, 128, 5, 5, 5, 5, 5, 5],
+                [16, 16, 16, 128, 4, 4, 4, 4, 4, 4],
+                [32, 32, 32, 128, 5, 5, 5, 5, 5, 5],
+                [32, 32, 32, 128, 4, 4, 4, 4, 4, 4]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC1_HighThroughput",
+            "_template": "BatchedGemmBf16Bf16HighThroughput",
+            "route_act": "tma",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [false, "swiglu", "relu2"],
+                [false, "none", "none"]
+            ],
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs": [
+                [64, 64, 64, 128, 5, 5, 5, 5, 5, 5, 168, 96, 96, 96, 96, 96, 96, 96],
+                [128, 128, 128, 64, 6, 6, 6, 6, 6, 6, 168, 96, 96, 96, 96, 96, 96, 96]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC2_no_splitK",
+            "_template": "BatchedGemmBf16Bf16LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
+                [8, 8, 8, 128, 6, 6, 6, 6, 6, 6],
+                [8, 8, 8, 128, 5, 5, 5, 5, 5, 5],
+                [8, 8, 8, 128, 4, 4, 4, 4, 4, 4],
+                [16, 16, 16, 128, 6, 6, 6, 6, 6, 6],
+                [16, 16, 16, 128, 5, 5, 5, 5, 5, 5],
+                [16, 16, 16, 128, 4, 4, 4, 4, 4, 4],
+                [32, 32, 32, 128, 5, 5, 5, 5, 5, 5],
+                [32, 32, 32, 128, 4, 4, 4, 4, 4, 4]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["static", 1],
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC2_HighThroughput",
+            "_template": "BatchedGemmBf16Bf16HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,epilogue_regs,mma_regs,load_regs,load_sf_regs,copy_sf_regs,padding_regs,workid_regs,gather_regs": [
+                [64, 64, 64, 128, 4, 4, 4, 4, 4, 4, 168, 96, 96, 96, 96, 96, 96, 96],
+                [128, 128, 64, 64, 8, 8, 8, 8, 8, 8, 168, 96, 96, 96, 96, 96, 96, 96]
+            ],
+            "tile_scheduler,num_stages_tmem_acc": [
+                ["persistent", 2]
+            ]
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_LowLatencyTmaFastDrain",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "route_act": "tma",
+            "route_sfs_act": "ldgsts",
+            "fused_act": true,
+            "sf_layout_b": "linear",
+            "mma_m": 256,
+            "mma_n": 32,
+            "tile_n": 32,
+            "epi_tile_n": 32,
+            "tile_k": 256,
+            "cluster_m": 2,
+            "num_stages_a": 5,
+            "num_stages_b": 5,
+            "num_stages_smem_sfa": 5,
+            "num_stages_smem_sfb": 5,
+            "num_stages_tmem_sfa": 5,
+            "num_stages_tmem_sfb": 5,
+            "num_stages_tmem_acc": 2,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": false
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_KimiK3LowLatencyFastDrain",
+            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "mma_n": 8,
+            "tile_n": 8,
+            "epi_tile_n": 8,
+            "tile_k": 512,
+            "num_stages_a": 3,
+            "num_stages_b": 3,
+            "num_stages_smem_sfa": 3,
+            "num_stages_smem_sfb": 3,
+            "num_stages_tmem_sfa": 3,
+            "num_stages_tmem_sfb": 3,
+            "num_stages_tmem_acc": 2,
+            "use_unroll_loop_2x_for_mma": false,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": true
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC2_KimiK3HighThroughputFastDrain",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": false,
+            "fused_act": false,
+            "dtype_c": "bf16",
+            "sf_layout_b": "128x4",
+            "mma_n": 128,
+            "tile_n": 128,
+            "epi_tile_n": 64,
+            "tile_k": 256,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_c_smem": 1,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 4,
+            "num_stages_tmem_sfb": 4,
+            "num_stages_tmem_acc": 2,
+            "use_unroll_loop_2x_for_mma": false,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true
+        },
+        {
+            "_comment": "MxFp4xMxFp8_FC1_KimiK3HighThroughputTmaOob",
+            "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act": true,
+            "sf_layout_b": "linear",
+            "sf_layout_c": "128x4",
+            "mma_n": 128,
+            "tile_n": 128,
+            "epi_tile_n": 32,
+            "tile_k": 256,
+            "num_stages_a": 4,
+            "num_stages_b": 4,
+            "num_stages_smem_sfa": 4,
+            "num_stages_smem_sfb": 4,
+            "num_stages_tmem_sfa": 1,
+            "num_stages_tmem_sfb": 4,
+            "num_stages_tmem_acc": 2,
+            "gather_regs": 128,
+            "num_load_sfb_warps": 4,
+            "load_sfb_regs": 128,
+            "fuse_sf_copy_to_mma": true,
+            "fuse_operand_sf_loads": true,
+            "use_unroll_loop_2x_for_mma": true,
+            "use_tma_oob_opt": true,
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": true
+        }
+    ]
+}

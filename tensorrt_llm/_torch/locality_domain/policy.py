@@ -258,8 +258,8 @@ class LocalityDomainExecutionPlanner:
     ) -> PartitionPlan:
         """Decide whether to partition a MoE GroupGemm for locality domain execution.
 
-        MoE locality domain replicates weights on each partition (not partitioned like Linear).
-        Each partition runs the full GroupGemm with inplace output into shared buffers.
+        Each partition owns half the output channels of both GEMMs and writes
+        its channel range into shared intermediate and output buffers.
         """
         from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
         from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
@@ -274,10 +274,11 @@ class LocalityDomainExecutionPlanner:
                 enabled=False, reason_if_disabled="locality domain not supported on this hardware"
             )
 
-        if moe_backend.upper() != "CUTEDSL":
+        is_prims_ts = moe_backend.upper() == "PRIMS_TS"
+        if moe_backend.upper() not in ("CUTEDSL", "PRIMS_TS"):
             return PartitionPlan(
                 enabled=False,
-                reason_if_disabled=f"locality domain MoE requires CuteDSL backend, got {moe_backend}",
+                reason_if_disabled=f"locality domain MoE requires CUTEDSL or PRIMS_TS, got {moe_backend}",
             )
 
         is_nvfp4 = (
@@ -306,18 +307,19 @@ class LocalityDomainExecutionPlanner:
                 enabled=False, reason_if_disabled="locality domain MoE only supports NVFP4 or BF16"
             )
 
-        # Both locality-domain MoE kernels fuse SwiGLU. Staying unpartitioned is
-        # the right answer for any other activation, not an error.
-        if activation != "Swiglu":
+        # PrimsTS also fuses the Kimi SiTU activation in its NVFP4 FC1.
+        # Other activations retain the ordinary unpartitioned path.
+        supported_activations = ("Swiglu", "SiTu") if is_prims_ts and is_nvfp4 else ("Swiglu",)
+        if activation not in supported_activations:
             return PartitionPlan(
                 enabled=False,
-                reason_if_disabled=f"locality domain MoE fuses SwiGLU only, got {activation}",
+                reason_if_disabled=f"locality domain MoE supports {supported_activations}, got {activation}",
             )
 
         if op_name not in self.policy.allowed_ops:
             return PartitionPlan(enabled=False, reason_if_disabled=f"{op_name} not in allowed_ops")
 
-        if not use_fused_finalize:
+        if not use_fused_finalize and not is_prims_ts:
             return PartitionPlan(
                 enabled=False, reason_if_disabled="locality domain MoE requires fused finalize"
             )
@@ -330,7 +332,7 @@ class LocalityDomainExecutionPlanner:
         return PartitionPlan(
             enabled=True,
             num_partitions=self.policy.num_partitions,
-            backend="cutedsl",
+            backend="prims_ts" if is_prims_ts else "cutedsl",
             merge_kind="none",
         )
 

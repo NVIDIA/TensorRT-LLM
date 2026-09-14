@@ -127,7 +127,9 @@ def test_identity_matching_nothing_registered_raises():
     """Built as a query rather than parsed, to get past the token vocabulary."""
     with override_moe_environment(_deepgemm_environment()):
         with pytest.raises(ValueError, match="matches no registered implementation"):
-            resolve_moe_impl(_deepgemm_model_config(), impl_id=MoEImplQuery(quant="nvfp4"))
+            resolve_moe_impl(
+                _deepgemm_model_config(), impl_id=MoEImplQuery(provider="deepgemm", quant="nvfp4")
+            )
 
 
 @pytest.mark.parametrize("spec", ["*", "*.*.*.*", MoEImplQuery()], ids=["star", "wide", "query"])

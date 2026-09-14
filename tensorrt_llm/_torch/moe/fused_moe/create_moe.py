@@ -128,7 +128,7 @@ def create_moe_backend(
             f"apply_router_weight_on_input not supported in {moe_cls.__name__}."
         )
 
-    if moe_cls == TRTLLMGenFusedMoE:
+    if issubclass(moe_cls, TRTLLMGenFusedMoE):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,

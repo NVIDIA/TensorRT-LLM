@@ -96,6 +96,7 @@ def prepare_dummy_topk_and_hook(
     hidden_states_index: int = 2,
     local_expert_offset: int = 0,
     use_dp: bool = False,
+    routing_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, TuningConfig]:
     """
     Prepare dummy topk tensors and input pre-hook for AutoTuner profiling.
@@ -130,6 +131,8 @@ def prepare_dummy_topk_and_hook(
             all global experts (pure-EP regime). See the module-level
             distribution comment for the full framing and the
             corresponding profile-bucket math driven by `round_rule`.
+        routing_bias: Model correction bias for profiling expert popularity.
+            When absent, routing methods that need a bias use a random dummy.
 
     Returns:
         Tuple of (routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook)
@@ -235,6 +238,13 @@ def prepare_dummy_topk_and_hook(
         return make_routing_dummy_topk(num_tokens, device,
                                        None if is_local else logits)
 
+    def make_routing_bias():
+        if routing_bias is not None:
+            return routing_bias
+        return torch.randn(num_experts,
+                           dtype=torch.bfloat16,
+                           device=hidden_states.device)
+
     def make_routing_method():
 
         # Lazy import to avoid circular import: fused_moe imports from this module.
@@ -254,18 +264,12 @@ def prepare_dummy_topk_and_hook(
                 'is_fused':
                 False,  # fuse_routing_kernel
                 'callable_e_score_correction_bias':
-                lambda: torch.randn(num_experts,
-                                    dtype=torch.bfloat16,
-                                    device=hidden_states.device)
+                make_routing_bias
             })
         if routing_method_type == RoutingMethodType.MiniMax2:
             routing_cls_kwargs.update({
-                'callable_e_score_correction_bias':
-                lambda: torch.randn(num_experts,
-                                    dtype=torch.bfloat16,
-                                    device=hidden_states.device),
-                'num_experts':
-                num_experts,
+                'callable_e_score_correction_bias': make_routing_bias,
+                'num_experts': num_experts,
             })
         if routing_method_type == RoutingMethodType.SigmoidRenorm:
             routing_cls_kwargs.update({
