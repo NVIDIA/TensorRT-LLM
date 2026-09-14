@@ -881,8 +881,6 @@ class PyTorchModelEngine(ModelEngine):
         # NOTE: This can be simplified by decoupling the model config loading and
         # the model engine.
         self.attn_metadata = None
-        self._eager_workspace_shrink_enabled = os.getenv(
-            "TRTLLM_EAGER_WORKSPACE_SHRINK", "0") == "1"
         self._eager_workspace_reclaimer: Optional[
             EagerWorkspaceReclaimer] = None
         self.encoder_attn_metadata = None
@@ -1632,8 +1630,6 @@ class PyTorchModelEngine(ModelEngine):
         self._freeze_eager_workspace_floor()
 
     def _freeze_eager_workspace_floor(self) -> None:
-        if not self._eager_workspace_shrink_enabled:
-            return
         metadata = self.attn_metadata
         if (self.is_spec_decode or self.mapping.cp_size != 1
                 or self._is_encoder_decoder_model()
