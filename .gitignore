@@ -82,6 +82,10 @@ ad-test-workspace/
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 !3rdparty/vendor_patches/*.patch
+# Correctness patches applied to the installed FlashInfer headers; they are
+# the payload of flashinfer-patches/apply-flashinfer-patches.py, so ignoring
+# them leaves that script with nothing to apply.
+!flashinfer-patches/*/*.patch
 examples/disaggregated/slurm/benchmark/logs/
 scripts/attribution/data/checksum_to_paths.yml
 

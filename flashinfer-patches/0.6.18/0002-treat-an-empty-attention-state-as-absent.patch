@@ -1,0 +1,69 @@
+Treat an attention state with no keys as absent when merging
+
+A KV chunk can be scheduled with no work: on a sliding-window layer the
+split-KV plan chunks the full kv_len while only window_left keys exist, so
+the trailing CTA never enters the KV loop and keeps the state init_states
+wrote (m = -inf, o = 0). threadblock_sync_mdo_states and state_t::merge
+then fold that state in unconditionally and evaluate
+exp2(m_prev - m_new) with both sides at the sentinel.
+
+With FlashInfer's finite sentinel (math::inf = 5e4) that is exp2(0) = 1
+rather than NaN, so this is hardening rather than a live NaN fix on this
+build; under an IEEE sentinel the same expression is NaN and one such
+partial poisons the merged row. Skipping empty states is also what the
+code means: an empty partial should contribute nothing.
+
+The comparison is against the sentinel after a round trip through
+DTypeQKAccum, because a half accumulator cannot represent -5e4 exactly.
+
+--- a/flashinfer/attention/prefill.cuh
++++ b/flashinfer/attention/prefill.cuh
+@@ -1888,6 +1888,11 @@
+     }
+ 
+     if constexpr (KTraits::AttentionVariant::use_softmax) {
++      // The empty-state sentinel as it survives a round trip through
++      // DTypeQKAccum: init_states stores DTypeQKAccum(-math::inf), and a half
++      // accumulator cannot hold -math::inf exactly, so comparing against the raw
++      // constant would miss it.
++      const float kEmptyState = float(typename KTraits::DTypeQKAccum(-math::inf));
+ #pragma unroll
+       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+ #pragma unroll
+@@ -1914,6 +1919,12 @@
+                                  j) *
+                                     8 +
+                                 lane_idx / 4];
++            if (md.x <= kEmptyState) {
++              // This KV warp's chunk held no keys, so its state is still the one
++              // init_states wrote. It contributes nothing, and merging it while
++              // m_new is also the empty sentinel evaluates exp2(-inf - -inf).
++              continue;
++            }
+             float m_prev = m_new, d_prev = d_new;
+             m_new = max(m_new, md.x);
+             d_new = d_prev * math::ptx_exp2(m_prev - m_new) + md.y * math::ptx_exp2(md.x - m_new);
+@@ -1929,7 +1940,7 @@
+                                     8 +
+                                 lane_idx / 4];
+             float mi = md.x;
+-            o_scale[j][i] = math::ptx_exp2(float(mi - m_new));
++            o_scale[j][i] = (mi <= kEmptyState) ? 0.f : math::ptx_exp2(float(mi - m_new));
+           }
+           m[mma_q][j] = typename KTraits::DTypeQKAccum(m_new);
+           d[mma_q][j] = d_new;
+--- a/flashinfer/attention/state.cuh
++++ b/flashinfer/attention/state.cuh
+@@ -52,6 +52,12 @@
+    */
+   __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o, float other_m,
+                                         float other_d) {
++    // A partial whose KV chunk was empty still carries the m init() wrote. It
++    // contributes nothing, and merging it into a state that is itself still
++    // empty evaluates exp2(-inf - -inf).
++    if (other_m <= -math::inf) {
++      return;
++    }
+     float m_prev = m, d_prev = d;
+     m = max(m_prev, other_m);
+     d = d_prev * math::ptx_exp2(m_prev - m) + other_d * math::ptx_exp2(other_m - m);

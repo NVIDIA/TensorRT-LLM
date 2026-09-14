@@ -24,3 +24,8 @@ docs/source/blogs/media/tech_blog28_video_*.gif filter=lfs diff=lfs merge=lfs -t
 3rdparty/patches/*.patch -whitespace
 tensorrt_llm/grpc/openengine/proto/** text eol=lf
 tensorrt_llm/grpc/openengine/_generated/** linguist-generated=true
+# A unified diff is data, not source: the leading space of a context line is
+# part of the format, so whitespace checks do not apply to it. pre-commit's
+# trailing-whitespace hook already exempts *.patch; this says the same to git,
+# so regenerating these payloads with diff -u cannot fail git diff --check.
+flashinfer-patches/**/*.patch -whitespace

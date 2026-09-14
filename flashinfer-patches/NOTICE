@@ -1,0 +1,33 @@
+Notices for third-party code embedded in the patch files in this directory.
+
+The unified diffs under 0.6.16/ and 0.6.18/ modify, and therefore reproduce
+fragments of (context and removed lines), the following files from the
+FlashInfer project (https://github.com/flashinfer-ai/flashinfer), licensed
+under the Apache License 2.0. The paths are as installed in the
+flashinfer-python wheel (`flashinfer/data/include`); the upstream repository
+keeps them under `include/`:
+
+  flashinfer/attention/prefill.cuh
+  flashinfer/attention/state.cuh
+
+Each of those files carries the following copyright notice, reproduced here
+because the patch fragments do not include the file headers:
+
+  Copyright (c) 2023 by FlashInfer team.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+Patch base revisions (the releases the fragments were copied from):
+
+  0.6.16/  flashinfer-python 0.6.16  = tag v0.6.16, commit 8da13a29c85f7e5b1c81878d933f84ae9fc4afa9
+  0.6.18/  flashinfer-python 0.6.18  = tag v0.6.18, commit 69ff11fc4954396d98326656dc85debd2223f637

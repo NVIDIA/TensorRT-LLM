@@ -1,0 +1,134 @@
+Zero-fill the K tail tile instead of leaving it unwritten
+
+page_produce_kv and its scale-factor twin load a partial KV tile with
+kNoFill for K, so the out-of-range rows of the last tile keep whatever the
+previous kernel on that SM left in shared memory. Nothing clears shared
+memory between kernels, so those rows can decode to NaN or Inf.
+
+The existing argument for K being safe is that logits_mask replaces the
+resulting scores before update_mdo_states sees them. That holds only while
+every out-of-range position is covered by a mask that overwrites rather
+than adds, which is a property of three separate call sites. Zero-filling
+K costs one predicated cp.async on the tail tile only and removes the
+dependency.
+
+Re-derived for 0.6.16 -> 0.6.18: 0.6.18 restructured page_produce_kv_sf around
+the FLASHINFER_PAGED_V_SF_DESWIZZLE branch, so the K/V fill-mode choice now sits
+in the else branch. The de-swizzle branch already stores a zero-initialised
+value for out-of-range rows, so only the else branch needs the change. Every
+other hunk is the 0.6.16 hunk at a new offset.
+
+--- a/flashinfer/attention/prefill.cuh
++++ b/flashinfer/attention/prefill.cuh
+@@ -537,8 +537,10 @@
+       (produce_v && !KTraits::USE_KV_SHARED_SMEM) ? smem_storage->v_smem : smem_storage->k_smem);
+   using DType = typename KTraits::DTypeKV;
+   using IdType = typename KTraits::IdType;
+-  constexpr SharedMemFillMode fill_mode =
+-      produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
++  // K zero-fills the out-of-range rows of a partial tile as V already does.
++  // With kNoFill those shared-memory rows keep whatever the previous kernel on
++  // this SM left behind; nothing clears shared memory between kernels.
++  constexpr SharedMemFillMode fill_mode = SharedMemFillMode::kFillZero;
+   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
+   constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
+   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+@@ -627,8 +629,10 @@
+   smem_t<KTraits::SWIZZLE_MODE_KV> smem(
+       (produce_v && !KTraits::USE_KV_SHARED_SMEM) ? smem_storage->v_smem : smem_storage->k_smem);
+   using DType = typename KTraits::DTypeKV;
+-  constexpr SharedMemFillMode fill_mode =
+-      produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
++  // K zero-fills the out-of-range rows of a partial tile as V already does.
++  // With kNoFill those shared-memory rows keep whatever the previous kernel on
++  // this SM left behind; nothing clears shared memory between kernels.
++  constexpr SharedMemFillMode fill_mode = SharedMemFillMode::kFillZero;
+   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
+   constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
+   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+@@ -792,12 +796,13 @@
+         }
+       } else {
+         const size_t sf_gmem_offset = page_head_base + entry_idx * sf_stride_n + sf_smem_col;
+-        // V SF must zero-fill out-of-bounds entries: compute_sfm_v reads SF for all CTA_TILE_KV
+-        // rows including padding, and 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754).
+-        // K SF can use kNoFill since NaN K scores are replaced by -inf via logits_mask before
+-        // update_mdo_states, so they never reach the accumulator.
+-        constexpr auto fill_mode = produce_v ? cp_async::SharedMemFillMode::kFillZero
+-                                             : cp_async::SharedMemFillMode::kNoFill;
++        // Both K and V SF zero-fill out-of-bounds entries. For V it is required:
++        // compute_sfm_v reads SF for all CTA_TILE_KV rows including padding, and
++        // 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754). For K it is
++        // defence in depth: the argument that logits_mask discards a NaN K score
++        // before update_mdo_states holds only while every masked-off position is
++        // covered by a mask that overwrites rather than adds.
++        constexpr auto fill_mode = cp_async::SharedMemFillMode::kFillZero;
+         cp_async::pred_load_32b<fill_mode>(
+             reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+             reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds);
+@@ -867,9 +872,8 @@
+           in_bounds ? (static_cast<size_t>(kv_abs_base + abs_kv_row) * sf_stride_n +
+                        kv_head_idx * sf_stride_h + sf_smem_col)
+                     : 0;
+-      // Same rationale as page_produce_kv_sf: zero-fill V SF to prevent 0*NaN=NaN in compute_sfm_v.
+-      constexpr auto fill_mode =
+-          produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
++      // Same rationale as page_produce_kv_sf: zero-fill both K and V SF.
++      constexpr auto fill_mode = cp_async::SharedMemFillMode::kFillZero;
+       cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+                                          reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
+                                          in_bounds);
+@@ -2322,7 +2326,7 @@
+                    lane_idx % KV_THR_LAYOUT_COL);
+       // For single prefill, the absolute KV base is just chunk_start (no kv_indptr offset).
+       const uint32_t kv_abs_base = chunk_start;
+-      produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
++      produce_kv<false, SharedMemFillMode::kFillZero, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
+                                                              k_stride_n, 0, chunk_size, tid);
+       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+                                     k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
+@@ -2398,7 +2402,7 @@
+           cp_async::commit_group();
+           cp_async::wait_group<0>();
+         } else {
+-          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
++          produce_kv<false, SharedMemFillMode::kFillZero, KTraits>(
+               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+               tid);
+           produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+@@ -2426,7 +2430,7 @@
+         block.sync();
+         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+           // K(iter+1) goes into the shared buffer only after sfm*v consumed V(iter).
+-          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
++          produce_kv<false, SharedMemFillMode::kFillZero, KTraits>(
+               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+               tid);
+           cp_async::commit_group();
+@@ -2997,7 +3001,7 @@
+                        kv_head_idx * v_stride_h +
+                        (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack;
+ 
+-      produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
++      produce_kv<false, SharedMemFillMode::kFillZero, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
+                                                              k_stride_n, 0, chunk_size, tid);
+       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+                                     k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
+@@ -3094,7 +3098,7 @@
+           cp_async::commit_group();
+           cp_async::wait_group<0>();
+         } else {
+-          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
++          produce_kv<false, SharedMemFillMode::kFillZero, KTraits>(
+               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+               tid);
+           produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+@@ -3133,7 +3137,7 @@
+         block.sync();
+         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+           // K(iter+1) goes into the shared buffer only after sfm*v consumed V(iter).
+-          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
++          produce_kv<false, SharedMemFillMode::kFillZero, KTraits>(
+               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+               tid);
+           cp_async::commit_group();

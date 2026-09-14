@@ -800,6 +800,77 @@ def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
                 archive.extract(member, package_root)
 
 
+# Console scripts `setup.py` declares. A Python-only setup cannot run the
+# editable install that would create them, so it writes them itself.
+_CONSOLE_SCRIPTS = {
+    "trtllm-bench": "tensorrt_llm.commands.bench",
+    "trtllm-serve": "tensorrt_llm.commands.serve",
+    "trtllm-eval": "tensorrt_llm.commands.eval",
+}
+
+
+def setup_python_only(project_dir: Path, venv_python: Path):
+    """Make a fresh checkout importable and runnable without compiling C++.
+
+    Why this exists. A checkout whose compiled artifacts are supplied from
+    elsewhere -- a worktree sharing another build's `.so`s, or a
+    reproducibility check whose `git diff -- cpp/` against the artifact commit
+    is empty -- still needs a venv it can import from. Until now there was no
+    way to get one: `--cpp_only` is the opposite of what is wanted,
+    `--configure_only` still runs conan and the cmake configure, and plain
+    `pip install -e .[devel]` fails during the build because `fmha_sm100` is
+    staged by cmake FetchContent and is not there yet:
+
+        ImportError: The `fmha_sm100` package is missing.
+                     Please execute scripts/build_wheel.py first
+
+    So the requirements go in through the venv, the checkout is put on the
+    venv's path with a `.pth`, the console scripts `setup.py` declares are
+    written by hand, and the FlashInfer patches are applied to the venv's own
+    copy of the headers. Nothing is copied from any other checkout.
+    """
+    site_packages = check_output([
+        str(venv_python), "-c",
+        "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+    ],
+                                 text=True).strip()
+    pth = Path(site_packages) / "tensorrt_llm_checkout.pth"
+    pth.write_text(f"{project_dir}\n", encoding="utf-8")
+    print(f"-- python-only: {pth} -> {project_dir}")
+
+    bin_dir = Path(venv_python).parent
+    for name, module in _CONSOLE_SCRIPTS.items():
+        target = bin_dir / name
+        target.write_text(
+            f"#!{venv_python}\n"
+            "import sys\n"
+            f"from {module} import main\n"
+            "if __name__ == '__main__':\n"
+            "    sys.exit(main())\n",
+            encoding="utf-8")
+        target.chmod(0o755)
+        print(f"-- python-only: wrote {target}")
+
+    # A plain script rather than an entry point, so it is copied from the
+    # checkout it belongs to.
+    launcher = project_dir / "tensorrt_llm" / "llmapi" / "trtllm-llmapi-launch"
+    if launcher.is_file():
+        installed = bin_dir / launcher.name
+        if installed.exists() or installed.is_symlink():
+            installed.unlink()
+        installed.symlink_to(launcher)
+        installed_target = os.readlink(installed)
+        print(f"-- python-only: {installed} -> {installed_target}")
+    else:
+        print(f"-- python-only: no {launcher}; skipping the launcher shim")
+
+    # The patches live in the venv's FlashInfer, so a fresh venv starts
+    # unpatched. `--install` applies them behind the compile; this path has no
+    # compile, so it applies them here or the checkout silently runs stock
+    # headers.
+    apply_flashinfer_patches(str(venv_python))
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -822,6 +893,7 @@ def main(*,
          out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
+         python_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
@@ -888,6 +960,12 @@ def main(*,
                              no_venv,
                              yes=yes,
                              build_root=build_root)
+
+    if python_only:
+        setup_python_only(project_dir, venv_python)
+        print("-- python-only setup complete: no C++ was built. Supply the "
+              "compiled artifacts separately (they are not part of this mode).")
+        return
 
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
@@ -1582,6 +1660,48 @@ def main(*,
 
     if install:
         install_editable_package(venv_python)
+        apply_flashinfer_patches(str(venv_python))
+
+
+# apply-flashinfer-patches.py exits with this when FlashInfer is not installed
+# for the interpreter it ran under, which is the one outcome that is not a
+# failure. Every other non-zero exit means the headers are not what the build
+# thinks they are.
+FLASHINFER_ABSENT = 4
+
+
+def apply_flashinfer_patches(python: str):
+    """Re-apply the in-tree FlashInfer header patches after an install.
+
+    FlashInfer compiles its attention kernels from headers that ship inside the
+    installed package, so the fixes in ``flashinfer-patches`` live in that
+    package rather than in this tree, and any install that (re)places FlashInfer
+    reverts them. Running this here is what keeps them from silently
+    disappearing. The script is idempotent and drops the compiled-kernel cache
+    only when it actually changes a header.
+
+    A missing or unimportable FlashInfer is not a build failure -- plenty of
+    builds never install it -- so that case reports and moves on. Anything else
+    fails the build: patch applies a hunk at a time, so a rejected patch leaves
+    some headers stock and others changed, and a build that reported success
+    over that would ship kernels nobody can account for.
+    """
+    script = Path(__file__).resolve(
+    ).parent.parent / "flashinfer-patches" / "apply-flashinfer-patches.py"
+    if not script.is_file():
+        raise RuntimeError(
+            f"{script} is missing, so this build cannot apply the FlashInfer "
+            f"header patches it is supposed to carry")
+    done = run(f'"{python}" "{script}"', shell=True, check=False)
+    if done.returncode == FLASHINFER_ABSENT:
+        print("FlashInfer is not installed; its header patches were skipped.")
+        return
+    if done.returncode != 0:
+        raise RuntimeError(
+            f"applying the FlashInfer header patches failed "
+            f"(rc={done.returncode}). The installed headers may be half "
+            f"patched; '{script} --check' reports the state and '--revert' "
+            f"restores the stock text. See {script.parent}/README.md")
 
 
 def add_arguments(parser: ArgumentParser):
@@ -1650,6 +1770,16 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Number of parallel jobs for compilation (default: number of CPUs available to this process, respecting affinity)"
     )
+    parser.add_argument(
+        "--python_only",
+        action="store_true",
+        help="Build the venv, install the "
+        "requirements, put this checkout on the venv's path, write the "
+        "console scripts and apply the FlashInfer patches, and build no C++ "
+        "at all. For a checkout whose compiled artifacts come from elsewhere "
+        "-- a worktree sharing another build's .so files, or a "
+        "reproducibility check whose `git diff -- cpp/` against the artifact "
+        "commit is empty. Supply the artifacts separately; this mode does not.")
     parser.add_argument(
         "--extra-cmake-vars",
         "-D",
