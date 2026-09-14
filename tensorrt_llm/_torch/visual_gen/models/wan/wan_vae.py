@@ -397,9 +397,9 @@ class WanConv2d(nn.Conv2d):
 # NVFP4 (FP4 E2M1) causal Conv3d via the vendored Blackwell CuteDSL kernel.
 # All cutlass / kernel imports are lazy so the BF16 path carries no FP4 dependency.
 # Kernel ABI: input/filter NDHWC/NDHWC (C innermost), sfa UNswizzled, sfb via
-# cvt_sf_MKL_to_M32x4xrm_K4xrk_L, alpha = 1/(gx*gw). Input channels use 64-channel
-# alignment through 256 and 256-channel alignment above it; zero padding preserves
-# the convolution mathematically.
+# cvt_sf_MKL_to_M32x4xrm_K4xrk_L, alpha = 1/(gx*gw). The kernel can serve
+# partial K tiles, while channel padding remains a host-side performance choice
+# and preserves the convolution mathematically.
 # ---------------------------------------------------------------------------
 _FP4_FP8_MAX = 448.0
 _FP4_E2M1_MAX = 6.0
@@ -417,6 +417,8 @@ class _FP4PrequantizedWeight(TypedDict):
     in_channels: int
     padded_out_channels: int
     padded_in_channels: int
+    cta_tile_k: int
+    sfb_channel_span: int
     kernel_depth: int
     kernel_height: int
     kernel_width: int
@@ -436,9 +438,14 @@ def _fp4_align_input_channels(channels: int) -> int:
     return _round_up(channels, 64 if channels <= 256 else 256)
 
 
+def _fp4_cta_tile_k(channels: int) -> int:
+    """Select a legal K tile while retaining the established channel padding."""
+    return min(256, max(64, 1 << (channels - 1).bit_length()))
+
+
 def _fp4_align_output_channels(channels: int) -> int:
-    """Pad output channels for BF16 vector alignment and large-channel tiling."""
-    return _round_up(channels, 8 if channels <= 128 else 256)
+    """Pad output channels only as needed for a 16-byte BF16 vector."""
+    return _round_up(channels, 8)
 
 
 def _supports_nvfp4_conv3d(module: nn.Module) -> bool:
@@ -479,6 +486,7 @@ def _fp4_imports() -> tuple[Any, ...]:
         compile_conv,
         compute_zpq,
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
+        sfb_per_position_channels,
     )
 
     return (
@@ -489,6 +497,7 @@ def _fp4_imports() -> tuple[Any, ...]:
         compile_conv,
         compute_zpq,
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
+        sfb_per_position_channels,
     )
 
 
@@ -499,10 +508,12 @@ def _fp4_prequant_weight(weight: torch.Tensor) -> _FP4PrequantizedWeight:
     if weight.ndim != 5:
         raise ValueError(f"FP4 Conv3d weight must be 5D, got shape {tuple(weight.shape)}")
 
-    cutlass, cutlass_torch, _, from_dlpack, _, _, cvt_sf = _fp4_imports()
+    cutlass, cutlass_torch, _, from_dlpack, _, _, cvt_sf, sfb_per_position_channels = _fp4_imports()
     output_channels, input_channels, depth, height, width = weight.shape
     padded_output_channels = _fp4_align_output_channels(output_channels)
     padded_input_channels = _fp4_align_input_channels(input_channels)
+    cta_tile_k = _fp4_cta_tile_k(padded_input_channels)
+    sfb_channel_span = sfb_per_position_channels(padded_input_channels, cta_tile_k, _FP4_SF_VEC)
     if padded_output_channels != output_channels or padded_input_channels != input_channels:
         padded_weight = weight.new_zeros(
             (padded_output_channels, padded_input_channels, depth, height, width)
@@ -538,15 +549,32 @@ def _fp4_prequant_weight(weight: torch.Tensor) -> _FP4PrequantizedWeight:
     ).mark_layout_dynamic(leading_dim=4)
 
     # Convert linear weight block scales to the MMA-swizzled SFB layout.
-    sf_k = (flattened_channels + _FP4_SF_VEC - 1) // _FP4_SF_VEC
+    logical_sf_per_position = padded_input_channels // _FP4_SF_VEC
+    storage_sf_per_position = sfb_channel_span // _FP4_SF_VEC
+    sf_k = storage_sf_per_position * depth * height * width
     mma_shape = (1, (padded_output_channels + 127) // 128, (sf_k + 3) // 4, 32, 4, 4)
     ref = torch.zeros((1, padded_output_channels, sf_k), dtype=torch.float32)
-    ref[0] = (
-        weight_block_scales.reshape(padded_output_channels, -1)[:, :sf_k]
+    logical_scales = (
+        weight_block_scales.reshape(
+            padded_output_channels,
+            depth,
+            height,
+            width,
+            logical_sf_per_position,
+        )
         .view(torch.float8_e4m3fn)
         .float()
         .cpu()
     )
+    ref_positions = ref.view(
+        1,
+        padded_output_channels,
+        depth,
+        height,
+        width,
+        storage_sf_per_position,
+    )
+    ref_positions[0, ..., :logical_sf_per_position] = logical_scales
     ref = ref.permute(1, 2, 0).contiguous()
     mma = cutlass_torch.create_and_permute_torch_tensor(
         mma_shape,
@@ -569,6 +597,8 @@ def _fp4_prequant_weight(weight: torch.Tensor) -> _FP4PrequantizedWeight:
         "in_channels": input_channels,
         "padded_out_channels": padded_output_channels,
         "padded_in_channels": padded_input_channels,
+        "cta_tile_k": cta_tile_k,
+        "sfb_channel_span": sfb_channel_span,
         "kernel_depth": depth,
         "kernel_height": height,
         "kernel_width": width,
@@ -588,7 +618,7 @@ def _fp4_conv_run(
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run FP4 Conv3d with pre-padded BF16 input and an optional fused epilogue.
+    """Run FP4 Conv3d with fused channel padding and an optional epilogue.
 
     ``x`` is logical NCDHW and already has causal time padding. ``bias`` is
     physical O and ``residual`` is physical NZPQO. ``pad`` is
@@ -617,7 +647,7 @@ def _fp4_conv_run(
     if (fuse_silu or fuse_norm_gamma is not None) and gs_static is None:
         raise ValueError("Fused FP4 input preparation requires a calibrated input scale")
 
-    cutlass, _, cudadrv, from_dlpack, compile_conv, compute_zpq, _ = _fp4_imports()
+    cutlass, _, cudadrv, from_dlpack, compile_conv, compute_zpq, _, _ = _fp4_imports()
     Oc = pq["out_channels"]
     C = pq["in_channels"]
     Op = pq["padded_out_channels"]
@@ -628,40 +658,26 @@ def _fp4_conv_run(
     N, Cx, D, H, Wd = x.shape
     if Cx != C:
         raise ValueError(f"FP4 Conv3d expected {C} input channels, got {Cx}")
-    if Cp % 64 != 0 or (Cp > 256 and Cp % 256 != 0):
+    if Cp < 32 or Cp % 32 != 0:
         raise ValueError(f"FP4 Conv3d received unsupported padded input channels: {Cp}")
     if Op % 8 != 0:
         raise ValueError(f"FP4 Conv3d received misaligned padded output channels: {Op}")
-    if Cp != Cx:  # zero-pad in-channels to a kernel-valid count
-        x = torch.cat([x, x.new_zeros((N, Cp - Cx, D, H, Wd))], dim=1)
     Z, P, Q = compute_zpq((D, H, Wd), (T, R, S), stride, pad, pad, dil)
     M = N * D * H * Wd
-    Xp = x.permute(0, 2, 3, 4, 1).contiguous().reshape(M, Cp)
-    if fuse_norm_gamma is not None:
-        from .fp4_fused_quant import rmsnorm_silu_nvfp4_quant
-
-        gs = gs_static  # static path only; calibrated on the SiLU(RMSNorm) output
-        xq, x_sf = rmsnorm_silu_nvfp4_quant(Xp, gs, fuse_norm_gamma, fuse_norm_scale)
-    elif fuse_silu:
-        from .fp4_fused_quant import silu_nvfp4_quant
-
-        gs = gs_static  # static path only; calibrated on the SiLU output
-        xq, x_sf = silu_nvfp4_quant(Xp, gs)
-    else:
-        gs = (
-            gs_static
-            if gs_static is not None
-            else ((_FP4_FP8_MAX * _FP4_E2M1_MAX) / Xp.abs().amax().float().clamp(min=1e-8)).reshape(
-                1
-            )
-        )
-        xq, x_sf = torch.ops.trtllm.fp4_quantize(Xp, gs, _FP4_SF_VEC, False, False)
+    xq, x_sf, gs = _fp4_quantize_activation(
+        x,
+        pq,
+        gs_static=gs_static,
+        fuse_silu=fuse_silu,
+        fuse_norm_gamma=fuse_norm_gamma,
+        fuse_norm_scale=fuse_norm_scale,
+    )
     inp = from_dlpack(
         xq.view(N, D, H, Wd, Cp // 2).view(torch.float4_e2m1fn_x2), assumed_align=16
     ).mark_layout_dynamic(leading_dim=4)
-    sf_ka = (Cp + _FP4_SF_VEC - 1) // _FP4_SF_VEC
-    if sf_ka % 4 != 0:
-        raise ValueError(f"FP4 Conv3d requires a four-aligned SFA K dimension, got {sf_ka}")
+    sf_ka = x_sf.shape[1]
+    if sf_ka % 4 != 0 or sf_ka < Cp // _FP4_SF_VEC:
+        raise ValueError(f"FP4 Conv3d received an invalid SFA K dimension: {sf_ka}")
     sfa = from_dlpack(
         x_sf.reshape(M, sf_ka, 1).view(torch.float8_e4m3fn), assumed_align=16
     ).mark_layout_dynamic(leading_dim=1)
@@ -693,7 +709,8 @@ def _fp4_conv_run(
         residual_ct = None
         beta = 0.0
     alpha = from_dlpack(((1.0 / pq["global_scale"]) / gs).to(torch.float32), assumed_align=4)
-    cta_tile_k = min(256, Cp)
+    stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    cta_tile_k = pq["cta_tile_k"]
     from ...modules.vae.nvfp4_conv_autotuner import FP4ConvTactic, run_tuned_fp4_conv
 
     def compile_tactic(tactic: FP4ConvTactic):
@@ -742,7 +759,6 @@ def _fp4_conv_run(
     runtime_geometry = tuple(cutlass.Int32(v) for v in (*pad, *pad, *stride, *dil))
 
     def launch(fn) -> None:
-        stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
         fn(
             inp,
             pq["filter"],
@@ -772,9 +788,65 @@ def _fp4_conv_run(
         compile_tactic=compile_tactic,
         launch=launch,
         output=out,
+        output_channels=Op,
     )
     y = out.permute(0, 4, 1, 2, 3)  # [N,Op,Z,P,Q]
     return y[:, :Oc] if Op != Oc else y  # drop padded out-channels
+
+
+def _fp4_quantize_activation(
+    x: torch.Tensor,
+    pq: _FP4PrequantizedWeight,
+    *,
+    gs_static: torch.Tensor | None,
+    fuse_silu: bool,
+    fuse_norm_gamma: torch.Tensor | None,
+    fuse_norm_scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize logical NCDHW activations into row-major FP4 data and scales."""
+    N, C, D, H, W = x.shape
+    expected_channels = pq["in_channels"]
+    if C != expected_channels:
+        raise ValueError(f"FP4 Conv3d expected {expected_channels} input channels, got {C}")
+    padded_channels = pq["padded_in_channels"]
+    rows = N * D * H * W
+    physical = x.permute(0, 2, 3, 4, 1).contiguous().reshape(rows, C)
+    if fuse_norm_gamma is not None:
+        from .fp4_fused_quant import rmsnorm_silu_nvfp4_quant
+
+        if gs_static is None or fuse_norm_scale is None:
+            raise ValueError("Fused RMSNorm quantization requires a static scale and norm scale")
+        xq, x_sf = rmsnorm_silu_nvfp4_quant(
+            physical,
+            gs_static,
+            fuse_norm_gamma,
+            fuse_norm_scale,
+            padded_channels=padded_channels,
+        )
+        gs = gs_static
+    elif fuse_silu:
+        from .fp4_fused_quant import silu_nvfp4_quant
+
+        if gs_static is None:
+            raise ValueError("Fused SiLU quantization requires a static scale")
+        xq, x_sf = silu_nvfp4_quant(
+            physical,
+            gs_static,
+            padded_channels=padded_channels,
+        )
+        gs = gs_static
+    else:
+        from .fp4_fused_quant import nvfp4_quant
+
+        gs = (
+            gs_static
+            if gs_static is not None
+            else (
+                (_FP4_FP8_MAX * _FP4_E2M1_MAX) / physical.abs().amax().float().clamp(min=1e-8)
+            ).reshape(1)
+        )
+        xq, x_sf = nvfp4_quant(physical, gs, padded_channels=padded_channels)
+    return xq, x_sf, gs
 
 
 class NVFP4WanCausalConv3d(WanCausalConv3d):
