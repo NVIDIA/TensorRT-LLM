@@ -25,8 +25,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fmha_test_utils import FakeAttention, make_fake_metadata
+from torch._dynamo.testing import CompileCounter
 
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
+from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.fallback import (
     FallbackFmha,
     _set_context_workspace_shape,
@@ -35,6 +38,7 @@ from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaParams, St
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
@@ -196,3 +200,161 @@ def test_attention_op_cache_separates_static_configurations(monkeypatch):
 
     TrtllmAttention.release(owner)
     assert owner._attention_ops == {}
+
+
+@pytest.mark.parametrize(
+    ("method_name", "combined"),
+    [
+        ("prepare_workspace", False),
+        ("run_context", False),
+        ("run_mla_context", False),
+        ("run_generation", False),
+        ("run_mla_generation", False),
+        ("prepare_workspace", True),
+        ("run_context", True),
+        ("run_generation", True),
+    ],
+)
+def test_fallback_native_phases_stay_eager_under_compile(
+    monkeypatch: pytest.MonkeyPatch, method_name: str, combined: bool
+) -> None:
+    torch._dynamo.reset()
+    calls = []
+
+    class AttentionOp:
+        def get_attention_workspace_size(self, params: FmhaParams, *args: int) -> int:
+            assert not torch.compiler.is_compiling()
+            calls.append("prepare_workspace")
+            return 16
+
+        def run_context(self, params: FmhaParams) -> None:
+            assert not torch.compiler.is_compiling()
+            calls.append("run_context")
+            params.output.copy_(params.qkv_or_q + 2)
+
+        def run_generation(self, params: FmhaParams) -> None:
+            assert not torch.compiler.is_compiling()
+            calls.append("run_generation")
+            params.output.copy_(params.qkv_or_q + 3)
+
+        def run_mla_generation(self, params: FmhaParams) -> None:
+            assert not torch.compiler.is_compiling()
+            calls.append("run_mla_generation")
+            params.output.copy_(params.qkv_or_q + 4)
+
+    def to_thop_params(self: FallbackFmha, params: FmhaParams) -> FmhaParams:
+        assert not torch.compiler.is_compiling()
+        return params
+
+    monkeypatch.setattr(FallbackFmha, "_to_thop_params", to_thop_params)
+    op = AttentionOp()
+    attn = FakeAttention()
+    attn.attention_op = lambda params: op
+    fallback = FallbackFmha(attn)
+    fmha = fallback
+    if combined:
+        fmha = CombinedFmha(attn)
+        fmha.set_fmha_impls(fallback, fallback)
+    method = getattr(fmha, method_name)
+    workspace = torch.empty(0, dtype=torch.uint8)
+    params = FmhaParams(
+        fwd=AttentionForwardArgs(),
+        output=torch.empty((1, 4)),
+        workspace=workspace,
+        host_context_lengths=torch.tensor([1], dtype=torch.int32),
+        host_past_key_value_lengths=torch.tensor([0], dtype=torch.int32),
+        cyclic_attention_window_size=1,
+        max_attention_window_size=1,
+    )
+    metadata = make_fake_metadata(
+        num_contexts=1, num_ctx_tokens=1, host_total_kv_lens=torch.tensor([1, 0])
+    )
+
+    def invoke(x: torch.Tensor) -> torch.Tensor:
+        params.qkv_or_q = x + 1
+        if method_name == "prepare_workspace":
+            method(params, metadata)
+            return params.qkv_or_q + workspace.numel()
+        method(params)
+        return params.output + 1
+
+    counter = CompileCounter()
+    compiled = torch.compile(invoke, backend=counter, fullgraph=False)
+    expected_method = "run_context" if method_name == "run_mla_context" else method_name
+    offset = {
+        "prepare_workspace": 17,
+        "run_context": 4,
+        "run_generation": 5,
+        "run_mla_generation": 6,
+    }[expected_method]
+    for value in (0.0, 1.0):
+        x = torch.full((1, 4), value)
+        torch.testing.assert_close(compiled(x), x + offset)
+    assert calls == [expected_method] * (
+        4 if combined and method_name == "prepare_workspace" else 2
+    )
+    assert counter.frame_count >= 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native FMHA")
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_fallback_compiled_context_matches_reference(backend: str) -> None:
+    """Exercise workspace sizing and native context execution without an outer custom op."""
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    seq_len, num_heads, head_dim = 64, 4, 128
+    attn = TrtllmAttention(
+        layer_idx=0,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+    )
+    fmha = FallbackFmha(attn)
+    lengths = torch.tensor([seq_len], dtype=torch.int32)
+    metadata = make_fake_metadata(
+        num_contexts=1,
+        num_ctx_tokens=seq_len,
+        max_context_length=seq_len,
+        max_seq_len=seq_len,
+        effective_workspace=torch.empty(0, dtype=torch.uint8, device="cuda"),
+        kv_lens_cuda_runtime=lengths.cuda(),
+        kv_lens_runtime=torch.zeros_like(lengths),
+        prompt_lens_cuda_runtime=lengths.cuda(),
+        prompt_lens_cpu_runtime=lengths,
+        host_total_kv_lens=torch.tensor([seq_len, 0], dtype=torch.int32),
+    )
+
+    def invoke(qkv: torch.Tensor) -> torch.Tensor:
+        output = torch.empty((seq_len, num_heads * head_dim), dtype=qkv.dtype, device=qkv.device)
+        fmha.forward(
+            qkv,
+            None,
+            None,
+            metadata,
+            AttentionForwardArgs(
+                output=output,
+                attention_mask=PredefinedAttentionMask.FULL,
+                attention_window_size=seq_len,
+            ),
+        )
+        return output
+
+    compiled = torch.compile(invoke, backend=backend, fullgraph=False)
+    for _ in range(2):
+        q, k, v = [
+            torch.randn((seq_len, num_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+            for _ in range(3)
+        ]
+        qkv = torch.cat([x.flatten(1) for x in (q, k, v)], dim=-1)
+        reference = (
+            torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(0, 1).float(), k.transpose(0, 1).float(), v.transpose(0, 1).float()
+            )
+            .transpose(0, 1)
+            .reshape(seq_len, -1)
+        )
+        expected = invoke(qkv)
+        actual = compiled(qkv)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(actual.float(), reference, rtol=2e-2, atol=2e-2)

@@ -541,6 +541,8 @@ class FallbackFmha(PhasedFmha):
             raise RuntimeError("FallbackFmha requires workspace.")
         return params.to_thop_params()
 
+    # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.
+    @torch.compiler.disable
     def prepare_workspace(
         self,
         params: FmhaParams,
@@ -590,14 +592,18 @@ class FallbackFmha(PhasedFmha):
         if workspace.numel() < workspace_size:
             workspace.resize_(workspace_size)
 
+    @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
         self.attn.attention_op(params).run_context(self._to_thop_params(params))
 
+    @torch.compiler.disable
     def run_mla_context(self, params: FmhaParams) -> None:
         self.attn.attention_op(params).run_context(self._to_thop_params(params))
 
+    @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
         self.attn.attention_op(params).run_generation(self._to_thop_params(params))
 
+    @torch.compiler.disable
     def run_mla_generation(self, params: FmhaParams) -> None:
         self.attn.attention_op(params).run_mla_generation(self._to_thop_params(params))
