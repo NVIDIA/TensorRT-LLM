@@ -70,9 +70,9 @@ class Fp4MlaFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        # Masks/output formats are in the selection cache key; cache geometry
-        # and sparse compression are model invariants. Live inputs stay in forward.
-        del q, k, v, phase
+        # Input presence/readiness and mask/output formats are in the selection
+        # cache key; cache geometry and sparse compression are model invariants.
+        del q, phase
         if forward_args.output_sf is not None:
             raise NotImplementedError("FP4 MLA does not support quantized attention output.")
         if forward_args.attention_mask != PredefinedAttentionMask.CAUSAL:
@@ -92,18 +92,6 @@ class Fp4MlaFmha(PhasedFmha):
             raise RuntimeError("FP4 MLA requires a SELF-K-only KV cache.")
         if metadata.beam_width != 1:
             raise NotImplementedError("FP4 MLA does not support beam search.")
-        return True
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-    ) -> None:
-        # These inputs/readiness conditions are not part of the FMHA cache
-        # key. Keep checking them even when selection reuses a cached library.
         if forward_args.attention_sinks is not None:
             raise NotImplementedError("FP4 MLA does not support attention sinks.")
         sparse_inputs = forward_args.sparse_runtime_params
@@ -135,7 +123,7 @@ class Fp4MlaFmha(PhasedFmha):
                 raise RuntimeError("FP4 MLA generation expects a fused query input.")
         else:
             raise NotImplementedError("FP4 MLA requires a context-only or generation-only call.")
-        super().forward(q, k, v, metadata, forward_args)
+        return True
 
     def run_mla_context(self, params: FmhaParams) -> None:
         attn = params.attn
@@ -163,10 +151,6 @@ class Fp4MlaFmha(PhasedFmha):
             raise RuntimeError("FP4 MLA context Q/K/V token counts do not match.")
 
         require_fp4_mla_fp8_context_support()
-        if metadata.is_cuda_graph:
-            raise NotImplementedError(
-                "FP4 MLA context does not support CUDA graphs with TRT-LLM FP8 FMHA."
-            )
 
         num_tokens = q.shape[0]
         output = output.view(num_tokens, -1)
@@ -174,7 +158,6 @@ class Fp4MlaFmha(PhasedFmha):
         kv_lora_rank = attn.kv_lora_rank or 0
         qk_rope_head_dim = attn.qk_rope_head_dim or 0
 
-        attn._ensure_rope_table_size(metadata.max_seq_len)
         latent_cache = forward_args.latent_cache[:num_tokens]
 
         def update_fp4_cache() -> None:
@@ -196,17 +179,18 @@ class Fp4MlaFmha(PhasedFmha):
             raise RuntimeError("FP8 MLA context scratch requires a KV cache manager.")
         scratch = getattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, None)
         scratch_head_dim = kv_lora_rank + qk_rope_head_dim
-        if not isinstance(scratch, _Fp8MlaContextScratch) or not scratch.matches(
-            metadata,
-            device=q.device,
-            head_dim=scratch_head_dim,
-        ):
+        if scratch is None:
             scratch = _Fp8MlaContextScratch.create(
                 metadata,
                 device=q.device,
                 head_dim=scratch_head_dim,
             )
             setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
+        else:
+            assert isinstance(scratch, _Fp8MlaContextScratch)
+            assert scratch.matches(metadata, device=q.device, head_dim=scratch_head_dim), (
+                "FP8 MLA context scratch geometry must be shared by all layers of its KV manager."
+            )
 
         fp8_attention = self._fp8_attention
         if fp8_attention is None:
