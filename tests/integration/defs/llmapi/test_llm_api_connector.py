@@ -17,9 +17,11 @@ import math
 import os
 import tempfile
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
@@ -38,6 +40,8 @@ def model_with_connector():
 
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
+        importlib_mock.import_module.return_value.KvConnectorScheduler.supports_attention_dp = False
+        importlib_mock.import_module.return_value.KvConnectorWorker.supports_attention_dp = False
 
         kv_connector_config = KvCacheConnectorConfig(
             connector_module="",
@@ -561,7 +565,7 @@ def test_connector_priorities_default(enforce_single_worker,
         ),
         pytest.param(
             dict(enable_attention_dp=True),
-            "attention data parallelism",
+            "supports_attention_dp=True",
             id="attention_dp",
         ),
     ],
@@ -569,9 +573,8 @@ def test_connector_priorities_default(enforce_single_worker,
 def test_connector_rejects_unsupported_config(enforce_single_worker,
                                               model_with_connector, llm_kwargs,
                                               match):
-    # Configurations the connector cannot handle today must fail loudly at
-    # construction time rather than silently miscompute. This pins the set of
-    # constructor-time exclusions in `_maybe_init_kv_connector_manager`.
+    # Unsupported layouts and connectors without an ADP capability declaration
+    # must fail during construction, before executing a request.
     model_fn, _, _ = model_with_connector
 
     with pytest.raises(NotImplementedError, match=match):
@@ -579,7 +582,10 @@ def test_connector_rejects_unsupported_config(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_e2e_persistent_cache(enforce_single_worker, monkeypatch):
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_connector_e2e_persistent_cache(enforce_single_worker: None,
+                                        monkeypatch: pytest.MonkeyPatch,
+                                        enable_attention_dp: bool) -> None:
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 
     Runs generation twice with separate LLM instances sharing a disk-based
@@ -610,6 +616,8 @@ def test_connector_e2e_persistent_cache(enforce_single_worker, monkeypatch):
             kv_connector_config=kv_connector_config,
             cuda_graph_config=None,
             disable_overlap_scheduler=True,
+            enable_attention_dp=enable_attention_dp,
+            enable_chunked_prefill=False,
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
         )
 
@@ -622,21 +630,80 @@ def test_connector_e2e_persistent_cache(enforce_single_worker, monkeypatch):
             "high-performance computing, and mobile and automotive "
             "applications. Tell me about the company.")
 
-        sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+        sampling_params = SamplingParams(max_tokens=32,
+                                         ignore_eos=True,
+                                         temperature=0)
 
         llm1 = LLM(**llm_kwargs)
         output1 = llm1.generate([prompt], sampling_params)
-        output1[0].outputs[0].text
+        tokens1 = output1[0].outputs[0].token_ids
         del llm1
 
         cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".pt")]
         assert len(cache_files) > 0, "No cache files written by connector"
 
         llm2 = LLM(**llm_kwargs)
-        llm2.generate([prompt], sampling_params)
+        output2 = llm2.generate([prompt], sampling_params)
+        assert output2[0].outputs[0].token_ids == tokens1
         del llm2
     finally:
         os.environ.pop("CONNECTOR_CACHE_FOLDER", None)
 
         import shutil
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+@pytest.mark.gpu2
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_connector_adp_persistent_pool(monkeypatch: pytest.MonkeyPatch,
+                                       tmp_path: Path,
+                                       disable_overlap_scheduler: bool) -> None:
+    """Two ADP owners share persisted KV across executor restarts.
+
+    A single request exercises an idle owner; four equal requests exercise
+    balanced batches; unequal prompt lengths exercise uneven prefill work.
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two GPUs")
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    examples_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../../../../examples/llm-api"))
+    monkeypatch.syspath_prepend(examples_dir)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join([examples_dir,
+                         os.environ.get("PYTHONPATH", "")]))
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    config = KvCacheConnectorConfig(
+        connector_module="llm_kv_cache_connector",
+        connector_scheduler_class="PersistentKvCacheConnectorLeader",
+        connector_worker_class="PersistentKvCacheConnectorWorker",
+    )
+    kwargs = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        kv_connector_config=config,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+    )
+    params = SamplingParams(max_tokens=8, ignore_eos=True, temperature=0)
+    short_prompt = "Explain how a computer stores information. " * 16
+    workloads = [[short_prompt], [short_prompt] * 4,
+                 [short_prompt * 4, short_prompt, short_prompt, short_prompt]]
+    expected = []
+    with LLM(**kwargs) as producer:
+        for prompts in workloads:
+            outputs = producer.generate(prompts, params)
+            expected.append([output.outputs[0].token_ids for output in outputs])
+    assert list(
+        tmp_path.glob("*.pt")), "The first executor must publish cache blocks"
+    with LLM(**kwargs) as consumer:
+        for prompts, token_ids in zip(workloads, expected):
+            outputs = consumer.generate(prompts, params)
+            assert [output.outputs[0].token_ids
+                    for output in outputs] == token_ids
