@@ -833,7 +833,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
 
 
 def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
-    """Conv, SSM and a single-layer side role all come from pool_group_descs."""
+    """Conv, SSM and PLE views all come from pool_group_descs, geometry included."""
     from tensorrt_llm._torch.disaggregation.resource.page import (
         MAMBA_CONV_ROLE,
         MAMBA_SSM_ROLE,
@@ -884,8 +884,7 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
 
     ple = by_role[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
     assert ple.pool_idx == 1
-    # A role with no declared kind takes the Role.ALL fallback.
-    assert ple.mapper_kind == MapperKind.INDEXED
+    assert ple.mapper_kind == MapperKind.REPLICATED
     assert ple.bytes_per_layer == 32
     assert [tuple(int(x) for x in e) for e in ple.buffer_entries] == [(1, 0, 32)]
 

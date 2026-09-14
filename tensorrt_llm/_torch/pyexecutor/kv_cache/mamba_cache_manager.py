@@ -3369,12 +3369,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Convolution state is SECTIONED: its flat per-layer buffer is a
         concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
         that are each TP-sharded independently. SSM state keeps the INDEXED
-        default (sharded by head).
+        default (sharded by head). PLE state is computed from replicated
+        inputs, so every rank holds identical bytes and the transfer copies
+        whole per-layer regions.
         """
         return {
             **super().get_disagg_role_mapper_kinds(),
             MambaRole.CONV_STATE:
             MapperKind.SECTIONED,
+            MambaRole.PLE_CONV_STATE:
+            MapperKind.REPLICATED,
+            MambaRole.PLE_NGRAM_CONTEXT:
+            MapperKind.REPLICATED,
         }
 
     def get_disagg_role_layouts(self) -> Dict[DataRole, RoleLayout]:

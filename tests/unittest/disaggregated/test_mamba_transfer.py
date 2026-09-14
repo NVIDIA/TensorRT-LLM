@@ -37,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
     MixedMambaHybridCacheManager,
@@ -211,6 +212,7 @@ def _create_managers(
     enable_attention_dp=False,
     use_v2=False,
     conv_state_layout="x_b_c",
+    with_ple=False,
 ):
     """Create Mamba hybrid cache managers for all TP ranks (PP=1).
 
@@ -231,6 +233,17 @@ def _create_managers(
             if use_v2
             else {}
         )
+        if with_ple:
+            if not use_v2:
+                raise ValueError("PLE state requires the V2 cache manager")
+            manager_kwargs["qwen4_exp_ple_cache_params"] = Qwen4ExpPLECacheParams(
+                ple_layer_mask=[False, False, True, False, False],
+                num_ple_layers=1,
+                short_conv_channels=12,
+                short_conv_state_len=3,
+                ngram_context_len=2,
+                conv_state_dtype=torch.float32,
+            )
         mgr = manager_cls(
             mamba_d_state=MAMBA_D_STATE,
             mamba_d_conv=MAMBA_D_CONV,
@@ -279,6 +292,11 @@ def _zero_mamba_states(manager):
     for layer_idx in _mamba_layer_ids(manager):
         manager.get_conv_states(layer_idx).zero_()
         manager.get_ssm_states(layer_idx).zero_()
+    if isinstance(manager, MambaHybridCacheManagerV2):
+        for state in manager._ple_conv_states.values():
+            state.zero_()
+        for state in manager._ple_ngram_contexts.values():
+            state.zero_()
 
 
 def test_mamba_receiver_payload_bytes_matched_tp():
@@ -616,6 +634,31 @@ def _read_actual(gen_managers, gen_request_ids) -> Dict:
     return actual
 
 
+def _write_ple_ground_truth_to_ctx(managers, request_ids):
+    """Populate the replicated PLE state and return CPU reference tensors."""
+    expected = {}
+    for req_idx, request_id in enumerate(request_ids):
+        for layer_idx in sorted(managers[0]._ple_conv_states):
+            conv_state = managers[0]._ple_conv_states[layer_idx]
+            ngram_context = managers[0]._ple_ngram_contexts[layer_idx]
+            conv = (
+                torch.arange(conv_state[0].numel(), dtype=conv_state.dtype)
+                .reshape(conv_state[0].shape)
+                .add_(1000 * (req_idx + 1) + layer_idx)
+            )
+            ngram = (
+                torch.arange(ngram_context[0].numel(), dtype=ngram_context.dtype)
+                .reshape(ngram_context[0].shape)
+                .add_(100 * (req_idx + 1) + layer_idx)
+            )
+            expected[(req_idx, layer_idx)] = (conv, ngram)
+            for manager in managers:
+                slot = _mamba_state_slot(manager, request_id)
+                manager._ple_conv_states[layer_idx][slot].copy_(conv)
+                manager._ple_ngram_contexts[layer_idx][slot].copy_(ngram)
+    return expected
+
+
 # ---------------------------------------------------------------------------
 # Main test logic
 # ---------------------------------------------------------------------------
@@ -653,6 +696,7 @@ def run_mamba_transfer_test(
     gen_tp: int,
     use_v2: bool = False,
     conv_state_layout: str = "x_b_c",
+    with_ple: bool = False,
 ):
     """Test mamba transfer: ctx_tp -> gen_tp (PP=1, no DP)."""
     # -- 1. Create managers, zero mamba caches --
@@ -660,11 +704,13 @@ def run_mamba_transfer_test(
         ctx_tp,
         use_v2=use_v2,
         conv_state_layout=conv_state_layout,
+        with_ple=with_ple,
     )
     gen_mgrs = _create_managers(
         gen_tp,
         use_v2=use_v2,
         conv_state_layout=conv_state_layout,
+        with_ple=with_ple,
     )
     for mgr in ctx_mgrs + gen_mgrs:
         _zero_mamba_states(mgr)
@@ -762,6 +808,8 @@ def run_mamba_transfer_test(
         ctx_rids,
         conv_state_layout,
     )
+    expected_ple = _write_ple_ground_truth_to_ctx(ctx_mgrs, ctx_rids) if with_ple else {}
+
     # -- 6. Compute expected BEFORE transfer --
     expected = _compute_expected(
         ground_truth,
@@ -806,6 +854,28 @@ def run_mamba_transfer_test(
                 ),
             )
 
+    # Only the V2 manager owns PLE state.
+    if with_ple:
+        for gen_rank, manager in enumerate(gen_mgrs):
+            for req_idx, request_id in enumerate(gen_rids):
+                slot = _mamba_state_slot(manager, request_id)
+                for layer_idx in sorted(manager._ple_conv_states):
+                    expected_conv, expected_ngram = expected_ple[(req_idx, layer_idx)]
+                    torch.testing.assert_close(
+                        manager._ple_conv_states[layer_idx][slot].cpu(),
+                        expected_conv,
+                        rtol=0,
+                        atol=0,
+                        msg=lambda msg, r=gen_rank: f"PLE conv mismatch on gen rank {r}: {msg}",
+                    )
+                    torch.testing.assert_close(
+                        manager._ple_ngram_contexts[layer_idx][slot].cpu(),
+                        expected_ngram,
+                        rtol=0,
+                        atol=0,
+                        msg=lambda msg, r=gen_rank: f"PLE n-gram mismatch on gen rank {r}: {msg}",
+                    )
+
     # -- 10. Cleanup --
     for mgr in ctx_mgrs + gen_mgrs:
         mgr.shutdown()
@@ -847,3 +917,9 @@ def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout):
         use_v2=True,
         conv_state_layout=conv_state_layout,
     )
+
+
+@pytest.mark.timeout(180)
+def test_v2_mamba_transfer_with_replicated_ple_state():
+    """Transfer PLE state once while standard Mamba state contracts from TP2 to TP1."""
+    run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True)
