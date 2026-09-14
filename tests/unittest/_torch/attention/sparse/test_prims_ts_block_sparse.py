@@ -136,6 +136,9 @@ class _Attention:
         self.position_embedding_type = PositionEmbeddingType.learned_absolute
         self.attention_chunk_size = 0
 
+    def out_head_size(self, is_gen_only: bool) -> int:
+        return self.head_dim
+
 
 def _contiguous_case():
     attention = _Attention()
