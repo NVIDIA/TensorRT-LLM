@@ -4604,6 +4604,38 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
     not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
 )
+def test_mxfp8_fused_fc12_sparse_gather_selection():
+    """The gather variant is chosen from static shapes, scaled by the rank's expert share.
+
+    Qwen3.5-397B geometry: 512 experts, top-k 10. ``padded_routes`` is the
+    static ``permuted_idx_to_expanded_idx`` length the backend hands the op.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    def runner(num_local_experts):
+        return Sm107Mxfp8FusedFc12MoeRunner(512, 10, num_local_experts, 0, 128)
+
+    # EP16 decode: 32 tokens, ~20 local routes spread over ~20 tiles -> sparse.
+    assert runner(32)._use_sparse_gather(num_rows=32, padded_routes=20 * 128)
+    # EP16 mid range, 2048 tokens: ~1280 local routes but heavy per-expert
+    # padding (32 experts x 127 rows) -> still sparse; the old rank-agnostic
+    # rule (tokens * top_k * 2 = 40960) would have kept the static gather.
+    assert runner(32)._use_sparse_gather(num_rows=2048, padded_routes=1280 + 32 * 127)
+    # EP4 prefill, 16384 tokens: routes dominate the padding -> static.
+    assert not runner(128)._use_sparse_gather(
+        num_rows=16384, padded_routes=16384 * 10 // 4 + 128 * 127
+    )
+    # No EP: a single 128-row tile per expert, all full -> static.
+    assert not runner(512)._use_sparse_gather(num_rows=8192, padded_routes=8192 * 10)
+    # The estimate never drops below one route per arriving row (alltoall).
+    assert runner(1)._use_sparse_gather(num_rows=4, padded_routes=128)
+    assert not runner(1)._use_sparse_gather(num_rows=100, padded_routes=128)
+
+
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
+)
 def test_mxfp8_moe_tuning_buckets_cover_decode_shapes():
     """The MXFP8 MoE tuning buckets must not depend on the warmup forward's token count.
 

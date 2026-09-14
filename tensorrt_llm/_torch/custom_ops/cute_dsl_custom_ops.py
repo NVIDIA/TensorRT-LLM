@@ -16348,6 +16348,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 def cta_group(self) -> int:
                     return self.tile_size // 128
 
+                def _use_sparse_gather(self, num_rows: int,
+                                       padded_routes: int) -> bool:
+                    """Pick the dynamic-trip-count FC1 A gather from static shapes.
+
+                    Decode tiles carry a few valid rows per 128-row tile and win
+                    from skipping the wholly padded 16-row groups; full tiles
+                    keep the statically unrolled gather. The DKG rule compares
+                    twice the valid local routes with the padded route count.
+                    The valid count is not known statically, so estimate it as
+                    ``num_rows * top_k`` scaled by this rank's share of the
+                    experts (routes land on local experts in proportion), and
+                    never below ``num_rows`` (with alltoall every arriving row
+                    has at least one local route). Overestimating keeps the
+                    original gather, so the estimate errs that way.
+                    """
+                    local_routes = -(-num_rows * self.top_k *
+                                     self.num_local_experts // self.num_experts)
+                    local_routes = max(num_rows, local_routes)
+                    return local_routes * 2 < padded_routes
+
                 def _default_tactic(self) -> Tuple:
                     return (
                         (self.tile_size, 128, 128),
@@ -16659,13 +16679,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters = get_max_activate_clusters(
                         cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                    # Decode tiles carry a few valid rows per 128-row tile; the
-                    # dynamic-trip-count A gather skips the wholly padded 16-row
-                    # groups there, while full tiles keep the statically unrolled
-                    # gather. Select from static shapes only (num_tokens * top_k
-                    # bounds the valid routes; ``m`` is the padded route count)
-                    # so the choice is fixed per CUDA-graph bucket.
-                    sparse_gather = orig_m * self.top_k * 2 < m
+                    # Static-shape choice (see _use_sparse_gather), so it is
+                    # fixed per CUDA-graph bucket.
+                    sparse_gather = self._use_sparse_gather(orig_m, m)
 
                     cache_key = (self.tile_size, self.top_k, mma_tiler,
                                  mma_inst_shape, cluster_shape_mn, scheduler,
