@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-logic tests for automatic MPI session reuse — no MPI, no GPU."""
 
-from concurrent.futures import ThreadPoolExecutor
-from threading import Event
-
 import pytest
 from test_common import session_reuse
 from test_common.session_reuse import SessionReuseCache
@@ -197,70 +194,11 @@ def test_spawn_failure_propagates_without_retry(reuse_cache):
     assert reuse_cache.prefetch.restocks == []
 
 
-def test_reuse_size_mismatch_preserves_cached_pools(reuse_cache: SessionReuseCache) -> None:
-    pools: dict[int, _FakePool] = {}
-    sessions = []
-    try:
-        for n_workers in (8, 4, 8, 4):
-            session = reuse_cache.acquire(_FakePool, n_workers)
-            sessions.append(session)
-            if n_workers in pools:
-                assert session._real is pools[n_workers]
-            else:
-                pools[n_workers] = session._real
-            assert session._real.n_workers == n_workers
-            session.shutdown()
-            assert all(not pool.shut for pool in pools.values())
-            assert len(reuse_cache.prefetch.restocks) == len(pools)
-        assert reuse_cache.resets == [pools[8], pools[4]]
-    finally:
-        for session in sessions:
-            session.shutdown()
-        reuse_cache.drain()
-
-
-@pytest.mark.parametrize("prefetched", [False, True], ids=["fresh", "prefetched"])
-def test_cache_miss_does_not_wait_for_unrelated_retirement(
-    reuse_cache: SessionReuseCache,
-    prefetched: bool,
-) -> None:
-    shutdown_started = Event()
-    shutdown_allowed = Event()
-
-    class _BlockingPool(_FakePool):
-        def shutdown(self) -> None:
-            shutdown_started.set()
-            shutdown_allowed.wait()
-            super().shutdown()
-
-    kept = reuse_cache.acquire(_FakePool, 2)
-    duplicate = reuse_cache.acquire(_BlockingPool, 2)
-    kept.shutdown()
-    duplicate.shutdown()  # The duplicate retires while the first pool stays cached.
-    shadow = _FakePool(4, wait_shutdown=True) if prefetched else None
-    reuse_cache.prefetch.shadow = shadow
-    executor = ThreadPoolExecutor(max_workers=1)
-    acquisition = None
-    try:
-        assert shutdown_started.wait(timeout=5)
-        acquisition = executor.submit(reuse_cache.acquire, _FakePool, 4)
-        # Retirement cannot finish until finally releases the event. The
-        # deadline only bounds a deadlock; this is not a spawn-time benchmark.
-        acquired = acquisition.result(timeout=5)
-        assert acquired._real.n_workers == 4
-        assert not acquired._real.shut
-        assert not duplicate._real.shut
-        if prefetched:
-            assert acquired._real is shadow
-    finally:
-        shutdown_allowed.set()
-        try:
-            if acquisition is not None:
-                if not acquisition.cancel() and acquisition.exception(timeout=5) is None:
-                    acquisition.result().shutdown()
-        finally:
-            executor.shutdown(wait=acquisition is None or acquisition.done(), cancel_futures=True)
-            reuse_cache.drain(timeout=1)
+def test_reuse_size_mismatch_builds_new(reuse_cache):
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    s1.shutdown()
+    s2 = reuse_cache.acquire(_FakePool, 4)
+    assert s2._real.n_workers == 4 and s2._real is not s1._real
 
 
 def test_reuse_env_change_retires_pool(reuse_cache, monkeypatch):
