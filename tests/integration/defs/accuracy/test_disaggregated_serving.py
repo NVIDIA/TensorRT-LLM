@@ -1126,9 +1126,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_iter_perf_stats": True,
             "max_stats_len": -1,
         }
-        kv_cache_config = {"use_kv_cache_manager_v2": True}
-        ctx_server_config["kv_cache_config"] = kv_cache_config
-        gen_server_config["kv_cache_config"] = kv_cache_config
         cache_transceiver_config = {
             "backend": "NIXL",
             "max_tokens_in_buffer": 4096,
@@ -1262,9 +1259,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
-        kv_cache_config = {"use_kv_cache_manager_v2": True}
-        ctx_server_config["kv_cache_config"] = kv_cache_config
-        gen_server_config["kv_cache_config"] = kv_cache_config
         ctx_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
@@ -2146,8 +2140,6 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
             ctx_cfg["speculative_config"] = spec
             gen_cfg["speculative_config"] = spec
-            ctx_cfg["kv_cache_config"]["use_kv_cache_manager_v2"] = True
-            gen_cfg["kv_cache_config"]["use_kv_cache_manager_v2"] = True
             gen_cfg["enable_iter_perf_stats"] = True
             gen_cfg["max_stats_len"] = -1
         if block_reuse:
