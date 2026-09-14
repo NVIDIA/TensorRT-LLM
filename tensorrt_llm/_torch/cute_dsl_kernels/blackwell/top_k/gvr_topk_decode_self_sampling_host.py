@@ -19,7 +19,7 @@ Three sections:
 
 1. dispatch — the CUDA host dispatch as a pure function
    ``route(b, n, npad, k, num_sms=148, sm_version=100)``;
-2. workspace — one zero-initialised per-device slab (20,973,568 B) via the
+2. workspace — one zero-initialised per-device slab (41,945,088 B) via the
    torch caching allocator, with keep-alive + double-checked locking;
 3. operator entry — ``run(logits, pre_idx, n_valid, indices)`` /
    ``run_ws(..., workspace)`` DPS forms with input hardening and a
@@ -1022,7 +1022,7 @@ Concurrent STREAMS on one device that may both take the multi-CTA SPLIT path
 must pass their own workspace via run_ws().
 
 Size: workspace_bytes() = GVR_WS_BUF_OFF + MAXC*GCAP*sizeof(int2)
-    = 2048 + 160*16384*8 = 20,973,568 B.
+    = 2048 + 160*32768*8 = 41,945,088 B.
 
 Kernel-facing view: the compiled main-family signature takes the workspace
 as a 1-D contiguous int32 tensor (fake tensor dtype Int32, assumed_align=16
@@ -1036,10 +1036,10 @@ the tensor's byte offset.
 # workspace geometry constants -- must match the device kernels
 GVR_MAX_DEV = 64
 _MAXC = 160
-_GCAP = 16384
+_GCAP = 32768
 _GVR_WS_BUF_OFF = 2048
-WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 20,973,568
-assert WS_BYTES == 20_973_568
+WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 41,945,088
+assert WS_BYTES == 41_945_088
 
 _mu = threading.Lock()  # slow-path mutex
 _ws_keep = {}  # device index -> keep-alive int32 view

@@ -1884,6 +1884,31 @@ def test_selfsampling_block_skip_exact(rows, msl_c, k, family, dist):
     assert _varlen_cache_key(rows, npad, k, msl_c, nn, cr) in ss_host._VARLEN_CACHE
 
 
+@pytest.mark.parametrize(
+    "rows,k,period",
+    [(1, 512, 672), (4, 1024, 672), (1, 1024, 960)],
+    ids=["b1_k512_p672", "b4_k1024_p672", "b1_k1024_p960"],
+)
+def test_selfsampling_varlen_split_periodic_rows(rows, k, period):
+    """Long rows that repeat one passage (period commensurate with the
+    self-sample stride: gcd(896, 672) = 224, gcd(1792, 960) = 64) must stay
+    exact through the multi-CTA SPLIT main (R = 64 / 37), whichever line the
+    jittered sample picks."""
+    cr, msl_c = 4, 262144
+    plan = ss_host.route(rows, msl_c, msl_c, k)
+    assert plan["kernel"] == "main" and plan["rt"]["R"] > 1, plan
+    torch.manual_seed(period * 7 + rows)
+    base = torch.randn(rows, period, dtype=torch.float32, device=_DEV)
+    lg = base.repeat(1, (msl_c + period - 1) // period)[:, :msl_c].contiguous()
+    lg += 0.01 * torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr - 4 * 3, dtype=torch.int32, device=_DEV)
+    ref = _reference_varlen_indices(lg, kv, 1, cr, k)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out, ref, "periodic")
+
+
 def test_selfsampling_block_skip_beyond_table_runs_dense():
     """Rows longer than the skip table (262144 compressed positions) fall back
     to the dense scan inside the kernel and stay exact."""
