@@ -306,6 +306,60 @@ def test_decoder_layers_raises_when_only_a_mapping_is_present() -> None:
         _decoder_layers(_Holder(model=_Holder(h={"attn": 1})))
 
 
+def _wrapped_chain(unwraps: int, layers) -> _Holder:
+    """`layers` behind `unwraps` levels of `.model`."""
+    obj = _Holder(layers=layers)
+    for _ in range(unwraps):
+        obj = _Holder(model=obj)
+    return obj
+
+
+@pytest.mark.parametrize("unwraps", [0, 1, 2, 3, 4])
+def test_decoder_layers_searches_the_whole_budget(unwraps: int) -> None:
+    """_MAX_UNWRAP_DEPTH counts unwraps, so the object reached by the last one
+    has to be examined.
+
+    `range(_MAX_UNWRAP_DEPTH)` searched the root and three levels while the name
+    promised four, so a four-deep layout raised instead of resolving.
+    """
+    layers = [_Layer()]
+    assert _decoder_layers(_wrapped_chain(unwraps, layers)) is layers
+
+
+def test_decoder_layers_stops_one_level_past_the_budget() -> None:
+    """The budget is a bound, not a suggestion -- one level further refuses."""
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(_wrapped_chain(5, [_Layer()]))
+
+
+def test_maybe_wrap_model_wraps_layers_behind_a_nested_wrapper() -> None:
+    """Through the public entry point, not the helper.
+
+    _decoder_layers is what the tests above exercise, but what the calibrator
+    actually does is assign onto `forward` for every layer it returns. A
+    regression that left nested `llm` layers unwrapped would pass every test
+    above and measure nothing at run time.
+
+    MARK mode reaches _wrap_layer_forward without touching CUDA.
+    """
+    layers = [_Layer(), _Layer(), _Layer()]
+    model = _Holder(llm=_Holder(model=_Holder(layers=layers)))
+    originals = [l.forward for l in layers]
+
+    calibrator = Calibrator()
+    calibrator.mode = Mode.MARK
+    assert calibrator.maybe_wrap_model(model) is model
+
+    for idx, (layer, original) in enumerate(zip(layers, originals)):
+        assert layer.forward is not original, f"layer {idx} left unwrapped"
+        # `==`, not `is`: attribute access builds a fresh bound method each time,
+        # so the object captured before wrapping is never identical to the one
+        # functools.wraps recorded, however correct the wrapping is.
+        assert layer.forward.__wrapped__ == original
+        # The wrapper has to delegate, not replace.
+        assert layer.forward() is None
+
+
 def test_decoder_layers_rejects_a_decoy_container() -> None:
     """A sized, indexable attribute is not by itself a decoder stack.
 
