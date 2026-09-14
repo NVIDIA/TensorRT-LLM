@@ -51,6 +51,11 @@ l0_cpu:
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
+  # The GPU half of this file runs on l0_h100, but that stage selects with
+  # -m "not cpu_only" (jenkins/L0_Test.groovy), which deselects the CPU half --
+  # including the AST guard that fails when a resource manager stops forwarding
+  # num_seq_slots. This entry is what runs it.
+  - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_utils.py
