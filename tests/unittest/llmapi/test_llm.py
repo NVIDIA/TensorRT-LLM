@@ -1396,7 +1396,17 @@ class _FakeRawRequest:
         return True
 
 
-def test_startup_metrics_by_server_info() -> None:
+@pytest.mark.parametrize("checkpoint_io_policy", [
+    None,
+    {
+        "requested": "auto",
+        "selected": "rank_striped_read_ahead",
+        "activated": True,
+        "effective": "native",
+        "fallback_reason": "reader failed after activation",
+    },
+])
+def test_startup_metrics_by_server_info(checkpoint_io_policy) -> None:
 
     class FakeExecutor:
 
@@ -1407,7 +1417,12 @@ def test_startup_metrics_by_server_info() -> None:
             self.calls += 1  # keep track of # calls to ensure the cache in the server works
             if self.calls == 1:
                 return None
-            return {"model_loader": {"total_model_loading_seconds": 1.5}}
+            return {
+                "model_loader": {
+                    "total_model_loading_seconds": 1.5,
+                    "checkpoint_io_policy": checkpoint_io_policy,
+                }
+            }
 
     executor = FakeExecutor()
     generator = object.__new__(BaseLLM)
@@ -1429,7 +1444,8 @@ def test_startup_metrics_by_server_info() -> None:
         "disaggregated_params": {},
         "startup_metrics": {
             "model_loader": {
-                "total_model_loading_seconds": 1.5
+                "total_model_loading_seconds": 1.5,
+                "checkpoint_io_policy": checkpoint_io_policy,
             }
         },
     }
