@@ -4,6 +4,7 @@ import json
 import math
 import os
 import pickle
+import re
 import statistics
 import sys
 import tempfile
@@ -176,6 +177,89 @@ def test_autotuner_cache_basic():
             torch.randn(m, 64), w)
         check_gemm_tactic_valid(best_tactic, m)
         m //= 2
+
+
+def _capture_autotuner_debug_lines(monkeypatch) -> List[str]:
+    """Collect what the tuner writes through ``_debug_logger`` during a tuning run.
+
+    The lines are the only record of what the tuner considered: the profiling
+    cache keeps just the winner, so a tactic choice can otherwise be explained
+    only by re-running the tuner with tactics removed. Patching the instance
+    attribute rather than the logger keeps other loggers out of the capture --
+    ``_debug_logger`` is bound once in ``__init__`` to ``logger.info`` or
+    ``logger.debug`` depending on TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO, and
+    this test must not depend on which.
+    """
+    lines: List[str] = []
+    monkeypatch.setattr(AutoTuner.get(), "_debug_logger", lines.append)
+    return lines
+
+
+def test_every_candidate_is_logged_and_the_winner_is_the_best_of_them(
+        monkeypatch):
+    """Each profiled (runner, tactic) is logged, and Selected agrees with them.
+
+    Two separate things, both needed to read a tactic choice off a run's log:
+
+    1. Every candidate the tuner measured appears, not just the winner. The
+       three tactics GemmRunner offers must each show up for the op under test.
+    2. The Selected line is in the same family as the candidates -- it used to
+       be the one [Autotuner] line on logger.debug while the rest went through
+       _debug_logger, so promoting the family to INFO gave a log with every
+       candidate and no winner, which is precisely the log a tuning
+       investigation asks for. Capturing through _debug_logger would not see it
+       at all if that regressed.
+
+    The agreement check is what makes this more than a formatting test: each
+    Selected time must equal the minimum candidate time of some profile, so a
+    candidate line that reported a different measurement from the one the
+    comparison used would fail here.
+    """
+    w = torch.randn(64, 128)
+    AutoTuner.get().clear_cache()
+
+    lines = _capture_autotuner_debug_lines(monkeypatch)
+    with autotune():
+        torch.ops.autotuner_test.get_best_gemm_tactic(torch.randn(M, 64), w)
+
+    op = "autotuner_test::get_best_gemm_tactic"
+    # Parsed with a regex, not a split on ", ": the shapes field is a tuple of
+    # tuples and carries commas of its own.
+    candidate_re = re.compile(
+        rf"^\[Autotuner\] Candidate: custom_op={re.escape(op)}, runner=.*?, "
+        r"tactic=(?P<tactic>-?\d+), shapes=(?P<shapes>.*), "
+        r"time=(?P<time>\S+)ms$")
+    selected_re = re.compile(
+        rf"^\[Autotuner\] Selected: custom_op={re.escape(op)}, runner=.*?, "
+        r"tactic=(?P<tactic>-?\d+), time=(?P<time>\S+)ms, fine_grained=")
+
+    candidates = [m for m in map(candidate_re.match, lines) if m]
+    selected = [m for m in map(selected_re.match, lines) if m]
+
+    assert candidates, f"no candidate lines were logged; got {lines}"
+    assert selected, f"no Selected line was logged; got {lines}"
+
+    logged_tactics = {m["tactic"] for m in candidates}
+    for tactic in GemmRunner().get_valid_tactics([], None):
+        assert str(tactic) in logged_tactics, (
+            f"tactic {tactic} was profiled but never logged as a candidate; "
+            f"logged {sorted(logged_tactics)}")
+
+    best_per_profile = {}
+    for m in candidates:
+        shapes, time = m["shapes"], m["time"]
+        best = best_per_profile.get(shapes)
+        if best is None or float(time) < float(best):
+            best_per_profile[shapes] = time
+
+    # String equality, deliberately: both lines format through the same
+    # "{:.3f}", so the winner's time is the best candidate's time character for
+    # character unless the two were computed from different measurements.
+    winners = set(best_per_profile.values())
+    for m in selected:
+        assert m["time"] in winners, (
+            f"Selected reports {m['time']}ms but no profile's best candidate "
+            f"matches; candidate minima were {sorted(winners)}")
 
 
 def test_bucket_mapping():

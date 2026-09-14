@@ -1377,6 +1377,23 @@ class AutoTuner:
                         # or some runtime error occurs during profiling.
                         time_measured = float('inf')
                         has_tuning_failure_occurred = True
+                    # Every candidate's measurement, not just the winner's. Only
+                    # the best (runner, tactic, min_time) reaches the profiling
+                    # cache, so without this the timings that justify a tactic
+                    # choice are computed and thrown away, and "why this tile and
+                    # not that one" can only be answered by re-running the tuner
+                    # with tactics removed. Placed after the handler, not inside
+                    # the try, so a formatting error here cannot be recorded as a
+                    # tactic failure -- and so failed candidates are listed too,
+                    # as inf, next to the ones that ran. Costs nothing off the
+                    # debug path: tuning happens once at warmup, and
+                    # _debug_logger is logger.debug unless
+                    # TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO=1.
+                    self._debug_logger(
+                        f"[Autotuner] Candidate: custom_op={custom_op}, "
+                        f"runner={runner}, tactic={tac}, "
+                        f"shapes={profile.get_opt_shapes()}, "
+                        f"time={time_measured:.3f}ms")
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
@@ -1393,7 +1410,13 @@ class AutoTuner:
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
             )
-            logger.debug(
+            # Through _debug_logger, like every other line in this family and
+            # like the one directly above it. It was the only [Autotuner] line
+            # on logger.debug, so TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO=1
+            # promoted the whole family EXCEPT the one that says which
+            # candidate won -- a run made specifically to record tactic
+            # selection would have shown every candidate and no winner.
+            self._debug_logger(
                 f"[Autotuner] Selected: custom_op={custom_op}, runner={runners[best_runner_id]}, "
                 f"tactic={best_tactic}, time={min_time:.3f}ms, fine_grained=OFF (disabled during tuning)"
             )
