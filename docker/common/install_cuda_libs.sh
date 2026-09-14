@@ -57,7 +57,6 @@ install_ubuntu_requirements() {
 
     apt-get update
 
-    CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
     CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
     NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
