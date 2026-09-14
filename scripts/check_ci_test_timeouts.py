@@ -19,13 +19,47 @@ import re
 import sys
 from pathlib import Path
 
-# CI command-line default; keep in sync with getPytestBaseCommandLine() in jenkins/L0_Test.groovy,
-# which passes --timeout=3600 (seconds) to pytest.
+# Checked against getPytestBaseCommandLine() in jenkins/L0_Test.groovy below.
 _DEFAULT_CI_TIMEOUT_MINUTES = 60
 
 
 def main() -> int:
-    ci_dir = Path(__file__).resolve().parents[1] / "tests/integration/test_lists/test-db"
+    repo_root = Path(__file__).resolve().parents[1]
+    ci_config = repo_root / "jenkins/L0_Test.groovy"
+    # Recognize the current top-level Groovy function and its literal assignment.
+    # Fail if that structure changes instead of silently trusting a stale default.
+    source = re.sub(r"(?ms)^[ \t]*/\*.*?\*/", "", ci_config.read_text(encoding="utf-8"))
+    functions = re.findall(
+        r"(?ms)^def\s+getPytestBaseCommandLine\s*\([^)]*\)\s*\{(.*?)^\}",
+        source,
+    )
+    assignments = (
+        re.findall(r"(?m)^[ \t]*(?:def[ \t]+)?pytestTestTimeout[ \t]*=[ \t]*(.*)$", functions[0])
+        if len(functions) == 1
+        else []
+    )
+    timeout = (
+        re.fullmatch(r"(['\"])([0-9]+)\1[ \t]*;?[ \t]*(?://[^\n]*)?", assignments[0])
+        if len(assignments) == 1
+        else None
+    )
+    if timeout is None:
+        print(
+            f"{ci_config}: Cannot identify a unique literal pytestTestTimeout in "
+            "getPytestBaseCommandLine(); update the CI default timeout check.",
+            file=sys.stderr,
+        )
+        return 1
+    seconds = int(timeout.group(2))
+    if seconds != _DEFAULT_CI_TIMEOUT_MINUTES * 60:
+        print(
+            f"{ci_config}: pytestTestTimeout={seconds} seconds does not match "
+            f"_DEFAULT_CI_TIMEOUT_MINUTES={_DEFAULT_CI_TIMEOUT_MINUTES} minutes.",
+            file=sys.stderr,
+        )
+        return 1
+
+    ci_dir = repo_root / "tests/integration/test_lists/test-db"
     if not ci_dir.is_dir():
         print(f"Missing CI test-list directory: {ci_dir}", file=sys.stderr)
         return 1

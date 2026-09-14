@@ -10,3 +10,6 @@ marker can expose an existing class-level timeout.
 
 Pre-commit enforces this with `python3 scripts/check_ci_test_timeouts.py` from the
 repository root. The check only scans this `test-db/` directory; QA lists are excluded.
+It also verifies that `pytestTestTimeout` in `getPytestBaseCommandLine()` equals
+`_DEFAULT_CI_TIMEOUT_MINUTES * 60` seconds, and fails if the definition cannot be
+uniquely identified as a quoted integer literal. Update both definitions together.
