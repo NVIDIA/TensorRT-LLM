@@ -137,18 +137,6 @@ def _cute_runtime_available() -> bool:
     return True
 
 
-def _resolve_kv_splits(q, kv_splits: int | str | None) -> int:
-    """Resolve the integration-only ``auto`` policy to the public integer API.
-
-    ``auto`` is always 1 here: kv_splits=2/4 was an SM90-only path, and this
-    build ships SM100 kernels only.
-    """
-
-    if kv_splits in (None, "auto"):
-        return 1
-    return int(kv_splits)
-
-
 def _strict() -> bool:
     """Whether SOL_ATTN_STRICT=1 asks us to raise instead of degrading."""
 
@@ -214,7 +202,7 @@ def _run_sol_attn_bthd(
     *,
     tau: float = DEFAULT_TAU,
     thresh_type: str = DEFAULT_THRESH_TYPE,
-    kv_splits: int | str | None = "auto",
+    kv_splits: int = 1,
     sink_start: int | None = None,
     sink_tokens: int = 0,
     dense_fn: Callable | None = None,
@@ -247,10 +235,6 @@ def _run_sol_attn_bthd(
         )
         return dense()
 
-    # Resolved outside the try: a bad kv_splits is a configuration error and
-    # must surface, not silently become a dense run.
-    resolved_kv_splits = _resolve_kv_splits(q0, kv_splits)
-
     try:
         kernel = _load_sol_attn()
         out = kernel(
@@ -259,7 +243,10 @@ def _run_sol_attn_bthd(
             v0,
             tau=float(tau),
             thresh_type=str(thresh_type),
-            kv_splits=resolved_kv_splits,
+            # Only 1 split exists on the shipped sm100/sm103 kernels (2/4 was an
+            # SM90-only path), so this is not a user-facing knob. The kernel
+            # interface rejects anything else before the try below can swallow it.
+            kv_splits=int(kv_splits),
             sink_start=sink_start,
             sink_tokens=int(sink_tokens),
         )

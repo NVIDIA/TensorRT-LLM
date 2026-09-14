@@ -247,16 +247,6 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
         "diag",
         description="Threshold policy forwarded to the kernel (kernel default: 'diag').",
     )
-    kv_splits: Literal["auto", "1"] = PydanticField(
-        "auto",
-        description=(
-            "KV split policy. Only 1 split is valid on the shipped sm100 "
-            "kernels, so 'auto' and '1' are equivalent; the 2/4 path was "
-            "SM90-only and returns with that kernel. Constrained rather than a "
-            "free string because any other value is rejected deep inside the "
-            "kernel, which would silently degrade the whole run to dense."
-        ),
-    )
     disabled_until_timestep: Optional[float] = PydanticField(
         None,
         gt=0.0,
