@@ -75,6 +75,22 @@ _META_NEG_FLT_MAX = -3.4028235e38
 # enc(f) = bits(f) >= 0 ? bits(f) : bits(f) ^ 0x7FFFFFFF (an involution)
 # with red.global.{min,max}.s32; sum uses red.global.add.f32.
 @dsl_user_op
+def _st_global_f32(addr_i64, fval, *, loc=None, ip=None):
+    """st.global.f32 [addr], val (block_max record store by precomputed byte address)."""
+    llvm.inline_asm(
+        None,
+        [addr_i64.ir_value(loc=loc, ip=ip), fval.ir_value(loc=loc, ip=ip)],
+        "st.global.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _red_global_fmin_ordered(addr_i64, fval, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -2190,6 +2206,8 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.emit_block_meta):
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge.
+                    # (block_max-only emission carries one live float and no
+                    # accumulators: it keeps the full weight cache.)
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
@@ -2210,6 +2228,12 @@ class FP4MQALogitsKernel:
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
+                    # block_max row base (bytes) + record pitch: hoisted per q so
+                    # the per-tile store is one address add instead of a full
+                    # tensor-index chain (LDC + 64-bit IMAD/LEA) on the
+                    # epilogue's critical path
+                    bm_base = cutlass.Int64(0)
+                    bm_nrec = cutlass.Int32(mBlockMax.shape[1])
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
                         scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
@@ -2313,6 +2337,9 @@ class FP4MQALogitsKernel:
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
                             ctx_cur = mContextLens[q_idx]
+                            bm_base = mBlockMax.iterator.toint() + cutlass.Int64(
+                                q_idx * next_n
+                            ) * cutlass.Int64(bm_nrec) * cutlass.Int64(4)
 
                     # Process KV block for group 0 (kv_idx + 0)
                     # Unconditional Math: OOB results
@@ -2535,9 +2562,14 @@ class FP4MQALogitsKernel:
                             # tile*4 + warp; the GVR consumer folds the
                             # 4 warp-partials per block.
                             if meta_lane == cutlass.Int32(0):
-                                out_row_m = q_idx * next_n + t
-                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
-                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                                rec_m = (
+                                    cutlass.Int32(t) * bm_nrec
+                                    + meta_kv_tile * cutlass.Int32(4)
+                                    + meta_warp
+                                )
+                                _st_global_f32(
+                                    bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
+                                )
                             if cutlass.const_expr(self.emit_seed_counts):
                                 # Seed-count accumulation: branchless 0/1
                                 # adds on the post-conversion value; the
@@ -2964,6 +2996,8 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.emit_block_meta):
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge.
+                    # (block_max-only emission carries one live float and no
+                    # accumulators: it keeps the full weight cache.)
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
@@ -2984,6 +3018,12 @@ class FP4MQALogitsKernel:
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
+                    # block_max row base (bytes) + record pitch: hoisted per q so
+                    # the per-tile store is one address add instead of a full
+                    # tensor-index chain (LDC + 64-bit IMAD/LEA) on the
+                    # epilogue's critical path
+                    bm_base = cutlass.Int64(0)
+                    bm_nrec = cutlass.Int32(mBlockMax.shape[1])
                     if cutlass.const_expr(self.emit_seed_counts):
                         sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
                         scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
@@ -3086,6 +3126,9 @@ class FP4MQALogitsKernel:
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
                             ctx_cur = mContextLens[q_idx]
+                            bm_base = mBlockMax.iterator.toint() + cutlass.Int64(
+                                q_idx * next_n
+                            ) * cutlass.Int64(bm_nrec) * cutlass.Int64(4)
 
                     # Process KV block for group 1 (kv_idx + 1)
                     # Unconditional Math
@@ -3302,9 +3345,14 @@ class FP4MQALogitsKernel:
                             # tile*4 + warp; the GVR consumer folds the
                             # 4 warp-partials per block.
                             if meta_lane == cutlass.Int32(0):
-                                out_row_m = q_idx * next_n + t
-                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
-                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                                rec_m = (
+                                    cutlass.Int32(t) * bm_nrec
+                                    + meta_kv_tile * cutlass.Int32(4)
+                                    + meta_warp
+                                )
+                                _st_global_f32(
+                                    bm_base + cutlass.Int64(rec_m) * cutlass.Int64(4), r_bmax
+                                )
                             if cutlass.const_expr(self.emit_seed_counts):
                                 # Seed-count accumulation: branchless 0/1
                                 # adds on the post-conversion value; the
