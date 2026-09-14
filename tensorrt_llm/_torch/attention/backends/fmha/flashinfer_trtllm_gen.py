@@ -826,7 +826,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         fp8_context_fmha = self._use_fp8_context_fmha(output, attention_input_type)
 
         workspace_max_tokens = max(num_tokens, metadata.max_context_length)
-        workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
+        workspace_max_gen_tokens = max(num_gen_tokens, max_num_sequences)
         required_workspace_size = _get_workspace_size(
             dtype=q.dtype,
             num_tokens=workspace_max_tokens,
@@ -834,7 +834,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             num_heads=attn.num_heads,
             num_kv_heads=attn.num_kv_heads,
             head_size=attn.head_dim,
-            max_num_requests=metadata.max_num_requests,
+            max_num_requests=max_num_sequences,
             rotary_embedding_dim=attn.rope_dim,
             fp8_context_fmha=fp8_context_fmha,
         )
