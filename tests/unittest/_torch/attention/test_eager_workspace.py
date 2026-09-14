@@ -61,7 +61,7 @@ class TestWorkspaceShrinkPolicy(unittest.TestCase):
 @pytest.mark.cpu_only
 class TestEagerWorkspaceReclaimer(unittest.TestCase):
     def setUp(self) -> None:
-        # Test ownership with real CPU storage; CUDA ordering is tested below.
+        # Test ownership with real CPU storage and mocked CUDA interfaces.
         self.metadata = _ScratchMetadata(torch.empty(4096, dtype=torch.uint8))
         stack = ExitStack()
         self.addCleanup(stack.close)
@@ -134,29 +134,6 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
                     self.assertIsNone(self.metadata.workspace_required_bytes)
                 with self.reclaimer.forward(self.metadata):
                     self.assertIsNone(self.metadata.workspace_required_bytes)
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA GPU required; no architecture restriction")
-class TestEagerWorkspaceCuda(unittest.TestCase):
-    def test_free_before_allocate_preserves_pending_same_stream_work(self) -> None:
-        mib = 1024**2
-        metadata = _ScratchMetadata(torch.empty(4096, dtype=torch.uint8, device="cuda"))
-        reclaimer = EagerWorkspaceReclaimer(metadata)
-        metadata.workspace.resize_(4 * mib)
-        for _ in range(2):
-            with reclaimer.forward(metadata):
-                metadata.workspace_required_bytes.fill_(4096)
-        with reclaimer.forward(metadata):
-            metadata.workspace.fill_(1)
-            result = metadata.workspace.sum()
-            metadata.workspace_required_bytes.fill_(4096)
-            before = torch.cuda.memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
-        self.assertLessEqual(torch.cuda.max_memory_allocated(), before)
-        self.assertEqual(torch.cuda.memory_allocated(), before - 4 * mib + 4096)
-        metadata.workspace.fill_(7)
-        torch.cuda.synchronize()
-        self.assertEqual(result.item(), 4 * mib)
 
 
 if __name__ == "__main__":

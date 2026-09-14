@@ -617,6 +617,5 @@ There is no environment-variable switch.
   with no cross-forward state and complete requirement reporting.
 
 Tests: policy, ownership branches, and engine wiring run on CPU (CUDA calls
-are mocked). Only allocator/async-lifetime and native FMHA tests need a GPU;
-prefer one available lower-cost supported card. Native FMHA requires SM80+
-and matching rebuilt bindings, not specifically H100/H200.
+are mocked). These tests do not validate GPU asynchronous lifetimes or native
+FMHA requirement reporting; those require separate GPU validation.
