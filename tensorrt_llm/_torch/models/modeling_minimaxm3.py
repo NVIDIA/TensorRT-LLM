@@ -398,13 +398,24 @@ class MiniMaxM3MoE(nn.Module):
         ``model.layers.N.block_sparse_moe.experts``.  Falls back to the
         global ``quant_config`` when no per-layer entry exists (e.g. BF16
         or user-supplied global NVFP4 config).
+
+        An exclusion outranks both the per-layer entry and the global config:
+        ``create_weights`` treats an override as authoritative over anything
+        ``__post_init__`` wrote, so this return value stands in for both
+        quantization passes and exclusion is the one that runs second.
+
+        The deepest name is the one tested, because exclusion walks ancestors
+        -- a coarser entry is caught anyway, one naming the experts is not.
         """
+        experts_name = f"model.layers.{layer_idx}.block_sparse_moe.experts"
+        quant_config = model_config.quant_config
+        if quant_config is not None and quant_config.is_module_excluded_from_quantization(
+            experts_name
+        ):
+            return QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         if getattr(model_config, "quant_config_dict", None) is None:
-            return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.block_sparse_moe.experts",
-            model_config.quant_config,
-        )
+            return quant_config
+        return model_config.quant_config_dict.get(experts_name, quant_config)
 
     def __init__(
         self,

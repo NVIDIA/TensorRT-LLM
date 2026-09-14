@@ -128,7 +128,10 @@ def create_moe_backend(
             f"apply_router_weight_on_input not supported in {moe_cls.__name__}."
         )
 
-    if moe_cls == TRTLLMGenFusedMoE:
+    # ``issubclass``, not ``==``: ``TRTLLMGenFusedMoE`` is the family name and
+    # resolution hands over one of the eleven leaves, so an equality check
+    # would miss all of them and fall through to the raise below.
+    if issubclass(moe_cls, TRTLLMGenFusedMoE):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -195,10 +198,8 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation=activation,
         )
-    # ``DeepGemmFusedMoE`` is an alias onto the registered implementation, so
-    # this matches that one class today. ``issubclass`` rather than ``==`` so
-    # that splitting an abstract parent back out, once a second quantization
-    # format needs one, does not require a new branch here.
+    # An alias onto one registered class today; ``issubclass`` so that a
+    # future parent split needs no new branch here.
     elif issubclass(moe_cls, DeepGemmFusedMoE):
         return moe_cls(
             routing_method=routing_method,
@@ -245,8 +246,7 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation=activation,
         )
-    # ``issubclass`` for the same reason as the DeepGEMM branch above;
-    # ``MegaMoEDeepGemm`` is likewise an alias onto the registered class.
+    # ``issubclass`` for the same reason as the DeepGEMM branch above.
     elif issubclass(moe_cls, (MegaMoEDeepGemm, MegaMoECuteDsl)):
         return moe_cls(
             routing_method=routing_method,

@@ -35,13 +35,14 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEProblem,
     canonical_activation,
     canonical_quant,
+    normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from .backend import MoeBackendType, get_backend_class
+from .backend import MoeBackendType, find_backend_class
 from .mapping import (
     _resolve_mapping_layout,
     default_hybrid_parallel_modes,
@@ -111,9 +112,21 @@ def _check_backend_can_implement(
     own explicit checks in :func:`is_candidate_valid` with better messages.
     """
     try:
-        backend_cls = get_backend_class(MoeBackendType(backend_str.upper()))
-    except (ImportError, KeyError, RuntimeError, ValueError) as exc:
+        backend_type = MoeBackendType(backend_str.upper())
+    except ValueError as exc:
         return False, f"unknown MoE backend {backend_str!r}: {exc}"
+    # ``find_backend_class``, not ``get_backend_class``: "TRTLLM publishes no
+    # leaf for this format" is a pruning answer, not an unknown backend name.
+    # The broad ``except`` stays because the lookup lazy-imports backend
+    # modules, so a missing optional wheel should cost the candidates that
+    # need it rather than kill the sweep before it benchmarks anything.
+    try:
+        backend_cls = find_backend_class(backend_type, quant_algo)
+    except (ImportError, KeyError, RuntimeError, ValueError) as exc:
+        return False, f"{backend_str} lookup failed: {type(exc).__name__}: {exc}"
+    if backend_cls is None:
+        quant = normalize_quant(canonical_quant(quant_algo))
+        return False, f"no {backend_str} implementation for quant={quant}"
     problem = MoEProblem(
         quant=canonical_quant(quant_algo),
         dtype_act=dtype_activation,

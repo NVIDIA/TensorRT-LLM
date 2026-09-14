@@ -104,16 +104,40 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
     sys.modules[module_name] = module
 
 
-def get_backend_class(backend_type: MoeBackendType):
-    """Import and return the concrete backend class for ``backend_type`` lazily."""
+def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
+    """As :func:`get_backend_class`, but ``None`` when TRTLLM has no such leaf.
+
+    For a caller enumerating combinations to decide which are worth running,
+    "no leaf publishes this format" is an answer and not a failure. Only the
+    TRTLLM branch can give it, so the rest is delegated rather than restated.
+    """
+    if backend_type == MoeBackendType.TRTLLM:
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import find_trtllm_gen_leaf
+
+        return find_trtllm_gen_leaf(quant_algo)
+    return get_backend_class(backend_type, quant_algo)
+
+
+def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
+    """Import and return the concrete backend class for ``backend_type`` lazily.
+
+    ``quant_algo`` is only consulted for ``TRTLLM``, whose eleven leaves are
+    keyed by quantization format; every other backend is one class. Raises when
+    no leaf publishes the format -- see :func:`find_backend_class` for the
+    lookup that reports absence instead.
+    """
     if backend_type == MoeBackendType.CUTLASS:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 
         return CutlassFusedMoE
     if backend_type == MoeBackendType.TRTLLM:
-        from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+        # Eleven leaves keyed by (provider, quant), so the format has to be
+        # named. ``trtllm_gen_leaf`` returns the native leaf where one exists
+        # and the FlashInfer one for the unquantized format, which is what a
+        # run without the opt-in flag would select.
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import trtllm_gen_leaf
 
-        return TRTLLMGenFusedMoE
+        return trtllm_gen_leaf(quant_algo)
     if backend_type == MoeBackendType.CUTEDSL:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 
