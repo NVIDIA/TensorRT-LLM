@@ -43,6 +43,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
     AttentionLayerConfig,
     BufferConfig,
     DataRole,
@@ -51,7 +52,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ScratchDesc,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, KVCacheDtype
 from .params import (

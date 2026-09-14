@@ -30,6 +30,7 @@ variable-window managers -- supports VSWA here.
 
 import gc
 import os
+import sys
 import unittest
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
@@ -41,19 +42,32 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import CudaStream, KVCacheManager, TokenId
-    from kv_cache_manager_v2._block_radix_tree import ReuseScope
-    from kv_cache_manager_v2._utils import TemporaryCudaStream, init_cuda_once, temporary_sys_path
+    from kv_cache_manager_v2 import CudaStream, KVCacheManager, ReuseScope, TokenId
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import CudaStream, KVCacheManager, TokenId
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import ReuseScope
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        CudaStream,
+        KVCacheManager,
+        ReuseScope,
+        TokenId,
+    )
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+# cuda_test_utils supplies temporary_sys_path, so its own path entry is added and
+# removed by hand here; every later sibling import goes through that helper.
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    from cuda_test_utils import (  # noqa: E402
         TemporaryCudaStream,
         init_cuda_once,
         temporary_sys_path,
     )
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
 
-with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
+with temporary_sys_path(_TEST_DIR):
     from test_kv_cache_manager_v2 import create_config
 
 # The probe lives in the pyexecutor wrapper; the key math is shared so it can be

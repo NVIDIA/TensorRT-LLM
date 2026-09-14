@@ -20,6 +20,7 @@ import itertools
 import math
 import os
 import random
+import sys
 import time
 import unittest
 from contextlib import contextmanager
@@ -27,13 +28,19 @@ from dataclasses import dataclass
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Sequence, cast, get_type_hints
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Sequence, cast
 
 import pytest
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
+    from bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+        MemToMemTask,
+        copy_device_to_device,
+    )
     from kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
+        GPU_LEVEL,
         AttentionLayerConfig,
         BatchDesc,
         BufferConfig,
@@ -50,8 +57,12 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        MemAddress,
+        OutOfPagesError,
+        PageIndexMode,
         PlannedDropHandle,
         ReuseScope,
+        SlidingWindowSize,
         SsmLayerConfig,
         SwaScratchReuseConfig,
         TokenId,
@@ -61,37 +72,18 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         gen_multimodal_cache_key_tokens,
         num_live_managers,
         poison_reason,
+        sequence_to_blockchain_keys,
         take_poison,
     )
-    from kv_cache_manager_v2._block_radix_tree import Hasher
-    from kv_cache_manager_v2._common import (
-        BAD_PAGE_INDEX,
-        GPU_LEVEL,
-        CacheTier,
-        MemAddress,
-        PageIndexMode,
-        SlidingWindowSize,
-    )
-    from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
-    from kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
-    from kv_cache_manager_v2._storage._core import CacheLevelStorage, PoolGroupBase, SlotAllocator
-    from kv_cache_manager_v2._storage_manager import StorageManager
-    from kv_cache_manager_v2._utils import (
-        CachedCudaStream,
-        HalfOpenRange,
-        TemporaryCudaStream,
-        div_up,
-        exact_div,
-        init_cuda_once,
-        intersect,
-        remove_if,
-        round_up,
-        temporary_sys_path,
-        typed_range,
-    )
 else:
+    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+        MemToMemTask,
+        copy_device_to_device,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
+        GPU_LEVEL,
         AttentionLayerConfig,
         BatchDesc,
         BufferConfig,
@@ -108,8 +100,12 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        MemAddress,
+        OutOfPagesError,
+        PageIndexMode,
         PlannedDropHandle,
         ReuseScope,
+        SlidingWindowSize,
         SsmLayerConfig,
         SwaScratchReuseConfig,
         TokenId,
@@ -117,25 +113,24 @@ else:
         _introspection,
         _KVCache,
         gen_multimodal_cache_key_tokens,
+        num_live_managers,
+        poison_reason,
+        sequence_to_blockchain_keys,
+        take_poison,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Hasher
-    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
-        BAD_PAGE_INDEX,
-        GPU_LEVEL,
-        CacheTier,
-        MemAddress,
-        PageIndexMode,
-        SlidingWindowSize,
-    )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
-    from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import (
-        CacheLevelStorage,
-        PoolGroupBase,
-        SlotAllocator,
-    )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageManager
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+
+from copy import deepcopy
+
+from parameterized import parameterized
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+# cuda_test_utils supplies temporary_sys_path, so its own path entry is added and
+# removed by hand here; every later sibling import goes through that helper.
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    from cuda_test_utils import (  # noqa: E402
         CachedCudaStream,
         HalfOpenRange,
         TemporaryCudaStream,
@@ -148,53 +143,24 @@ else:
         temporary_sys_path,
         typed_range,
     )
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
 
-from copy import deepcopy
-
-from parameterized import parameterized
-
-with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
+with temporary_sys_path(_TEST_DIR):
     from fake_engine import FakeEngine, Role, Step
     from kernels import HostGate, enable_kernel_delay
 
 
-KV_CACHE_MANAGER_V2_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
-
-# Gate for white-box tests that reach into the pure-Python implementation's objects
-# (e.g. mutating a CommittedPage field). Prefer `_introspection`, which works on both
-# backends; use this only when the behaviour under test cannot be reached through it.
-requires_python_backend = unittest.skipIf(
-    KV_CACHE_MANAGER_V2_BACKEND == "cpp",
-    "white-box test over pure-Python KVCacheManagerV2 internals",
-)
-
-requires_cpp_backend = unittest.skipUnless(
-    KV_CACHE_MANAGER_V2_BACKEND == "cpp",
-    "cold-page codec end-to-end test requires the C++ backend",
-)
-
-
 def get_cached_cuda_event_type():
-    backend = KV_CACHE_MANAGER_V2_BACKEND
-    if backend == "cpp":
-        try:
-            from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
+    try:
+        from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
 
-            return _introspection.CachedCudaEvent
-        except ImportError:
-            from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
-                _introspection,
-            )
+        return _introspection.CachedCudaEvent
+    except ImportError:
+        from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
 
-            return _introspection.CachedCudaEvent
-
-    if find_spec("kv_cache_manager_v2") is not None:
-        from kv_cache_manager_v2._utils import CachedCudaEvent
-
-        return CachedCudaEvent
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import CachedCudaEvent
-
-    return CachedCudaEvent
+        return _introspection.CachedCudaEvent
 
 
 seed = int.from_bytes(os.urandom(8), "little")
@@ -244,28 +210,6 @@ def assert_no_ref_cycle(func):
         return result
 
     return wrapper
-
-
-class TestTypedSlotIds(unittest.TestCase):
-    def test_num_slots_accessors_return_int(self) -> None:
-        self.assertIs(get_type_hints(SlotAllocator.num_slots.fget)["return"], int)
-        self.assertIs(get_type_hints(SlotAllocator.num_free_slots.fget)["return"], int)
-        self.assertIs(get_type_hints(SlotAllocator.num_occupied_slots.fget)["return"], int)
-        self.assertIs(get_type_hints(PoolGroupBase.num_slots.fget)["return"], int)
-        self.assertIs(get_type_hints(PoolGroupBase.num_free_slots.fget)["return"], int)
-        self.assertIs(get_type_hints(CacheLevelStorage.num_slots)["return"], int)
-        self.assertIs(get_type_hints(CacheLevelStorage.get_num_free_slots)["return"], int)
-        self.assertIs(get_type_hints(StorageManager.num_slots)["return"], int)
-
-        self.assertIs(get_type_hints(SlotAllocator.allocate_multiple)["num_slots"], int)
-        self.assertIs(get_type_hints(PoolGroupBase.allocate_multiple)["num_slots"], int)
-        self.assertIs(get_type_hints(CacheLevelStorage.allocate_multiple)["num_slots"], int)
-        self.assertIs(get_type_hints(StorageManager.new_slots_for_pool_group)["num_slots"], int)
-
-        allocator = SlotAllocator(3)
-        self.assertEqual(allocator.num_slots, 3)
-        self.assertEqual(allocator.num_free_slots, 3)
-        self.assertEqual(allocator.num_occupied_slots, 0)
 
 
 class TestCacheLevelStorage(unittest.TestCase):
@@ -496,8 +440,6 @@ class TestNoBatching(TestKVCacheManagerV2):
         tic = time.perf_counter()
         # prefill
         num_reused = kv_cache.num_committed_tokens
-        # workaround a mypyc bug: exception in property setter is not propagated
-        # kv_cache.capacity = round_up(len(prompt), interval)
         if not kv_cache.resize(round_up(len(prompt), interval)):
             raise OutOfPagesError("Not enough pages in GPU memory")
         capacity = kv_cache.capacity
@@ -514,8 +456,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             if required_capacity > capacity:
                 if not delay_commit:
                     kv_cache.commit(history[kv_cache.history_length :])
-                # workaround a mypyc bug: exception in property setter is not propagated
-                # kv_cache.capacity = round_up(required_capacity, interval)
                 if not kv_cache.resize(round_up(required_capacity, interval)):
                     raise OutOfPagesError("Not enough pages in GPU memory")
                 capacity = kv_cache.capacity
@@ -600,7 +540,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             if hasattr(self, "manager"):
                 self.manager.clear_reusable_blocks()
 
-    @requires_cpp_backend
     def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(self) -> None:
         """Padding merges full attention with one of two differently-sized SWA LCs."""
         unit = 1 << 20
@@ -662,7 +601,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             },
         )
 
-    @requires_cpp_backend
     def test_cold_codec_splits_lifecycles_from_one_hot_pool_group(self) -> None:
         """Padding one SWA lifecycle splits a shared hot pool group in cold storage."""
         unit = 1 << 20
@@ -1077,43 +1015,6 @@ class TestNoBatching(TestKVCacheManagerV2):
         with self.assertRaisesRegex(RuntimeError, "already been dropped"):
             long_handle.drop()
 
-    @requires_python_backend
-    def test_planned_drop_handle_rejects_partial_coverage(self) -> None:
-        # plan_committed_block_drop() rejects via _prune_match, which clamps the match to
-        # the page's recorded token count, so the endpoint no longer matches exactly.
-        # Forcing that state needs a direct write to the page, hence the backend gate.
-        window_size = 8
-        tokens_per_block = 8
-        self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=tokens_per_block)
-        tokens = [self.next_token() for _ in range(3 * tokens_per_block)]
-
-        with TemporaryCudaStream([]) as stream_holder:
-            stream = cast(CudaStream, stream_holder.handle)
-            kv_cache = self.manager.create_kv_cache(None, tokens)
-            self.assertTrue(kv_cache.resume(stream))
-            self.assertTrue(kv_cache.resize(len(tokens)))
-            kv_cache.commit(tokens)
-            kv_cache.stop_committing()
-
-            swa_lc_id = next(
-                lc_id
-                for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
-                if lc.window_size is not None
-            )
-            tree_block = kv_cache._blocks[2].tree_block
-            assert tree_block is not None
-            page = tree_block.get_page(swa_lc_id)
-            assert page is not None
-            self.assertEqual(page.num_tokens_in_block, len(tree_block.tokens))
-
-            page.num_tokens_in_block -= 1
-            try:
-                self.assertIsNone(kv_cache.plan_committed_block_drop())
-            finally:
-                page.num_tokens_in_block += 1
-                kv_cache.close()
-        stream_holder.take_finish_event().synchronize()
-
     def test_int32_ndarray_ingest_matches_list(self) -> None:
         """Zero-copy int32-ndarray ingest must hash identically to the list path.
 
@@ -1126,11 +1027,6 @@ class TestNoBatching(TestKVCacheManagerV2):
         bit, blocks committed via the ndarray path would not be found by a list
         probe (and vice versa), so the equalities below would fail.
         """
-        # The int32-ndarray ingest fast path lives in the C++ binding; the pure-Python
-        # backend consumes plain lists (the dispatcher hands it get_tokens, not a view).
-        if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python":
-            self.skipTest("int32-ndarray ingest is a C++-backend fast path")
-
         import numpy as np
 
         tokens_per_block = 8
@@ -1398,15 +1294,12 @@ class TestLivingKvCacheGuard(TestKVCacheManagerV2):
 
     `clear_reusable_blocks()` detaches the whole radix tree and `shutdown()` frees the
     storage the pages live in. A request that is still open keeps committing into the
-    detached subtree, which silently discards work on the Python backend and segfaults on
-    the C++ one, so both entry points must reject the call instead.
+    detached subtree, which segfaults, so both entry points must reject the call instead.
     """
 
-    # The two backends raise different types: the Python backend raises its own
-    # LogicError, while the C++ backend's TLLM_CHECK_WITH_INFO throws a TllmException
-    # (a std::runtime_error), which nanobind surfaces as RuntimeError. Accept either so
-    # this test is meaningful under both.
-    GuardError = (LogicError, RuntimeError)
+    # TLLM_CHECK_WITH_INFO throws a TllmException (a std::runtime_error), which nanobind
+    # surfaces as RuntimeError.
+    GuardError = RuntimeError
 
     def _seed_reusable_prompt(self) -> list[TokenIdExt]:
         """Commit and close a sequence so the radix tree actually holds reusable blocks.
@@ -1902,7 +1795,7 @@ class TestDisaggregatedServing(unittest.TestCase):
                         assert src_tp_slice.num_slices == 1 and dst_tp_slice.num_slices == 1
                         num_bytes = exact_div(src_page.size, src_tp_slice.num_slices)
                         for i, j in zip(dst_indices, src_indices, strict=True):
-                            task = CopyTask(
+                            task = MemToMemTask(
                                 MemAddress(dst_page.base + dst_page.stride * i),
                                 MemAddress(src_page.base + src_page.stride * j),
                             )
@@ -1925,12 +1818,12 @@ class TestDisaggregatedServing(unittest.TestCase):
                                 + num_bytes * src_tp_slice.slice_rank
                             )
                             for b in range(num_buffers):
-                                task = CopyTask(
+                                task = MemToMemTask(
                                     MemAddress(dst_base + dst_buf_size * b),
                                     MemAddress(src_base + src_buf_size * b),
                                 )
                                 tasks.append(task)
-                    batched_copy(CacheTier.GPU_MEM, CacheTier.GPU_MEM, num_bytes, tasks, stream)
+                    copy_device_to_device(tasks, num_bytes, stream)
 
     @parameterized.expand([(1, 1, 1, 1), (1, 2, 1, 1), (1, 1, 1, 2), (2, 1, 1, 1), (1, 1, 2, 1)])
     def test_disaggregated_serving(
@@ -4920,11 +4813,8 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
 class TestPoolRebalance(TestKVCacheManagerV2):
     """Drive the auto-tuner's pool rebalance end to end.
 
-    TestSlotAllocatorShrink below pokes the Python SlotAllocator directly, so it
-    never reaches the backend selected by TLLM_KV_CACHE_MANAGER_V2_BACKEND. This
-    class goes through the manager instead, covering
-    need_adjustment -> adjust() -> adjust_cache_level -> shrink/expand_pool_group
-    on whichever backend is active (C++ by default).
+    Everything goes through the manager, covering
+    need_adjustment -> adjust() -> adjust_cache_level -> shrink/expand_pool_group.
     """
 
     _TOKENS_PER_BLOCK = 32
@@ -5114,43 +5004,6 @@ class TestPoolRebalance(TestKVCacheManagerV2):
         self._run_sequence(prompt=prompt, expect_reuse=True)
 
 
-class TestSlotAllocatorShrink(unittest.TestCase):
-    def test_shrink_underused_pool(self) -> None:
-        # Regression for NVBug 6225866: shrinking a pool whose new size is
-        # still above the slot-ID high-water mark used to assert because
-        # _num_active_slots - _target_capacity went negative.
-        allocator = SlotAllocator(capacity=184064)
-        slots = [allocator.allocate() for _ in range(2048)]
-        for s in slots:
-            allocator.release(s)
-        self.assertEqual(allocator._num_active_slots, 2048)
-
-        allocator.prepare_for_shrink(122624)
-        self.assertEqual(len(allocator._overflow_slots), 0)
-        self.assertTrue(allocator.finish_shrink())
-        self.assertEqual(allocator._capacity, 122624)
-        self.assertEqual(allocator._num_active_slots, 2048)
-        self.assertFalse(allocator.shrink_in_progress)
-
-    def test_shrink_touched_pool(self) -> None:
-        # Sanity-check that the non-trivial migration path still works:
-        # all ids are issued, half released, shrink to half.
-        allocator = SlotAllocator(capacity=16)
-        slots = [allocator.allocate() for _ in range(16)]
-        for s in slots[8:]:
-            allocator.release(s)
-        self.assertEqual(allocator._num_active_slots, 16)
-
-        allocator.prepare_for_shrink(8)
-        self.assertEqual(len(allocator._overflow_slots), 8)
-        self.assertTrue(allocator.finish_shrink())
-        self.assertEqual(allocator._capacity, 8)
-        self.assertEqual(allocator._num_active_slots, 8)
-
-        for s in slots[:8]:
-            allocator.release(s)
-
-
 class TestCachedTokensByTier(TestKVCacheManagerV2):
     @contextmanager
     def _tiered_prefix(self):
@@ -5281,33 +5134,74 @@ class TestCachedTokensByTier(TestKVCacheManagerV2):
 
 @pytest.mark.cpu_only
 class TestBlockKeyHashing(unittest.TestCase):
-    """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
+    """Verify blockchain keys are bit-identical to the per-token reference (no GPU needed)."""
 
     @staticmethod
-    def _ref_update(seed: bytes, block: "list[int | bytes]") -> bytes:
+    def _chain(block: "list[int | bytes]") -> bytes:
+        """The single block key for one whole-sequence block, and its parent root key."""
+        keys = list(sequence_to_blockchain_keys(max(len(block), 1), ReuseScope(), block))
+        return keys[-1][1]
+
+    @staticmethod
+    def _root() -> bytes:
+        return next(iter(sequence_to_blockchain_keys(1, ReuseScope(), [])))[1]
+
+    @staticmethod
+    def _ref_update(parent_key: bytes, block: "list[int | bytes]") -> bytes:
         h = hashlib.sha256()
-        h.update(seed)
+        h.update(parent_key)
         for item in block:
             # Normal token ids are packed as 4 little-endian bytes (31-bit range),
-            # matching the C++ backend's 4-byte TokenIdExt layout.
+            # matching the 4-byte TokenIdExt layout.
             h.update(item.to_bytes(4, "little") if type(item) is int else item)
         return h.digest()
 
-    def test_update_int_block_matches_reference(self) -> None:
+    def test_block_key_int_block_matches_reference(self) -> None:
         rng = random.Random(123)
-        seed = b"\xaa\xbb\xcc"
-        for n in (0, 1, 7, 32, 33, 257):
+        parent_key = self._root()
+        for n in (1, 7, 32, 33, 257):
             block = [rng.randint(0, (1 << 31) - 1) for _ in range(n)]
             self.assertEqual(
-                Hasher(seed).update(block).digest,
-                self._ref_update(seed, block),
+                self._chain(block),
+                self._ref_update(parent_key, block),
                 f"int block of length {n}",
             )
 
-    def test_update_mixed_multimodal_block(self) -> None:
+    def test_block_keys_chain_across_blocks(self) -> None:
+        """Each block key hashes its parent's key, so block N depends on blocks 0..N-1."""
+        rng = random.Random(4242)
+        tokens_per_block = 32
+        # Three whole blocks plus a short tail: the tail is chunked like any other block,
+        # so it gets a key of its own.
+        tokens = [rng.randint(0, (1 << 31) - 1) for _ in range(3 * tokens_per_block + 5)]
+
+        keys = [
+            key for _, key in sequence_to_blockchain_keys(tokens_per_block, ReuseScope(), tokens)
+        ]
+        self.assertEqual(keys[0], self._root())
+        self.assertEqual(len(keys), 5)
+
+        expected = self._root()
+        for ordinal in range(4):
+            block = tokens[ordinal * tokens_per_block : (ordinal + 1) * tokens_per_block]
+            expected = self._ref_update(expected, block)
+            self.assertEqual(keys[ordinal + 1], expected, f"block {ordinal}")
+
+        # Chaining runs forward only: rewriting the tail must not disturb the keys of the
+        # blocks before it, which is what makes a matched prefix reusable.
+        tail_rewritten = tokens[:-1] + [tokens[-1] ^ 1]
+        rewritten_keys = [
+            key
+            for _, key in sequence_to_blockchain_keys(
+                tokens_per_block, ReuseScope(), tail_rewritten
+            )
+        ]
+        self.assertEqual(rewritten_keys[:-1], keys[:-1])
+        self.assertNotEqual(rewritten_keys[-1], keys[-1])
+
+    def test_block_key_mixed_multimodal_block(self) -> None:
         block = [randbytes(32), 5, 6, randbytes(32)] + list(range(20))
-        seed = b"\x01"
-        self.assertEqual(Hasher(seed).update(block).digest, self._ref_update(seed, block))
+        self.assertEqual(self._chain(block), self._ref_update(self._root(), block))
 
     def test_multimodal_digest_requires_sha256_length(self) -> None:
         for digest_size in (31, 33):
