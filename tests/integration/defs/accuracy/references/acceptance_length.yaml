@@ -96,3 +96,9 @@ disagg::TestNemotron3Super120B::test_auto_dtype:
 TestQwen3_8_27B::test_dflash2:
   ref_al: 5.899181450085933
   min_al: 5.604222377581636
+# GLM-5.3-Flash: the checkpoint's single MTP layer chained for 3 drafts,
+# B200 TP4/EP4, GSM8K under the harness protocol (5-shot, no chat template,
+# 256 output tokens). min_al is 95% of the measured value.
+TestGLM53FlashFP8::test_mtp:
+  ref_al: 3.384
+  min_al: 3.215

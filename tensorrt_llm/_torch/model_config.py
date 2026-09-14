@@ -31,9 +31,10 @@ from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-    load_pretrained_config)
+    is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
+    is_qwen4_exp, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -1600,6 +1601,8 @@ class ModelConfig(Generic[TConfig]):
             return get_qwen3_hybrid_num_attention_layers(cfg)
         if is_kimi_linear(cfg):
             return get_kimi_linear_num_attention_layers(cfg)
+        if is_glm5_next(cfg):
+            return get_glm5_next_num_attention_layers(cfg)
         return cfg.num_hidden_layers
 
     def get_num_mamba_layers(self) -> int:
@@ -1613,6 +1616,11 @@ class ModelConfig(Generic[TConfig]):
         if is_kimi_linear(cfg):
             return cfg.num_hidden_layers - get_kimi_linear_num_attention_layers(
                 cfg)
+        if is_glm5_next(cfg):
+            # From the literal layer_types list: the composite config may not
+            # carry num_hidden_layers at the top level before normalization.
+            _, kda_mask = get_glm5_next_layer_masks(cfg)
+            return sum(kda_mask)
         return 0
 
 

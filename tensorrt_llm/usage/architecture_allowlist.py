@@ -46,6 +46,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "Gemma4UnifiedForConditionalGeneration",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "GptOssForCausalLM",
         "GraniteForCausalLM",
