@@ -18,7 +18,8 @@ from typing import Iterable
 
 import pytest
 
-from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Calibrator, Mode
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import (
+    Calibrator, Mode, NoDecoderLayers, _decoder_layers)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -229,3 +230,100 @@ def test_replay_token_count_rejects_an_empty_window() -> None:
 def test_replay_token_count_requires_replay_mode() -> None:
     with pytest.raises(ValueError, match="only valid in REPLAY mode"):
         Calibrator().get_replay_token_count()
+
+
+class _Layer:
+    """Stands in for a decoder layer: the one thing the calibrator wraps."""
+
+    def forward(self, *args, **kwargs):
+        return None
+
+
+class _Holder:
+    def __init__(self, **attrs) -> None:
+        self.__dict__.update(attrs)
+
+
+def test_decoder_layers_of_a_plain_causal_lm() -> None:
+    layers = [_Layer(), _Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(layers=layers))) is layers
+
+
+@pytest.mark.parametrize("attr", ["layers", "block", "blocks", "h"])
+def test_decoder_layers_under_each_known_name(attr: str) -> None:
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(**{attr: layers}))) is layers
+
+
+def test_decoder_layers_of_a_vl_wrapper_without_an_inner_model() -> None:
+    """A wrapper that holds its stack directly, with no inner `.model`."""
+    layers = [_Layer(), _Layer(), _Layer()]
+    assert _decoder_layers(_Holder(layers=layers)) is layers
+
+
+def test_decoder_layers_descends_into_llm() -> None:
+    """The bug this function exists for.
+
+    Qwen3.5-9B registers as `Qwen3_5VLModel`, which keeps the causal LM under
+    `llm` rather than `model`, so its stack is at `model.llm.model.layers`.
+    Stopping after one unwrap raised NoDecoderLayers here, which is a better
+    failure than the original AttributeError and is still a failure.
+    """
+    layers = [_Layer(), _Layer()]
+    vl = _Holder(llm=_Holder(model=_Holder(layers=layers)))
+    assert _decoder_layers(vl) is layers
+
+
+def test_decoder_layers_descends_into_language_model() -> None:
+    """The HF-style `*ForConditionalGeneration` shape, Gemma-3/4 among them."""
+    layers = [_Layer()]
+    assert _decoder_layers(
+        _Holder(language_model=_Holder(model=_Holder(layers=layers)))) is layers
+
+
+def test_decoder_layers_stops_on_a_self_referential_wrapper() -> None:
+    """A wrapper whose `model` is itself must not spin."""
+    holder = _Holder()
+    holder.model = holder
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(holder)
+
+
+def test_decoder_layers_skips_a_mapping_named_h() -> None:
+    """A dict passes __getitem__ and len(), then raises KeyError on [0].
+
+    `h` is the one name here that a config mapping plausibly collides with, and
+    catching only TypeError let that one attribute abort the search before the
+    real stack was found.
+    """
+    layers = [_Layer()]
+    holder = _Holder(h={"attn": 1}, blocks=layers)
+    assert _decoder_layers(_Holder(model=holder)) is layers
+
+
+def test_decoder_layers_raises_when_only_a_mapping_is_present() -> None:
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(_Holder(model=_Holder(h={"attn": 1})))
+
+
+def test_decoder_layers_rejects_a_decoy_container() -> None:
+    """A sized, indexable attribute is not by itself a decoder stack.
+
+    `_wrap_layer_forward` assigns `forward` onto each item it is handed, so
+    accepting a list of, say, config dicts would wrap nothing, measure nothing,
+    and still produce a number.
+    """
+    with pytest.raises(NoDecoderLayers, match="none of"):
+        _decoder_layers(_Holder(model=_Holder(blocks=[{"hidden": 4096}])))
+
+
+def test_decoder_layers_skips_an_empty_candidate_for_a_real_one() -> None:
+    """An architecture may define the name and leave it empty."""
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(layers=[], blocks=layers))) is layers
+
+
+def test_decoder_layers_names_the_type_it_could_not_resolve() -> None:
+    """The message has to say which class to go read, not just that it failed."""
+    with pytest.raises(NoDecoderLayers, match=r"_Holder keeps its decoder layers"):
+        _decoder_layers(_Holder(model=_Holder(decoder=[_Layer()])))
