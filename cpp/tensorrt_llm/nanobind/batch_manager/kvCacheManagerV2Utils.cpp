@@ -21,6 +21,8 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime_api.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
@@ -33,6 +35,39 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace
+{
+
+void checkTensorReadableByGpu(at::Tensor const& tensor, at::Device const& outputDevice, char const* name)
+{
+    void const* const inputPointer = tensor.const_data_ptr();
+    cudaPointerAttributes attributes{};
+    cudaError_t const status = cudaPointerGetAttributes(&attributes, inputPointer);
+    TLLM_CHECK_WITH_INFO(status == cudaSuccess, "%s pointer %p is not readable by output device %s: %s", name,
+        inputPointer, outputDevice.str().c_str(), cudaGetErrorString(status));
+    TLLM_CHECK_WITH_INFO(attributes.devicePointer != nullptr, "%s pointer %p is not readable by output device %s", name,
+        inputPointer, outputDevice.str().c_str());
+
+    bool originalPointerIsReadable = static_cast<void const*>(attributes.devicePointer) == inputPointer;
+    if (!originalPointerIsReadable && attributes.type == cudaMemoryTypeHost)
+    {
+        int canUseHostPointer = 0;
+        cudaError_t const attributeStatus = cudaDeviceGetAttribute(
+            &canUseHostPointer, cudaDevAttrCanUseHostPointerForRegisteredMem, outputDevice.index());
+        TLLM_CHECK_WITH_INFO(attributeStatus == cudaSuccess,
+            "Could not determine whether output device %s can read %s through its host pointer: %s",
+            outputDevice.str().c_str(), name, cudaGetErrorString(attributeStatus));
+        originalPointerIsReadable = canUseHostPointer != 0;
+    }
+
+    TLLM_CHECK_WITH_INFO(originalPointerIsReadable,
+        "%s pointer %p is readable only through device alias %p on output device %s, but the kernel receives the "
+        "original pointer",
+        name, inputPointer, attributes.devicePointer, outputDevice.str().c_str());
+}
+
+} // namespace
 
 std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optional<at::Tensor> torchPtr)
 {
@@ -133,11 +168,71 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from device to device using CUDA kernels");
 
+    module.def("gather_base_page_rows", &gatherBasePageRows, nb::arg("source"), nb::arg("destination"),
+        nb::arg("copy_index"), nb::arg("num_blocks"), nb::call_guard<nb::gil_scoped_release>(),
+        "Gather canonical V2 base-page rows into a dense host tensor");
+
+    module.def(
+        "copy_base_page_rows_to_device",
+        [](at::Tensor input, at::Tensor output, SizeType32 numRows, uintptr_t stream)
+        {
+            TLLM_CHECK_WITH_INFO(input.device().is_cpu(), "input must be a CPU tensor");
+            TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
+            c10::cuda::CUDAGuard const deviceGuard(output.device());
+            TLLM_CHECK_WITH_INFO(input.scalar_type() == at::kInt && output.scalar_type() == at::kInt,
+                "input and output must contain int32 values");
+            TLLM_CHECK_WITH_INFO(
+                input.is_contiguous() && output.is_contiguous(), "input and output must be contiguous");
+            auto inputTensor = from_torch(input);
+            auto outputTensor = from_torch(output);
+            TLLM_CHECK_WITH_INFO(inputTensor.has_value() && outputTensor.has_value(), "Invalid page-table tensor.");
+            copyBasePageRowsToDevice(
+                *(inputTensor.value()), *(outputTensor.value()), numRows, reinterpret_cast<CUstream>(stream));
+        },
+        nb::arg("input"), nb::arg("output"), nb::arg("num_rows"), nb::arg("stream"),
+        nb::call_guard<nb::gil_scoped_release>(), "Copy dense V2 base-page rows into a 4-D device table");
+
     module.def(
         "copy_batch_block_offsets_to_device",
         [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor indexScales, at::Tensor kvOffset,
             uintptr_t stream)
         {
+            auto const checkInt32Contiguous = [](at::Tensor const& tensor, char const* name)
+            {
+                TLLM_CHECK_WITH_INFO(tensor.scalar_type() == at::kInt, "%s must contain int32 values", name);
+                TLLM_CHECK_WITH_INFO(tensor.is_contiguous(), "%s must be contiguous", name);
+            };
+            checkInt32Contiguous(input, "input");
+            checkInt32Contiguous(output, "output");
+            checkInt32Contiguous(copyIndex, "copy_index");
+            checkInt32Contiguous(indexScales, "index_scales");
+            checkInt32Contiguous(kvOffset, "kv_offset");
+
+            TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
+            c10::cuda::CUDAGuard const deviceGuard(output.device());
+
+            constexpr int64_t kKvFactor = 2;
+            TLLM_CHECK_WITH_INFO(input.dim() == 4 && output.dim() == 4,
+                "input and output must be [numPools, rowCapacity, 2, numBlocksPerSeq]");
+            TLLM_CHECK_WITH_INFO(copyIndex.dim() == 1 && indexScales.dim() == 1 && kvOffset.dim() == 1,
+                "copy_index, index_scales, and kv_offset must be one-dimensional");
+            TLLM_CHECK_WITH_INFO(input.size(0) == output.size(0), "input and output pool counts must match");
+            TLLM_CHECK_WITH_INFO(
+                input.size(2) == kKvFactor && output.size(2) == kKvFactor, "input and output must have K/V factor 2");
+            TLLM_CHECK_WITH_INFO(input.size(3) == output.size(3), "input and output block widths must match");
+            TLLM_CHECK_WITH_INFO(
+                output.size(1) >= copyIndex.size(0), "output must have at least one row per copy_index entry");
+            TLLM_CHECK_WITH_INFO(indexScales.size(0) == input.size(0) && kvOffset.size(0) == input.size(0),
+                "index_scales and kv_offset must have one entry per pool");
+
+            if (copyIndex.numel() > 0)
+            {
+                checkTensorReadableByGpu(input, output.device(), "input");
+                checkTensorReadableByGpu(copyIndex, output.device(), "copy_index");
+                checkTensorReadableByGpu(indexScales, output.device(), "index_scales");
+                checkTensorReadableByGpu(kvOffset, output.device(), "kv_offset");
+            }
+
             auto _input = from_torch(input);
             auto _output = from_torch(output);
             auto _copyIndex = from_torch(copyIndex);
@@ -152,7 +247,8 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
                 *(_indexScales.value()), *(_kvOffset.value()), reinterpret_cast<CUstream>(stream));
         },
         nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("index_scales"), nb::arg("kv_offset"),
-        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(), "Copy batch block indices to device");
+        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Materialize attention block offsets from V2 base-page indices");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
