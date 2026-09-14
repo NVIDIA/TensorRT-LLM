@@ -18,6 +18,7 @@ These tests validate the session state machine using the real
 TxSession/RxSession classes with lightweight stub sender/receiver objects.
 """
 
+from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -31,14 +32,18 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TokenRange,
     WaitResult,
 )
+from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
+    AuxSendTask,
     KVSendTask,
+    MessageType,
     RecvReqInfo,
     RxSession,
     Sender,
     TaskStatus,
     TxSession,
+    _UnplannedWrite,
     project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
@@ -329,6 +334,50 @@ def test_final_swa_slice_keeps_the_receivers_complete_active_window():
     assert np.array_equal(write_meta.dst_ptrs, np.arange(102, 108, dtype=np.int64))
 
 
+def test_swa_floor_above_the_lists_start_still_writes_every_resident_block():
+    """The SWA floor raises both starts; it does not cut either list.
+
+    The geometry is built here rather than taken from ``_create_kv_slice``,
+    which trims a windowed group to ``prompt_blocks - stale_end`` and so never
+    hands this path a list that reaches below the floor. A slice built to a
+    looser window rule does -- ``test_kv_transfer``'s worker harness builds
+    exactly that -- and there a floor read as a cut drops one block from each
+    side, leaving the receiver's oldest block unwritten with nothing raising.
+    """
+    sender = _make_projection_sender()
+    sender._registrar.self_extractor.page_table.layer_groups[0].sliding_window_size = (
+        3 * _PROJECTION_TPB
+    )
+    task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            block_ids_per_layer_groups=[
+                np.arange(4, 8, dtype=np.int64),
+                np.array([], dtype=np.int64),
+            ],
+            token_range=None,
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=_PROJECTION_PROMPT_TOKENS,
+    )
+    req_info = RecvReqInfo(
+        sender_req_id=42,
+        instance_name="decode",
+        instance_rank=0,
+        block_ids_per_layer_groups=[
+            np.arange(104, 108, dtype=np.int64),
+            np.array([], dtype=np.int64),
+        ],
+        unique_rid=42,
+    )
+
+    write_meta = sender._build_kv_write_meta(task, req_info)
+
+    assert np.array_equal(write_meta.src_ptrs, np.arange(4, 8, dtype=np.int64))
+    assert np.array_equal(write_meta.dst_ptrs, np.arange(104, 108, dtype=np.int64))
+
+
 def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
     """A whole-prompt chunk has monolithic addressing."""
     sender = _make_projection_sender()
@@ -525,7 +574,7 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=2)
+    transceiver._mapping = SimpleNamespace(pp_size=2, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -535,12 +584,33 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
     assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 
 
+def test_pipelined_transfer_rejects_context_parallelism_at_startup():
+    """This rank's own cp_size is refused at startup, not on chunk two.
+
+    Only half the pairing is decided here: a peer's cp_size is not known until
+    it asks, so a helix receiver is refused at plan time instead -- see
+    test_a_pipelined_whole_prompt_chunk_under_helix_is_refused.
+    """
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=2)
+    transceiver._kv_cache_manager = MagicMock()
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="NIXL",
+        enable_pipelined_transfer=True,
+    )
+
+    with pytest.raises(ValueError, match=r"context parallelism \(cp_size=2\)"):
+        KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
+
+
 def test_pipelined_transfer_rejects_bounce_buffer():
     """Bounce buffers stage whole requests rather than individual chunks."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -561,7 +631,7 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1)
+    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock(spec=MambaHybridCacheManager)
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -702,14 +772,371 @@ def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
 
 
 def test_pipelined_transfer_rejects_helix_receiver():
+    """A chunk of a pipelined session is refused when the receiver runs helix.
+
+    The slice says so itself: a partial token range used to stand in for that,
+    but a chunk covering the whole prompt is partial by neither test, and the
+    refusal is owed to the session rather than to whichever chunk arrives.
+    """
     sender = _make_projection_sender()
     sender._registrar.get_peer_rank_info.return_value.cp_size = 2
+    task = _make_projection_task()
+    task._slice = replace(task._slice, pipelined=True)
 
     with pytest.raises(
         ValueError,
         match=r"context parallelism \(sender cp_size=1, receiver cp_size=2\)",
     ):
-        sender._build_kv_write_meta(_make_projection_task(), _make_projection_req_info())
+        sender._build_kv_write_meta(task, _make_projection_req_info())
+
+
+def test_a_whole_prompt_range_under_helix_is_the_monolithic_transfer():
+    """Stating the whole prompt as a range must not change what a CP peer gets.
+
+    Every slice now carries a range, so the refusal has to test *partial*, not
+    *present* -- otherwise a monolithic transfer that says so is refused where
+    the same transfer saying nothing goes through. Both shapes here take the
+    helix path and must produce the same plan.
+    """
+    src_per_group = [np.arange(8, dtype=np.int64), np.array([10, 11, 12], dtype=np.int64)]
+
+    def plan(token_range):
+        sender = _make_projection_sender()
+        sender._registrar.get_peer_rank_info.return_value.cp_size = 2
+        sender._registrar.get_peer_rank_info.return_value.cp_rank = 0
+        task = KVSendTask(
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=src_per_group,
+                token_range=token_range,
+            ),
+            _make_params(),
+            slice_id=0,
+            prompt_len=_PROJECTION_PROMPT_TOKENS,
+        )
+        return sender._build_kv_write_meta(task, _make_projection_req_info())
+
+    stated = plan(_projection_token_range(0, 8))
+    unstated = plan(None)
+    # cp_rank 0 of 2 owns global blocks [0::2] of each group, and group 1's longer
+    # destination is head-trimmed to that count. Without this, two empty plans
+    # would compare equal below and the test would pin nothing.
+    assert np.array_equal(stated.src_ptrs, np.array([0, 2, 4, 6, 10, 12], dtype=np.int64))
+    assert np.array_equal(stated.dst_ptrs, np.array([104, 105, 106, 107, 201, 202], dtype=np.int64))
+    assert np.array_equal(stated.src_ptrs, unstated.src_ptrs)
+    assert np.array_equal(stated.dst_ptrs, unstated.dst_ptrs)
+
+
+def test_a_pipelined_whole_prompt_chunk_under_helix_is_refused():
+    """One chunk must not decide whether a pairing runs or fails.
+
+    The startup blocker sees only the sender's cp_size, so a helix receiver
+    still reaches the planner. Refusing on partial-ness alone would serve a
+    prompt short enough to be a single chunk and refuse the next prompt up.
+    """
+    sender = _make_projection_sender()
+    sender._registrar.get_peer_rank_info.return_value.cp_size = 2
+    sender._registrar.get_peer_rank_info.return_value.cp_rank = 0
+    task = KVSendTask(
+        KVSlice(
+            is_last_slice=True,
+            pipelined=True,
+            block_ids_per_layer_groups=[
+                np.arange(8, dtype=np.int64),
+                np.array([10, 11, 12], dtype=np.int64),
+            ],
+            token_range=_projection_token_range(0, 8),  # the whole prompt
+        ),
+        _make_params(),
+        slice_id=0,
+        prompt_len=_PROJECTION_PROMPT_TOKENS,
+    )
+
+    with pytest.raises(ValueError, match="context parallelism"):
+        sender._build_kv_write_meta(task, _make_projection_req_info())
+
+
+def test_build_prefill_chunk_marks_its_slice_pipelined():
+    """The planner needs the flag on the wire it actually reads.
+
+    A single-chunk prompt states the whole range, so nothing else on the slice
+    separates it from a monolithic transfer, and the refusal above would pin a
+    field nobody sets.
+    """
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    prompt_len = 4 * _PROJECTION_TPB
+    base_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=[np.arange(4, dtype=np.int64)],
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_reqs = {}
+    transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=_PROJECTION_TPB)
+    transceiver._page_table = SimpleNamespace(
+        layer_groups=[SimpleNamespace(sliding_window_size=None)]
+    )
+    transceiver._create_kv_slice = MagicMock(return_value=base_slice)
+    req = SimpleNamespace(
+        py_beam_width=1,
+        py_disaggregated_params=None,
+        request_id=7,
+        prompt_len=prompt_len,
+        prepopulated_prompt_len=0,
+        py_last_context_chunk=(0, prompt_len),
+        context_remaining_length=0,  # the whole prompt arrived in one chunk
+    )
+
+    chunk = transceiver._build_prefill_chunk(req)
+
+    # The premise of the flag: by token_range alone this chunk and a monolithic
+    # slice are the same message.
+    assert chunk.token_range == TokenRange(start=0, end=prompt_len)
+    assert chunk.pipelined is True
+    assert base_slice.pipelined is False
+
+
+def _send_worker(monkeypatch) -> tuple[Sender, MagicMock]:
+    """A Sender reduced to its send worker, plus the dealer it answers on.
+
+    Only ``_process_task_queue`` runs here, so the CUDA binding and the per-thread
+    ZMQ socket it opens on entry are stubbed rather than provided.
+    """
+    import queue
+    import threading
+
+    from tensorrt_llm._torch.disaggregation.native import transfer as tfr
+
+    sender = _make_projection_sender()
+    sender._device_id = 0
+    sender._instance_rank = 0
+    sender._enforce_physical_ownership = False
+    sender._thread_local = threading.local()
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    monkeypatch.setattr(tfr.torch.cuda, "set_device", lambda *_: None)
+    monkeypatch.setattr(tfr, "CUASSERT", lambda *_: None)
+    monkeypatch.setattr(tfr, "cudart", SimpleNamespace(cudaSetDevice=lambda *_: None))
+    dealer = MagicMock()
+    monkeypatch.setattr(sender, "_get_or_connect_thread_dealer", lambda _endpoint: dealer)
+    return sender, dealer
+
+
+def _vanished_endpoint() -> str:
+    """An endpoint whose peer is already gone -- a bound port, then unbound."""
+    router = ZMQMessenger(mode="ROUTER")
+    try:
+        return router.endpoint
+    finally:
+        router.stop()
+
+
+def _worker_that_cannot_plan(monkeypatch) -> tuple[Sender, MagicMock]:
+    """A send worker whose planning always raises, plus the dealer it answers on."""
+    sender, dealer = _send_worker(monkeypatch)
+    for builder in ("_build_kv_write_meta", "_build_aux_write_meta"):
+        monkeypatch.setattr(sender, builder, MagicMock(side_effect=ValueError("no plan")))
+    return sender, dealer
+
+
+def _drain_one(sender: Sender, task, req_info) -> None:
+    """Run the worker loop over one demand and require it to answer in that pass.
+
+    The worker is the thread that drains this queue, so a reply it puts back on
+    the queue is behind the shutdown sentinel it is about to read: routing the
+    answer through the queue is how the answer gets lost.
+    """
+    task_queue = sender._send_task_queues[0]
+    task_queue.put(_UnplannedWrite(task, req_info))
+    task_queue.put(None)  # sentinel: leave the worker loop
+    sender._process_task_queue(0)
+    assert task_queue.empty(), "the worker left a frame no thread will ever send"
+
+
+@pytest.mark.parametrize("kind", ["kv", "aux"])
+def test_a_plan_that_fails_on_the_worker_answers_in_the_waiters_own_frame(monkeypatch, kind):
+    """Planning runs on the send worker now, so the worker owes the reply.
+
+    Nothing downstream answers for it, and a KV waiter and an aux waiter decode
+    different frames -- the wrong one lands in the wrong bookkeeping and still
+    leaves the right waiter to time out.
+    """
+    sender, dealer = _worker_that_cannot_plan(monkeypatch)
+    task = _make_projection_task() if kind == "kv" else AuxSendTask(_make_params(), slot=None)
+
+    _drain_one(sender, task, _make_projection_req_info())
+
+    assert task.status is TaskStatus.ERROR
+    dealer.send.assert_called_once()
+    (frame,), _ = dealer.send.call_args
+    expected = MessageType.KV_AGENT_RESULT if kind == "kv" else MessageType.AUX_AGENT_RESULT
+    assert frame[0] == expected
+
+
+def test_a_refusal_still_leaves_when_shutdown_lands_mid_plan(monkeypatch):
+    """Shutdown puts its sentinel on the queue while this worker is planning.
+
+    Answering by re-queueing puts the refusal behind that sentinel, so the worker
+    breaks out without ever sending it and the waiter learns nothing until its
+    own deadline.
+    """
+    sender, dealer = _send_worker(monkeypatch)
+    task_queue = sender._send_task_queues[0]
+
+    def plan_then_shutdown(*_args):
+        task_queue.put(None)  # Sender.shutdown() reaches the queue mid-plan
+        raise ValueError("no plan")
+
+    monkeypatch.setattr(sender, "_build_kv_write_meta", MagicMock(side_effect=plan_then_shutdown))
+    task = _make_projection_task()
+    task_queue.put(_UnplannedWrite(task, _make_projection_req_info()))
+
+    sender._process_task_queue(0)
+
+    assert task.status is TaskStatus.ERROR
+    dealer.send.assert_called_once()
+    (frame,), _ = dealer.send.call_args
+    assert frame[0] == MessageType.KV_AGENT_RESULT
+    assert task_queue.empty()
+
+
+def test_a_worker_refusal_survives_the_dealer_close_that_follows_it(monkeypatch):
+    """Sending the refusal is not delivering it: the worker closes right after.
+
+    A mocked dealer records the call and can never see ZMQ discard the frame,
+    so this one runs a real DEALER against a real ROUTER and lets the worker's
+    own teardown run. Each round rebuilds the thread-local store, so the
+    refusal is always the first frame that socket ever wrote to that peer --
+    the shape where a close that does not drain loses it every time.
+    """
+    import threading
+
+    sender, _ = _send_worker(monkeypatch)
+    # Undo the harness's mock dealer: what is under test is the socket, not the call.
+    monkeypatch.setattr(
+        sender,
+        "_get_or_connect_thread_dealer",
+        MethodType(Sender._get_or_connect_thread_dealer, sender),
+    )
+    task_queue = sender._send_task_queues[0]
+
+    def plan_then_shutdown(*_args):
+        task_queue.put(None)  # Sender.shutdown() reaches the queue mid-plan
+        raise ValueError("no plan")
+
+    monkeypatch.setattr(sender, "_build_kv_write_meta", MagicMock(side_effect=plan_then_shutdown))
+
+    for round_idx in range(5):
+        router = ZMQMessenger(mode="ROUTER")
+        try:
+            sender._registrar.get_peer_rank_info.return_value.self_endpoint = router.endpoint
+            sender._thread_local = threading.local()
+            task = _make_projection_task()
+            task_queue.put(_UnplannedWrite(task, _make_projection_req_info()))
+
+            sender._process_task_queue(0)  # returns only after closing its dealers
+
+            assert task.status is TaskStatus.ERROR
+            # poll, not receive(): a lost frame must fail the test, not hang it.
+            assert router._socket.poll(2000), f"round {round_idx}: the refusal never left"
+            frames = router.receive()
+            assert frames[1] == MessageType.KV_AGENT_RESULT  # frames[0] is the DEALER identity
+        finally:
+            router.stop()
+
+
+def test_a_worker_whose_peers_are_gone_still_exits_promptly(monkeypatch):
+    """Draining is bounded, and bounded once per thread rather than once per peer.
+
+    Three unreachable peers hold their frames for the whole drain. On one shared
+    deadline that costs the drain once; a per-dealer linger would cost it three
+    times and push Sender.shutdown's join(timeout=5) toward leaking live threads.
+    """
+    import threading
+    import time
+
+    from tensorrt_llm._torch.disaggregation.native import transfer as tfr
+
+    sender, _ = _send_worker(monkeypatch)
+    sender._thread_local = threading.local()
+    dealers = {}
+    for _ in range(3):
+        endpoint = _vanished_endpoint()
+        dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+        # Queued in ZMQ with nobody to take it: exactly what the drain waits on.
+        dealers[endpoint].send([MessageType.KV_AGENT_RESULT, b"unsendable"])
+    sender._thread_local.dealers = dealers
+    sender._send_task_queues[0].put(None)
+
+    try:
+        start = time.monotonic()
+        sender._process_task_queue(0)
+        elapsed = time.monotonic() - start
+    finally:
+        # The worker drains and clears them on its way out; anything left here
+        # would keep a ZMQ context alive into whatever test runs next, and this
+        # is the one test that deliberately points sockets at a dead peer.
+        for leftover in dealers.values():
+            try:
+                leftover.stop()
+            except Exception:
+                pass
+
+    assert elapsed < 2 * tfr._RESULT_DEALER_DRAIN_S
+
+
+@pytest.mark.parametrize("kind", ["kv", "aux"])
+def test_a_session_closed_after_enqueue_still_answers_its_waiter(monkeypatch, kind):
+    """close() unregisters the session between enqueue and dequeue.
+
+    Failing only the local task leaves the demanding rank with no frame at all,
+    so it holds its slot until the transfer deadline retires the request.
+    """
+    sender, dealer = _send_worker(monkeypatch)
+    # The aux payload plumbing is not under test; plan an empty aux write.
+    sender._registrar.should_send_aux.return_value = False
+    task = _make_projection_task() if kind == "kv" else AuxSendTask(_make_params(), slot=None)
+
+    _drain_one(sender, task, _make_projection_req_info(slice_id=0))
+
+    assert task.status is TaskStatus.ERROR
+    # Named, not just any failure: planning must have succeeded and the missing
+    # session must be what stopped it, or this passes for the wrong reason.
+    assert "not found or already GC'd" in str(task._exception)
+    (frame,), _ = dealer.send.call_args
+    expected = MessageType.KV_AGENT_RESULT if kind == "kv" else MessageType.AUX_AGENT_RESULT
+    assert frame[0] == expected
+
+
+def test_an_aux_plan_that_dies_on_the_worker_shows_in_the_session_status(monkeypatch):
+    """The failure the worker records on the task has to reach the session.
+
+    The worker marks the task and nothing else. A status that polled only the KV
+    tasks went on saying KV_TRANSFERRED for a session whose first token was never
+    going to arrive, and a caller that trusts one answer acts on that one.
+    """
+    session = TxSession(
+        request_id=42,
+        params=DisaggregatedParams(
+            disagg_request_id=42,
+            schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+        ),
+        sender=_stub_sender(),
+        prompt_len=8,
+    )
+    session.send(KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[0]]))
+    session.kv_tasks[0].complete()
+    assert session.status is SessionStatus.KV_TRANSFERRED
+
+    sender, _ = _worker_that_cannot_plan(monkeypatch)
+    _drain_one(sender, session.send_aux(), _make_projection_req_info())
+
+    assert session.status is SessionStatus.ERROR
+    assert session.has_failed()
+    assert not session.is_completed()
+    assert session.wait_complete(blocking=False) is WaitResult.FAILED
 
 
 def test_pipelined_transfer_requires_single_beam_for_context_request():

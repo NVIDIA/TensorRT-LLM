@@ -95,6 +95,27 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
+# How long a closing DEALER may keep flushing the results it still holds. One
+# deadline is shared by every dealer a thread closes, so a vanished peer costs
+# this once rather than once per endpoint.
+_RESULT_DEALER_DRAIN_S = 0.5
+
+
+def _stop_result_dealer(dealer: ZMQMessenger, deadline: float, label: str) -> None:
+    """Close a result DEALER, letting frames it only queued still leave.
+
+    A default close discards whatever send() merely handed to ZMQ -- measured
+    as a total loss when the frame is the first this socket wrote to that
+    peer, which is the usual shape of a failure reply. All of this thread's
+    dealers share one `deadline`, so a peer that has vanished costs the
+    shutdown that budget once rather than once per dealer.
+    """
+    linger_ms = max(0, int((deadline - time.monotonic()) * 1000))
+    try:
+        dealer.stop(linger_ms=linger_ms)
+    except Exception as e:
+        logger.warning(f"failed to stop dealer for {label}: {e}")
+
 
 class _TransferNotSubmittedError(RuntimeError):
     """The sender rejected an operation before the backend could access memory."""
@@ -625,11 +646,23 @@ class KVSendTask(SendTaskBase):
         self._beam_width = beam_width
 
 
+@dataclass
+class _UnplannedWrite:
+    """What a send worker dequeues: a task and the demand it has to satisfy.
+
+    The write plan is built on that worker, so what the queue carries is the
+    pair the planner needs rather than a finished ``WriteMeta``.
+    """
+
+    task: SendTaskBase
+    req_info: RecvReqInfo
+
+
 class Sender(SenderBase):
-    # Time-to-live for orphaned RecvReqInfo entries (seconds).
-    # In gen-first ADP broadcast, non-assigned DP ranks accumulate
-    # RecvReqInfo that never gets consumed.  Entries older than this
-    # are evicted during periodic sweeps.
+    # Fallback time-to-live for orphaned RecvReqInfo entries (seconds), used only
+    # when no transfer timeout is configured. The receiver starts its own timeout
+    # clock when it publishes the demand, so the configured value is the deadline
+    # past which no demand can still be live.
     _STALE_REQ_INFO_TTL_S = 120.0
 
     def __init__(
@@ -638,12 +671,14 @@ class Sender(SenderBase):
         agent: BaseTransferAgent,
         bounce=None,
         enforce_physical_ownership: bool = False,
+        stale_req_info_ttl_s: Optional[float] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._init_stale_sweep(stale_req_info_ttl_s)
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -682,6 +717,19 @@ class Sender(SenderBase):
     def endpoint(self):
         return self._messenger.endpoint
 
+    def _init_stale_sweep(self, stale_req_info_ttl_s: Optional[float]) -> None:
+        """How long an unclaimed demand lives, and how often that is checked."""
+        # A floor, not a choice: the receiver's wait is its own number and does not
+        # travel with the demand, so a short local transfer timeout must not shorten
+        # the lease on a demand someone may still be waiting on.
+        self._stale_req_info_ttl_s = max(
+            stale_req_info_ttl_s or 0.0, self._STALE_REQ_INFO_TTL_S
+        )
+        # Scanning on every poll would take the listener's lock on every executor
+        # iteration; a quarter of the TTL bounds the overshoot at 1.25x.
+        self._stale_sweep_interval_s = self._stale_req_info_ttl_s / 4.0
+        self._next_stale_sweep_at = 0.0
+
     def _add_req_info(self, unique_rid: int, instance_rank: int, req_info: RecvReqInfo):
         with self._peer_requests_lock:
             if unique_rid not in self._peer_requests:
@@ -715,16 +763,18 @@ class Sender(SenderBase):
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
 
-        Called opportunistically from the listener thread when a new REQUEST_DATA
-        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
-        entries that are never consumed; this sweep prevents unbounded growth.
+        Called from the context-transfer status poll. Under gen-first ADP broadcast
+        a rank that never sends still accumulates entries no TxSession will claim.
         """
         now = time.monotonic()
+        if now < self._next_stale_sweep_at:
+            return
+        self._next_stale_sweep_at = now + self._stale_sweep_interval_s
         with self._peer_requests_lock:
             stale_rids = [
                 rid
                 for rid, ts in self._peer_requests_timestamps.items()
-                if now - ts > self._STALE_REQ_INFO_TTL_S
+                if now - ts > self._stale_req_info_ttl_s
             ]
         if not stale_rids:
             return
@@ -816,12 +866,17 @@ class Sender(SenderBase):
                 task.status = TaskStatus.TRANSFERRING
             return True
 
-    def _enqueue(self, write_meta: WriteMeta):
-        # Route by (unique_rid, peer_rank) so that:
-        # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
-        # - Different peers can run on different threads (better load balancing)
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
-        self._send_task_queues[thread_idx].put(write_meta)
+    def _enqueue(self, task: "SendTaskBase", info: RecvReqInfo):
+        """Hand a demand to a worker thread; the write plan is built there.
+
+        Routing by (unique_rid, peer_rank) keeps one peer's slices ordered. push_start
+        is stamped here, so queue_latency_ms now covers the planning the worker took
+        over; stamping it after the plan would hide both the wait and the work.
+        """
+        if task._perf_timer is not None:
+            task._perf_timer.record_push_start(info.instance_rank)
+        thread_idx = hash((task._unique_rid, info.instance_rank)) % self._num_threads
+        self._send_task_queues[thread_idx].put(_UnplannedWrite(task, info))
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
         """Get or create a per-thread DEALER socket via threading.local().
@@ -895,6 +950,11 @@ class Sender(SenderBase):
         return True, None
 
     def _process_task_queue(self, thread_idx: int):
+        """One send worker: plan each queued demand, then write it.
+
+        Planning is heavy numpy and used to run on the ZMQ listener, where a
+        large transfer stalled the thread that answers every peer.
+        """
         device_id = self._device_id
         torch.cuda.set_device(device_id)
         CUASSERT(cudart.cudaSetDevice(device_id))
@@ -902,24 +962,43 @@ class Sender(SenderBase):
         task_queue = self._send_task_queues[thread_idx]
         try:
             while True:
-                write_meta = task_queue.get()
-                if write_meta is None:
+                item = task_queue.get()
+                if item is None:
                     break
-                if isinstance(write_meta, tuple):
-                    endpoint, message = write_meta
+                if isinstance(item, tuple):
+                    endpoint, message = item
                     try:
                         self._get_or_connect_thread_dealer(endpoint).send(message)
                     except Exception as e:
                         logger.warning(f"failed to send transfer rejection: {e}")
                     continue
+                task, info = item.task, item.req_info
                 try:
-                    if write_meta.meta_type == WriteMetaType.AUX:
+                    write_meta = (
+                        self._build_kv_write_meta(task, info)
+                        if isinstance(task, KVSendTask)
+                        else self._build_aux_write_meta(task, info)
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"_process_task_queue[{thread_idx}]: failed to plan the write for "
+                        f"unique_rid={task._unique_rid}: {e}"
+                    )
+                    # Planning used to raise where somebody would answer; here
+                    # it reaches nobody, so a silent failure costs the timeout.
+                    if self._enforce_physical_ownership:
+                        task.retire_unsubmitted_physical_operation(info.instance_rank)
+                    task.fail(e)
+                    self._send_failed_task_result_to_receiver(task, info, on_send_worker=True)
+                    continue
+                try:
+                    if isinstance(task, KVSendTask):
+                        self._deliver_kv_to_agent(write_meta)
+                    else:
                         logger.debug(
                             f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
                         )
                         self._deliver_aux_to_agent(write_meta)
-                    else:
-                        self._deliver_kv_to_agent(write_meta)
                 except Exception as e:
                     logger.error(
                         f"_process_task_queue[{thread_idx}]: unhandled exception for "
@@ -932,14 +1011,12 @@ class Sender(SenderBase):
             # happen here rather than in Sender.shutdown().
             dealers = getattr(self._thread_local, "dealers", None)
             if dealers:
+                # The results this thread just sent are only queued in ZMQ; the
+                # sentinel that ends the loop can arrive microseconds later, so
+                # closing without a drain answers a failure to nobody.
+                deadline = time.monotonic() + _RESULT_DEALER_DRAIN_S
                 for endpoint, dealer in dealers.items():
-                    try:
-                        dealer.stop()
-                    except Exception as e:
-                        logger.warning(
-                            f"_process_task_queue[{thread_idx}]: failed to stop dealer "
-                            f"for endpoint {endpoint}: {e}"
-                        )
+                    _stop_result_dealer(dealer, deadline, f"worker {thread_idx} -> {endpoint}")
                 dealers.clear()
 
     @staticmethod
@@ -983,6 +1060,11 @@ class Sender(SenderBase):
 
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
+        """Hand one planned KV write to the transfer agent and report its result.
+
+        The last check that the session is still alive happens here, under its
+        lock, so a cancel cannot free the pages the agent is about to read.
+        """
         assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
@@ -998,6 +1080,18 @@ class Sender(SenderBase):
             if owned:
                 write_meta.task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
             write_meta.task.fail(RuntimeError(msg))
+            # A close between enqueue and dequeue is invisible to the receiver,
+            # which would otherwise hold its slot to the transfer deadline
+            # waiting on a write nobody is going to make.
+            self._get_result_dealer(write_meta.peer_endpoint).send(
+                _make_kv_result_msg(
+                    self._instance_rank,
+                    write_meta.unique_rid,
+                    write_meta.receiver_slice_id,
+                    True,  # is_last_slice — ensures receiver resolves its task future
+                    AgentResult.FAILED,
+                )
+            )
             return
         assert write_meta.slice_id is not None
         task = session.kv_tasks[write_meta.slice_id]
@@ -1009,7 +1103,7 @@ class Sender(SenderBase):
         # worker is about to write into them.
         with session.lock:
             status = session.status
-            if status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            if status.is_failure:
                 should_abort = True
             else:
                 if not owned:
@@ -1170,6 +1264,15 @@ class Sender(SenderBase):
             if owned:
                 write_meta.task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
             write_meta.task.fail(RuntimeError(msg))
+            # Same as the KV path, in the frame an aux waiter decodes: with no
+            # session left there is no other claimant to contradict.
+            self._get_result_dealer(write_meta.peer_endpoint).send(
+                _make_aux_result_msg(
+                    self._instance_rank,
+                    write_meta.unique_rid,
+                    AgentResult.FAILED,
+                )
+            )
             return
         aux_task = session.aux_task
         assert aux_task is not None, f"aux_task is None for session {write_meta.unique_rid}"
@@ -1259,30 +1362,17 @@ class Sender(SenderBase):
     def _align_kv_blocks(
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
-        src_token_start: int,
-        dst_token_start: int,
-        tokens_per_block: int,
+        src_start_block: int,
+        dst_start_block: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Align src/dst block arrays using explicit token-start positions.
+        """Pair the two lists over the global blocks they both cover.
 
-        Both src_token_start and dst_token_start must be block-aligned
-        (multiples of tokens_per_block), which is always true for prefix-cache
-        boundaries in current KV cache managers.
-
-        Returns the (src, dst) sub-arrays that cover the shared token overlap.
-        Returns a pair of empty arrays when there is no overlap (i.e. this
-        context slice is entirely within generation's already-cached prefix).
-
-        This handles four cases without special-casing:
-          1. No prefix cache on either side  → identity (start_token == 0 both)
-          2. Context prefix cache (src starts later than 0)  → trim dst head
-          3. Generation prefix cache (dst starts later than 0)  → trim src head
-          4. Chunked context (each slice has its own token_range)  → correct
-             overlap even when the slice is entirely before dst_token_start
+        Entry ``i`` is global block ``start + i``, so a list beginning later has
+        that many fewer to skip. Empty when the two spans never meet.
         """
-        overlap_start = max(src_token_start, dst_token_start)
-        src_skip = (overlap_start - src_token_start) // tokens_per_block
-        dst_skip = (overlap_start - dst_token_start) // tokens_per_block
+        overlap_start = max(src_start_block, dst_start_block)
+        src_skip = overlap_start - src_start_block
+        dst_skip = overlap_start - dst_start_block
         n_transfer = min(src_block_ids.size - src_skip, dst_block_ids.size - dst_skip)
         if n_transfer <= 0:
             return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
@@ -1307,18 +1397,16 @@ class Sender(SenderBase):
     ) -> np.ndarray:
         """Drop the receiver's extra leading blocks for a windowed layer group.
 
-        A windowed receiver keeps a larger window when only it runs speculative
-        decoding, so its suffix starts earlier and the extra blocks are at the
-        head. Both starts are derived from list length, so trimming the tail
-        instead would shift every block one position early.
-
-        Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
-        _create_kv_slice, so there dst must not exceed src. A smaller dst
-        (generation prefix-cache reuse) is handled via dst_start.
+        A longer destination means either a wider receiver window (trim the
+        head) or a holder that does not cover the range (refuse -- trimming
+        would report success with the window's head uninitialized). Only the
+        first is a bigger window on the receiving side, so that is the check.
         """
         block_diff = dst_block_ids.size - src_block_ids.size
         if block_diff <= 0:
             return dst_block_ids
+        # A windowed receiver and one beam: trim its head so the two tails line
+        # up. Both ends read the window from one model config, so it is equal.
         if peer_window_size is None or beam_width > 1:
             raise ValueError(
                 f"src/dst block count mismatch: {src_block_ids.size} vs "
@@ -1328,12 +1416,22 @@ class Sender(SenderBase):
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
+        """Pair this slice's blocks with the requester's into one write plan.
+
+        Runs on the send worker: it is the numpy-heavy half of a transfer, and
+        the local cp check here is the peer half of the startup one, since a
+        receiver's cp_size is not known until it asks.
+        """
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         self_ri = self._registrar.self_rank_info
         token_range = task._slice.token_range
-        if token_range is not None and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
+        # Refuse the session, not the chunk: a prompt that fits one chunk covers
+        # the whole range and would otherwise be served where the next prompt is
+        # refused. The startup blocker cannot make this call -- it sees only this
+        # rank's cp_size, and a helix receiver announces its own only here.
+        if task._slice.pipelined and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
             raise ValueError(
-                "enable_pipelined_transfer is not supported with context parallelism "
+                "pipelined transfer is not supported with context parallelism "
                 f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
             )
         timer = task._perf_timer
@@ -1443,12 +1541,13 @@ class Sender(SenderBase):
                     stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
                     src_start = max(stale_end * tpb, src_start)
                     dst_start = max(stale_end * tpb, dst_start)
+                # Both starts are block-aligned by construction above, so the
+                # division is exact and the ordinals it yields are the real ones.
                 src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                     src_block_ids,
                     dst_block_ids,
-                    src_token_start=src_start,
-                    dst_token_start=dst_start,
-                    tokens_per_block=tpb,
+                    src_start_block=src_start // tpb,
+                    dst_start_block=dst_start // tpb,
                 )
                 src_region = extractor.extract(src_block_ids, self_lg, self_pi)
                 dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
@@ -1551,6 +1650,7 @@ class Sender(SenderBase):
         task: KVSendTask | AuxSendTask,
         req_info_snapshot: Optional[dict] = None,
     ):
+        """Queue this task once per requester already known to want it."""
         # req_info_snapshot may be pre-fetched under session.lock by the caller to keep the
         # critical section small.  When not provided, we fetch it here (legacy / standalone path).
         if req_info_snapshot is None:
@@ -1580,14 +1680,7 @@ class Sender(SenderBase):
         try:
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(info.instance_rank)
-            trans_meta = (
-                self._build_kv_write_meta(task, info)
-                if isinstance(task, KVSendTask)
-                else self._build_aux_write_meta(task, info)
-            )
-            if task._perf_timer is not None:
-                task._perf_timer.record_push_start(trans_meta.peer_rank)
-            self._enqueue(trans_meta)
+            self._enqueue(task, info)
         except Exception:
             if owned:
                 task.retire_unsubmitted_physical_operation(info.instance_rank)
@@ -1660,6 +1753,11 @@ class Sender(SenderBase):
 
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
+        """Answer a receiver's demand with whatever this session has to send.
+
+        The demand can arrive before the session exists, so it is remembered
+        either way and dispatch_task replays it when the slices show up.
+        """
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
@@ -1753,7 +1851,9 @@ class Sender(SenderBase):
                 f"failed to report auxiliary transfer result for rid={info.unique_rid}: {error}"
             )
 
-    def _send_failed_task_result_to_receiver(self, task: SendTaskBase, info: RecvReqInfo) -> None:
+    def _send_failed_task_result_to_receiver(
+        self, task: SendTaskBase, info: RecvReqInfo, *, on_send_worker: bool = False
+    ) -> None:
         if not task.is_done:
             task.fail(RuntimeError("transfer rejected before backend submission"))
         try:
@@ -1779,12 +1879,17 @@ class Sender(SenderBase):
                     info.unique_rid,
                     AgentResult.FAILED,
                 )
-            self._route_result_messages_to_receiver(
-                info,
-                endpoint,
-                [message],
-                defer_to_worker=True,
-            )
+            if on_send_worker:
+                # The caller is the thread that drains the queue, so a deferred
+                # frame would sit behind shutdown's sentinel and never leave.
+                self._get_result_dealer(endpoint).send(message)
+            else:
+                self._route_result_messages_to_receiver(
+                    info,
+                    endpoint,
+                    [message],
+                    defer_to_worker=True,
+                )
         except Exception as error:
             logger.warning(f"failed to settle rejected transfer {info.unique_rid}: {error}")
 
@@ -1889,11 +1994,9 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
-            try:
-                dealer.stop()
-            except Exception as e:
-                logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
+        deadline = time.monotonic() + _RESULT_DEALER_DRAIN_S
+        for endpoint, dealer in self._dealers.items():
+            _stop_result_dealer(dealer, deadline, f"Sender shutdown -> {endpoint}")
         self._dealers.clear()
         self._shutdown = True
 
@@ -1965,10 +2068,16 @@ class TxSession(TxSessionBase):
 
     @property
     def status(self) -> SessionStatus:
+        """The session's one answer about where the whole transfer stands.
+
+        Every task counts, aux included: an aux task that died in planning left
+        the session answering KV_TRANSFERRED and the KV writes still running.
+        """
         if self._terminal_status is not None:
             return self._terminal_status
         # A chunk may fail before the final task is created.
-        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self.kv_tasks):
+        tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in tasks):
             return SessionStatus.ERROR
         kv_all_transferred = (
             self._has_last_slice
@@ -2088,21 +2197,18 @@ class TxSession(TxSessionBase):
         if self._need_aux:
             logically_completed = status == SessionStatus.FULLY_TRANSFERRED
         else:
-            logically_completed = status in (
-                SessionStatus.KV_TRANSFERRED,
-                SessionStatus.FULLY_TRANSFERRED,
-            )
+            logically_completed = status.is_delivered
         return logically_completed and (
             not getattr(self, "_enforce_physical_ownership", False) or self.resources_drained()
         )
 
     def has_failed(self) -> bool:
-        """Non-blocking check: has the transfer failed or been cancelled?"""
-        if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-            return True
-        if any(task.status == TaskStatus.ERROR for task in self.kv_tasks):
-            return True
-        return self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR
+        """Non-blocking check: has the transfer failed or been cancelled?
+
+        The per-task sweep this used to repeat is now inside ``status``, which
+        is the point: two answers that could disagree were how aux slipped past.
+        """
+        return self.status.is_failure
 
     def resources_drained(self) -> bool:
         if not getattr(self, "_enforce_physical_ownership", False):
@@ -2240,10 +2346,7 @@ class TxSession(TxSessionBase):
                 # terminal, a missing required aux task is an invariant error,
                 # not an asynchronously pending transfer.
                 with self.lock:
-                    if self._terminal_status not in (
-                        SessionStatus.ERROR,
-                        SessionStatus.CANCELLED,
-                    ):
+                    if self._terminal_status is None or not self._terminal_status.is_failure:
                         self._exception = RuntimeError(
                             "required auxiliary transfer was not dispatched"
                         )
@@ -2252,11 +2355,7 @@ class TxSession(TxSessionBase):
             result = wait_for_task(self.aux_task)
             if result != WaitResult.COMPLETED:
                 return result
-        return (
-            self._failed_wait_result()
-            if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
-            else WaitResult.COMPLETED
-        )
+        return self._failed_wait_result() if self.status.is_failure else WaitResult.COMPLETED
 
     def set_exception(self, reason: str = "") -> None:
         msg = f"TxSession {self.disagg_request_id} exception"
@@ -2464,11 +2563,9 @@ class Receiver(ReceiverBase):
             if self._enforce_physical_ownership and self._sessions:
                 raise RuntimeError("Receiver refuses shutdown while transfer ownership is active")
             self._shutdown = True
-        for dealer in self._dealers.values():
-            try:
-                dealer.stop()
-            except Exception as e:
-                logger.warning(f"Failed to stop dealer during Receiver shutdown: {e}")
+        deadline = time.monotonic() + _RESULT_DEALER_DRAIN_S
+        for endpoint, dealer in self._dealers.items():
+            _stop_result_dealer(dealer, deadline, f"Receiver shutdown -> {endpoint}")
         self._dealers.clear()
         self._messenger.stop()
 
@@ -2619,6 +2716,11 @@ class Receiver(ReceiverBase):
         return None
 
     def dispatch_task(self, task: KVRecvTask) -> None:
+        """Publish this receiver's demand to the context peers that will write it.
+
+        Also where the bounce reservation is decided: a fan-in split needs the
+        writer set fixed in advance, which not every topology gives.
+        """
         params = task._params
         logger.debug(
             f"Receiver.dispatch_task: unique_rid={task._unique_rid}, ctx_dp_rank={params.ctx_dp_rank}"
@@ -3457,17 +3559,14 @@ class RxSession(RxSessionBase):
         if self._need_aux:
             logically_completed = status == SessionStatus.FULLY_TRANSFERRED
         else:
-            logically_completed = status in (
-                SessionStatus.KV_TRANSFERRED,
-                SessionStatus.FULLY_TRANSFERRED,
-            )
+            logically_completed = status.is_delivered
         return logically_completed and (
             not self._enforce_physical_ownership or self.resources_drained()
         )
 
     def has_failed(self) -> bool:
         """Non-blocking check: has the transfer failed or been cancelled?"""
-        return self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+        return self.status.is_failure
 
     def resources_drained(self) -> bool:
         if not self._enforce_physical_ownership:
@@ -3564,7 +3663,7 @@ class RxSession(RxSessionBase):
                 status = self.status
                 if status == SessionStatus.FULLY_TRANSFERRED:
                     return WaitResult.COMPLETED
-                elif status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                elif status.is_failure:
                     return self._failed_wait_result()
                 if not blocking:
                     return None  # KV done, aux still in flight; re-poll next cycle
@@ -3800,11 +3899,15 @@ class TransferWorker:
             # The bounce object owns its own NIXL descriptors (deregistered by Transport.close in
             # shutdown), so they are NOT added to _registered_mem — single-source to avoid a
             # double deregister.
+            # An unclaimed demand is swept no sooner than the 120 s floor, whatever
+            # this worker's own transfer timeout is: the waiter's deadline is its
+            # number, not ours.
             self._sender = Sender(
                 self._peer_registrar,
                 self._agent,
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
+                stale_req_info_ttl_s=self._config.tx_overall_timeout_s,
             )
             self._receiver = Receiver(
                 self._peer_registrar,

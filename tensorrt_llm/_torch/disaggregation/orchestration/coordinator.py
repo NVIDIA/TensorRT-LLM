@@ -57,6 +57,7 @@ class DisaggLoopDelegates:
 
     handle_errors_synced: Callable[[], None]
     prepare_context_schedulable: Callable[[List[LlmRequest]], None]
+    refuse_incomplete_gen_handoffs: Callable[[], None]
     admit: Callable[[List[LlmRequest]], Tuple[List[LlmRequest], bool]]
     revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
     receive_gen_init: Callable[[List[LlmRequest]], None]
@@ -121,6 +122,10 @@ class DisaggTransferCoordinator:
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         """Let the transceiver gate generation-first context requests."""
         self._d.prepare_context_schedulable(new_requests)
+
+    def refuse_incomplete_gen_handoffs(self) -> None:
+        """Fail a landed handoff missing its first tokens, while it is still unschedulable."""
+        self._d.refuse_incomplete_gen_handoffs()
 
     @nvtx_range("poll_gen_transfers")
     def poll_gen_transfers(self) -> None:

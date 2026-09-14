@@ -98,6 +98,19 @@ class ServerState:
 
 
 class KvCacheAwareServerState(ServerState):
+    """One server's KV cache as the router sees it, replayed from its events.
+
+    Under attention DP the ranks behind a server report independently, so a
+    block hash is held here until the last rank that stored it removes it, and
+    a rank's ``created`` event -- or any break in its event numbering -- voids
+    everything that rank reported before it.
+    """
+
+    # Batches a rank may be absent from, while others report, before its view is
+    # dropped. Wide enough that an idle rank on a busy server is not evicted for
+    # one quiet stretch; finite because a rank that never comes back otherwise
+    # keeps answering as a hit forever.
+    _SILENT_BATCHES_BEFORE_FORGET = 16
 
     def __init__(
             self,
@@ -112,6 +125,21 @@ class KvCacheAwareServerState(ServerState):
             KV_CACHE_HASH_ALGO_V1: self._kv_cache_block_table
         }
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
+        # Which attention-DP ranks reported each block, so one rank evicting cannot
+        # delete a hash the others still back -- the defect that made a server
+        # under-report its own reuse. Membership stays the set above.
+        # A bitmask, not a set: one set per block costs ~200 bytes, and a few
+        # hundred thousand blocks then costs more than the router itself. Python
+        # ints are unbounded, so a rank beyond 64 needs no separate case.
+        self._kv_cache_block_owners: dict[str, dict[BlockHash, int]] = {}
+        # The id each rank is expected to report next. A cache manager drops
+        # its oldest events once its buffer overflows, so a break in the
+        # sequence is the only sign that a removal we need will never arrive.
+        self._next_event_id: dict[Optional[int], int] = {}
+        # Consecutive batches each known rank has been absent from. A rank that
+        # stops reporting never breaks its own numbering, so silence is the only
+        # signal left that its view has gone stale.
+        self._silent_batches: dict[Optional[int], int] = {}
         self._tokens_per_block = tokens_per_block
         self._poll_task: Optional[asyncio.Task] = None
         self._poll_pending: bool = False
@@ -125,6 +153,34 @@ class KvCacheAwareServerState(ServerState):
         if hash_algo not in self._kv_cache_block_tables:
             self._kv_cache_block_tables[hash_algo] = set()
         return self._kv_cache_block_tables[hash_algo]
+
+    def _block_owners(self, hash_algo: str) -> dict[BlockHash, int]:
+        """The reporting ranks per hash as a bitmask, beside the membership set."""
+        if hash_algo not in self._kv_cache_block_owners:
+            self._kv_cache_block_owners[hash_algo] = {}
+        return self._kv_cache_block_owners[hash_algo]
+
+    def _forget_rank(self, attention_dp_rank: Optional[int]) -> None:
+        """Void what a rank reported: whatever is left of it cannot be trusted.
+
+        A rank-blind server reports as one stream, so its whole view goes; a
+        hash left with no owner leaves the match set with it.
+        """
+        if attention_dp_rank is None:
+            for block_table in self._kv_cache_block_tables.values():
+                block_table.clear()
+            self._kv_cache_block_owners.clear()
+            return
+        bit = 1 << attention_dp_rank
+        for hash_algo, owners in self._kv_cache_block_owners.items():
+            block_table = self._block_table(hash_algo)
+            for block_hash in [h for h, mask in owners.items() if mask & bit]:
+                remaining = owners[block_hash] & ~bit
+                if remaining:
+                    owners[block_hash] = remaining
+                else:
+                    del owners[block_hash]
+                    block_table.discard(block_hash)
 
     def set_hash_algo(self, hash_algo: str):
         self._kv_cache_hash_algo = hash_algo
@@ -141,22 +197,79 @@ class KvCacheAwareServerState(ServerState):
 
     def add_blocks(self,
                    block_hashes: Iterable[BlockHash],
-                   hash_algo: Optional[str] = None):
+                   hash_algo: Optional[str] = None,
+                   attention_dp_rank: Optional[int] = None):
+        """Record that this server holds these blocks, and which rank said so.
+
+        Without a rank the block is credited to the server as a whole, which is
+        how a non-attention-DP server reports.
+        """
         hash_algo = self._resolve_hash_algo(hash_algo)
         self.set_hash_algo(hash_algo)
         block_table = self._block_table(hash_algo)
+        block_hashes = list(block_hashes)
         block_table.update(block_hashes)
+        if attention_dp_rank is not None:
+            bit = 1 << attention_dp_rank
+            owners = self._block_owners(hash_algo)
+            for block_hash in block_hashes:
+                owners[block_hash] = owners.get(block_hash, 0) | bit
 
     def remove_blocks(self,
                       block_hashes: Iterable[BlockHash],
-                      hash_algo: Optional[str] = None):
+                      hash_algo: Optional[str] = None,
+                      attention_dp_rank: Optional[int] = None):
+        """Drop these blocks on one rank's word, or on the server's own.
+
+        A hash leaves the match set only when no rank still backs it; deleting
+        it on the first eviction is what made a server under-report its reuse.
+        """
         hash_algo = self._resolve_hash_algo(hash_algo)
         self.set_hash_algo(hash_algo)
         block_table = self._block_table(hash_algo)
-        block_table.difference_update(block_hashes)
+        block_hashes = list(block_hashes)
+        owners = self._block_owners(hash_algo)
+        if attention_dp_rank is None:
+            block_table.difference_update(block_hashes)
+            for block_hash in block_hashes:
+                owners.pop(block_hash, None)
+            return
+        # One rank evicting says nothing about the others.
+        bit = 1 << attention_dp_rank
+        for block_hash in block_hashes:
+            holders = owners.get(block_hash)
+            if holders is None:
+                block_table.discard(block_hash)
+                continue
+            holders &= ~bit
+            if holders:
+                owners[block_hash] = holders
+            else:
+                del owners[block_hash]
+                block_table.discard(block_hash)
+
+    def _track_event_sequence(self, event_id: Optional[int],
+                              attention_dp_rank: Optional[int]) -> None:
+        """Follow one rank's event numbering and void its view when it breaks.
+
+        A cache manager numbers its events consecutively but discards the
+        oldest of them once its buffer fills, so a skipped id means removals we
+        will never be sent: what that rank still appears to hold cannot be
+        trusted, and a hash left standing answers as a hit nothing serves. A
+        rewind says the same about a restart whose ``created`` event was itself
+        discarded. Events that carry no id are taken at face value.
+        """
+        if not isinstance(event_id, int):
+            return
+        expected = self._next_event_id.get(attention_dp_rank)
+        if expected is not None and event_id != expected:
+            self._forget_rank(attention_dp_rank)
+        self._next_event_id[attention_dp_rank] = event_id + 1
 
     def update_with_events(self, events: Iterable[dict]):
-        # event_raw: {"id": <id>, "data": <event body>}
+        """Fold a batch of KV cache events into this server's view."""
+        reporting_ranks: set[Optional[int]] = set()
+        # event_raw: {"event_id": <id>, "data": <event body>}
         for event_raw in events:
             if "data" in event_raw:
                 event = event_raw["data"]
@@ -165,15 +278,63 @@ class KvCacheAwareServerState(ServerState):
 
             hash_algo = event_raw.get(
                 "hash_algo", event.get("hash_algo", KV_CACHE_HASH_ALGO_DEFAULT))
+            # On the envelope, like hash_algo and unlike everything else here: the
+            # serializer puts it beside "data", not inside. Read from the body it is
+            # always None, so the per-rank index is never written.
+            attention_dp_rank = event_raw.get("attention_dp_rank",
+                                              event.get("attention_dp_rank"))
+            reporting_ranks.add(attention_dp_rank)
+            self._track_event_sequence(event_raw.get("event_id"),
+                                       attention_dp_rank)
             if event["type"] == "created":
                 self.set_hash_algo(hash_algo)
+                # A cache manager emits this once, at construction, and a restart
+                # rewinds its event ids: what that rank reported before is stale,
+                # and left standing it answers as a hit nothing can serve.
+                self._forget_rank(attention_dp_rank)
             if event["type"] == "stored":
                 block_hashes = [
                     block["block_hash"] for block in event["blocks"]
                 ]
-                self.add_blocks(block_hashes, hash_algo=hash_algo)
+                self.add_blocks(
+                    block_hashes,
+                    hash_algo=hash_algo,
+                    attention_dp_rank=attention_dp_rank,
+                )
             elif event["type"] == "removed":
-                self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
+                self.remove_blocks(
+                    event["block_hashes"],
+                    hash_algo=hash_algo,
+                    attention_dp_rank=attention_dp_rank,
+                )
+        self._age_silent_ranks(reporting_ranks)
+
+    def _age_silent_ranks(self, reporting_ranks: set[Optional[int]]) -> None:
+        """Void the view of a rank that stopped reporting while others did not.
+
+        A broken sequence is only visible in the rank's next event, so a rank
+        that goes away entirely leaves its blocks standing and they answer as
+        hits nothing serves. Batches carrying no event at all say nothing about
+        any rank -- the server may simply be idle -- so only a batch some other
+        rank appears in counts against the silent one.
+        """
+        if not reporting_ranks:
+            return
+        for rank in reporting_ranks:
+            self._silent_batches[rank] = 0
+        for rank, missed in list(self._silent_batches.items()):
+            if rank in reporting_ranks:
+                continue
+            missed += 1
+            if missed < self._SILENT_BATCHES_BEFORE_FORGET:
+                self._silent_batches[rank] = missed
+                continue
+            logger.warning(
+                f"attention-DP rank {rank} reported nothing across {missed} "
+                "batches in which other ranks did; dropping its cached view")
+            self._forget_rank(rank)
+            self._next_event_id.pop(rank, None)
+            self._silent_batches.pop(rank, None)
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
