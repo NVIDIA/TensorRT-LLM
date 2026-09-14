@@ -9,13 +9,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from . import (
-    FP4_MLA_KV_GLOBAL_SCALE,
-    FP4_MLA_Q_GLOBAL_SCALE,
-    HP_BLOCK_SIZE,
-    configure_fp4_mla_device_page_table,
-    populate_fp4_mla_append_metadata,
-)
+from .config import FP4_MLA_KV_GLOBAL_SCALE, FP4_MLA_Q_GLOBAL_SCALE, HP_BLOCK_SIZE
+from .metadata import configure_fp4_mla_device_page_table, populate_fp4_mla_append_metadata
 
 if TYPE_CHECKING:
     from ....memory_buffer_utils import Buffers
@@ -143,6 +138,8 @@ class Fp4MlaState:
         self.generation_lengths_capture_recorded = False
 
     def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
+        # All local layers reuse this FP8 view only within the current batch.
+        self.fp8_context_state = None
         self.invalidate_generation_lengths()
         if metadata.kv_cache_manager is None or metadata.request_ids is None:
             raise RuntimeError(

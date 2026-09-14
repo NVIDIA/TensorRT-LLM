@@ -1580,12 +1580,6 @@ class KVCacheManager(BaseResourceManager):
         # get head dim
         mla = hasattr(config,
                       "kv_lora_rank") and config.kv_lora_rank is not None
-        quant_config = model_config.quant_config
-        if (mla and quant_config is not None
-                and quant_config.quant_mode.has_fp4_kv_cache()):
-            raise ValueError(
-                "FP4 MLA cache sizing requires Fp4MlaKVCacheManagerV2; "
-                "KVCacheManager V1 is not supported.")
         if mla:
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
@@ -1602,6 +1596,7 @@ class KVCacheManager(BaseResourceManager):
         # K and V
         mem_per_token = kv_factor * num_attention_layers * head_dim
         # The data type bytes.
+        quant_config = model_config.quant_config
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
             mem_per_token *= 1

@@ -872,10 +872,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return None
 
     def prepare(self) -> None:
-        # The FP8 scratch metadata view is shared by every local FP4 MLA layer
-        # in one eager context forward and must be rebuilt for the next batch.
-        if self.fp4_mla_state is not None:
-            self.fp4_mla_state.fp8_context_state = None
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
@@ -2740,7 +2736,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 "FP4 MLA generation requires fused BF16 RoPE/cache update "
                 "with an FP32 rotary table.")
 
-        metadata.fp4_mla_state.generation_cache_scattered = False
         hp_pool_updated = scatter_fp4_mla_kv_cache(
             metadata,
             latent_cache,
@@ -2757,7 +2752,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not hp_pool_updated:
             raise RuntimeError(
                 "Fused FP4 MLA RoPE/cache scatter did not update the HP pool.")
-        metadata.fp4_mla_state.generation_cache_scattered = True
 
     def can_fuse_fp4_mla_q_quant(
         self,
