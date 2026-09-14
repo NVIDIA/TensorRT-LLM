@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    MAMBA_CONV_ROLE,
+    AttentionLayerGroup,
+    MambaLayerGroup,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -3397,7 +3401,8 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         assert isinstance(mamba_group, MambaLayerGroup)
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        assert mamba_group.conv_section_bytes == [
+        conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
+        assert conv_view.section_bytes == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]
