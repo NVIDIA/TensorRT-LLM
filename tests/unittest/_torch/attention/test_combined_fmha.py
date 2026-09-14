@@ -193,8 +193,10 @@ def test_cross_attention_uses_effective_beam_width() -> None:
     assert events[-1] == ("run", "generation", FmhaPhase.GENERATION, 2, 2, 2)
 
 
-def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
-    attn = FakeAttention(local_layer_idx=3)
+@pytest.mark.parametrize("local_layer_idx", [0, 3, 7])
+def test_combined_fmha_uses_flattened_v2_page_bound(local_layer_idx: int) -> None:
+    attn = FakeAttention(local_layer_idx=local_layer_idx)
+    attn.layer_idx = 42
     combined_fmha = CombinedFmha(attn)
     calls: list[tuple[int, object]] = []
 
@@ -205,11 +207,18 @@ def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
     kv_cache_manager = object.__new__(KVCacheManagerV2)
     kv_cache_manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
 
-    assert (
-        combined_fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=kv_cache_manager))
-        == 23
+    params = combined_fmha._build_params(
+        torch.empty((1, 4)),
+        None,
+        None,
+        make_fake_metadata(kv_cache_manager=kv_cache_manager),
+        AttentionForwardArgs(output=torch.empty((1, 4))),
+        torch.empty(0, dtype=torch.uint8),
     )
-    assert calls == [(3, Role.KEY)]
+    assert params.layer_idx == 42
+    assert params.local_layer_idx == local_layer_idx
+    assert params.total_num_blocks == 23
+    assert calls == [(local_layer_idx, Role.KEY)]
 
 
 def test_flashinfer_fp8_mode_remains_implementation_local() -> None:

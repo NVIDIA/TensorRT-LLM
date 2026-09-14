@@ -1246,7 +1246,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_lora_rank,  # kv_lora_rank
             qk_rope_head_dim,  # qk_rope_head_dim
             block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
+            params.sequence_length,  # seq_lens
             params.max_past_kv_length,  # max_seq_len
             0,  # sparse_mla_top_k
             params.output.view(batch_beam, q_len_per_req, params.num_heads, kv_lora_rank),  # out
