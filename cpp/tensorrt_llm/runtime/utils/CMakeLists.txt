@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -22,7 +22,10 @@ set_property(TARGET pg_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(pg_utils PUBLIC ${PROJECT_SOURCE_DIR}/include
                                            ${TORCH_INCLUDE_DIRS})
 
-target_link_libraries(pg_utils PUBLIC ${TORCH_LIBRARIES})
+# ProcessGroup and intrusive_ptr only need the CPU-side PyTorch libraries.
+# TORCH_LIBRARIES also includes dynamic NVRTC, which can preempt the static
+# NVRTC linked into libtensorrt_llm through this library's dependency chain.
+target_link_libraries(pg_utils PUBLIC torch_cpu c10)
 
 # Find torch_python
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
