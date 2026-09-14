@@ -9757,6 +9757,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return _sm107_bf16_valid_tactics(m, n, k, 1, c_dtype_cutlass,
                                              mma_tiler_mn_candi, split_k_candi)
 
+        def should_profile_tactic_in_subprocess(
+            self,
+            custom_op: str,
+            inputs: List[torch.Tensor],
+            tactic,
+            tuning_config: TuningConfig,
+            **kwargs,
+        ) -> bool:
+            # This runner owns shape-only dense inputs. MoE routing tensors and
+            # locality-domain thread-local state cannot be reconstructed here.
+            if get_current_locality_domain() is not None:
+                return False
+            if len(inputs) != 3 or any(t.ndim != 2 for t in inputs):
+                return False
+            if tuple(inputs[2].shape) != (inputs[0].shape[0],
+                                          inputs[1].shape[0]):
+                return False
+            return _parse_sm107_bf16_tactic(tactic)[-1] > 1
+
         def forward(
             self,
             inputs: List[torch.Tensor],
