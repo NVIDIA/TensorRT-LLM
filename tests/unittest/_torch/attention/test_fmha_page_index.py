@@ -184,6 +184,59 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
         )
 
 
+@pytest.mark.parametrize("max_num_sequences", [32, None, 0])
+@pytest.mark.parametrize("num_gen_tokens", [1, 64])
+def test_prepare_workspace_sizes_generation_for_max_num_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_sequences: int | None,
+    num_gen_tokens: int,
+) -> None:
+    max_num_requests = 16
+    sequence_capacity = max_num_sequences or max_num_requests
+    q = torch.empty((num_gen_tokens, 6 * 64), dtype=torch.float16)
+    workspace = torch.empty(0, dtype=torch.uint8)
+    workspace_size = Mock(return_value=33)
+    monkeypatch.setattr(flashinfer_trtllm_gen_module, "_get_workspace_size", workspace_size)
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module, "get_multi_ctas_kv_counter_size", lambda *args: 0
+    )
+    fmha = SimpleNamespace(
+        attn=SimpleNamespace(num_heads=6, num_kv_heads=2, head_dim=64, rope_dim=64),
+        _multi_processor_count=148,
+        _multi_ctas_kv_counter=torch.empty(0, dtype=torch.uint8),
+        _use_fp8_context_fmha=lambda *args: False,
+    )
+    params = FmhaParams(
+        qkv_or_q=q,
+        workspace=workspace,
+        fwd=AttentionForwardArgs(
+            output=torch.empty_like(q),
+            attention_input_type=AttentionInputType.generation_only,
+        ),
+    )
+    metadata = SimpleNamespace(
+        max_num_sequences=max_num_sequences,
+        max_num_requests=max_num_requests,
+        max_context_length=16,
+        is_cuda_graph=False,
+    )
+
+    FlashInferTrtllmGenFmha.prepare_workspace(fmha, params, metadata)
+
+    workspace_size.assert_called_once_with(
+        dtype=q.dtype,
+        num_tokens=max(num_gen_tokens, metadata.max_context_length),
+        num_gen_tokens=max(num_gen_tokens, sequence_capacity),
+        num_heads=6,
+        num_kv_heads=2,
+        head_size=64,
+        max_num_requests=sequence_capacity,
+        rotary_embedding_dim=64,
+        fp8_context_fmha=False,
+    )
+    assert workspace.numel() == 33
+
+
 def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
