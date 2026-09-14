@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -61,7 +61,7 @@ A sample benchmark.txt file is shown below:
 import argparse
 import sys
 from pathlib import Path
-from typing import Tuple, Type
+from typing import Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -81,6 +81,7 @@ except (ModuleNotFoundError, ImportError):
 BlockScaledContiguousGatherGroupedGemmKernel = (
     kernel_module.BlockScaledContiguousGatherGroupedGemmKernel
 )
+ActivationType = kernel_module.ActivationType
 
 try:
     from .testing import benchmark
@@ -378,7 +379,8 @@ def create_tensors(
 ):
     """Create tensors for contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
-    Note: Output C has N/2 columns since SwiGLU combines pairs of (up, gate) from interleaved B weights.
+    Note: Output C has N/2 columns because gated activations combine pairs of
+    (up, gate) from interleaved B weights.
     B weights are expected to be interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
 
     Returns tensors including:
@@ -532,13 +534,18 @@ def run(
     use_cupti: bool = False,
     raster_along_m: bool = False,
     swiglu_limit: float = float("inf"),
+    act_compute_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    use_tanh: bool = False,
     **kwargs,
 ):
-    """Run contiguous grouped GEMM with gather operation and SwiGLU fusion for FC1 layer.
+    """Run contiguous grouped GEMM with gather and gated activation fusion for FC1.
 
     Computation flow:
     1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
-    2. SwiGLU: C = up * silu(gate), where up/gate are extracted from interleaved acc (granularity=64)
+    2. Activation: SwiGLU or SiTU on interleaved up/gate accumulators
     3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
     Note: Output C has N/2 columns since SwiGLU combines pairs of (up, gate) from interleaved B weights.
@@ -563,6 +570,11 @@ def run(
     print(f"Use cold L2: {use_cold_l2}")
     print(f"Use CUPTI: {use_cupti}")
     print(f"Raster along M: {raster_along_m}")
+    print(f"Activation type: {activation_type.name}")
+    print(f"Activation compute dtype: {act_compute_dtype}")
+    print(f"Use native 16-bit tanh: {use_tanh}")
+    if activation_type == ActivationType.SiTu:
+        print(f"SiTU beta: {situ_beta}, linear beta: {situ_linear_beta}")
 
     # Unpack parameters
     n, k, num_groups = nkl
@@ -642,14 +654,20 @@ def run(
     )
 
     # Configure gemm kernel
+    vectorized_f32 = activation_type != ActivationType.SiTu or act_compute_dtype == cutlass.Float32
     gemm = BlockScaledContiguousGatherGroupedGemmKernel(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
-        True,
+        vectorized_f32,
         topk=1,
         raster_along_m=raster_along_m,
+        activation_type=activation_type,
         swiglu_limit=swiglu_limit,
+        act_compute_dtype=act_compute_dtype,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        use_tanh=use_tanh,
     )
 
     # Compute max active clusters on current device
@@ -710,6 +728,7 @@ def run(
 
         # Step 1: Compute full GEMM first
         gemm_result = torch.empty((1, valid_m, n), dtype=torch.float32)
+        alpha_by_row = torch.empty((valid_m, 1), dtype=torch.float32)
         start = 0
         a_torch_cpu_f32 = torch.einsum("mk,mk->mk", a_torch_cpu[:, :, 0], sfa_torch_cpu[:, :, 0])
         for i, group_m in enumerate(aligned_group_m_list):
@@ -717,12 +736,11 @@ def run(
             res_a = a_torch_cpu_f32[token_id_mapping_cpu[start:end]]
 
             res_b = torch.einsum("nk,nk->nk", b_torch_cpu[:, :, i], sfb_torch_cpu[:, :, i])
-            alpha_val = alpha_torch_cpu[i]
-
-            gemm_result[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b) * alpha_val
+            gemm_result[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b)
+            alpha_by_row[start:end] = alpha_torch_cpu[i]
             start = end
 
-        # Step 2: Apply SwiGLU on interleaved GEMM result
+        # Step 2: Apply the gated activation on interleaved GEMM result
         # Weights are interleaved: [up_0:64, gate_64:128, up_128:192, gate_192:256, ...]
         assert n % (2 * interleave_granularity) == 0
         ref = torch.empty((1, valid_m, n_out), dtype=torch.float32)
@@ -734,19 +752,113 @@ def run(
                 0, :, n_block + interleave_granularity : n_block + 2 * interleave_granularity
             ]
 
-            # SwiGLU clamp
-            if swiglu_limit != float("inf"):
-                gate_result = gate_result.clamp(max=swiglu_limit)
-                up_result = up_result.clamp(min=-swiglu_limit, max=swiglu_limit)
+            if act_compute_dtype == cutlass.Float32:
+                up_result = up_result * alpha_by_row
+                gate_result = gate_result * alpha_by_row
+            else:
+                torch_compute_dtype = {
+                    cutlass.Float16: torch.float16,
+                    cutlass.BFloat16: torch.bfloat16,
+                }[act_compute_dtype]
+                alpha_compute = alpha_by_row.to(torch_compute_dtype)
+                up_result = (up_result.to(torch_compute_dtype) * alpha_compute).to(
+                    torch_compute_dtype
+                )
+                gate_result = (gate_result.to(torch_compute_dtype) * alpha_compute).to(
+                    torch_compute_dtype
+                )
 
-            # SwiGLU: up * silu(gate) where silu(x) = x * sigmoid(x)
-            silu_gate = gate_result * torch.sigmoid(gate_result)
-            output_block = up_result * silu_gate
+            if activation_type == ActivationType.SiTu:
+                assert situ_beta is not None and situ_linear_beta is not None
+                if act_compute_dtype == cutlass.Float32:
+                    softcapped_gate = situ_beta * torch.tanh(gate_result / situ_beta)
+                    softcapped_up = situ_linear_beta * torch.tanh(up_result / situ_linear_beta)
+                    output_block = softcapped_up * softcapped_gate * torch.sigmoid(gate_result)
+                else:
+
+                    def sigmoid_16bit(value):
+                        log2_e = torch.tensor(1.4426950408889634, dtype=torch_compute_dtype)
+                        neg_log2e_value = (-log2_e * value).to(torch_compute_dtype)
+                        exp_value = torch.exp2(neg_log2e_value).to(torch_compute_dtype)
+                        return (1.0 + exp_value.float()).reciprocal().to(torch_compute_dtype)
+
+                    gate_beta = torch.tensor(situ_beta, dtype=torch_compute_dtype)
+                    linear_beta = torch.tensor(situ_linear_beta, dtype=torch_compute_dtype)
+                    if use_tanh:
+                        half = torch.tensor(0.5, dtype=torch_compute_dtype)
+                        inv_gate_beta = torch.tensor(1.0 / situ_beta, dtype=torch_compute_dtype)
+                        inv_linear_beta = torch.tensor(
+                            1.0 / situ_linear_beta, dtype=torch_compute_dtype
+                        )
+                        gate_tanh_input = (gate_result * inv_gate_beta).to(torch_compute_dtype)
+                        gate_tanh = torch.tanh(gate_tanh_input).to(torch_compute_dtype)
+                        softcapped_gate = (gate_beta * gate_tanh).to(torch_compute_dtype)
+                        up_tanh_input = (up_result * inv_linear_beta).to(torch_compute_dtype)
+                        up_tanh = torch.tanh(up_tanh_input).to(torch_compute_dtype)
+                        softcapped_up = (linear_beta * up_tanh).to(torch_compute_dtype)
+                    else:
+                        twice_gate_beta = torch.tensor(2.0 * situ_beta, dtype=torch_compute_dtype)
+                        inv_gate_beta = torch.tensor(2.0 / situ_beta, dtype=torch_compute_dtype)
+                        twice_linear_beta = torch.tensor(
+                            2.0 * situ_linear_beta, dtype=torch_compute_dtype
+                        )
+                        inv_linear_beta = torch.tensor(
+                            2.0 / situ_linear_beta, dtype=torch_compute_dtype
+                        )
+                        gate_tanh_sigmoid = sigmoid_16bit(
+                            (gate_result * inv_gate_beta).to(torch_compute_dtype)
+                        )
+                        softcapped_gate = (twice_gate_beta * gate_tanh_sigmoid).to(
+                            torch_compute_dtype
+                        )
+                        softcapped_gate = (softcapped_gate - gate_beta).to(torch_compute_dtype)
+                        up_tanh_sigmoid = sigmoid_16bit(
+                            (up_result * inv_linear_beta).to(torch_compute_dtype)
+                        )
+                        softcapped_up = (twice_linear_beta * up_tanh_sigmoid).to(
+                            torch_compute_dtype
+                        )
+                        softcapped_up = (softcapped_up - linear_beta).to(torch_compute_dtype)
+
+                    if use_tanh:
+                        gate_sigmoid_input = (gate_result * half).to(torch_compute_dtype)
+                        gate_sigmoid_tanh = torch.tanh(gate_sigmoid_input).to(torch_compute_dtype)
+                        gate_sigmoid = (half * gate_sigmoid_tanh).to(torch_compute_dtype)
+                        gate_sigmoid = (gate_sigmoid + half).to(torch_compute_dtype)
+                    else:
+                        gate_sigmoid = sigmoid_16bit(gate_result)
+                    situ_gate = (softcapped_gate * gate_sigmoid).to(torch_compute_dtype)
+                    output_block = (situ_gate * softcapped_up).to(torch_compute_dtype)
+            else:
+                # SwiGLU clamp
+                if swiglu_limit != float("inf"):
+                    gate_result = gate_result.clamp(max=swiglu_limit)
+                    up_result = up_result.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+                # SwiGLU: up * silu(gate), following the kernel's compute dtype and
+                # operation ordering so the reference includes intermediate rounding.
+                if act_compute_dtype == cutlass.Float32:
+                    silu_gate = gate_result * torch.sigmoid(gate_result)
+                    output_block = up_result * silu_gate
+                else:
+                    if use_tanh:
+                        half = torch.tensor(0.5, dtype=torch_compute_dtype)
+                        half_gate = (gate_result * half).to(torch_compute_dtype)
+                        tanh_value = torch.tanh(half_gate).to(torch_compute_dtype)
+                        silu_gate = (half_gate * tanh_value).to(torch_compute_dtype)
+                        silu_gate = (silu_gate + half_gate).to(torch_compute_dtype)
+                    else:
+                        log2_e = torch.tensor(1.4426950408889634, dtype=torch_compute_dtype)
+                        neg_log2e_gate = (-log2_e * gate_result).to(torch_compute_dtype)
+                        exp_value = torch.exp2(neg_log2e_gate).to(torch_compute_dtype)
+                        sigmoid = (1.0 + exp_value.float()).reciprocal().to(torch_compute_dtype)
+                        silu_gate = (gate_result * sigmoid).to(torch_compute_dtype)
+                    output_block = (up_result * silu_gate).to(torch_compute_dtype)
 
             # Store to output at n_block/2 position
             out_start = n_block // 2
             out_end = out_start + interleave_granularity
-            ref[0, :, out_start:out_end] = output_block
+            ref[0, :, out_start:out_end] = output_block.float().cpu()
 
         ref = ref.permute((1, 2, 0))
 
@@ -1207,7 +1319,36 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Swiglu clamp factor, +inf (default) disables clamp",
     )
-
+    parser.add_argument(
+        "--act_compute_dtype",
+        type=cutlass.dtype,
+        choices=[cutlass.Float32, cutlass.Float16, cutlass.BFloat16],
+        default=cutlass.Float32,
+        help=("Gated activation arithmetic dtype after loading FP32 accumulators from TMEM"),
+    )
+    parser.add_argument(
+        "--activation_type",
+        choices=["Swiglu", "SiTu"],
+        default="Swiglu",
+        help="Gated FC1 activation",
+    )
+    parser.add_argument(
+        "--situ_beta",
+        type=float,
+        default=None,
+        help="SiTU gate softcap; required with --activation_type SiTu",
+    )
+    parser.add_argument(
+        "--situ_linear_beta",
+        type=float,
+        default=None,
+        help="SiTU up/linear softcap; required with --activation_type SiTu",
+    )
+    parser.add_argument(
+        "--use_tanh",
+        action="store_true",
+        help="Use native approximate 16-bit tanh for SwiGLU or SiTU",
+    )
     args = parser.parse_args()
 
     # Process arguments to generate nkl and group_m_list
@@ -1263,6 +1404,11 @@ if __name__ == "__main__":
         args.use_cupti,
         args.raster_along_m,
         args.swiglu_limit,
+        args.act_compute_dtype,
+        ActivationType[args.activation_type],
+        args.situ_beta,
+        args.situ_linear_beta,
+        args.use_tanh,
     )
     print(f"Execution time: {exec_time:.2f} us")
     print("PASS")
