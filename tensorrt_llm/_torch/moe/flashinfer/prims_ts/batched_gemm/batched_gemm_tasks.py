@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,10 +23,11 @@ the schedule.
 from contextlib import contextmanager, nullcontext
 
 import cutlass
+import cutlass.cute as cute
 
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
-    schedule,
+    schedule as capture_schedule,
     work_tile_loop,
 )
 from cutlass.experimental.task_scheduling.task import Task
@@ -38,6 +40,48 @@ from .batched_gemm_config import (
 from .smem_misc_resources import BatchedGemmWorkQueue
 
 Constexpr = cutlass.Constexpr
+
+
+def schedule(function):
+    """Qualify grouped resource arguments when capturing their task schedules."""
+    traced = capture_schedule(function)
+
+    def capture(*resources, **kwargs):
+        def qualify(resource):
+            if (
+                isinstance(resource, MemoryResource)
+                and resource.pipeline_group is not None
+            ):
+                return getattr(resource.pipeline_group, resource.name)
+            return resource
+
+        return traced(*(qualify(resource) for resource in resources), **kwargs)
+
+    return capture
+
+
+class _MmaGroupTask(Task):
+    """Run a leader task once per MMA group in a multicast cluster."""
+
+    def __init__(self, cta_group_size, **kwargs):
+        super().__init__(**kwargs)
+        self.cta_group_size = cta_group_size
+
+    @cute.jit
+    def is_selected(self) -> bool:
+        warp = cute.arch.warp_idx()
+        rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        return (
+            (warp >= self.warp_start)
+            & (warp < self.warp_end)
+            & (rank % self.cta_group_size == 0)
+        )
+
+
+def _make_task(cfg, **kwargs) -> Task:
+    if cfg.cluster_reuse_m > 1 and kwargs.get("run_only_on_cta_id") == 0:
+        return _MmaGroupTask(cfg.cluster_m, **kwargs)
+    return Task(**kwargs)
 
 
 def _is_persistent(cfg: BatchedGemmConfig) -> bool:
@@ -204,7 +248,8 @@ def create_load_a_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_a_schedule(gmem_a, smem_a, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=(
             [gmem_a]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -289,7 +334,8 @@ def create_load_b_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_b_schedule(gmem_b, smem_b, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=(
             [gmem_b]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -389,7 +435,8 @@ def create_gather_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = gather_schedule(gmem_act, smem_gather, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=(
             [gmem_act]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -401,6 +448,47 @@ def create_gather_task(
         schedule=captured_schedule,
         num_registers=cfg.gather_regs,
         name="GatherTask",
+    )
+
+
+def create_weight_sf_task(cfg, gmem_a, smem_a, gmem_sfa, work_queue, num_k_tiles):
+    """Load weight values and scales using a shared producer state."""
+
+    @schedule
+    def weight_schedule(gmem, smem, sf, wq=None):
+        _ = gmem.init_coords_state()
+        _ = sf.init_coords_state()
+        smem.init_load_state()
+        with _work_tile_schedule_loop(cfg, wq):
+            _ = gmem.compute_a_coords_head()
+            with domain_loop(0, num_k_tiles, 1):
+                ak, amn, al, expert, limit = gmem.compute_a_coords_loop()
+                sfk, sfmn = sf.compute_sfa_coords_loop()
+                smem.try_acquire()
+                smem.acquire()
+                smem.load_a_sfa_tile(
+                    coord_a_k=ak,
+                    coord_a_mn=amn,
+                    coord_a_l=al,
+                    expert_idx=expert,
+                    mn_limit=limit,
+                    coord_sfa_k=sfk,
+                    coord_sfa_mn=sfmn,
+                )
+                smem.commit()
+
+    captured = _call_schedule_with_optional_work_queue(
+        weight_schedule, cfg.is_persistent, work_queue, gmem_a, smem_a, gmem_sfa
+    )
+    return _make_task(
+        cfg,
+        src_resources=[gmem_a, gmem_sfa] + ([work_queue] if cfg.is_persistent else []),
+        dst_resources=[smem_a],
+        warp_idx=cfg.load_a_warp_idx,
+        num_warps=cfg.num_load_a_warps,
+        schedule=captured,
+        num_registers=max(cfg.load_a_task_regs, cfg.load_sfa_task_regs),
+        name="WeightSfTask",
     )
 
 
@@ -488,7 +576,8 @@ def create_fused_load_a_sfa_task(
         smem_sfa,
         *extra_resources,
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[gmem_a, gmem_sfa] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[smem_a, smem_sfa]
         + ([work_throttle] if has_work_throttle else []),
@@ -642,7 +731,8 @@ def create_fused_gather_sfb_task(
         smem_sfb,
         *extra_resources,
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=(
             [gmem_b, gmem_sfb]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -699,7 +789,8 @@ def create_sync_task(
         gather_smem,
         tma_smem,
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[gather_smem, tma_smem]
         + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[proxy_cluster],
@@ -794,7 +885,8 @@ def create_load_sfa_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_sfa_schedule(gmem_sfa, smem_sfa, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=(
             [gmem_sfa]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -893,7 +985,8 @@ def create_load_sfb_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_sfb_schedule(gmem_sfb, smem_sfb, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=(
             [gmem_sfb]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -943,7 +1036,8 @@ def create_copy_sfa_task(
     captured_schedule = _call_schedule_with_optional_work_queue(
         copy_sfa_schedule, is_persistent, work_queue, smem_sfa, tmem_sfa
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[smem_sfa] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_sfa],
         warp_idx=cfg.copy_sfa_warp_idx,
@@ -986,7 +1080,8 @@ def create_copy_sfb_task(
     captured_schedule = _call_schedule_with_optional_work_queue(
         copy_sfb_schedule, is_persistent, work_queue, smem_sfb, tmem_sfb
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[smem_sfb] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_sfb],
         warp_idx=cfg.copy_sfb_warp_idx,
@@ -1059,7 +1154,8 @@ def create_copy_sfab_task(
         smem_sfb,
         tmem_sfab,
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[smem_sfa, smem_sfb]
         + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_sfab],
@@ -1123,7 +1219,8 @@ def create_cast_a_task(
         smem_sfa,
         tmem_cast_a,
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[smem_a, smem_sfa] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_cast_a],
         warp_idx=cfg.cast_a_warp_idx_first,
@@ -1162,12 +1259,20 @@ def create_mma_task(
 
     Only one of (smem_sfa, tmem_sfa) should be set for each operand.
     """
-    if (smem_sfa is None) != (smem_sfb is None):
+    if not cfg.fuse_weight_sf and (smem_sfa is None) != (smem_sfb is None):
         raise ValueError("create_mma_task requires smem_sfa and smem_sfb together")
-    if (tmem_sfa is None) != (tmem_sfb is None):
+    if not cfg.fuse_weight_sf and (tmem_sfa is None) != (tmem_sfb is None):
         raise ValueError("create_mma_task requires tmem_sfa and tmem_sfb together")
 
-    has_fused_sf = smem_sfa is not None
+    has_weight_sf = bool(cfg.fuse_weight_sf)
+    if has_weight_sf and not (
+        smem_sfa is None
+        and tmem_sfb is not None
+        and smem_sfb is None
+        and tmem_sfa is None
+    ):
+        raise ValueError("weight-SF fusion requires combined weights and TmemSfB")
+    has_fused_sf = smem_sfa is not None and not has_weight_sf
     has_separate_sf = tmem_sfa is not None
     has_combined_sf = tmem_sfab is not None
     has_cast_a = tmem_cast_a is not None
@@ -1177,6 +1282,7 @@ def create_mma_task(
             ("fused", has_fused_sf),
             ("separate", has_separate_sf),
             ("combined", has_combined_sf),
+            ("weight", has_weight_sf),
         )
         if enabled
     ]
@@ -1188,6 +1294,7 @@ def create_mma_task(
     if has_cast_a and active_sf_modes:
         raise ValueError("create_mma_task forbids tmem_cast_a with SF modes")
     has_proxy = proxy_cluster is not None
+    has_ab_group = smem_a.pipeline_group is not None
     is_persistent = _is_persistent(cfg)
 
     @schedule
@@ -1206,12 +1313,14 @@ def create_mma_task(
         idx += 1 if has_fused_sf else 0
         tmem_sfa_res = extra[idx] if has_separate_sf else None
         idx += 1 if has_separate_sf else 0
-        tmem_sfb_res = extra[idx] if has_separate_sf else None
-        idx += 1 if has_separate_sf else 0
+        tmem_sfb_res = extra[idx] if has_separate_sf or has_weight_sf else None
+        idx += 1 if has_separate_sf or has_weight_sf else 0
         tmem_sfab_res = extra[idx] if has_combined_sf else None
         idx += 1 if has_combined_sf else 0
         tmem_cast_a_res = extra[idx] if has_cast_a else None
         idx += 1 if has_cast_a else 0
+        ab_group = extra[idx] if has_ab_group else None
+        idx += 1 if has_ab_group else 0
         wq = extra[idx] if is_persistent else None
 
         if not has_cast_a:
@@ -1249,6 +1358,7 @@ def create_mma_task(
                         tmem_sfb_res,
                         tmem_sfab_res,
                         tmem_cast_a_res,
+                        ab_group,
                         release_sources=False,
                     )
                     tmem_c_res.commit()
@@ -1262,6 +1372,7 @@ def create_mma_task(
                         tmem_sfb_res,
                         tmem_sfab_res,
                         tmem_cast_a_res,
+                        ab_group,
                     )
             else:
                 tmem_c_res.try_acquire()
@@ -1279,6 +1390,7 @@ def create_mma_task(
                             tmem_sfb_res,
                             tmem_sfab_res,
                             tmem_cast_a_res,
+                            ab_group,
                         )
                 else:
                     with domain_loop(0, num_k_tiles, 1):
@@ -1293,6 +1405,7 @@ def create_mma_task(
                             tmem_sfb_res,
                             tmem_sfab_res,
                             tmem_cast_a_res,
+                            ab_group,
                         )
                 tmem_c_res.commit()
                 if cfg.use_tile256_tmem_overlap and cfg.num_epilogue_warps == 4:
@@ -1309,6 +1422,7 @@ def create_mma_task(
         tmem_sfb_res,
         tmem_sfab_res,
         tmem_cast_a_res,
+        ab_group,
         *,
         release_sources: bool = True,
     ) -> None:
@@ -1320,6 +1434,8 @@ def create_mma_task(
             proxy_stage_idx = proxy.consumer_work()
         elif has_cast_a:
             smem_b_res.try_wait()
+        elif has_ab_group:
+            ab_group.try_wait()
         else:
             smem_a_res.try_wait()
             smem_b_res.try_wait()
@@ -1329,6 +1445,8 @@ def create_mma_task(
         if has_separate_sf:
             tmem_sfa_res.try_wait()
             tmem_sfb_res.try_wait()
+        if has_weight_sf:
+            tmem_sfb_res.try_wait()
         if has_combined_sf:
             tmem_sfab_res.try_wait()
         if has_cast_a:
@@ -1336,6 +1454,8 @@ def create_mma_task(
         if not has_proxy:
             if has_cast_a:
                 smem_b_res.wait()
+            elif has_ab_group:
+                ab_group.wait()
             else:
                 smem_a_res.wait()
                 smem_b_res.wait()
@@ -1344,6 +1464,8 @@ def create_mma_task(
             smem_sfb_res.wait()
         if has_separate_sf:
             tmem_sfa_res.wait()
+            tmem_sfb_res.wait()
+        if has_weight_sf:
             tmem_sfb_res.wait()
         if has_combined_sf:
             tmem_sfab_res.wait()
@@ -1370,7 +1492,19 @@ def create_mma_task(
             else:
                 desc_a_mma_base, smem_a_stage_ptr = smem_a_res.build_mma_desc_a()
                 desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
-            if has_fused_sf:
+            if has_weight_sf:
+                desc_a_s2t_base, smem_sfa_stage_ptr = smem_a_res.build_weight_sf_desc()
+                sfb_stage_col_offset = tmem_sfb_res.publish_sfb_offset()
+                tmem_c_res.mma_weight_sf(
+                    desc_a_mma_base=desc_a_mma_base,
+                    smem_a_stage_ptr=smem_a_stage_ptr,
+                    desc_b_mma_base=desc_b_mma_base,
+                    smem_b_stage_ptr=smem_b_stage_ptr,
+                    desc_a_s2t_base=desc_a_s2t_base,
+                    sfb_stage_col_offset=sfb_stage_col_offset,
+                    smem_sfa_stage_ptr=smem_sfa_stage_ptr,
+                )
+            elif has_fused_sf:
                 desc_a_s2t_base, smem_sfa_stage_ptr = smem_sfa_res.build_sfa_s2t_desc()
                 desc_b_s2t_base = smem_sfb_res.build_sfb_s2t_desc()
                 tmem_c_res.mma_fused_sf(
@@ -1423,6 +1557,7 @@ def create_mma_task(
                 tmem_sfb_res,
                 tmem_sfab_res,
                 tmem_cast_a_res,
+                ab_group,
             )
 
     def _release_mma_sources(
@@ -1435,10 +1570,13 @@ def create_mma_task(
         tmem_sfb_res,
         tmem_sfab_res,
         tmem_cast_a_res,
+        ab_group,
     ) -> None:
         if has_cast_a:
             tmem_cast_a_res.release()
             smem_b_res.release()
+        elif has_ab_group:
+            ab_group.release()
         else:
             smem_a_res.release()
             smem_b_res.release()
@@ -1450,12 +1588,16 @@ def create_mma_task(
         if has_separate_sf:
             tmem_sfa_res.release()
             tmem_sfb_res.release()
+        if has_weight_sf:
+            tmem_sfb_res.release()
         if has_combined_sf:
             tmem_sfab_res.release()
 
     src_resources = [tmem_cast_a, smem_b] if has_cast_a else [smem_a, smem_b]
     if has_proxy:
         src_resources.append(proxy_cluster)
+    if has_weight_sf:
+        src_resources.append(tmem_sfb)
     if has_fused_sf:
         src_resources += [smem_sfa, smem_sfb]
     if has_separate_sf:
@@ -1467,6 +1609,8 @@ def create_mma_task(
     extra_resources = []
     if has_proxy:
         extra_resources.append(proxy_cluster)
+    if has_weight_sf:
+        extra_resources.append(tmem_sfb)
     if has_fused_sf:
         extra_resources += [smem_sfa, smem_sfb]
     if has_separate_sf:
@@ -1475,11 +1619,14 @@ def create_mma_task(
         extra_resources.append(tmem_sfab)
     if has_cast_a:
         extra_resources.append(tmem_cast_a)
+    if has_ab_group:
+        extra_resources.append(smem_a.pipeline_group)
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = mma_schedule(smem_a, smem_b, tmem_c, *extra_resources)
 
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=src_resources,
         dst_resources=[tmem_c],
         warp_idx=cfg.mma_warp_idx,
@@ -1574,7 +1721,8 @@ def create_epilogue_task(
         tmem_c,
         gmem_c,
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[tmem_c] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[gmem_c],
         warp_idx=cfg.epilogue_warp_idx,
@@ -1638,7 +1786,8 @@ def create_load_sfab_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_sfab_schedule(smem_dsfp8_sfab, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=(
             _pdl_wait_resources(pdl_wait_resource)
             + ([work_queue] if cfg.is_persistent else [])
@@ -1737,7 +1886,8 @@ def create_epilogue_task_dsfp8(
         smem_dsfp8_sfab,
         gmem_c,
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[tmem_c, smem_dsfp8_sfab]
         + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[gmem_c],
@@ -1788,7 +1938,8 @@ def create_workid_task(
         captured_schedule = workid_schedule(work_queue, work_throttle)
     else:
         captured_schedule = workid_schedule(work_queue)
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[work_queue]
         + ([work_throttle] if work_throttle is not None else []),
         dst_resources=[work_queue],
@@ -1821,7 +1972,8 @@ def create_padding_task(
     captured_schedule = (
         padding_schedule(work_queue) if is_persistent else padding_schedule()
     )
-    return Task(
+    return _make_task(
+        cfg,
         src_resources=[work_queue] if is_persistent else [],
         dst_resources=[],
         warp_idx=cfg.padding_warp_idx,

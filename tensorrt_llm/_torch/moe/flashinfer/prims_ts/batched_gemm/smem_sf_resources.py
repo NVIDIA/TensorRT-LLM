@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -110,6 +111,20 @@ class SmemSfAResource(MemoryResource):
         coord_sfa_k: Int32,
         coord_sfa_mn: cutlass.Int32,
     ) -> None:
+        self._load_sfa_tile_impl(
+            stage_info,
+            coord_sfa_k=coord_sfa_k,
+            coord_sfa_mn=coord_sfa_mn,
+        )
+
+    @cute.jit
+    def _load_sfa_tile_impl(
+        self,
+        stage_info: StageInfo,
+        *,
+        coord_sfa_k: Int32,
+        coord_sfa_mn: cutlass.Int32,
+    ) -> None:
         """TMA load SFA into SMEM using the descriptor's coordinate rank."""
         # Split R128c4 coords: (0, 0, sfk_block, outer_tile). The generated
         # descriptor uses a split (256, 2) leading tile to satisfy TMA.
@@ -199,6 +214,10 @@ class SmemSfAResource(MemoryResource):
     @consumer_work(returns=(desc_a_s2t_base, smem_sfa_stage_ptr))
     @cute.jit
     def build_sfa_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
+        return self._build_sfa_s2t_desc_impl(stage_info)
+
+    @cute.jit
+    def _build_sfa_s2t_desc_impl(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
         """Build SMEM descriptor for S2T copy of SFA."""
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_sfa_per_stage * stage_info.stage_idx
@@ -512,7 +531,9 @@ class SmemSfGatherResource(MemoryResource):
     def _load_routed_row_or_zero(self, route_idx, row_in_tile, tile_limit):
         routed_row = Int32(0)
         if row_in_tile < tile_limit:
-            routed_row = self.route_map.load(idx=route_idx, vector_size=1)[0]
+            routed_row = self.route_map.load(idx=route_idx, vector_size=1)[0] // Int32(
+                self.cfg.route_map_top_k
+            )
         return cute.arch.make_warp_uniform(routed_row)
 
     @cute.jit
@@ -1009,7 +1030,7 @@ class SmemSfLdgstsResource(MemoryResource):
             if is_valid:
                 self.routed_rows[li] = self.route_map.load(
                     idx=route_idx, vector_size=1
-                )[0]
+                )[0] // Int32(self.cfg.route_map_top_k)
 
     @cute.jit
     def _producer_work_impl(self, stage_info: StageInfo, coord_k, coord_mn) -> None:

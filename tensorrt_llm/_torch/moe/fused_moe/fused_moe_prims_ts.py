@@ -342,24 +342,35 @@ class PrimsTSFusedMoE(TRTLLMGenFusedMoE):
         from ..flashinfer.tllm_enums import ActivationType as PrimsActivation
 
         plan = require_comm_plan(self, ctx)
+        routing = self._extract_routing_params()
         topk_ids, topk_weights = ctx.token_selected_experts, ctx.token_final_scales
+        fused_logits = None
         if topk_ids is None:
             if ctx.router_logits is None:
                 raise ValueError("PrimsTS requires precomputed routing or router logits")
-            topk_ids, topk_weights = self.routing_method.apply(ctx.router_logits)
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(torch.bfloat16)
+            if (
+                self.has_nvfp4
+                and _supports_kimi_routing(self.routing_method, self.num_experts, self.hidden_size)
+                and ctx.router_logits.dtype == torch.float32
+                and routing.routing_bias is not None
+                and routing.routing_bias.dtype == torch.float32
+            ):
+                fused_logits = ctx.router_logits
+            else:
+                topk_ids, topk_weights = self.routing_method.apply(ctx.router_logits)
+        if topk_ids is not None:
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights = topk_weights.to(torch.bfloat16)
         shards = self._locality_domain_weight_shards
         if shards is None:
             shards = [{"w3_w1_weight": self.w3_w1_weight, "w2_weight": self.w2_weight}]
         output = plan.moe_output
         if output is None:
             output = ctx.x.new_empty((ctx.x.shape[0], self.hidden_size), dtype=torch.bfloat16)
-        routing = self._extract_routing_params()
         activation = int(
             PrimsActivation.Situ if self.is_situ_activation else PrimsActivation.Swiglu
         )
-        permuted, expanded_map, _ = prims_ts_partitioned_moe(
+        permuted, expanded_map, fused_weights = prims_ts_partitioned_moe(
             ctx.x,
             ctx.x_sf.flatten() if ctx.x_sf is not None else None,
             [s["w3_w1_weight"] for s in shards],
@@ -386,10 +397,14 @@ class PrimsTSFusedMoE(TRTLLMGenFusedMoE):
             topk_group=routing.topk_group,
             routed_scaling_factor=routing.routed_scaling_factor,
             routing_bias=routing.routing_bias,
+            router_logits=fused_logits,
+            top_k=self.routing_method.top_k,
+            use_hybrid_routing=fused_logits is not None,
+            enable_pdl=get_env_enable_pdl(),
         )
         if ctx.do_finalize:
             return output
-        return permuted, topk_weights, expanded_map
+        return permuted, topk_weights if topk_weights is not None else fused_weights, expanded_map
 
     def _select_op_provider(self) -> None:
         self.use_flashinfer = False

@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -110,7 +111,7 @@ class TmemSfAResource(MemoryResource):
 
         do_copy = cutlass.Boolean(True)
         if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.has_cluster):
-            do_copy = self.cta_rank == Int32(0)
+            do_copy = self.cta_rank % Int32(self.cfg.cluster_m) == Int32(0)
         if do_copy:
             for s2t_idx in cutlass.range_constexpr(num_s2t_iters):
                 tmem_addr = (
@@ -202,7 +203,7 @@ class TmemSfBResource(MemoryResource):
         do_copy = cutlass.Boolean(True)
         if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.has_cluster):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            do_copy = cta_rank == Int32(0)
+            do_copy = cta_rank % Int32(self.cfg.cluster_m) == Int32(0)
         if do_copy:
             for s2t_idx in cutlass.range_constexpr(num_s2t_iters):
                 tmem_addr = (
@@ -301,7 +302,7 @@ class TmemSfABResource(MemoryResource):
         s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
 
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        if cta_rank == Int32(0):
+        if cta_rank % Int32(self.cfg.cluster_m) == Int32(0):
             for s2t_idx in cutlass.range_constexpr(
                 self.cfg.tmem_sfa_cols // TMEM_SF_UTCCP_COLS_PER_COPY
             ):
@@ -632,7 +633,7 @@ class TmemSfRouteResource(MemoryResource):
             s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
             num_s2t_iters = cols_per_stage // TMEM_SF_UTCCP_COLS_PER_COPY
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            if cta_rank == Int32(0):
+            if cta_rank % Int32(self.cfg.cluster_m) == Int32(0):
                 for s2t_idx in cutlass.range_constexpr(num_s2t_iters):
                     tmem_addr = (
                         self.sf_tmem_addr_base

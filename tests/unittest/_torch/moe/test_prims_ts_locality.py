@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """PrimsTS output partitioning, BF16 dispatch and Rubin locality domains."""
 
+from copy import copy
+from functools import partial
+
 import pytest
 import torch
 from _torch.moe.test_kimi_k3_situ_moe import _make_nvfp4_expert_bank
@@ -55,6 +58,7 @@ def make_moe_pair(
     top_k: int = 2,
     expert_bank=None,
     localize: bool = True,
+    routing_method=None,
 ):
     """Load identical checkpoint tensors through both production module paths."""
     generator = torch.Generator().manual_seed(37)
@@ -102,7 +106,7 @@ def make_moe_pair(
             locality_domain_policy=LocalityDomainPolicy(enabled=localized),
         )
         module = create_moe(
-            routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
+            routing_method=routing_method or RenormalizeMoeRoutingMethod(top_k=top_k),
             num_experts=experts,
             hidden_size=hidden,
             intermediate_size=intermediate,
@@ -135,6 +139,163 @@ def _bf16_reference(x, logits, routing_method, bank):
         scale = ((ids == expert_id) * scales.float()).sum(dim=-1)
         reference += expert * scale[:, None]
     return reference
+
+
+def _assert_locality_close(actual, expected, *, fused=True):
+    if not fused:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        return
+    # Fused finalize rounds each weighted contribution to BF16 and performs
+    # unordered BF16 bulk adds, matching the CuTe DSL finalize arithmetic.
+    error = actual.float() - expected.float()
+    reference_norm = torch.linalg.vector_norm(expected.float())
+    assert torch.isfinite(actual).all()
+    assert torch.linalg.vector_norm(error) <= 0.02 * reference_norm
+    assert error.abs().max() <= 0.02 * expected.float().abs().max()
+
+
+@pytest.mark.skipif(get_sm_version() not in (100, 103, 107), reason="requires Blackwell or Rubin")
+@pytest.mark.parametrize("nvfp4,tactic", [(False, (64, 0)), (True, (8, 18)), (True, (16, 12))])
+@pytest.mark.parametrize("reuse", [2, 4])
+def test_prims_ts_partitioned_persistent_graph(nvfp4, tactic, reuse, monkeypatch):
+    """Exercise multiple expert tiles per resident cluster on ordinary streams."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.moe.custom_ops import prims_ts_moe as ops
+
+    class StreamPartitions:
+        def __init__(self):
+            self.streams = [torch.cuda.Stream() for _ in range(2)]
+
+        def fork(self):
+            for stream in self.streams:
+                stream.wait_stream(torch.cuda.current_stream())
+
+        def join(self):
+            for stream in self.streams:
+                torch.cuda.current_stream().wait_stream(stream)
+
+        def partition_context(self, index):
+            return torch.cuda.stream(self.streams[index])
+
+    # One resident cluster guarantees work-tile iteration even for tiny batches.
+    monkeypatch.setattr(ops, "_full_device_cluster_budget", lambda *args: 1)
+    (_, baseline), _ = make_moe_pair(nvfp4, False, hidden=1024, intermediate=1024, localize=False)
+    x = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16) * 0.5
+    logits = torch.randn(16, 8, device="cuda")
+    with torch.inference_mode(), AutoTuner.get().capture() as capture:
+        baseline(x, logits)
+    context = next(
+        c for c in capture._captured_contexts if isinstance(c["runners"][0], ops.PrimsTSMoERunner)
+    )
+    runner, inputs = context["runners"][0], context["inputs"]
+    candidate = copy(runner)
+    candidate.locality_runtime = StreamPartitions()
+    shards = []
+    for partition in range(2):
+        shard = []
+        for index in (4, 5, 10, 11):
+            tensor = inputs[index]
+            if tensor is None:
+                shard.append(None)
+            else:
+                axis = 2 if tensor.ndim == 4 else 1
+                width = tensor.shape[axis] // 2
+                shard.append(tensor.narrow(axis, partition * width, width).clone())
+        shards.append(tuple(shard))
+    candidate.locality_weights = tuple(shards)
+    partitioned_inputs = list(inputs)
+    for index, tensor in zip((4, 5, 10, 11), shards[0]):
+        partitioned_inputs[index] = tensor
+    expected, actual = torch.empty_like(x), torch.empty_like(x)
+    with torch.inference_mode():
+        runner(inputs, tactic=tactic, output=expected)
+        for fused in (False, True):
+            candidate.fuse_finalize = fused
+            candidate(partitioned_inputs, tactic=(*tactic, reuse), output=actual)
+            _assert_locality_close(actual, expected, fused=fused)
+            assert torch.count_nonzero(actual) > 0
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            candidate(partitioned_inputs, tactic=(*tactic, reuse), output=actual)
+        for _ in range(5):
+            inputs[-1].add_(1).remainder_(8)
+            inputs[-2].uniform_(0.1, 0.9)
+            runner(inputs, tactic=tactic, output=expected)
+            graph.replay()
+            _assert_locality_close(actual, expected)
+
+
+@pytest.mark.skipif(get_sm_version() != 107, reason="requires Rubin locality domains")
+@pytest.mark.parametrize("nvfp4,mma_group", [(False, 2), (True, 1), (True, 2)])
+@pytest.mark.parametrize("reuse", [2, 4])
+def test_prims_ts_locality_activation_multicast(nvfp4, mma_group, reuse, monkeypatch):
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+    from tensorrt_llm._torch.moe.custom_ops.prims_ts_moe import PrimsTSMoERunner
+    from tensorrt_llm._torch.moe.flashinfer.prims_ts.moe.config_mapper import (
+        map_trtllm_bf16_moe_tactic,
+        map_trtllm_nvfp4_moe_tactic,
+    )
+    from tensorrt_llm._torch.moe.flashinfer.tllm_enums import WeightLayout
+
+    monkeypatch.delenv("DISABLE_LOCALITY_DOMAINS", raising=False)
+    is_locality_domain_enabled.cache_clear()
+    (baseline, candidate), _ = make_moe_pair(nvfp4, False, hidden=1024, intermediate=1024)
+    x = torch.randn(16, 1024, dtype=torch.bfloat16, device="cuda") * 0.5
+    logits = torch.randn(16, 8, device="cuda")
+    tuner = AutoTuner.get()
+    with torch.inference_mode(), tuner.capture() as capture:
+        candidate(x, logits)
+    context = next(
+        context
+        for context in capture._captured_contexts
+        if isinstance(context["runners"][0], PrimsTSMoERunner)
+    )
+    runner, inputs = context["runners"][0], context["inputs"]
+    mapper = map_trtllm_nvfp4_moe_tactic if nvfp4 else map_trtllm_bf16_moe_tactic
+    selected = None
+    for tactic in runner.get_valid_tactics(inputs, None):
+        if len(tactic) != 3 or tactic[2] != reuse:
+            continue
+        pair = mapper(
+            tactic[:2],
+            num_tokens=16,
+            top_k=2,
+            num_local_experts=8,
+            enable_pdl=runner.enable_pdl,
+            weight_layout=int(
+                WeightLayout.BlockMajorK if inputs[10].ndim == 4 else WeightLayout.MajorK
+            ),
+        )
+        if pair.fc1.cfg.kwargs["cluster_m"] == mma_group:
+            selected = tactic
+            break
+    assert selected is not None, "autotuning must expose every supported multicast cluster"
+    choose_one = tuner.choose_one
+
+    def choose_multicast(*args, **kwargs):
+        chosen_runner, tactic = choose_one(*args, **kwargs)
+        if (
+            isinstance(chosen_runner, PrimsTSMoERunner)
+            and chosen_runner.locality_runtime is not None
+        ):
+            return chosen_runner, selected
+        return chosen_runner, tactic
+
+    monkeypatch.setattr(tuner, "choose_one", choose_multicast)
+    with torch.inference_mode():
+        expected = baseline(x, logits)
+        actual = candidate(x, logits)
+        _assert_locality_close(actual, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = candidate(x, logits)
+        for _ in range(3):
+            x.normal_(std=0.5)
+            logits.normal_()
+            expected = baseline(x, logits)
+            graph.replay()
+            _assert_locality_close(captured, expected)
 
 
 rubin = pytest.mark.skipif(get_sm_version() != 107, reason="requires Rubin locality domains")
@@ -185,8 +346,16 @@ def test_prims_ts_locality_releases_stale_primary_pool_storage(monkeypatch):
 @rubin
 @pytest.mark.parametrize("nvfp4,situ", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("tokens", [1, 8, 64, 257])
-def test_prims_ts_locality_matches_unpartitioned(nvfp4, situ, tokens, monkeypatch):
+@pytest.mark.parametrize("fuse_finalize", [False, True])
+def test_prims_ts_locality_matches_unpartitioned(nvfp4, situ, tokens, fuse_finalize, monkeypatch):
     from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+    from tensorrt_llm._torch.moe.custom_ops import prims_ts_partitioned_moe as ops
+
+    monkeypatch.setattr(
+        ops,
+        "prims_ts_partitioned_moe",
+        partial(ops.prims_ts_partitioned_moe, fuse_finalize=fuse_finalize),
+    )
 
     monkeypatch.delenv("DISABLE_LOCALITY_DOMAINS", raising=False)
     is_locality_domain_enabled.cache_clear()
@@ -198,7 +367,7 @@ def test_prims_ts_locality_matches_unpartitioned(nvfp4, situ, tokens, monkeypatc
     with torch.inference_mode():
         expected = baseline(x, logits)
         actual = candidate(x, logits)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        _assert_locality_close(actual, expected, fused=fuse_finalize)
         assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
         if not nvfp4:
             reference = _bf16_reference(x, logits, baseline.backend.routing_method, bank)
@@ -215,7 +384,7 @@ def test_prims_ts_locality_matches_unpartitioned(nvfp4, situ, tokens, monkeypatc
             logits.normal_()
             expected = baseline(x, logits)
             graph.replay()
-            torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+            _assert_locality_close(captured, expected, fused=fuse_finalize)
 
 
 @pytest.mark.skipif(get_sm_version() not in (100, 103), reason="requires Blackwell")
@@ -232,6 +401,49 @@ def test_prims_ts_bf16_blackwell_reference(tokens):
         actual.float() - reference
     ) / torch.linalg.vector_norm(reference)
     assert relative_error < 0.02
+
+
+@rubin
+@pytest.mark.parametrize("tokens", [1, 16, 1024])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_prims_ts_locality_fused_routing_graph(tokens, enable_pdl, monkeypatch):
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_prims_ts as backend
+    from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+
+    monkeypatch.delenv("DISABLE_LOCALITY_DOMAINS", raising=False)
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", str(int(enable_pdl)))
+    is_locality_domain_enabled.cache_clear()
+    # Exercise the production logits path with a small expert bank. Full K3
+    # geometry is covered separately by the model benchmark and SiTU test.
+    monkeypatch.setattr(backend, "_supports_kimi_routing", lambda *args: True)
+    bias = torch.randn(8, device="cuda", dtype=torch.float32) * 0.1
+    routing = DeepSeekV3MoeRoutingMethod(2, 1, 1, 1.0, lambda: bias)
+    (baseline, candidate), _ = make_moe_pair(True, True, routing_method=routing)
+    x = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16) * 0.5
+    logits = torch.randn(tokens, 8, device="cuda", dtype=torch.float32)
+    with torch.inference_mode(), AutoTuner.get().capture() as capture:
+        expected = baseline(x, logits)
+        actual = candidate(x, logits)
+    context = capture._captured_contexts[-1]
+    runner, inputs = context["runners"][0], context["inputs"]
+    assert runner.use_hybrid_routing and runner.fuse_finalize
+    assert runner.enable_pdl is enable_pdl
+    assert inputs[0] is not None and inputs[-1] is None and inputs[-2] is None
+    _assert_locality_close(actual, expected)
+    assert torch.count_nonzero(actual) > 0
+    with torch.inference_mode():
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = candidate(x, logits)
+        for _ in range(5):
+            x.normal_(std=0.5)
+            logits.normal_()
+            bias.normal_(std=0.1)
+            expected = baseline(x, logits)
+            graph.replay()
+            _assert_locality_close(captured, expected)
 
 
 @rubin
@@ -266,7 +478,7 @@ def test_prims_ts_locality_reuses_compiled_gemm(nvfp4, monkeypatch):
     with torch.inference_mode():
         actual = torch.empty_like(x)
         runner(inputs, output=actual)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        _assert_locality_close(actual, expected)
         assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
     for children in launches.values():
         assert len(children) == 2
@@ -334,7 +546,7 @@ def test_prims_ts_locality_empty_and_inactive_experts(nvfp4, monkeypatch):
             expected = torch.empty_like(x)
             runner(inputs, output=expected)
             graph.replay()
-            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            _assert_locality_close(output, expected)
             if expert_ids == [8, 9]:
                 assert torch.count_nonzero(output) == 0
             else:
@@ -365,7 +577,7 @@ def test_prims_ts_locality_concurrent_autotune(nvfp4, monkeypatch):
     assert runner.locality_runtime is not None
     assert len(runner.locality_weights) == 2
     assert not context["tuning_config"].use_cold_l2_cache
-    assert "locality_v2" in runner.unique_id()
+    assert "locality_execution_v4" in runner.unique_id()
     with torch.inference_mode(), autotune():
         actual = candidate(x, logits)
     torch.testing.assert_close(actual, expected, rtol=0.1, atol=0.1)
@@ -440,9 +652,9 @@ def test_prims_ts_rubin_nvfp4_large_batch_tactics(monkeypatch):
             assert "rubin_k128_v1" in runner.unique_id()
             actual = torch.empty_like(x)
             runner(inputs, tactic=(128, 0), output=actual)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            _assert_locality_close(actual, expected)
             assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
             with pytest.raises(ValueError, match="token tile of at most 128"):
                 runner(inputs, tactic=(256, 0))
             outputs.append(actual)
-    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+    _assert_locality_close(outputs[0], outputs[1])

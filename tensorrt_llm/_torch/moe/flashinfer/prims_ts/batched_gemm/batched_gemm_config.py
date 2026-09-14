@@ -53,6 +53,7 @@ class RouteImpl(IntEnum):
 class TileScheduler(IntEnum):
     STATIC = 0
     PERSISTENT = 1
+    STATIC_PERSISTENT = 2
 
 
 class ActKind(IntEnum):
@@ -194,13 +195,34 @@ class BatchedGemmConfig:
 
     # --- Shape ---
     cluster_m: int = 1
-    """Number of CTAs per cluster along the M axis.
+    """Number of CTAs per MMA instruction along the output-channel axis.
 
-    ``1`` disables clustering; ``2`` forms a 2-CTA cluster that multicasts the
-    shared operand over cluster-scoped mbarriers. Drives :attr:`has_cluster`,
+    ``1`` selects CTA_1; ``2`` selects CTA_2. The independent activation-reuse
+    dimension may make the physical cluster larger. Drives :attr:`has_cluster`,
     :attr:`cta_group`, and per-CTA B sizing (:attr:`split_b_across_ctas`).
     [FIXME]:attr:`use_max_tmem_overlap` requires ``cluster_m == 2``.
     """
+
+    merge_ab_pipeline: int = 0
+    """Share TMA arrival/release barriers for weights and routed activations."""
+
+    cluster_reuse_m: int = 1
+    """Independent output tiles sharing the routed activation tile via TMA.
+
+    The launch contains ``cluster_m * cluster_reuse_m`` CTAs, while each
+    tcgen05 operation still uses only ``cluster_m`` CTAs. This dimension
+    changes activation reuse without changing the MMA instruction shape.
+    """
+
+    @property
+    def cluster_size(self) -> int:
+        return self.cluster_m * self.cluster_reuse_m
+
+    @property
+    def activation_multicast_mask(self) -> int:
+        return sum(
+            1 << (index * self.cluster_m) for index in range(self.cluster_reuse_m)
+        )
 
     epi_tile_m: int = 128
     """Epilogue tile M (rows processed per epilogue stage), in elements.
@@ -635,10 +657,20 @@ class BatchedGemmConfig:
     output rows and quantization scales use the full output leading dimension.
     """
 
+    route_map_top_k: int = 1
+    """Divisor converting expanded route indices to input token indices."""
+
+    moe_finalize_top_k: int = 0
+    """Fuse weighted scatter-add into BF16 FC2 output when positive."""
+
+    max_active_clusters: int = 1
+    """Resident cluster budget for static persistent scheduling."""
+
     tile_scheduler: int = int(TileScheduler.STATIC)
     """CTA scheduling mode, as a :class:`TileScheduler` value.
 
-    ``STATIC`` (fixed hardware grid) or ``PERSISTENT`` (dynamic CLC work queue).
+    ``STATIC`` (one CTA per tile), ``PERSISTENT`` (dynamic CLC work queue),
+    or ``STATIC_PERSISTENT`` (arithmetic scheduling within a resident wave).
     See :attr:`is_persistent`.
     """
 
@@ -684,6 +716,13 @@ class BatchedGemmConfig:
     This matches TRT-LLM Gen's ``fuseUtccpWithUtcmma`` path and removes the
     otherwise separate CopySf tasks.  Unlike :attr:`use_max_tmem_overlap`, it
     does not require a tile-256 accumulator layout.
+    """
+
+    fuse_weight_sf: int = 0
+    """Fuse weight/SF TMA loads and weight-SF TMEM copy into MMA. ``0``/``1``.
+
+    The routed activation scales keep their separate layout-transform task.
+    This mixed path is used by the swap-AB TMA multicast FC1 schedule.
     """
 
     fuse_operand_sf_loads: int = 0
@@ -1499,6 +1538,10 @@ class BatchedGemmConfig:
         reduced per-warpgroup form when :attr:`uses_bf16_gated_tma_c_scratch` or
         :attr:`uses_deepseek_fp8_split_epilogue_tma_c_scratch`.
         """
+        if self.moe_finalize_top_k:
+            return (
+                self.tile_m * self.epi_tile_n * 2 * max(1, self.num_epilogue_warps // 4)
+            )
         if self.uses_deepseek_fp8_split_epilogue_tma_c_scratch:
             return (
                 (self.tile_m // 2)
@@ -1523,7 +1566,7 @@ class BatchedGemmConfig:
         overlaps the next tile's loads (:attr:`is_persistent` and
         ``num_stages_workid > 1``), or for :attr:`has_cast_a`.
         """
-        if self.uses_bf16_gated_tma_c_scratch:
+        if self.uses_bf16_gated_tma_c_scratch or self.moe_finalize_top_k:
             return False
         if self.is_persistent and self.num_stages_workid > 1:
             return False
@@ -1635,6 +1678,8 @@ class BatchedGemmConfig:
         """:class:`SfSmemToTmemCopy` strategy for A SF, from
         :attr:`smem_sfa_layout`.
         """
+        if self.fuse_weight_sf:
+            return int(SfSmemToTmemCopy.FUSED_UTCCP)
         return self._sf_smem_to_tmem_copy(self.smem_sfa_layout)
 
     @property
@@ -1664,6 +1709,7 @@ class BatchedGemmConfig:
         """
         if not (
             self.uses_unfused_tmem_sf_copy
+            and not self.fuse_weight_sf
             and self.is_swap_ab
             and self.is_persistent
             and self.has_cluster
@@ -1719,7 +1765,12 @@ class BatchedGemmConfig:
 
     @property
     def is_persistent(self) -> bool:
-        """True for dynamic persistent CLC scheduling (:attr:`tile_scheduler` == PERSISTENT)."""
+        """True when tasks iterate over multiple output tiles."""
+        return self.tile_scheduler != int(TileScheduler.STATIC)
+
+    @property
+    def is_clc_persistent(self) -> bool:
+        """True when a dedicated warp fetches CLC work IDs."""
         return self.tile_scheduler == int(TileScheduler.PERSISTENT)
 
     @property
@@ -1729,7 +1780,7 @@ class BatchedGemmConfig:
         Equals :attr:`is_persistent` and :attr:`use_work_throttle`; paces CLC work-id
         fetch so loads cannot outrun the mainloop.
         """
-        return self.is_persistent and bool(self.use_work_throttle)
+        return self.is_clc_persistent and bool(self.use_work_throttle)
 
     @property
     def num_work_throttle_producer_warps(self) -> int:
@@ -2070,7 +2121,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_cast_a_warps = 0
         cfg.num_gather_warps = 0
         cfg.num_sync_warps = 0
-        cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+        cfg.num_workid_warps = 1 if cfg.is_clc_persistent else 0
         _pack_warp_layout(
             cfg,
             WarpLayout(
@@ -2092,7 +2143,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_copy_sfb_warps = 0
         cfg.num_gather_warps = 0
         cfg.num_sync_warps = 0
-        cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+        cfg.num_workid_warps = 1 if cfg.is_clc_persistent else 0
 
         cfg.epilogue_warp_idx = 0
         if cfg.has_activation_side_effects:
@@ -2176,7 +2227,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
         cfg.num_sync_warps = 0
-        cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+        cfg.num_workid_warps = 1 if cfg.is_clc_persistent else 0
 
         c = cfg.cast_a_warp_idx_first + cfg.num_cast_a_warps
         if cfg.has_gather:
@@ -2290,7 +2341,7 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
     cfg.num_sync_warps = (
         1 if cfg.has_cluster and cfg.has_gather and not cfg.fuse_operand_sf_loads else 0
     )
-    cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+    cfg.num_workid_warps = 1 if cfg.is_clc_persistent else 0
     # CopySf warps copy scale factors to TMEM before the MMA. The compact low-N
     # SFB path needs the 4-warp STTM warpgroup; all bulk S2T paths use one warp
     # to stay inside the launch envelope.
@@ -2307,6 +2358,27 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
     else:
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
+
+    if cfg.fuse_weight_sf:
+        cfg.num_load_sfa_warps = 0
+        cfg.num_copy_sfa_warps = 0
+        _pack_warp_layout(
+            cfg,
+            WarpLayout(
+                (
+                    "epilogue",
+                    "copy_sfb",
+                    "load_b",
+                    "load_sfb",
+                    "load_a",
+                    "mma",
+                    "workid",
+                )
+            ),
+        )
+        cfg.num_load_sfa_warps = cfg.num_load_a_warps
+        cfg.load_sfa_warp_idx = cfg.load_a_warp_idx
+        return
 
     if cfg.fuse_operand_sf_loads:
         # Gen's high-throughput FC1 layout:
@@ -2614,16 +2686,34 @@ def validate_config(
     if cfg.tile_scheduler not in (
         int(TileScheduler.STATIC),
         int(TileScheduler.PERSISTENT),
+        int(TileScheduler.STATIC_PERSISTENT),
     ):
-        raise ValueError(
-            f"tile_scheduler must be STATIC or PERSISTENT, got {cfg.tile_scheduler}"
-        )
+        raise ValueError(f"Unsupported tile_scheduler={cfg.tile_scheduler}")
+
+    if cfg.max_active_clusters < 1:
+        raise ValueError("max_active_clusters must be positive")
 
     if cfg.cluster_m not in (1, 2):
         raise ValueError(
             "cluster_m must be 1 or 2; the kernel only implements CTA_1/CTA_2 "
             f"cluster paths, got {cfg.cluster_m}"
         )
+    if cfg.merge_ab_pipeline:
+        if not cfg.has_tma_route or cfg.num_stages_a != cfg.num_stages_b:
+            raise ValueError("Merged A/B requires TMA routing with equal stage counts")
+    if cfg.cluster_reuse_m not in (1, 2, 4):
+        raise ValueError("cluster_reuse_m must be 1, 2 or 4")
+    if cfg.cluster_reuse_m > 1:
+        if not cfg.is_swap_ab or not cfg.has_tma_route or cfg.is_clc_persistent:
+            raise ValueError("Activation multicast requires static swapAB TMA routing")
+        if problem_mnk is not None:
+            problem_m, _, _ = problem_mnk
+            if isinstance(problem_m, int) and problem_m % (
+                cfg.tile_m * cfg.cluster_size
+            ):
+                raise ValueError(
+                    "Activation multicast requires complete output-channel clusters"
+                )
 
     _validate_pipeline_stage_counts(cfg)
     _validate_output_store_dtype(cfg)
@@ -2798,6 +2888,22 @@ def validate_config(
         )
     if cfg.fuse_sf_copy_to_mma != 0 and not cfg.has_scale_factors:
         raise ValueError("fuse_sf_copy_to_mma requires block-scaled MMA operands")
+    _validate_binary_config_option("fuse_weight_sf", cfg.fuse_weight_sf)
+    if cfg.fuse_weight_sf and not (
+        cfg.is_nvfp4_mma
+        and cfg.is_swap_ab
+        and cfg.has_tma_route
+        and cfg.uses_tma_routed_sfs
+        and cfg.merge_ab_pipeline
+        and not cfg.is_clc_persistent
+        and cfg.uses_unfused_tmem_sf_copy
+        and cfg.smem_sfa_layout == int(SfLayout.R128c4)
+        and cfg.num_stages_smem_sfa == cfg.num_stages_a
+    ):
+        raise ValueError(
+            "fuse_weight_sf requires swap-AB NVFP4 TMA routing, merged A/B "
+            "stages, tiled weight scales, and separate activation-SF copies"
+        )
     _validate_binary_config_option(
         "fuse_operand_sf_loads",
         cfg.fuse_operand_sf_loads,
@@ -2847,7 +2953,7 @@ def validate_config(
         raise ValueError(
             f"use_clc_fast_drain must be 0 or 1, got {cfg.use_clc_fast_drain}"
         )
-    if cfg.use_clc_fast_drain and (not cfg.is_persistent or not cfg.use_early_exit):
+    if cfg.use_clc_fast_drain and (not cfg.is_clc_persistent or not cfg.use_early_exit):
         raise ValueError(
             "use_clc_fast_drain requires persistent scheduling and use_early_exit=1"
         )
@@ -2875,18 +2981,35 @@ def validate_config(
     if cfg.use_pdl not in (0, 1):
         raise ValueError(f"use_pdl must be 0 or 1, got {cfg.use_pdl}")
 
-    if (
-        not isinstance(cfg.output_num_partitions, int)
-        or cfg.output_num_partitions not in (1, 2)
-    ):
+    if cfg.route_map_top_k < 1 or cfg.moe_finalize_top_k < 0:
+        raise ValueError(
+            "Route-map divisor must be positive and finalize top-k nonnegative"
+        )
+    if cfg.moe_finalize_top_k:
+        if (
+            not cfg.is_swap_ab
+            or cfg.dtype_c_kind != int(DType.BF16)
+            or cfg.act_kind != int(ActKind.NONE)
+            or cfg.tile_m != 128
+            or cfg.use_tma_store
+            or cfg.use_tma_oob_opt
+            or cfg.route_map_top_k != cfg.moe_finalize_top_k
+        ):
+            raise ValueError(
+                "MoE finalize requires an ungated BF16 swapAB 128-channel tile and expanded routes"
+            )
+
+    if not isinstance(
+        cfg.output_num_partitions, int
+    ) or cfg.output_num_partitions not in (1, 2):
         raise ValueError("output_num_partitions must be 1 or 2")
     if cfg.output_num_partitions > 1:
         if not cfg.is_swap_ab:
             raise ValueError("Partitioned output requires swapAB")
         if cfg.use_tma_oob_opt:
             raise ValueError("Partitioned output requires ordinary TMA bounds")
-        if cfg.use_pdl:
-            raise ValueError("Partitioned output requires explicit stream synchronization")
+        # PDL is local to each stream. The caller must still join both FC1
+        # partitions before FC2 reads their shared full-width output.
 
     if cfg.do_pdl_wait_for_num_non_exiting_ctas not in (0, 1):
         raise ValueError(
@@ -2895,12 +3018,16 @@ def validate_config(
         )
 
     if cfg.routing_metadata_ready not in (0, 1):
-        raise ValueError(f"routing_metadata_ready must be 0 or 1, got {cfg.routing_metadata_ready}")
+        raise ValueError(
+            f"routing_metadata_ready must be 0 or 1, got {cfg.routing_metadata_ready}"
+        )
     if cfg.routing_metadata_ready:
         if not cfg.use_pdl or not cfg.use_early_exit:
             raise ValueError("routing_metadata_ready requires PDL and early exit")
         if cfg.do_pdl_wait_for_num_non_exiting_ctas:
-            raise ValueError("routing_metadata_ready excludes the kernel-entry routing wait")
+            raise ValueError(
+                "routing_metadata_ready excludes the kernel-entry routing wait"
+            )
 
     if cfg.do_pdl_wait_for_num_non_exiting_ctas:
         if not cfg.use_pdl:

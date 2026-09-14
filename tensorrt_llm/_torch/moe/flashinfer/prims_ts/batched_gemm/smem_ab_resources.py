@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,10 +45,13 @@ class SmemAResource(MemoryResource):
 
     cfg: Constexpr[BatchedGemmConfig]
     tma_a_desc: Any = None
+    weight_sf: Any = None
     smem_buf: Any = None
     _alloc_a: Constexpr[Optional[SmemAllocation]] = None
     desc_a_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_a_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    smem_sfa_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __post_init__(self):
         if self._alloc_a is None:
@@ -62,6 +66,9 @@ class SmemAResource(MemoryResource):
         self.smem_a_stage_ptr = TaskLocalVariable(
             dtype=Int64, default=Int64(0), docs="SMEM stage pointer for operand A."
         )
+
+        self.desc_a_s2t_base = TaskLocalVariable(dtype=Int64, default=Int64(0))
+        self.smem_sfa_stage_ptr = TaskLocalVariable(dtype=Int64, default=Int64(0))
 
     def get_smem_requirements(self):
         return [self._alloc_a]
@@ -80,15 +87,72 @@ class SmemAResource(MemoryResource):
     @cute.jit
     def init_load_state(self, stage_info: StageInfo) -> None:
         self._init_smem_state(stage_info)
+        if cutlass.const_expr(self.cfg.fuse_weight_sf):
+            self.weight_sf._init_smem_sfa(stage_info.context)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def init_mma_state(self, stage_info: StageInfo) -> None:
         self._init_smem_state(stage_info)
+        if cutlass.const_expr(self.cfg.fuse_weight_sf):
+            self.weight_sf._init_smem_sfa(stage_info.context)
+
+    @producer_work
+    @cute.jit
+    def load_a_sfa_tile(
+        self,
+        stage_info: StageInfo,
+        *,
+        coord_a_k: Int32,
+        coord_a_mn: Int32,
+        coord_a_l: Int32,
+        expert_idx: Int32,
+        mn_limit: Int32,
+        coord_sfa_k: Int32,
+        coord_sfa_mn: Int32,
+    ) -> None:
+        self._load_a_tile_impl(
+            stage_info,
+            coord_a_k=coord_a_k,
+            coord_a_mn=coord_a_mn,
+            coord_a_l=coord_a_l,
+            expert_idx=expert_idx,
+            mn_limit=mn_limit,
+        )
+        self.weight_sf._load_sfa_tile_impl(
+            stage_info,
+            coord_sfa_k=coord_sfa_k,
+            coord_sfa_mn=coord_sfa_mn,
+        )
+
+    @consumer_work(returns=(desc_a_s2t_base, smem_sfa_stage_ptr))
+    @cute.jit
+    def build_weight_sf_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
+        return self.weight_sf._build_sfa_s2t_desc_impl(stage_info)
 
     @producer_work
     @cute.jit
     def load_a_tile(
+        self,
+        stage_info: StageInfo,
+        *,
+        coord_a_k: cutlass.Int32,
+        coord_a_mn: cutlass.Int32,
+        coord_a_l: cutlass.Int32,
+        expert_idx: Int32,
+        mn_limit: Int32,
+    ) -> None:
+        self._load_a_tile_impl(
+            stage_info,
+            coord_a_k=coord_a_k,
+            coord_a_mn=coord_a_mn,
+            coord_a_l=coord_a_l,
+            expert_idx=expert_idx,
+            mn_limit=mn_limit,
+        )
+
+    @cute.jit
+    def _load_a_tile_impl(
         self,
         stage_info: StageInfo,
         *,
@@ -331,7 +395,7 @@ class SmemBResource(MemoryResource):
         split_b_across_ctas = cutlass.const_expr(self.cfg.split_b_across_ctas)
         if cutlass.const_expr(split_b_across_ctas and not self.cfg.use_tma_oob_opt_b):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            coord_b_mn = coord_b_mn + cta_rank * Int32(
+            coord_b_mn = coord_b_mn + (cta_rank % Int32(self.cfg.cluster_m)) * Int32(
                 self.cfg.tile_n // self.cfg.cluster_m
             )
         stage_base = self.smem_buf.subview(
@@ -392,7 +456,9 @@ class SmemBResource(MemoryResource):
             cta_row_offset = Int32(0)
             if cutlass.const_expr(split_b_across_ctas):
                 cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                cta_row_offset = cta_rank * Int32(self.cfg.tile_n // self.cfg.cluster_m)
+                cta_row_offset = (cta_rank % Int32(self.cfg.cluster_m)) * Int32(
+                    self.cfg.tile_n // self.cfg.cluster_m
+                )
             return self._tma_oob_coords(
                 coord_k, coord_mn, mn_limit, cta_row_offset, self.cfg.tile_n
             )
@@ -612,7 +678,9 @@ class SmemGatherResource(MemoryResource):
         if cutlass.const_expr(is_operand_b and self.cfg.has_cluster):
             tile_rows_per_cta = tile_rows // self.cfg.cluster_m
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
+            cta_row_offset = (cta_rank % Int32(self.cfg.cluster_m)) * Int32(
+                tile_rows_per_cta
+            )
         else:
             tile_rows_per_cta = tile_rows
             cta_row_offset = Int32(0)
@@ -662,7 +730,7 @@ class SmemGatherResource(MemoryResource):
             if is_valid:
                 self.routed_rows[ci] = self.route_map.load(
                     idx=logical_row, vector_size=1
-                )[0]
+                )[0] // Int32(self.cfg.route_map_top_k)
 
     @cute.jit
     def _local_tile_limit(self, raw_limit, token_tile, tile_rows):
@@ -723,7 +791,9 @@ class SmemGatherResource(MemoryResource):
         if cutlass.const_expr(is_operand_b and self.cfg.has_cluster):
             tile_rows_per_cta = tile_rows // self.cfg.cluster_m
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
+            cta_row_offset = (cta_rank % Int32(self.cfg.cluster_m)) * Int32(
+                tile_rows_per_cta
+            )
         else:
             tile_rows_per_cta = tile_rows
             cta_row_offset = Int32(0)
@@ -878,7 +948,16 @@ def _tma_gather4_cta(smem_dst, tma_desc, k_coord, row0, row1, row2, row3, barrie
 
 @cute.jit
 def _tma_gather4_cluster(
-    smem_dst, tma_desc, k_coord, row0, row1, row2, row3, barrier, multicast_mask
+    smem_dst,
+    tma_desc,
+    k_coord,
+    row0,
+    row1,
+    row2,
+    row3,
+    barrier,
+    multicast_mask,
+    cta_group_size: cutlass.Constexpr[int] = 2,
 ):
     """Emit cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4."""
     smem_ptr = smem_dst.data_ptr()
@@ -890,7 +969,7 @@ def _tma_gather4_cluster(
     mcast_mask_u16 = Uint16(multicast_mask)
     prims.inline_ptx_hl(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
-        ".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+        f".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::{cta_group_size}"
         " [{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], [{$r7}], {$r8};",
         read_only_args=[
             smem_ptr,
@@ -932,6 +1011,7 @@ def _tma_gather4_cluster_x4(
     row33,
     barrier,
     multicast_mask,
+    cta_group_size: cutlass.Constexpr[int] = 2,
 ):
     """Emit four cluster gather4 operations from one inline PTX block.
 
@@ -949,7 +1029,7 @@ def _tma_gather4_cluster_x4(
     mcast_mask_u16 = Uint16(multicast_mask)
     suffix = (
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
-        ".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
+        f".mbarrier::complete_tx::bytes.multicast::cluster.cta_group::{cta_group_size}"
     )
     prims.inline_ptx_hl(
         f"{suffix} [{{$r0}}], [{{$r4}}, "
@@ -1095,10 +1175,12 @@ class SmemTmaGatherResource(MemoryResource):
         return local_limit
 
     @cute.jit
-    def _load_routed_row_or_zero(self, route_idx, row_in_tile, tile_limit):
-        routed_row = Int32(0)
+    def _load_routed_row_or_oob(self, route_idx, row_in_tile, tile_limit):
+        routed_row = Int32(-1)
         if row_in_tile < tile_limit:
-            routed_row = self.route_map.load(idx=route_idx, vector_size=1)[0]
+            routed_row = self.route_map.load(idx=route_idx, vector_size=1)[0] // Int32(
+                self.cfg.route_map_top_k
+            )
         return cute.arch.make_warp_uniform(routed_row)
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -1112,7 +1194,9 @@ class SmemTmaGatherResource(MemoryResource):
         if cutlass.const_expr(self.cfg.has_cluster and is_b):
             tile_rows_per_cta = tile_rows // self.cfg.cluster_m
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
+            cta_row_offset = (cta_rank % Int32(self.cfg.cluster_m)) * Int32(
+                tile_rows_per_cta
+            )
         else:
             tile_rows_per_cta = tile_rows
             cta_row_offset = Int32(0)
@@ -1156,16 +1240,16 @@ class SmemTmaGatherResource(MemoryResource):
             if cutlass.const_expr(all_gathers_valid):
                 base_row = coord_mn + cta_row_offset + gi * Int32(4)
                 row_base = cta_row_offset + gi * Int32(4)
-                self.routed_rows[wi * 4] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4] = self._load_routed_row_or_oob(
                     base_row, row_base, tile_limit
                 )
-                self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_oob(
                     base_row + Int32(1), row_base + Int32(1), tile_limit
                 )
-                self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_oob(
                     base_row + Int32(2), row_base + Int32(2), tile_limit
                 )
-                self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_zero(
+                self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_oob(
                     base_row + Int32(3), row_base + Int32(3), tile_limit
                 )
             else:
@@ -1173,16 +1257,16 @@ class SmemTmaGatherResource(MemoryResource):
                 if is_valid_gather:
                     base_row = coord_mn + cta_row_offset + gi * Int32(4)
                     row_base = cta_row_offset + gi * Int32(4)
-                    self.routed_rows[wi * 4] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4] = self._load_routed_row_or_oob(
                         base_row, row_base, tile_limit
                     )
-                    self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4 + 1] = self._load_routed_row_or_oob(
                         base_row + Int32(1), row_base + Int32(1), tile_limit
                     )
-                    self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4 + 2] = self._load_routed_row_or_oob(
                         base_row + Int32(2), row_base + Int32(2), tile_limit
                     )
-                    self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_zero(
+                    self.routed_rows[wi * 4 + 3] = self._load_routed_row_or_oob(
                         base_row + Int32(3), row_base + Int32(3), tile_limit
                     )
 
@@ -1226,7 +1310,7 @@ class SmemTmaGatherResource(MemoryResource):
         # Rows to gather = tile dimension of the operand this resource replaces
         tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
         dtype_bits = self.cfg.dtype_b_smem_bits if is_b else self.cfg.dtype_a_smem_bits
-        if cutlass.const_expr(self.cfg.has_cluster):
+        if cutlass.const_expr(self.cfg.cluster_size > 1):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         if cutlass.const_expr(self.cfg.has_cluster and is_b):
             tile_rows_per_cta = tile_rows // self.cfg.cluster_m
@@ -1260,11 +1344,16 @@ class SmemTmaGatherResource(MemoryResource):
         warp_in_task = warp_idx - Int32(load_warp_idx)
         warp_in_task = cute.arch.make_warp_uniform(warp_in_task)
 
-        if prims.elect_sync():
+        is_multicast_source = cutlass.Boolean(True)
+        if cutlass.const_expr(self.cfg.cluster_reuse_m > 1):
+            is_multicast_source = cta_rank < Int32(self.cfg.cluster_m)
+        if prims.elect_sync() & is_multicast_source:
             for ki in cutlass.range_constexpr(num_k_boxes):
                 k_offset = coord_k + Int32(ki * box_k)
                 if cutlass.const_expr(
-                    self.cfg.has_cluster and all_gathers_valid and warp_batches == 4
+                    self.cfg.cluster_size > 1
+                    and all_gathers_valid
+                    and warp_batches == 4
                 ):
                     smem_offset0 = Int32(
                         ki * tile_rows_per_cta * 128
@@ -1274,7 +1363,9 @@ class SmemTmaGatherResource(MemoryResource):
                     smem_dst1 = stage_base.subview(smem_offset0 + smem_delta)
                     smem_dst2 = stage_base.subview(smem_offset0 + smem_delta * Int32(2))
                     smem_dst3 = stage_base.subview(smem_offset0 + smem_delta * Int32(3))
-                    mcast_mask = Int32(1) << cta_rank
+                    mcast_mask = Int32(self.cfg.activation_multicast_mask) << (
+                        cta_rank % Int32(self.cfg.cluster_m)
+                    )
                     _tma_gather4_cluster_x4(
                         smem_dst0,
                         smem_dst1,
@@ -1300,6 +1391,7 @@ class SmemTmaGatherResource(MemoryResource):
                         self.routed_rows[15],
                         stage_info.barrier,
                         mcast_mask,
+                        self.cfg.cluster_m,
                     )
                 else:
                     for wi in cutlass.range_constexpr(warp_batches):
@@ -1318,8 +1410,10 @@ class SmemTmaGatherResource(MemoryResource):
                             ) + gi * Int32(4 * 128)
                             smem_dst = stage_base.subview(smem_offset)
 
-                            if cutlass.const_expr(self.cfg.has_cluster):
-                                mcast_mask = Int32(1) << cta_rank
+                            if cutlass.const_expr(self.cfg.cluster_size > 1):
+                                mcast_mask = Int32(
+                                    self.cfg.activation_multicast_mask
+                                ) << (cta_rank % Int32(self.cfg.cluster_m))
                                 _tma_gather4_cluster(
                                     smem_dst,
                                     self.tma_desc,
@@ -1330,6 +1424,7 @@ class SmemTmaGatherResource(MemoryResource):
                                     r3,
                                     stage_info.barrier,
                                     mcast_mask,
+                                    self.cfg.cluster_m,
                                 )
                             else:
                                 _tma_gather4_cta(
@@ -1358,8 +1453,10 @@ class SmemTmaGatherResource(MemoryResource):
                                 ) + gi * Int32(4 * 128)
                                 smem_dst = stage_base.subview(smem_offset)
 
-                                if cutlass.const_expr(self.cfg.has_cluster):
-                                    mcast_mask = Int32(1) << cta_rank
+                                if cutlass.const_expr(self.cfg.cluster_size > 1):
+                                    mcast_mask = Int32(
+                                        self.cfg.activation_multicast_mask
+                                    ) << (cta_rank % Int32(self.cfg.cluster_m))
                                     _tma_gather4_cluster(
                                         smem_dst,
                                         self.tma_desc,
@@ -1370,6 +1467,7 @@ class SmemTmaGatherResource(MemoryResource):
                                         r3,
                                         stage_info.barrier,
                                         mcast_mask,
+                                        self.cfg.cluster_m,
                                     )
                                 else:
                                     _tma_gather4_cta(

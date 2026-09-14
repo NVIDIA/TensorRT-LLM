@@ -323,15 +323,32 @@ split; otherwise execution keeps the ordinary unpartitioned path.
 
 Both FC1 partitions write their channel ranges directly into one intermediate
 buffer, including NVFP4 scale-factor storage. After joining FC1, both FC2
-partitions consume that full intermediate and write their output ranges before
-one native weighted unpermutation. Each FC shares one compiled GEMM between
-its partitions: the launch adapter offsets output and scale-factor pointers
+partitions consume that full intermediate. By default, their epilogues apply
+the routing weights and bulk-reduce BF16 contributions directly into the final
+output, which is cleared before the partition streams start. This avoids the
+expanded FC2 output and separate weighted unpermutation. BF16 contribution
+rounding and accumulation order differ from the standalone FP32 reduction;
+correctness checks must account for this arithmetic difference. Each FC shares
+one compiled GEMM between its partitions: the launch adapter offsets output and scale-factor pointers
 while retaining the full output stride. Keep the partition ID out of the
 compile-time config; separate kernel specializations increase concurrent
-launch latency on Rubin. This path uses separated routing and
-explicit stream dependencies with PDL disabled. The ordinary Blackwell path
-retains its existing routing and PDL selection. PrimsTS NVFP4 locality supports
-SwiGLU and SiTU; BF16 locality supports SwiGLU.
+launch latency on Rubin. The Kimi NVFP4 path preserves ordinary execution's
+fused/hybrid routing and FP32 router logits. PDL follows `TRTLLM_ENABLE_PDL`;
+the per-FC fork/join dependencies still make both FC1 partitions complete
+before either FC2 partition reads the full intermediate. PrimsTS NVFP4 locality
+supports SwiGLU and SiTU; BF16 locality supports SwiGLU.
+
+FC1 TMA tactics can multicast the routed activation across two or four output
+tiles, independently of the one- or two-CTA MMA instruction. These tactics
+use static persistent scheduling with the actual locality-domain cluster
+budget, and a shared A/B TMA pipeline with one MMA wait/release
+per stage. They require complete output-channel clusters and token tiles of
+at most 128. Existing LDGSTS and CLC tactics remain available to the autotuner.
+For NVFP4 TMA-routed scale factors, one producer warp loads weights and their
+scales under the same A/B barrier. The MMA warp copies weight scales to TMEM,
+while a separate task transforms the routed activation scales.
+Gather descriptors describe the compact input token count, while routing
+metadata and intermediate buffers use the padded expert-sorted capacity.
 
 The autotuner measures both partitions together and includes the actual compute
 split in its cache identity. It retains the localized allocations during

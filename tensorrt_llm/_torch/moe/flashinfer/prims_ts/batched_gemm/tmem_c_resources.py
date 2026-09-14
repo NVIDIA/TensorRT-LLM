@@ -138,6 +138,10 @@ class TmemCResource(MemoryResource):
                 # no standalone TmemSf resources participate in the task graph
                 # (and therefore the allocator) on this path.
                 total_cols += self.cfg.tmem_sfa_cols + self.cfg.tmem_sfb_cols
+            if self.cfg.fuse_weight_sf:
+                # Keep the activation-SF ring at the existing offset. Weight
+                # scales are consumed in-order by this MMA task in slot zero.
+                total_cols += self.cfg.tmem_sfa_cols * self.cfg.num_stages_tmem_sfa
             self._alloc_c = TmemAllocation(
                 f"{self.name}_tmem_c",
                 num_columns=total_cols,
@@ -354,6 +358,30 @@ class TmemCResource(MemoryResource):
 
     @producer_work
     @cute.jit
+    def mma_weight_sf(
+        self,
+        stage_info: StageInfo,
+        *,
+        desc_a_mma_base: prims.Tcgen05SmemDesc,
+        smem_a_stage_ptr: Int64,
+        desc_b_mma_base: prims.Tcgen05SmemDesc,
+        smem_b_stage_ptr: Int64,
+        desc_a_s2t_base: prims.Tcgen05SmemDesc,
+        sfb_stage_col_offset: cutlass.Int32,
+        smem_sfa_stage_ptr: Int64,
+    ) -> None:
+        self._mma_impl(
+            stage_info,
+            desc_a_mma_base,
+            desc_b_mma_base,
+            smem_a_stage_ptr=smem_a_stage_ptr,
+            desc_a_s2t_base=desc_a_s2t_base,
+            sfa_stage_col_offset=Int32(0),
+            sfb_stage_col_offset=sfb_stage_col_offset,
+        )
+
+    @producer_work
+    @cute.jit
     def mma_separate_sf(
         self,
         stage_info: StageInfo,
@@ -530,11 +558,17 @@ class TmemCResource(MemoryResource):
 
         else:
             # FP4 path: block-scaled MMA
-            if cutlass.const_expr(not self.cfg.uses_unfused_tmem_sf_copy):
+            if cutlass.const_expr(
+                not self.cfg.uses_unfused_tmem_sf_copy or self.cfg.fuse_weight_sf
+            ):
                 # Fused S2T+MMA: do S2T copy here, then MMA.
                 s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
                 num_sfa_iters = self.cfg.tmem_sfa_cols // TMEM_SF_UTCCP_COLS_PER_COPY
-                num_sfb_iters = self.cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
+                num_sfb_iters = (
+                    0
+                    if self.cfg.fuse_weight_sf
+                    else self.cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
+                )
 
                 for s2t_idx in cutlass.range_constexpr(num_sfa_iters):
                     sfa_tmem_addr = (
@@ -655,7 +689,9 @@ class TmemCResource(MemoryResource):
                         64,
                         (256 * b_stage_bytes // self.cfg.tile_k) >> 4,
                     )
-                    desc_b_increment = k_major * desc_b_group_stride + k_minor * (self.cfg.mma_k // 32)
+                    desc_b_increment = k_major * desc_b_group_stride + k_minor * (
+                        self.cfg.mma_k // 32
+                    )
                 else:
                     desc_step = 2 if self.cfg.is_mx_mma else self.cfg.mma_k // 32
                     desc_a_increment = desc_step * kblock_idx

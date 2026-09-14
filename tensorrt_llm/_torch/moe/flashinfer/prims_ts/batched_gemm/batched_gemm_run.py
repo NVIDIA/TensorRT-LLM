@@ -1,4 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team.
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +31,9 @@ from ..cutlass_dsl import task_scheduling_scope
 
 
 def _cute_compile_options() -> str:
-    return os.environ.get("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2 --enable-tvm-ffi")
+    return os.environ.get(
+        "FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2 --enable-tvm-ffi"
+    )
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -3403,6 +3406,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_alpha_dp"],
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
+        io.get("token_final_scales_dp", io["c0_dp"]),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         io["cfg"],
@@ -3437,6 +3441,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_alpha_dp"],
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
+        io.get("token_final_scales_dp", io["c0_dp"]),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         stream,
@@ -3688,6 +3693,7 @@ def benchmark(
             gemm1_alpha_dp,
             gemm1_beta_dp,
             gemm1_clamp_limit_dp,
+            io.get("token_final_scales_dp", io["c0_dp"]),
             (M, N, K, L, num_tokens),
             io["launch_early_exit_max_token_ctas"],
             stream,

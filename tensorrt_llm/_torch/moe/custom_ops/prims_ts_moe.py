@@ -144,6 +144,13 @@ def _with_routing_profile_hook(config, weights, ids):
     return replace(config, inputs_pre_hook=prepare)
 
 
+@lru_cache(maxsize=32)
+def _full_device_cluster_budget(device_index: int, cluster_size: int) -> int:
+    import cutlass.utils
+
+    return cutlass.utils.HardwareInfo(device_id=device_index).get_max_active_clusters(cluster_size)
+
+
 def _run_prims_ts_moe(
     hidden_states: torch.Tensor,
     hidden_states_scale: Optional[torch.Tensor],
@@ -176,6 +183,7 @@ def _run_prims_ts_moe(
     use_hybrid_routing=False,
     locality_weights=None,
     locality_runtime=None,
+    fuse_finalize=False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = hidden_states.shape[0]
     has_precomputed_routing = topk_ids is not None
@@ -190,7 +198,9 @@ def _run_prims_ts_moe(
             hidden_states.new_empty((0, top_k) if topk_ids is None else (0,), dtype=torch.bfloat16),
         )
 
+    import cutlass
     from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import make_ptr
 
     from ..flashinfer.prims_ts.batched_gemm.batched_gemm_run import _launch_arg_tuple
     from ..flashinfer.prims_ts.moe.compile_cache import get_compiled_gemm
@@ -216,6 +226,9 @@ def _run_prims_ts_moe(
         intermediate_size = gemm2_weights.shape[-1] * 2
         weight_layout = int(WeightLayout.MajorK)
     is_nvfp4 = hidden_states.dtype == torch.uint8
+    cluster_reuse_m = 1
+    if isinstance(tactic, (tuple, list)) and len(tactic) == 3:
+        tactic, cluster_reuse_m = tuple(tactic[:2]), tactic[2]
     pair = _gemm_pair(
         num_tokens,
         top_k,
@@ -237,8 +250,13 @@ def _run_prims_ts_moe(
     # The externally visible workspace shape must not depend on the autotuned
     # tactic. Every vendored FP4 tactic uses a token tile of at most 256.
     _, fc2_rows = _workspace_rows(num_tokens, top_k, local_experts, 256, hidden_size)
-    gemm2_output = torch.empty(
-        (fc2_rows, hidden_size), dtype=torch.bfloat16, device=hidden_states.device
+    fuse_finalize = fuse_finalize and do_finalize
+    if fuse_finalize and topk_weights is not None and topk_weights.dtype != torch.bfloat16:
+        raise ValueError("Fused PrimsTS finalization requires BF16 routing weights.")
+    gemm2_output = (
+        output
+        if fuse_finalize
+        else torch.empty((fc2_rows, hidden_size), dtype=torch.bfloat16, device=hidden_states.device)
     )
     if use_hybrid_routing and not has_precomputed_routing and 1 < num_tokens < 1024:
         # K3's medium-batch native fused router is slower than noaux_tc plus
@@ -263,7 +281,7 @@ def _run_prims_ts_moe(
                 routed_scaling_factor,
                 tile_n,
                 routing_method_type,
-                True,
+                not fuse_finalize,
             )
         )
         topk_weights = fused_weights
@@ -277,7 +295,7 @@ def _run_prims_ts_moe(
                 local_expert_offset,
                 local_experts,
                 tile_n,
-                True,
+                not fuse_finalize,
             )
         )
         # Custom-op outputs must not alias the caller's precomputed weights.
@@ -329,12 +347,38 @@ def _run_prims_ts_moe(
     weights = locality_weights or (
         (gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale),
     )
+    if fuse_finalize:
+        # Every token starts at zero, including tokens with no local expert.
+        # The per-FC fork carries this dependency into both localized streams.
+        output.zero_()
     for fc, config in (("fc1", pair.fc1), ("fc2", pair.fc2)):
         if locality_runtime is not None:
             locality_runtime.fork()
         try:
             for partition_id, (w1, sf1, w2, sf2) in enumerate(weights):
                 options = dict(config.cfg.kwargs)
+                if fc == "fc1" and cluster_reuse_m > 1:
+                    options.update(
+                        cluster_reuse_m=cluster_reuse_m,
+                        merge_ab_pipeline=1,
+                        tile_scheduler=2,
+                        use_clc_fast_drain=0,
+                        use_work_throttle=0,
+                    )
+                    if (
+                        is_nvfp4
+                        and options["route_sfs_act"] == 1
+                        and not options["fuse_sf_copy_to_mma"]
+                        and not options["use_max_tmem_overlap"]
+                    ):
+                        options.update(
+                            fuse_weight_sf=1,
+                            num_stages_smem_sfa=options["num_stages_a"],
+                        )
+                if fuse_finalize:
+                    options["route_map_top_k"] = top_k
+                    if fc == "fc2":
+                        options.update(moe_finalize_top_k=top_k, use_tma_store=0, use_tma_oob_opt=0)
                 if is_nvfp4 and get_sm_version() == 107:
                     options["mma_k"] = 128
                 if locality_runtime is not None:
@@ -342,6 +386,22 @@ def _run_prims_ts_moe(
                         output_num_partitions=len(weights),
                         use_tma_oob_opt=0,
                     )
+                if options["tile_scheduler"] == 2:
+                    cluster_size = options["cluster_m"] * cluster_reuse_m
+                    context = (
+                        locality_runtime.partition_context(partition_id)
+                        if locality_runtime is not None
+                        else nullcontext()
+                    )
+                    with context:
+                        from ...locality_domain_utils import node_local_max_active_clusters
+
+                        full_limit = _full_device_cluster_budget(
+                            hidden_states.device.index, cluster_size
+                        )
+                        options["max_active_clusters"] = (
+                            node_local_max_active_clusters(full_limit) or full_limit
+                        )
                 prepared_config, config_hash = _materialize_gemm_config(
                     tuple(options.items()), hidden_size if fc == "fc1" else intermediate_size
                 )
@@ -386,6 +446,13 @@ def _run_prims_ts_moe(
                         output2_scale_scalar=output2_scale_scalar,
                     )
                 io = build_io(**io_kwargs)
+                if fuse_finalize and fc == "fc2":
+                    io["token_final_scales_dp"] = make_ptr(
+                        cutlass.BFloat16,
+                        topk_weights.data_ptr(),
+                        cutlass.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
                 partition_context = (
                     locality_runtime.partition_context(partition_id)
                     if locality_runtime is not None
@@ -400,8 +467,11 @@ def _run_prims_ts_moe(
         finally:
             if locality_runtime is not None:
                 locality_runtime.join()
-    if do_finalize:
+    if do_finalize and not fuse_finalize:
         torch.ops.trtllm.moe_unpermute_inplace(gemm2_output, output, expanded_map, topk_weights)
+    if fuse_finalize:
+        # Custom-op returns must not alias the caller-owned output buffer.
+        gemm2_output = output.new_empty((0, hidden_size))
     return gemm2_output, expanded_map, fused_weights
 
 
@@ -422,6 +492,7 @@ class PrimsTSMoERunner(TunableRunner):
         topk_group=None,
         routed_scaling_factor=None,
         use_hybrid_routing=False,
+        fuse_finalize=False,
     ):
         self.locality_weights = None
         self.locality_runtime = None
@@ -437,6 +508,7 @@ class PrimsTSMoERunner(TunableRunner):
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
         self.use_hybrid_routing = use_hybrid_routing
+        self.fuse_finalize = fuse_finalize
 
     def unique_id(self):
         identity = (
@@ -453,12 +525,13 @@ class PrimsTSMoERunner(TunableRunner):
             self.topk_group,
             self.routed_scaling_factor,
             self.use_hybrid_routing,
+            self.fuse_finalize,
         )
 
         if get_sm_version() == 107:
             identity += ("rubin_k128_v1",)
         if self.locality_runtime is not None:
-            return identity + ("locality_v2", self.locality_runtime.topology_identity())
+            return identity + ("locality_execution_v4", self.locality_runtime.topology_identity())
         return identity
 
     def should_profile_tactic_in_subprocess(
@@ -509,6 +582,35 @@ class PrimsTSMoERunner(TunableRunner):
             # results with Rubin's K=128 OMMA. Smaller tiles cover arbitrary
             # token counts; never autotune the unsupported variant.
             tactics = [tactic for tactic in tactics if tactic[0] <= 128]
+        if self.locality_runtime is not None:
+            output_axis = 2 if args.gemm1_weights.ndim == 4 else 1
+            output_channels = args.gemm1_weights.shape[output_axis]
+            for tactic in tuple(tactics):
+                if tactic[0] > 128:
+                    continue
+                pair = _gemm_pair(
+                    args.hidden_states.shape[0],
+                    self.top_k,
+                    args.gemm1_weights.shape[0],
+                    self.activation_type,
+                    args.hidden_states.dtype == torch.uint8,
+                    args.gemm1_alpha is not None,
+                    args.gemm1_beta is not None,
+                    args.gemm1_clamp_limit is not None,
+                    tuple(tactic),
+                    self.enable_pdl,
+                    is_bf16,
+                    extra.get("weight_layout", 0),
+                )
+                options = pair.fc1.cfg.kwargs
+                # TMA gather4 multicasts activations across output tiles;
+                # LDGSTS remains a separate, independently tuned alternative.
+                if options["route_act"] != 1:
+                    continue
+                for reuse in (2, 4):
+                    cluster_width = options["tile_m"] * options["cluster_m"] * reuse
+                    if output_channels % cluster_width == 0:
+                        tactics.append([*tactic, reuse])
         return tactics
 
     def forward(self, inputs, *, tactic=-1, output=None):
@@ -555,6 +657,7 @@ class PrimsTSMoERunner(TunableRunner):
             use_hybrid_routing=self.use_hybrid_routing,
             locality_weights=self.locality_weights,
             locality_runtime=self.locality_runtime,
+            fuse_finalize=self.fuse_finalize,
         )
 
 
@@ -664,6 +767,7 @@ def prims_ts_moe(
     runner, tactic = AutoTuner.get().choose_one(
         "trtllm::prims_ts_moe", [runner], tuning_config, inputs
     )
+    inputs[0] = router_logits
     inputs[-2:] = [topk_weights, topk_ids]
     return runner(inputs, tactic=tactic, output=output)
 

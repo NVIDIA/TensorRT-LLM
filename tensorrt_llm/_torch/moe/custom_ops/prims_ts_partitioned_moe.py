@@ -34,8 +34,8 @@ def prims_ts_partitioned_moe(
     output1_scale_scalar: torch.Tensor | None,
     output1_scale_gate_scalar: torch.Tensor | None,
     output2_scale_scalar: torch.Tensor | None,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
     num_experts: int,
     local_expert_offset: int,
     activation_type: int,
@@ -48,7 +48,18 @@ def prims_ts_partitioned_moe(
     topk_group: int | None = None,
     routed_scaling_factor: float | None = None,
     routing_bias: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    top_k: int = 0,
+    use_hybrid_routing: bool = False,
+    enable_pdl: bool = False,
+    fuse_finalize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (topk_ids is None) != (topk_weights is None):
+        raise ValueError("Precomputed routing requires both indices and weights.")
+    if topk_ids is not None:
+        top_k = topk_ids.shape[1]
+    elif router_logits is None or top_k <= 0:
+        raise ValueError("Fused routing requires logits and a positive top_k.")
     num_partitions = len(gemm1_weights)
     if num_partitions not in (1, 2) or len(gemm2_weights) != num_partitions:
         raise ValueError("PrimsTS requires one or two matching weight partitions")
@@ -64,12 +75,11 @@ def prims_ts_partitioned_moe(
     if hidden_states.shape[0] == 0:
         return (
             hidden_states.new_empty((0, output.shape[1]), dtype=torch.bfloat16),
-            topk_ids.new_empty((0, topk_ids.shape[1]), dtype=torch.int32),
-            topk_weights.new_empty((0,)),
+            hidden_states.new_empty((0, top_k), dtype=torch.int32),
+            hidden_states.new_empty((0, top_k) if topk_ids is None else (0,), dtype=torch.bfloat16),
         )
 
     local_experts = gemm1_weights[0].shape[0]
-    top_k = topk_ids.shape[1]
     tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
         num_experts // local_experts, tune_max_num_tokens, use_dp
     )
@@ -86,7 +96,7 @@ def prims_ts_partitioned_moe(
         topk_weights,
         topk_ids,
         hidden_states,
-        None,
+        router_logits,
         routing_method_type,
         tuning_config,
         top_k,
@@ -127,13 +137,15 @@ def prims_ts_partitioned_moe(
         local_expert_offset,
         activation_type,
         do_finalize,
-        False,
+        enable_pdl,
         use_dp,
         top_k,
         routing_method_type,
         n_group,
         topk_group,
         routed_scaling_factor,
+        use_hybrid_routing,
+        fuse_finalize and num_partitions > 1,
     )
     if num_partitions > 1:
         runner.locality_runtime = _runtime(hidden_states.device.index)
@@ -141,6 +153,7 @@ def prims_ts_partitioned_moe(
     runner, tactic = AutoTuner.get().choose_one(
         "trtllm::prims_ts_partitioned_moe", [runner], tuning_config, inputs
     )
+    inputs[0] = router_logits
     inputs[-2:] = [topk_weights, topk_ids]
     return runner(inputs, tactic=tactic, output=output)
 
@@ -173,14 +186,22 @@ def _prims_ts_partitioned_moe_fake(
     topk_group=None,
     routed_scaling_factor=None,
     routing_bias=None,
+    router_logits=None,
+    top_k=0,
+    use_hybrid_routing=False,
+    enable_pdl=False,
+    fuse_finalize=True,
 ):
     num_tokens, hidden_size = output.shape
-    top_k = topk_ids.shape[1]
+    if topk_ids is not None:
+        top_k = topk_ids.shape[1]
     rows = 0
-    if num_tokens:
+    if num_tokens and not (fuse_finalize and do_finalize and len(gemm1_weights) > 1):
         _, rows = _workspace_rows(num_tokens, top_k, gemm1_weights[0].shape[0], 256, hidden_size)
     return (
         hidden_states.new_empty((rows, hidden_size), dtype=torch.bfloat16),
-        topk_ids.new_empty((num_tokens, top_k), dtype=torch.int32),
-        topk_weights.new_empty((0,)),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32),
+        hidden_states.new_empty(
+            (num_tokens, top_k) if topk_ids is None else (0,), dtype=torch.bfloat16
+        ),
     )

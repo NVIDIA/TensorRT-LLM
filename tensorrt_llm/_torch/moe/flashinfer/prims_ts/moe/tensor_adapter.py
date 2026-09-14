@@ -23,7 +23,11 @@ from typing import Literal
 
 import torch
 
-from tensorrt_llm._torch.moe.flashinfer.tllm_enums import ActivationType, Fp8QuantizationType, WeightLayout
+from tensorrt_llm._torch.moe.flashinfer.tllm_enums import (
+    ActivationType,
+    Fp8QuantizationType,
+    WeightLayout,
+)
 
 
 _expert_scale_ones: dict[tuple[torch.device, int], torch.Tensor] = {}
@@ -87,7 +91,9 @@ def _partition_output_scale_ptr(
     """Offset a full swizzled SF allocation by whole output-channel groups."""
     if cfg.output_num_partitions == 1:
         return output_scale.data_ptr()
-    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
+    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        SfLayout,
+    )
 
     group_width = cfg.output_sf_block_size_c * 4
     if output_width % group_width:
@@ -190,12 +196,13 @@ def _logical_token_capacity(
     output_buf: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
     routed_token_capacity: int | None = None,
+    output_is_finalized: bool = False,
 ) -> int:
     if routed_token_capacity is not None:
         logical_capacity = int(routed_token_capacity)
         if logical_capacity <= 0:
             raise ValueError(f"{fc} logical token capacity is empty")
-        if int(output_buf.shape[0]) < logical_capacity:
+        if not output_is_finalized and int(output_buf.shape[0]) < logical_capacity:
             raise ValueError(
                 f"{fc} output buffer token capacity too small: need "
                 f"{logical_capacity}, got {output_buf.shape[0]}"
@@ -214,7 +221,7 @@ def _logical_token_capacity(
     logical_capacity = int(total_num_padded_tokens.reshape(-1)[0].item())
     if logical_capacity <= 0:
         raise ValueError(f"{fc} logical token capacity is empty")
-    if int(output_buf.shape[0]) < logical_capacity:
+    if not output_is_finalized and int(output_buf.shape[0]) < logical_capacity:
         raise ValueError(
             f"{fc} output buffer token capacity too small: need "
             f"{logical_capacity}, got {output_buf.shape[0]}"
@@ -449,6 +456,7 @@ def build_bf16_launch_io(
         output_buf=output_buf,
         total_num_padded_tokens=total_num_padded_tokens,
         routed_token_capacity=routed_token_capacity,
+        output_is_finalized=bool(cfg.moe_finalize_top_k),
     )
     if tile_idx.numel() != mn_limit.numel():
         raise ValueError(
@@ -511,9 +519,10 @@ def build_bf16_launch_io(
     logical_output_m = (
         m_val // 2 if cfg.is_swap_ab and cfg.has_gated_epilogue else m_val
     )
-    if output_buf.numel() < logical_output_m * n_val:
+    output_rows = num_tokens if cfg.moe_finalize_top_k else n_val
+    if output_buf.numel() < logical_output_m * output_rows:
         raise ValueError(
-            f"{fc} output buffer too small: need {logical_output_m * n_val}, "
+            f"{fc} output buffer too small: need {logical_output_m * output_rows}, "
             f"got {output_buf.numel()}"
         )
 
@@ -718,7 +727,9 @@ def build_nvfp4_launch_io(
     from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _runtime_config,
     )
-    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+    )
 
     if fc == "fc1":
         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
@@ -762,6 +773,7 @@ def build_nvfp4_launch_io(
         output_buf=output_buf,
         total_num_padded_tokens=total_num_padded_tokens,
         routed_token_capacity=routed_token_capacity,
+        output_is_finalized=bool(cfg.moe_finalize_top_k),
     )
     if not cfg.is_swap_ab:
         raise ValueError("NVFP4 MoE expects swapAB Prims-TS configs")
@@ -2128,7 +2140,9 @@ def build_fp8_per_tensor_launch_io(
     from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _runtime_config,
     )
-    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+    from tensorrt_llm._torch.moe.flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+    )
 
     if fc == "fc1":
         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)

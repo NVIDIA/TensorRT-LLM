@@ -89,6 +89,7 @@ class GmemCResource(MemoryResource):
     gemm1_alpha_tensor: Any = None
     gemm1_beta_tensor: Any = None
     gemm1_clamp_limit_tensor: Any = None
+    token_final_scales_tensor: Any = None
     per_token_sf_a_tensor: Any = None
     per_token_sf_b_tensor: Any = None
     route_map_view: Any = None
@@ -108,6 +109,8 @@ class GmemCResource(MemoryResource):
     gGemm1Alpha: Any = None
     gGemm1Beta: Any = None
     gGemm1ClampLimit: Any = None
+    gTokenFinalScales: Any = None
+    gFinalOutput: Any = None
     gPerTokenSfA: Any = None
     gPerTokenSfB: Any = None
     gTotalNumPaddedTokens: Any = None
@@ -169,6 +172,13 @@ class GmemCResource(MemoryResource):
             )
         if self.c_tensor is not None:
             self.gC = cutlass.make_array_view(self.c_tensor)
+            if self.cfg.moe_finalize_top_k:
+                self.gFinalOutput = cutlass.Array(
+                    self.gC.data_ptr(), dtype=cutlass.BFloat16
+                )
+                self.gTokenFinalScales = cutlass.make_array_view(
+                    self.token_final_scales_tensor
+                )
             if (
                 self.cfg.uses_fp4_output_quant
                 or self.cfg.uses_mxfp8_output_quant
@@ -783,7 +793,9 @@ class GmemCResource(MemoryResource):
                     elif cutlass.const_expr(
                         self.cfg.has_routed_act and self.route_map_view is not None
                     ):
-                        sf_idx = self.route_map_view.load(idx=m_row, vector_size=1)[0]
+                        sf_idx = self.route_map_view.load(idx=m_row, vector_size=1)[
+                            0
+                        ] // Int32(self.cfg.route_map_top_k)
                     if cutlass.const_expr(self.gPerTokenSfA is not None):
                         sf_val = Float32(
                             self.gPerTokenSfA.load(idx=sf_idx, vector_size=1)[0]
@@ -810,7 +822,7 @@ class GmemCResource(MemoryResource):
                         ):
                             token_idx = self.route_map_view.load(
                                 idx=token_idx, vector_size=1
-                            )[0]
+                            )[0] // Int32(self.cfg.route_map_top_k)
                         if cutlass.const_expr(self.gPerTokenSfB is not None):
                             sf_val = Float32(
                                 self.gPerTokenSfB.load(idx=token_idx, vector_size=1)[0]
@@ -2107,10 +2119,15 @@ class GmemCResource(MemoryResource):
         elif output_in_bounds:
             if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                 if token_in_bounds:
-                    flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                    flat_idx0 = (
+                        n_col * (output_m * Int32(self.cfg.output_num_partitions))
+                        + m_row0
+                    )
                     self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
             else:
-                flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                flat_idx0 = (
+                    n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                )
                 self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
 
         sf_packed = sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
@@ -2421,7 +2438,9 @@ class GmemCResource(MemoryResource):
                 ) + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
                 self.sCInt16.subview(smem_offset0 >> Int32(1)).store(packed)
         elif output_in_bounds:
-            flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+            flat_idx0 = (
+                n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+            )
             if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
                 packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
@@ -2454,6 +2473,71 @@ class GmemCResource(MemoryResource):
         return sf_packed
 
     @cute.jit
+    def _store_moe_finalize(self, values0, values1, tile_m, tile_n, call_idx, warp_idx):
+        """Scale FC2 fragments and bulk-reduce rows into their original tokens."""
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx & Int32(31)
+        group = cute.arch.make_warp_uniform(warp_idx // Int32(4))
+        warp = cute.arch.make_warp_uniform(warp_idx % Int32(4))
+        group_count = max(1, self.cfg.num_epilogue_warps // 4)
+        group_stride = Int32(self.cfg.tile_m * self.cfg.epi_tile_n)
+        token_offset = (call_idx * Int32(group_count) + group) * Int32(
+            self.cfg.epi_tile_n
+        )
+        channel_base = tile_m * Int32(self.cfg.tile_m)
+        row_base = warp * Int32(32) + (lane >> Int32(2)) * Int32(4)
+        col_base = (lane & Int32(3)) * Int32(2)
+        token_limit = self.tile_token_limit
+        for col_group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
+            for col_sub in cutlass.range_constexpr(2):
+                col = col_base + Int32(col_group * 8 + col_sub)
+                permuted_row = tile_n * Int32(self.cfg.tile_n) + token_offset + col
+                token_scale = Float32(0.0)
+                if token_offset + col < token_limit:
+                    expanded = self.route_map_view.load(
+                        idx=permuted_row, vector_size=1
+                    )[0]
+                    token_scale = Float32(
+                        self.gTokenFinalScales.load(idx=expanded, vector_size=1)[0]
+                    )
+                reg0 = col_group * 4 + col_sub
+                reg1 = reg0 + 2
+                alpha = self.tile_scale_c * token_scale
+                self.sC.store(
+                    (
+                        cutlass.BFloat16(values0[reg0] * alpha),
+                        cutlass.BFloat16(values0[reg1] * alpha),
+                        cutlass.BFloat16(values1[reg0] * alpha),
+                        cutlass.BFloat16(values1[reg1] * alpha),
+                    ),
+                    idx=group * group_stride + col * Int32(self.cfg.tile_m) + row_base,
+                    vector_size=4,
+                    alignment=8,
+                )
+        cute.arch.fence_view_async_shared()
+        cute.arch.fence_view_async_tmem_load()
+        barrier = Int32(7) + group
+        prims.barrier_cta_sync(barrier_id=barrier, thread_count=128)
+        row = warp * Int32(32) + lane
+        if (row < Int32(self.cfg.epi_tile_n)) & (token_offset + row < token_limit):
+            permuted_row = tile_n * Int32(self.cfg.tile_n) + token_offset + row
+            expanded = self.route_map_view.load(idx=permuted_row, vector_size=1)[0]
+            token = expanded // Int32(self.cfg.moe_finalize_top_k)
+            output_offset = (
+                token * (self.problem_m * Int32(self.cfg.output_num_partitions))
+                + channel_base
+            )
+            prims.cp_reduce_async_bulk_global_shared_cta(
+                self.gFinalOutput.subview(output_offset),
+                self.sC.subview(group * group_stride + row * Int32(self.cfg.tile_m)),
+                self.cfg.tile_m * 2,
+                noftz=True,
+            )
+            prims.cp_async_bulk_commit_group()
+            prims.cp_async_bulk_wait_group(0, read=True)
+        prims.barrier_cta_sync(barrier_id=barrier, thread_count=128)
+
+    @cute.jit
     def _store_swap_ab_16x256b(
         self, t2r_rmem, t2r_rmem_1, tile_coord_m, tile_coord_n, call_idx, warp_idx
     ):
@@ -2468,6 +2552,11 @@ class GmemCResource(MemoryResource):
         same register grouping and uses logical row-major ArrayView indices; the
         C tensor layout maps those indices to column-major physical memory.
         """
+        if cutlass.const_expr(self.cfg.moe_finalize_top_k):
+            self._store_moe_finalize(
+                t2r_rmem, t2r_rmem_1, tile_coord_m, tile_coord_n, call_idx, warp_idx
+            )
+            return
         t2r_slice1 = t2r_rmem_1
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -2944,7 +3033,11 @@ class GmemCResource(MemoryResource):
                                     output_in_bounds,
                                 )
                             else:
-                                flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                                flat_idx0 = (
+                                    n_col
+                                    * (output_m * Int32(self.cfg.output_num_partitions))
+                                    + m_row0
+                                )
                                 flat_idx1 = flat_idx0 + Int32(1)
                                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                                     if token_in_bounds & output_in_bounds:
@@ -3215,7 +3308,11 @@ class GmemCResource(MemoryResource):
 
                                 m_row = m_tile_base // Int32(2) + m_local_row
                                 n_col = n_tile_base + tmem_col_even
-                                flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
+                                flat_idx = (
+                                    n_col
+                                    * (output_m * Int32(self.cfg.output_num_partitions))
+                                    + m_row
+                                )
                                 token_in_bounds = (
                                     n_subtile_offset + tmem_col_even
                                 ) < token_limit
@@ -3326,7 +3423,10 @@ class GmemCResource(MemoryResource):
                             warpgroup_idx,
                         )
                         m_row1 = m_row0 + Int32(1)
-                        flat_idx0 = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row0
+                        flat_idx0 = (
+                            n_col * (output_m * Int32(self.cfg.output_num_partitions))
+                            + m_row0
+                        )
                         output_pair_in_bounds = (m_row1 < output_m) & (
                             n_col < self.problem_n
                         )
@@ -3492,7 +3592,11 @@ class GmemCResource(MemoryResource):
                             elif row_sub == 3:
                                 val_f32 = val3_vals[pair_idx]
                             val_out = self._to_output_value(val_f32 * q_scale)
-                            flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
+                            flat_idx = (
+                                n_col
+                                * (output_m * Int32(self.cfg.output_num_partitions))
+                                + m_row
+                            )
                             output_in_bounds = (m_row < output_m) & (
                                 n_col < self.problem_n
                             )
@@ -3636,7 +3740,11 @@ class GmemCResource(MemoryResource):
                                 val_f32 = val_f32 * val_f32
                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
                             val_out = self._to_output_value(val_f32)
-                            flat_idx = n_col * (output_m * Int32(self.cfg.output_num_partitions)) + m_row
+                            flat_idx = (
+                                n_col
+                                * (output_m * Int32(self.cfg.output_num_partitions))
+                                + m_row
+                            )
                             token_in_bounds = (
                                 n_subtile_offset + tmem_col
                             ) < token_limit

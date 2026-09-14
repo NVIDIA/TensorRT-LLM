@@ -22,6 +22,7 @@ Entry points:
 """
 
 import os
+from dataclasses import replace
 from typing import Any
 
 from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
@@ -42,6 +43,7 @@ if not hasattr(cuda, "create_tensor_map_tiled_from_tensor") and hasattr(
 
 from cutlass.experimental.task_scheduling.enums import (
     SignalingThreads,
+    PipelineGroupMode,
     TileSchedulerType,
 )
 from cutlass.experimental.task_scheduling.memory import (
@@ -57,6 +59,7 @@ from cutlass.experimental.task_scheduling.resources import (
     WorkQueue,
 )
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
+from cutlass.experimental.task_scheduling.pipeline_group import PipelineGroup
 
 from .batched_gemm_config import (
     BatchedGemmConfig,
@@ -106,6 +109,7 @@ from .batched_gemm_tasks import (
     create_load_b_task,
     create_gather_task,
     create_fused_load_a_sfa_task,
+    create_weight_sf_task,
     create_fused_gather_sfb_task,
     create_sync_task,
     create_load_sfa_task,
@@ -125,6 +129,24 @@ from cutlass.experimental import primitives as prims
 
 TMA_DIM_MAX = 1 << 31
 TMA_XLARGE_N = 1 << 35
+
+
+def _validate_weight_sf_tmem(cfg, allocator):
+    if cfg.fuse_weight_sf and allocator.total_tmem_columns != cfg.tmem_required_cols:
+        raise ValueError(
+            "Mixed scale-factor fusion has an inconsistent TMEM allocation: "
+            f"{allocator.total_tmem_columns} vs {cfg.tmem_required_cols} columns"
+        )
+
+
+def _merge_weight_sf_pipeline(smem_a, smem_b, smem_sfa):
+    # A owns weight values and scales: one producer state and one transaction
+    # count. The standalone SF object supplies only its layout and storage.
+    smem_sfa.pipeline_config = None
+    smem_a.weight_sf = smem_sfa
+    return PipelineGroup(
+        name="SmemAB", members=[smem_a, smem_b], mode=PipelineGroupMode.FusedMerge
+    )
 
 
 def _exhaustive_deadlock_race_check_enabled() -> bool:
@@ -174,7 +196,7 @@ def _require_even_divide(value: int, divisor: int, name: str) -> int:
 def _make_pipeline_configs(cfg):
     """Build all PipelineConfig objects for the given config."""
     one_thread = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-    cluster_vmnk = (cfg.cluster_m, 1, 1, 1)
+    cluster_vmnk = (cfg.cluster_m, cfg.cluster_reuse_m, 1, 1)
 
     smem_a_num_bytes = cfg.num_bytes_a_tma_per_stage * cfg.cluster_m
     smem_b_num_bytes = cfg.num_bytes_b_tma_per_stage * cfg.cluster_m
@@ -206,7 +228,7 @@ def _make_pipeline_configs(cfg):
                 cfg.cluster_m * max(1, cfg.num_load_a_warps),
                 "smem_a_num_bytes_per_warp_per_cta",
             )
-    if cfg.has_cluster:
+    if cfg.cluster_size > 1:
         if smem_a_num_bytes_per_warp_per_cta is None:
             smem_a_num_bytes_per_warp_per_cta = _require_even_divide(
                 smem_a_num_bytes,
@@ -219,6 +241,14 @@ def _make_pipeline_configs(cfg):
                 cfg.cluster_m * max(1, cfg.num_load_b_warps),
                 "smem_b_num_bytes_per_warp_per_cta",
             )
+
+    if cfg.fuse_weight_sf:
+        smem_a_num_bytes += cfg.num_bytes_sfa_per_stage * cfg.cluster_m
+        smem_a_num_bytes_per_warp_per_cta = smem_a_num_bytes // cfg.cluster_m
+    if cfg.merge_ab_pipeline:
+        # One warp in each producer task arms its share of the merged barrier.
+        smem_a_producer_signaling = routed_tma_producer_signaling
+        smem_b_producer_signaling = routed_tma_producer_signaling
 
     if cfg.has_cast_a:
         smem_a_cfg = PipelineConfig.create_tma_async_pipeline_cfg(
@@ -265,7 +295,7 @@ def _make_pipeline_configs(cfg):
                 cfg.cluster_m * max(1, cfg.num_load_sfa_warps),
                 "smem_sfa_num_bytes_per_warp_per_cta",
             )
-            if cfg.has_cluster
+            if cfg.cluster_size > 1
             else None
         )
         smem_sfa_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -275,6 +305,11 @@ def _make_pipeline_configs(cfg):
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_vmnk,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
+            producer_signaling_threads=(
+                routed_tma_producer_signaling
+                if cfg.fuse_weight_sf
+                else SignalingThreads.CtaLeader
+            ),
             advance_on_wait=cfg.has_cluster and cfg.use_combined_sfab_copy,
             num_bytes_per_warp_per_cta=smem_sfa_num_bytes_per_warp_per_cta,
         )
@@ -312,7 +347,7 @@ def _make_pipeline_configs(cfg):
     if cfg.has_scale_factors:
         smem_sfb_num_bytes = (
             cfg.num_bytes_sfb_per_stage * cfg.cluster_m
-            if cfg.has_cluster
+            if cfg.cluster_size > 1
             and not (
                 cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
                 and cfg.smem_sfb_layout == int(SfLayout.R8c4)
@@ -325,7 +360,7 @@ def _make_pipeline_configs(cfg):
                 cfg.cluster_m * max(1, cfg.num_load_sfb_warps),
                 "smem_sfb_num_bytes_per_warp_per_cta",
             )
-            if cfg.has_cluster
+            if cfg.cluster_size > 1
             and not (
                 cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
                 and cfg.smem_sfb_layout == int(SfLayout.R8c4)
@@ -628,7 +663,7 @@ def _make_pipeline_configs(cfg):
         )
 
     # CLC dynamic persistent WorkQueue pipeline
-    if cfg.is_persistent:
+    if cfg.is_clc_persistent:
         clc_cluster_scale = cfg.cluster_m if cfg.has_cluster else 1
         num_clc_consumer_threads = 0
 
@@ -707,6 +742,21 @@ def _make_pipeline_configs(cfg):
                 consumer_signaling_threads=SignalingThreads.CtaLeader,
             )
 
+    if cfg.cluster_reuse_m > 1:
+        # Each MMA group releases every peer's stage. Keep weights and scales
+        # live until all consumers of the shared activation have completed.
+        # This is the same cluster rendezvous as a merged A/B TMA pipeline.
+        from cutlass.experimental.task_scheduling.enums import PipelineType
+
+        for name, config in result.items():
+            if config.pipeline_type == PipelineType.TmaUmma:
+                result[name] = replace(
+                    config,
+                    consumer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, cfg.cluster_reuse_m
+                    ),
+                    mcast_mode_mn=(1, 1),
+                )
     return result
 
 
@@ -730,8 +780,8 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     tmem_c = TmemCResource(cfg=cfg, pipeline_config=pcfgs["tmem_c"], name="TmemC")
     gmem_c = GmemCResource(cfg=cfg, name="GmemC")
 
-    # WorkQueue — CLC persistent or static (non-persistent)
-    if cfg.is_persistent:
+    # WorkQueue — CLC or arithmetic static scheduling.
+    if cfg.is_clc_persistent:
         tile_sched_cfg = TileSchedulerConfig(
             tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
             tile_scheduler_params=None,
@@ -747,7 +797,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             tile_scheduler_type=TileSchedulerType.StaticPersistent,
             tile_scheduler_params=None,
         )
-        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
+        work_queue = BatchedGemmWorkQueue(
+            tile_scheduler_config=tile_sched_cfg, cfg=cfg, name="WorkQueue"
+        )
 
     work_throttle = None
     if cfg.use_work_throttle_barrier:
@@ -762,6 +814,8 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         else None
     )
     pdl_launch_resource = PdlLaunchBarrier(name="PdlLaunch") if cfg.use_pdl else None
+
+    smem_ab = None
 
     # Tasks: LoadA/LoadB (or Gather replacing one of them), MMA, Epilogue
     proxy_cluster = None
@@ -839,7 +893,18 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             _operand="b" if cfg.is_swap_ab else "a",
             name="SmemTmaGather",
         )
-        if cfg.is_swap_ab:
+        if cfg.merge_ab_pipeline and not cfg.fuse_weight_sf:
+            smem_ab = PipelineGroup(
+                name="SmemAB",
+                members=[smem_a, smem_tma_gather]
+                if cfg.is_swap_ab
+                else [smem_tma_gather, smem_b],
+                mode=PipelineGroupMode.FusedMerge,
+            )
+        if cfg.fuse_weight_sf:
+            smem_b = smem_tma_gather
+            task_list = []
+        elif cfg.is_swap_ab:
             load_a = create_load_a_task(
                 cfg,
                 gmem_a,
@@ -960,6 +1025,8 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 cfg=cfg, pipeline_config=pcfgs["smem_sfb"], name="SmemSfB"
             )
 
+        if cfg.fuse_weight_sf:
+            smem_ab = _merge_weight_sf_pipeline(smem_a, smem_b, smem_sfa)
         if cfg.use_combined_sfab_copy:
             tmem_sfab = TmemSfABResource(
                 cfg=cfg, pipeline_config=pcfgs["tmem_sfab"], name="TmemSfAb"
@@ -1011,7 +1078,31 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             tmem_sfa = TmemSfAResource(cfg=cfg, pipeline_config=None, name="TmemSfA")
             tmem_sfb = TmemSfBResource(cfg=cfg, pipeline_config=None, name="TmemSfB")
 
-        if cfg.fuse_operand_sf_loads:
+        if cfg.fuse_weight_sf:
+            task_list = [
+                create_weight_sf_task(
+                    cfg, gmem_a, smem_a, gmem_sfa, work_queue, num_k_tiles
+                ),
+                create_load_b_task(
+                    cfg,
+                    gmem_b,
+                    smem_b,
+                    work_queue,
+                    num_k_tiles,
+                    pdl_wait_resource=pdl_wait_resource,
+                    pdl_launch_resource=pdl_launch_resource,
+                ),
+                create_load_sfb_task(
+                    cfg,
+                    gmem_sfb,
+                    smem_sfb,
+                    work_queue,
+                    num_k_tiles,
+                    pdl_wait_resource=pdl_wait_resource,
+                    pdl_launch_resource=pdl_launch_resource,
+                ),
+            ]
+        elif cfg.fuse_operand_sf_loads:
             task_list = [
                 create_fused_load_a_sfa_task(
                     cfg,
@@ -1063,13 +1154,15 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 )
                 task_list.append(copy_sfab)
             else:
-                copy_sfa = create_copy_sfa_task(
-                    cfg, smem_sfa, tmem_sfa, work_queue, num_k_tiles
-                )
+                copy_sfa = None
+                if not cfg.fuse_weight_sf:
+                    copy_sfa = create_copy_sfa_task(
+                        cfg, smem_sfa, tmem_sfa, work_queue, num_k_tiles
+                    )
                 copy_sfb = create_copy_sfb_task(
                     cfg, smem_sfb, tmem_sfb, work_queue, num_k_tiles
                 )
-                task_list += [copy_sfa, copy_sfb]
+                task_list += [copy_sfb] if cfg.fuse_weight_sf else [copy_sfa, copy_sfb]
 
     # MMA task
     if cfg.has_cast_a:
@@ -1110,7 +1203,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 work_queue,
                 num_k_tiles,
                 proxy_cluster=proxy_cluster,
-                tmem_sfa=tmem_sfa,
+                tmem_sfa=None if cfg.fuse_weight_sf else tmem_sfa,
                 tmem_sfb=tmem_sfb,
             )
     elif cfg.has_scale_factors:
@@ -1166,7 +1259,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         pad = create_padding_task(cfg, work_queue, num_k_tiles)
         task_list.append(pad)
     # WorkScheduleTask (CLC persistent only)
-    if cfg.is_persistent:
+    if cfg.is_clc_persistent:
         workid = create_workid_task(
             cfg,
             work_queue,
@@ -1182,7 +1275,10 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         gmem_c: [tmem_c],
     }
     if cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
-        resource_dependency_graph[smem_sfa] = [gmem_sfa]
+        if cfg.fuse_weight_sf:
+            resource_dependency_graph[smem_a] = [gmem_a, gmem_sfa]
+        else:
+            resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
         ab_dependencies = [smem_a, smem_b]
         if proxy_cluster is not None:
@@ -1192,12 +1288,16 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             resource_dependency_graph[tmem_sfab] = [smem_sfa, smem_sfb]
             resource_dependency_graph[tmem_c] = ab_dependencies + [tmem_sfab]
         else:
-            resource_dependency_graph[tmem_sfa] = [smem_sfa]
+            if not cfg.fuse_weight_sf:
+                resource_dependency_graph[tmem_sfa] = [smem_sfa]
             resource_dependency_graph[tmem_sfb] = [smem_sfb]
-            resource_dependency_graph[tmem_c] = ab_dependencies + [
-                tmem_sfa,
-                tmem_sfb,
-            ]
+            resource_dependency_graph[tmem_c] = (
+                ab_dependencies
+                + [
+                    tmem_sfb,
+                ]
+                + ([] if cfg.fuse_weight_sf else [tmem_sfa])
+            )
     elif cfg.has_scale_factors:
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
@@ -1265,6 +1365,8 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    if cutlass.const_expr(smem_ab is not None):
+        smem_allocator.add_pipeline_group(smem_ab)
     if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
         # Alias SmemA/B with GmemC scratch to save SMEM when the generated
         # schedule does not require a disjoint epilogue staging window.
@@ -1288,9 +1390,11 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         if cfg.use_combined_sfab_copy:
             tmem_allocator.add_resource(tmem_sfab)
         else:
-            tmem_allocator.add_resource(tmem_sfa)
+            if not cfg.fuse_weight_sf:
+                tmem_allocator.add_resource(tmem_sfa)
             tmem_allocator.add_resource(tmem_sfb)
     tmem_allocator.compute_layout()
+    _validate_weight_sf_tmem(cfg, tmem_allocator)
 
     return task_list, resource_dependency_graph, smem_allocator, tmem_allocator
 
@@ -1373,6 +1477,7 @@ def _batched_gemm_kernel_bf16_body(
     gemm1_alpha_tensor: cute.Tensor,
     gemm1_beta_tensor: cute.Tensor,
     gemm1_clamp_limit_tensor: cute.Tensor,
+    token_final_scales_tensor: cute.Tensor,
     per_token_sf_a_tensor: cute.Tensor,
     per_token_sf_b_tensor: cute.Tensor,
     tile_idx_tensor: cute.Tensor,
@@ -1545,6 +1650,12 @@ def _batched_gemm_kernel_bf16_body(
             name="SmemB",
         )
 
+    smem_ab = None
+    if cutlass.const_expr(cfg.merge_ab_pipeline and not cfg.fuse_weight_sf):
+        smem_ab = PipelineGroup(
+            name="SmemAB", members=[smem_a, smem_b], mode=PipelineGroupMode.FusedMerge
+        )
+
     tmem_c = TmemCResource(cfg=cfg, pipeline_config=pcfgs["tmem_c"], name="TmemC")
     tmem_sfa = None
     tmem_sfb = None
@@ -1686,6 +1797,8 @@ def _batched_gemm_kernel_bf16_body(
             )
         # TmemSf resources: when SF is routed, separate CopySf tasks need pipelines.
         # When not routed, S2T is fused in MMA (pipeline_config=None).
+        if cutlass.const_expr(cfg.fuse_weight_sf):
+            smem_ab = _merge_weight_sf_pipeline(smem_a, smem_b, smem_sfa)
         if cutlass.const_expr(cfg.use_combined_sfab_copy):
             tmem_sfab = TmemSfABResource(
                 cfg=cfg,
@@ -1775,6 +1888,7 @@ def _batched_gemm_kernel_bf16_body(
         gemm1_alpha_tensor=gemm1_alpha_tensor,
         gemm1_beta_tensor=gemm1_beta_tensor,
         gemm1_clamp_limit_tensor=gemm1_clamp_limit_tensor,
+        token_final_scales_tensor=token_final_scales_tensor,
         per_token_sf_a_tensor=per_token_sf_a_tensor,
         per_token_sf_b_tensor=per_token_sf_b_tensor,
         route_map_view=cutlass.make_array_view(route_map_tensor),
@@ -1786,8 +1900,8 @@ def _batched_gemm_kernel_bf16_body(
         name="GmemC",
     )
 
-    # WorkQueue — CLC persistent or static (non-persistent)
-    if cutlass.const_expr(cfg.is_persistent):
+    # WorkQueue — CLC or arithmetic static scheduling.
+    if cutlass.const_expr(cfg.is_clc_persistent):
         if cutlass.const_expr(
             cfg.use_early_exit
             and (not cfg.use_pdl or _pdl_wait_completed_before_tasks(cfg))
@@ -1819,7 +1933,12 @@ def _batched_gemm_kernel_bf16_body(
                 tile_scheduler_params=tile_sched_params,
             )
         )
-        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
+        work_queue = BatchedGemmWorkQueue(
+            tile_scheduler_config=tile_sched_cfg,
+            cfg=cfg,
+            num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
+            name="WorkQueue",
+        )
 
     work_throttle = None
     if cutlass.const_expr(cfg.use_work_throttle_barrier):
@@ -1842,6 +1961,8 @@ def _batched_gemm_kernel_bf16_body(
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    if cutlass.const_expr(smem_ab is not None):
+        smem_allocator.add_pipeline_group(smem_ab)
     if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
         alloc_a = smem_a._alloc if hasattr(smem_a, "_alloc") else smem_a._alloc_a
         alloc_b = smem_b._alloc if hasattr(smem_b, "_alloc") else smem_b._alloc_b
@@ -1871,9 +1992,11 @@ def _batched_gemm_kernel_bf16_body(
         if cutlass.const_expr(cfg.use_combined_sfab_copy):
             tmem_allocator.add_resource(tmem_sfab)
         else:
-            tmem_allocator.add_resource(tmem_sfa)
+            if cutlass.const_expr(not cfg.fuse_weight_sf):
+                tmem_allocator.add_resource(tmem_sfa)
             tmem_allocator.add_resource(tmem_sfb)
     tmem_allocator.compute_layout()
+    _validate_weight_sf_tmem(cfg, tmem_allocator)
 
     pdl_wait_completed_before_tasks = cutlass.const_expr(
         _pdl_wait_completed_before_tasks(cfg)
@@ -1974,20 +2097,25 @@ def _batched_gemm_kernel_bf16_body(
             )
             task_list.append(sync)
     else:
-        load_a = create_load_a_task(
-            cfg,
-            gmem_a,
-            smem_a,
-            work_queue,
-            k_tile_cnt,
-            work_throttle=work_throttle,
-            pdl_wait_resource=(
-                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
-            ),
-            pdl_launch_resource=(
-                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
-            ),
-        )
+        if cutlass.const_expr(cfg.fuse_weight_sf):
+            load_a = create_weight_sf_task(
+                cfg, gmem_a, smem_a, gmem_sfa, work_queue, k_tile_cnt
+            )
+        else:
+            load_a = create_load_a_task(
+                cfg,
+                gmem_a,
+                smem_a,
+                work_queue,
+                k_tile_cnt,
+                work_throttle=work_throttle,
+                pdl_wait_resource=(
+                    None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
+                ),
+                pdl_launch_resource=(
+                    None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
+                ),
+            )
         load_b = create_load_b_task(
             cfg,
             gmem_b,
@@ -2028,19 +2156,20 @@ def _batched_gemm_kernel_bf16_body(
         task_list += [load_sfa, cast_a]
 
     if cutlass.const_expr(cfg.has_scale_factors and not cfg.fuse_operand_sf_loads):
-        load_sfa = create_load_sfa_task(
-            cfg,
-            gmem_sfa,
-            smem_sfa,
-            work_queue,
-            k_tile_cnt,
-            pdl_wait_resource=(
-                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
-            ),
-            pdl_launch_resource=(
-                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
-            ),
-        )
+        if cutlass.const_expr(not cfg.fuse_weight_sf):
+            load_sfa = create_load_sfa_task(
+                cfg,
+                gmem_sfa,
+                smem_sfa,
+                work_queue,
+                k_tile_cnt,
+                pdl_wait_resource=(
+                    None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
+                ),
+                pdl_launch_resource=(
+                    None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
+                ),
+            )
         load_sfb = create_load_sfb_task(
             cfg,
             gmem_sfb,
@@ -2054,7 +2183,10 @@ def _batched_gemm_kernel_bf16_body(
                 pdl_launch_resource if cutlass.const_expr(cfg.is_swap_ab) else None
             ),
         )
-        task_list += [load_sfa, load_sfb]
+        if cutlass.const_expr(cfg.fuse_weight_sf):
+            task_list += [load_sfb]
+        else:
+            task_list += [load_sfa, load_sfb]
         if cutlass.const_expr(cfg.uses_unfused_tmem_sf_copy):
             # Separate CopySf tasks for SMEM→TMEM when SF is routed.
             if cutlass.const_expr(cfg.use_combined_sfab_copy):
@@ -2063,13 +2195,19 @@ def _batched_gemm_kernel_bf16_body(
                 )
                 task_list.append(copy_sfab)
             else:
-                copy_sfa = create_copy_sfa_task(
-                    cfg, smem_sfa, tmem_sfa, work_queue, k_tile_cnt
-                )
+                copy_sfa = None
+                if cutlass.const_expr(not cfg.fuse_weight_sf):
+                    copy_sfa = create_copy_sfa_task(
+                        cfg, smem_sfa, tmem_sfa, work_queue, k_tile_cnt
+                    )
                 copy_sfb = create_copy_sfb_task(
                     cfg, smem_sfb, tmem_sfb, work_queue, k_tile_cnt
                 )
-                task_list += [copy_sfa, copy_sfb]
+                task_list += (
+                    [copy_sfb]
+                    if cutlass.const_expr(cfg.fuse_weight_sf)
+                    else [copy_sfa, copy_sfb]
+                )
 
     # With separate CopySf: MMA consumes TmemSf, not SmemSf.
     # Otherwise MMA consumes SmemSf and does fused S2T in producer_work.
@@ -2088,7 +2226,8 @@ def _batched_gemm_kernel_bf16_body(
     tmem_sfa_for_mma = (
         tmem_sfa
         if cutlass.const_expr(
-            cfg.has_scale_factors
+            not cfg.fuse_weight_sf
+            and cfg.has_scale_factors
             and cfg.uses_unfused_tmem_sf_copy
             and not cfg.use_combined_sfab_copy
         )
@@ -2146,7 +2285,7 @@ def _batched_gemm_kernel_bf16_body(
         pad = create_padding_task(cfg, work_queue, k_tile_cnt)
         task_list.append(pad)
     # WorkScheduleTask (CLC persistent only)
-    if cutlass.const_expr(cfg.is_persistent):
+    if cutlass.const_expr(cfg.is_clc_persistent):
         workid = create_workid_task(
             cfg,
             work_queue,
@@ -2161,7 +2300,10 @@ def _batched_gemm_kernel_bf16_body(
         gmem_c: [tmem_c],
     }
     if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
-        resource_dependency_graph[smem_sfa] = [gmem_sfa]
+        if cutlass.const_expr(cfg.fuse_weight_sf):
+            resource_dependency_graph[smem_a] = [gmem_a, gmem_sfa]
+        else:
+            resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
         ab_dependencies = [smem_a, smem_b]
         if cutlass.const_expr(
@@ -2173,14 +2315,18 @@ def _batched_gemm_kernel_bf16_body(
             resource_dependency_graph[tmem_sfab] = [smem_sfa, smem_sfb]
             resource_dependency_graph[tmem_c] = ab_dependencies + [tmem_sfab]
         else:
-            resource_dependency_graph[tmem_sfa] = [smem_sfa]
+            if cutlass.const_expr(not cfg.fuse_weight_sf):
+                resource_dependency_graph[tmem_sfa] = [smem_sfa]
             resource_dependency_graph[tmem_sfb] = [smem_sfb]
             # Separate CopySf: TmemC depends on the A/B readiness proxy (when
             # clustered gather is active) and both TMEM scale-factor rings.
-            resource_dependency_graph[tmem_c] = ab_dependencies + [
-                tmem_sfa,
-                tmem_sfb,
-            ]
+            resource_dependency_graph[tmem_c] = (
+                ab_dependencies
+                + [
+                    tmem_sfb,
+                ]
+                + ([] if cutlass.const_expr(cfg.fuse_weight_sf) else [tmem_sfa])
+            )
     elif cutlass.const_expr(cfg.has_scale_factors):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
@@ -2302,7 +2448,7 @@ def _batched_gemm_kernel_bf16_body(
             tmem_ptr_i32.data_ptr(),
             cutlass.AddressSpace.smem,
         )
-        cluster_vmnk = cute.make_layout((cfg.cluster_m, 1, 1, 1))
+        cluster_vmnk = cute.make_layout((cfg.cluster_m, cfg.cluster_reuse_m, 1, 1))
         pipeline.pipeline_init_arrive(cluster_vmnk, is_relaxed=True)
         pipeline.pipeline_init_wait(cluster_vmnk)
 
@@ -2396,6 +2542,7 @@ def batched_gemm_kernel_bf16(
     gemm1_alpha_tensor: cute.Tensor,
     gemm1_beta_tensor: cute.Tensor,
     gemm1_clamp_limit_tensor: cute.Tensor,
+    token_final_scales_tensor: cute.Tensor,
     per_token_sf_a_tensor: cute.Tensor,
     per_token_sf_b_tensor: cute.Tensor,
     tile_idx_tensor: cute.Tensor,
@@ -2445,6 +2592,7 @@ def batched_gemm_kernel_bf16(
                 gemm1_alpha_tensor,
                 gemm1_beta_tensor,
                 gemm1_clamp_limit_tensor,
+                token_final_scales_tensor,
                 per_token_sf_a_tensor,
                 per_token_sf_b_tensor,
                 tile_idx_tensor,
@@ -2479,6 +2627,7 @@ def batched_gemm_kernel_bf16(
             gemm1_alpha_tensor,
             gemm1_beta_tensor,
             gemm1_clamp_limit_tensor,
+            token_final_scales_tensor,
             per_token_sf_a_tensor,
             per_token_sf_b_tensor,
             tile_idx_tensor,
@@ -2527,6 +2676,7 @@ def gemm(
     gemm1_alpha_raw_ptr,
     gemm1_beta_raw_ptr,
     gemm1_clamp_limit_raw_ptr,
+    token_final_scales_raw_ptr,
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
@@ -2567,13 +2717,18 @@ def gemm(
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
         a_layout = cute.make_layout(
-            (cute.assume(k, 32), m), stride=(1, cute.assume(k, 32))
+            (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
         a_layout = cute.make_layout(
             (64, m, cute.assume(k // 64, 1), num_experts_dim),
-            stride=(1, cute.assume(k, 32), 64, cute.assume(cutlass.Int64(m) * cutlass.Int64(k), 32)),
+            stride=(
+                1,
+                cute.assume(k, 32),
+                64,
+                cute.assume(cutlass.Int64(m) * cutlass.Int64(k), 32),
+            ),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
@@ -2585,7 +2740,11 @@ def gemm(
     else:
         a_layout = cute.make_layout(
             (cute.assume(k, 32), m, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(cutlass.Int64(m) * cutlass.Int64(k), 32)),
+            stride=(
+                1,
+                cute.assume(k, 32),
+                cute.assume(cutlass.Int64(m) * cutlass.Int64(k), 32),
+            ),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
 
@@ -2602,7 +2761,7 @@ def gemm(
         )
     elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
         b_layout = cute.make_layout(
-            (cute.assume(k, 32), n), stride=(1, cute.assume(k, 32))
+            (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
     elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
         b_layout = cute.make_layout(
@@ -2612,7 +2771,11 @@ def gemm(
     else:
         b_layout = cute.make_layout(
             (cute.assume(k, 32), n, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(cutlass.Int64(n) * cutlass.Int64(k), 32)),
+            stride=(
+                1,
+                cute.assume(k, 32),
+                cute.assume(cutlass.Int64(n) * cutlass.Int64(k), 32),
+            ),
         )
     b_tensor = cute.make_tensor(b_ptr, b_layout)
 
@@ -2777,7 +2940,7 @@ def gemm(
             # Pad sf_k to 16-byte alignment (TMA requirement).
             sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
             sfa_2d_layout = cute.make_layout(
-                (sf_k_total, m),
+                (sf_k_total, num_tokens),
                 stride=(1, sf_k_total),
             )
             sfa_tensor = cute.make_tensor(
@@ -2855,7 +3018,7 @@ def gemm(
             # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4
             sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
             sfb_2d_layout = cute.make_layout(
-                (sf_k_total, n),
+                (sf_k_total, num_tokens),
                 stride=(1, sf_k_total),
             )
             sfb_tensor = cute.make_tensor(
@@ -2982,9 +3145,9 @@ def gemm(
         else:
             launch_num_tiles_m = early_exit_max_token_ctas
     block = cfg.threads_per_cta
-    cluster_shape = (cfg.cluster_m, 1, 1)
+    cluster_shape = (cfg.cluster_size, 1, 1)
 
-    if cutlass.const_expr(cfg.is_persistent):
+    if cutlass.const_expr(cfg.is_clc_persistent):
         clc_raster_along_m = True
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
@@ -2999,7 +3162,12 @@ def gemm(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
             cluster_shape,
         )
-        grid = (launch_num_tiles_m, launch_num_tiles_n, 1)
+        if cutlass.const_expr(cfg.is_persistent):
+            grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+                tile_sched_params, cfg.max_active_clusters
+            )
+        else:
+            grid = (launch_num_tiles_m, launch_num_tiles_n, 1)
 
     # C output tensor
     output_m_for_c = m
@@ -3204,6 +3372,11 @@ def gemm(
         per_token_sf_layout,
     )
 
+    token_final_scales_tensor = cute.make_tensor(
+        token_final_scales_raw_ptr,
+        cute.make_layout((num_tokens * max(1, cfg.moe_finalize_top_k),), stride=(1,)),
+    )
+
     # tile_idx and mn_limit: indexed by the TOKEN dimension tiles.
     # non-swapAB: tokens = M → num_tiles_m.  swapAB: tokens = N → num_tiles_n.
     if cutlass.const_expr(cfg.is_swap_ab):
@@ -3214,7 +3387,7 @@ def gemm(
     tile_idx_tensor = cute.make_tensor(tile_idx_raw_ptr, tile_idx_layout)
 
     # Route map (gather only; dummy 1-element when off)
-    if cutlass.const_expr(cfg.has_routed_act):
+    if cutlass.const_expr(cfg.has_routed_act or cfg.moe_finalize_top_k):
         num_total_tokens = n if cutlass.const_expr(cfg.is_swap_ab) else m
         route_map_layout = cute.make_layout((num_total_tokens,), stride=(1,))
     else:
@@ -3305,6 +3478,7 @@ def gemm(
         gemm1_alpha_tensor,
         gemm1_beta_tensor,
         gemm1_clamp_limit_tensor,
+        token_final_scales_tensor,
         per_token_sf_a_tensor,
         per_token_sf_b_tensor,
         tile_idx_tensor,
