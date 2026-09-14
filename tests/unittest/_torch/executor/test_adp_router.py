@@ -1374,19 +1374,8 @@ class TestConversationAwareADPRouter:
         "placement, expected_rank",
         [("round_robin", 0), ("least_queued", 1), ("least_tokens", 2)],
     )
-    @pytest.mark.parametrize("old_env", [None, "0", "1"])
-    def test_new_conv_placement_config(
-        self,
-        placement: str,
-        expected_rank: int,
-        old_env: str | None,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The serialized public config selects each strategy; the old env is inert."""
-        if old_env is None:
-            monkeypatch.delenv("TLLM_ADP_TOKEN_AWARE_PLACEMENT", raising=False)
-        else:
-            monkeypatch.setenv("TLLM_ADP_TOKEN_AWARE_PLACEMENT", old_env)
+    def test_new_conv_placement_config(self, placement: str, expected_rank: int) -> None:
+        """The serialized public config selects each strategy."""
         cfg = AttentionDpConfig(
             kv_cache_routing_conversation_affinity=True,
             kv_cache_routing_max_sessions=8,
@@ -1485,16 +1474,19 @@ class TestConversationAwareADPRouter:
         assert all(expected >= f for f in final), (expected, final)
         assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
 
-    def test_new_conversations_never_exceed_slot_capacity(self):
+    @pytest.mark.parametrize("placement", ["round_robin", "least_queued", "least_tokens"])
+    def test_new_conversations_never_exceed_slot_capacity(self, placement: str) -> None:
         """Regression: the spreading target must be clamped to
         max_num_active_requests. Unclamped it reaches 2 * fair_share, so a rank
         already holding every sequence slot still passes the `< soft_cap` gate
         and add_slot later raises NoFreeSlotsError mid-collective."""
-        router = self._router(tp_size=4)
+        router = self._router(tp_size=4, placement=placement)
         cap = 64
-        # 2 * ceil((184 + 8) / 4) = 96 > cap, so the unclamped target admits the
-        # full rank 3 and pushes it to 66 sequence slots.
+        # 2 * ceil((184 + 8) / 4) = 96 > cap, so an unclamped target would
+        # incorrectly admit the full rank 3.
         states = self._states(4, active=[40, 40, 40, cap])
+        # Make the full rank token-light so least_tokens must check capacity.
+        states[3].num_active_tokens = cap
         items = [_make_conv_request_item(i, None) for i in range(8)]
         assign, expected = router.route_requests(states, items, max_num_active_requests=cap)
         final = [states[r].num_active_requests + len(assign[r]) for r in range(4)]

@@ -948,13 +948,11 @@ class ConversationAwareADPRouter(ADPRouter):
         # local KV statistics would make ranks disagree on placement.
         token_load: list[int] = []
         if self._new_conv_placement == "least_tokens":
-            token_load = [
-                state.num_active_tokens
-                + sum(
+            token_load = [0] * tp_size
+            for state in all_rank_states:
+                token_load[state.rank] = state.num_active_tokens + sum(
                     _num_input_tokens(item.request) for item in all_ranks_new_requests[state.rank]
                 )
-                for state in all_rank_states
-            ]
 
         # 2) Soft cap for spreading new conversations across ranks, clamped to
         #    per-rank slot capacity so no placement path can overfill a rank.
