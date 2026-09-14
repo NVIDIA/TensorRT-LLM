@@ -284,6 +284,82 @@ def test_deepseek_v4_chat_template_renders_developer_tools_and_latest_reminder()
     assert "<｜User｜><tool_result>[0]</tool_result><｜Assistant｜><think>" in prompt
 
 
+def test_deepseek_v4_chat_template_ends_on_handoff_after_trailing_reminder():
+    """A trailing reminder must not swallow the generation prompt.
+
+    Clients append transient system messages (task nags, background-task
+    notifications) after the last user turn; those are re-roled to
+    `latest_reminder`. The reminder itself never emits a turn boundary, so
+    without deferring the handoff the prompt ends inside the reminder text with
+    `<think>` already open, and the model continues the document rather than
+    answering.
+    """
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "reminder"},
+        ],
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜>sys<｜User｜>hi<｜latest_reminder｜>reminder<｜Assistant｜><think>"
+    )
+    assert prompt.count("<｜Assistant｜>") == 1
+
+
+def test_deepseek_v4_chat_template_defers_handoff_past_every_trailing_reminder():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "one"},
+            {"role": "system", "content": "two"},
+        ],
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert prompt.endswith("<｜Assistant｜><think>")
+    assert prompt.count("<｜Assistant｜>") == 1
+    assert "<｜latest_reminder｜>one<｜latest_reminder｜>two" in prompt
+
+
+def test_deepseek_v4_chat_template_keeps_handoff_before_mid_conversation_reminder():
+    """A reminder with a turn after it keeps the existing layout.
+
+    Here the handoff belongs to the assistant message that follows, and the
+    reminder is injected inside that assistant's thinking block.
+    """
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "reminder"},
+            {"role": "assistant", "content": "answer", "reasoning": "why"},
+            {"role": "user", "content": "again"},
+        ],
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    # apply_chat_template drops historical reasoning by default, which also
+    # closes the completed turn with </think> rather than opening one.
+    assert (
+        "<｜User｜>hi<｜Assistant｜></think><｜latest_reminder｜>reminder"
+        "answer<｜end▁of▁sentence｜>"
+    ) in prompt
+    assert prompt.endswith("<｜User｜>again<｜Assistant｜><think>")
+
+
 def test_deepseek_v4_chat_template_renders_action_task_token():
     tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
 
