@@ -6585,6 +6585,9 @@ class TestDeepSeekR1LongBenchV2(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_mpi_world_size(4)
+    # NVBug 6621358: cached DeepGEMM workers retain ~31 GiB per GPU.
+    # NVFP4 CUDA graph capture needs these allocations released first.
+    @pytest.mark.private_mpi_session
     def test_nvfp4_4gpus(self):
         model_dir = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
         if not os.path.exists(model_dir):
