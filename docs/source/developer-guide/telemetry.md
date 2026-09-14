@@ -153,7 +153,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_connector_config.connector` | `Optional[str]` | `categorical` | allowlist | `lmcache`, `lmcache-mp`, `kvbm` |
 | `layer_wise_benchmarks_config.calibration_layer_indices` | `Optional[List[int]]` | `value` |  |  |
 | `layer_wise_benchmarks_config.calibration_mode` | `Literal['NONE', 'MARK', 'COLLECT']` | `categorical` |  | `NONE`, `MARK`, `COLLECT` |
-| `load_format` | `Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]` | `categorical` | allowlist | `auto`, `dummy`, `vision_only`, `gms` |
+| `load_format` | `Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]` | `categorical` | allowlist | `auto`, `dummy`, `vision_only`, `gms`, `lazy_safetensors` |
 | `lora_config.lora_ckpt_source` | `Literal['hf', 'nemo']` | `categorical` |  | `hf`, `nemo` |
 | `lora_config.max_cpu_loras` | `Optional[int]` | `value` |  |  |
 | `lora_config.max_lora_rank` | `<class 'int'>` | `value` |  |  |

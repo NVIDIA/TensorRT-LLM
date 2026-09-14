@@ -5278,6 +5278,11 @@ class LoadFormat(Enum):
     VISION_ONLY = 2
     # Load weights through GPU Memory Service.
     GMS = 3
+    # Open safetensors shards lazily and stream only the rank-local slices,
+    # never materializing the full checkpoint in host RAM. A model opts in by
+    # declaring this as its default load format (get_model_defaults), or a user
+    # can select it via load_format="lazy_safetensors" for any HF checkpoint.
+    LAZY_SAFETENSORS = 4
 
 
 class ModelExpressConfig(StrictBaseModel):
@@ -5799,7 +5804,7 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "How to load the model weights. By default, detect the weight type from the model checkpoint.",
         telemetry=TelemetryField.categorical("auto", "dummy", "vision_only",
-                                             "gms"))
+                                             "gms", "lazy_safetensors"))
 
     enable_min_latency: bool = Field(
         default=False,

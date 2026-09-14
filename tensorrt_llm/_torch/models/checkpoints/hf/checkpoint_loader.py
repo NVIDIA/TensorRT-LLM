@@ -91,6 +91,7 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         return self.weight_loader.build_checkpoint_catalog(
             checkpoint_dir,
             use_consolidated=kwargs.get("use_consolidated", False),
+            load_lazily=kwargs.get("load_lazily", False),
         )
 
     @property
