@@ -207,11 +207,39 @@ because it promises a guard the caller then does not write. Every "raises" /
 raise, in the certified configuration, with the error text quoted. Absent
 that, write what you measured: accepted, and what it then does.
 
+### Where a candidate comes from
+
+**Any callable in the installed `tensorrt_llm` package is fair game**, not
+only `torch.ops.trtllm.*`. A first-party binding reached as a plain Python
+function — `tensorrt_llm.flash_mla.flash_mla_sparse_fwd` is the standing
+example — is exactly as legitimate a catalog entry as a registered custom op,
+and a capability is often served by one of those and by nothing in the op
+registry. Record the actual import path in the wrapper docstring, the
+contract, and the index `impl` field, so what an entry wraps is never
+inferred from the entry's name.
+
+**Search by capability, not by op name.** Ask "what single call does
+index-gathered sparse MQA with sinks?", not "which of the ops I can enumerate
+look related?". The second question finds a set of parts and quietly commits
+you to assembling them; the first can find one call that does the whole job.
+When both exist, prefer the one that is **one call with fully explicit
+state** — that is what a catalog entry is. A candidate that needs a paged
+pool, a block table, a scheduler counter and a raw pool pointer threaded in
+from elsewhere is a worse entry than one that takes its state as arguments,
+even when both compute the same thing.
+
+**A reasoned negative verdict is a complete result.** "I drove candidate A,
+here is the domain probe, here is why it does not fit, candidate B does and
+here is its evidence" closes an iteration as legitimately as an entry does.
+If only entries count as progress, only entries get produced — including ones
+that should not have been written.
+
 ### `<name>.py` — wrapper
 
 Module docstring, typed signature, short function docstring.
 
-- Exactly one trtllm op invocation in the body. Glue that launches no kernel
+- Exactly one kernel-launching call in the body — a `torch.ops.trtllm.*` op or
+  another first-party `tensorrt_llm` callable. Glue that launches no kernel
   (building an `out` tensor for out-variant ops) is acceptable; tensor math
   is not.
 - Guard asserts are allowed only when **both** hold: the check is pure

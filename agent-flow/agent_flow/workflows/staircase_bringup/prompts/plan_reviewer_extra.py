@@ -103,9 +103,22 @@ malformed:
   parses these headers to scope its verification.
 - Goal bullets lack `<Stage>.<Goal>` IDs, or IDs skip or duplicate numbers
   within a Stage.
-- **A Goal is not tagged `[catalog]` or `[target]`.** The two kinds close on
-  different evidence and the Reviewer switches checklists on that tag; an
-  untagged Goal leaves the closure criterion ambiguous.
+- **A Goal names an op instead of a module.** `Goal 1.4: onboard
+  <some_op>` is a planning error, not a small one: which call serves a
+  capability is settled by driving candidates on GPU, and a planner has run
+  nothing. Goals are modules — attention, MoE, engram — named by the
+  capability they own. Leads may appear in the capability map, marked
+  non-binding; they may not appear as Goals.
+- **Goal 1.1 is not the reference ladder, or is not first.** Every later
+  Goal's parity condition cites it, so any other order has the plan's own
+  dependencies backwards.
+- **A module Goal's acceptance items state only receipts.** Closure needs
+  both: the entries it calls certified with the passed values inside their
+  columns, *and* the module matching its verified pure-PyTorch implementation.
+  Receipts alone pass the case this architecture is most exposed to — every
+  part certified, the wiring wrong. Where a module cannot be driven in
+  isolation the plan must name what replaces parity for it; silence is a
+  REJECT.
 - A Stage has no Goals, or a Goal names no concrete deliverable. "Goal 1.1:
   improve accuracy" without naming a component or a benchmark is a REJECT.
 - A Stage exists that `task.yaml` does not imply. In particular, a second

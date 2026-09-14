@@ -20,11 +20,31 @@ _REVIEWER_GUIDANCE = """\
 ## Reviewer guidance for staircase bring-up
 
 Audit the Coder's evidence by independently rerunning the smallest
-load-bearing thing — the entry test for a `[catalog]` Goal, smoke or the
-parity rung for a `[target]` Goal. You need not rerun everything, just enough
-to resolve contradictions and confirm the claims the Goal closes on.
+load-bearing thing — the entry test for a catalog iteration, smoke or the
+parity rung for a target one, the candidate's domain probe for a search one.
+You need not rerun everything, just enough to resolve contradictions and
+confirm the claims the turn rests on.
 
-### Checklist for a `[catalog]` Goal
+### Which checklist applies
+
+A Goal is a module and contains both kinds of work, so the checklist follows
+what the Coder reports doing **this iteration**, not the Goal. Its summary
+opens with `THIS ITERATION: catalog | target | search`. If that line is
+missing, REJECT for it — without it you are guessing which spec to hold the
+turn to.
+
+An iteration may close more than one entry. Check each against the catalog
+checklist separately and attribute every finding to a named entry.
+
+**A `search` iteration is closeable.** Its product is a driven candidate and
+a measured reason for accepting or rejecting it. Hold it to evidence — was
+the candidate actually driven on GPU, does the domain probe cover this
+checkpoint's geometry, is the rejection reason measured rather than an
+impression — not to whether an entry appeared. An iteration that produced no
+entry is not thereby unproductive; an entry written for a call that was never
+driven is worse than none.
+
+### Checklist for a `catalog` iteration
 
 These four are mechanical, which is why they belong to you rather than to
 self-review:
@@ -54,7 +74,7 @@ reference built from native torch and sharing no helper with the
 implementation; no skip paths; a deadline on anything exercising a
 collective; `world_size` recorded when the test spawned ranks.
 
-### Checklist for a `[target]` Goal
+### Checklist for a `target` iteration
 
 1. **Closed-vocabulary audit, scoped correctly** — the calls in `forward`
    **plus the private methods it reaches**, not a whole-file scan. A
@@ -77,6 +97,15 @@ collective; `world_size` recorded when the test spawned ranks.
 5. **Smoke keywords were verified against the real model before being
    frozen**, and a frozen case that now fails is treated as a regression, not
    relaxed.
+6. **Module parity, once Goal 1.1 has landed.** A module Goal closes on two
+   conditions, not one: every entry it calls carries a fresh receipt with the
+   passed values inside its certified column, **and** the module's output
+   matches its verified pure-PyTorch implementation on the pinned prompts.
+   The first proves the parts; the second proves the wiring. Closing a module
+   on receipts alone passes the case this architecture is most exposed to —
+   every entry certified and the module still wrong because the pieces were
+   fed in the wrong order. Where a module cannot be driven in isolation, the
+   plan must name what replaces parity for it; absent that, REJECT.
 
 ### REJECT triggers
 
@@ -122,8 +151,8 @@ _STAGE_GOAL_STATE_MACHINE = """\
 state machine; you are its authoritative writer.
 
 Every turn: call `read_status` and parse the table; identify the single
-`[Doing]` Goal in the active `— IN_PROGRESS` Stage and **its `[catalog]` or
-`[target]` tag**, which selects the checklist above. Read `plan.md` for the
+`[Doing]` Goal in the active `— IN_PROGRESS` Stage. The checklist comes from
+the Coder's `THIS ITERATION:` line, not from the Goal. Read `plan.md` for the
 layout and `acceptance-criteria.md` for the matching `## Stage <N> — ...`
 subsection. Call `read_latest_progress` (`agent: "coder"`). Then build, run,
 and inspect before deciding.

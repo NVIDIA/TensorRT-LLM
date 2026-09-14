@@ -21,14 +21,62 @@ from ._common import (
 _CODER_GUIDANCE = """\
 ## Coder guidance for staircase bring-up
 
-### Two kinds of Goal, two product specs
+### A Goal is a module, and it contains both kinds of work
 
-A `[catalog]` Goal produces one entry — contract, wrapper, GPU test — and
-closes on a **receipt from a run that post-dates every file in the entry**.
-A `[target]` Goal produces or advances the target's own files and closes on
-the gate tier it aimed at. Work the active Goal's kind and do not drift into
-the other: a catalog Goal that also edits `modeling.py` makes both
-unattributable.
+A module Goal owns a capability — attention, MoE, engram — and runs until
+that module is closed. Inside it you will both **onboard catalog entries**
+and **wire them into the target**, across however many iterations it takes.
+There is no per-Goal kind to stay inside.
+
+What there *is*, is a per-iteration kind. **Open every summary by saying
+which you did this turn**, because the Reviewer switches checklists on it:
+
+```
+THIS ITERATION: catalog — onboarded attention/<name>, certified <surface>
+THIS ITERATION: target  — wired the module's forward, drove parity
+THIS ITERATION: search  — drove <candidate>, rejected it, here is why
+```
+
+More than one entry in an iteration is fine. Enumerate each with its own
+evidence — receipt job id, what the test covered — so a defect lands on a
+named entry rather than on the turn.
+
+### A search iteration is a real result
+
+An iteration whose whole product is *"I drove candidate A, here is its
+domain probe, it does not fit because X; candidate B does, here is the
+evidence"* closes as legitimately as one that produces an entry. Do not
+manufacture an entry to have something to show: an entry written for a call
+that turns out to be the wrong one costs more to remove than it cost to
+write.
+
+**How to pick a call.** Search by capability, not by enumerating op names.
+Drive the candidate on GPU and compare its domain against this checkpoint's
+actual geometry before committing to it — divisibility constraints, head
+counts, head dims, dtypes, what an empty or degenerate row returns. None of
+that is readable from source; all of it is measurable. Prefer the candidate
+that is one call with fully explicit state.
+
+### The decision record — what must survive a context reset
+
+Your session is recycled periodically and you lose everything except what is
+on disk. The expensive content of a module Goal is the **negative** results:
+which candidate was driven, what ruled it out, why the current one was
+chosen. Lose those and the next turn re-drives a candidate that was already
+rejected — a whole iteration for nothing.
+
+`status.md` is the only thing that survives. Under the active Goal keep:
+
+```markdown
+### Goal <N>.<M> — decisions
+- <capability>: using `<call>` (evidence: job <id>, <what it showed>)
+  - rejected `<other>`: <the measured reason, not an impression>
+- open: <what is still undecided and what would settle it>
+```
+
+Write the reason, not the verdict. "needs a paged pool, a block table, a
+scheduler counter and a raw pool pointer threaded in from elsewhere" tells
+the next turn something; "not suitable" makes it re-drive the candidate.
 
 ### Order of operations inside a catalog Goal
 
@@ -59,7 +107,7 @@ freeze the cases only after observing the continuations on the real model.
 ### Rules that hold in both
 
 - **Never substitute torch math for a missing kernel.** A missing computation
-  kernel is a vocabulary gap that belongs to a `[catalog]` Goal. If the plan
+  kernel is a vocabulary gap to close with an entry in this Goal. If the
   has no such Goal and you need one, say so as a blocker rather than
   composing the computation from mirrors — that passes the gates while
   defeating them.
@@ -107,9 +155,9 @@ one `[Doing]` Goal per Stage.
 
 ### Per-turn rules
 
-1. **Stay inside the active Goal**, and inside its kind. Work belonging to a
-   future `[Undo]` Goal is out of bounds; so is target work during a
-   `[catalog]` Goal and vice versa.
+1. **Stay inside the active Goal.** Work belonging to a future `[Undo]`
+   Goal is out of bounds. Within the active Goal both catalog and target
+   work are in scope — say which you did in the `THIS ITERATION:` line.
 2. **Make tangible progress, then describe it.** Each turn should produce new
    evidence: a test that ran, a diagnosis, a different approach attempted.
 3. **Do not flip Goal or Stage state in the table.** Only the Reviewer

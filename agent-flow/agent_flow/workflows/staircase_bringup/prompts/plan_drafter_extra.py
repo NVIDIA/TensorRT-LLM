@@ -55,27 +55,46 @@ instead. Walk the segment separately: what the topology partitions, what must
 be reduced or gathered to put it back together, whether `lm_head` is
 vocab-parallel, and whether entries exist for those collectives.
 
-### 2. The vocabulary mapping table — one row per forward step
+### 2. The capability map — one row per computation, NOT per op
 
-Map every computation step in the forward onto `catalog/index.yaml`. Triage
-each miss:
+List the computations the forward performs and, for each, what a call would
+have to do. **Do not name the op that will serve it.** Record candidates you
+happened to notice as *non-binding leads*, explicitly marked as such.
 
-- **No trtllm-backed entry, but a candidate op exists upstream** — plan a
-  Goal that onboards it. One op per Goal.
-- **Entry exists, the needed surface is not certified** — plan a Goal that
-  certifies that surface. One surface per Goal.
-- **Missing `catalog/torch/` mirror, and it is pure glue** — no Goal needed;
-  the Coder adds the thin wrapper plus its index entry inline.
-- **A computation kernel with no upstream candidate at all** — the vocabulary
-  ceiling. Say so explicitly; this is the one condition the plan cannot route
-  around.
+```
+capability   index-gathered sparse MQA with sinks
+must do      gather the KV rows named by an int32 index list, score the
+             query against them, apply one sink logit per query head
+leads        two candidates noticed, NEITHER verified -- the build decides
+```
 
-Never plan a computation as "compose it from torch mirrors". A missing
-computation kernel is a vocabulary gap, not an implementation detail.
+**This table is mine-clearing, not authority.** Its job is to stop the Coder
+starting from zero, not to decide anything. Which call serves a capability is
+settled by driving candidates on GPU and comparing their domain against this
+checkpoint's actual geometry — `topk` divisibility, head counts, head dims,
+dtypes, what an empty row returns. None of that is readable; all of it is
+measurable. A planner that has run nothing cannot know it, and a plan that
+pretends otherwise converts a guess into a locked Goal.
 
-A new-capability Goal must name its implementation approach. "Add the missing
-kernel" is layer drift: the Coder must not be picking the architecture during
-implementation.
+**The one judgement the plan should make is shape, not identity.** When a
+capability could be served by one fused call or by several composed ones,
+say that the fused form is preferred and why: a call that takes its state as
+explicit arguments is a better catalog entry than one needing a paged pool, a
+block table, a scheduler counter and a raw pool pointer threaded in from
+elsewhere — even when both compute the same thing. Leave *which* call to the
+build.
+
+**Triage of what the map turns up** — all of it advisory:
+
+- A capability with several plausible leads: note them, let the build choose.
+- A capability with none: say so. It may still be served by something the
+  planner could not see, so this is a flag for the build to hunt, **not** a
+  vocabulary ceiling. Only the build, after an exhaustive search with the
+  evidence written down, can declare that.
+- A glue step (tensor layout, movement, allocation, lookup): note that a
+  `catalog/torch/` mirror covers it; no Goal needed.
+- A computation that would otherwise be composed from torch mirrors: flag it.
+  That composition is forbidden and its appearance in a plan is a defect.
 
 ### 3. Where the accuracy bar comes from
 
@@ -126,6 +145,11 @@ produce correct text. Its exit is the same accuracy bar plus that signal.
 
 ### `plan.md` — `## Implementation Steps` format
 
+**A Goal is a module, not an op.** Name the capability the module owns and
+the evidence that closes it; do not name the ops it will use. Which call
+serves a capability is settled by measurement during the build, not by
+reading during planning — see *Capability mapping* above.
+
 ```markdown
 ## Implementation Steps
 
@@ -133,22 +157,53 @@ produce correct text. Its exit is the same accuracy bar plus that signal.
 Exit criterion: <one-line pointer to `acceptance-criteria.md`'s
                 "Stage 1" subsection — the measured-vs-anchor bar>
 
-- Goal 1.1: [catalog] onboard <op> — one op, closing on a receipt
-- Goal 1.2: [catalog] certify <entry>'s <surface>
-- Goal 1.3: [target] modeling.py + weights.py + MANIFEST + registration
-- Goal 1.4: [target] smoke green on verified keywords
-- Goal 1.5: [target] module parity against the verified pure-PyTorch rungs
-- Goal 1.6: [target] accuracy debug until the bar
+- Goal 1.1: reference ladder — native HF baseline on fixed prompts, then a
+            pure-PyTorch implementation per module aligned to it, then the
+            accuracy anchor and its protocol frozen
+- Goal 1.2: attention — <the capability in one line: geometry, positional
+            scheme, sparsity, cache shape>
+- Goal 1.3: MoE — <routing rule, expert count/topk, quantization>
+- Goal 1.4: <further modules the derivation table found>
+- Goal 1.5: assembly — modeling.py, weights.py, MANIFEST, registration
+- Goal 1.6: smoke green on keywords verified against the real model
+- Goal 1.7: accuracy debug until the bar
 ```
 
 Goal IDs use `<Stage>.<Goal>`. Stages appear in execution order; Goal order
 within a Stage is a suggested sequence the Reviewer may reorder at runtime.
 
-**Tag every Goal `[catalog]` or `[target]`.** The two kinds close on
-different evidence and are reviewed against different specs — a catalog Goal
-closes on a fresh receipt from its own GPU test, a target Goal on the gate
-tier it targets — and the Reviewer switches checklists on that tag. An
-untagged Goal is a malformed plan.
+**Goal 1.1 is always the reference ladder, and it always comes first.**
+Every later Goal's exit criterion cites it, so a plan that puts it anywhere
+else has ordered its own dependencies wrong.
+
+### How a module Goal closes
+
+Two conditions, and the second only becomes checkable once Goal 1.1 has
+landed:
+
+1. **Vocabulary closed for that module** — every catalog entry the module
+   calls carries a fresh receipt on this arch, and every value the module
+   passes (including the shapes the engine varies at runtime) sits inside the
+   entry contract's certified column.
+2. **Module parity** — the module's output matches its verified pure-PyTorch
+   implementation from Goal 1.1, on the pinned prompts, at a stated tolerance.
+
+(1) proves the parts work. (2) proves they were assembled correctly, and it
+is the condition that catches the failure (1) cannot see: **every entry
+certified, every receipt fresh, and the module still wrong because the pieces
+were wired in the wrong order or fed the wrong argument.** A catalog
+architecture is unusually exposed to that, which is why (2) is required and
+not a nice-to-have.
+
+State both in the Goal's acceptance items. Where a module genuinely cannot be
+driven in isolation — a cross-layer mechanism with no standalone boundary —
+say so in the plan and name what replaces (2) for it, rather than dropping
+the condition silently.
+
+**Do not tag Goals `[catalog]` or `[target]`.** A module Goal contains both
+kinds of work by design: it onboards entries *and* wires them. The Reviewer
+switches checklists on what the Coder reports doing **this iteration**, which
+the Coder states in its summary.
 
 ### `acceptance-criteria.md` — Stage-partitioned checklist
 

@@ -20,6 +20,29 @@ from .task_schema import (
     world_size,
 )
 
+# agent_team defaults this to 2, which suits Goals that are a few iterations
+# long and carry their whole intent in the Goal name ("onboard <op>"). A
+# staircase Goal is a module, runs far longer, and its expensive content is the
+# *negative* results -- which candidate was tried, what ruled it out. Recycling
+# the session every other turn throws exactly those away, and the next turn
+# re-tries the candidate that was already rejected. 5 is a compromise: still
+# bounded, but long enough that a decision and its evidence usually outlive one
+# reset. `status.md` is what must carry them across the resets that do happen.
+#
+# Injected into argv rather than set on the workflow, because agent_team's
+# `main` re-parses argv itself and takes no override. Only applied when the
+# user did not ask for a value, so an explicit flag always wins.
+STAIRCASE_CODER_CONTEXT_RESET_INTERVAL = 5
+_RESET_FLAG = "--coder-context-reset-interval"
+
+
+def _with_staircase_defaults(argv: list[str] | None) -> list[str]:
+    """Return argv with staircase's own default for the coder reset interval."""
+    source = list(sys.argv[1:] if argv is None else argv)
+    if any(a == _RESET_FLAG or a.startswith(f"{_RESET_FLAG}=") for a in source):
+        return source
+    return source + [_RESET_FLAG, str(STAIRCASE_CODER_CONTEXT_RESET_INTERVAL)]
+
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
@@ -41,7 +64,7 @@ def main(argv: list[str] | None = None) -> None:
         include_slurm_environment=has_slurm_environment(task_data),
         replan_on_qa=args.replan_on_qa,
     )
-    _team_main(argv, prompts=prompts)
+    _team_main(_with_staircase_defaults(argv), prompts=prompts)
 
 
 if __name__ == "__main__":

@@ -264,3 +264,55 @@ def test_receipt_freshness_prefers_the_structural_route():
         assert "nothing to check afterwards" in p, role
         # The inspection route must survive for single-step reruns.
         assert "By inspection" in p, role
+
+
+def test_goals_are_modules_not_ops():
+    """The planner must not name the op a Goal will use — only execution can decide that.
+
+    This is the defect that cost the first run: the plan decomposed one fused
+    capability into nine op-named Goals, and the lock matrix then froze that
+    guess. Suitability is settled by driving a candidate on GPU (divisibility
+    constraints, head counts, what an empty row returns), none of which a
+    planner has observed.
+    """
+    p = _flat(build_staircase_prompts().plan_drafter)
+    assert "A Goal is a module, not an op" in p
+    assert "mine-clearing, not authority" in p
+    assert "non-binding" in p
+    # And the reviewer must enforce it.
+    r = _flat(build_staircase_prompts().plan_reviewer)
+    assert "A Goal names an op instead of a module" in r
+
+
+def test_module_goal_closes_on_parts_and_wiring():
+    """Receipts alone pass the failure this architecture is most exposed to."""
+    for role in ("plan_drafter", "plan_reviewer", "reviewer"):
+        t = _flat(getattr(STAIRCASE_PROMPTS, role))
+        assert "pure-PyTorch" in t, role
+    assert "Goal 1.1 is always the reference ladder" in _flat(STAIRCASE_PROMPTS.plan_drafter)
+    # The wiring condition must name what it catches, or it reads as ceremony.
+    assert "the pieces were" in _flat(STAIRCASE_PROMPTS.reviewer)
+
+
+def test_iteration_kind_replaces_the_goal_tag():
+    """A module Goal holds both kinds of work, so the checklist follows the turn."""
+    assert "THIS ITERATION" in STAIRCASE_PROMPTS.coder
+    assert "THIS ITERATION" in STAIRCASE_PROMPTS.reviewer
+    # A search turn that produces no entry is still a closeable result.
+    assert "search iteration is a real result" in _flat(STAIRCASE_PROMPTS.coder)
+    assert "search` iteration is closeable" in _flat(STAIRCASE_PROMPTS.reviewer)
+
+
+def test_decision_record_survives_a_context_reset():
+    """The coder session is recycled; the negative results are what must not be lost."""
+    c = _flat(STAIRCASE_PROMPTS.coder)
+    assert "decision record" in c.lower()
+    assert "re-drives a candidate that was already rejected" in c
+
+
+def test_vocabulary_is_not_limited_to_registered_ops():
+    """`flash_mla_sparse_fwd` is a plain function; the first run could not reach it."""
+    for role in ("plan_drafter", "coder", "reviewer"):
+        t = _flat(getattr(STAIRCASE_PROMPTS, role))
+        assert "Any callable in the installed `tensorrt_llm` package" in t, role
+    assert "Search by capability, not by op name" in _flat(STAIRCASE_PROMPTS.coder)
