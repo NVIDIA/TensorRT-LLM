@@ -15,11 +15,15 @@
 """CPU tests for GLM sparse attention metadata and cache layouts."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
     INDEX_SENTINEL,
     GlmKpoolSparseAttention,
@@ -28,8 +32,149 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
     paged_slot_indices,
     positions_to_pool_rows,
 )
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.params import (
+    GlmKpoolBackendForwardArgs,
+)
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture
+def forward_case():
+    backend = object.__new__(GlmKpoolSparseAttention)
+    backend.num_heads = 2
+    backend.head_dim = backend.kv_lora_rank = 4
+    state = SimpleNamespace(
+        latent_pool=torch.arange(64, dtype=torch.bfloat16).view(4, 4, 4),
+        block_tables=torch.tensor([[3, 0], [2, 1], [0, 2]]),
+        num_contexts=1,
+        tokens_per_block=4,
+    )
+    backend._cache_state = Mock(return_value=state)
+    backend._dispatch_sparse_core = Mock()
+    return SimpleNamespace(
+        backend=backend,
+        state=state,
+        q=torch.ones(2, 8, dtype=torch.bfloat16),
+        indices=torch.tensor([[0, -1], [1, 2]], dtype=torch.int32),
+        metadata=object(),
+    )
+
+
+@pytest.mark.parametrize(
+    "route", ["context", "generation", "verify", "paged_context", "paged_generation"]
+)
+@pytest.mark.parametrize("supply_output", [False, True])
+def test_forward_dispatches_latent_rows_and_preserves_output(forward_case, route, supply_output):
+    case = forward_case
+    context = route in ("context", "paged_context")
+    q = case.q.repeat_interleave(2, dim=0) if route == "verify" else case.q
+    indices = case.indices.repeat_interleave(2, dim=0) if route == "verify" else case.indices
+    core_output = torch.arange(q.shape[0] * 8, dtype=q.dtype).view(q.shape[0], 2, 4)
+    case.backend._dispatch_sparse_core.return_value = core_output
+    latent_prefix = torch.zeros(3, 4, dtype=q.dtype) if route == "context" else None
+    selection = (
+        GlmKpoolBackendForwardArgs(topk_rows=indices)
+        if route.startswith("paged_")
+        else GlmKpoolBackendForwardArgs(topk_indices=indices)
+    )
+    output = torch.empty(q.shape[0], 8, dtype=q.dtype) if supply_output else None
+    args = AttentionForwardArgs(
+        attention_input_type=(
+            AttentionInputType.context_only if context else AttentionInputType.generation_only
+        ),
+        sparse_backend_args=selection,
+        output=output,
+    )
+    actual = case.backend.forward(q, latent_prefix, None, case.metadata, args)
+    torch.testing.assert_close(actual, core_output.flatten(1))
+    if supply_output:
+        assert actual is output
+    case.backend._cache_state.assert_called_once_with(case.metadata)
+    case.backend._dispatch_sparse_core.assert_called_once()
+    dispatched_q, dispatched_k, dispatched_indices = (
+        case.backend._dispatch_sparse_core.call_args.args
+    )
+    torch.testing.assert_close(dispatched_q, q.view(-1, 2, 4))
+    if route == "context":
+        torch.testing.assert_close(dispatched_k, latent_prefix.view(3, 1, 4))
+        torch.testing.assert_close(dispatched_indices, indices)
+    else:
+        torch.testing.assert_close(dispatched_k, case.state.latent_pool.view(-1, 1, 4))
+        expected = (
+            indices
+            if route.startswith("paged_")
+            else torch.tensor([[8, -1], [1, 2]], dtype=torch.int32)
+        )
+        if route == "verify":
+            expected = expected.repeat_interleave(2, dim=0)
+        torch.testing.assert_close(dispatched_indices, expected)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["selection", "v", "out_scale", "out_scale_sf", "output_sf", "shape", "dtype", "device"],
+)
+def test_forward_rejects_invalid_arguments_before_cache_access(forward_case, invalid):
+    case = forward_case
+    args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        sparse_backend_args=GlmKpoolBackendForwardArgs(topk_indices=case.indices),
+    )
+    v = None
+    error, message = ValueError, "quantized attention output"
+    if invalid == "selection":
+        args.sparse_backend_args = None
+        error, message = NotImplementedError, "pool-expanded selection"
+    elif invalid == "v":
+        v = torch.zeros(1)
+        message = "v must be None"
+    elif invalid in ("out_scale", "out_scale_sf", "output_sf"):
+        setattr(args, invalid, torch.tensor(1.0))
+    else:
+        args.output = torch.empty(
+            2,
+            9 if invalid == "shape" else 8,
+            dtype=torch.float32 if invalid == "dtype" else case.q.dtype,
+            device="meta" if invalid == "device" else "cpu",
+        )
+        message = "forward_args.output must be"
+    with pytest.raises(error, match=message):
+        case.backend.forward(case.q, None, v, case.metadata, args)
+    case.backend._cache_state.assert_not_called()
+    case.backend._dispatch_sparse_core.assert_not_called()
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_forward_rejects_mixed_phase(forward_case, paged):
+    case = forward_case
+    selection = (
+        GlmKpoolBackendForwardArgs(topk_rows=case.indices)
+        if paged
+        else GlmKpoolBackendForwardArgs(topk_indices=case.indices)
+    )
+    args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.mixed, sparse_backend_args=selection
+    )
+    with pytest.raises(ValueError, match="phase-explicit"):
+        case.backend.forward(case.q, None, None, case.metadata, args)
+    case.backend._dispatch_sparse_core.assert_not_called()
+
+
+@pytest.mark.parametrize("context", [False, True])
+def test_forward_requires_phase_specific_latent_source(forward_case, context):
+    case = forward_case
+    args = AttentionForwardArgs(
+        attention_input_type=(
+            AttentionInputType.context_only if context else AttentionInputType.generation_only
+        ),
+        sparse_backend_args=GlmKpoolBackendForwardArgs(topk_indices=case.indices),
+    )
+    k = None if context else torch.zeros(3, 4, dtype=case.q.dtype)
+    message = "contiguous latent prefix as k" if context else "k must be None"
+    with pytest.raises(ValueError, match=message):
+        case.backend.forward(case.q, k, None, case.metadata, args)
+    case.backend._dispatch_sparse_core.assert_not_called()
 
 
 def test_cache_state_prefers_live_metadata_and_rejects_graph_fallback():
