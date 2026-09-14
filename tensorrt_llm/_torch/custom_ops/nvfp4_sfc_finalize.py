@@ -16,8 +16,9 @@
 # Deferred-NVFP4 scale finalize (K2) - the shared second half of the
 # deferred-SFC quantization scheme.
 #
-# The producer (K1: e.g. this package's fused_norm_producer with
-# store="nvfp4_deferred") emits scale-invariant e2m1 payloads plus RAW fp32
+# The producer (dense_blockscaled_gemm_act_fusion.py's
+# Sm100BlockScaledPersistentDenseGemmActFusionKernel.wrapper_deferred_fp4out)
+# emits scale-invariant e2m1 payloads plus RAW fp32
 # block scales a/6 in [M, K/16] row-major unswizzled. This module computes
 # the global scale s = 448 / max(raw) (0-d device tensor - no .item(), no
 # host sync) and re-encodes every raw block scale into the swizzled e4m3 SF
@@ -28,8 +29,6 @@
 # This module is deliberately kernel-family-neutral so any deferred-store
 # producer (norm-site, activation+quant, GEMM epilogue) can share it: keep
 # it the single in-tree K2 - do not fork per producer.
-
-from typing import Tuple
 
 import torch
 import triton
@@ -94,7 +93,7 @@ def _k2_sfc_kernel(raw_ptr, s_ptr, sf_ptr, M, KB_TOT, NUM_K_TILES, KT_BLOCK: tl.
 
 def sfc_finalize(
     raw: torch.Tensor, kt_block: int = 8, num_warps: int = 4
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """K2: raw f32 [M, K/16] -> (sf uint8 [swizzled_sf_size], s 0-d f32,
     max_raw 0-d f32). s = 448/max(raw); caller computes
     alpha = weight_scale_2 * (max_raw / 448) == weight_scale_2 / s.
@@ -102,10 +101,7 @@ def sfc_finalize(
     m, kb_tot = raw.shape
     max_raw = torch.amax(raw)
     is_positive = max_raw > 0.0
-    safe_max_raw = torch.where(
-        is_positive, max_raw, torch.tensor(1.0, dtype=raw.dtype, device=raw.device)
-    )
-    s = torch.where(is_positive, FP8_MAX / safe_max_raw, torch.zeros_like(max_raw))
+    s = torch.where(is_positive, FP8_MAX / max_raw, torch.zeros_like(max_raw))
     num_m_tiles = (m + 127) // 128
     num_k_tiles = (kb_tot + 3) // 4
     sf = torch.empty(num_m_tiles * 128 * num_k_tiles * 4, dtype=torch.uint8, device=raw.device)
@@ -119,7 +115,7 @@ def sfc_finalize(
     mutates_args=(),
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
-def nvfp4_sfc_finalize(raw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def nvfp4_sfc_finalize(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Finalize deferred-NVFP4 raw block scales: returns (sf, s, max_raw).
 
     raw: fp32 [M, K/16] row-major contiguous (a/6 block scales from a
@@ -139,7 +135,7 @@ def nvfp4_sfc_finalize(raw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, t
 
 
 @nvfp4_sfc_finalize.register_fake
-def _nvfp4_sfc_finalize_fake(raw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _nvfp4_sfc_finalize_fake(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Meta/fake impl: sf is sized for the 128x4-padded swizzled layout; s and
     max_raw are 0-d fp32 tensors, matching the eager return contract."""
     m, kb_tot = raw.shape

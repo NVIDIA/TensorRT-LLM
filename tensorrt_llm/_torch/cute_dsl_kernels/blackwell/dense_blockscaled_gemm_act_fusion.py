@@ -1705,12 +1705,11 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                                 zero_f32,
                                 0,
                             )
+                            raw = zero_f32
+                            oscale = zero_f32
                             if gmax > zero_f32:
                                 raw = gmax * cutlass.Float32(1.0 / 6.0)
                                 oscale = div_full_f32(cutlass.Float32(6.0), gmax)
-                            else:
-                                raw = zero_f32
-                                oscale = zero_f32
 
                             if row < mRawSF.shape[0]:
                                 if col_block < mRawSF.shape[1]:

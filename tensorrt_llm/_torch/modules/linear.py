@@ -4165,8 +4165,7 @@ def is_dynamic_nvfp4_input_eligible(linear) -> bool:
     if linear is None:
         return False
     return (getattr(linear, "has_nvfp4_activation_quantization", False)
-            and (getattr(linear, "force_dynamic_quantization", False)
-                 or getattr(linear, "input_scale", None) is None)
+            and getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "pre_quant_scale", None) is None
             and getattr(linear, "weight_scale_2", None) is not None)
 

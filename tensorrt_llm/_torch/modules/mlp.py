@@ -11,6 +11,7 @@ from torch import nn
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
+from ..custom_ops.nvfp4_sfc_finalize import FP8_MAX
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
@@ -294,8 +295,8 @@ class MLP(nn.Module):
             fp4_output, raw_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell(
                 act_fp4, module.weight, act_sf, module.weight_scale, alpha,
                 module.bias)
-            out_sf, s, max_raw = torch.ops.trtllm.nvfp4_sfc_finalize(raw_sf)
-            reciprocal_scale = max_raw / 448.0
+            out_sf, _, max_raw = torch.ops.trtllm.nvfp4_sfc_finalize(raw_sf)
+            reciprocal_scale = max_raw / FP8_MAX
             if original_shape is not None:
                 fp4_output = fp4_output.reshape(*original_shape[:-1],
                                                 fp4_output.shape[-1])

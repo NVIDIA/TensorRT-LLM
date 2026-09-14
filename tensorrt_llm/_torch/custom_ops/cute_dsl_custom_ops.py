@@ -468,11 +468,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
-    try:
-        from ..cute_dsl_kernels.blackwell.norm_producer import \
-            nvfp4_sfc_finalize
-    except Exception:
-        nvfp4_sfc_finalize = None
 
     @functools.cache
     def _get_full_device_max_active_clusters(device_id: int,
