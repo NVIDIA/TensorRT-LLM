@@ -1417,9 +1417,7 @@ class TestConversationAwareADPRouter:
     def test_least_tokens_accumulates_same_batch_load(self, has_conversation_id: bool) -> None:
         router = self._router(tp_size=4, placement="least_tokens")
         items = [
-            _make_conv_request_item(
-                i, f"c{i}" if has_conversation_id else None, num_tokens=tokens
-            )
+            _make_conv_request_item(i, f"c{i}" if has_conversation_id else None, num_tokens=tokens)
             for i, tokens in enumerate([500, 500, 100, 100, 100])
         ]
         pos = self._route(router, self._states(4), items)
@@ -1437,9 +1435,7 @@ class TestConversationAwareADPRouter:
         ]
         assert self._route(router, states, [_make_conv_request_item(1, "A")])[1] == 1
         # Fresh rank snapshots replace prior load; only the tie cursor persists.
-        states = [
-            RankState(rank=r, num_active_requests=1, num_active_tokens=100) for r in range(3)
-        ]
+        states = [RankState(rank=r, num_active_requests=1, num_active_tokens=100) for r in range(3)]
         assert self._route(router, states, [_make_conv_request_item(2, "B")])[2] == 2
         assert self._route(router, states, [_make_conv_request_item(3, "C")])[3] == 0
 

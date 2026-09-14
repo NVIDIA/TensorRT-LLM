@@ -950,7 +950,9 @@ class ConversationAwareADPRouter(ADPRouter):
         if self._new_conv_placement == "least_tokens":
             token_load = [
                 state.num_active_tokens
-                + sum(_num_input_tokens(item.request) for item in all_ranks_new_requests[state.rank])
+                + sum(
+                    _num_input_tokens(item.request) for item in all_ranks_new_requests[state.rank]
+                )
                 for state in all_rank_states
             ]
 
