@@ -306,5 +306,67 @@ LOG2_E = 1.4426950408889634074
 MAX_SPLITS = 256
 
 
+@cute.jit
+def get_variable_query_tile_info(
+    num_heads: cutlass.Constexpr,
+    q_tile_idx: cutlass.Int32,
+    batch_idx: cutlass.Int32,
+    cum_seq_lens_q: cute.Tensor,
+    m_tile: cutlass.Constexpr,
+) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
+    """Return request-local metadata for one compact token/head tile.
+
+    Compact Q uses ``row = token * num_heads + head``. Returns
+    ``(q_begin, q_len, valid_rows)``; ``valid_rows == 0`` identifies a
+    rectangular schedule slot beyond the request. Such a slot must remain
+    scheduler-valid and become a no-op rather than terminate a persistent
+    scheduler iteration.
+    """
+    # Every caller supplies a CTA-uniform request index. Marking the two indptr
+    # loads warp-uniform avoids issuing the same scalar load in every lane,
+    # especially in the many small standalone-reducer CTAs.
+    q_begin = cute.arch.make_warp_uniform(cum_seq_lens_q[batch_idx])
+    q_end = cute.arch.make_warp_uniform(cum_seq_lens_q[batch_idx + 1])
+    q_len = q_end - q_begin
+
+    remaining_rows = q_len * num_heads - q_tile_idx * m_tile
+    valid_rows = cutlass.max(
+        cutlass.Int32(0),
+        cutlass.min(cutlass.Int32(m_tile), remaining_rows),
+    )
+    return q_begin, q_len, valid_rows
+
+
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def compute_q_tile_layout(num_heads: int,
+                          seq_len_q: int,
+                          m_tile: int = 128) -> tuple[int, int, int]:
+    """Return ``(total_rows, num_tiles, tail_rows)`` for flat query packing.
+
+    Query-token and head modes are one affine row space ordered as
+    ``flat_row = q_token * num_heads + q_head``.  Consecutive M tiles may
+    therefore cross token boundaries; only the final tile can be partial.
+    ``tail_rows`` is always in ``[1, m_tile]`` and equals ``m_tile`` when the
+    flattened row count exactly fills the final tile.
+
+    This host-side helper is shared by launch/workspace selection and both
+    kernel variants so their split-KV geometry cannot drift apart.
+    """
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+    if seq_len_q <= 0:
+        raise ValueError(f"seq_len_q must be positive, got {seq_len_q}")
+    if m_tile <= 0:
+        raise ValueError(f"m_tile must be positive, got {m_tile}")
+    if num_heads > m_tile:
+        raise ValueError(
+            f"num_heads ({num_heads}) must not exceed the MMA M tile ({m_tile})"
+        )
+
+    total_rows = num_heads * seq_len_q
+    num_tiles = ceil_div(total_rows, m_tile)
+    tail_rows = total_rows - (num_tiles - 1) * m_tile
+    return total_rows, num_tiles, tail_rows
