@@ -268,7 +268,7 @@ class Logger(metaclass=Singleton):
 
     # A %-conversion specifier (not an escaped %%): %s, %d, %.3f, %(name)s...
     _PERCENT_SPEC = re.compile(
-        r"%(?!%)(\([^)]*\))?[-+ #0]*(\d+|\*)?(\.(\d+|\*))?[diouxXeEfFgGcrsa]"
+        r"%(?!%)(\([^)]*\))?[-+ #0]*(\d+|\*)?(\.(\d+|\*))?[hlL]?[diouxXeEfFgGcrsa]"
     )
 
     @classmethod

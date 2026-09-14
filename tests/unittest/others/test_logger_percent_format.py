@@ -104,6 +104,7 @@ def test_non_string_first_argument_joins(emitted):
         (("%s", "x"), "x"),
         (("%(k)r", {"k": "v"}), "'v'"),
         (("%d%%", 5), "5%"),
+        (("%ld", 7), "7"),
     ],
 )
 def test_percent_format_shapes(msg, expected):
