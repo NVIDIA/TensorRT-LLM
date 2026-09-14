@@ -16269,10 +16269,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                   MMA tile M (no B-reuse in the fused kernel).
 
                 Tactic: ``(mma_tiler, mma_inst_shape, cluster_shape_mn,
-                scheduler)`` with ``mma_tiler_m == mma_inst_m == tile_size``,
-                ``mma_n in {128, 256}``, ``mma_tiler_k in {128, 256}``
-                (``UMMA_K = 64`` for FP8), ``cluster_shape_mn == (cta_group, 1)``
-                and ``scheduler in {"l2_atomic", "static"}``.
+                scheduler, stream_weights)`` with ``mma_tiler_m == mma_inst_m ==
+                tile_size``, ``mma_n in {128, 256}``, ``mma_tiler_k in {128,
+                256}`` (``UMMA_K = 64`` for FP8), ``cluster_shape_mn ==
+                (cta_group, 1)``, ``scheduler in {"l2_atomic", "static"}`` and
+                ``stream_weights`` selecting L2 evict-first weight loads (a
+                four-element tactic means ``stream_weights=False``).
                 """
                 kernel_class = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
                 kernel_cache = dict()
@@ -16289,6 +16291,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_k_candidates = (128, 256)
                 mma_n_candidates = (128, 256)
                 scheduler_candidates = ("l2_atomic", "static")
+                # L2 evict-first weight loads pay off once most M tiles read
+                # their expert's weights exactly once (decode with many active
+                # experts per rank) and lose when weights are reused across M
+                # tiles, so the autotuner picks it per token bucket.
+                stream_weights_candidates = (False, True)
                 # The FC1 SFA gather fetches 16-byte chunks of scales per row.
                 fc1_k_alignment = 16 * MXFP8_FUSED_FC12_SF_VEC_SIZE
 
@@ -16341,15 +16348,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         (self.tile_size, 128, self.mma_inst_k),
                         (self.cta_group, 1),
                         "l2_atomic",
+                        False,
                     )
 
                 @staticmethod
                 def _normalize_tactic(tactic) -> Tuple:
-                    mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = tactic
+                    # Four-element tactics (from caches or precomputed strings
+                    # predating ``stream_weights``) keep the default policy.
+                    (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+                     *rest) = tactic
+                    stream_weights = bool(rest[0]) if rest else False
                     return (tuple(int(v) for v in mma_tiler),
                             tuple(int(v) for v in mma_inst_shape),
-                            tuple(int(v)
-                                  for v in cluster_shape_mn), str(scheduler))
+                            tuple(int(v) for v in cluster_shape_mn),
+                            str(scheduler), stream_weights)
 
                 def _is_tactic_feasible(
                         self,
@@ -16420,9 +16432,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_m = self.tile_size
                     cluster_shape_mn = (self.cta_group, 1)
                     valid_tactics = []
-                    for mma_n, mma_tiler_k, scheduler in itertools.product(
-                            self.mma_n_candidates, self.mma_tiler_k_candidates,
-                            self.scheduler_candidates):
+                    for (mma_n, mma_tiler_k, scheduler,
+                         stream_weights) in itertools.product(
+                             self.mma_n_candidates,
+                             self.mma_tiler_k_candidates,
+                             self.scheduler_candidates,
+                             self.stream_weights_candidates):
                         # The fused N tile must divide both the FC1 (2*I) and the
                         # FC2 (hidden) output N; the K tile both GEMM K extents.
                         if fc1_n % mma_n != 0 or fc2_n % mma_n != 0:
@@ -16435,8 +16450,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                     cluster_shape_mn, scheduler,
                                                     m, fc1_n, k, l, fc2_n,
                                                     fc2_k):
-                            valid_tactics.append((mma_tiler, mma_inst_shape,
-                                                  cluster_shape_mn, scheduler))
+                            valid_tactics.append(
+                                (mma_tiler, mma_inst_shape, cluster_shape_mn,
+                                 scheduler, stream_weights))
 
                     logger.debug(
                         f"CuteDSL Rubin MXFP8 FusedFC12: Found {len(valid_tactics)} "
@@ -16537,12 +16553,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     assert output.size(1) == fc2_n
                     assert token_final_scales.size() == (num_tokens, self.top_k)
 
-                    if isinstance(tactic, (tuple, list)) and len(tactic) == 4:
-                        mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = \
-                            self._normalize_tactic(tactic)
+                    if isinstance(tactic, (tuple, list)) and len(tactic) in (4,
+                                                                             5):
+                        (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+                         stream_weights) = self._normalize_tactic(tactic)
                     else:
-                        mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler = \
-                            self._default_tactic()
+                        (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+                         stream_weights) = self._default_tactic()
                     assert mma_tiler[0] == self.tile_size, (
                         f"Tactic ({tactic}) is incompatible with tile size "
                         f"({self.tile_size})")
@@ -16641,7 +16658,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cache_key = (self.tile_size, self.top_k, mma_tiler,
                                  mma_inst_shape, cluster_shape_mn, scheduler,
                                  self.swiglu_limit, max_active_clusters,
-                                 sparse_gather)
+                                 sparse_gather, stream_weights)
                     if cache_key not in self.__class__.kernel_cache:
                         gemm = self.__class__.kernel_class(
                             self.sf_vec_size,
@@ -16654,6 +16671,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             swiglu_limit=self.swiglu_limit,
                             scheduler=scheduler,
                             sparse_gather=sparse_gather,
+                            stream_weights=stream_weights,
                         )
                         sf_vec_cx = self.sf_vec_size
                         tile_size_cx = self.tile_size

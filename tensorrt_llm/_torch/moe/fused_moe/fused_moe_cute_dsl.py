@@ -680,7 +680,8 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
                  num_local_experts: int,
                  local_expert_offset: int,
                  enable_alltoall: bool = False,
-                 output_dtype: torch.dtype = torch.bfloat16):
+                 output_dtype: torch.dtype = torch.bfloat16,
+                 tune_max_num_tokens: Optional[int] = None):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -690,6 +691,7 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
+        self.tune_max_num_tokens = tune_max_num_tokens
 
     def unique_id(self):
         return (
@@ -699,6 +701,7 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             self.local_expert_offset,
             self.enable_alltoall,
             self.output_dtype,
+            self.tune_max_num_tokens,
         )
 
     def get_valid_tactics(
@@ -724,10 +727,18 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
                                                       self.local_expert_offset)
             # MXFP8 inputs: [x, token_selected_experts, token_final_scales,
             #                x_sf, moe_output]
+            # ``tune_max_num_tokens`` anchors the power-of-two token buckets
+            # to the module's saturation token count instead of the warmup
+            # forward's token count, so the decode buckets (a few tokens per
+            # DP rank) are always profiled; the nested fused-kernel tuning
+            # runs for each of them. Without it the gen engine's warmup shape
+            # left the 4-token bucket untuned and decode ran the fallback
+            # tactic.
             self.__class__.tuning_config_cache[key] = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
                     0, 0, get_last_power_of_2_num_tokens_buckets,
                     last_positive_power_of_2), ),
+                tune_max_num_tokens=self.tune_max_num_tokens,
                 constraint_specs=(
                     ConstraintSpec(1, 0, helper.infer_shape_num_tokens),
                     ConstraintSpec(2, 0, helper.infer_shape_num_tokens),
@@ -1007,6 +1018,15 @@ class CuteDslFusedMoE(MoEImplBase):
             init_load_balancer=init_load_balancer,
         )
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        # Anchors the MXFP8 fused FC12 autotuning buckets to the module's
+        # saturation token count (see CuteDslFusedMoEMxfp8Runner.get_tuning_config),
+        # so the decode buckets are profiled even when the warmup forward is
+        # large. Same cap as CutlassFusedMoE: ~16k tokens per expert is well
+        # into the compute-bound domain, so profiling beyond it only costs time.
+        self.tune_max_num_tokens = min(
+            model_config.moe_max_num_tokens,
+            16384 * self.num_slots // routing_method.get_experts_per_token(),
+        )
         # The scheduler enables the full fast path only for compatible
         # DeepEPLowLatency NVFP4 post-quant dispatch.
         self.disable_deep_ep_direct_metadata = os.environ.get(
@@ -1617,6 +1637,7 @@ class CuteDslFusedMoE(MoEImplBase):
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             enable_alltoall=enable_alltoall,
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
         inputs = [
             x, token_selected_experts, token_final_scales, x_sf, moe_output

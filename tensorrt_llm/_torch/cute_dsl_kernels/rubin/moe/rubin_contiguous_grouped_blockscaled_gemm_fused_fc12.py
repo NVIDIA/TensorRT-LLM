@@ -181,6 +181,27 @@ def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def streaming_weight_cache_policy(*, loc=None, ip=None) -> cutlass.Int64:
+    """Build the opaque TMA L2 eviction descriptor for streamed weights.
+
+    Decode workloads with one M tile per expert read each weight tile once.
+    Prefer evicting that stream before activations, scales, and intermediates.
+    Use createpolicy rather than depending on the descriptor's bit encoding.
+    """
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @dataclass(frozen=True)
 class Fc12Task:
     """One descriptor in a resident CTA's fused FC12 task stream."""
@@ -870,6 +891,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         tiles: that keeps the original statically unrolled loop, which is faster
         when every group is live. The caller selects it per launch from the
         routing (only one loop body is ever compiled).
+    :param stream_weights: Give the FC1/FC2 B (weight) TMA loads L2 evict-first
+        priority. Intended for decode shapes with little weight reuse across M
+        tiles (about seven or more active experts per rank); leave it False
+        for workloads that benefit from caching weights. Scale-factor loads
+        keep their default cache policy.
     """
 
     def __init__(
@@ -884,9 +910,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         swiglu_limit: cutlass.Float32 = float("inf"),
         scheduler: str = "static",
         sparse_gather: bool = False,
+        stream_weights: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
         self.sparse_gather = sparse_gather
+        self.stream_weights = stream_weights
         self.topk = topk
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
@@ -3358,6 +3386,9 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
 
         # TMA B/SFB load warp (warp 9). Loads B/SFB GMEM → SMEM with multicast.
         if warp_idx == self.tma_b_warp_id:
+            weight_cache_policy = None
+            if cutlass.const_expr(self.stream_weights):
+                weight_cache_policy = streaming_weight_cache_policy()
             fc1_b_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -3444,6 +3475,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         tFC1BsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        cache_policy=weight_cache_policy,
                     )
 
                     # TMA load SFB
@@ -3516,6 +3548,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         tFC2BsB[(None, fc2_b_producer_state.index)],
                         tma_bar_ptr=fc2_b_barrier,
                         mcast_mask=b_full_mcast_mask,
+                        cache_policy=weight_cache_policy,
                     )
                     cute.copy(
                         tma_atom_fc2_sfb,
