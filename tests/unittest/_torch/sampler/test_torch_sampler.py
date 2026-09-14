@@ -53,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
+    SampleType,
     UtilsSamplingParams,
     _get_max_beam_width,
 )
@@ -763,6 +764,9 @@ def test_select_generated_logits(
 def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.MonkeyPatch):
     sampler = object.__new__(TorchSampler)
     sampler.max_beam_width = 1
+    # Bypassing __init__ skips the in-graph sampling state; the batch is sampled
+    # eagerly here, which is what FULL means.
+    sampler._current_sample_type = SampleType.FULL
     sampler._stable_greedy_request_ids = []
     sampler._stable_greedy_seq_slots = []
     sampler._stable_greedy_seq_slots_host = None

@@ -8,16 +8,19 @@ register its transfer before the connector does, and the ctx reap must run
 last so a quickly-completed send cannot terminate a request whose connector
 transfer is not registered yet. These tests pin that structure, and pin the
 property this split exists for: the connector leg keeps running when the
-transceiver is disabled.
+transceiver is disabled. After the coordinator extraction, that property comes
+from the lazily built no-op coordinator, so the transceiver-off test goes
+through the real builder rather than an injected coordinator.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.executor.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
@@ -30,16 +33,17 @@ def _stub_executor() -> PyExecutor:
 
 def _wrapper_calls(executor: PyExecutor) -> list:
     calls = []
-    executor._send_disagg_ctx_kv_async = lambda reqs: calls.append("disagg_send")
+    executor._disagg_coordinator = SimpleNamespace(
+        send_completed_context=lambda reqs: calls.append("disagg_send"),
+        reap_context_sends=lambda n: calls.append(f"ctx_reap:{n}"),
+    )
     executor._save_kv_to_connector_async = lambda reqs: calls.append("connector_save")
-    executor._check_disagg_ctx_cache_transfer_status = lambda n: calls.append(f"ctx_reap:{n}")
     return calls
 
 
 def test_wrapper_order_disagg_then_connector_then_reap() -> None:
     executor = _stub_executor()
     calls = _wrapper_calls(executor)
-    executor.kv_cache_transceiver = object()
 
     PyExecutor._send_kv_async(executor, [])
 
@@ -47,22 +51,18 @@ def test_wrapper_order_disagg_then_connector_then_reap() -> None:
 
 
 def test_wrapper_keeps_connector_leg_without_transceiver() -> None:
-    """Connector-only configs must keep working when the disagg path is off."""
+    """Connector-only configs: with no transceiver the executor lazily builds
+    the no-op coordinator, which turns both disagg legs into no-ops around the
+    connector save. No coordinator is injected so the builder is exercised."""
     executor = _stub_executor()
-    calls = _wrapper_calls(executor)
     executor.kv_cache_transceiver = None
+    calls = []
+    executor._save_kv_to_connector_async = lambda reqs: calls.append("connector_save")
 
     PyExecutor._send_kv_async(executor, [])
 
+    assert isinstance(executor.disagg, NoopDisaggCoordinator)
     assert calls == ["connector_save"]
-
-
-def test_disagg_send_leg_is_noop_without_transceiver() -> None:
-    executor = _stub_executor()
-    executor.kv_cache_transceiver = None
-    # Use a request that passes the send filter: without the guard, the loop
-    # body would hit unset executor attributes and raise.
-    PyExecutor._send_disagg_ctx_kv_async(executor, [_finished_ctx_only_request()])
 
 
 def test_connector_save_leg_is_noop_without_connector() -> None:
@@ -82,60 +82,6 @@ def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
         py_request_id=request_id,
         py_kv_transfer_start_time=None,
     )
-
-
-def test_disagg_send_leg_stores_blocks_before_sending() -> None:
-    executor = _stub_executor()
-    transceiver = Mock()
-    transceiver.kv_transfer_timeout_ms = 1000
-    transceiver.has_retired_send_session.return_value = False
-    executor.kv_cache_transceiver = transceiver
-    executor.kv_cache_manager = Mock(spec=[])  # no release_index_slot
-    executor.async_transfer_manager = Mock()
-    order = Mock()
-    order.attach_mock(executor.async_transfer_manager.start_transfer, "start")
-    order.attach_mock(transceiver.respond_and_send_async, "send")
-    req = _finished_ctx_only_request()
-
-    PyExecutor._send_disagg_ctx_kv_async(executor, [req])
-
-    assert order.mock_calls == [call.start(req), call.send(req)]
-    assert req.py_kv_transfer_start_time is not None
-
-
-def test_disagg_send_leg_skips_timeout_stamp_when_disabled() -> None:
-    executor = _stub_executor()
-    transceiver = Mock()
-    transceiver.kv_transfer_timeout_ms = None
-    transceiver.has_retired_send_session.return_value = False
-    executor.kv_cache_transceiver = transceiver
-    executor.kv_cache_manager = Mock(spec=[])
-    executor.async_transfer_manager = Mock()
-    req = _finished_ctx_only_request()
-
-    PyExecutor._send_disagg_ctx_kv_async(executor, [req])
-
-    transceiver.respond_and_send_async.assert_called_once_with(req)
-    assert req.py_kv_transfer_start_time is None
-
-
-def test_disagg_send_leg_skips_cancelled_and_unfinished_requests() -> None:
-    executor = _stub_executor()
-    transceiver = Mock()
-    transceiver.has_retired_send_session.return_value = False
-    transceiver.pipeline_transfer_enabled = False
-    executor.kv_cache_transceiver = transceiver
-    executor.kv_cache_manager = Mock(spec=[])
-    executor.async_transfer_manager = Mock()
-    cancelled = _finished_ctx_only_request(2)
-    cancelled.is_finished_due_to_cancellation = True
-    unfinished = _finished_ctx_only_request(3)
-    unfinished.is_context_finished = False
-
-    PyExecutor._send_disagg_ctx_kv_async(executor, [cancelled, unfinished])
-
-    executor.async_transfer_manager.start_transfer.assert_not_called()
-    transceiver.respond_and_send_async.assert_not_called()
 
 
 def _connector_executor() -> PyExecutor:
@@ -187,9 +133,9 @@ def test_connector_save_skips_transfer_when_connector_declines() -> None:
 
 
 def _dual_claim_executor() -> PyExecutor:
-    """Executor running the real wrapper, real legs, and a real
-    AsyncTransferManager; only the transceiver, connector, and KV cache
-    manager boundaries are mocked."""
+    """Executor running the real wrapper, a real coordinator, the real
+    connector leg and a real AsyncTransferManager; only the transceiver,
+    connector, and KV cache manager boundaries are mocked."""
     executor = _stub_executor()
     kv_cache_manager = Mock()
     kv_cache_manager.get_cache_indices.return_value = [7]
@@ -205,12 +151,12 @@ def _dual_claim_executor() -> PyExecutor:
     executor.kv_connector_manager = Mock()
     executor.disable_overlap_scheduler = True
     executor.active_requests = []
+    executor.canceled_req_ids = []
     executor.force_terminate_ctx_for_partial_reuse = False
-    executor._disagg_timed_out_ctx_cancelled_ids = set()
+    executor.dist = SimpleNamespace(rank=0, world_size=2)
     executor._terminate_request = Mock()
     # Make the reap's trailing _check_cache_transfer_errors a no-op.
     executor.enable_attention_dp = True
-    executor.dist = SimpleNamespace(world_size=2)
     return executor
 
 
@@ -258,4 +204,20 @@ def test_reap_releases_request_once_connector_declines() -> None:
 
     assert 9 not in executor.async_transfer_manager.requests_in_transfer()
     executor.kv_cache_manager.unpin_blocks_by_id.assert_called_once()
+    executor._terminate_request.assert_called_once_with(req)
+
+
+def test_connector_release_without_transceiver_terminates_on_last_claim() -> None:
+    """Connector-only configs release through the executor, not the
+    coordinator: the request terminates as soon as its save completes."""
+    executor = _stub_executor()
+    executor.kv_cache_transceiver = None
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.end_transfer.return_value = True
+    executor._terminate_request = Mock()
+    req = Mock()
+
+    PyExecutor._release_transfer(executor, req)
+
     executor._terminate_request.assert_called_once_with(req)

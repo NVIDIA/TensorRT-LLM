@@ -21,11 +21,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
-#include "tensorrt_llm/batch_manager/rnnStateManager.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
-#include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/ATen.h>
@@ -512,52 +508,6 @@ void initBindings(nb::module_& m)
         // offset is shared with the native library rather than living in this
         // module's separate copy.
         .def_rw_static("global_steady_clock_offset", &tb::globalSteadyClockOffset());
-
-    nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
-        .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),
-            nb::arg("max_sequence_idle_microseconds"))
-        .def("get_sequence_slot", &tb::SequenceSlotManager::getSequenceSlot, nb::arg("start_flag"),
-            nb::arg("sequence_id"))
-        .def("free_sequence_slot", &tb::SequenceSlotManager::freeSequenceSlot, nb::arg("sequence_id"))
-        .def("free_idle_sequence_slots", &tb::SequenceSlotManager::freeIdleSequenceSlots);
-
-    nb::class_<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
-        .def(nb::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
-                 tr::WorldConfig const&, int64_t, tensorrt_llm::DataType, tensorrt_llm::DataType,
-                 std::vector<tr::SizeType32> const&, tr::SizeType32>(),
-            nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
-            nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),
-            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::arg("num_layers"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("get_cache_index", &tb::rnn_state_manager::RnnStateManager::getCacheIndex, nb::arg("request_id"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def(
-            "get_conv_states",
-            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
-            {
-                auto tensor = self.getConvStates(layerIdx);
-                return tr::Torch::tensor(tensor);
-            },
-            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def(
-            "get_ssm_states",
-            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
-            {
-                auto tensor = self.getSsmStates(layerIdx);
-                return tr::Torch::tensor(tensor);
-            },
-            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
-        .def("allocate_cache_blocks", &tb::rnn_state_manager::RnnStateManager::allocateCacheBlocks,
-            nb::arg("request_ids"), nb::call_guard<nb::gil_scoped_release>())
-        .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, nb::arg("request_id"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, nb::arg("request_ids"),
-            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>())
-        .def("get_num_local_layers", &tb::rnn_state_manager::RnnStateManager::getNumLocalLayers,
-            nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "add_new_tokens_to_requests",

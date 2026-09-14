@@ -2190,7 +2190,7 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
         super().__init__(model_config)
 
         # Expose multimodal token IDs at the top-level model so the
-        # production runtime (``model_engine._prepare_multimodal_indices``)
+        # production runtime (``runners.prepare_multimodal_indices``)
         # can locate the placeholder positions in flat in-flight-batched
         # ``input_ids`` via ``getattr(self.model, "mm_token_ids", None)``.
         # MiniMax-M3's image/video tokens are in-vocab so the engine's

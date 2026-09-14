@@ -73,7 +73,7 @@ ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
 
-MODEL_EXPRESS_VERSION = "0.4.1"
+MODEL_EXPRESS_VERSION = "0.5.1"
 MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
 MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
@@ -492,11 +492,12 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     }
 }
 
-def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
+def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
     def rerunFailed = false
+    def hasUnrerunFailure = false
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -532,6 +533,33 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
                 }
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
+            } else {
+                // Strip trailing " TIMEOUT (N)" / "TIMEOUT(N)" / " ISOLATION" turtle
+                // directives the same way generate_duration.py's _TURTLE_DIRECTIVE_RE does.
+                def bareTestName = isolateTestName.replaceAll(/(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$/, '').trim()
+                def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+                // conftest.py prefixes nodeids with --test-prefix=${stageName}; match in
+                // Groovy, not a shell grep, so a quote in a parametrized id can't break it.
+                def isTestUnfinished = fileExists(unfinishedTestFile) &&
+                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.contains("${stageName}/${bareTestName}".toString())
+                if (isTestUnfinished) {
+                    // Record this crash as a JUnit <testcase> like the regular-test
+                    // path does. hasUnrerunFailure stays untouched here: it drives
+                    // the duration/no-signature message below, which doesn't apply.
+                    generateTimeoutTestResultXml(pipeline, stageName)
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
+                    }
+                } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
+                    // Same duration/no-signature gap as the regular-test path: this
+                    // finished but failed, and was never actually rerun, so
+                    // results_isolated_${i}.xml still carries the original
+                    // <failure> with nothing here to flag it.
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
+                    }
+                    hasUnrerunFailure = true
+                }
             }
         } finally {
             // Clean up the temporary test file
@@ -545,8 +573,13 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
             error "One or more isolated tests failed after rerun attempts"
         }
     }
+    if (hasUnrerunFailure) {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            error "One or more isolated tests failed and were not eligible for rerun, please check the test report."
+        }
+    }
 
-    return rerunFailed  // Return the updated value
+    return [rerunFailed: rerunFailed, hasUnrerunFailure: hasUnrerunFailure]
 }
 
 def getInfraDryRunPytestTargets(testListPath) {
@@ -1073,6 +1106,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     def slurmJobID = null
     def dockerArgs = null
 
+    // The in-flight stage failure (test/bring-up/interrupt), if any. Recorded so the
+    // cleanup finally below can tell "cleanup is the only failure" (throw a retryable
+    // typed InfraFailure) from "a stage failure is already pending" (preserve it, since
+    // a throw from the finally would supersede the real failure per JVM semantics).
+    Throwable pendingStageFailure = null
+
     try {
         // Run ssh command to start node in desired cluster via SLURM
         CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
@@ -1472,6 +1511,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         try {
             executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
         } catch (InterruptedException e) {
+            pendingStageFailure = e
             throw e
         } catch (Exception e) {
             // A test-execution failure was already labeled inside the task runner, so
@@ -1479,26 +1519,56 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             // failure -- just propagate it. Failures raised outside the task runner
             // (image pull, node/agent bring-up, etc.) were never labeled, so classify
             // them here on the agent.
-            throw (slurmFailureClassified || e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
+            Throwable classified = (slurmFailureClassified || e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
+            pendingStageFailure = classified
+            throw classified
         }
     } finally {
         // Resource cleanup must run even if SLURM metadata capture is interrupted.
         try {
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
         } finally {
+            boolean cleanupFailed = false
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources
                 retry(3) {
                     try {
                         cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
                     } catch (Exception e) {
-                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                        if (pendingStageFailure != null) {
+                            // A stage failure (test/bring-up/interrupt) is already in flight.
+                            // Throwing the cleanup error from this finally would supersede it
+                            // (JVM finally semantics), dropping the real failure and letting
+                            // runLLMTestlistOnSlurm reclassify the stage as retryable SLURM
+                            // infra -- masking a genuine test failure as an infra retry. Swallow
+                            // the cleanup error (keep it in the console for diagnostics) so the
+                            // pending failure propagates unchanged.
+                            cleanupFailed = true
+                            echo "Clean Up SLURM resources failed while a stage failure was already " +
+                                 "pending; preserving the pending failure and leaving the resource " +
+                                 "ledger entry for the post-build sweep. Cleanup error: ${e.toString()}"
+                        } else {
+                            // Cleanup is the only failure. Throw it typed (chaining the cause)
+                            // instead of error(...): error(...) flattens the exception to a bare
+                            // string, dropping the cause chain and the ssh transport signature,
+                            // which is how a cleanup ssh drop (exit 255) reaches FailureClassifier
+                            // as an unmatched UserFailure and fail-fast-kills sibling stages. A
+                            // typed throw still de-interrupts into a retryable throw for the
+                            // retry(3) workaround, and keeps any pod-death signal in the cause
+                            // chain for isDispatcherPodFailure() upstream.
+                            throw new InfraFailure(
+                                "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
+                        }
                     }
                 }
             }
             // Cleanup ran on the live pod; drop the registry entry so the off-pod
-            // finalizer/sweep does not reconcile already-freed resources.
-            deregisterSlurmResource(stageName)
+            // finalizer/sweep does not reconcile already-freed resources. If cleanup was
+            // skipped under a pending stage failure, leave the entry live for the sweep.
+            if (!cleanupFailed) {
+                deregisterSlurmResource(stageName)
+            }
         }
     }
 }
@@ -1590,6 +1660,8 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
+    extraInternalEnv += " TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1"
     // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
     // that repeated tactic profiling is reused across testcases within one stage.
     // /tmp lives on the container overlay (srun --no-container-mount-home / fresh
@@ -1644,6 +1716,9 @@ def getPytestBaseCommandLine(
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        // Reruns redirect --periodic-junit-xmlpath elsewhere but inherit this
+        // flag unchanged, so every attempt shares one unfinished_test.txt.
+        "--periodic-unfinished-test-path=${outputPath}/unfinished_test.txt",
         "--periodic-hang-traceback",
     ]
 
@@ -2070,7 +2145,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'BUILD_URL',
                     'JOB_NAME',
                     'globalVars',
-                    'gitlabCommit'
+                    'gitlabCommit',
+                    'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
                 ]
                 def envVarsToExport = [:]
                 envVarNames.each { varName ->
@@ -2665,19 +2741,50 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, postTag, suppressTestReporting)
             deleteProgressArtifact(stageName, postTag)
         } finally {
+            // A stage failure (test/bring-up) or interruption already in flight; recorded
+            // above as caughtStageError / stageIsInterrupted. If either is set, a throw from
+            // this cleanup finally would supersede it.
+            boolean stageFailurePending = (caughtStageError != null || stageIsInterrupted)
+            boolean cleanupFailed = false
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources
                 retry(3) {
                     try {
                         cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
                     } catch (Exception e) {
-                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                        if (stageFailurePending) {
+                            // Throwing the cleanup error from this finally would supersede the
+                            // pending failure (JVM finally semantics), dropping the real failure
+                            // and letting runLLMTestlistOnSlurm reclassify the stage as retryable
+                            // SLURM infra -- masking a genuine test failure (or an interrupt) as
+                            // an infra retry. Swallow the cleanup error (keep it in the console
+                            // for diagnostics) so the pending failure propagates unchanged.
+                            cleanupFailed = true
+                            echo "Clean Up SLURM resources failed while a stage failure was already " +
+                                 "pending; preserving the pending failure and leaving the resource " +
+                                 "ledger entry for the post-build sweep. Cleanup error: ${e.toString()}"
+                        } else {
+                            // Cleanup is the only failure. Throw it typed (chaining the cause)
+                            // instead of error(...): error(...) flattens the exception to a bare
+                            // string, dropping the cause chain and the ssh transport signature,
+                            // which is how a cleanup ssh drop (exit 255) reaches FailureClassifier
+                            // as an unmatched UserFailure and fail-fast-kills sibling stages. A
+                            // typed throw still de-interrupts into a retryable throw for the
+                            // retry(3) workaround, and keeps any pod-death signal in the cause
+                            // chain for isDispatcherPodFailure() upstream.
+                            throw new InfraFailure(
+                                "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
+                        }
                     }
                 }
             }
             // Cleanup ran on the live pod; drop the registry entry so the off-pod
-            // finalizer/sweep does not reconcile already-freed resources.
-            deregisterSlurmResource(stageName)
+            // finalizer/sweep does not reconcile already-freed resources. If cleanup was
+            // skipped under a pending stage failure, leave the entry live for the sweep.
+            if (!cleanupFailed) {
+                deregisterSlurmResource(stageName)
+            }
         }
     }
 }
@@ -3704,7 +3811,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - name: TRTLLM_MX_E2E_REQUIRED
                       value: "1"
         """
-        // Mirrors the ModelExpress v0.4.1 Redis deployment and image contract.
+        // Mirrors the ModelExpress Redis deployment and image contract.
         // The image exposes /app/modelexpress-server and accepts the port/backend settings below.
         // Use regular containers because the Jenkins Kubernetes launcher does not
         // reliably attach to pods containing restartable init-container sidecars.
@@ -4361,11 +4468,21 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
+// generate_rerun_tests_list opens rerun_0/1/2.txt eagerly but removes any that
+// end up empty, so this also guards against a future change to that cleanup.
+def fileHasContent(path) {
+    return fileExists(path) && readFile(path).trim()
+}
+
 // Return true means the test rerun also fails. Return false otherwise.
 def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
-        echo "There is no ${resultFileName} file, skip the rerun step"
-        return true
+        // No results were ever flushed (e.g. the process was killed before any
+        // test finished reporting). test_rerun.py treats a missing xml as "no
+        // tests ran" and falls back to unfinished_test.txt / the original test
+        // list to classify each test, so keep going instead of assuming a
+        // rerun already failed.
+        echo "There is no ${resultFileName} file; falling back to unfinished/not-run classification for ${testType}"
     }
 
     // Create rerun directory structure to avoid conflicts
@@ -4531,6 +4648,7 @@ def generateRerunReport(stageName, llmSrc) {
     // Collect all original and rerun result files
     def allInputFiles = []
 
+    // ---- Regular test results ----
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
@@ -4539,7 +4657,18 @@ def generateRerunReport(stageName, llmSrc) {
             rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
         }
     }
+    // Add regular rerun results
+    if (hasRegularReruns) {
+        for (times in [1, 2]) {
+            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            if (fileExists(rerunFile)) {
+                allInputFiles.add(rerunFile)
+                rerunResultFiles.add(rerunFile)
+            }
+        }
+    }
 
+    // ---- Isolated test results ----
     // Add ALL isolated test results to allInputFiles
     def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
     if (isolatedResults) {
@@ -4548,26 +4677,15 @@ def generateRerunReport(stageName, llmSrc) {
                 allInputFiles.add(file.trim())
             }
         }
-        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
-        isolatedTestsWithReruns.each { isolatedTest ->
-            if (fileExists(isolatedTest.originalResult)) {
-                rerunResultFiles.add(isolatedTest.originalResult)
-                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
-            }
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    rerunResultFiles.add(rerunFile)
-                }
-            }
-        }
     }
-
-    // Add regular rerun results
-    if (hasRegularReruns) {
+    // Add isolated rerun results
+    isolatedTestsWithReruns.each { isolatedTest ->
+        if (fileExists(isolatedTest.originalResult)) {
+            rerunResultFiles.add(isolatedTest.originalResult)
+            echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
+        }
         for (times in [1, 2]) {
-            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
             if (fileExists(rerunFile)) {
                 allInputFiles.add(rerunFile)
                 rerunResultFiles.add(rerunFile)
@@ -4947,38 +5065,20 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // Gateway adapters are opt-in extras excluded from requirements.txt;
-            // each gateway declares its pins in a dedicated
-            // requirements-<gateway>.txt, and a test stage installs exactly
-            // zero or one gateway file so every adapter is tested under the
-            // dependency set its real opt-in users receive. A gateway whose
-            // pins co-resolve with the default environment (SMG today) is
-            // installed in the shared stages so its unit tests run from the
-            // regular shard pool instead of being skipped at collection; a
-            // gateway whose pins conflict with the default environment (for
-            // example a protobuf major-version floor or a custom package
-            // index) must instead install its file behind a dedicated stage
-            // guard and skip this one (see the Ray install below for the
-            // stage-scoped pattern).
+            // Gateway adapters (SMG, OpenEngine) are opt-in extras excluded
+            // from requirements.txt, each declaring its pins in a dedicated
+            // requirements-<gateway>.txt so it is tested under the dependency
+            // set its real opt-in users receive. Both are installed on every
+            // stage: their pins co-resolve, so no stage-name guard is needed to
+            // keep them apart, and no stage silently loses a gateway's coverage
+            // to an `importorskip` at collection.
             //
-            // OpenEngine takes that second branch: its bindings resolve only
-            // from a custom index (--extra-index-url https://buf.build/gen/python),
-            // so it owns the CPU-Generic stages -- the only stages whose test
-            // list carries unittest/grpc/openengine/ -- and SMG steps aside
-            // there. No test in l0_cpu.yml imports tensorrt_llm.grpc.smg, so
-            // the swap costs no coverage. The guard is on the stage name and
-            // never on the CBTS scope: `scopes` is the union of every fired
-            // rule's scope, so a mixed selection (openengine source + any other
-            // narrowing change) would push these pins into every shard it runs.
-            // Matched as a substring, like the Ray guard below: a stage name that
-            // picks up a prefix or suffix must keep matching, because a missed
-            // match here is a silent `importorskip` skip rather than a failure.
-            if (stageName.contains("CPU-Generic")) {
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
-            } else {
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
-            }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
+            // OpenEngine's bindings resolve only from a custom index
+            // (--extra-index-url https://buf.build/gen/python), but that flag is
+            // scoped to this one pip invocation and does not affect how any
+            // other package resolves.
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: """
@@ -4993,7 +5093,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             if (stageName.contains("-ModelExpress-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
-                // ModelExpress 0.4.1 imports nixl._api, while requirements-dev.txt
+                // ModelExpress imports nixl._api, while requirements-dev.txt
                 // installs only the nixl-cu13 backend. Install the matching
                 // namespace shim without pulling the unused CUDA 12 backend.
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")
@@ -5079,6 +5179,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
+        def hasUnrerunFailure = false
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
             testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -5270,18 +5371,33 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (Exception e) {
                         def isRerunFailed = rerunFailedTests(
                             stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
+                        // Unconditional: a test can crash again during the rerun itself
+                        // (isRerunFailed=true), and unfinished_test.txt is the only
+                        // record of that crash. junit()'s "results*.xml" glob picks up
+                        // results-timeout.xml directly, so this is what surfaces it.
+                        def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
                         if (isRerunFailed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
                             }
                             rerunFailed = true
-                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                        } else if (hadUnfinishedTests) {
                             // Rerun passed but the first run had a timeout: mark this
                             // stage FAILURE so "[${stageName}] Run Pytest" turns red,
                             // not just the enclosing parent stage.
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Some tests terminated unexpectedly, please check the test report."
                             }
+                        } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
+                            // Failures that finished (not a timeout) but were never
+                            // rerun because duration > 10 min and no known failure
+                            // signature matched: results.xml still carries their
+                            // original <failure>, but neither branch above fires for
+                            // them, so without this the stage silently reports green.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+                            }
+                            hasUnrerunFailure = true
                         }
                     }
 
@@ -5289,8 +5405,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     if (preprocessedLists.isolateCount > 0) {
                         stage ("[${stageName}] Run Pytest (Isolated)") {
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                            rerunFailed = runIsolatedTests(
-                                preprocessedLists, pytestCommand, llmSrc, stageName, postTag) || rerunFailed
+                            def isolatedResult = runIsolatedTests(
+                                pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag)
+                            rerunFailed = isolatedResult.rerunFailed || rerunFailed
+                            hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
                         }
                     } else {
                         echo "No isolated tests to run for stage ${stageName}"
@@ -5327,14 +5445,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
-        }
-
-        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
-            error "Some tests terminated unexpectedly, please check the test report."
-        }
-
+        // catchError just lets "Create Perf Report" still run; the real
+        // failure is raised via perfRegressionExitCode after perfMode below.
+        def perfRegressionExitCode = null
         if (perfMode) {
             // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
             basePerfFilename = "base_perf_pytorch.csv"
@@ -5349,7 +5462,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     returnStatus: true
                 )
                 if (perfCheckResult != 0) {
-                    error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                    perfRegressionExitCode = perfCheckResult
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                    }
                 }
             }
             stage("Create Perf Report") {
@@ -5364,6 +5480,25 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     echo "No perf script test results to create report"
                 }
             }
+        }
+
+        // Checked after perfMode so perf artifacts are generated first.
+        // Unguarded error() on purpose -- catchError here would swallow the
+        // throw that cacheErrorAndUploadResult relies on to fail the build.
+        if (rerunFailed) {
+            error "Some tests still failed after rerun attempts, please check the test report."
+        }
+
+        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+            error "Some tests terminated unexpectedly, please check the test report."
+        }
+
+        if (hasUnrerunFailure) {
+            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+        }
+
+        if (perfRegressionExitCode != null) {
+            error "Performance regression detected and failing the build (exit code: ${perfRegressionExitCode})"
         }
     }
 
@@ -6386,7 +6521,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 5 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
         2,
         20,
@@ -6423,9 +6558,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
-        2,
+        3,
         36,
         9
     )
@@ -6434,16 +6569,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16",
-        2,
+        3,
         40,
         10
     )
     // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
-        2,
+        3,
         44,
         11
     )
@@ -6452,7 +6587,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8",
-        2,
+        3,
         56,
         14
     )
@@ -6468,7 +6603,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen6_node1_gpu4",
         2,
         28,
@@ -6477,7 +6612,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 50k2k con178: ctx5 (5 nodes, 4 GPUs each) + gen1 dep4 (1 node, 4 GPUs) = 24 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX5-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4",
         2,
         24,
@@ -6488,12 +6623,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
     // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
     // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
-    // wall-clock duration instead of a fixed prompt count, so they are pinned to
-    // aws-cmh where the DSpark checkpoint and the trace corpus are staged.
+    // wall-clock duration instead of a fixed prompt count. They require the
+    // DSpark checkpoint and the trace corpus to be staged on whichever
+    // gb300-flex cluster the stage lands on.
     // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
         1,
         24,
@@ -6502,7 +6638,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 10 Nodes: ctx3 (2 nodes, 8 GPUs each) + gen1 (4 nodes, 16 GPUs) = 40 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX3-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node2_gpu8_gen1_node4_gpu16",
         1,
         40,

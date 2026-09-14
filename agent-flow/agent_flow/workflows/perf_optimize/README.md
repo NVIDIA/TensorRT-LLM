@@ -49,16 +49,27 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   round that neither accepted anything nor made a potentially
   build-changing code attempt it runs **replan-only**, planning from the
   standing profile and that round's verdicts — see *What a round costs*):
-  profiles the *current* build (nsys +
-  torch profiler + an ncu per-kernel deep dive on the top nsys kernels,
-  captured over the same iteration window and interpreted with the
+  profiles the *current* build (nsys — decomposed with the
+  `internal-perf-nsight-system-analysis` skill into per-iteration time, busy/idle
+  rungs and the compute-absent split (launch-starved / blocking /
+  dependency-stalled) — plus an ncu per-kernel deep dive on the top
+  kernels of that decomposition (ranked by in-window union time, not by
+  the capture-wide `kern_sum`), captured over the same iteration window
+  and interpreted
+  with the
   `perf-nsight-compute-analysis` skill — per-kernel SOL%, occupancy,
   warp stalls → bound class; perf-analyze methodology), then
   writes/updates
   `roadmap.yaml` — items ordered by `expected_gain_pct` (bottleneck share
   removed, casebook-grounded), never by fix ease, each item's evidence
   drawn across the analyses (nsys timeline, ncu kernel analysis, SOL
-  correlation when the projector ran) rather than the timeline alone.
+  correlation when the projector ran) rather than the timeline alone,
+  and each kernel-speedup item bounded by the operator's measured
+  headroom rather than its cost. The timeline analysis's own
+  `items.json` is accounted for row by row in `roadmap.yaml`'s
+  `nsys_items` block — every opportunity it found becomes an item or a
+  dismissal with evidence, and the orchestrator validates that the
+  moment the turn ends (see *The nsys opportunity-coverage gate*).
   Later rounds re-profile
   (bottlenecks shift after each accepted item) and update statuses /
   ordering without rewriting history — a round following one that left
@@ -120,11 +131,12 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   not a separate stage: after the clean measurement, the evaluator
   relaunches the server under the canonical nsys wrap, replays the load
   once, and saves `attempt_<k>/profile/` (trace, `nsys_stats.txt`,
-  replay log), then writes a *Kernel evidence* section comparing the
-  capture against the frozen accepted state — verifying the item's
-  claimed mechanism is actually visible in the trace. Because rejected
-  attempts are hard-reverted. A final-state integration capture, when
-  produced, becomes the reporter's newest accepted-state profile.
+  `nsys_analysis/`, replay log), then writes a *Kernel evidence* section
+  comparing the capture against the frozen accepted state — verifying
+  the item's claimed mechanism is actually visible in the trace. Because
+  rejected attempts are hard-reverted. A final-state integration
+  capture, when produced, becomes the reporter's newest accepted-state
+  profile.
   The capture is diagnostic, never a measurement (fresh relaunch; the
   verdict comes from the un-profiled run); no capture is made when
   `nsys` is not in `profile.methods`, and a failed capture never flips
@@ -157,6 +169,41 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
 The orchestrator — not the agents — owns the roadmap lifecycle fields and
 the git state of the TRT-LLM checkout, driven by the evaluator's
 structured decisions in `progress.yaml`.
+
+## The nsys opportunity-coverage gate
+
+The `internal-perf-nsight-system-analysis` skill closes every run by writing
+`nsys_analysis/items.json` — the performance opportunities the timeline
+found, each with a stable `id`, the step table behind it and a
+`magnitudeMs`. Without a consumer that list is prose: the analyzer reads
+the numbers, writes findings, and whether an opportunity ever reached
+the plan is invisible.
+
+So `roadmap.yaml` carries a top-level `nsys_items` block accounting for
+every id in that file — the same `disposition` / `ref` vocabulary as
+`kernel_ledger.yaml`, for the same reason:
+
+```yaml
+nsys_items:
+  - {id: nsys-01, disposition: item, ref: opt-003}
+  - {id: nsys-02, disposition: dismissed, ref: "0.2 ms/iter is below the noise floor"}
+```
+
+An `item` ref must name a real roadmap id (any status — an opportunity
+whose fix was already tried *was* considered); a `dismissed` ref is the
+evidence for dismissing it. The orchestrator validates the block the
+moment the analyzer's turn ends, so an opportunity that was neither
+planned nor dismissed parks the campaign at the analyzer instead of
+quietly evaporating. Dismissing is a first-class answer — below the
+noise floor, mechanism already present, no allowed approach reaches it —
+and is always cheaper than an unfounded item a full benchmark has to
+disprove.
+
+**Self-gating on the artifact**, so it needs no task knob: enforced
+exactly when the round produced an `items.json`. A replan-only round
+runs no profiler and writes none; a round whose skill was unavailable or
+whose pipeline errored writes none either and records the reason under
+*Caveats*. Neither owes the block anything.
 
 ## The acceptance gate
 
@@ -236,7 +283,7 @@ directly.
 
 - **Profiling round** — round 1; any round opening after an accept; and
   any round whose reverted code attempt may have changed ignored build
-  output. Re-profiles the current runtime (nsys + torch + ncu per
+  output. Re-profiles the current runtime (nsys + ncu per
   `profile.methods`) and re-ranks the roadmap against fresh traces. An
   older checkpoint with no profile-currency marker also buys one
   conservative profile on resume.
@@ -307,7 +354,11 @@ Fresh runs only: on resume the checkpoint wins and the flag is ignored
 with a warning. Note that a run whose `profile.kernel_coverage` contract
 is on does **not** enforce the per-kernel ledger for a reused round that
 carries none, nor for a replan-only round (neither ran ncu); every round
-the analyzer actually profiles is still bound by it.
+the analyzer actually profiles is still bound by it. A reused round that
+*did* import a ledger is held to the contract, but one this campaign
+cannot satisfy — an older schema, or `item` refs naming the source
+campaign's roadmap ids — is waived with a warning rather than aborted,
+since the plan-only round never writes a ledger a retry could repair.
 
 ## Usage
 
@@ -364,6 +415,23 @@ exactly as in perf-analyze):
 are always normalized so positive = improvement (throughput up, latency
 down).
 
+When `slurm-environment.cluster_ssh` is set, paths belong to these machines:
+
+| Field | Location |
+| --- | --- |
+| `trtllm_repo_path` | Local checkout edited and managed by perf-optimize. |
+| `extra_llm_api_options` | Local input copied into the workflow's live tuning YAML. |
+| `checkpoint_path` | Remote path visible to the Slurm job/container. |
+| `slurm-environment.cluster_ssh` | SSH target; setting it enables remote execution. |
+| `slurm-environment.docker_image` | Remote SQSH path visible to Slurm/Pyxis. |
+| `slurm-environment.remote_run_root` | Remote absolute temporary root; defaults to `~/agent_flow_workspace/<workspace-name>`. |
+| `slurm-environment.slurm_partition`, `account`, `qos` | Settings of the selected remote Slurm cluster. |
+
+The workflow workspace and Git stay local. Agents copy required inputs and
+changed source to isolated directories below the remote run root, then pull
+required outputs back. Without `cluster_ssh`, all paths refer to the machine
+running the CLI.
+
 ## Git requirements (read before running)
 
 `perf-optimize` **mutates the TRT-LLM checkout** at `trtllm_repo_path`:
@@ -407,7 +475,7 @@ down).
 │   ├── manifest.md                  #   what was imported, and from where
 │   └── prior_roadmap.yaml           #   source campaign's roadmap — read-only prior art
 ├── rounds/round_<n>/
-│   ├── analysis/                    # analyzer: profile_findings.md, nsys/torch/ncu traces (+ regions.json / sol.json when the projector ran;
+│   ├── analysis/                    # analyzer: profile_findings.md, nsys/ncu traces, nsys_analysis/ (+ regions.json / sol.json when the projector ran;
 │   │                                #   + kernel_ledger.yaml with a profile.kernel_coverage block)
 │   └── item_<j>_<id>/attempt_<k>/   # per item: optimization_summary.md, evaluation.md, result *.json
 │       └── profile/                 # accept-evidence nsys capture (APPROVEd attempts only)
@@ -448,10 +516,35 @@ down).
   canonical `benchmark_serving.py` / `nsys profile` / `ncu` templates at
   the configured operating point(s) — one run per `benchmark.concurrency`
   point in Pareto-curve mode — so numbers stay comparable across the
-  whole campaign. The analyzer's ncu deep dive is bounded
-  (`--launch-count`, kernel filter from the top nsys kernels) and
-  interpreted with the `perf-nsight-compute-analysis` skill; it degrades
-  gracefully when `ncu` or the skill is unavailable.
+  whole campaign. Every nsys capture — the analyzer's round profile and
+  the evaluator's accept-evidence capture alike — is exported to
+  `.sqlite` and decomposed with the `internal-perf-nsight-system-analysis` skill
+  into `nsys_analysis/`, so "the launch gaps shrunk" is a measured
+  per-iteration budget on both sides rather than an eyeballed kernel
+  table. The accept-evidence capture runs that pipeline **comparative**
+  against the previous capture of the accepted state, so the mechanism
+  check reads signed deltas out of `difference/rank-0/` instead of
+  comparing two trees by eye. Kernels are classified with the
+  checked-in TRT-LLM taxonomy
+  (`perf_analyze/assets/taxonomy_trtllm.json`), which the analyzer
+  extends per workload before quoting any category number. The
+  analyzer's ncu deep dive is bounded
+  (`--launch-count`, kernel filter from the top decomposition kernels)
+  and
+  interpreted with the `perf-nsight-compute-analysis` skill; both
+  degrade gracefully when the tool or the skill is unavailable.
+- **Multi-rank capture (`profile.profile_ranks`, default `[0]`).**
+  Listing several ranks wraps each of them separately inside the
+  launcher step and unlocks the skill's rank-jitter step, whose
+  `pinned`-vs-`rotating` straggler verdict is the only evidence that
+  separates "waiting on a slow rank" from "waiting on the network".
+  Above world size 1 a bare `trtllm-serve` cannot deliver it — its
+  workers are `MPI.COMM_SELF.Spawn`ed and nsys does not follow them — so
+  per-rank traces need the Slurm `trtllm-llmapi-launch` shape. An
+  imbalance item is filed under the category of the imbalanced *work*
+  (`compute` for uneven expert load, and so on), never `communication`:
+  the jitter wait shows up inside a collective but bucketing, overlap
+  and interconnect levers cannot recover another rank's lateness.
 - **Per-kernel coverage contract (optional).** A
   `profile.kernel_coverage` block in `task.yaml` (empty mapping =
   defaults: `min_share_pct: 0.5`, `coverage_target_pct: 95`) upgrades
@@ -460,25 +553,56 @@ down).
   coverage target is reached, captured over up to 3 bounded ncu passes
   that re-filter on still-missing stems so once-per-step kernels are
   not starved by per-layer hot ones). Each round the analyzer must then
-  answer two questions per enumerated kernel — *can it be made faster?*
-  *can it be fused with its neighbors?* — in
+  answer four questions per enumerated kernel — *can it be eliminated?*
+  *can it be made faster?* *can it be fused with its neighbors?* *can it
+  be overlapped with independent work on another stream?* — in
   `rounds/round_<n>/analysis/kernel_ledger.yaml`: every row carries the
-  kernel's ncu SOL metrics/bound class plus a `faster` and a `fusion`
-  disposition, each either a roadmap item id or an evidence-backed
-  dismissal (`at-sol-floor`, `below-materiality` with arithmetic,
-  `multi-consumer-pinned`, `already-fused`, `phase-boundary`,
-  `needs-rebuild`, ...); `needs-rebuild` is valid only when a
-  written-from-scratch replacement kernel routed from the Python call
-  site is also ruled out, not merely because the incumbent ships
-  compiled; fusion rows record the observed neighbors from the trace. The orchestrator schema-validates the ledger after every
-  analyzer turn (both dispositions per row, `item` refs resolving to
-  real roadmap ids, coverage ≥ target) and **aborts the stage on an
-  incomplete ledger**, so the campaign cannot conclude while a hot
-  kernel's optimization or fusion possibility was never considered; the
-  reporter's *Kernel Coverage* section resolves the final ledger's
-  dispositions to campaign outcomes and itemizes the untried tail.
-  Requires `nsys` + `ncu` in `profile.methods`; costs extra profiling
-  wall-clock per round.
+  kernel's ncu SOL metrics/bound class plus an `elimination`, a
+  `faster`, a `fusion` and an `overlap` disposition, each either a
+  roadmap item id or an evidence-backed dismissal (`mandatory-math`,
+  `padding-minimal`, `already-hoisted`, `fast-path-active`,
+  `fast-path-blocked`, `at-sol-floor`, `below-materiality` with
+  arithmetic, `multi-consumer-pinned`, `already-fused`,
+  `phase-boundary`, `needs-rebuild`, `graph-disabled`,
+  `no-independent-partner`, `resource-saturated`, ...);
+  `needs-rebuild` is valid only when a written-from-scratch replacement
+  kernel routed from the Python call site is also ruled out, not merely
+  because the incumbent ships compiled; elimination rows record what
+  consumes the output (or the guard that selected this path), fusion
+  rows the observed neighbors from the trace, and overlap rows the
+  candidate partner plus the evidence the two are serialized today.
+
+  The four are ordered by how much they presuppose, each asking less
+  than the last. **Elimination** presupposes only that the kernel runs
+  today, and is first because a `yes` moots the rest and recovers the
+  row's *whole* share rather than a fraction — it covers redundant work,
+  work over padded/masked data, per-step recompute of something
+  invariant, and the accidental slow path (an `is_fused=False` fallback
+  firing because a gated fast path did not), which is the per-kernel
+  per-round teeth on round 1's dormant-capability sweep. **Faster** and
+  **fusion** presuppose the work is necessary *and* that the kernel must
+  run alone. **Overlap** drops the alone assumption: a kernel at its
+  bound-class ceiling (`at-sol-floor`) whose neighbors move only
+  mandatory bytes (`neighbors-at-bandwidth-floor`) is legitimately
+  closed on both and can still give back most of its share by running
+  concurrently with independent work — realized through the checkout's
+  own `maybe_execute_in_parallel` / `AuxStreamType` idiom, and gated on
+  CUDA graphs being enabled (multi-stream no-ops without them). The
+  ledger also carries `coverage.gpu_busy_pct`, the busy share of the
+  profiled window: `share_pct` is a share of *GPU time* while
+  `noise_floor_pct` and `expected_gain_pct` are shares of *wall clock*,
+  so every materiality claim converts through it rather than
+  overstating candidates by `1/busy` on a host-bound deployment.
+
+  The orchestrator schema-validates the ledger after every analyzer
+  turn (all four dispositions per row, `item` refs resolving to real
+  roadmap ids, coverage ≥ target, `gpu_busy_pct` present) and **aborts
+  the stage on an incomplete ledger**, so the campaign cannot conclude
+  while a hot kernel's elimination, optimization, fusion, or overlap
+  possibility was never considered; the reporter's *Kernel Coverage* section resolves
+  the final ledger's dispositions to campaign outcomes and itemizes the
+  untried tail. Requires `nsys` + `ncu` in `profile.methods`; costs
+  extra profiling wall-clock per round.
 - **Optimization casebook.** The benchmarker/analyzer load the
   `trtllm-agent-toolkit:perf-optimization-casebook` skill as read-only
   reference; the optimizer uses it *actionably* (how-to-apply /
@@ -520,7 +644,7 @@ down).
   as read-only reference, used only if it is installed in the
   session.
 - **Cost.** The analyzer re-profiles every round that follows an accept
-  or a potentially build-changing reverted code attempt (nsys + torch +
+  or a potentially build-changing reverted code attempt (nsys plus
   the bounded ncu deep dive by default); set `profile.methods: [nsys]`
   to trim it. When the standing runtime profile is still current, the
   next round opens replan-only and pays no GPU time at all — see *What a

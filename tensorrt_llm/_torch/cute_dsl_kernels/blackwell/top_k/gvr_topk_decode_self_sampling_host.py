@@ -678,6 +678,63 @@ def route_streaming(
 
 _VARLEN_CACHE = {}
 
+# ---- prefill launcher cache ------------------------------------------------
+# Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
+# launcher depends only on the row tier, k and the envelope bucket — never on the
+# exact row count or npad — so the cache stays bounded on a long-running server.
+_PREFILL_CACHE = {}
+_PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
+_PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
+
+
+def _prefill_tier(rows: int) -> int:
+    return 0 if rows <= 148 else 1 if rows <= 296 else 2
+
+
+def _prefill_bucket(n_env: int) -> int:
+    # pow2-quantize the envelope so a growing envelope reuses one plan; cap at
+    # 32768 because U=8 for every n>=32768 on the tier-0 arm.
+    return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
+
+
+def _prefill_cache_key(tier: int, k: int, n_bucket: int):
+    # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
+    # to one key so warmup covers them with a single launch.
+    return (tier, k, n_bucket if tier == 0 else 0)
+
+
+def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
+    """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
+    r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
+    upper bounds; npad is filled per call in ``run_prefill``."""
+    key = _prefill_cache_key(tier, k, n_bucket)
+    hit = _PREFILL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    b_route = _PREFILL_TIER_ROWS[tier]
+    n_route = max(n_bucket, k + 1)
+    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+    if plan["kernel"] != "main":
+        raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
+    rt = plan["rt"]
+    if rt["R"] != 1:
+        raise RuntimeError(f"prefill requires R==1 (got {rt['R']})")
+    tpl = tuple(plan["tpl"])
+    dev = _device()
+    fn = dev.get_compiled(tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True)
+    big = tier == 0
+    # r_const==1 branch of the _varlen_launcher tuning scalars
+    aim_base = (
+        (4 * k if k >= 1024 else 2 * k) if big else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+    )
+    sfac = 64 if k >= 1024 else 32
+    amin = (7 * k) // 2
+    sd_en = 1 if (k > 1024 and not big) else 0
+    tail = (aim_base, sfac, amin, sd_en, 0)  # tsh_en=0 (split=False)
+    lc = ("main", fn, (rt["SCAP_"], rt["CMP_"]), tail)
+    _PREFILL_CACHE[key] = lc
+    return lc
+
 
 def _varlen_launcher(
     num_rows: int,
@@ -1435,6 +1492,119 @@ def run_varlen(
     return
 
 
+def run_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    max_row_len: int | None = None,
+    workspace: torch.Tensor | None = None,
+) -> None:
+    """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
+    ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
+    with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
+    No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1]."""
+    if logits.dtype is not _F32:
+        raise RuntimeError(
+            f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
+            "are a follow-up — see the PR roadmap"
+        )
+    for _nm, _t in (("row_starts", row_starts), ("row_ends", row_ends)):
+        if not (isinstance(_t, _TENSOR) and _t.is_cuda):
+            raise RuntimeError(f"{_nm} must be a CUDA tensor")
+        if _t.dtype is not _I32:
+            raise RuntimeError(f"{_nm} must be int32")
+        if _t.dim() != 1:
+            raise RuntimeError(f"{_nm} must be 1-D")
+        if not _t.is_contiguous():
+            raise RuntimeError(f"{_nm} must be contiguous")
+    if len(logits.shape) != 2:
+        raise RuntimeError("logits must be 2-D")
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return
+    if row_starts.shape[0] != num_rows or row_ends.shape[0] != num_rows:
+        raise RuntimeError(
+            f"row_starts/row_ends length must equal logits.shape[0]={num_rows}, "
+            f"got {row_starts.shape[0]}/{row_ends.shape[0]}"
+        )
+    if not (logits.is_cuda and indices.is_cuda):
+        raise RuntimeError("all tensors must be CUDA")
+    if indices.dtype is not _I32:
+        raise RuntimeError("indices must be int32")
+    if len(indices.shape) != 2 or indices.shape[0] != num_rows:
+        raise RuntimeError(f"indices must be [num_rows={num_rows}, k], got {tuple(indices.shape)}")
+    if not indices.is_contiguous():
+        raise RuntimeError("indices must be contiguous")
+    k = indices.shape[1]
+    if k < 4 or (k & 3):
+        raise RuntimeError(f"index_topk must be a multiple of 4 and >= 4, got {k}")
+    if indices.data_ptr() & 15:
+        raise RuntimeError("indices base must be 16-byte aligned")
+    if logits.stride(1) != 1:
+        raise RuntimeError("logits inner stride must be 1")
+    # key on stride(0) for every row count: DeepGEMM prefill rows are 1024B-aligned
+    # with slack, and the varlen 1-row shape[1] rule would reject odd-width tiles.
+    npad = logits.stride(0)
+    if npad & 3:
+        raise RuntimeError(f"npad (logits row stride) must be a multiple of 4, got {npad}")
+    if logits.data_ptr() & 15:
+        raise RuntimeError("logits base must be 16-byte aligned")
+    d = logits.get_device()
+    if not 0 <= d < _GVR_MAX_DEV:
+        raise RuntimeError(f"device index out of range: {d}")
+    lg = logits
+    if logits.shape[1] != npad:
+        need = logits.storage_offset() + num_rows * npad
+        if logits.untyped_storage().size() // 4 < need:
+            raise RuntimeError("logits view storage too small to widen to its row stride")
+        lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
+    if workspace is not None:
+        validate_run_ws(workspace, logits)
+        ws = kernel_view(workspace)
+    else:
+        ws = _ws_hot.get(d)
+        if ws is None:
+            ws = default_workspace(logits)
+    n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
+    n_env = min(max(n_env, 1), npad)
+    n_bucket = _prefill_bucket(n_env)
+    for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
+        r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
+        tier = _prefill_tier(r1 - r0)
+        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
+        if lc is None:
+            if _is_capturing():
+                raise RuntimeError(
+                    "prefill launcher not compiled for this shape — warm up "
+                    "before CUDA graph capture"
+                )
+            lc = _prefill_launcher(tier, k, n_bucket)
+        _, fn, (scap, cmp_), tail = lc
+        # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
+        # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
+        pre = (0, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
+        fn(lg[r0:r1], row_ends[r0:r1], indices[r0:r1], ws, *pre, row_starts[r0:r1], *tail)
+    return
+
+
+def prefill_ready(logits: torch.Tensor, indices: torch.Tensor) -> bool:
+    """True iff ``run_prefill(logits, ..., indices)`` would launch without
+    compiling — the same (tier, k, envelope bucket) keys it looks up, so a
+    caller can route around the engine under CUDA graph capture. Host-only."""
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return True
+    k = indices.shape[1]
+    npad = logits.stride(0)
+    n_bucket = _prefill_bucket(min(max(logits.shape[1], 1), max(npad, 1)))
+    for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
+        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0)
+        if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
+            return False
+    return True
+
+
 __all__ = [
     "route",
     "route_static",
@@ -1444,7 +1614,10 @@ __all__ = [
     "run",
     "run_ws",
     "run_varlen",
+    "run_prefill",
+    "prefill_ready",
     "warmup_varlen",
+    "warmup_prefill",
     "workspace_bytes",
     "WS_BYTES",
     "default_workspace",
@@ -1580,3 +1753,54 @@ def warmup_varlen(
     if not bands_done:
         with _VARLEN_WARMUP_LOCK:
             _VARLEN_WARMUP_DONE.add(key)
+
+
+_PREFILL_WARMUP_DONE: set = set()
+_PREFILL_WARMUP_LOCK = threading.Lock()
+
+
+def warmup_prefill(
+    top_k: int,
+    max_cols: int,
+    num_rows_list: Sequence[int] = (1, 149, 297),
+    row_stride: int | None = None,
+) -> None:
+    """Compile the prefill engine set before serving (<=6 per k): the tier-0 arm
+    walks the pow2 envelope buckets up to 32768, tiers 1/2 need one launch each.
+    ``max_cols`` is the compressed max column count; idempotent per done-key."""
+    dev = torch.cuda.current_device()
+    k = int(top_k)
+    max_cols = int(max_cols)
+    lo = _prefill_bucket(k + 1)
+    hi = _prefill_bucket(max_cols)
+    buckets = []
+    b = lo
+    while b <= hi:
+        buckets.append(b)
+        b <<= 1
+    if not buckets:
+        buckets = [hi]
+    keys = {}  # cache_key -> (tier, bucket) representative for the launch
+    for rows in num_rows_list:
+        tier = _prefill_tier(int(rows))
+        bset = buckets if tier == 0 else buckets[:1]
+        for bk in bset:
+            keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk))
+    done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
+    with _PREFILL_WARMUP_LOCK:
+        if done_key in _PREFILL_WARMUP_DONE:
+            return
+    for tier, bk in keys.values():
+        rows = _PREFILL_TIER_ROWS[tier]
+        stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
+        if stride < bk or stride % 4:
+            stride = (max(stride, bk) + 256 + 255) // 256 * 256
+        logits = torch.zeros((rows, stride), dtype=torch.float32, device=dev)
+        ks = torch.zeros((rows,), dtype=torch.int32, device=dev)
+        ke = torch.full((rows,), bk, dtype=torch.int32, device=dev)
+        out = torch.empty((rows, k), dtype=torch.int32, device=dev)
+        run_prefill(logits[:, :bk], ks, ke, out, max_row_len=bk)
+        del logits, ks, ke, out
+    torch.cuda.synchronize()
+    with _PREFILL_WARMUP_LOCK:
+        _PREFILL_WARMUP_DONE.add(done_key)

@@ -1482,7 +1482,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
             try:
                 server_role = ServerRole[server_role.upper()]
-            except ValueError:
+            except KeyError:
                 raise ValueError(f"Invalid server role: {server_role}. " \
                                 f"Must be one of: {', '.join([role.name for role in ServerRole])}")
         # Parse media_io_kwargs from JSON string to dict if provided
@@ -1553,7 +1553,10 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         "https://buf.build/gen/python "
                         "\"tensorrt_llm[openengine]\"`.") from error
 
-                launch_grpc_server(host, port)
+                launch_grpc_server(host,
+                                   port,
+                                   llm_args,
+                                   served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

@@ -29,8 +29,6 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
 
-from tensorrt_llm._torch.attention.backends.fmha.interface import (
-    MlaBackendPolicy, _CuteDslMlaStagingKey)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -48,8 +46,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
-from .sparse.params import SparseParams
-from .sparse.skip_softmax import SkipSoftmaxParams
+from .sparse.params import BlockSparseForwardInputs, SparseParams
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -199,18 +196,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _flash_mla_metadata_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
-
-    # Per-forward-pass staging key for the CuTeDSL MLA generation workspace
-    # (page table + sequence lengths). All MLA layers of one step stage
-    # byte-identical data into the shared workspace, so the first layer
-    # copies and later layers skip. Reset whenever kv lens can change so
-    # eager forwards always re-stage (under CUDA graphs the first layer's
-    # captured copies replay once per step).
-    _cute_dsl_mla_staging_key: Optional[_CuteDslMlaStagingKey] = field(
-        default=None,
-        init=False,
-        repr=False,
-    )
 
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
@@ -586,9 +571,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
-        # The staged CuTe DSL page table and sequence lengths are derived from
-        # the same per-iteration scheduler state.
-        self._cute_dsl_mla_staging_key = None
 
     def update_helix_param(
         self,
@@ -1350,9 +1332,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 2: static tree (target model only)
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert (spec_metadata.spec_dec_mode.is_eagle3()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-                        ), "Tree decoding is only supported for Eagle3 now"
+                assert spec_metadata.spec_dec_mode.is_eagle3_one_model(
+                ), "Tree decoding is only supported for Eagle3 now"
                 assert not getattr(spec_metadata, 'is_draft_model', False), (
                     "Static tree spec-dec params are only prepared for the target model"
                 )
@@ -1416,7 +1397,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
         kv_cache_dtype: str = "auto",
-        flashinfer_mla_backend: Optional[str] = None,
         skip_correction_threshold: float = 0.0,
         **kwargs,
     ) -> None:
@@ -1437,10 +1417,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
                 torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
                 used by DeepSeek-V4 and DSA on SM120/SM121.
-            flashinfer_mla_backend (Optional[str]): FlashInfer MLA generation backend
-                                                    selected for this attention instance.
-                                                    None preserves the ordered FMHA-library
-                                                    dispatch.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
         """
@@ -1449,18 +1425,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.sparse_params = sparse_params
         self.kv_cache_dtype = kv_cache_dtype
         self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
-        self.flashinfer_mla_backend = flashinfer_mla_backend
-        # Per-batch MLA decode backend override hook. Maps (statically
-        # configured backend, batch metadata, generation-token count) to the
-        # backend name for the current batch. None (the default) keeps the
-        # static ``flashinfer_mla_backend`` selection unchanged. Model code
-        # that needs batch-dependent selection (e.g. Kimi K3's MLA module)
-        # installs a policy on the attention instances it owns; it lives on
-        # the backend object rather than the FMHA lib instances because
-        # ``update_quant_config`` may recreate the manager after model
-        # construction.
-        self.mla_backend_policy: Optional[MlaBackendPolicy] = None
-
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
@@ -1963,7 +1927,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 )
 
         forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
-            self, q, k, metadata, forward_args)
+            self, q, k, v, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata
@@ -2092,14 +2056,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
-
-        sparse_params = self.sparse_params
-        if isinstance(sparse_params, SkipSoftmaxParams):
-            forward_args.sparse_runtime_params = (
-                sparse_params.scheduler.get_runtime_params(
-                    runtime_params=forward_args.sparse_runtime_params,
-                    timestep=forward_args.timestep,
-                ))
 
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:
@@ -2319,6 +2275,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Predict sparse KV indices when required by an algorithm."""
         return None, None
+
+    def block_sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[BlockSparseForwardInputs]:
+        """Predict the block-sparse routing payload for one attention call.
+
+        The default hands through routes that the attention module predicted
+        before the core forward via ``sparse_backend_args``. Algorithms that
+        predict inside the backend override this method and return ``None``
+        for dense phases.
+        """
+        backend_args = forward_args.sparse_backend_args
+        if backend_args is None:
+            return None
+        return backend_args.block_sparse_inputs
 
     def sparse_attn_predict(
         self,

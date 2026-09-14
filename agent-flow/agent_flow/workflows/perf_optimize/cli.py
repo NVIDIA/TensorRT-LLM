@@ -53,8 +53,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "An optional `profile.kernel_coverage` block "
         "activates the per-kernel coverage contract: the analyzer's ncu "
         "dive covers every kernel above the share bar and answers "
-        "faster?/fusible? per kernel in a schema-validated "
-        "kernel_ledger.yaml each round. "
+        "eliminable?/faster?/fusible?/overlappable? per kernel in a "
+        "schema-validated kernel_ledger.yaml each round. "
         "See task.example.yaml.",
     )
     parser.add_argument(
@@ -132,6 +132,8 @@ def main(argv: list[str] | None = None) -> None:
         print(note, file=sys.stderr)
     prompts = build_perf_optimize_prompts(
         include_slurm_environment=has_slurm_environment(task_data),
+        remote_execution=task_data,
+        campaign_name=args.workspace.resolve().name,
         approaches=task_data["optimize"]["approaches"],
         include_sol=sol_enabled(task_data),
         kernel_coverage=kernel_coverage(task_data),

@@ -133,14 +133,14 @@ def test_a_condition_the_user_wrote_that_disagrees_is_an_error(tmp_path):
 
 
 def test_profiling_reduces_to_nsys_on_the_gen_window(tmp_path):
-    """The harness only wraps workers in nsys; torch/ncu have no path in it."""
+    """The harness only wraps workers in nsys; ncu has no path in it."""
     harness = _write_harness(tmp_path)
     data = task_schema.load_and_validate_task_yaml(
         _write_task(
             tmp_path,
             {
                 "disagg": {"config": str(harness)},
-                "profile": {"methods": ["nsys", "torch", "ncu"], "kernel_coverage": {}},
+                "profile": {"methods": ["nsys", "ncu"], "kernel_coverage": {}},
             },
         )
     )
@@ -148,7 +148,7 @@ def test_profiling_reduces_to_nsys_on_the_gen_window(tmp_path):
     assert data["profile"]["nsys_iter_range"] == "200-250"
     assert "kernel_coverage" not in data["profile"]
     notes = " ".join(data["disagg"]["filled_from_disagg_config"])
-    assert "torch" in notes and "ncu" in notes
+    assert "ncu" in notes
 
 
 def test_focus_concurrencies_validate_against_the_backfilled_points(tmp_path):

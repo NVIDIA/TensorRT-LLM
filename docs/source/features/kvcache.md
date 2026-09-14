@@ -94,15 +94,6 @@ Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
 unified pool, so `use_kv_cache_manager_v2` does not apply to them.
 
-Two-model speculative decoding (for example Eagle3 with
-`eagle3_one_model=False`) is not supported by V2: the draft model runs in a
-separate engine with its own KV cache manager, and V2 sizes both managers from
-the full `max_gpu_total_bytes` budget instead of partitioning it between them.
-Under `auto`, a model default of V2 falls back to V1 for that combination;
-setting `use_kv_cache_manager_v2: true` explicitly raises an error. This
-applies to every model that selects its manager through
-`use_kv_cache_manager_v2`, not just GPT-OSS.
-
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
@@ -219,6 +210,114 @@ The property ```copy_on_partial_reuse``` specifies whether a block should be cop
 ### Attention Window Size
 
 Property ```max_attention_window``` specifies the maximum attention window size for each layer in the model as a list of integer values. If the length of this list is less than number of layers, the list is repeated as many times as necessary. For instance, if the model has only full attention layers and maximum sequence length is 4096, you can specify this as ```max_attention_window = [4096]```. If the first layer is full attention, the second layer is limited attention with window size 256 and then this repeats for the remaining layers, you specify this as ```max_attention_window = [4096,256]```. This means first layer is full attention, second layer is limited attention, third layer is full attention, fourth layer is limited attention and so on.
+
+### Debugging Aids
+
+Two opt-in environment variables help when a result looks like it came from KV
+pages the request does not own -- a stale page handed over by a previous owner,
+or a page-table slot the attention mask was supposed to cover. Both are off
+unless set, and when unset nothing about allocation, page contents or reported
+block counts changes. Both are diagnostic only: they cost extra work and are
+not meant for production serving. They apply to `KVCacheManagerV2`.
+
+Each accepts the same fill value: `1`, `on`, `true` or `zero` for zeros, `nan`
+for NaN (any uncovered read then fails immediately and visibly rather than
+producing a plausible number), or any number for that constant.
+
+> **Packed NVFP4 (e2m1) limitation.** A packed sub-byte pool cannot store an
+> arbitrary sentinel: every non-zero fill value collapses to the byte pattern
+> `0x7f`. For most packed formats `0x7f` is non-finite, so a `nan`/`inf`
+> sentinel still poisons the page. Packed NVFP4 (e2m1) has no NaN/Inf encoding,
+> so `0x7f` decodes to `+6.0` (the largest finite magnitude) instead. On such a
+> pool the sentinel lands as `6.0` -- still a recognisable out-of-band pattern,
+> but not one that an `isnan`/`isinf` check will flag. Only zero fills carry
+> over exactly for packed e2m1.
+
+- `TRTLLM_KV_GUARD_PAGE` reserves one page that no request can be given, fills
+  it with the chosen pattern, and publishes its per-layer index. Attention
+  backends that have to keep masked-out page-table entries in range park them
+  on this page instead of on page 0, which is a live page belonging to whatever
+  request holds it. The mask still decides the result; what changes is that a
+  masking bug reads a recognisable pattern instead of a stranger's keys and
+  values. Costs one page and one index-mapper slot.
+- `TRTLLM_KV_FRESH_PAGE_FILL` writes the pattern into pages as a request is
+  given them, so a read past what the request itself wrote returns the pattern
+  rather than the previous owner's data. Pages covering the reused/committed
+  prefix are never overwritten. Costs one fill per layer per new allocation
+  plus a device synchronization.
+
+Both announce themselves once at warning level when they take effect, so a log
+shows whether the switch actually did anything.
+
+### KV Cache Events
+
+KV cache events report block **stored**, **removed**, **created** and **updated** operations
+so an external KV-cache-aware router (for example NVIDIA Dynamo) can route a request to the
+engine that already holds its prefix. Two delivery paths are available.
+
+#### Buffered path (default)
+
+Set ```event_buffer_max_size``` to a positive integer and ```enable_block_reuse``` to True.
+Events are buffered per rank, gathered onto rank 0 under attention data parallelism, and
+pulled per iteration through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
+or over the `/kv_cache_events` endpoint of `trtllm-serve`.
+
+#### Streaming path (prototype)
+
+Configured with ```kv_cache_config.kv_events_config```. Each rank encodes its own events and
+publishes them directly over a ZeroMQ `PUB` socket from a background thread, so there is no
+rank-0 gather and no per-iteration pull.
+
+```python
+from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
+
+kv_cache_config = KvCacheConfig(
+    enable_block_reuse=True,
+    kv_events_config=KVEventsConfig(
+        enable_kv_cache_events=True,
+        endpoint="tcp://*:5557",
+        replay_endpoint="tcp://*:5657",
+    ),
+)
+```
+
+**Constraints.** The streaming path requires KV cache manager V2 running on its Python
+backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
+consume the Python event sink and raises an error naming this variable. Pipeline
+parallelism and context parallelism are rejected. Events are not published for draft
+models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
+returns an empty list rather than raising.
+
+**Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
+**global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
+each rank's port is distinct — on a multi-node deployment, rank 8 binds `base_port + 8`
+whichever node it runs on. Co-located engines — for example disaggregated prefill and
+decode on one host — must use base ports at least `N` apart.
+
+```replay_endpoint``` follows the same convention. Because only ranks co-located on one
+host actually contend for a port, and a host holds a contiguous run of ranks, its base
+port must be at least *ranks-per-host* away from ```endpoint```'s rather than `N` away.
+Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints, which
+have no port, each rank appends a `_dp<rank>` suffix instead.
+
+**Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
+an 8-byte big-endian sequence number, and a msgpack payload
+`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
+`BlockStored`, `BlockRemoved` or `AllBlocksCleared` — carrying int64 block hashes derived
+from the V2 radix block keys. This is the format documented for custom router backends; it
+differs from vLLM's positional-array encoding of the individual events, though the batch
+envelope is positional in both.
+
+**Delivery guarantees.** Delivery is best effort, but loss is observable. Every accepted
+batch reserves a sequence number up front, so a batch dropped by a full publisher queue
+(```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
+treat any gap as lost KV-cache state and resynchronize rather than assuming continuity.
+
+**Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
+subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and
+receives each retained batch as `[delimiter, topic, seq, payload]`, terminated by a sentinel
+with an empty payload. Only the last ```buffer_steps``` batches are retained, so a replay
+can legitimately start above the requested sequence — that too is a gap.
 
 ### Deprecated Properties
 

@@ -44,24 +44,7 @@ class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
-        if (
-            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
-            and not cls.supports_skip_correction
-        ):
-            logger.debug(
-                "CuTe DSL MLA FMHA is unavailable: skip-correction is enabled and unsupported."
-            )
-            return False
-
-        if attn.flashinfer_mla_backend is not None:
-            logger.debug(
-                "Standalone CuTe DSL MLA FMHA is unavailable: an explicit "
-                "flashinfer_mla_backend delegates MLA generation to "
-                "FlashInferTrtllmGenFmha."
-            )
-            return False
-
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if not IS_CUTLASS_DSL_AVAILABLE:
             logger.debug("CuTe DSL MLA FMHA is unavailable: nvidia-cutlass-dsl is not installed.")
             return False
@@ -204,7 +187,7 @@ class CuteDslMlaFmha(PhasedFmha):
             )
         return True, ""
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],

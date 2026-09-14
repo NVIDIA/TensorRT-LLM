@@ -955,7 +955,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         py_beam_width=1,
         py_kv_send_session_retired=False,
         prepopulated_prompt_len=0,
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         set_kv_cache_transfer_start=lambda _ts: None,
         state=LlmRequestState.CONTEXT_INIT,
     )
@@ -1326,15 +1326,38 @@ def test_is_request_in_transmission_false_when_nothing_in_flight():
     assert not PyExecutor._is_request_in_transmission(executor, request)
 
 
-def _make_send_kv_executor(canceled_req_ids):
-    executor = MagicMock()
-    executor.kv_connector_manager = None
-    executor.canceled_req_ids = list(canceled_req_ids)
-    executor._pending_ctx_transfer_failures = set()
-    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
-    executor.kv_cache_transceiver.kv_transfer_timeout_ms = None
-    executor.kv_cache_transceiver.has_retired_send_session.return_value = False
-    return executor
+def _make_send_kv_coordinator(canceled_req_ids, active_requests=()):
+    """Coordinator over MagicMock services.
+
+    Returns (coordinator, transceiver, transfer_manager).
+    """
+    from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
+        DisaggTransferCoordinator,
+    )
+
+    transceiver = MagicMock()
+    transceiver.pipeline_transfer_enabled = True
+    transceiver.kv_transfer_timeout_ms = None
+    transceiver.has_retired_send_session.return_value = False
+    transfer_manager = MagicMock()
+    active = list(active_requests)
+    coordinator = DisaggTransferCoordinator(
+        transceiver=transceiver,
+        transfer_manager=transfer_manager,
+        kv_cache_manager=MagicMock(),
+        dist=SimpleNamespace(rank=0, tp_size=1, world_size=1),
+        effects=MagicMock(),
+        registry=SimpleNamespace(
+            active_requests=lambda: tuple(active),
+            contains=lambda request: request in active,
+            remove=active.remove,
+            canceled_request_ids=lambda: list(canceled_req_ids),
+        ),
+        enable_attention_dp=False,
+        force_terminate_ctx_for_partial_reuse=False,
+        delegates=MagicMock(),
+    )
+    return coordinator, transceiver, transfer_manager
 
 
 def _make_send_kv_request(is_last_chunk: bool, request_id: int = 7):
@@ -1356,27 +1379,23 @@ def _make_send_kv_request(is_last_chunk: bool, request_id: int = 7):
 
 
 def test_send_disagg_ctx_kv_sends_intermediate_chunk_when_not_cancelled():
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([])
+    coordinator, transceiver, _ = _make_send_kv_coordinator([])
     request = _make_send_kv_request(is_last_chunk=False)
 
-    PyExecutor._send_disagg_ctx_kv_async(executor, [request])
+    coordinator.send_completed_context([request])
 
-    executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
+    transceiver.respond_and_send_async.assert_called_once_with(request)
 
 
 def test_send_disagg_ctx_kv_sends_final_chunk_in_generation_complete_state():
     """The final context slice is not suppressed by the intermediate-slice state gate."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([])
+    coordinator, transceiver, transfer_manager = _make_send_kv_coordinator([])
     request = _make_send_kv_request(is_last_chunk=True)
 
-    PyExecutor._send_disagg_ctx_kv_async(executor, [request])
+    coordinator.send_completed_context([request])
 
-    executor.async_transfer_manager.start_transfer.assert_called_once_with(request)
-    executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
+    transfer_manager.start_transfer.assert_called_once_with(request)
+    transceiver.respond_and_send_async.assert_called_once_with(request)
 
 
 @pytest.mark.parametrize(
@@ -1389,58 +1408,58 @@ def test_send_disagg_ctx_kv_sends_final_chunk_in_generation_complete_state():
 def test_send_disagg_ctx_kv_skips_retired_session_without_mutating_state(
     is_last_chunk, expected_state
 ):
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    executor = _make_send_kv_executor([])
-    executor.kv_cache_transceiver.has_retired_send_session.return_value = True
+    coordinator, transceiver, transfer_manager = _make_send_kv_coordinator([])
+    transceiver.has_retired_send_session.return_value = True
     request = _make_send_kv_request(is_last_chunk=is_last_chunk)
 
-    PyExecutor._send_disagg_ctx_kv_async(executor, [request])
+    coordinator.send_completed_context([request])
 
     assert request.state == expected_state
-    executor.async_transfer_manager.start_transfer.assert_not_called()
-    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
+    transfer_manager.start_transfer.assert_not_called()
+    transceiver.respond_and_send_async.assert_not_called()
 
 
 def test_context_send_failure_is_applied_at_next_loop_boundary():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-    executor = _make_send_kv_executor([])
     request = _make_send_kv_request(is_last_chunk=False)
     request.py_kv_transfer_timed_out = False
-    executor.active_requests = [request]
-    executor.kv_cache_transceiver.check_context_transfer_status.return_value = SimpleNamespace(
+    coordinator, transceiver, transfer_manager = _make_send_kv_coordinator(
+        [], active_requests=[request]
+    )
+    transceiver.check_context_transfer_status.return_value = SimpleNamespace(
         completed_request_ids=[], error_request_ids=[request.py_request_id]
     )
-    executor.async_transfer_manager.requests_in_transfer.return_value = {}
+    transfer_manager.requests_in_transfer.return_value = {}
 
-    PyExecutor._check_disagg_ctx_cache_transfer_status(executor)
+    coordinator.reap_context_sends()
 
+    # The failure arrived after the request left the manager: nothing to
+    # release now, the error is applied at the rank-synchronized pass.
     assert request.state == LlmRequestState.CONTEXT_INIT
-    assert executor._pending_ctx_transfer_failures == {request.py_request_id}
-    executor.async_transfer_manager.end_transfer.assert_not_called()
+    transfer_manager.end_transfer.assert_not_called()
 
+    executor = MagicMock()
+    executor.disagg = coordinator
+    executor.active_requests = [request]
     executor.enable_attention_dp = False
     executor.dist.world_size = 1
-    executor._is_disagg_inflight_cancel_active.return_value = False
 
     PyExecutor._handle_disagg_cache_errors_synced(executor)
 
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
-    assert not executor._pending_ctx_transfer_failures
+    assert not coordinator.take_pending_context_failures()
     executor._check_cache_transfer_errors.assert_called_with("context requests")
 
 
 @pytest.mark.parametrize("is_last_chunk", [False, True])
 def test_send_disagg_ctx_kv_skips_pending_cancellation(is_last_chunk):
     """A pending cancellation suppresses both intermediate and final slices."""
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
     request = _make_send_kv_request(is_last_chunk=is_last_chunk)
-    executor = _make_send_kv_executor([request.py_request_id])
+    coordinator, transceiver, transfer_manager = _make_send_kv_coordinator([request.py_request_id])
 
-    PyExecutor._send_disagg_ctx_kv_async(executor, [request])
+    coordinator.send_completed_context([request])
 
-    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
-    executor.async_transfer_manager.start_transfer.assert_not_called()
-    executor.kv_cache_manager.release_index_slot.assert_not_called()
+    transceiver.respond_and_send_async.assert_not_called()
+    transfer_manager.start_transfer.assert_not_called()
+    coordinator._kv_cache_manager.release_index_slot.assert_not_called()
