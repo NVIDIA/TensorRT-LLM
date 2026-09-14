@@ -19,6 +19,88 @@ class Mode(Enum):
     REPLAY = 4
 
 
+_LAYER_LIST_ATTRS = ("layers", "block", "blocks", "h")
+
+# Wrappers that hold the causal LM one level down. Qwen3-VL keeps it under
+# `llm`, the HF-style `*ForConditionalGeneration` classes under
+# `language_model`, and the plain causal-LM wrappers under `model`.
+_INNER_MODEL_ATTRS = ("model", "llm", "language_model")
+
+_MAX_UNWRAP_DEPTH = 4
+
+
+class NoDecoderLayers(AttributeError):
+    """This model does not keep its decoder layers anywhere this tool knows."""
+
+
+def _layer_list(obj):
+    """The decoder layer list directly on `obj`, or None.
+
+    A candidate has to look like a decoder stack -- non-empty, indexable, and
+    holding something with a `forward` to wrap. An unrelated attribute that
+    happens to share the name would be worse than no match: `_wrap_layer_forward`
+    assigns `forward` onto every item it is handed, so the run would measure the
+    wrong thing and still report a number.
+    """
+    for attr in _LAYER_LIST_ATTRS:
+        layers = getattr(obj, attr, None)
+        if layers is None or not hasattr(layers, "__getitem__"):
+            continue
+        try:
+            if len(layers) == 0:
+                continue
+            first = layers[0]
+        except (TypeError, KeyError, IndexError):
+            # Not an integer-indexed sequence. A dict named `h` passes both the
+            # __getitem__ and len() checks and then raises KeyError on [0], so
+            # catching TypeError alone would let one attribute abort the search
+            # for the others.
+            continue
+        if callable(getattr(first, "forward", None)):
+            return layers
+    return None
+
+
+def _decoder_layers(model):
+    """The decoder layer list of `model`, whatever this architecture calls it
+    and however deeply it is wrapped.
+
+    `model.model.layers` holds for the plain causal-LM wrappers and for nothing
+    else. A vision-language checkpoint serving text only exposes no `.model`:
+    Qwen3.5-9B registers as `Qwen3_5VLModel`, which keeps the causal LM under
+    `llm`, so its stack is at `model.llm.model.layers`. Calibration died during
+    executor creation with
+
+        AttributeError: 'Qwen3_5VLModel' object has no attribute 'model'
+
+    after the weights had already loaded, which made COLLECT -- and therefore
+    every replay derived from it -- unavailable for those architectures.
+
+    Both lists of names are deliberately short and explicit rather than a
+    search of the module tree, for the reason given in `_layer_list`.
+    """
+    seen = []
+    obj = model
+    for _ in range(_MAX_UNWRAP_DEPTH):
+        layers = _layer_list(obj)
+        if layers is not None:
+            return layers
+        seen.append(type(obj).__name__)
+        for attr in _INNER_MODEL_ATTRS:
+            inner = getattr(obj, attr, None)
+            if inner is not None and inner is not obj:
+                obj = inner
+                break
+        else:
+            break
+    raise NoDecoderLayers(
+        "%s keeps its decoder layers under none of %s, at or below %s. Add the "
+        "name here once you have read the model definition -- guessing which "
+        "attribute is the decoder stack is how a tool measures the wrong thing "
+        "and still reports a number."
+        % (type(model).__name__, ", ".join(_LAYER_LIST_ATTRS), " -> ".join(seen)))
+
+
 class Calibrator:
     """Calibrator for layer-wise benchmarks with MoE expert routing data.
 
@@ -362,7 +444,7 @@ class Calibrator:
 
             return forward
 
-        for idx, layer in enumerate(model.model.layers):
+        for idx, layer in enumerate(_decoder_layers(model)):
             layer.forward = make_forward(idx, layer.forward)
 
     def maybe_collect_or_replay_slots(self, num_slots, token_selected_slots):
