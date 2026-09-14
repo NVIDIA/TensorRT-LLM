@@ -55,8 +55,7 @@ class _SeedManager:
        is the first row of its strategy group. ``observe`` emits a one-time
        warning when a seeded request is seen. The per-row state is kept here so
        that honoring ``SamplingParams.seed`` becomes a FlashInfer version bump
-       rather than a redesign. ``TRTLLMSampler`` is unaffected -- its C++
-       ``curandBatchInitialize`` seeds each slot's state individually.
+       rather than a redesign.
 
        Upstream fix in progress: https://github.com/flashinfer-ai/flashinfer/pull/2345
        ("add per-request generator support for sampling kernels"), which also
@@ -125,9 +124,9 @@ class _SeedManager:
         ``any_seeded`` reflects only the requests passed in, so it falls back to
         False once no scheduled request carries a seed.
 
-        Draft batches are ignored. ``ModelDrafter`` allocates draft slots from
-        its own ``SeqSlotManager`` over the same numeric range, so a draft
-        request can occupy a slot number that a live target request owns here.
+        Draft batches are ignored. A drafter allocates draft slots from its own
+        ``SeqSlotManager`` over the same numeric range, so a draft request can
+        occupy a slot number that a live target request owns here.
         Observing it would look like a change of occupant and reset that
         target's offset, making it replay a stretch of its Philox stream. Draft
         sampling keeps using the shared generator.
@@ -157,10 +156,9 @@ class _SeedManager:
                         "seed/offset per sampling call and distinguishes rows "
                         "internally, so when several requests are sampled together "
                         "only the first row's seed applies. Seeded requests are "
-                        "therefore not yet reproducible unless sampled alone. Use "
-                        "the TRTLLM sampler for fully per-request seeding; "
-                        "TorchSampler support will land once FlashInfer honors "
-                        "per-row seeds (tracked in "
+                        "therefore not yet reproducible unless sampled alone. "
+                        "Full per-request seeding will land once FlashInfer "
+                        "honors per-row seeds (tracked in "
                         "https://github.com/flashinfer-ai/flashinfer/pull/2345).",
                         key="torch_sampler_per_request_seed_unsupported",
                     )

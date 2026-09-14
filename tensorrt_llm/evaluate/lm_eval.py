@@ -16,10 +16,13 @@ import concurrent.futures
 import copy
 import json
 import os
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from types import ModuleType
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Tuple)
 
 import click
 import numpy as np
@@ -69,6 +72,31 @@ MAX_IN_FLIGHT_ENV_VAR = "TLLM_EVAL_MAX_IN_FLIGHT"
 # this flag also opts requests into return_perf_metrics (see
 # _get_sampling_params).
 SPEC_STATS_ENV_VAR = "TLLM_EVAL_SPEC_STATS"
+
+
+@contextmanager
+def _replace_fuzzywuzzy_with_rapidfuzz() -> Iterator[None]:
+    """Provide RapidFuzz under the import name expected by LongBench.
+
+    lm-evaluation-harness and THUDM/LongBench import ``fuzzywuzzy.fuzz``
+    directly, although they only use its ``ratio`` function. Keep that import
+    working while loading their metrics without installing FuzzyWuzzy.
+    """
+    from rapidfuzz import fuzz
+
+    module_name = "fuzzywuzzy"
+    missing = object()
+    original_module = sys.modules.get(module_name, missing)
+    compatibility_module = ModuleType(module_name)
+    compatibility_module.fuzz = fuzz
+    sys.modules[module_name] = compatibility_module
+    try:
+        yield
+    finally:
+        if original_module is missing:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original_module
 
 
 class _RunningScoreTracker:
@@ -790,6 +818,25 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         return results_text
 
 
+def _override_stop_strings(task_obj, stop_strings: List[str]) -> None:
+    """Replace a task's stop strings (``generation_kwargs["until"]``).
+
+    A task yaml's ``until`` list is otherwise unreachable from the CLI, and
+    some of its entries are few-shot delimiters rather than end-of-answer
+    markers: gsm8k stops on ``"Question:"``. A chat-templated 0-shot run of a
+    model that restates the question before answering then stops within the
+    first few generated tokens and scores zero, so the list has to be
+    overridable per run without editing the task yaml.
+
+    Other keys in ``generation_kwargs`` are preserved.
+    """
+    generation_kwargs = dict(task_obj.config.generation_kwargs or {})
+    generation_kwargs["until"] = list(stop_strings)
+    task_obj.set_config(key="generation_kwargs", value=generation_kwargs)
+    logger.info(
+        f"generation_kwargs['until'] overridden to {list(stop_strings)}")
+
+
 class LmEvalEvaluator(Evaluator):
 
     def __init__(self,
@@ -806,7 +853,9 @@ class LmEvalEvaluator(Evaluator):
                  output_path: Optional[str] = None,
                  output_dir: Optional[str] = None,
                  post_process_fn: Optional[Callable[[str], str]] = None,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 num_fewshot: Optional[int] = None,
+                 stop_strings: Optional[List[str]] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -861,6 +910,18 @@ class LmEvalEvaluator(Evaluator):
                 else:
                     # NOTE: Few-shot random seed
                     task_obj.set_fewshot_seed(seed=random_seed)
+                    # Caller override of the task yaml's shot count, the same
+                    # call lm-eval's own simple_evaluate makes. Without it a
+                    # 0-shot chat evaluation of a task whose yaml pins 5 shots
+                    # is unreachable, which is the regime a chat-distilled
+                    # speculative drafter has to be measured in.
+                    if num_fewshot is not None:
+                        task_obj.set_config(key="num_fewshot",
+                                            value=num_fewshot)
+                        logger.info(f"num_fewshot overridden to {num_fewshot}")
+                    # Caller override of the task yaml's stop strings.
+                    if stop_strings is not None:
+                        _override_stop_strings(task_obj, stop_strings)
                     adjusted_task_dict[task_name] = task_obj
 
                     # NOTE: Shuffle dataset
@@ -1026,6 +1087,8 @@ class LmEvalEvaluator(Evaluator):
             random_seed=kwargs.pop("random_seed", 0),
             apply_chat_template=kwargs.pop("apply_chat_template", False),
             fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn", False),
+            num_fewshot=kwargs.pop("num_fewshot", None),
+            stop_strings=kwargs.pop("stop_strings", None),
             system_prompt=kwargs.pop("system_prompt", None),
             is_multimodal=kwargs.pop("is_multimodal", False),
             chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
@@ -1065,6 +1128,27 @@ class LmEvalEvaluator(Evaluator):
         llm.shutdown()
 
 
+def _parse_stop_strings(ctx, param, value):
+    """Parse the ``--stop_strings`` CLI value into a list of strings.
+
+    The value must be a JSON list whose members are all strings, e.g.
+    ``'["</s>", "<|im_end|>"]'``. Anything else (a JSON string, object, or a
+    list with a non-string member) is rejected so the evaluator never stops on
+    individual characters.
+    """
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise click.BadParameter(f"must be valid JSON: {e}")
+    if not isinstance(parsed, list) or not all(
+            isinstance(s, str) for s in parsed):
+        raise click.BadParameter("must be a JSON list of strings, e.g. "
+                                 '\'["</s>", "<|im_end|>"]\'')
+    return parsed
+
+
 class GSM8K(LmEvalEvaluator):
 
     def __init__(self, **kwargs):
@@ -1101,6 +1185,12 @@ class GSM8K(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Apply fewshot as multiturn.")
+    @click.option("--num_fewshot",
+                  type=int,
+                  default=None,
+                  help="Override the task yaml's shot count. Use 0 with "
+                  "--apply_chat_template for a single-question chat "
+                  "evaluation.")
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -1130,6 +1220,16 @@ class GSM8K(LmEvalEvaluator):
                   type=int,
                   default=None,
                   help="Random seed for generation sampling.")
+    @click.option(
+        "--stop_strings",
+        type=str,
+        default=None,
+        callback=_parse_stop_strings,
+        help='Replace the task yaml\'s stop strings, as a JSON list, e.g. '
+        '\'["</s>", "<|im_end|>"]\'. GSM8K\'s yaml stops on "Question:", a '
+        'few-shot delimiter; in a chat-templated 0-shot run a model that '
+        'restates the question before answering stops within the first few '
+        'tokens and scores zero.')
     @click.option("--log_samples",
                   is_flag=True,
                   default=False,
@@ -1650,7 +1750,8 @@ class LongBenchV1(LmEvalEvaluator):
     """
 
     def __init__(self, **kwargs):
-        super().__init__("longbench", **kwargs)
+        with _replace_fuzzywuzzy_with_rapidfuzz():
+            super().__init__("longbench", **kwargs)
 
     @staticmethod
     def _flatten_task_dict(task_dict: dict) -> List[str]:

@@ -13,13 +13,13 @@ import torch
 import tensorrt_llm._torch.model_config
 import tensorrt_llm._torch.pyexecutor.config_utils
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
@@ -33,7 +33,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     load_pretrained_config,
     unwrap_kimi_text_config,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
     _construct_checkpoint_loader,
@@ -632,7 +632,6 @@ class Runner:
         kv_cache_manager: KVCacheManager,
         attn_workspace: Optional[torch.Tensor] = None,
     ):
-        world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
         sparse_attention_config = self.model_config.sparse_attention_config
         sparse_params = (
@@ -674,7 +673,11 @@ class Runner:
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
         )
-        attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
+        # One entry per attention-DP rank, not per world rank: the non-DP MoE path
+        # asserts len(all_rank_num_tokens) == 1.
+        attn_metadata.all_rank_num_tokens = [
+            batch_size * seq_len_q
+        ] * self.model_config.mapping.dp_size
         # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
         # serving the executor announces that via update_spec_dec_param(), the only
         # place max_draft_tokens is set. Without it the DSA indexer's context_lens

@@ -53,8 +53,8 @@ def test_validate_models_allows_same_name_with_different_config_id(mod):
 
 def test_validate_models_rejects_duplicate_default_config_id(mod):
     models = [
-        {"name": "Qwen/Qwen2.5-7B-Instruct", "yaml_extra": ["world_size_1.yaml"]},
-        {"name": "Qwen/Qwen2.5-7B-Instruct", "yaml_extra": ["world_size_2.yaml"]},
+        {"name": "Qwen/Qwen3-8B", "yaml_extra": ["world_size_1.yaml"]},
+        {"name": "Qwen/Qwen3-8B", "yaml_extra": ["world_size_2.yaml"]},
     ]
 
     errors = mod.validate_models(models)
@@ -67,12 +67,12 @@ def test_validate_models_rejects_duplicate_default_config_id(mod):
 def test_validate_models_rejects_duplicate_explicit_config_id(mod):
     models = [
         {
-            "name": "Qwen/Qwen2.5-7B-Instruct",
+            "name": "Qwen/Qwen3-8B",
             "config_id": "benchmark_a",
             "yaml_extra": ["world_size_1.yaml"],
         },
         {
-            "name": "Qwen/Qwen2.5-7B-Instruct",
+            "name": "Qwen/Qwen3-8B",
             "config_id": "benchmark_a",
             "yaml_extra": ["world_size_2.yaml"],
         },
@@ -103,12 +103,12 @@ def test_validate_models_rejects_empty_config_id(mod):
 def test_validate_models_rejects_same_model_same_yaml_extra_different_config_id(mod):
     models = [
         {
-            "name": "Qwen/Qwen2.5-7B-Instruct",
+            "name": "Qwen/Qwen3-8B",
             "config_id": "cfg_a",
             "yaml_extra": ["dashboard_default.yaml", "world_size_2.yaml"],
         },
         {
-            "name": "Qwen/Qwen2.5-7B-Instruct",
+            "name": "Qwen/Qwen3-8B",
             "config_id": "cfg_b",
             "yaml_extra": ["dashboard_default.yaml", "world_size_2.yaml"],
         },

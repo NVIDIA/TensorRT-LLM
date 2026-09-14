@@ -692,10 +692,10 @@ class TestFanInReserve:
 # replicated per rank.
 _K3_MLA_BLOCK_BYTES = 32 * 576 * 2 * 24  # tpb x (kv_lora_rank+rope) x bf16 x 24 layers = 884,736
 _K3_KDA_LAYERS = 69
-_K3_CONV_SLOT_BYTES = 294_912  # [3*H*hd, W] bf16 per layer
+_K3_CONV_SLOT_BYTES = 221_184  # [3*H*hd, W-1] bf16 per layer
 _K3_SSM_SLOT_BYTES = 6_291_456  # [H, hd, hd] fp32 per layer (95.5% of the state)
 _K3_KDA_PAYLOAD_BYTES = (
-    454_459_392  # 69 x (conv + delta) per request per rank, from the geometry above
+    449_372_160  # 69 x (conv + delta) per request per rank, from the geometry above
 )
 
 
@@ -977,6 +977,29 @@ class TestLifecycle:
         assert ret.disposition is bcore.Disposition.RELEASE  # all drained -> free, not quarantine
         assert ret.success is False
         assert c.state is bcore.TransferState.FAILED
+
+    def test_partial_publication_waits_for_published_writers_without_scatter(self):
+        c = self._ctx(2)
+        c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())
+
+        c.abort_publication(published_writers={7})
+
+        assert not c.ready_to_scatter()
+        assert c.ready_to_settle()
+        ret = c.settle()
+        assert ret.disposition is bcore.Disposition.RELEASE
+        assert ret.success is False
+        assert c.state is bcore.TransferState.FAILED
+
+    def test_failed_publication_with_no_published_writer_settles_immediately(self):
+        c = self._ctx(2)
+
+        c.abort_publication(published_writers=set())
+
+        assert c.ready_to_settle()
+        ret = c.settle()
+        assert ret.disposition is bcore.Disposition.RELEASE
+        assert ret.success is False
 
     def test_orphan_quarantines(self):
         c = self._ctx(2)

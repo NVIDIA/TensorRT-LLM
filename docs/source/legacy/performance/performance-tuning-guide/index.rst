@@ -1,3 +1,5 @@
+:orphan:
+
 Performance Tuning Guide
 =======================
 

@@ -364,6 +364,12 @@ class TestKVCacheV2Llama:
 # ===========================================================================
 # LoRA tests on llama-7b-hf
 # ===========================================================================
+# 8192 tokens use ~4 GiB for llama-7b-hf, enough for these functional tests
+# without scaling the KV allocation with the GPU's available memory.
+_LORA_KV_CACHE_MAX_TOKENS = 8192
+
+
+@pytest.mark.private_mpi_session
 @pytest.mark.skip_less_device_memory(40000)
 class TestKVCacheV2LoRA:
     """LoRA tests for V2 scheduler using llama-7b-hf (1 GPU, >=40GB)."""
@@ -393,7 +399,10 @@ class TestKVCacheV2LoRA:
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
         if kv_extra is None:
-            kv_extra = {"free_gpu_memory_fraction": 0.4}
+            kv_extra = {
+                "max_tokens": _LORA_KV_CACHE_MAX_TOKENS,
+                "free_gpu_memory_fraction": 0.4,
+            }
         lora_request = executor_request.LoRARequest("lora-0", 0, self.LORA_DIR)
 
         kv_v1 = KvCacheConfig(use_kv_cache_manager_v2=False, **kv_extra)
@@ -462,12 +471,20 @@ class TestKVCacheV2LoRA:
             return out_lora, out_base
 
         outs_v1 = _run_multi_adapter(
-            KvCacheConfig(use_kv_cache_manager_v2=False, free_gpu_memory_fraction=0.4),
+            KvCacheConfig(
+                use_kv_cache_manager_v2=False,
+                max_tokens=_LORA_KV_CACHE_MAX_TOKENS,
+                free_gpu_memory_fraction=0.4,
+            ),
         )
         gc.collect()
         torch.cuda.empty_cache()
         outs_v2 = _run_multi_adapter(
-            KvCacheConfig(use_kv_cache_manager_v2=True, free_gpu_memory_fraction=0.4),
+            KvCacheConfig(
+                use_kv_cache_manager_v2=True,
+                max_tokens=_LORA_KV_CACHE_MAX_TOKENS,
+                free_gpu_memory_fraction=0.4,
+            ),
             scheduler_config=_V2_SCHEDULER_CONFIG,
         )
 

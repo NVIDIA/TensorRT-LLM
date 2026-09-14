@@ -62,13 +62,11 @@ The following tasks are currently supported:
 Usage and Examples
 ------------------
 
-Some evaluation tasks (e.g., GSM8K and GPQA) depend on the ``lm_eval`` package. To run these tasks, you need to install ``lm_eval`` with:
+Some evaluation tasks (e.g., GSM8K and GPQA) depend on the ``lm_eval`` package. To run these tasks, install the version pinned in `requirements-dev.txt <https://github.com/NVIDIA/TensorRT-LLM/blob/main/requirements-dev.txt>`_:
 
 .. code-block:: bash
 
-   pip install -r requirements-dev.txt
-
-Alternatively, you can install the ``lm_eval`` version specified in ``requirements-dev.txt``.
+   pip install "lm_eval[api]==0.4.10"
 
 Here are some examples:
 

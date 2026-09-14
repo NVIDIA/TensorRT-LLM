@@ -1,7 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -11,6 +11,43 @@ from tensorrt_llm.logger import logger
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
 from .utils import find_common_prefix, is_complete_json, partial_json_loads
+
+
+def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
+                               text: str, calls: List[ToolCallItem]) -> None:
+    """Warn when tool-call markup was detected but no tool call was extracted.
+
+    Without this, a tool call the parser could not extract is indistinguishable
+    from a model that chose not to call a tool: the request returns 200 and the
+    response simply carries no tool call, so the call is silently lost (GitHub
+    issue #17917).
+
+    Only the non-streaming path calls this, because the check needs the whole
+    model output and ``has_tool_call`` on a partial increment is not meaningful.
+    The streaming path could run an equivalent check at ``finished=True``, when
+    the parser's ``_buffer`` still holds the unparsed remainder; that is left
+    for a follow-up.
+
+    The warning is emitted once per parser name: the condition reflects a
+    persistent misconfiguration (wrong ``--tool_parser`` or a changed chat
+    template), so repeating it for every request would only scale with traffic.
+    """
+    if calls:
+        return
+    try:
+        detected = tool_parser.has_tool_call(text)
+    except NotImplementedError:
+        return
+    if not detected:
+        return
+    logger.warning_once(
+        f"Tool parser '{parser_name}' detected tool-call markup but extracted "
+        "no tool calls from the model output; the response will not carry "
+        "any tool call. "
+        "Likely causes: the parser does not match the model's chat template "
+        "(check --tool_parser), the output is malformed or truncated, the tool "
+        "block is empty, or the parser rejected the arguments.",
+        key=parser_name)
 
 
 class BaseToolParser(ABC):
@@ -328,6 +365,17 @@ class BaseToolParser(ABC):
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True
+
+    def build_strict_structural_tag_format(
+            self, tools: List[Tool]) -> Optional[Dict[str, Any]]:
+        """Build a complete structural-tag format for strict-tool decoding.
+
+        Override on parsers whose wire format cannot be expressed through
+        the `structure_info` begin/end/trigger triples (e.g. kimi_k3's
+        XTML call tags). Returns the xgrammar structural-tag format dict,
+        or None to fall back to the `structure_info` path.
+        """
+        return None
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:

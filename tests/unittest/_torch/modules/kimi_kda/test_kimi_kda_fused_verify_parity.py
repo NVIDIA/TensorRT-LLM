@@ -120,7 +120,7 @@ def _make_pools(B, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     d = H * K
     conv_pool = (
-        torch.randn(B, 3 * d, W, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+        torch.randn(B, 3 * d, W - 1, generator=gen, device="cuda", dtype=torch.float32) * 0.5
     ).to(torch.bfloat16)
     ssm_pool = torch.randn(B, H, K, K, generator=gen, device="cuda", dtype=torch.float32)
     ssm_pool *= torch.linspace(0.5, 1.5, K, device="cuda").view(1, 1, K, 1)
@@ -130,13 +130,13 @@ def _make_pools(B, seed):
 def _make_fused_layer_cache(B, conv_pool):
     """Replay caches shaped like PythonMambaCacheManager's KDA allocation,
     with the committed conv window seeded from the base pool (the prefill
-    seeding contract: FLA window columns [1, W) -> committed columns)."""
+    seeding contract: the base pool stores committed columns directly)."""
     d = H * K
     S = W - 1 + M
 
     def _conv_cache(section):
         cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d, 1:].float()
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
         return cache
 
     return SimpleNamespace(
@@ -147,6 +147,7 @@ def _make_fused_layer_cache(B, conv_pool):
         kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
         kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.float32),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
+        has_kda_replay_caches=True,
         intermediate_conv_window=None,
         intermediate_ssm=None,
     )
@@ -156,8 +157,9 @@ def _make_seq_layer_cache(B):
     d = H * K
     return SimpleNamespace(
         kda_qkg_cache=None,
+        has_kda_replay_caches=False,
         intermediate_conv_window=torch.zeros(
-            B, M + 1, 3 * d, W, device="cuda", dtype=torch.bfloat16
+            B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
         ),
         intermediate_ssm=torch.zeros(B, M + 1, H, K, K, device="cuda", dtype=torch.float32),
     )
@@ -191,7 +193,7 @@ def test_fused_vs_sequential_two_rounds():
     rt_fused.finalize_decode_weights()
     assert rt_fused._qkvg_proj_weight is not None
     assert rt_fused._bfa_proj_weight is not None
-    slot_indices = torch.arange(B, dtype=torch.long, device="cuda")
+    slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2)
     conv_pool_fused = conv_pool_seq.clone()
@@ -209,12 +211,16 @@ def test_fused_vs_sequential_two_rounds():
     ok = True
     # ---- Round 1 (no pending drafts) ----
     x1 = tokens()
-    out1_seq = rt_seq.forward_verify_sequential(
-        x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+    out1_seq = rt_seq._project_output(
+        rt_seq.forward_verify_sequential(
+            x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+        )
     )
     with with_multi_stream(True):
-        out1_fused = rt_fused.forward_verify(
-            x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+        out1_fused = rt_fused._project_output(
+            rt_fused.forward_verify(
+                x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+            )
         )
     print("round 1:")
     ok &= _rep("out", out1_fused, out1_seq)
@@ -226,13 +232,24 @@ def test_fused_vs_sequential_two_rounds():
 
     # ---- Round 2 (fused path replays the accepted drafts) ----
     x2 = tokens()
-    out2_seq = rt_seq.forward_verify_sequential(
-        x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
-    )
-    with with_multi_stream(True):
-        out2_fused = rt_fused.forward_verify(
-            x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+    out2_seq = rt_seq._project_output(
+        rt_seq.forward_verify_sequential(
+            x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
         )
+    )
+    core2_fused = x2.new_empty(B * T, H, K)
+    with with_multi_stream(True):
+        result2_fused = rt_fused.forward_verify(
+            x2,
+            T,
+            cache_fused,
+            conv_pool_fused,
+            ssm_pool_fused,
+            slot_indices,
+            output=core2_fused,
+        )
+    assert result2_fused is core2_fused
+    out2_fused = rt_fused._project_output(core2_fused)
     print("round 2 (mixed replay):")
     ok &= _rep("out", out2_fused, out2_seq)
 

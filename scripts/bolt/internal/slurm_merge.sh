@@ -36,15 +36,20 @@
 #           OUT_DIR LLVM_BOLT_VERSION BOLT_APPLY
 
 # ====================== EDIT THESE (cluster specifics) ======================
-# NOTE: this merge job is 100% CPU
-# (setup_env pip, readelf, merge-fdata, llvm-bolt .fdata->.yaml conversion,
-# packaging) and needs NO GPUs -- requesting gpus-per-node=4 holds a full GB200
-# node for nothing and queues behind GPU demand. Switch to a CPU partition (or
-# --gpus-per-node=0) once we confirm the target cluster accepts GPU-less jobs.
+# NOTE: this merge job is 100% CPU (setup_env pip, readelf, merge-fdata, llvm-bolt
+# .fdata->.yaml conversion, packaging, apply_bolt.py) and needs NO GPUs, so it runs
+# on the CPU partition rather than holding a whole GPU node idle behind GPU demand.
+# These clusters REJECT a zero GPU request (--gpus-per-node=0 / --gpus=0) -- any GPU
+# resource arg must be a positive integer -- so a CPU job omits every --gpus* arg.
+# The header below is the account/time/partition source of truth for both a
+# standalone `sbatch slurm_merge.sh` and the BoltProfileGen submission; the latter
+# passes only --partition on the sbatch CLI (overriding this header) so the CPU
+# partition name stays overridable via boltMergePartition. NOTE: these clusters
+# reject a submission that carries no account at all, so keep --account here.
 #SBATCH --account=coreai_tensorrt_ci
 #SBATCH --job-name=bolt-merge
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
+#SBATCH --partition=cpu
 #SBATCH --time=01:00:00
 
 set -euo pipefail
@@ -117,7 +122,11 @@ srun --ntasks=1 --ntasks-per-node=1 --nodes=1 \
         #    No instrument -- the collect jobs already produced the .fdata.
         _extract='"$RUNDIR"'/extract
         mkdir -p "$_extract" && tar xzf /builds/'"$TARBALL_NAME"' -C "$_extract" 2>/dev/null
-        /workspace/bolt/setup_env.sh "$_extract"
+        # Libs-only: the merge only needs the wheel ELFs on disk to convert
+        # .fdata -> .yaml (no runtime import), so skip setup_env.sh runtime
+        # tensorrt gate -- the profiling base image has no importable tensorrt
+        # before install and would otherwise fail here.
+        BOLT_SETUP_LIBS_ONLY=1 /workspace/bolt/setup_env.sh "$_extract"
         source /workspace/bolt/bolt_lib.sh
         bolt_run_stages setup_directories backup_libraries
 

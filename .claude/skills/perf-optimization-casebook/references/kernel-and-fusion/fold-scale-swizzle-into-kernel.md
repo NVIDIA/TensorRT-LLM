@@ -30,4 +30,4 @@ measured: []
 - **Accuracy risk:** lossless when the flag is correct (kernel reads SF in its actual layout). Risk = layout/flag mismatch silently corrupting FP4 GEMM output — parity-check on first enable.
 - **Verify:** profile shows the swizzle op gone from MoE path; MoE-layer latency/launch count down; NVFP4 MoE output parity vs pre-swizzle path.
 - **Rollback:** set `swizzled_input_sf=True` and restore the `swizzle_sf(...)` calls. Trigger: FP4 MoE accuracy mismatch (layout/flag inconsistency).
-- **Prior art:** PR #6231. Files: `_torch/custom_ops/torch_custom_ops.py`, `_torch/modules/fused_moe/fused_moe_wide_ep.py`, `cpp/.../thop/moeOp.cpp`, `cutlass_kernels/moe_gemm/moe_kernels.cu`. Owning specialist: **kernel-cuda-specialist**.
+- **Prior art:** PR #6231. Files: `_torch/custom_ops/torch_custom_ops.py`, `_torch/moe/fused_moe/fused_moe_wide_ep.py`, `cpp/.../thop/moeOp.cpp`, `cutlass_kernels/moe_gemm/moe_kernels.cu`. Owning specialist: **kernel-cuda-specialist**.
