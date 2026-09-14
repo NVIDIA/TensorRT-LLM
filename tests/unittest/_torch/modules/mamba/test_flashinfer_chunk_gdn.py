@@ -96,6 +96,7 @@ def _make_inputs(
 
 
 def _zero_initial_state(num_seqs, num_heads, head_dim, device, dtype=torch.float32):
+    """Create a zero-filled recurrent state pool."""
     return torch.zeros(num_seqs, num_heads, head_dim, head_dim, dtype=dtype, device=device)
 
 
@@ -170,6 +171,51 @@ def test_preallocated_state_workspace(num_seqs, inplace):
     assert all(torch.isnan(buffer[num_seqs:]).all() for buffer in workspace)
 
 
+@pytest.mark.parametrize("buffer_index", [0, 1])
+@pytest.mark.parametrize("invalid", ["capacity", "shape", "dtype", "device"])
+def test_state_workspace_rejects_invalid_buffer(monkeypatch, buffer_index, invalid):
+    """Reject either invalid state buffer before launching a GPU kernel."""
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import tensorrt_llm._torch.modules.fla.flashinfer_chunk as adapter
+
+    kernel = Mock(side_effect=RuntimeError("unexpected kernel launch"))
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(chunk_gated_delta_rule=kernel))
+    monkeypatch.setattr(adapter, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(adapter, "gather_cast_vk_to_fp32_vk", kernel)
+    q, k, v, g, beta, cu = _make_inputs(
+        [1, 1], num_q_heads=2, num_v_heads=2, head_dim=4, device="cpu"
+    )
+    state = torch.empty(2, 2, 4, 4, dtype=torch.bfloat16)
+    shape = (
+        (1, 2, 4, 4)
+        if invalid == "capacity"
+        else (2, 2, 4, 3)
+        if invalid == "shape"
+        else state.shape
+    )
+    buffers = [torch.empty(state.shape), torch.empty(state.shape)]
+    buffers[buffer_index] = torch.empty(
+        shape,
+        dtype=torch.bfloat16 if invalid == "dtype" else torch.float32,
+        device="meta" if invalid == "device" else "cpu",
+    )
+    with pytest.raises(AssertionError):
+        adapter.chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu,
+            initial_state=state,
+            state_workspace=tuple(buffers),
+        )
+    kernel.assert_not_called()
+
+
 @pytest.mark.parametrize("with_workspace", [False, True])
 def test_state_workspace_dispatch(monkeypatch, with_workspace):
     """Do not pass the FlashInfer-only option to the Triton fallback."""
@@ -236,10 +282,40 @@ def test_state_workspace_warmup_and_reuse(
     assert get_workspace(layer, metadata, state) is None
 
 
+def test_state_workspace_warmup_growth(monkeypatch):
+    """Grow both cached buffers from 16 to 512 and reuse them during inference."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
+
+    monkeypatch.setattr(mixer, "_use_flashinfer_gdn_prefill", lambda: True)
+    monkeypatch.setattr(mixer, "is_sm_100f", lambda: False)
+    layer = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}))
+    metadata = SimpleNamespace(
+        is_warmup=True, max_num_sequences=16, max_num_requests=512, max_num_tokens=2048
+    )
+    state = torch.empty(1, 2, 4, 4, dtype=torch.bfloat16)
+    get_workspace = mixer.Qwen3NextGatedDeltaNet._get_prefill_state_workspace
+    small = get_workspace(layer, metadata, state)
+    assert all(buffer.shape[0] == 16 for buffer in small)
+    metadata.max_num_sequences = 512
+    large = get_workspace(layer, metadata, state)
+    assert all(buffer.shape == (512, 2, 4, 4) for buffer in large)
+    assert all(before.data_ptr() != after.data_ptr() for before, after in zip(small, large))
+    metadata.is_warmup = False
+    with (
+        patch.object(torch, "empty", side_effect=RuntimeError("unexpected allocation")),
+        patch.object(torch, "empty_like", side_effect=RuntimeError("unexpected allocation")),
+    ):
+        assert get_workspace(layer, metadata, state) is large
+
+
 # Parity tests against the Triton reference -------------------------------
 
 
 @skip_unsupported
+@pytest.mark.skipif(is_sm_100f(), reason="Mixer-managed state workspace is only used on Hopper")
 def test_state_workspace_maximum_batch_and_cuda_graph():
     """A one-sequence warmup must provision state scratch for a full mixed batch."""
     from types import SimpleNamespace
@@ -254,6 +330,7 @@ def test_state_workspace_maximum_batch_and_cuda_graph():
     pool = torch.zeros(512, 16, 128, 128, dtype=torch.bfloat16, device="cuda")
     get_workspace = Qwen3NextGatedDeltaNet._get_prefill_state_workspace
     workspace = get_workspace(layer, metadata, pool)
+    assert workspace is not None
     metadata.is_warmup = False
     peaks = []
     for num_seqs in (1, 512):
@@ -299,9 +376,8 @@ def test_state_workspace_maximum_batch_and_cuda_graph():
         graph_out, _ = chunk_gated_delta_rule(**args)
     for _ in range(3):
         # Simulate another layer overwriting the shared scratch between replays.
-        if workspace is not None:
-            for buffer in workspace:
-                buffer.fill_(float("nan"))
+        for buffer in workspace:
+            buffer.fill_(float("nan"))
         pool.zero_()
         graph.replay()
         torch.cuda.synchronize()

@@ -57,6 +57,7 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # launch, so we fall back to Triton there. Resolution is deferred to first call
 # (and cached) so importing this module never initializes CUDA.
 def _use_flashinfer_gdn_prefill() -> bool:
+    """Check the prefill backend setting and supported GPU architecture."""
     return (
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
         and is_flashinfer_gdn_supported_arch()
@@ -65,6 +66,7 @@ def _use_flashinfer_gdn_prefill() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _resolve_chunk_gated_delta_rule():
+    """Resolve and cache the selected prefill implementation."""
     if _use_flashinfer_gdn_prefill():
         from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as impl
     else:
@@ -76,6 +78,7 @@ def _resolve_chunk_gated_delta_rule():
 def chunk_gated_delta_rule(
     *args, state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None, **kwargs
 ):
+    """Dispatch prefill, omitting unused FlashInfer-only workspace arguments."""
     if state_workspace is not None:
         kwargs["state_workspace"] = state_workspace
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
@@ -1019,6 +1022,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def _get_prefill_state_workspace(
         self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Reserve maximum state scratch during warmup and reuse it across layers."""
         # Blackwell uses indexed pool I/O directly, without state scratch.
         if not _use_flashinfer_gdn_prefill() or is_sm_100f():
             return None
