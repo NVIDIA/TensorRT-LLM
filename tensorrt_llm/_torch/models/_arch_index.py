@@ -58,6 +58,8 @@ MODEL_ARCH_TO_MODULE = {
     "Gemma4ForConditionalGeneration": "modeling_gemma4mm",
     "Gemma4UnifiedForConditionalGeneration": "modeling_gemma4_unified",
     "Glm4MoeForCausalLM": "modeling_glm",
+    "Glm5NextForCausalLM": "modeling_glm5_next",
+    "Glm5NextForConditionalGeneration": "modeling_glm5_next_vision",
     "GlmMoeDsaForCausalLM": "modeling_deepseekv3",
     "GptOssForCausalLM": "modeling_gpt_oss",
     "HCXVisionForCausalLM": "modeling_hyperclovax",
@@ -140,6 +142,8 @@ MODEL_CLASS_TO_MODULE = {
     "Gemma4ForConditionalGeneration": "modeling_gemma4mm",
     "Gemma4UnifiedForConditionalGeneration": "modeling_gemma4_unified",
     "Glm4MoeForCausalLM": "modeling_glm",
+    "Glm5NextForCausalLM": "modeling_glm5_next",
+    "Glm5NextVLM": "modeling_glm5_next_vision",
     "GptOssForCausalLM": "modeling_gpt_oss",
     "HCXVisionForCausalLM": "modeling_hyperclovax",
     "HunYuanDenseV1ForCausalLM": "modeling_hunyuan_dense",
@@ -200,6 +204,7 @@ MODEL_CLASS_TO_MODULE = {
 # ``modeling_qwen_image_bench`` with byte-identical metadata; the real model's
 # module is indexed.
 MULTIMODAL_MODEL_TYPE_TO_MODULE = {
+    "glm5_next": "modeling_glm5_next_vision",
     "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_nano",
     "NemotronH_Nano_VL_V2": "modeling_nemotron_nano",
     "cosmos3": "modeling_cosmos3",
