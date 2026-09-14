@@ -93,3 +93,22 @@ TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
 TestKimiK3DSpark::test_gsm8k_tep8:
   ref_al: 4.323
   min_al: 4.0
+# Populate with TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 before refactoring.
+disagg::TestLlama3_1_8BInstruct::test_eagle3:
+  ref_al: null
+  min_al: null
+disagg::TestDeepSeekV3Lite::test_auto_dtype:
+  ref_al: null
+  min_al: null
+disagg::TestLlama3_1_8BInstruct::test_gen_only_spec_dec:
+  ref_al: null
+  min_al: null
+disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec:
+  ref_al: null
+  min_al: null
+disagg::TestDeepSeekV3Lite::test_gen_first:
+  ref_al: null
+  min_al: null
+disagg::TestNemotron3Super120B::test_auto_dtype:
+  ref_al: null
+  min_al: null

@@ -43,7 +43,8 @@ from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail,
-                            LlmapiAccuracyTestHarness, get_accuracy_task)
+                            LlmapiAccuracyTestHarness,
+                            assert_acceptance_length_for_llm, get_accuracy_task)
 
 
 class Result(GenerationResultBase):
@@ -62,7 +63,9 @@ class Result(GenerationResultBase):
         return self
 
 
-DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
+DuckLLM = namedtuple('DuckLLM',
+                     ['args', 'tokenizer', 'generate_async', 'get_stats'],
+                     defaults=[None])
 
 # Timeout for the entire test
 DEFAULT_TEST_TIMEOUT = 3600
@@ -529,6 +532,16 @@ def launch_disaggregated_llm(
             thread_pool.futures.append(future)
             return future
 
+        def get_stats(timeout: float = 2.0) -> list[dict]:
+            stats = []
+            # /metrics reads get_stats_async(2) when perf metrics are disabled.
+            for server in cluster_info["server_lists"]["generation"]:
+                response = requests.get(f"http://{server}/metrics",
+                                        timeout=timeout + 5)
+                response.raise_for_status()
+                stats.extend(response.json())
+            return stats
+
         def _show_kvcache_time(kv_cache_perf_dir, max_lines=100):
             print(f"kv_cache_perf_dir: {kv_cache_perf_dir}")
             for file in os.listdir(kv_cache_perf_dir):
@@ -540,7 +553,7 @@ def launch_disaggregated_llm(
 
         tokenizer = load_hf_tokenizer(model_name)
         try:
-            yield DuckLLM(args, tokenizer, generate_async)
+            yield DuckLLM(args, tokenizer, generate_async, get_stats)
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
@@ -801,6 +814,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             True,  # BS=1 does not need overlap scheduling
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
                 "free_gpu_memory_fraction": 0.5,
                 "enable_block_reuse": True  # reuse on context requests
             },
@@ -808,6 +822,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_batch_size": 1,
             "cache_transceiver_config": {
                 "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "cuda_graph_config": None,
@@ -815,7 +830,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": not overlap_scheduler,
             "speculative_config": speculative_decoding_config,
+            "enable_iter_perf_stats": True,
+            "max_stats_len": -1,
             "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
                 "free_gpu_memory_fraction": 0.5,
                 "enable_block_reuse": False
             },
@@ -823,6 +841,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_batch_size": 16,
             "cache_transceiver_config": {
                 "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "cuda_graph_config": None,
@@ -841,6 +860,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            assert_acceptance_length_for_llm(
+                "disagg::TestLlama3_1_8BInstruct::test_eagle3", llm)
 
     @pytest.mark.skip_less_device(2)
     @skip_pre_hopper
@@ -856,6 +877,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler":
             True,  # BS=1 does not need overlap scheduling
             "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
                 "free_gpu_memory_fraction": 0.5,
                 "enable_block_reuse": True  # reuse on context requests
             },
@@ -871,7 +893,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "speculative_config": speculative_decoding_config,
+            "enable_iter_perf_stats": True,
+            "max_stats_len": -1,
             "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
                 "free_gpu_memory_fraction": 0.5,
                 "enable_block_reuse": False
             },
@@ -898,6 +923,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            assert_acceptance_length_for_llm(
+                "disagg::TestLlama3_1_8BInstruct::test_gen_only_spec_dec", llm)
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
@@ -1096,7 +1123,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_gen_only_spec_dec(self):
         ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": False}
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "enable_iter_perf_stats": True,
+            "max_stats_len": -1,
+        }
+        kv_cache_config = {"use_kv_cache_manager_v2": True}
+        ctx_server_config["kv_cache_config"] = kv_cache_config
+        gen_server_config["kv_cache_config"] = kv_cache_config
         cache_transceiver_config = {
             "backend": "NIXL",
             "max_tokens_in_buffer": 4096,
@@ -1124,6 +1158,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH,
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            assert_acceptance_length_for_llm(
+                "disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec", llm)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
@@ -1228,6 +1264,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
+        kv_cache_config = {"use_kv_cache_manager_v2": True}
+        ctx_server_config["kv_cache_config"] = kv_cache_config
+        gen_server_config["kv_cache_config"] = kv_cache_config
         ctx_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
@@ -1247,6 +1286,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "decoding_type": "MTP",
                 "max_draft_len": mtp_nextn
             }
+            gen_server_config["enable_iter_perf_stats"] = True
+            gen_server_config["max_stats_len"] = -1
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
@@ -1263,6 +1304,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH,
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length_for_llm(
+                    "disagg::TestDeepSeekV3Lite::test_auto_dtype", llm)
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
@@ -1364,6 +1408,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             }
             ctx_server_config["speculative_config"] = spec_config
             gen_server_config["speculative_config"] = spec_config
+            gen_server_config["enable_iter_perf_stats"] = True
+            gen_server_config["max_stats_len"] = -1
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -1382,6 +1428,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length_for_llm(
+                    "disagg::TestDeepSeekV3Lite::test_gen_first", llm)
 
 
 @skip_pre_blackwell
@@ -2099,6 +2148,10 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
             ctx_cfg["speculative_config"] = spec
             gen_cfg["speculative_config"] = spec
+            ctx_cfg["kv_cache_config"]["use_kv_cache_manager_v2"] = True
+            gen_cfg["kv_cache_config"]["use_kv_cache_manager_v2"] = True
+            gen_cfg["enable_iter_perf_stats"] = True
+            gen_cfg["max_stats_len"] = -1
         if block_reuse:
             ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
             gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
@@ -2111,6 +2164,9 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length_for_llm(
+                    "disagg::TestNemotron3Super120B::test_auto_dtype", llm)
 
     @pytest.mark.skip_less_device(8)
     def test_ctx_dp2_gen_tp4(self):
