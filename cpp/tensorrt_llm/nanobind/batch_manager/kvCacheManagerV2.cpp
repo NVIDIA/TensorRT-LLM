@@ -1528,6 +1528,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AttentionLayerConfig::numSinkTokens)
+        .def_rw("_residency_group", &kv::AttentionLayerConfig::residencyGroup)
         .def_prop_ro("window_size", &kv::AttentionLayerConfig::windowSize) DEF_COPY(kv::AttentionLayerConfig);
 
     nb::enum_<kv::LayerType>(m, "LayerType")
@@ -1687,6 +1688,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("cuda_stream") = nb::none())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_set_residency_window",
+            [](kv::KvCache& self, int layerGroupId, std::optional<int> windowSize, int numSinkTokens)
+            { self.setResidencyWindow(kv::LayerGroupId{layerGroupId}, windowSize, numSinkTokens); },
+            nb::arg("layer_group_id"), nb::arg("window_size").none(), nb::arg("num_sink_tokens") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
