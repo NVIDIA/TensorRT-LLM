@@ -283,6 +283,7 @@ def test_sol_backend_rejects_cutoff_capture_without_warmup(monkeypatch) -> None:
     params = SolParams(tau=1.0, disabled_until_timestep=0.6)
     q = _bshd()
     backend, predictor = _stub_backend(params)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with pytest.raises(RuntimeError, match="prepared before CUDA Graph capture"):

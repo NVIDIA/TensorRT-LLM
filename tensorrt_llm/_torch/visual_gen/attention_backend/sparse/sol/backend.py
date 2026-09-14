@@ -52,7 +52,7 @@ class SOLTrtllmAttention(TrtllmAttention):
 
         if self.sol_params.disabled_until_timestep is None:
             return None
-        if torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             if self._prepared_graph_phase is None:
                 raise RuntimeError("SOL graph phase must be prepared before CUDA Graph capture")
             return self._prepared_graph_phase

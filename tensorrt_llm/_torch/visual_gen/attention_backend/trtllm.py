@@ -299,6 +299,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
+        timestep: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -325,18 +326,16 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             sparse_backend_args: Module-predicted sparse inputs handed to the core
                 prediction hooks. A ``block_sparse_inputs`` payload selects the
                 generic block-sparse FMHA.
-            **kwargs: ``timestep`` only; other names are rejected.
+            timestep: Denoising timestep consumed by the sparse prediction hooks.
+            **kwargs: Backend-specific keyword arguments forwarded by the attention
+                module, such as ``key_padding_mask``; ignored here, as by the other
+                backends. The TRTLLM kernels have no key-padding input, so callers
+                that need padded keys must guard at the model level or select the
+                ``VANILLA`` backend.
 
         Returns:
             Output tensor [B, S, H*D]
         """
-        timestep = kwargs.pop("timestep", None)
-        if kwargs:
-            unexpected_names = ", ".join(sorted(kwargs))
-            raise TypeError(
-                f"Unexpected TRTLLM attention forward keyword arguments: {unexpected_names}"
-            )
-
         block_sparse_inputs = (
             sparse_backend_args.block_sparse_inputs if sparse_backend_args is not None else None
         )
