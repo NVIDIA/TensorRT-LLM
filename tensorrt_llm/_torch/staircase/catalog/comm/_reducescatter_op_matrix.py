@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the reducescatter catalog entry.
+"""GPU certification matrix for the reducescatter catalog entry.
 
 A collective cannot be exercised in one process, so this script is its own
 launcher: run it plainly and it re-executes itself under `mpirun` with one
@@ -10,10 +10,10 @@ rather than raising — and this op wedges rather than raising when the ranks
 disagree about the split — so the deadline is what keeps a broken kernel
 from taking the calling run down with it.
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python catalog/comm/reducescatter_test.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python catalog/comm/_reducescatter_op_matrix.py
 
-That runs two jobs, in this order. The first is the test proper: every
-`TESTS` entry on `world_size` ranks, and it must exit 0. The second is a
+That runs two jobs, in this order. The first is the matrix proper: every
+`CHECKS` entry on `world_size` ranks, and it must exit 0. The second is a
 four-rank sub-job of its own that deliberately mispairs this op against an
 all-gather of a *different* byte count, which is the one call-order
 divergence that hangs instead of returning wrong data — it cannot live in
@@ -22,6 +22,20 @@ certifies it out of band: every rank marks the file system before issuing
 the pair, none marks it afterwards, and the job is ended by its own
 watchdog. That sub-job doubles as the harness's positive control, since it
 is a real collective deadlock this launcher has to survive.
+
+Not a pytest module, despite the `check_*` bodies. They are one fixed
+sequence inside a single 4-rank job rather than independent cases: each reads
+module-global rank state that only `_run_one_rank` binds, and several assert
+on communicator state the previous one left behind. Collected as tests they
+would run at world size 1 against unbound globals — so neither this file's
+name nor its function names match pytest's collection patterns, which is what
+keeps it uncollectable however pytest is pointed at this tree.
+
+The collected entry point is
+`tests/unittest/_torch/staircase/comm/test_staircase_reducescatter_op_matrix.py`:
+it starts this job and turns its exit code into an assertion. This half stays
+in the package because the launcher re-execs it as `python -m`, and the ranks
+need the package context for their relative imports.
 """
 
 import os
@@ -104,7 +118,7 @@ def _block(
     fp32 all represent k/8 exactly for |k| <= 255, and a sum of WORLD of them
     reaches |k| <= 4 * 31 = 124, so **every partial sum is exact in every
     summation order**. That is what lets the assertions be bitwise despite the
-    op summing in the input dtype (see test_reduction_is_deterministic_and_
+    op summing in the input dtype (see check_reduction_is_deterministic_and_
     accumulates_in_the_input_dtype for what happens when they are not).
     """
     gen = torch.Generator(device="cuda").manual_seed((seed * 977 + rank) * 131 + dest + 1)
@@ -208,7 +222,7 @@ def _ring_chain(rows: int, pos: int, seeds: Sequence[int]) -> torch.Tensor:
     """Ring-order sequential sum for group position `pos`, rounded every step.
 
     The order this op reduces in (certified by
-    test_reduction_is_deterministic_and_accumulates_in_the_input_dtype):
+    check_reduction_is_deterministic_and_accumulates_in_the_input_dtype):
     `x_{pos+1} + x_{pos+2} + ... + x_{pos+G-1} + x_pos`, indices mod WORLD,
     where `x_r` is rank `r`'s block for `pos` drawn from `seeds[r]`. Per-rank
     seeds, so a mispaired call's exact bits can be predicted too — on payloads
@@ -259,7 +273,7 @@ def _warm_up_off_capture_stream(body, reps: int = 2) -> None:
 
     Two things have to be done before a capture and cannot be done inside one:
     the group's NCCL communicator has to exist (see
-    test_cuda_graph_capture_of_a_first_call_raises), and torch wants the work
+    check_cuda_graph_capture_of_a_first_call_raises), and torch wants the work
     warmed on a non-default stream.
     """
     side = torch.cuda.Stream()
@@ -345,7 +359,7 @@ def _verify_replay(
         _assert_bitwise(out, _ref([rows] * WORLD, RANK, seed + 13 * site), f"{where} site={site}")
 
 
-def test_cuda_graph_capture_of_a_first_call_raises() -> None:
+def check_cuda_graph_capture_of_a_first_call_raises() -> None:
     """A group's first-ever call cannot be captured; the build inside fails.
 
     Must run before anything else touches GROUP — the failure is specifically
@@ -404,7 +418,7 @@ def test_cuda_graph_capture_of_a_first_call_raises() -> None:
     COMM.Barrier()
 
 
-def test_uniform_reduce_scatter() -> None:
+def check_uniform_reduce_scatter() -> None:
     """sizes=None: every rank sends WORLD * rows rows and keeps `rows` of them.
 
     Decode-like (1, 2, 8, 32) through prefill-like (2048) per-rank row counts,
@@ -424,7 +438,7 @@ def test_uniform_reduce_scatter() -> None:
         COMM.Barrier()
 
 
-def test_ragged_reduce_scatter() -> None:
+def check_ragged_reduce_scatter() -> None:
     """sizes=[...]: the split is uneven, this rank keeps sizes[my position].
 
     Attention data parallelism produces exactly this — each rank owns its own
@@ -442,7 +456,7 @@ def test_ragged_reduce_scatter() -> None:
         COMM.Barrier()
 
 
-def test_output_is_fresh_and_input_is_untouched() -> None:
+def check_output_is_fresh_and_input_is_untouched() -> None:
     """The op allocates its result; the caller keeps ownership of `input`."""
     rows, seed = 8, 4100
     sizes = [rows] * WORLD
@@ -460,7 +474,7 @@ def test_output_is_fresh_and_input_is_untouched() -> None:
     COMM.Barrier()
 
 
-def test_trailing_dims_are_preserved() -> None:
+def check_trailing_dims_are_preserved() -> None:
     """dim 0 is the scatter axis; every other dim is carried through untouched."""
     cases: List[Tuple[Tuple[int, ...], bool]] = [
         ((2, HIDDEN // 2), False),
@@ -482,7 +496,7 @@ def test_trailing_dims_are_preserved() -> None:
         COMM.Barrier()
 
 
-def test_dtypes_reduce_arithmetically() -> None:
+def check_dtypes_reduce_arithmetically() -> None:
     """The dtypes whose sum this op actually computes, in both forms.
 
     fp16 and fp32 alongside bf16, and the integer widths, which reduce as
@@ -513,7 +527,7 @@ def test_dtypes_reduce_arithmetically() -> None:
         COMM.Barrier()
 
 
-def test_group_selects_a_rank_subset() -> None:
+def check_group_selects_a_rank_subset() -> None:
     """`group` names MPI session ranks; the slice index is the position in it.
 
     The second subset is the discriminating one: it excludes rank 0, so a rank
@@ -539,7 +553,7 @@ def test_group_selects_a_rank_subset() -> None:
         COMM.Barrier()
 
 
-def test_group_order_does_not_change_the_output() -> None:
+def check_group_order_does_not_change_the_output() -> None:
     """The split is ordered by ascending rank, whatever order `group` lists."""
     rows, seed = 4, 7200
     sizes = [rows] * WORLD
@@ -549,7 +563,7 @@ def test_group_order_does_not_change_the_output() -> None:
     COMM.Barrier()
 
 
-def test_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> None:
+def check_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> None:
     """What the sum is, exactly — the fact a target's accuracy gate rests on.
 
     On payloads with no exactness property (standard normal, cast to bf16):
@@ -625,7 +639,7 @@ def test_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> None
     COMM.Barrier()
 
 
-def test_uniform_form_and_an_explicit_even_split_agree_bitwise() -> None:
+def check_uniform_form_and_an_explicit_even_split_agree_bitwise() -> None:
     """`sizes=None` and an explicit even `sizes` vector return the same bits.
 
     Worth pinning because the two are not obliged to take the same path — and
@@ -644,7 +658,7 @@ def test_uniform_form_and_an_explicit_even_split_agree_bitwise() -> None:
         COMM.Barrier()
 
 
-def test_round_trip_with_a_gather_returns_each_rank_its_own_rows() -> None:
+def check_round_trip_with_a_gather_returns_each_rank_its_own_rows() -> None:
     """The attention-DP MoE round trip, end to end, against a local reference.
 
     Gather every rank's tokens, let each rank apply its own expert window to
@@ -684,7 +698,7 @@ def test_round_trip_with_a_gather_returns_each_rank_its_own_rows() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_at_every_engine_batch_size() -> None:
+def check_cuda_graph_at_every_engine_batch_size() -> None:
     """Captured at all 35 engine batch sizes, then replayed interleaved.
 
     Capturing one row count proves nothing about an engine, which holds every
@@ -732,7 +746,7 @@ def test_cuda_graph_at_every_engine_batch_size() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
+def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
     """The decode graph this checkpoint captures, at all 35 batch sizes.
 
     1015 captured reduce-scatters, one memory pool. The sites are independent —
@@ -766,7 +780,7 @@ def test_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
+def check_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
     """Between two decode replays, a server runs work no graph holds.
 
     A prefill runs eagerly at a row count far outside the captured set, and a
@@ -799,7 +813,7 @@ def test_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
+def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
     """`sizes` is a host argument: a replay re-runs the split it was captured with.
 
     Two graphs with different sizes vectors are captured into one pool and
@@ -839,7 +853,7 @@ def test_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
     COMM.Barrier()
 
 
-def test_the_gate_discriminates_a_wrong_reduce_scatter() -> None:
+def check_the_gate_discriminates_a_wrong_reduce_scatter() -> None:
     """The bitwise gate rejects every plausible wrong result, by a wide margin.
 
     A gate of exactly 0 cannot be too loose, but it can be blind: if every
@@ -885,7 +899,7 @@ def test_the_gate_discriminates_a_wrong_reduce_scatter() -> None:
     COMM.Barrier()
 
 
-def test_calls_pair_by_position_and_a_swapped_pair_realigns() -> None:
+def check_calls_pair_by_position_and_a_swapped_pair_realigns() -> None:
     """Calls pair by their **position** on the communicator, not by intent.
 
     One rank issuing two same-shaped calls in the opposite order to everybody
@@ -953,7 +967,7 @@ def test_calls_pair_by_position_and_a_swapped_pair_realigns() -> None:
         COMM.Barrier()
 
 
-def test_a_mispaired_result_is_deterministic_rather_than_noise() -> None:
+def check_a_mispaired_result_is_deterministic_rather_than_noise() -> None:
     """Because this op computes, "wrong" could have meant "unreproducible".
 
     It does not. On payloads with no exactness property, a mispaired call is
@@ -1007,7 +1021,7 @@ def test_a_mispaired_result_is_deterministic_rather_than_noise() -> None:
     COMM.Barrier()
 
 
-def test_an_extra_call_on_one_rank_misaligns_until_the_counts_match() -> None:
+def check_an_extra_call_on_one_rank_misaligns_until_the_counts_match() -> None:
     """An odd number of extra calls does not realign; a swapped pair does.
 
     Rank 0 issues one call the others never issue, then all ranks issue four
@@ -1061,7 +1075,7 @@ def test_an_extra_call_on_one_rank_misaligns_until_the_counts_match() -> None:
     COMM.Barrier()
 
 
-def test_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently() -> None:
+def check_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently() -> None:
     """A different collective at the same byte count is not detected either.
 
     What pairs is position, not the identity of the op: with rank 0 issuing
@@ -1125,7 +1139,7 @@ def test_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently()
     COMM.Barrier()
 
 
-def test_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
+def check_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
     """The op runs on whatever stream is current, and ranks need not agree.
 
     A serving engine moves the current stream under the model: the same forward
@@ -1175,7 +1189,7 @@ def test_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
         COMM.Barrier()
 
 
-def test_float8_is_summed_as_raw_bytes() -> None:
+def check_float8_is_summed_as_raw_bytes() -> None:
     """float8_e4m3fn is accepted and reduced as unsigned bytes, not as floats.
 
     Measured, and the reason the wrapper rejects the dtype: an all-gather moves
@@ -1213,7 +1227,7 @@ def test_float8_is_summed_as_raw_bytes() -> None:
     COMM.Barrier()
 
 
-def test_unsupported_dtypes_raise_and_poison_every_later_collective() -> None:
+def check_unsupported_dtypes_raise_and_poison_every_later_collective() -> None:
     """fp64 and the other float8 formats raise — and the raise is terminal.
 
     Runs last, and has to: the raise leaves NCCL's group state unbalanced (the
@@ -1257,7 +1271,7 @@ def test_unsupported_dtypes_raise_and_poison_every_later_collective() -> None:
     COMM.Barrier()
 
 
-def test_wrapper_guards_a_non_contiguous_input() -> None:
+def check_wrapper_guards_a_non_contiguous_input() -> None:
     """The wrapper's assert stands where the op itself is silently wrong."""
     rows, seed = 8, 92000
     sizes = [rows] * WORLD
@@ -1286,7 +1300,7 @@ def test_wrapper_guards_a_non_contiguous_input() -> None:
     COMM.Barrier()
 
 
-def test_wrapper_guards_a_zero_dim_input() -> None:
+def check_wrapper_guards_a_zero_dim_input() -> None:
     """A 0-d input segfaults inside the op, so the wrapper stops it first.
 
     The op is deliberately not called here: the crash is in
@@ -1301,7 +1315,7 @@ def test_wrapper_guards_a_zero_dim_input() -> None:
     COMM.Barrier()
 
 
-def test_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
+def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     """Neither wrong length is survivable, so the wrapper stops both.
 
     The raw op is deliberately not called with either. A list one entry short
@@ -1326,7 +1340,7 @@ def test_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     COMM.Barrier()
 
 
-def test_wrapper_guards_a_split_that_does_not_cover_the_input() -> None:
+def check_wrapper_guards_a_split_that_does_not_cover_the_input() -> None:
     """Rows the split does not reach are silently dropped, not flagged.
 
     Two ways to get there, both exercised on the raw op because both are
@@ -1361,7 +1375,7 @@ def test_wrapper_guards_a_split_that_does_not_cover_the_input() -> None:
     COMM.Barrier()
 
 
-def test_the_group_still_works_after_the_negative_tests() -> None:
+def check_the_group_still_works_after_the_negative_tests() -> None:
     """The raises above leave the communicator usable — checked, not assumed."""
     rows, seed = 8, 95000
     sizes = [rows] * WORLD
@@ -1370,42 +1384,42 @@ def test_the_group_still_works_after_the_negative_tests() -> None:
     COMM.Barrier()
 
 
-TESTS = (
+CHECKS = (
     # Stays first: it is the only test that can observe GROUP's first-ever
     # call, and every later test needs the communicator it builds.
-    test_cuda_graph_capture_of_a_first_call_raises,
-    test_uniform_reduce_scatter,
-    test_ragged_reduce_scatter,
-    test_output_is_fresh_and_input_is_untouched,
-    test_trailing_dims_are_preserved,
-    test_dtypes_reduce_arithmetically,
-    test_group_selects_a_rank_subset,
-    test_group_order_does_not_change_the_output,
-    test_reduction_is_deterministic_and_accumulates_in_the_input_dtype,
-    test_uniform_form_and_an_explicit_even_split_agree_bitwise,
-    test_round_trip_with_a_gather_returns_each_rank_its_own_rows,
-    test_cuda_graph_at_every_engine_batch_size,
-    test_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph,
-    test_cuda_graph_replays_survive_eager_calls_of_other_shapes,
-    test_cuda_graph_holds_the_sizes_vector_it_captured,
-    test_the_gate_discriminates_a_wrong_reduce_scatter,
+    check_cuda_graph_capture_of_a_first_call_raises,
+    check_uniform_reduce_scatter,
+    check_ragged_reduce_scatter,
+    check_output_is_fresh_and_input_is_untouched,
+    check_trailing_dims_are_preserved,
+    check_dtypes_reduce_arithmetically,
+    check_group_selects_a_rank_subset,
+    check_group_order_does_not_change_the_output,
+    check_reduction_is_deterministic_and_accumulates_in_the_input_dtype,
+    check_uniform_form_and_an_explicit_even_split_agree_bitwise,
+    check_round_trip_with_a_gather_returns_each_rank_its_own_rows,
+    check_cuda_graph_at_every_engine_batch_size,
+    check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph,
+    check_cuda_graph_replays_survive_eager_calls_of_other_shapes,
+    check_cuda_graph_holds_the_sizes_vector_it_captured,
+    check_the_gate_discriminates_a_wrong_reduce_scatter,
     # The call-order block. Each of these deliberately disagrees about call
     # order and each restores alignment before it returns — the plain call
     # every one of them ends on is what proves it.
-    test_calls_pair_by_position_and_a_swapped_pair_realigns,
-    test_a_mispaired_result_is_deterministic_rather_than_noise,
-    test_an_extra_call_on_one_rank_misaligns_until_the_counts_match,
-    test_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently,
-    test_the_stream_the_call_lands_on_is_not_part_of_the_match,
-    test_float8_is_summed_as_raw_bytes,
-    test_wrapper_guards_a_non_contiguous_input,
-    test_wrapper_guards_a_zero_dim_input,
-    test_wrapper_guards_a_sizes_list_of_the_wrong_length,
-    test_wrapper_guards_a_split_that_does_not_cover_the_input,
-    test_the_group_still_works_after_the_negative_tests,
+    check_calls_pair_by_position_and_a_swapped_pair_realigns,
+    check_a_mispaired_result_is_deterministic_rather_than_noise,
+    check_an_extra_call_on_one_rank_misaligns_until_the_counts_match,
+    check_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently,
+    check_the_stream_the_call_lands_on_is_not_part_of_the_match,
+    check_float8_is_summed_as_raw_bytes,
+    check_wrapper_guards_a_non_contiguous_input,
+    check_wrapper_guards_a_zero_dim_input,
+    check_wrapper_guards_a_sizes_list_of_the_wrong_length,
+    check_wrapper_guards_a_split_that_does_not_cover_the_input,
+    check_the_group_still_works_after_the_negative_tests,
     # Stays last: the raise it asserts leaves every later collective in the
     # process returning garbage, so nothing can run after it.
-    test_unsupported_dtypes_raise_and_poison_every_later_collective,
+    check_unsupported_dtypes_raise_and_poison_every_later_collective,
 )
 
 
@@ -1424,13 +1438,13 @@ def _run_one_rank() -> int:
     assert WORLD >= 2, f"a collective needs at least 2 ranks, got {WORLD}"
     torch.cuda.set_device(RANK)
 
-    for test in TESTS:
+    for check in CHECKS:
         try:
-            test()
+            check()
         except BaseException:
             import traceback
 
-            print(f"[rank {RANK}] FAILED {test.__name__}", flush=True)
+            print(f"[rank {RANK}] FAILED {check.__name__}", flush=True)
             traceback.print_exc()
             sys.stdout.flush()
             sys.stderr.flush()
@@ -1438,7 +1452,7 @@ def _run_one_rank() -> int:
             # wedges every other rank in it.
             COMM.Abort(1)
     COMM.Barrier()
-    print(f"[rank {RANK}] {len(TESTS)} tests passed", flush=True)
+    print(f"[rank {RANK}] {len(CHECKS)} checks passed", flush=True)
     return 0
 
 
@@ -1469,7 +1483,7 @@ def _run_wedge_rank() -> int:
     """Body of one rank of the sub-job that certifies the wedge.
 
     Same mispairing as
-    test_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently,
+    check_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently,
     with one difference: the two calls carry **different** element counts
     (`rows*HIDDEN` against `5*HIDDEN`). That is the case NCCL cannot serve out
     of the buffers it was given, and it hangs rather than returning wrong data.
@@ -1529,7 +1543,7 @@ def _mpirun(world_size: int, flag: str, env: Optional[Dict[str, str]] = None) ->
         str(world_size),
         sys.executable,
         "-m",
-        "tensorrt_llm._torch.staircase.catalog.comm.reducescatter_test",
+        "tensorrt_llm._torch.staircase.catalog.comm._reducescatter_op_matrix",
         flag,
     ]
     print(f"[launcher] {' '.join(command)}", flush=True)
@@ -1539,7 +1553,7 @@ def _mpirun(world_size: int, flag: str, env: Optional[Dict[str, str]] = None) ->
 def _certify_the_unequal_byte_count_wedge(world_size: int) -> None:
     """Second job: the one call-order divergence that hangs instead of lying.
 
-    It cannot be a `TESTS` entry, because the job that runs it never reports.
+    It cannot be a `CHECKS` entry, because the job that runs it never reports.
     So it runs on its own, and the evidence is the marks its ranks leave: all
     of them entered the mispaired pair, none came out of it within
     WEDGE_GRACE_S, and the job ended by its own watchdog rather than by
