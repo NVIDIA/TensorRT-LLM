@@ -166,12 +166,14 @@ Evaluated {self.metric_name}: {accuracy:.3f}
             assert accuracy <= self.threshold, err_msg
 
 
-def compute_acceptance_length(llm: PyTorchLLM) -> float:
-    """Mean acceptance length over speculative iterations.
+def acceptance_length_from_iteration_stats(stats: List[dict]) -> float:
+    """Mean acceptance length over the speculative iterations in ``stats``.
 
-    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
+    ``stats`` is a list of iteration-stats dicts, as returned by
+    ``LLM.get_stats()`` for an in-process engine or by the ``/metrics``
+    endpoint of a ``trtllm-serve`` worker. Both emit the same shape, so a
+    disaggregated test scores on the same definition as an aggregate one.
     """
-    stats = llm.get_stats(timeout=2)
     spec_iters = [
         stat["specDecodingStats"] for stat in stats
         if stat.get("specDecodingStats")
@@ -181,6 +183,14 @@ def compute_acceptance_length(llm: PyTorchLLM) -> float:
     accepted = sum(stat["numAcceptedTokens"] for stat in spec_iters)
     requests = sum(stat["numRequestsWithDraftTokens"] for stat in spec_iters)
     return (accepted + requests) / requests
+
+
+def compute_acceptance_length(llm: PyTorchLLM) -> float:
+    """Mean acceptance length over speculative iterations.
+
+    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
+    """
+    return acceptance_length_from_iteration_stats(llm.get_stats(timeout=2))
 
 
 def assert_acceptance_length(test_key: str, al_value: float) -> None:
