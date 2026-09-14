@@ -432,7 +432,6 @@ class PerfTestConfig:
         api: str = "",
         streaming: str = "",
         backend: str = "pytorch",
-        mode: str = "plugin",
         data_type: str = "float16",
         max_batch_size: int = 512,
         max_num_tokens: int = 2048,
@@ -467,8 +466,6 @@ class PerfTestConfig:
         self.backend = backend
         # Streaming responses
         self.streaming = streaming
-        # Plugin or OOTB mode.
-        self.mode = mode
         # Activation dtype.
         self.data_type = data_type
         # Percentage of weights that resides on GPU.
@@ -543,9 +540,7 @@ class PerfTestConfig:
             if self.streaming == "streaming":
                 entries.append("streaming")
 
-        # Add mode and dtype.
-        if self.runtime not in ("bench", "serve"):
-            entries.append(self.mode)
+        # Add dtype.
         entries.append(self.data_type)
 
         if self.gpu_weights_percent != -1:
@@ -663,8 +658,6 @@ class PerfTestConfig:
         self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"
                                                       ] else "pytorch"
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
-        if self.runtime not in ("bench", "serve"):
-            self.mode = labels.pop(0)
         self.data_type = labels.pop(0)
         if labels[0].startswith("gwp"):
             self.gpu_weights_percent = float(labels.pop(0).replace("gwp:", ""))
@@ -782,10 +775,6 @@ class PerfTestConfig:
             assert self.moe_backend, "moe backend must not be empty!"
             assert self.backend == "pytorch", \
                 "moe backend overrides require the pytorch backend!"
-
-        # Validate plugin mode.
-        VALID_MODES = ["plugin", "ootb", "ootb_except_mha"]
-        assert self.mode in VALID_MODES, f"Invalid mode {self.mode}!"
 
         # Validate dtype.
         VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
