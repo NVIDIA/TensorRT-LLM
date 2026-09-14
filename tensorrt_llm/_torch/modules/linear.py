@@ -1518,7 +1518,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def resolve_scaling_vector_size(self, module: Linear) -> int:
         """Scale block width for ``module``, validated against this method."""
-        size = nvfp4_scaling_vector_size(getattr(module, "quant_config", None))
+        size = nvfp4_scaling_vector_size(module.quant_config)
         if size not in self.supported_scaling_vector_sizes:
             raise ValueError(
                 f"{type(self).__name__} supports NVFP4 scale blocks of "
@@ -2300,8 +2300,7 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     @staticmethod
     def is_supported(module: Linear) -> bool:
         sm_version = get_sm_version()
-        block_width = nvfp4_scaling_vector_size(
-            getattr(module, "quant_config", None))
+        block_width = nvfp4_scaling_vector_size(module.quant_config)
         return ((89 <= sm_version < 100 or sm_version in (120, 121))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
