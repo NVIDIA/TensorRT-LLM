@@ -1659,7 +1659,7 @@ repos:
         language: script
         pass_filenames: false
     -   id: check-ci-test-timeouts
-        name: Disallow redundant default CI test timeouts
+        name: Limit CI test-list timeouts
         entry: ./scripts/check_ci_test_timeouts.py
         language: script
         pass_filenames: false

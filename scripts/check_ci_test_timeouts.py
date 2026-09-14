@@ -13,11 +13,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reject redundant 60-minute TIMEOUT markers in CI test-db lists only."""
+"""Reject explicit CI-default TIMEOUT markers in CI test-db lists only."""
 
 import re
 import sys
 from pathlib import Path
+
+# CI command-line default; keep in sync with getPytestBaseCommandLine() in jenkins/L0_Test.groovy,
+# which passes --timeout=3600 (seconds) to pytest.
+_DEFAULT_CI_TIMEOUT_MINUTES = 60
 
 
 def main() -> int:
@@ -31,9 +35,12 @@ def main() -> int:
         if not path.is_file() or path.suffix not in (".txt", ".yml", ".yaml"):
             continue
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if re.search(r"\bTIMEOUT\s*\(\s*0*60\s*\)", line.partition("#")[0]):
+            if re.search(
+                rf"\bTIMEOUT\s*\(\s*0*{_DEFAULT_CI_TIMEOUT_MINUTES}\s*\)", line.partition("#")[0]
+            ):
                 print(
-                    f"{path}:{lineno}: Remove TIMEOUT (60); 60 minutes is the default.",
+                    f"{path}:{lineno}: Remove TIMEOUT ({_DEFAULT_CI_TIMEOUT_MINUTES}); "
+                    f"{_DEFAULT_CI_TIMEOUT_MINUTES} minutes is the CI command-line default.",
                     file=sys.stderr,
                 )
                 failed = True

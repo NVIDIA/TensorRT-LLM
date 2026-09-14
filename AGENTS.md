@@ -156,10 +156,6 @@ The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub
 
 See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
-Omit redundant `TIMEOUT (60)` markers in CI lists under
-`tests/integration/test_lists/test-db/`; 60 minutes is the default. Pre-commit
-enforces this with `python3 scripts/check_ci_test_timeouts.py`. QA lists are excluded.
-
 | Layer | Location | Notes |
 |-------|----------|-------|
 | Unit tests | `tests/unittest/` | Run in pre-merge CI; some tests require GPU |
