@@ -21,12 +21,15 @@ Each wrapper function maps 1-to-1 to a single verl pytest case, enabling
 fine-grained waiving without blanket-skipping a whole file.
 """
 
+import glob
 import os
+import re
 import subprocess
 import sys
 
 import pytest
 import yaml
+from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_PATH = os.path.join(_HERE, "verl_config.yml")
@@ -80,30 +83,61 @@ def _clone_verl_repo(config):
     )
 
 
+_MODEL_ROOT_JOIN = re.compile(r"""os\.path\.join\(\s*model_root\s*,\s*["']([^"']+)["']""")
+
+
+def _model_ids_requested_by_verl():
+    """Model ids the pinned checkout resolves against TRTLLM_TEST_MODEL_PATH_ROOT.
+
+    Only these need staging: a bare hub id in a verl test is resolved by
+    transformers itself and no symlink applies to it.
+    """
+    requested = set()
+    for path in sorted(glob.glob(os.path.join(VERL_ROOT, _ROLLOUT, "*.py"))):
+        with open(path) as f:
+            requested.update(_MODEL_ROOT_JOIN.findall(f.read()))
+    return requested
+
+
 def _setup_model_symlinks(config):
     """Create symlinks from HF-style paths to CI cache paths.
 
-    Verl tests expect models at {model_root}/Qwen/ModelName but the CI cache
-    stores them at {ci_cache}/ModelName (flat structure). We create symlinks
-    in a writable staging directory that point to the read-only CI cache.
+    Verl tests expect models at {model_root}/Qwen/ModelName, so stage symlinks
+    in a writable directory that point at the read-only CI cache. Resolution is
+    delegated to hf_id_to_local_model_dir so that models kept under a prefix
+    (Qwen3/, llama-3.1-model/, ...) stay reachable, which a private
+    {cache}/{basename} join cannot do.
     """
     model_root = os.environ.get("TRTLLM_TEST_MODEL_PATH_ROOT", "")
-    ci_cache = config.get("ci_model_cache", "")
-    if not model_root or not ci_cache:
+    if not model_root or llm_models_root() is None:
         return
-    for model_id in config.get("required_models", []):
+
+    required = config.get("required_models", [])
+    # required_models is hand-maintained while repo_tag pins the checkout that
+    # consumes it, so the two drift independently. Comparing against the pinned
+    # sources names both sides here instead of failing ~400 s later as an opaque
+    # HFValidationError once transformers retries an unstaged path as a Hub id.
+    uncovered = _model_ids_requested_by_verl() - set(required)
+    assert not uncovered, (
+        f"verl {config['repo_tag']} resolves {sorted(uncovered)} against "
+        f"TRTLLM_TEST_MODEL_PATH_ROOT, but required_models in verl_config.yml "
+        f"lists {sorted(required)}. Keep required_models in sync with repo_tag."
+    )
+
+    for model_id in required:
         if "/" not in model_id:
             continue
         namespace, name = model_id.split("/", 1)
         ns_dir = os.path.join(model_root, namespace)
-        src = os.path.join(ci_cache, name)
         dst = os.path.join(ns_dir, name)
-        if os.path.exists(dst):
-            print(f"[verl setup] Model symlink already exists: {dst}")
-            continue
-        if not os.path.isdir(src):
-            print(f"[verl setup] Model not found in CI cache: {src}, skipping")
-            continue
+        src = hf_id_to_local_model_dir(model_id)
+        if os.path.lexists(dst):
+            if os.path.realpath(dst) == os.path.realpath(src):
+                print(f"[verl setup] Model symlink already exists: {dst}")
+                continue
+            # Staged against a different cache root. lexists rather than exists
+            # so a dangling link is re-pointed instead of raising EEXIST below.
+            os.unlink(dst)
         os.makedirs(ns_dir, exist_ok=True)
         os.symlink(src, dst)
         print(f"[verl setup] Created symlink: {dst} -> {src}")
