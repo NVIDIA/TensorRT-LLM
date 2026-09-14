@@ -526,6 +526,7 @@ def batched_lock_to_gpu(
                 [p.page for p in part],
                 update_src=True,
                 migration_recorder=migration_recorder,
+                dst_locality_domain_id=kv_cache.locality_domain_id,
             )
     except Exception:
         for t, e in zip(tasks, scheduled_for_eviction):

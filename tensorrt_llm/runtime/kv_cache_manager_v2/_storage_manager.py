@@ -658,6 +658,7 @@ class StorageManager:
                     pages,
                     update_src=True,
                     migration_recorder=migration_recorder,
+                    dst_locality_domain_id=locality_domain_id,
                 )
                 for p in pages:
                     if is_last_level and p.status == PageStatus.HELD:
@@ -680,9 +681,10 @@ class StorageManager:
 
         Supported migration patterns:
 
-        - Cross-tier migration (e.g. GPU → Host): the destination is always a
-          different tier (Host/Disk), so dst_pool_group operations use the
-          default locality_domain_id=0 — correct because Host/Disk pools are not
+        - Cross-tier migration (e.g. GPU → Host, Host → GPU): pass
+          ``dst_locality_domain_id`` whenever the destination is the GPU tier, so
+          pages loaded back land in the locality domain their slots were reserved
+          in. It is ignored when the destination is Host/Disk, which are not
           locality domain-aware.
         - Same-level defragmentation: moves slots within the same tier and
           same locality domain to eliminate fragmentation after a shrink.
@@ -701,6 +703,11 @@ class StorageManager:
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
+        assert (
+            not isinstance(dst_pool_group, GpuPoolGroup)
+            or dst_pool_group.num_locality_domains == 1
+            or dst_locality_domain_id is not None
+        ), "dst_locality_domain_id is required when the destination pool group is localized"
         dst_ldid = dst_locality_domain_id if dst_locality_domain_id is not None else 0
         if isinstance(dst_pool_group, GpuPoolGroup):
             dst_num_free_slots = dst_pool_group.num_free_slots(dst_ldid)
@@ -1352,6 +1359,7 @@ class StorageManager:
         self,
         dst_lvl: CacheLevel,
         pages: TypedIndexList[PoolGroupIndex, TypedIndexList[CacheLevel, list[Page]]],
+        locality_domain_id: int | None = None,
     ) -> None:
         """Dispatch page migration to the destination cache level.
 
@@ -1378,11 +1386,18 @@ class StorageManager:
                         if lvl == dst_lvl:
                             continue
                         num_slots[pg_idx] += 1
-            self.prepare_free_slots(dst_lvl, num_slots)
+            self.prepare_free_slots(dst_lvl, num_slots, locality_domain_id=locality_domain_id)
             for pg_idx, pg_tasks in typed_enumerate(pages):
                 for lvl in typed_range(CacheLevel(dst_lvl + 1), self.num_cache_levels):
                     lvl_tasks = pg_tasks[lvl]
-                    self._batched_migrate(pg_idx, dst_lvl, lvl, lvl_tasks, True)
+                    self._batched_migrate(
+                        pg_idx,
+                        dst_lvl,
+                        lvl,
+                        lvl_tasks,
+                        True,
+                        dst_locality_domain_id=locality_domain_id,
+                    )
         finally:
             for p in scheduled:
                 self.schedule_for_eviction(p)
