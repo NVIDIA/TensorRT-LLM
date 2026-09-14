@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..selection import SelectedEntries, SelectionContext
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -28,6 +29,7 @@ from .indexer import (
 )
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSAParams
+from .selection import DSASelectionPolicy, select_dsa_topk
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -152,6 +154,41 @@ class DSATrtllmAttention(TrtllmAttention):
         else:
             self.indexer = None
 
+    def select_logical_topk(
+        self,
+        q: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> torch.Tensor:
+        """Run/reuse the indexer without consulting physical KV page tables."""
+        return select_dsa_topk(
+            self.indexer,
+            q,
+            metadata,
+            forward_args.sparse_backend_args.indexer_intermediates
+            if self.indexer is not None
+            else None,
+            is_generation=forward_args.attention_input_type == AttentionInputType.generation_only,
+        )
+
+    def select_kv(
+        self,
+        q: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        context: SelectionContext,
+    ) -> SelectedEntries:
+        """Expose logical DSA selections for the selected-entry cache path.
+
+        The caller supplies KVCM IDs, query-to-request rows, and causal entry
+        bounds. IndexShare shares positions; context still names this KV layer.
+        This entry point replaces sparse_attn_predict on that path: do not call
+        both for the same query. Model cache wiring follows in the HiSparse task.
+        """
+        return DSASelectionPolicy().select(
+            self.select_logical_topk(q, metadata, forward_args), context
+        )
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -161,26 +198,7 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run the DSA indexer and convert its local TopK to paged indices."""
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
-        sparse_backend_args = forward_args.sparse_backend_args
-        phase_start = metadata.num_ctx_tokens if is_generation else 0
-        phase_end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
-        shared_topk_indices = metadata.shared_topk_indices
-        if self.indexer is None:
-            topk_indices = shared_topk_indices[phase_start:phase_end]
-        else:
-            indexer_intermediates = sparse_backend_args.indexer_intermediates
-            topk_indices = self.indexer.forward_from_projected(
-                metadata,
-                q,
-                indexer_intermediates,
-                is_generation=is_generation,
-            )
-            preserve_mtp_topk = metadata.in_mtp_draft_loop and self.indexer.mtp_index_share
-            if shared_topk_indices is not None and not preserve_mtp_topk:
-                shared_topk_indices[
-                    phase_start : phase_start + topk_indices.shape[0],
-                    : topk_indices.shape[1],
-                ].copy_(topk_indices)
+        topk_indices = self.select_logical_topk(q, metadata, forward_args)
 
         local_layer_idx = self.get_local_layer_idx(metadata)
         kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
