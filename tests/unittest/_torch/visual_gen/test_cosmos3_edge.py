@@ -1615,8 +1615,8 @@ class TestDiffusersParity:
         The emitted tensors are one-step BF16 video and action velocities. The
         model-specific behavior is a clean state row followed by 32 noisy
         actions, with domain-selected input/output heads. The trusted reference
-        is pinned Diffusers 0.40.0 with identical synthetic weights and packed
-        inputs. This is transparent T1; its tolerance covers reduction
+        is installed Diffusers 0.40.0 or newer with identical synthetic weights
+        and packed inputs. This is transparent T1; its tolerance covers reduction
         reordering between SDPA and TRT-LLM's vanilla attention backend.
 
         This pair deliberately exercises the shared action machinery on the

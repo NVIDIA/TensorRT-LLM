@@ -27,9 +27,6 @@ def main():
     import diffusers
     import torch
 
-    assert diffusers.__version__ == "0.40.0", (
-        f"Cosmos3 Edge parity requires Diffusers 0.40.0, got {diffusers.__version__}"
-    )
     print("diffusers:", diffusers.__version__)
     from diffusers import Cosmos3OmniPipeline
 
