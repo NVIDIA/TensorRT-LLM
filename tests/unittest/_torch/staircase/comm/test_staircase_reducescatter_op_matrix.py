@@ -7,10 +7,11 @@ duplicate of it: that file covers the *fusion patterns* through the
 ``AllReduce`` module, while this covers the op itself cell by cell. The names
 are kept apart so review does not read one as a copy of the other.
 
-The matrix lives in ``reducescatter_test.py``, which is its own launcher and
-runs two jobs: the ordered test sequence, then a separately capped job that
-certifies the one call-order divergence that wedges instead of lying (it
-cannot be a normal test, because the job that runs it never reports).
+The matrix lives in ``catalog/comm/_reducescatter_op_matrix.py``, which is its
+own launcher and runs two jobs: the ordered check sequence, then a separately
+capped job that certifies the one call-order divergence that wedges instead of
+lying (it cannot be a normal check, because the job that runs it never
+reports).
 """
 
 import pytest

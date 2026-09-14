@@ -57,9 +57,9 @@ def _devices() -> str:
 
 
 def run(entry: str) -> None:
-    """Run ``<entry>_test``'s launcher over ``WORLD_SIZE`` devices."""
-    module = f"{__package__}.{entry}_test"
-    launcher = Path(__file__).with_name(f"{entry}_test.py")
+    """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices."""
+    module = f"{__package__}._{entry}_op_matrix"
+    launcher = Path(__file__).with_name(f"_{entry}_op_matrix.py")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
     # The launcher re-execs itself per rank and needs this package importable
     # from the ranks; by path it has no package context of its own to inherit.

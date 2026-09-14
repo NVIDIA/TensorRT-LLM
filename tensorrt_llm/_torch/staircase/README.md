@@ -123,9 +123,12 @@ is valid only if it post-dates the last write to *every* file of its entry, so
 that check now has to look in both trees.
 
 The two collective entries keep their rank bodies in `catalog/comm/`
-(`allgather_test.py`, `reducescatter_test.py`) because the launcher re-execs
-them as `python -m` and the ranks need the package context; only the collected
-shells moved.
+(`_allgather_op_matrix.py`, `_reducescatter_op_matrix.py`) because the launcher
+re-execs them as `python -m` and the ranks need the package context; only the
+collected shells moved. Neither those file names nor their `check_*` bodies
+match pytest's collection patterns: a package tree is no place for a
+collectable test, and each of those two is one fixed 4-rank sequence that
+cannot run as independent cases anyway.
 
 Identity is the path. `targets/` keeps all three segments rather than
 flattening them, and the class name carries the same triple;
