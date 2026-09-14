@@ -1398,19 +1398,21 @@ class MiniMaxM3Attention(Attention):
         The backend runs the sparse GQA or dense paged GQA through its inherited
         FMHA forward; this layer selects the top-k blocks (sparse only) and
         builds the forward_args the FMHA reads.
+
+        This layer owns the cache write: write_layer_caches stores the
+        new-token K/V (and, on the bf16 indexer path, index-K) in one launch
+        before the indexer's proxy pass reads the index-K cache. forward()
+        then receives k=v=None, which is the backend's contract for "K/V are
+        already resident", so neither FMHA phase writes them again.
         """
         if self.is_sparse_attention_layer:
             assert idx_q is not None
-            # One launch writes this layer's K/V and, on the bf16 path, index-K,
-            # ahead of the proxy pass that reads the index-K cache. On the FP8
-            # indexer path idx_k is None because the fused producer already
-            # inserted FP8 index-K into the side cache; the fused write then
-            # stores K/V only.
-            attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v, idx_k)
+            # On the FP8 indexer path idx_k is None: the fused producer already
+            # inserted E4M3 index-K into the side cache, so only K/V are written.
+            self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
             # Publish the selected blocks so the FMHA runs the sparse path.
-            # idx_k_prewritten marks that index-K is already in the cache (via
-            # the fused write above on bf16, or the FP8 producer when idx_k is
-            # None), so run_indexer must not write it again.
+            # idx_k_prewritten: index-K is already in the cache (written above
+            # on bf16, or by the FP8 producer), so run_indexer must not write it.
             kv_block_indexes = self.attn.run_indexer(
                 idx_q, idx_k, attn_metadata, idx_k_prewritten=True
             )
@@ -1420,11 +1422,10 @@ class MiniMaxM3Attention(Attention):
             )
         else:
             assert idx_q is None and idx_k is None
-            # Dense layers get the same fused K/V write.
-            attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v)
+            self.attn.write_layer_caches(k, v, None, attn_metadata)
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
-        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        self.attn.forward(q, None, None, attn_metadata, forward_args=forward_args)
         return output
 
     def _sparse_forward(

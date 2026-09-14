@@ -140,7 +140,11 @@ def write_msa_phase_kv(
     phases cover the step between them and neither repeats the other's write.
 
     k and v are the phase's token slice, and token_offset its first token on
-    the step's token axis, which is what msa_out_cache_loc is indexed by.
+    the step's token axis, which is what msa_out_cache_loc is indexed by. A
+    phase handed no K/V (k and v None) has nothing to write: that is how the
+    MiniMax-M3 model layer, which stores the whole step's K/V itself through
+    MiniMaxM3MsaSparseAttention.write_layer_caches ahead of its indexer,
+    tells both libraries the cache is already resident.
     """
     if attention_input_type != AttentionInputType.mixed:
         raise NotImplementedError(
@@ -149,11 +153,6 @@ def write_msa_phase_kv(
             "top-k block table are indexed by whole-step token position."
         )
     if k is None or v is None:
-        return
-    # The fused per-layer scatter (metadata.msa_write_layer_caches) may have
-    # written this whole step's K/V for the layer already; both phases of a
-    # mixed step then skip, and prepare() clears the marker for the next step.
-    if getattr(metadata, "_msa_prewritten_layer", None) == attn.layer_idx:
         return
     num_tokens = int(k.shape[0])
     if num_tokens == 0:
