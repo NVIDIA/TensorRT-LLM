@@ -24,7 +24,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
-from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -56,12 +56,16 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # (SM100/SM103); on consumer Blackwell (SM120) and other archs it aborts at
 # launch, so we fall back to Triton there. Resolution is deferred to first call
 # (and cached) so importing this module never initializes CUDA.
-@functools.lru_cache(maxsize=1)
-def _resolve_chunk_gated_delta_rule():
-    if (
+def _use_flashinfer_gdn_prefill() -> bool:
+    return (
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
         and is_flashinfer_gdn_supported_arch()
-    ):
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_chunk_gated_delta_rule():
+    if _use_flashinfer_gdn_prefill():
         from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as impl
     else:
         from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as impl
@@ -737,6 +741,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_prefill = kwargs["num_prefill"]
         num_decodes = kwargs["num_decodes"]
 
+        state_workspace = kwargs.get("state_workspace")
+        chunk_kwargs = {"state_workspace": state_workspace} if state_workspace is not None else {}
+
         conv_states_to_use = conv_states
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
@@ -887,6 +894,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     head_first=False,
                     use_qk_l2norm_in_kernel=False,
                     output=output_p,
+                    **chunk_kwargs,
                 )
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
@@ -1002,9 +1010,34 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             head_first=False,
             use_qk_l2norm_in_kernel=False,
             output=output,
+            **chunk_kwargs,
         )
 
         return core_attn_out
+
+    def _get_prefill_state_workspace(
+        self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        # Blackwell uses indexed pool I/O directly, without state scratch.
+        if not _use_flashinfer_gdn_prefill() or is_sm_100f():
+            return None
+        dtype = torch.float32
+        key = (ssm_states.device, dtype, tuple(ssm_states.shape[1:]))
+        # Layers execute sequentially and share one pair of state I/O buffers.
+        # Keep them alive after profiling instead of allocating a pair per layer.
+        workspaces = self.model_config.extra_attrs.setdefault("gdn_state_workspaces", {})
+        workspace = workspaces.get(key)
+        if attn_metadata.is_warmup:
+            capacity = min(
+                attn_metadata.max_num_sequences or attn_metadata.max_num_requests,
+                attn_metadata.max_num_tokens,
+            )
+            if workspace is None or workspace.shape[1] < capacity:
+                workspace = torch.empty(
+                    (2, capacity, *ssm_states.shape[1:]), dtype=dtype, device=ssm_states.device
+                )
+                workspaces[key] = workspace
+        return workspace
 
     def forward(
         self,
@@ -1143,6 +1176,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 intermediate_ssm_states=intermediate_ssm_states,
                 is_target_verify=is_target_verify,
                 output=output,
+                state_workspace=self._get_prefill_state_workspace(attn_metadata, ssm_states),
                 **kwargs,
             )
         else:

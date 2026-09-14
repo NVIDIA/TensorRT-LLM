@@ -68,6 +68,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
+    state_workspace: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's ``chunk_gated_delta_rule``.
 
@@ -78,6 +79,8 @@ def chunk_gated_delta_rule(
     module docstring). ``final_state`` is non-``None`` only on the
     gather/scatter path with ``output_final_state=True`` and no in-place
     update; an in-place update reports through ``initial_state``.
+    ``state_workspace`` optionally supplies shared scratch of shape
+    ``[2, capacity, H, V, K]``; returned states never alias this scratch.
     """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
@@ -166,8 +169,17 @@ def chunk_gated_delta_rule(
     # SM90/SM120 still require fp32 state. Fuse gather (+ optional cast) and
     # contiguous into a single Triton kernel.
     state_dtype = initial_state.dtype if is_sm_100f() else torch.float32
+    num_seqs = cu_seqlens.shape[0] - 1
+    if state_workspace is not None:
+        assert state_workspace.shape[0] == 2 and state_workspace.shape[1] >= num_seqs
+        assert state_workspace.shape[2:] == initial_state.shape[1:]
+        assert state_workspace.dtype == state_dtype
+        assert state_workspace.device == initial_state.device
     gathered_init = gather_cast_vk_to_fp32_vk(
-        initial_state, initial_state_indices, out_dtype=state_dtype
+        initial_state,
+        initial_state_indices,
+        out_dtype=state_dtype,
+        output=state_workspace[0, :num_seqs] if state_workspace is not None else None,
     )
 
     # --- Step 5+6: call FlashInfer with pre-allocated output/state buffers
@@ -180,7 +192,11 @@ def chunk_gated_delta_rule(
         # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
         # fp32); FlashInfer writes the final state in this dtype and the scatter
         # below adapts to the destination pool dtype without an extra cast.
-        state_buf = q3.new_empty(num_seqs, num_o_heads, head_size, head_size, dtype=state_dtype)
+        state_buf = (
+            state_workspace[1, :num_seqs]
+            if state_workspace is not None
+            else q3.new_empty(num_seqs, num_o_heads, head_size, head_size, dtype=state_dtype)
+        )
         out_packed, out_state = flashinfer.chunk_gated_delta_rule(
             q=q3,
             k=k3,
