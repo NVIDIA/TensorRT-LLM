@@ -31,7 +31,7 @@ def parse_arguments():
     parser.add_argument(
         "--mcp_url",
         type=str,
-        default="http://127.0.0.1:8086/mcp",
+        default="http://127.0.0.1:8083/mcp",
         help="URL for the Coder Apiary MCP server (coder_mcp.py)",
     )
     parser.add_argument(

@@ -55,7 +55,7 @@ def create_starlette_app() -> Starlette:
     return mcp.streamable_http_app()
 
 
-def run_mcp_server(host: str, port: int):
+def run_mcp_server(host: str, port: int) -> None:
     """Run MCP server in a separate process."""
     print(f"Running MCP server on {host}:{port}")
     starlette_app = create_starlette_app()
@@ -114,10 +114,10 @@ class RemoteMCPServer:
         start = time.time()
         while True:
             try:
-                # Try to connect to server
-                requests.get(url, timeout=1)
+                response = requests.get(url, timeout=1)
+                response.raise_for_status()
                 break
-            except (requests.ConnectionError, requests.Timeout) as err:
+            except (requests.ConnectionError, requests.HTTPError, requests.Timeout) as err:
                 # Check if process exited unexpectedly
                 if self.proc is not None and not self.proc.is_alive():
                     raise RuntimeError("MCP server process exited unexpectedly.") from err

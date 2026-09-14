@@ -24,7 +24,7 @@ class MCPClient:
         result = await self.session.call_tool(tool_name, tool_args)
         return result
 
-    async def connect_to_streamable_http_server(self, server_url: str):
+    async def connect_to_streamable_http_server(self, server_url: str) -> None:
         """Connect to an MCP server using Streamable HTTP transport."""
         streams_context = streamablehttp_client(url=server_url)
         read_stream, write_stream, _ = await self.exit_stack.enter_async_context(

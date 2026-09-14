@@ -10,8 +10,8 @@ import logging
 import os
 import re
 import shlex
-import uuid
 from collections import OrderedDict
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -457,7 +457,14 @@ class _ApiarySessionMiddleware:
                 await response(scope, receive, send)
                 return
 
-        client_id = request.query_params.get("client_id") or uuid.uuid4().hex[:12]
+        client_id = request.query_params.get("client_id")
+        if not client_id:
+            response = JSONResponse(
+                {"error": "client_id query parameter is required"}, status_code=400
+            )
+            await response(scope, receive, send)
+            return
+
         image = request.query_params.get("image", "")
         token = _client_id.set(client_id)
         try:
@@ -499,7 +506,7 @@ def create_starlette_app() -> ASGIApp:
     mcp_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
-    async def lifespan(starlette_app: Starlette):
+    async def lifespan(starlette_app: Starlette) -> AsyncIterator[None]:
         _session.start_reaper()
         try:
             async with mcp_lifespan(starlette_app):
