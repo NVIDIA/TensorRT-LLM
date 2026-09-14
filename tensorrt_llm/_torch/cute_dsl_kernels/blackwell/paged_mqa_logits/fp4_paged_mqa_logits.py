@@ -75,6 +75,25 @@ _META_NEG_FLT_MAX = -3.4028235e38
 # enc(f) = bits(f) >= 0 ? bits(f) : bits(f) ^ 0x7FFFFFFF (an involution)
 # with red.global.{min,max}.s32; sum uses red.global.add.f32.
 @dsl_user_op
+def _fabs_f32(x, *, loc=None, ip=None):
+    """abs.f32 as inline PTX so ptxas folds it into the FADD2 |R| operand modifier
+    (relu(x) = (x + |x|) * 0.5, the 0.5 pre-folded into the cached weights)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [x.ir_value(loc=loc, ip=ip)],
+            "abs.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _st_global_f32(addr_i64, fval, *, loc=None, ip=None):
     """st.global.f32 [addr], val (block_max record store by precomputed byte address)."""
     llvm.inline_asm(
@@ -618,11 +637,9 @@ class FP4MQALogitsKernel:
         self.umma_warp_base = 10
 
         self.num_q_stages = 3
-        # Note, when next_n=1, num_umma_stages could be 2. But test on silicon shows,
-        # num_umma_stages=2 don't improve perf much, so we use num_umma_stages=1 now.
-        # This parameter could be tuned when needed.
-        # self.num_umma_stages = 2 if next_n == 1 else 1
-        self.num_umma_stages = 1
+        # next_n == 1: two accumulator stages per math warpgroup so the next
+        # tile's MMA overlaps this tile's epilogue; next_n > 1 keeps one (TMEM).
+        self.num_umma_stages = 2 if next_n == 1 else 1
         # KV pipeline depth
         self.num_kv_stages = 6
         # Step 5.11: smem_pad_bytes (FP8 sub-partition opt knob) dropped.
@@ -1006,6 +1023,9 @@ class FP4MQALogitsKernel:
             umma_mbar_0: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
             umma_mbar_1: cute.struct.MemRange[cutlass.Int64, self.num_umma_stages * 2]
             tmem_holding_buf: cutlass.Int32
+            # scheduler words re-read per warp role after setmaxnreg (a prologue
+            # value carried across the role split is spilled function-wide)
+            sched_state: cute.struct.MemRange[cutlass.Int32, 4]
 
         self.kernel(
             tiled_mma,
@@ -1639,6 +1659,11 @@ class FP4MQALogitsKernel:
         # While-loop termination flag (fetch_next_task pattern).
         # True if this CTA has work assigned (start != end in schedule_meta).
         has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
+        s_sched = cute.make_tensor(storage.sched_state.data_ptr(), cute.make_layout((4,)))
+        if tidx == cutlass.Int32(0):
+            s_sched[0] = current_kv_idx
+            s_sched[1] = current_num_kv
+            s_sched[2] = end_kv_idx
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
@@ -1647,6 +1672,9 @@ class FP4MQALogitsKernel:
         if is_tma_warp_0:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
             cute.arch.warpgroup_reg_dealloc(24)
+            next_kv_idx = s_sched[0]
+            next_num_kv = s_sched[1]
+            end_kv_idx = s_sched[2]
             lane_idx = tidx % 32
 
             # Block table prefetch: 32 lanes cache block indices,
@@ -1794,6 +1822,9 @@ class FP4MQALogitsKernel:
         elif is_tma_warp_1:
             # TMA warp 1: loads KV + Scale for group 1 only
             cute.arch.warpgroup_reg_dealloc(24)
+            next_kv_idx = s_sched[0]
+            next_num_kv = s_sched[1]
+            end_kv_idx = s_sched[2]
             lane_idx = tidx % 32
 
             # Block table prefetch for group 1
@@ -1866,6 +1897,9 @@ class FP4MQALogitsKernel:
             # warp. KV0 barrier arriving does not guarantee Q SMEM
             # writes are visible.
             cute.arch.warpgroup_reg_dealloc(24)
+            next_kv_idx = s_sched[0]
+            next_num_kv = s_sched[1]
+            end_kv_idx = s_sched[2]
 
             # TMEM: wait for math warp 0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -2034,6 +2068,9 @@ class FP4MQALogitsKernel:
             # only loads KV1, not Q. Without this wait, UMMA warp 1 can
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
             cute.arch.warpgroup_reg_dealloc(24)
+            next_kv_idx = s_sched[0]
+            next_num_kv = s_sched[1]
+            end_kv_idx = s_sched[2]
 
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -2162,6 +2199,9 @@ class FP4MQALogitsKernel:
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
         elif is_math_warp:
             cute.arch.warpgroup_reg_alloc(240)
+            next_kv_idx = s_sched[0]
+            next_num_kv = s_sched[1]
+            end_kv_idx = s_sched[2]
 
             # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
             tmem.allocate(num_tmem_alloc_cols_total)
@@ -2203,11 +2243,11 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64
                 else:  # fp32, 4-byte weights
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
-                if cutlass.const_expr(self.emit_block_meta):
+                if cutlass.const_expr(self.emit_block_meta and next_n > 1):
                     # Free ~8 registers for the meta accumulators/fragments;
-                    # the epilogue's weight cache sits at the spill edge.
-                    # (block_max-only emission carries one live float and no
-                    # accumulators: it keeps the full weight cache.)
+                    # the epilogue's weight cache sits at the spill edge for
+                    # next_n >= 2. next_n == 1 has the headroom and keeps the
+                    # full cache (the cut cost 2 LDS.128 per warp and tile).
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
@@ -2286,9 +2326,15 @@ class FP4MQALogitsKernel:
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
+                                if cutlass.const_expr(self.epi_dtype == cutlass.Float32):
+                                    # cached weights carry the 0.5 of (x + |x|) / 2
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ] * cutlass.Float32(0.5)
+                                else:
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ]
                         if cutlass.const_expr(self.emit_block_meta):
                             # Flush the PREVIOUS request's hit accumulators
                             # before switching context.
@@ -2457,10 +2503,17 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    # relu(x) * w == (x + |x|) * (w / 2), bit-exact in fp32
+                                    x0 = acc_vec[n0]
+                                    x1 = acc_vec[n0 + 1]
+                                    x2 = acc_vec[n0 + 2]
+                                    x3 = acc_vec[n0 + 3]
+                                    a0, a1 = cute.arch.add_packed_f32x2(
+                                        (x0, x1), (_fabs_f32(x0), _fabs_f32(x1))
+                                    )
+                                    a2, a3 = cute.arch.add_packed_f32x2(
+                                        (x2, x3), (_fabs_f32(x2), _fabs_f32(x3))
+                                    )
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -2993,11 +3046,11 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64
                 else:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
-                if cutlass.const_expr(self.emit_block_meta):
+                if cutlass.const_expr(self.emit_block_meta and next_n > 1):
                     # Free ~8 registers for the meta accumulators/fragments;
-                    # the epilogue's weight cache sits at the spill edge.
-                    # (block_max-only emission carries one live float and no
-                    # accumulators: it keeps the full weight cache.)
+                    # the epilogue's weight cache sits at the spill edge for
+                    # next_n >= 2. next_n == 1 has the headroom and keeps the
+                    # full cache (the cut cost 2 LDS.128 per warp and tile).
                     MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Hit accumulators + bitmap word add ~6 more live
@@ -3076,9 +3129,15 @@ class FP4MQALogitsKernel:
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
+                                if cutlass.const_expr(self.epi_dtype == cutlass.Float32):
+                                    # cached weights carry the 0.5 of (x + |x|) / 2
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ] * cutlass.Float32(0.5)
+                                else:
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ]
                         if cutlass.const_expr(self.emit_block_meta):
                             # Flush the PREVIOUS request's hit accumulators
                             # before switching context.
@@ -3240,10 +3299,17 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    # relu(x) * w == (x + |x|) * (w / 2), bit-exact in fp32
+                                    x0 = acc_vec[n0]
+                                    x1 = acc_vec[n0 + 1]
+                                    x2 = acc_vec[n0 + 2]
+                                    x3 = acc_vec[n0 + 3]
+                                    a0, a1 = cute.arch.add_packed_f32x2(
+                                        (x0, x1), (_fabs_f32(x0), _fabs_f32(x1))
+                                    )
+                                    a2, a3 = cute.arch.add_packed_f32x2(
+                                        (x2, x3), (_fabs_f32(x2), _fabs_f32(x3))
+                                    )
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
