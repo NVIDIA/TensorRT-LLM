@@ -5804,7 +5804,7 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "How to load the model weights. By default, detect the weight type from the model checkpoint.",
         telemetry=TelemetryField.categorical("auto", "dummy", "vision_only",
-                                             "gms"))
+                                             "gms", "lazy_safetensors"))
 
     enable_min_latency: bool = Field(
         default=False,

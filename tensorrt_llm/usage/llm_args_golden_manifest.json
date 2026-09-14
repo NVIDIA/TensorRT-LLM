@@ -1030,7 +1030,8 @@
         "auto",
         "dummy",
         "vision_only",
-        "gms"
+        "gms",
+        "lazy_safetensors"
       ],
       "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.LoadFormat]",
       "converter": "allowlist",

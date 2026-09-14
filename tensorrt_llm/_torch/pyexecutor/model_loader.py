@@ -909,11 +909,13 @@ class ModelLoader:
                 getattr(module, "_requires_standard_hf_loading", False)
                 for module in model.modules())
             # Pinned-host parameters must be materialized and filled in place.
-            # AUTO uses the HF mapper that preserves their stable addresses;
-            # AUTO may still resolve to MX, so check the resolved format too.
-            uses_standard_hf_loader = (load_format == LoadFormat.AUTO
-                                       and checkpoint_loader.checkpoint_format
-                                       != "MX")
+            # AUTO and LAZY_SAFETENSORS both go through the HF mapper that
+            # preserves their stable addresses -- the lazy format only changes
+            # how shards are opened. AUTO may still resolve to MX, so check the
+            # resolved format too.
+            uses_standard_hf_loader = (
+                load_format in (LoadFormat.AUTO, LoadFormat.LAZY_SAFETENSORS)
+                and checkpoint_loader.checkpoint_format != "MX")
             if requires_standard_hf_loading and not uses_standard_hf_loader:
                 raise ValueError(
                     "Host-resident model weights currently require the standard "
