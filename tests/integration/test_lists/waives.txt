@@ -254,7 +254,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::Tes
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-overlap_scheduler] SKIP (https://nvbugs/6672360)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-one_model-overlap_scheduler] SKIP (https://nvbugs/6672360)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-one_model] SKIP (https://nvbugs/6672360)
-full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-two_model] SKIP (https://nvbugs/6672360)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-fp8] SKIP (https://nvbugs/6626640)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass] SKIP (https://nvbugs/6470267)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
