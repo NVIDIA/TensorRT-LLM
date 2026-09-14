@@ -43,7 +43,7 @@
 
 # This file is copied and modified from cutlass example https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py
 
-from typing import Literal, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -56,6 +56,9 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import dsl_user_op
+
+if TYPE_CHECKING:
+    from ..rubin import dense_blockscaled_gemm_persistent as rubin_gemm
 
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from .utils import (TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents,
@@ -2546,7 +2549,7 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
 
 
 def scaled_mm(
-    gemm_obj: Sm100BlockScaledPersistentDenseGemmKernel,
+    gemm_obj: "rubin_gemm.Sm107BlockScaledPersistentDenseGemmKernel",
     a_dtype: Type[cutlass.Numeric],
     b_dtype: Type[cutlass.Numeric],
     c_dtype: Type[cutlass.Numeric],
@@ -2558,8 +2561,15 @@ def scaled_mm(
     stream: cuda.CUstream,
     epilogue_op: cutlass.Constexpr = lambda x: x,
     options: str = "",
+    *,
+    alpha_tensor: cute.Tensor,
 ):
-    """Compile the persistent dense blockscaled GEMM operation."""
+    """Compile a kernel implementing the SM107 pointer-based GEMM interface.
+
+    Alpha must be a single-element FP32 device tensor. The returned function
+    takes A/B/SFA/SFB/C pointers, alpha, an (M, N, K, L) tuple, and a stream.
+    Keep alpha's backing allocation alive until execution completes.
+    """
     a_ptr = make_ptr(a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     b_ptr = make_ptr(b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     c_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
@@ -2579,6 +2589,7 @@ def scaled_mm(
         sfa_ptr,
         sfb_ptr,
         c_ptr,
+        alpha_tensor,
         (a_major_mode, b_major_mode, c_layout),
         (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0),
          cutlass.Int32(0)),
