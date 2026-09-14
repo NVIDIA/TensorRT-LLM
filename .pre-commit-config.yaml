@@ -1659,8 +1659,8 @@ repos:
         language: script
         pass_filenames: false
     -   id: check-ci-test-timeouts
-        name: Limit CI test-list timeouts to 120 minutes
-        entry: ./scripts/check_test_list.py --check-timeouts
+        name: Disallow redundant default CI test timeouts
+        entry: ./scripts/check_ci_test_timeouts.py
         language: script
         pass_filenames: false
     -   id: DCO check

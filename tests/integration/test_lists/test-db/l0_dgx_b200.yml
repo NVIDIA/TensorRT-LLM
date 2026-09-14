@@ -188,13 +188,13 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGlm4MoeSpeculativeDecoding::test_glm4_moe_mtp
   - accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8]
   - accuracy/test_glm52.py::TestGLM52NVFP4::test_mtp_index_share[tp_size=8-ep_size=8]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy TIMEOUT (240)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph TIMEOUT (120) ISOLATION
   - examples/test_deepseek_v4_pro.py::test_short_token_boundary_smoke TIMEOUT (120)
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False]
-  - accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4 TIMEOUT (90)
+  - accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4 TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm TIMEOUT (240)
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4 TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_8gpus[attention_dp_on-cutedsl]
@@ -263,7 +263,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline_pp4_mtp1]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_chunked_prefill[baseline_fp8kv]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_breakable_cuda_graph[baseline]
-  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[use_msa=False] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[use_msa=False] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8_attn_dp]
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[ep8]
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[dep8]

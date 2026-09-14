@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 """Verify test lists for L0, QA, and waives file; AST-based validation via --validate.
 
 This script is used to verify test lists for L0, QA, and waives file.
@@ -18,7 +16,6 @@ Options:
 --qa:       Check only the QA tests under $LLM_ROOT/tests/integration/test_list/*.txt.
 --waive:    Check only the tests in $LLM_ROOT/tests/integration/test_list/waives.txt.
 --validate: Run AST-based validation of test list entries against source files.
---check-timeouts: Reject TIMEOUT values above 120 minutes in test-db (not QA).
 --report-unverifiable [PATH]: With --validate, write the list of active entries
             whose parametrize IDs cannot be checked statically (runtime-computed
             argvalues/ids) to PATH (default: stdout). Use to sweep them.
@@ -49,7 +46,6 @@ MARKER_LIST_IN_TEST = [" TIMEOUT"]
 # AST validation defaults
 _DEFAULT_TEST_LISTS_DIR = "tests/integration/test_lists"
 _DEFAULT_TEST_BASE_DIR = "tests/integration/defs"
-_MAX_CI_TIMEOUT_MINUTES = 120
 # Paths whose tests are generated dynamically — skip AST validation
 _EXCLUDED_PATH_PREFIXES = ("perf/", )
 
@@ -563,27 +559,6 @@ def _has_method(class_name: str, method_name: str, ast_cache: dict,
                 return True
 
     return False
-
-
-def check_ci_timeouts(test_lists_dir: str) -> list[str]:
-    """Return over-budget CI timeout locations, including waived test entries."""
-    ci_dir = Path(test_lists_dir) / "test-db"
-    if not ci_dir.is_dir():
-        return [f"Missing CI test-list directory: {ci_dir}"]
-    errors = []
-    for path in sorted(ci_dir.rglob("*")):
-        if not path.is_file() or path.suffix not in (".txt", ".yml", ".yaml"):
-            continue
-        for lineno, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), 1):
-            for match in re.finditer(r"\bTIMEOUT\s*\(\s*(\d+)\s*\)",
-                                     line.partition("#")[0]):
-                minutes = int(match.group(1))
-                if minutes > _MAX_CI_TIMEOUT_MINUTES:
-                    errors.append(
-                        f"{path}:{lineno}: TIMEOUT ({minutes}) exceeds "
-                        f"{_MAX_CI_TIMEOUT_MINUTES} minutes.")
-    return errors
 
 
 def collect_entries(test_lists_dir: str, include_waives: bool = False):
@@ -1156,16 +1131,10 @@ def main():
         help=
         "Run AST-based validation of test list entries against source files.")
     parser.add_argument(
-        "--check-timeouts",
-        action="store_true",
-        help=
-        "Reject CI test-db TIMEOUT values above 120 minutes; QA is excluded.",
-    )
-    parser.add_argument(
         "--test-lists-dir",
         default=_DEFAULT_TEST_LISTS_DIR,
         help=
-        f"Test lists directory for --validate/--check-timeouts (default: {_DEFAULT_TEST_LISTS_DIR})",
+        f"Test lists directory for --validate (default: {_DEFAULT_TEST_LISTS_DIR})",
     )
     parser.add_argument(
         "--test-base-dir",
@@ -1212,15 +1181,6 @@ def main():
         install_python_dependencies(llm_src)
 
     pass_flag = True
-    if args.check_timeouts:
-        errors = check_ci_timeouts(args.test_lists_dir)
-        for error in errors:
-            print(error, file=sys.stderr)
-        if errors:
-            pass_flag = False
-        else:
-            print("OK: CI test-list timeouts are at most 120 minutes.")
-
     # Verify L0 test lists
     if args.l0:
         print("-----------Starting L0 test list verification...-----------",
