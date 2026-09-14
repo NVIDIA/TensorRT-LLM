@@ -420,14 +420,21 @@ class Qwen3ReasoningParser(DeepSeekV4ReasoningParser):
 
     def parse(self, text: str) -> ReasoningParserResult:
         if self._strip_start:
-            text = text.removeprefix(self.reasoning_start)
+            # Leading whitespace can precede a redundant `<think>`; strip the
+            # tag after it without losing the whitespace itself.
+            prefix_len = len(text) - len(text.lstrip())
+            text = text[:prefix_len] + text[prefix_len:].removeprefix(
+                self.reasoning_start)
         return self._parser.parse(text)
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         result = self._parser.parse_delta(delta_text)
-        if self._strip_start and (result.content or result.reasoning_content):
+        if self._strip_start and (result.content.strip()
+                                  or result.reasoning_content.strip()):
             # `DeepSeekR1Parser` withholds a partial tag, so the first
-            # non-empty result holds the whole leading `<think>`, if any.
+            # delta with real content holds the whole leading `<think>`, if
+            # any. A whitespace-only delta must not disarm the strip early,
+            # or a redundant `<think>` arriving later leaks unstripped.
             self._strip_start = False
             result.reasoning_content = result.reasoning_content.removeprefix(
                 self.reasoning_start)

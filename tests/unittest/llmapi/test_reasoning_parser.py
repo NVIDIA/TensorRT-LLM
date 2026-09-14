@@ -603,6 +603,9 @@ def _parse_qwen3(chat_template_kwargs: dict[str, bool] | None, text: str,
          "\nhidden\n"),
         ("", dict(enable_thinking=True), f"{R1_START}a{R1_END}b", "b", "a"),
         ("", dict(thinking=True), f"{R1_START}a{R1_END}b", "b", "a"),
+        # A whitespace-only first delta must not disarm the strip before a
+        # redundant `<think>` split across a later delta arrives.
+        ("", dict(thinking=True), f" {R1_START}a{R1_END}b", "b", " a"),
     ])
 def test_qwen3_mode_resolved_from_prompt(prompt_tail: str,
                                          request_kwargs: dict[str, bool] | None,
