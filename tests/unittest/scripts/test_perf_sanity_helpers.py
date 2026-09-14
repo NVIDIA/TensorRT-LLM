@@ -168,7 +168,6 @@ def test_checkpoint_io_experiment_preserves_explicit_policy() -> None:
 @pytest.mark.parametrize(
     "config",
     [
-        {"backend": "_autodeploy"},
         {"checkpoint_format": "MX"},
         {"load_format": "dummy"},
         {"checkpoint_loader": "custom"},

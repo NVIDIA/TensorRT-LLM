@@ -253,8 +253,8 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("Perf")) {
         return false
     }
-    // Skip stages with no product Python coverage: TensorRT (legacy), CPP (gtest), AutoDeploy (leaving L0).
-    if (stageName.contains("TensorRT") || stageName.contains("CPP") || stageName.contains("AutoDeploy")) {
+    // Skip stages with no product Python coverage: TensorRT (legacy) and CPP (gtest).
+    if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
     // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.

@@ -29,10 +29,7 @@ from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
-    _dequantize_nvfp4,
-    _quantize_nvfp4,
-)
+from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import dequant_nvfp4_2d_triton
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
@@ -718,7 +715,7 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 
     Since HuggingFace cannot run NVFP4 inference natively, this class:
     1. Loads the bf16 model from HF
-    2. Quantizes each linear weight to NVFP4 using _quantize_nvfp4
+    2. Quantizes each linear weight to NVFP4
     3. Dequantizes back to bf16 and replaces model parameters (round-trip),
        so the HF model can serve as a reference for logits comparison
     4. Provides IPC handles with NVFP4 weight keys (weight, weight_scale, weight_scale_2)
@@ -938,18 +935,25 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         if weight_scale_2 is None:
             weight_scale_2 = weight_float.abs().amax().float() / (6.0 * 448.0)
 
-        packed_weight, block_scale = _quantize_nvfp4(
-            weight_float, self.NVFP4_BLOCK_SIZE, weight_scale_2
+        global_scale = weight_scale_2.reciprocal()
+        packed_weight, block_scale = torch.ops.trtllm.fp4_quantize(
+            weight_float.to(torch.bfloat16),
+            global_scale,
+            self.NVFP4_BLOCK_SIZE,
+            False,
+            False,
         )
         packed_uint8 = packed_weight.to(torch.uint8)
-        block_scale_fp8 = block_scale.to(torch.float8_e4m3fn)
+        block_scale_fp8 = block_scale.view(torch.float8_e4m3fn).reshape(
+            weight_float.shape[0], weight_float.shape[1] // self.NVFP4_BLOCK_SIZE
+        )
 
-        self._dequantized_weights[name] = _dequantize_nvfp4(
+        self._dequantized_weights[name] = dequant_nvfp4_2d_triton(
             packed_uint8,
             block_scale_fp8,
             weight_scale_2,
-            weight_float.shape,
-            torch.bfloat16,
+            target_dtype=torch.bfloat16,
+            sf_vec_size=self.NVFP4_BLOCK_SIZE,
         )
 
         return [
