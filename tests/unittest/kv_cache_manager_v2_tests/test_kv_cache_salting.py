@@ -15,9 +15,8 @@
 """Pure unit tests for KV cache reuse scopes."""
 
 import unittest
-from collections.abc import Iterator
 from importlib.util import find_spec
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -25,42 +24,24 @@ pytestmark = pytest.mark.cpu_only
 
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import TokenId
-    from kv_cache_manager_v2._block_radix_tree import (
-        Block,
-        BlockRadixTree,
-        ReuseScope,
-        sequence_to_blockchain_keys,
-    )
-    from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
+    from kv_cache_manager_v2 import ReuseScope, TokenId, sequence_to_blockchain_keys
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import TokenId
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-        Block,
-        BlockRadixTree,
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         ReuseScope,
+        TokenId,
         sequence_to_blockchain_keys,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry
 
 
-class _EmptyLifeCycles:
-    size = 0
-
-    @property
-    def ssm_life_cycle_id(self) -> None:
-        return None
-
-    def attention_life_cycles(self) -> Iterator[tuple[object, object]]:
-        return iter(())
+def _root_key(scope):
+    """The reuse-scope digest a blockchain starts from, which is its first key."""
+    return next(iter(sequence_to_blockchain_keys(1, scope, [])))[1]
 
 
 class TestReuseScope(unittest.TestCase):
     def test_reuse_scope_seeds_distinct_keys(self) -> None:
         # Distinct reuse scopes -- including the None-vs-0 cases for each field --
-        # must seed distinct radix-tree keys. The first blockchain key is the
-        # root (the reuse-scope digest), so hashing the same tokens under each
-        # scope isolates the scope's contribution to the key.
+        # must seed distinct radix-tree keys.
         scopes = [
             ReuseScope(),
             ReuseScope(lora_id=0),
@@ -68,15 +49,11 @@ class TestReuseScope(unittest.TestCase):
             ReuseScope(lora_id=0, salt=0),
             ReuseScope(lora_id=7, salt=11),
         ]
-        tokens = [TokenId(1), TokenId(2)]
 
-        def root_key(scope: "ReuseScope") -> bytes:
-            return next(iter(sequence_to_blockchain_keys(2, scope, tokens)))[1]
-
-        roots = [root_key(scope) for scope in scopes]
+        roots = [_root_key(scope) for scope in scopes]
         self.assertEqual(len(set(roots)), len(scopes))
         # Deterministic across repeated derivation.
-        self.assertEqual(roots, [root_key(scope) for scope in scopes])
+        self.assertEqual(roots, [_root_key(scope) for scope in scopes])
 
     def test_blockchain_keys_are_seeded_by_reuse_scope(self) -> None:
         tokens = [TokenId(1), TokenId(2), TokenId(3), TokenId(4)]
@@ -89,26 +66,35 @@ class TestReuseScope(unittest.TestCase):
         self.assertEqual(keys, same_scope_keys)
         self.assertNotEqual([key for _, key in keys], [key for _, key in different_scope_keys])
 
-    def test_radix_tree_match_is_scoped(self) -> None:
-        tree = BlockRadixTree(cast(LifeCycleRegistry, _EmptyLifeCycles()), tokens_per_block=2)
+    def test_blockchain_keys_chain_from_the_scope_root(self) -> None:
+        # The first blockchain key is the reuse-scope digest, and each subsequent key
+        # is that chain extended by one block of tokens.
+        tokens = [TokenId(1), TokenId(2), TokenId(3), TokenId(4)]
         scope = ReuseScope(lora_id=7, salt=11)
-        other_scope = ReuseScope(lora_id=7, salt=12)
+
+        keys = list(sequence_to_blockchain_keys(2, scope, tokens))
+        self.assertEqual([chunk for chunk, _ in keys], [[], [1, 2], [3, 4]])
+        self.assertEqual(keys[0][1], _root_key(scope))
+
+        # Each key covers a prefix of the sequence, so extending the sequence leaves the
+        # earlier keys untouched.
+        prefix = list(sequence_to_blockchain_keys(2, scope, tokens[:2]))
+        self.assertEqual([key for _, key in prefix], [key for _, key in keys[:2]])
+
+    def test_block_keys_are_scoped_through_their_root(self) -> None:
         tokens = [TokenId(1), TokenId(2)]
 
-        root = tree.add_or_get_existing(scope)
-        block = Block(tokens, root)
+        def block_keys(scope):
+            return [key for _, key in sequence_to_blockchain_keys(2, scope, tokens)][1:]
 
-        match = tree.match(scope, tokens)
-        self.assertEqual(match.blocks, [block])
-        self.assertEqual(match.num_tokens, len(tokens))
-
-        match = tree.match(other_scope, tokens)
-        self.assertEqual(match.blocks, [])
-        self.assertEqual(match.num_tokens, 0)
-
-        match = tree.match(other_scope, tokens[:1], enable_partial_match=True)
-        self.assertEqual(match.blocks, [])
-        self.assertEqual(match.num_tokens, 0)
+        self.assertNotEqual(
+            block_keys(ReuseScope(lora_id=7, salt=11)),
+            block_keys(ReuseScope(lora_id=7, salt=12)),
+        )
+        self.assertEqual(
+            block_keys(ReuseScope(lora_id=7, salt=11)),
+            block_keys(ReuseScope(7, 11)),
+        )
 
 
 if __name__ == "__main__":

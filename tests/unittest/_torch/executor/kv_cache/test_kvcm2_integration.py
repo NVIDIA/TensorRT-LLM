@@ -67,7 +67,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     SsmLayerConfig,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
@@ -392,7 +391,7 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    init_cuda_once()
+    torch.cuda.init()
     manager = KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
@@ -1445,7 +1444,7 @@ def test_external_draft_estimated_quota_supports_allocation_and_resume(
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    init_cuda_once()
+    torch.cuda.init()
     spec = config_cls(max_draft_len=4, speculative_model="draft")
     model_config = SimpleNamespace(
         quant_config=None,
@@ -1519,7 +1518,7 @@ def max_num_turns() -> int:
 def manager(max_num_turns: int) -> KVCacheManagerV2:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    init_cuda_once()
+    torch.cuda.init()
     manager = KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=True,
@@ -1793,7 +1792,9 @@ def test_per_conversation_policy_ignores_overlapping_request(
 
 
 def test_live_storage_stats_use_the_manager_api() -> None:
-    init_cuda_once()
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
     core = KVCacheManager(
         KVCacheManagerConfig(
             tokens_per_block=TOKENS_PER_BLOCK,
@@ -1934,7 +1935,9 @@ def test_disagg_gen_init_drops_only_the_partial_block() -> None:
 @pytest.mark.parametrize("enable_stats", [True, False])
 def test_disagg_partial_attribution_survives_admission_retry(enable_stats: bool) -> None:
     """A failed resume preserves the cache, so retrying must not exclude its tail again."""
-    init_cuda_once()
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
     stream = torch.cuda.Stream()
     core = KVCacheManager(
         KVCacheManagerConfig(

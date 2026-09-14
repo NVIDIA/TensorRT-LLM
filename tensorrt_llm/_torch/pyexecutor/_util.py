@@ -3172,12 +3172,6 @@ def validate_kv_cache_compression_compatibility(
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
     if config.algorithm == "quantization_for_cold_page":
-        from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
-
-        if _BACKEND == "python":
-            raise ValueError(
-                "Cold-page quantization requires the C++ KVCacheManagerV2 backend"
-            )
         if config.quant == "nvfp4" and not is_sm_100f():
             raise RuntimeError(
                 "NVFP4 cold-page quantization requires an SM100-family device "
