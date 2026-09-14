@@ -635,6 +635,18 @@ class EncoderRunner(EncoderMixin):
         **model_inputs: Any,
     ) -> EncoderPreparedInputs:
         del resource_manager, cuda_graph_lora_manager, runtime_draft_len
+        self._reject_unsupported_model_inputs(model_inputs)
+        input_ids, sequence_lengths, multi_item_part_lens = self._collect_scheduled_inputs(
+            scheduled_requests
+        )
+        return self.prepare_packed_inputs(
+            input_ids,
+            sequence_lengths,
+            multi_item_part_lens=multi_item_part_lens,
+            **model_inputs,
+        )
+
+    def _reject_unsupported_model_inputs(self, model_inputs: dict[str, Any]) -> None:
         reserved_inputs = model_inputs.keys() & {
             "input_ids",
             "seq_lens",
@@ -652,9 +664,30 @@ class EncoderRunner(EncoderMixin):
                 "CUDA graphs are enabled. Disable encoder CUDA graphs or omit "
                 f"the inputs. Unsupported keys: {sorted(model_inputs)}"
             )
-        input_ids, sequence_lengths, multi_item_part_lens = self._collect_scheduled_inputs(
-            scheduled_requests
-        )
+
+    def prepare_packed_inputs(
+        self,
+        input_ids: list[int],
+        sequence_lengths: list[int],
+        *,
+        multi_item_part_lens: list[list[int]] | None = None,
+        **model_inputs: Any,
+    ) -> EncoderPreparedInputs:
+        """Prepare a batch the caller already packed, for the direct Encode API.
+
+        `llm.encode()` hands over packed tokens, so routing it through
+        `ScheduledRequests` would only split them into requests this runner
+        immediately repacks.
+        """
+        self._reject_unsupported_model_inputs(model_inputs)
+        if not sequence_lengths:
+            raise ValueError("Encoder execution requires at least one request.")
+        if sum(sequence_lengths) != len(input_ids):
+            raise ValueError("The sum of seq_lens must equal the number of input_ids.")
+        if multi_item_part_lens is not None and len(multi_item_part_lens) != len(sequence_lengths):
+            raise ValueError(
+                '"multi_item_part_lens" must either be provided for all requests or for none.'
+            )
         return self._prepare_encoder_batch(
             input_ids,
             sequence_lengths,
@@ -900,6 +933,29 @@ class EncoderRunner(EncoderMixin):
             resource_manager=resource_manager,
             cuda_graph_lora_manager=cuda_graph_lora_manager,
             runtime_draft_len=runtime_draft_len,
+            **model_inputs,
+        )
+        return self._execute_prepared(
+            prepared,
+            gather_context_logits=gather_context_logits,
+        )
+
+    @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self._model.extra_attrs)
+    def forward_packed(
+        self,
+        input_ids: list[int],
+        sequence_lengths: list[int],
+        *,
+        multi_item_part_lens: list[list[int]] | None = None,
+        gather_context_logits: bool = False,
+        **model_inputs: Any,
+    ) -> dict[str, Any]:
+        """Execute a batch the caller already packed."""
+        prepared = self.prepare_packed_inputs(
+            input_ids,
+            sequence_lengths,
+            multi_item_part_lens=multi_item_part_lens,
             **model_inputs,
         )
         return self._execute_prepared(

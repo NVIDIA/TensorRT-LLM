@@ -1341,6 +1341,27 @@ class PyTorchModelEngine(ModelEngine):
             max_batch_size,
             pad_to_limit=self._encoder_graph_pad_to_limit)
 
+    def forward_encode_batch(
+        self,
+        input_ids: List[int],
+        sequence_lengths: List[int],
+        *,
+        multi_item_part_lens: Optional[List[List[int]]] = None,
+        gather_context_logits: bool = False,
+        **model_inputs: Any,
+    ) -> Dict[str, Any]:
+        """Run one already-packed encode-only batch, for the direct Encode API."""
+        if not isinstance(self._runner, EncoderRunner):
+            raise RuntimeError(
+                "Encode-only execution requires an initialized encoder runner.")
+        return self._runner.forward_packed(
+            input_ids,
+            sequence_lengths,
+            multi_item_part_lens=multi_item_part_lens,
+            gather_context_logits=gather_context_logits,
+            **model_inputs,
+        )
+
     def forward_encoder(
         self,
         encoder_requests: List[LlmRequest],

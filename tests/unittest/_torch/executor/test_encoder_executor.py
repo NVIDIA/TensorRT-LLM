@@ -21,10 +21,10 @@ def test_encoder_executor_warms_up_through_model_engine() -> None:
     model_engine.warmup.assert_called_once_with(None)
 
 
-def test_batch_forward_adapts_inputs_to_scheduled_requests_once() -> None:
+def test_batch_forward_hands_the_packed_batch_to_the_engine() -> None:
     expected = {"logits": torch.tensor([1.0, 2.0])}
     model_engine = Mock()
-    model_engine.forward.return_value = expected
+    model_engine.forward_encode_batch.return_value = expected
     executor = object.__new__(EncoderExecutor)
     executor.model_engine = model_engine
     inputs = {
@@ -43,39 +43,12 @@ def test_batch_forward_adapts_inputs_to_scheduled_requests_once() -> None:
         "multi_item_part_lens",
         "token_type_ids",
     }
-    scheduled_requests = model_engine.forward.call_args.args[0]
-    assert [request.get_tokens(0) for request in scheduled_requests.context_requests] == [
-        [11, 12],
-        [21, 22, 23],
-    ]
-    assert [request.py_multi_item_part_lens for request in scheduled_requests.context_requests] == [
-        [1, 1],
-        [2, 1],
-    ]
-    model_engine.forward.assert_called_once_with(
-        scheduled_requests,
-        resource_manager=None,
+    model_engine.forward_encode_batch.assert_called_once_with(
+        [11, 12, 21, 22, 23],
+        [2, 3],
+        multi_item_part_lens=[[1, 1], [2, 1]],
         token_type_ids=inputs["token_type_ids"],
         gather_context_logits=True,
     )
-
-
-@pytest.mark.parametrize(
-    ("inputs", "message"),
-    [
-        ({"input_ids": [1, 2], "seq_lens": [1]}, "sum of seq_lens"),
-        (
-            {
-                "input_ids": [1, 2],
-                "seq_lens": [1, 1],
-                "multi_item_part_lens": [[1]],
-            },
-            "provided for all requests or for none",
-        ),
-    ],
-)
-def test_encoder_executor_rejects_inconsistent_request_boundaries(
-    inputs: dict[str, object], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        EncoderExecutor._build_scheduled_requests(inputs)
+    # The tokens must not be split into requests only to be repacked downstream.
+    model_engine.forward.assert_not_called()

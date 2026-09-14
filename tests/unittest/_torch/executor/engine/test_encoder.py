@@ -225,6 +225,67 @@ def test_multi_item_batch_stays_eager_even_when_a_graph_is_available() -> None:
     graph_runner.maybe_get_cuda_graph.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("input_ids", "sequence_lengths", "multi_item_part_lens", "message"),
+    [
+        ([1, 2], [], None, "at least one request"),
+        ([1, 2], [1], None, "sum of seq_lens"),
+        ([1, 2], [1, 1], [[1]], "provided for all requests or for none"),
+    ],
+)
+def test_packed_inputs_reject_inconsistent_request_boundaries(
+    input_ids: list[int],
+    sequence_lengths: list[int],
+    multi_item_part_lens: list[list[int]] | None,
+    message: str,
+) -> None:
+    runner = object.__new__(EncoderRunner)
+
+    with pytest.raises(ValueError, match=message):
+        runner.prepare_packed_inputs(
+            input_ids,
+            sequence_lengths,
+            multi_item_part_lens=multi_item_part_lens,
+        )
+
+
+def test_scheduled_inputs_are_prepared_through_the_packed_path() -> None:
+    """Both entry points share one preparation, so they cannot drift apart."""
+    runner = object.__new__(EncoderRunner)
+    runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=False)
+    runner.prepare_packed_inputs = Mock(return_value="prepared")
+    requests = [
+        SimpleNamespace(
+            get_tokens=lambda _: [11, 12],
+            py_multi_item_part_lens=None,
+            is_last_context_chunk=True,
+        ),
+        SimpleNamespace(
+            get_tokens=lambda _: [21],
+            py_multi_item_part_lens=None,
+            is_last_context_chunk=True,
+        ),
+    ]
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests(requests)
+
+    actual = runner.prepare_inputs(
+        scheduled_requests,
+        resource_manager=None,
+        cuda_graph_lora_manager=None,
+        runtime_draft_len=0,
+        token_type_ids="passthrough",
+    )
+
+    assert actual == "prepared"
+    runner.prepare_packed_inputs.assert_called_once_with(
+        [11, 12, 21],
+        [2, 1],
+        multi_item_part_lens=None,
+        token_type_ids="passthrough",
+    )
+
+
 def test_encoder_runner_collects_scheduled_inputs_without_losing_request_boundaries() -> None:
     requests = [
         SimpleNamespace(
