@@ -682,12 +682,17 @@ class EncoderRunner(EncoderMixin):
         self._reject_unsupported_model_inputs(model_inputs)
         if not sequence_lengths:
             raise ValueError("Encoder execution requires at least one request.")
+        if any(sequence_length < 0 for sequence_length in sequence_lengths):
+            raise ValueError("Encoder sequence lengths must not be negative.")
         if sum(sequence_lengths) != len(input_ids):
             raise ValueError("The sum of seq_lens must equal the number of input_ids.")
-        if multi_item_part_lens is not None and len(multi_item_part_lens) != len(sequence_lengths):
-            raise ValueError(
-                '"multi_item_part_lens" must either be provided for all requests or for none.'
-            )
+        if multi_item_part_lens is not None:
+            if len(multi_item_part_lens) != len(sequence_lengths):
+                raise ValueError(
+                    '"multi_item_part_lens" must either be provided for all requests or for none.'
+                )
+            if any(not part_lens for part_lens in multi_item_part_lens):
+                raise ValueError('"multi_item_part_lens" entries must not be empty.')
         return self._prepare_encoder_batch(
             input_ids,
             sequence_lengths,

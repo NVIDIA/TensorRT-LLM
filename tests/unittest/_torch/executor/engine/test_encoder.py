@@ -231,6 +231,10 @@ def test_multi_item_batch_stays_eager_even_when_a_graph_is_available() -> None:
         ([1, 2], [], None, "at least one request"),
         ([1, 2], [1], None, "sum of seq_lens"),
         ([1, 2], [1, 1], [[1]], "provided for all requests or for none"),
+        # A negative length passes the sum check and would reach attention metadata.
+        ([1, 2], [3, -1], None, "must not be negative"),
+        # An empty entry passes the cardinality check and would IndexError later.
+        ([1, 2], [1, 1], [[1], []], "entries must not be empty"),
     ],
 )
 def test_packed_inputs_reject_inconsistent_request_boundaries(
@@ -319,7 +323,16 @@ def test_encoder_runner_rejects_partial_multi_item_metadata() -> None:
         EncoderRunner._collect_scheduled_inputs(scheduled_requests)
 
 
-@pytest.mark.parametrize("reserved_name", ["input_ids", "seq_lens", "attn_metadata"])
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        "input_ids",
+        "seq_lens",
+        "multi_item_part_lens",
+        "attn_metadata",
+        "return_context_logits",
+    ],
+)
 def test_encoder_runner_rejects_model_inputs_owned_by_the_runner(reserved_name: str) -> None:
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=False)

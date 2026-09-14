@@ -1266,6 +1266,7 @@ class BaseLLM:
         _RESERVED_KEYS = {
             'input_ids',
             'seq_lens',
+            'multi_item_part_lens',
             'attn_metadata',
             'return_context_logits',
         }
