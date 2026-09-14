@@ -90,7 +90,7 @@ def tokenize_harmony_chat_request(
 
 
 def render_chat_request_for_tokenizer(
-    request: ChatCompletionRequest, tokenizer: object
+    request: ChatCompletionRequest, tokenizer: object, model_type: Optional[str] = None
 ) -> str | list[int]:
     from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwargs
     from tensorrt_llm.inputs.utils import resolve_hf_chat_template
@@ -164,8 +164,10 @@ def tokenize_chat_request_for_serving(
             set_prompt_token_ids=set_prompt_token_ids,
         )
 
+    if model_type is None and model_type_resolver is not None:
+        model_type = model_type_resolver()
     tokenizer = tokenizer_factory()
-    rendered = render_chat_request_for_tokenizer(request, tokenizer)
+    rendered = render_chat_request_for_tokenizer(request, tokenizer, model_type=model_type)
     result = encode_rendered(rendered, tokenizer) if isinstance(rendered, str) else rendered
     if set_prompt_token_ids:
         request.prompt_token_ids = result

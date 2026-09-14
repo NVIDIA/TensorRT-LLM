@@ -14,6 +14,7 @@ from .kimi_k2_tool_parser import KimiK2ToolParser
 from .kimi_k3_tool_parser import KimiK3ToolParser
 from .minimax_m2_parser import MiniMaxM2ToolParser
 from .minimax_m3_parser import MiniMaxM3ToolParser
+from .musespark_parser import MuseSparkToolParser
 from .poolside_v1_parser import PoolsideV1ToolParser
 from .qwen3_coder_parser import Qwen3CoderToolParser
 from .qwen3_tool_parser import Qwen3ToolParser
@@ -43,6 +44,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     # the Qwen3-Coder <tool_call><function=...><parameter=...> XML shape,
     # not JSON, so it shares that parser.
     "nemotron_h_omni": "qwen3_coder",
+    "musespark_open_omni": "musespark",
 }
 
 
@@ -74,6 +76,7 @@ class ToolParserFactory:
         "glm47": Glm47ToolParser,
         "minimax_m2": MiniMaxM2ToolParser,
         "minimax_m3": MiniMaxM3ToolParser,
+        "musespark": MuseSparkToolParser,
         "poolside_v1": PoolsideV1ToolParser,
     }
 
