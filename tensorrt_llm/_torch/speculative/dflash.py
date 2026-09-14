@@ -335,7 +335,7 @@ class DFlashWorker(SpecWorkerBase):
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
         # The DFlash 2 selector indexes full-vocab codebooks by draft-token
-        # id, so a d2t-remapped draft vocab would score the wrong tokens. 
+        # id, so a d2t-remapped draft vocab would score the wrong tokens.
         assert self._d2t is None or not getattr(draft_model, "is_dflash2", False), (
             "DFlash 2 candidate selection requires a shared draft/target vocab "
             "(d2t vocab mapping is not supported)."
@@ -618,10 +618,9 @@ class DFlashWorker(SpecWorkerBase):
             page_size = self._ctx_page_size if pool is None else pool[0].size(-2)
             self._ctx_page_size = page_size
             if self._dflash_attention_backend == "TRTLLM":
-                # TRTLLM-Gen takes only a left window; refuse a block wider
-                # than a non-causal layer's window rather than silently
-                # unmasking block positions.
-                draft_model.validate_block_attention_windows(self._compute_block_size)
+                # TRTLLM-Gen has no non-causal sliding window; fail here
+                # rather than inside the first draft forward.
+                draft_model.validate_block_attention_windows()
                 has_context_attention = any(
                     not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
                 )
