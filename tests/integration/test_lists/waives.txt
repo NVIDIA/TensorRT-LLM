@@ -79,6 +79,8 @@ examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_
 examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[nvfp4] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden SKIP (https://nvbugs/6759067)
 examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_edit_example SKIP (https://nvbugs/6726626)
+examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example SKIP (https://nvbugs/6771010)
+examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_lpips_against_golden SKIP (https://nvbugs/6771010)
 examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[cuda-graph] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[nvfp4] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_wan.py::test_fastwan_lpips_against_golden SKIP (https://nvbugs/6572800)
