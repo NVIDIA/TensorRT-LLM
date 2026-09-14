@@ -34,7 +34,6 @@ if TYPE_CHECKING:
 
 _FP8_CONTEXT_SUPPORTED_SMS = {90, 100, 103, 107, 120}
 _FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
-_FP8_CONTEXT_ATTN_ATTR = "_fp4_mla_fp8_context_attn"
 
 
 def require_fp4_mla_fp8_context_support() -> None:
@@ -303,7 +302,7 @@ def _build_fp8_mla_context_metadata(
 ) -> "TrtllmAttentionMetadata":
     """Route the mandatory FP8 cache write through a direct metadata view."""
     fp8_meta = copy.copy(meta)
-    fp8_meta._fp4_mla_fp8_context_state = None
+    fp8_meta.fp4_mla_state = None
     fp8_meta.kv_cache_manager = scratch.cache_manager_view
     fp8_meta.kv_cache_block_offsets = scratch.block_offsets
     fp8_meta.block_ids_per_seq = scratch.block_ids_per_seq
@@ -319,7 +318,7 @@ def _build_fp8_mla_context_metadata(
     # Scratch lengths intentionally start from zero. Preserve the actual
     # absolute positions for Q/K RoPE through the native kernel's explicit
     # per-token position-offset input.
-    fp8_meta.helix_position_offsets = meta.positions[: meta.num_ctx_tokens]
+    fp8_meta.helix_position_offsets = meta.fp4_mla_state.positions[: meta.num_ctx_tokens]
     return fp8_meta
 
 
@@ -328,11 +327,11 @@ def _get_fp8_mla_context_metadata(
     scratch: _Fp8MlaContextScratch,
 ) -> "TrtllmAttentionMetadata":
     """Prepare and reuse one direct metadata view for all layers in a step."""
-    state = meta._fp4_mla_fp8_context_state
+    state = meta.fp4_mla_state.fp8_context_state
     if state is not None and state[0] is scratch:
         return state[1]
 
     scratch.prepare(meta)
     fp8_meta = _build_fp8_mla_context_metadata(meta, scratch)
-    meta._fp4_mla_fp8_context_state = (scratch, fp8_meta)
+    meta.fp4_mla_state.fp8_context_state = (scratch, fp8_meta)
     return fp8_meta

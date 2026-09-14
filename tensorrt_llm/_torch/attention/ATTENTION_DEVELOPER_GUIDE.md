@@ -258,6 +258,7 @@ The core contract is:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+  - `support_fp4_kv_cache()`
 - `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
   contract (default `0`); see below
 - `runtime_workspace_is_chunked_prefill_bounded(model_config)` — whether
@@ -399,8 +400,8 @@ independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
-class attributes, such as `supports_skip_correction` and
-`supports_block_sparse_inputs`, and override only
+class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
+and `supports_fp4_mla`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared
@@ -428,6 +429,10 @@ The FMHA package is split by role:
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA context and no-dequant decode.
+  The shared FMHA availability check admits FP4 MLA only to libraries that
+  declare `supports_fp4_mla`; it does not restrict the existing FP4 GQA path.
+  Selection caches model-invariant and cache-key-covered validation. Dynamic
+  sparse/sinks inputs and prepared-state checks still run on cache hits.
   The core implementation requires dense TRTLLM MLA, BF16 absorption weights,
   fused RoPE with duplicated rotary tables, and KV Cache Manager V2. It uses
   FP8 context attention with an FP4 cache update and FP4 generation attention.
@@ -437,6 +442,11 @@ The FMHA package is split by role:
   Disaggregated serving is reserved for the follow-up integration. On SM107,
   this dense TRTLLM path keeps NVFP4 KV quantization; unsupported profiles retain
   the existing FP8 fallback.
+  `fp4_mla/state.py` owns batch-shared page tables, HP/V-scale views, append
+  metadata, and scratch caches. `TrtllmAttentionMetadata` keeps one optional
+  state reference and forwards prepare/MTP lifecycle updates to it. These
+  buffers continue to use the metadata allocator for CUDA-graph address
+  stability; the layer-local FP8 attention view is allocated lazily by FMHA.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
