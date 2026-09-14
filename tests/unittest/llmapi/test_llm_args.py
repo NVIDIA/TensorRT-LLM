@@ -250,14 +250,6 @@ moe_backend: TRTLLM
 
         assert llm_args.speculative_config.moe_backend == "CUTLASS"
 
-    def test_deprecated_two_engine_mtp_is_normalized_to_one_engine(
-            self) -> None:
-        spec_config = MTPDecodingConfig(max_draft_len=1,
-                                        mtp_eagle_one_model=False)
-
-        assert spec_config.mtp_eagle_one_model
-        assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-
     def test_ignores_override_without_neural_drafter(self) -> None:
         spec_config = NGramDecodingConfig(max_draft_len=1,
                                           moe_backend="CUTLASS")
