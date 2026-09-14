@@ -614,13 +614,12 @@ def test_cute_kernel_matches_dense_on_a_single_block():
     torch.testing.assert_close(out.float(), reference, rtol=2e-2, atol=2e-2)
 
 
-def test_kv_splits_rejects_unsupported_value():
-    """kv_splits is constrained at the config layer: an out-of-range value is
-    otherwise rejected deep inside the kernel and caught by the blanket
-    except, silently degrading the entire run to dense attention."""
+def test_kv_splits_is_not_a_config_knob():
+    """Only one KV split exists on the shipped kernels, so the config exposes
+    no `kv_splits` and rejects it rather than accepting a no-op choice."""
+    assert "kv_splits" not in SolAttentionConfig.model_fields
     with pytest.raises(ValueError):
-        SolAttentionConfig(tau=2.0, kv_splits="4")
-    assert SolAttentionConfig(tau=2.0).kv_splits == "auto"
+        SolAttentionConfig(tau=2.0, kv_splits="1")
 
 
 def _is_dynamo_disabled(fn) -> bool:
@@ -754,7 +753,37 @@ def test_dense_by_step_prefers_runner_resolved_phase(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
-def test_cuda_graph_runner_publishes_resolved_extra_keys_during_capture():
+def _base_runner():
+    return CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+
+
+def _ltx2_runner():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import _LTX2CUDAGraphRunner
+
+    return _LTX2CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+
+
+def _ltx2_two_stage_runner():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+        _LTX2TwoStageCUDAGraphRunner,
+    )
+
+    return _LTX2TwoStageCUDAGraphRunner(
+        CUDAGraphRunnerConfig(use_cuda_graph=True), lambda: "original", lambda: "default"
+    )
+
+
+# Every runner that overrides ``capture`` must keep the phase-scope contract;
+# LTX-2's runners re-implement capture for ``Modality`` inputs.
+_RUNNER_FACTORIES = pytest.mark.parametrize(
+    "make_runner",
+    [_base_runner, _ltx2_runner, _ltx2_two_stage_runner],
+    ids=["base", "ltx2", "ltx2_two_stage"],
+)
+
+
+@_RUNNER_FACTORIES
+def test_cuda_graph_runner_publishes_resolved_extra_keys_during_capture(make_runner):
     """The runner exposes its host-resolved extra keys to the captured callee."""
     seen = []
 
@@ -762,7 +791,7 @@ def test_cuda_graph_runner_publishes_resolved_extra_keys_during_capture():
         seen.append(resolved_extra_key("probe"))
         return x * 2
 
-    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    runner = make_runner()
     runner.register_extra_key_fn("probe", lambda *args, **kwargs: 7)
     wrapped = runner.wrap(fn)
     x = torch.ones(4, device="cuda")
@@ -774,7 +803,8 @@ def test_cuda_graph_runner_publishes_resolved_extra_keys_during_capture():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Sol-Attn needs CUDA")
-def test_sol_attn_dense_prefix_survives_cuda_graph_capture():
+@_RUNNER_FACTORIES
+def test_sol_attn_dense_prefix_survives_cuda_graph_capture(make_runner):
     """Capture and replay a graph on each side of the cutoff without a sync.
 
     The dense-prefix decision must be baked into each captured graph via the
@@ -789,7 +819,7 @@ def test_sol_attn_dense_prefix_survives_cuda_graph_capture():
     cutoff = 0.9
     attn = SolAttention(layer_idx=1, num_heads=2, head_dim=128)
     attn.disabled_until_timestep = cutoff
-    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    runner = make_runner()
     runner.register_extra_key_fn(
         "sol_attn_phase",
         lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
