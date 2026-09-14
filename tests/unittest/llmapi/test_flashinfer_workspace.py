@@ -70,9 +70,10 @@ def test_worker_bootstrap_reuses_rank_workspace_and_releases_lock(
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(workspace)
     assert os.environ[_FLASHINFER_MANAGED_ENV] == "1"
     assert workspace.is_dir()
-    assert os.environ[_FLASHINFER_CUBIN_ENV] == str(
-        Path.home() / ".cache" / "flashinfer" / "cubins"
-    )
+    # The artifact cache must stay unpinned so FlashInfer derives it from the
+    # isolated workspace; a shared directory lets a peer's download replace a
+    # trtllm-gen export header mid-compilation.
+    assert _FLASHINFER_CUBIN_ENV not in os.environ
 
     with (workspace / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -304,12 +305,15 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
     assert env.get(_FLASHINFER_MANAGED_ENV) == expected_marker
 
 
-def test_mpi_pool_shares_cubins_but_isolates_workspaces(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("explicit_cubin_dir", [False, True])
+def test_mpi_pool_isolates_workspaces_and_keeps_explicit_cubin_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_cubin_dir: bool
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
     monkeypatch.delenv(_FLASHINFER_ISOLATION_ENV, raising=False)
-    monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
+    monkeypatch.delenv(_FLASHINFER_CUBIN_ENV, raising=False)
+    if explicit_cubin_dir:
+        monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
     workspace_root = tmp_path / "workspaces"
     monkeypatch.setattr(mpi_session, "_FLASHINFER_WORKSPACE_ROOT", str(workspace_root))
     session = mpi_session.MpiPoolSession(n_workers=2)
@@ -322,7 +326,10 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
     assert len(workspaces) == 2
     assert all(Path(workspace).is_dir() for workspace in workspaces)
     assert all(Path(workspace).parent == workspace_root for workspace in workspaces)
-    assert all(cubin == str(tmp_path / "cubins") for _, cubin in worker_envs)
+    # Unset means FlashInfer derives the artifact cache from each isolated
+    # workspace, so downloaded compiler inputs stay per-rank.
+    expected_cubin = str(tmp_path / "cubins") if explicit_cubin_dir else None
+    assert all(cubin == expected_cubin for _, cubin in worker_envs)
 
 
 def test_mpi_pool_propagates_explicit_workspace(

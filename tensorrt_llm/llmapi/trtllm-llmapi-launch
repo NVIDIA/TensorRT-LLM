@@ -31,11 +31,13 @@ function mpi_world_size {
     fi
 }
 
-function set_shared_flashinfer_cubin_dir {
-    if [ -z "$FLASHINFER_CUBIN_DIR" ] && [ -n "$HOME" ]; then
-        export FLASHINFER_CUBIN_DIR="$HOME/.cache/flashinfer/cubins"
-    fi
-}
+# FLASHINFER_CUBIN_DIR is deliberately left alone so the downloaded-artifact
+# cache follows the isolated workspace. FlashInfer downloads the trtllm-gen
+# export headers into that directory and symlinks them onto the JIT include
+# path, so they are compiler inputs rather than plain runtime cubins, and its
+# fetch path verifies the checksum before taking the download lock. Sharing the
+# directory therefore lets one rank's atomic rename replace a header while
+# another rank is still compiling a translation unit that includes it.
 
 function cleanup_flashinfer_temporary_workspace {
     local exit_status=$?
@@ -64,7 +66,6 @@ function use_unique_flashinfer_workspace {
     flashinfer_temporary_workspace="$workspace"
     export FLASHINFER_WORKSPACE_BASE="$workspace"
     export TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1
-    set_shared_flashinfer_cubin_dir
     log_stderr "Using temporary FlashInfer JIT workspace after persistent workspace isolation failed: $FLASHINFER_WORKSPACE_BASE"
 }
 
@@ -136,7 +137,6 @@ function configure_flashinfer_workspace {
             flashinfer_workspace_lock_held=1
             export FLASHINFER_WORKSPACE_BASE="$workspace"
             export TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1
-            set_shared_flashinfer_cubin_dir
             log_stderr "FlashInfer JIT workspace: $FLASHINFER_WORKSPACE_BASE"
             return
         else
