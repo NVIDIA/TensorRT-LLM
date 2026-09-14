@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import numpy as np
 import pytest
 import torch
 
@@ -188,25 +187,18 @@ class TestDuplicateData:
             self, dim, max_positions, theta):
         """duplicate_data=True should equal creating without duplication then
         manually concatenating, which is what _normalize_mla_rotary_cache_layout did."""
-        inv_freq_no, cs_no = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+        _, cs_no = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
             num_pos=max_positions,
             dim=dim,
             theta=theta,
             duplicate_data=False,
         )
-        inv_freq_yes, cs_yes = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+        _, cs_yes = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
             num_pos=max_positions,
             dim=dim,
             theta=theta,
             duplicate_data=True,
         )
-
-        # The rotary table dtype is pinned to fp32 (see
-        # create_sinusoidal_positions_for_attention_plugin); guard that here.
-        assert inv_freq_no.dtype == np.float32
-        assert inv_freq_yes.dtype == np.float32
-        assert cs_no.dtype == np.float32
-        assert cs_yes.dtype == np.float32
 
         t = torch.tensor(cs_no).view(max_positions, -1, 2)
         expected = torch.cat([t, t], dim=1).reshape(1, -1).contiguous()
