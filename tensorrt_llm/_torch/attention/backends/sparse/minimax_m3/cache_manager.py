@@ -364,6 +364,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             raise NotImplementedError(
                 "MiniMax-M3 shared Eagle3 draft layers do not support SWA scratch reuse."
             )
+        # Draft layers run at the target's 128-token pages. trtllm-gen has P128
+        # kernels for their dense-GQA shapes but not for every shape, so opt in
+        # here rather than in the global allowlist.
+        if self.tokens_per_block == 128:
+            self.trtllm_gen_extra_tokens_per_block = frozenset({128})
+        if self._use_per_layer_page_tables:
+            # Per-layer page tables already give every layer its own pool.
+            return
         geometry = []
         for layer_idx in draft_layers:
             key_base_addr, _dtype, _num_slots, sub_pages_per_slot, _shape = self._kv_slot_geometry(
@@ -381,11 +389,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         self._draft_op_pools = tuple(op_pools)
         self.num_attention_op_pools = self.num_pools + len(op_pools)
-        # Draft layers run at the target's 128-token pages. trtllm-gen has P128
-        # kernels for their dense-GQA shapes but not for every shape, so opt in
-        # here rather than in the global allowlist.
-        if self.tokens_per_block == 128:
-            self.trtllm_gen_extra_tokens_per_block = frozenset({128})
         logger.info(
             f"[unified-kv] draft layers {draft_layers} share the target KV cache manager; "
             f"attention-op pools {[pool for pool, _ in op_pools]} address their pages."
