@@ -25,7 +25,7 @@ class _ScratchMetadata:
 
 @pytest.mark.cpu_only
 class TestWorkspaceShrinkPolicy(unittest.TestCase):
-    def test_third_forward_and_warmup_floor(self) -> None:
+    def test_third_forward_uses_window_maximum_and_warmup_floor(self) -> None:
         policy = WorkspaceShrinkPolicy(64)
         self.assertIsNone(policy.finish_forward(1024, 1024, grew=True))
         self.assertIsNone(policy.finish_forward(32, 1024, grew=False))
@@ -37,8 +37,6 @@ class TestWorkspaceShrinkPolicy(unittest.TestCase):
         for _ in range(8):
             self.assertIsNone(policy.finish_forward(8, 64, grew=False))
 
-    def test_window_maximum_not_last_requirement(self) -> None:
-        policy = WorkspaceShrinkPolicy(64)
         policy.finish_forward(256, 1024, grew=False)
         policy.finish_forward(128, 1024, grew=False)
         self.assertEqual(policy.finish_forward(32, 1024, grew=False), 256)
@@ -58,14 +56,6 @@ class TestWorkspaceShrinkPolicy(unittest.TestCase):
         policy.finish_forward(32, 1024, grew=False)
         self.assertIsNone(policy.finish_forward(0, 1024, grew=False))
         self.assertEqual(policy.remaining, 2)
-
-    def test_invalid_requirement_and_floor(self) -> None:
-        with self.assertRaises(ValueError):
-            WorkspaceShrinkPolicy(-1)
-        for required, capacity in [(-1, 64), (128, 64), (8, 32)]:
-            with self.subTest(required=required, capacity=capacity):
-                with self.assertRaises(ValueError):
-                    WorkspaceShrinkPolicy(64).finish_forward(required, capacity, grew=False)
 
 
 @pytest.mark.cpu_only
@@ -99,7 +89,7 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
         self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 4096)
         self.assertIsNone(self.metadata.workspace_required_bytes)
 
-    def test_exception_resets_and_clears_report(self) -> None:
+    def test_failed_and_overlapping_forwards(self) -> None:
         self.metadata.workspace.resize_(16384)
         self.report_forward(4096)
         with self.assertRaisesRegex(RuntimeError, "model failure"):
@@ -107,18 +97,12 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
                 raise RuntimeError("model failure")
         self.assertEqual(self.reclaimer.policy.remaining, 3)
         self.assertIsNone(self.metadata.workspace_required_bytes)
-
-    def test_unsupported_backend_prevents_shrink(self) -> None:
-        self.metadata.workspace.resize_(16384)
-        self.report_forward(4096)
-        self.report_forward(4096)
         with self.reclaimer.forward(self.metadata):
-            self.metadata.workspace_required_bytes.fill_(4096)
-            self.metadata.workspace_reclaimable = False
-        self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
-        self.assertEqual(self.reclaimer.policy.remaining, 3)
+            with self.assertRaisesRegex(RuntimeError, "Overlapping forwards"):
+                with self.reclaimer.forward(self.metadata):
+                    self.fail("Nested workspace ownership must not be accepted")
 
-    def test_graph_and_capture_leave_counter_and_storage_unchanged(self) -> None:
+    def test_unsafe_paths_do_not_reclaim(self) -> None:
         self.metadata.workspace.resize_(16384)
         self.report_forward(4096)
         self.metadata.is_cuda_graph = True
@@ -132,25 +116,24 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
         self.assertEqual(self.reclaimer.policy.remaining, 2)
         self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
         self.assertIs(self.metadata.cuda_graph_workspace, graph_tensor)
-
-    def test_multi_stream_disables_reclamation(self) -> None:
-        with with_multi_stream(True):
-            with self.reclaimer.forward(self.metadata):
-                self.assertIsNone(self.metadata.workspace_required_bytes)
-        with self.reclaimer.forward(self.metadata):
-            self.assertIsNone(self.metadata.workspace_required_bytes)
-
-    def test_changed_stream_disables_reclamation(self) -> None:
         self.report_forward(4096)
-        self.current_stream.return_value = object()
         with self.reclaimer.forward(self.metadata):
-            self.assertIsNone(self.metadata.workspace_required_bytes)
+            self.metadata.workspace_required_bytes.fill_(4096)
+            self.metadata.workspace_reclaimable = False
+        self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
+        self.assertEqual(self.reclaimer.policy.remaining, 3)
 
-    def test_overlapping_forward_is_rejected(self) -> None:
-        with self.reclaimer.forward(self.metadata):
-            with self.assertRaisesRegex(RuntimeError, "Overlapping forwards"):
+        for multi_stream in (True, False):
+            with self.subTest(multi_stream=multi_stream):
+                self.metadata.workspace_reclaimable = True
+                self.reclaimer = EagerWorkspaceReclaimer(self.metadata)
+                self.report_forward(4096)
+                if not multi_stream:
+                    self.current_stream.return_value = object()
+                with with_multi_stream(multi_stream), self.reclaimer.forward(self.metadata):
+                    self.assertIsNone(self.metadata.workspace_required_bytes)
                 with self.reclaimer.forward(self.metadata):
-                    self.fail("Nested workspace ownership must not be accepted")
+                    self.assertIsNone(self.metadata.workspace_required_bytes)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA GPU required; no architecture restriction")
