@@ -436,8 +436,9 @@ The FMHA package is split by role:
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
   upstream-worthy changes in FlashInfer and update the vendor lock; keep only
   TRT-LLM-specific adaptations in the persistent patch.
-- `fmha/msa_sparse_gqa.py` integrates the packaged SM100/SM103 block-sparse
-  GQA implementation.
+- `fmha/msa_prefill.py` integrates the packaged SM100/SM103 block-sparse GQA
+  implementation for the context phase, and `fmha/msa_decode.py` runs the
+  MiniMax-M3 decode kernels for the generation phase.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA

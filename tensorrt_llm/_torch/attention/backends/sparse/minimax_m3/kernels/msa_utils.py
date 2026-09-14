@@ -11,15 +11,27 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+from tensorrt_llm._utils import is_sm_100f, maybe_pin_memory
 
-from .common import write_kv_slots
+from .paged_cache import write_kv_slots
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
 # with a clear message rather than a cryptic shape error inside the kernel.
 MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
+
+
+def is_msa_layer(attn) -> bool:
+    """Whether this layer's attention is served by the MiniMax-M3 MSA kernels."""
+    sparse_params = attn.sparse_params
+    return (
+        is_sm_100f()
+        and sparse_params is not None
+        and sparse_params.algorithm == "minimax_m3"
+        and getattr(sparse_params, "implementation", None) == "msa"
+    )
 
 
 def _install_msa_cutlass_compatibility() -> None:
@@ -108,6 +120,45 @@ def write_msa_main_kv(
     )
     write_kv_slots(
         v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+    )
+
+
+def write_msa_phase_kv(
+    attn,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    metadata,
+    attention_input_type,
+    *,
+    token_offset: int,
+) -> None:
+    """Write one phase's new-token main K/V for one layer.
+
+    The decode kernels and fmha_sm100 read the paged cache directly, so a
+    phase's new-token K/V has to be resident before its kernel runs. Each FMHA
+    library writes the rows it is about to attend, so a mixed batch's two
+    phases cover the step between them and neither repeats the other's write.
+
+    k and v are the phase's token slice, and token_offset its first token on
+    the step's token axis, which is what msa_out_cache_loc is indexed by.
+    """
+    if attention_input_type != AttentionInputType.mixed:
+        raise NotImplementedError(
+            "MiniMax-M3 MSA attention requires the mixed attention input type, "
+            f"but this call passed {attention_input_type!r}. Its cache slots and "
+            "top-k block table are indexed by whole-step token position."
+        )
+    if k is None or v is None:
+        return
+    num_tokens = int(k.shape[0])
+    if num_tokens == 0:
+        return
+    write_msa_main_kv(
+        metadata.kv_cache_manager,
+        attn.layer_idx,
+        metadata.msa_out_cache_loc[token_offset : token_offset + num_tokens],
+        k,
+        v,
     )
 
 
@@ -219,4 +270,5 @@ __all__ = [
     "require_msa_module",
     "select_blocks_from_maxscore",
     "write_msa_main_kv",
+    "write_msa_phase_kv",
 ]
