@@ -33,12 +33,10 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 # isort: off
 from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DFlashDecodingConfig,
-    DSparkDecodingConfig, DraftTargetDecodingConfig, Eagle3DecodingConfig,
-    KvCacheConfig, MambaStateConfig, MiniMaxM3SparseAttentionConfig, MoeConfig,
-    MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
-    PrefillCudaGraphBackend, RocketSparseAttentionConfig, SADecodingConfig,
-    SamplingParams, SchedulerConfig, SkipSoftmaxAttentionConfig,
-    SAEnhancerConfig, TorchCompileConfig)
+    DSparkDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
+    MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
+    PrefillCudaGraphBackend, SamplingParams, SchedulerConfig,
+    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
