@@ -70,11 +70,7 @@ class ModelSpec:
     @property
     def bytes_per_pair(self) -> int:
         # Packed values + scales + FP8 output + index read/write.
-        return (
-            self.source_bytes_per_token
-            + self.head_dim
-            + 2 * torch.int32.itemsize
-        )
+        return self.source_bytes_per_token + self.head_dim + 2 * torch.int32.itemsize
 
 
 MODEL_SPECS = {
@@ -168,15 +164,14 @@ class GatherBenchmark:
             # tiles from the gathered FP8 pool. Its valid lengths select the
             # dynamic kernel family; omitting them selects GLM's static family.
             swa_indices = (
-                torch.arange(max_batch_size, dtype=torch.int32, device=device)[:, None]
-                * spec.topk
+                torch.arange(max_batch_size, dtype=torch.int32, device=device)[:, None] * spec.topk
                 + torch.arange(spec.swa_window_size, dtype=torch.int32, device=device)[None, :]
             )
             # All generated source indices are valid, so direct gather always
             # compacts them to this fixed row map. Precompute it outside timing.
-            compact_indices = torch.arange(
-                num_indices, dtype=torch.int32, device=device
-            ).view(max_batch_size, spec.topk)
+            compact_indices = torch.arange(num_indices, dtype=torch.int32, device=device).view(
+                max_batch_size, spec.topk
+            )
             self.sparse_attn_indices = torch.cat((swa_indices, compact_indices), dim=1)
             self.sparse_attn_kv_lens = torch.full(
                 (max_batch_size,), self.num_sparse_topk, dtype=torch.int32, device=device
@@ -224,9 +219,7 @@ class GatherBenchmark:
         self.kv_lens_cuda = torch.full(
             (max_batch_size,), spec.topk, dtype=torch.int32, device=device
         )
-        self.kv_lens_host = torch.full(
-            (max_batch_size,), spec.topk - 1, dtype=torch.int32
-        )
+        self.kv_lens_host = torch.full((max_batch_size,), spec.topk - 1, dtype=torch.int32)
         self.prompt_lens_cuda = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
         self.prompt_lens_host = torch.zeros(max_batch_size, dtype=torch.int32)
         self.host_request_types = torch.ones(max_batch_size, dtype=torch.int32)
@@ -234,13 +227,9 @@ class GatherBenchmark:
         self.kv_cache_block_offsets = torch.arange(
             max_batch_size * num_blocks, dtype=torch.int32, device=device
         ).view(1, max_batch_size, num_blocks)
-        self.cu_q_seqlens = torch.arange(
-            max_batch_size + 1, dtype=torch.int32, device=device
-        )
+        self.cu_q_seqlens = torch.arange(max_batch_size + 1, dtype=torch.int32, device=device)
         self.cu_q_seqlens.mul_(spec.num_heads)
-        self.cu_kv_seqlens = torch.arange(
-            max_batch_size + 1, dtype=torch.int32, device=device
-        )
+        self.cu_kv_seqlens = torch.arange(max_batch_size + 1, dtype=torch.int32, device=device)
         self.cu_kv_seqlens.mul_(spec.topk)
         self.fmha_scheduler_counter = torch.zeros(1, dtype=torch.uint32, device=device)
         self.attention_workspace = torch.empty(0, dtype=torch.uint8, device=device)
@@ -300,9 +289,7 @@ class GatherBenchmark:
         sparse_indices = self.sparse_attn_indices
         assert sparse_indices is not None
         sparse_kv_lens = (
-            self.sparse_attn_kv_lens[:batch_size]
-            if self.sparse_attn_kv_lens is not None
-            else None
+            self.sparse_attn_kv_lens[:batch_size] if self.sparse_attn_kv_lens is not None else None
         )
 
         def run() -> None:
@@ -500,7 +487,7 @@ def _run_model(
         if spec.direct:
             torch.testing.assert_close(
                 benchmark.indices[:batch_size],
-                benchmark.sparse_attn_indices[:batch_size, spec.swa_window_size:],
+                benchmark.sparse_attn_indices[:batch_size, spec.swa_window_size :],
                 rtol=0,
                 atol=0,
             )
@@ -509,9 +496,7 @@ def _run_model(
             dsa = _capture_cuda_graph(dsa)
             gather_and_dsa = _capture_cuda_graph(gather_and_dsa, reset_indices)
 
-        gather_samples = _time_cuda_us(
-            gather, benchmark.l2_clear, warmup, iters, reset_indices
-        )
+        gather_samples = _time_cuda_us(gather, benchmark.l2_clear, warmup, iters, reset_indices)
         dsa_samples = _time_cuda_us(dsa, benchmark.l2_clear, warmup, iters)
         total_samples = _time_cuda_us(
             gather_and_dsa, benchmark.l2_clear, warmup, iters, reset_indices
