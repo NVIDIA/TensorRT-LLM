@@ -134,7 +134,30 @@ class _Attention:
             return self.head_dim
         if not is_gen_only:
             return self.v_head_dim
-        return self.kv_lora_rank + self.qk_rope_head_dim
+        return self.kv_lora_rank if self.rope_append else self.kv_lora_rank + self.qk_rope_head_dim
+
+
+@pytest.mark.parametrize("rope_append,expected_head_size", [(True, 512), (False, 576)])
+def test_mla_fixture_generation_output_size(rope_append: bool, expected_head_size: int) -> None:
+    attn = _Attention(head_dim=576, is_mla=True)
+    attn.rope_append = rope_append
+    fmha = PrimsTSFmha(attn)
+    output = torch.empty((2, attn.num_heads * expected_head_size), dtype=torch.bfloat16)
+
+    params = fmha._build_params(
+        torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        None,
+        None,
+        make_fake_metadata(),
+        AttentionForwardArgs(
+            output=output,
+            attention_input_type=AttentionInputType.generation_only,
+        ),
+        torch.empty(0, dtype=torch.uint8),
+    )
+
+    assert params.output.shape == (2, attn.num_heads, expected_head_size)
+    assert attn.out_head_size(is_gen_only=False) == attn.v_head_dim
 
 
 def _make_v1_manager(**attributes: object) -> KVCacheManager:

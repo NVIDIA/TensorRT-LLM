@@ -119,7 +119,7 @@ class FakeAttention:
         self.sparse_params = None
 
     def get_local_layer_idx(self, metadata: object) -> int:
-        return self.layer_idx
+        return self.local_layer_idx
 
     def out_head_size(self, is_gen_only: bool) -> int:
         """Mirror ``TrtllmAttention.out_head_size``; ``PhasedFmha`` reads it at init."""

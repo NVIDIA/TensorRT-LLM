@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -289,6 +290,48 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
 
     assert preprocess_calls[0][24] == batch_size
     assert len(decode_calls) == 1
+
+
+def test_flashinfer_mla_generation_uses_phase_sequence_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sequence_length = torch.tensor([99, 7, 19], dtype=torch.int32)[1:]
+    params = FmhaParams(
+        fwd=AttentionForwardArgs(),
+        qkv_or_q=torch.empty((2, 2, 576), dtype=torch.bfloat16),
+        output=torch.empty((2, 2, 512), dtype=torch.bfloat16),
+        workspace=torch.empty(4, dtype=torch.uint8),
+        sequence_length=sequence_length,
+        seq_offset=1,
+        num_seqs=2,
+        num_tokens=2,
+        num_heads=2,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        q_scaling=1.0,
+        max_past_kv_length=19,
+    )
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module.thop,
+        "build_trtllm_gen_kv_cache_metadata",
+        lambda *args: (torch.empty(0), torch.empty((2, 1), dtype=torch.int32), None),
+    )
+    decode = Mock()
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen_module,
+        "flashinfer",
+        SimpleNamespace(mla=SimpleNamespace(trtllm_batch_decode_with_kv_cache_mla=decode)),
+        raising=False,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._enable_pdl = False
+    fmha._multi_ctas_kv_counter = torch.empty(0, dtype=torch.uint8)
+
+    fmha.run_mla_generation(params)
+
+    decode.assert_called_once()
+    assert decode.call_args.args[7] is sequence_length
 
 
 def _cute_dsl_mla_helix_support(
