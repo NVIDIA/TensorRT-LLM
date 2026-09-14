@@ -50,6 +50,24 @@ l0_gb300_multi_gpus:
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  # MuseSparkOpen decode-path fusions (random weights, no checkpoint): router
+  # projection, sorted top-8 routing, attention norm+gate, attention->FFN
+  # boundary (Triton and GB300 CTA-cluster kernels), pre-expert NVFP4 quant,
+  # router/quant overlap, and the fusion opt-out switches. The finalize+TP4
+  # all-reduce test file is deliberately NOT listed: it requires an external
+  # 4-rank MPI launch and every case skips under single-process pytest.
+  - unittest/_torch/modeling/test_musespark_open_router_projection.py
+  - unittest/_torch/modeling/test_musespark_open_full_routing.py
+  - unittest/_torch/modeling/test_musespark_open_norm_gate.py
+  - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
+  - unittest/_torch/modeling/test_musespark_open_cluster_boundary.py
+  - unittest/_torch/modeling/test_musespark_open_pre_expert_quant.py
+  - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
+  - unittest/_torch/modeling/test_musespark_open_fusion_switches.py
+  # Opt-in layout/contract gates for the shared fused RMSNorm FP4 helper and
+  # the FlashInfer MoE provider (from the same fusion stack).
+  - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant_opt_in.py
+  - unittest/_torch/moe/test_flashinfer_moe_scale_layout.py
   # Kimi K3 speculative decoding: exact kernel-level verify parity (random
   # weights, no checkpoint).
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py

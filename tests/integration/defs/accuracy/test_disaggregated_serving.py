@@ -139,8 +139,7 @@ DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
 @functools.lru_cache(maxsize=1)
 def has_nvlink():
-    """
-    Check if the system has NVLink connectivity between GPUs.
+    """Check if the system has NVLink connectivity between GPUs.
 
     Returns:
         bool: True if NVLink is detected, False otherwise.
@@ -244,7 +243,7 @@ def launch_disaggregated_llm(
 
     if tensor_parallel_size > 1:
         print(
-            f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
+            "Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
     perf_metrics_output_dir = os.path.join(temp_dir.name, "perf_metrics")
 

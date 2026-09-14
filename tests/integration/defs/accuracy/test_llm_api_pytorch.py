@@ -2840,7 +2840,7 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
     def test_eagle3(self):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5698434"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5698434"""
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -3249,7 +3249,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1)], ids=["latency"])
     def test_fp8(self, tp_size, ep_size, torch_compile):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5284463"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5284463"""
         "Need to check Ada support"
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
 

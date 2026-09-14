@@ -408,10 +408,77 @@ A. The communication for kvCache transfer between executors are established dyna
 
 *Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?*
 
-A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` field. A few UCX environment variables can be adjusted when your servers have different NVLink domains:
+A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` field. Compare that field and not `Fabric.CliqueId`, which sits next to it in the same output: `CliqueId` identifies a clique within a domain and can be equal on nodes whose `ClusterUUID`s differ, so comparing it reports two separate domains as one and skips the settings below. A few UCX environment variables can be adjusted when your servers have different NVLink domains:
 
 * `UCX_CUDA_IPC_ENABLE_MNNVL`: Set to `n`. This also can reduce UCX timeout error messages like `UCX  ERROR   cuMemImportFromShareableHandle failed: invalid resource handle`, although these errors don't necessarily cause your trtllm-serve to fail.
 
 * `UCX_NET_DEVICES`: Check if this is set correctly, or unset this variable to allow UCX to use all possible devices.
 
 * `UCX_RNDV_SCHEME`: Set to `get_zcopy` or `put_zcopy` on GB200 for better performance. The default value is `auto`.
+
+*Q. My context and generation servers fail during executor initialization with `Assertion failed: status == NIXL_SUCCESS`. What is wrong?*
+
+A. Look further up the log for these lines:
+
+```
+W ucx_utils.cpp  N NVIDIA GPU(s) were detected, but UCX CUDA support was not found! GPU memory is not supported.
+E ucx_utils.cpp  VRAM memory is detected as host by UCX. UCX is likely not configured with CUDA/ROCm support. VRAM registration cannot proceed.
+E nixl_agent.cpp registerMem: registration failed for the specified or all potential backends
+```
+
+This means UCX has no CUDA transport available, so the NIXL agent cannot register the KV cache in device memory. The usual cause is a `UCX_TLS` value that excludes the CUDA transports — for example `UCX_TLS=tcp`. Check it with `env | grep UCX` inside the container: some images set their own `UCX_TLS` and `UCX_NET_DEVICES` defaults from the entrypoint or profile, and those override anything passed through `srun --export`. Re-export the values inside the container command, after the profile has run, so they win:
+
+```bash
+export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp
+export UCX_NET_DEVICES=eth0
+```
+
+Set `UCX_NET_DEVICES` to a named interface rather than `all`. See the next entry for why.
+
+`examples/disaggregated/slurm/cache_transceiver_test/` sweeps these variables and reports the transport UCX actually selected, which is the quickest way to find a working combination on a new cluster.
+
+*Q. My servers fail during executor initialization with `Failed to create NIXL backend: UCX`. What is wrong?*
+
+A. Look for a UCX bind error just above it:
+
+```
+E sock.c        bind(fd=N addr=fdcd:...:ee4%0:0) failed: Cannot assign requested address
+E ucp_worker.c  uct_iface_open(tcp/<iface>) failed: Input/output error
+RuntimeError: Failed to create NIXL backend: UCX
+```
+
+UCX could not open one of the interfaces it was told to use, and creating the UCX worker failed. NIXL treats that as fatal, so the worker dies. The same bind error is often present and harmless in aggregated serving logs, where nothing depends on that UCX worker.
+
+The usual cause is `UCX_NET_DEVICES=all`, or leaving it unset so UCX defaults to all devices. A node can expose interfaces that are not usable from inside the container — for example virtual-function or bridge interfaces carrying only an IPv6 link-local address, which cannot be bound. List them with `ip -o addr` or `ls /sys/class/net` inside the container and set `UCX_NET_DEVICES` to a single interface with a bindable address (commonly `eth0`).
+
+Note this is the opposite of the advice for the different-NVLink-domain case above, which suggests unsetting `UCX_NET_DEVICES`. Prefer a named interface, and only widen the selection if a transfer needs a device that is excluded.
+
+Do not try to fix this by dropping `tcp` from `UCX_TLS`, even when the context and generation servers are on the same node and the KV transfer itself only needs `cuda_ipc`. The NIXL agent handshake requires a network transport, so a CUDA-only value such as `cuda_ipc,cuda_copy,sm,self` fails the same way.
+
+*Q. My servers fail during executor initialization with `Assertion failed: status == NIXL_SUCCESS` and NIXL reports that the UCX backend does not exist. What is wrong?*
+
+A. This assertion fires on the result of `getPluginParams`, before any backend is created, so by default it prints no reason. Re-run with `NIXL_LOG_LEVEL=DEBUG` to see why the plugin did not load:
+
+```
+nixl_plugin_manager.cpp Failed to load plugin from <path>/libplugin_UCX.so:
+                        /usr/local/ucx/lib/libucp.so.0: file too short
+nixl_plugin_manager.cpp Failed to load plugin 'UCX' from any directory
+nixl_agent.cpp          getPluginParams: backend 'UCX' not found
+```
+
+Here the container's UCX shared libraries were unreadable — in one case truncated to zero bytes on a single node, while the same image was intact elsewhere — so `dlopen` of the NIXL UCX plugin failed. Without the debug log this is indistinguishable from a NIXL build that has no UCX support at all.
+
+Check the libraries before concluding the backend is missing:
+
+```bash
+ls -lL /usr/local/ucx/lib/libucp.so.0
+python3 -c "import pathlib, tensorrt_llm; print(pathlib.Path(tensorrt_llm.__file__).parent / 'libs/ucx')"
+```
+
+TensorRT-LLM ships its own complete UCX under `tensorrt_llm/libs/ucx`. If the system copy is damaged, prepend the bundled directory so the plugin resolves against a good copy:
+
+```bash
+export LD_LIBRARY_PATH=$(python3 -c "import pathlib, tensorrt_llm; print(pathlib.Path(tensorrt_llm.__file__).parent / 'libs/ucx')"):$LD_LIBRARY_PATH
+```
+
+Because a node can be broken in isolation, a NIXL failure that appears on only one of several otherwise identical nodes is worth checking here first, before spending a full weight load on an environment change.

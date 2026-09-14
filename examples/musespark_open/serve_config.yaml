@@ -1,0 +1,28 @@
+# Muse Spark Open (816B-A42B) aggregated serving configuration, validated on
+# a single GB300 NVL node (4 GPUs, TP4/EP4). Pass to trtllm-serve with
+# --config. See ../../docs/source/deployment-guide/
+# deployment-guide-for-musespark-open-on-trtllm.md for the walkthrough.
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: false
+max_batch_size: 256
+max_num_tokens: 8192
+max_seq_len: 49152
+trust_remote_code: true
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+attn_backend: TRTLLM
+allreduce_strategy: NCCL
+guided_decoding_backend: xgrammar
+cuda_graph_config:
+  max_batch_size: 256
+  enable_padding: true
+moe_config:
+  backend: TRTLLM
+kv_cache_config:
+  # FP8 KV cache is required on SM103 when chunked prefill or block reuse
+  # is enabled (head-dimension-64 paged-context FMHA constraint).
+  dtype: fp8
+  enable_block_reuse: true
+  enable_partial_reuse: true
+  free_gpu_memory_fraction: 0.8
