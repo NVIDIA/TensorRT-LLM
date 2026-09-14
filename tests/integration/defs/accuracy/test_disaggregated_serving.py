@@ -822,7 +822,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_batch_size": 1,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "cuda_graph_config": None,
@@ -841,7 +840,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_batch_size": 16,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "cuda_graph_config": None,
