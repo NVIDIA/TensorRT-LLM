@@ -30,6 +30,7 @@ from tensorrt_llm._torch.attention.backends.flashinfer import (
     FlashInferAttentionMetadata,
     PlanParams,
     decode_tensor_cores_override,
+    warn_if_decode_tensor_cores_forced_on,
 )
 from tensorrt_llm.functional import AttentionMaskType
 
@@ -144,3 +145,55 @@ def test_decision_is_read_per_call_not_cached_at_import():
     assert use_tensor_cores(plan(128, 16)) is False
     os.environ.pop(FI_DECODE_TENSOR_CORES_ENV, None)
     assert use_tensor_cores(plan(128, 16)) is True
+
+
+def _forced_on_warnings(use_graph_tensor_cores: bool, backend: str, use_tensor_cores: bool) -> list:
+    """Run the forced-on check and return the warnings it emitted."""
+    with mock.patch(
+        "tensorrt_llm._torch.attention.backends.flashinfer.logger.warning_once"
+    ) as warn:
+        warn_if_decode_tensor_cores_forced_on(use_graph_tensor_cores, backend, use_tensor_cores)
+    return warn.call_args_list
+
+
+@pytest.mark.parametrize(
+    "use_graph_tensor_cores,backend,reason",
+    [
+        (True, "fa2", "CUDA graph with head_dim > 128"),
+        (False, "trtllm-gen", "the trtllm-gen backend"),
+    ],
+)
+def test_a_forced_override_warns_with_the_forcing_reason(use_graph_tensor_cores, backend, reason):
+    """An off override that a requirement outranks must say so, and say why.
+
+    The override names an A/B leg; a leg that silently runs as the other leg
+    records "no difference", so removal or misrouting of this warning turns a
+    voided measurement into a finding.
+    """
+    os.environ[FI_DECODE_TENSOR_CORES_ENV] = "0"
+    calls = _forced_on_warnings(use_graph_tensor_cores, backend, use_tensor_cores=False)
+    assert len(calls) == 1, f"expected exactly one warning; got {calls}"
+    message = calls[0].args[0]
+    assert f"{FI_DECODE_TENSOR_CORES_ENV}=0 ignored" in message
+    assert reason in message
+
+
+@pytest.mark.parametrize(
+    "env,use_graph_tensor_cores,backend,use_tensor_cores",
+    [
+        # No off override -> nothing was outranked, whatever the wrapper does.
+        (None, True, "fa2", False),
+        ("auto", False, "trtllm-gen", False),
+        # The heuristic already chose tensor cores -> the override did not
+        # change the outcome for this plan.
+        ("0", True, "fa2", True),
+        # Nothing forces tensor cores -> the off override is honoured.
+        ("0", False, "fa2", False),
+    ],
+)
+def test_no_warning_when_nothing_is_forced(env, use_graph_tensor_cores, backend, use_tensor_cores):
+    """The warning is for one case only: an off override a requirement beat."""
+    if env is not None:
+        os.environ[FI_DECODE_TENSOR_CORES_ENV] = env
+    calls = _forced_on_warnings(use_graph_tensor_cores, backend, use_tensor_cores)
+    assert calls == [], f"expected no warning; got {calls}"

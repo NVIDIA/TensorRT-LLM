@@ -1244,6 +1244,7 @@ def test_single_pair_shortcut(monkeypatch):
 
     tuner = AutoTuner.get()
     tuner.clear_cache()
+    lines = _capture_autotuner_debug_lines(monkeypatch)
     x = torch.randn(M, 64, device="cuda")
     w = torch.randn(64, 128, device="cuda")
 
@@ -1262,6 +1263,13 @@ def test_single_pair_shortcut(monkeypatch):
         f"got {forward_calls}")
     assert len(tuner.profiling_cache.get_specific_custom_op(op_single)) == 1, (
         "single-pair shortcut must still record the (runner, tactic) entry")
+    # The shortcut bypasses the timed loop but must not bypass the candidate
+    # log: 0.000 is the recorded-without-profiling marker, and the format is
+    # the timed path's, so one regex reads a run's log whichever path ran.
+    assert any(
+        line.startswith(f"[Autotuner] Candidate: custom_op={op_single}, ")
+        and line.endswith("time=0.000ms") for line in lines), (
+            f"single-pair shortcut must log its candidate; got {lines}")
 
     # Multi-tactic on the same fixture: timed profile path must still run.
     forward_calls.clear()
