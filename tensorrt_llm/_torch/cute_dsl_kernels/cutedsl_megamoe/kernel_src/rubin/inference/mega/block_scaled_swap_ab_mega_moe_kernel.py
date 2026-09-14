@@ -162,8 +162,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.occupancy = 1
         self.architecture = "sm_107"
         self.local_expert_count = self.expert_count // self.world_size
-        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32
-        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72
+        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32  # nosec B105
+        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72  # nosec B105
 
         self.mixed_cga_config = NonClcMixedCgaConfig(
             preferred_cluster_shape=self.cluster_shape_mn,
@@ -1119,7 +1119,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
         )
         finalize_barrier_thread_count = (
-            12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
+            12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32  # nosec B105
         )
         finalize_barrier = pipeline.NamedBarrier(
             barrier_id=13, num_threads=finalize_barrier_thread_count
@@ -1249,7 +1249,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 iket.range_pop()
                 if cutlass.const_expr(
                     self.token_comm.token_back_enabled
-                    and self.token_back_mode != "standalone_warps"
+                    and self.token_back_mode != "standalone_warps"  # nosec B105
                 ):
                     iket.range_push("mega.token_back")
                     self.token_comm.token_back(self._smem_workspace, smem_base)
@@ -1258,7 +1258,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 iket.range_push("mega.tail_reset")
                 self.token_comm.reset_tail()
                 iket.range_pop()
-            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):
+            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
                 iket.range_push("mega.token_back_standalone")
                 self.token_comm.token_back(self._smem_workspace, smem_base)
                 iket.range_pop()
