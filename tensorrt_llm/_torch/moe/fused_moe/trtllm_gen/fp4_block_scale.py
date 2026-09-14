@@ -12,24 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``run_fp4_block_scale_moe`` and the three formats that reach it.
+"""``run_fp4_block_scale_moe`` and the formats that reach it.
 
 :class:`.TRTLLMGenFp4BlockScaleBase` owns the kernel call; NVFP4, W4A16_MXFP4
 and W4A8_MXFP4_MXFP8 differ in how weights and inputs are prepared and not at
 all in how the kernel is called, so each subclass supplies only the
-preparation. Six of the eleven leaves land here, two per format.
+preparation. Two leaves land here per format, one per provider.
 
 A format's class also answers whatever the family base would otherwise switch
 on ``quant_config`` for: the SiTu weight alignment and scale group size are
 per-format, so they are settled here rather than branched on above.
 """
 
-from typing import Optional, Union
-
 import torch
 from torch import nn
 
-from ....utils import ActType_TrtllmGen, Fp4QuantizedTensor, MxFp8QuantizedTensor
+from tensorrt_llm._torch.utils import ActType_TrtllmGen, Fp4QuantizedTensor, MxFp8QuantizedTensor
+
 from ..activation import materialize_activation_params, resolve_activation_support
 from ..impl_contract import MoERunContext
 from ..quantization import (
@@ -44,17 +43,17 @@ from .kernel_inputs import get_data_or_none, prepare_kernel_inputs, to_trtllm_ge
 
 
 class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
-    """``run_fp4_block_scale_moe`` for the three formats that share it.
+    """``run_fp4_block_scale_moe`` for the formats that share it.
 
     NVFP4, W4A16_MXFP4 and W4A8_MXFP4_MXFP8 differ in how weights and inputs
     are prepared and not at all in how the kernel is called, so the call lives
-    here once and each subclass supplies the preparation. Six of the eleven
-    leaves reach the kernel through this body.
+    here once and each subclass supplies the preparation. Every leaf of those
+    formats reaches the kernel through this body.
     """
 
     #: Group size the SiTu cubins were built for. A property of the format,
     #: unlike ``supports_situ``; ``None`` where there are no such cubins.
-    situ_scaling_vector_size: Optional[int] = None
+    situ_scaling_vector_size: int | None = None
 
     def _create_quant_method_weights(self) -> None:
         """Also promote SiTu's soft-caps to parameter slots the cubin indexes.
@@ -126,8 +125,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self,
         ctx: MoERunContext,
         *,
-        workspace: Optional[dict] = None,
-    ) -> Union[torch.Tensor, tuple]:
+        workspace: dict | None = None,
+    ) -> torch.Tensor | tuple:
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
 
@@ -211,7 +210,7 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         """
         return NVFP4TRTLLMGenFusedMoEMethod.scaling_vector_size
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         # SiTu fills the act_alpha/act_beta slots from create_weights, which
         # runs after this, so keying off the tensor would make the method
         # depend on *when* it is asked for.
@@ -224,7 +223,11 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
             else NVFP4TRTLLMGenFusedMoEBaseMethod()
         )
 
-    def quantize_input(self, x, post_quant_comm: bool = True):
+    def quantize_input(
+        self,
+        x: torch.Tensor | Fp4QuantizedTensor | MxFp8QuantizedTensor,
+        post_quant_comm: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(x, Fp4QuantizedTensor):
             assert not x.is_sf_swizzled, (
                 "Fp4QuantizedTensor should not be swizzled before communication"
@@ -263,10 +266,12 @@ class TRTLLMGenW4a16Mxfp4Base(TRTLLMGenFp4BlockScaleBase):
     supports_gptoss_style = True
     needs_zero_expert_bias = True
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         return W4A16MXFP4TRTLLMGenFusedMoEMethod()
 
-    def quantize_input(self, x, post_quant_comm: bool = True):
+    def quantize_input(
+        self, x: torch.Tensor, post_quant_comm: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Weight-only: the activation is padded to the packed weight width and
         # stays bfloat16, so there is no scaling factor to hand back.
         pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
@@ -286,10 +291,12 @@ class TRTLLMGenW4a8Mxfp4Mxfp8Base(TRTLLMGenFp4BlockScaleBase):
         """Whole group-32 scale groups per rank; the loader pads to 128 itself."""
         return W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.scaling_vector_size
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         return W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
 
-    def quantize_input(self, x, post_quant_comm: bool = True):
+    def quantize_input(
+        self, x: torch.Tensor, post_quant_comm: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x, x_sf = self.op_backend.mxfp8_quantize(
             x, False, alignment=self.quant_method.input_hidden_alignment
         )

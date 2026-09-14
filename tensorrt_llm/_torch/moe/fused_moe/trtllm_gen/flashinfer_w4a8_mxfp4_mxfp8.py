@@ -23,11 +23,11 @@ from .eligibility import (
     check_trtllm_gen_leaf,
 )
 from .fp4_block_scale import TRTLLMGenW4a8Mxfp4Mxfp8Base
-from .identity import PROVIDER_FLASHINFER, FlashinferProviderTraits, trtllm_gen_descriptor
+from .identity import PROVIDER_FLASHINFER, trtllm_gen_descriptor
 
 
 @register_moe_impl
-class FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl(FlashinferProviderTraits, TRTLLMGenW4a8Mxfp4Mxfp8Base):
+class FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
     """``flashinfer.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8``."""
 
     descriptor = trtllm_gen_descriptor(

@@ -31,7 +31,7 @@ PROVIDER_FLASHINFER = "flashinfer"
 TECHNIQUE_TRTLLM_GEN = "trtllm_gen"
 KERNEL_FUSED_MOE = "fused_moe"
 
-# All eleven leaves publish these two, so they are declared family-wide rather
+# Every leaf publishes these two, so they are declared family-wide rather
 # than per leaf.
 TRTLLM_GEN_CAPABILITIES = MoEStaticCapability(supports_expert_bias=True, supports_eplb=True)
 
@@ -44,25 +44,6 @@ TRTLLM_GEN_INPUT_REQUIREMENT = MoEInputRequirement(
     # one-sided payload buffer has to match.
     onesided_workspace_dtype=torch.bfloat16,
 )
-
-
-class TrtllmProviderTraits:
-    """The native TRT-LLM cubins, reached through ``TRTLLMOpBackend``."""
-
-    provider = PROVIDER_TRTLLM
-    use_flashinfer = False
-
-
-class FlashinferProviderTraits:
-    """The same algorithm as shipped in the FlashInfer wheel."""
-
-    provider = PROVIDER_FLASHINFER
-    use_flashinfer = True
-
-
-# The two trait classes carry values only, for attributes
-# ``TrtllmGenFusedMoEBase`` declares and leaves unset. A leaf must list its
-# traits first so they win the MRO over the family base's defaults.
 
 
 def trtllm_gen_descriptor(provider: str, quant: str, doc: str) -> MoEImplDescriptor:

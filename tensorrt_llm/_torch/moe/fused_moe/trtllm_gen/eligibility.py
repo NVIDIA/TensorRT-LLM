@@ -15,7 +15,7 @@
 """The eligibility gates the leaves compose into ``can_implement``.
 
 Free functions rather than methods on :class:`.TrtllmGenFusedMoEBase`: the
-family base must not implement ``can_implement``, or all eleven leaves would
+family base must not implement ``can_implement``, or every leaf would
 inherit an answer that belongs to no single identity. Each leaf composes its
 own gates explicitly, so one can diverge without unpicking an inherited
 default.
@@ -25,30 +25,22 @@ Each gate reads only ``cls``, ``MoEProblem`` and ``MoEDeployment``. No
 on a GPU-less host gets the same verdict a serving process does.
 """
 
-from typing import Optional
-
 import torch
 
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import is_sm_100f
 
-from ....utils import ActivationType
-from ..impl_contract import (
-    MoEDeployment,
-    MoEEligibility,
-    MoEProblem,
-    MoERejectReason,
-    normalize_quant,
-)
+from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERejectReason
 from ..impl_environment import MoEDep, MoEEnvFlag
 from ..interface import _reject
 
 
 def check_trtllm_gen_capabilities(
     cls: type, p: MoEProblem, d: MoEDeployment
-) -> Optional[MoEEligibility]:
+) -> MoEEligibility | None:
     """Capability gates every TRTLLM-Gen leaf shares, or ``None`` to admit.
 
-    Eleven leaves restating the same gates is how the SM, dtype, routing and
+    Every leaf restating the same gates is how the SM, dtype, routing and
     activation answers drift apart, so each leaf checks its own quantization
     format and then defers here.
     """
@@ -98,9 +90,7 @@ def check_trtllm_gen_capabilities(
     return None
 
 
-def check_flashinfer_provider(
-    cls: type, p: MoEProblem, d: MoEDeployment
-) -> Optional[MoEEligibility]:
+def check_flashinfer_provider(cls: type, p: MoEProblem, d: MoEDeployment) -> MoEEligibility | None:
     """Gates that separate the FlashInfer provider from the ``trtllm`` one.
 
     Only the quantized leaves come through here. The unquantized one is
@@ -153,8 +143,8 @@ def check_flashinfer_shard_alignment(
     d: MoEDeployment,
     *,
     weight_alignment: int,
-    input_hidden_alignment: Optional[int] = None,
-) -> Optional[MoEEligibility]:
+    input_hidden_alignment: int | None = None,
+) -> MoEEligibility | None:
     """Per-rank shard alignment the FlashInfer kernels need, or ``None``.
 
     Two distinct spellings of "does not apply": an absent shape on ``p`` means
@@ -192,6 +182,58 @@ def check_flashinfer_shard_alignment(
     return None
 
 
+def check_no_expert_bias(cls: type, p: MoEProblem) -> MoEEligibility | None:
+    """No standalone expert bias, for the leaves whose runner reads none.
+
+    Narrower than two gates that look like they would cover it.
+    ``supports_gptoss_style`` sees only the bias-plus-alpha-beta package as a
+    whole, and a checkpoint can carry a plain expert bias without it.
+    ``capabilities.supports_expert_bias`` is declared once for the whole
+    family, and ``create_moe`` reads it against the class resolution already
+    picked -- so a leaf that answered only there would be chosen and then
+    refuse, instead of standing aside for a sibling that can serve.
+
+    A gate rather than only the ``_check_configs`` assert for the same reason:
+    some leaves reaching here have a sibling on the other provider that does
+    take a bias, and standing aside during selection is what lets it be
+    tried; for the rest it is the difference between a structured verdict
+    and an assert after resolution has committed.
+
+    Its own function rather than a line inside
+    :func:`check_mxfp4_flashinfer_shape`, because a leaf whose shape gate is
+    conditional still has to answer about bias unconditionally, and one copy
+    of the rule keeps every leaf giving the same reason.
+    """
+    if p.bias:
+        return _reject(
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            f"{cls.__name__} takes no expert bias",
+        )
+    return None
+
+
+def check_no_activation_constants(cls: type, p: MoEProblem) -> MoEEligibility | None:
+    """No activation constants at all, for the runners that take none.
+
+    Companion to :func:`check_no_expert_bias` and the same argument: these
+    runners have no parameter for alpha, beta or the clamp and pin
+    ``act_type``, so a constant the carrier materialized would be dropped
+    rather than applied. ``supports_gptoss_style`` does not cover it -- that
+    gate sees the bias-plus-alpha-beta package as a whole, while a checkpoint
+    can carry a plain clamp on its own, which is not part of the package at
+    all.
+
+    Any nonempty set, rather than a named subset, because for these leaves the
+    kernel applies none of them.
+    """
+    if p.activation_constants:
+        return _reject(
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            f"{cls.__name__} takes no activation constants, got {sorted(p.activation_constants)}",
+        )
+    return None
+
+
 def check_mxfp4_flashinfer_shape(
     cls: type,
     p: MoEProblem,
@@ -199,7 +241,7 @@ def check_mxfp4_flashinfer_shape(
     *,
     weight_alignment: int,
     input_hidden_alignment: int,
-) -> Optional[MoEEligibility]:
+) -> MoEEligibility | None:
     """The quantized FlashInfer leaves' shape gate: no bias, then alignment.
 
     Bundled rather than folded into
@@ -207,11 +249,9 @@ def check_mxfp4_flashinfer_shape(
     shares the alignment rule but answers about bias through
     ``swiglu_gptoss_style``.
     """
-    if p.bias:
-        return _reject(
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{cls.__name__} takes no expert bias on the FlashInfer provider",
-        )
+    bias_verdict = check_no_expert_bias(cls, p)
+    if bias_verdict is not None:
+        return bias_verdict
     return check_flashinfer_shard_alignment(
         cls,
         p,
@@ -228,10 +268,10 @@ def nvfp4_needs_padded_method(activation_type: ActivationType, has_alpha_constan
     problem, ``_get_quant_method`` of the instance -- so that a configuration
     cannot be admitted by one and laid out by the other.
     """
-    return (
-        has_alpha_constant
-        or activation_type is ActivationType.SiTu
-        or activation_type in (ActivationType.Relu2, ActivationType.Silu)
+    return has_alpha_constant or activation_type in (
+        ActivationType.SiTu,
+        ActivationType.Relu2,
+        ActivationType.Silu,
     )
 
 
@@ -244,10 +284,10 @@ def identity_quant_of(cls: type) -> str:
     return cls.descriptor.identity.quant
 
 
-def check_quant_matches_identity(cls: type, p: MoEProblem) -> Optional[MoEEligibility]:
+def check_quant_matches_identity(cls: type, p: MoEProblem) -> MoEEligibility | None:
     """Reject any format other than the one in this leaf's own identity."""
     expected = identity_quant_of(cls)
-    actual = normalize_quant(p.quant)
+    actual = p.identity_quant
     if actual != expected:
         return _reject(
             MoERejectReason.QUANT_UNSUPPORTED,
@@ -257,7 +297,7 @@ def check_quant_matches_identity(cls: type, p: MoEProblem) -> Optional[MoEEligib
 
 
 def check_trtllm_gen_leaf(
-    cls: type, p: MoEProblem, d: MoEDeployment, *provider_gates: Optional[MoEEligibility]
+    cls: type, p: MoEProblem, d: MoEDeployment, *provider_gates: MoEEligibility | None
 ) -> MoEEligibility:
     """Compose one leaf's verdict: identity, shared capability, then provider.
 

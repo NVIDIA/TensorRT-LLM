@@ -12,19 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Everything TRTLLM-Gen: the eleven registered leaves and the layers under them.
+"""Everything TRTLLM-Gen: the registered leaves and the layers under them.
 
 Self-contained, so the ``..fused_moe_trtllm_gen`` module path above it holds
 nothing but the ``TRTLLMGenFusedMoE`` name. Bottom to top:
 
 * :mod:`.identity` -- the provider / technique / kernel strings, the two
-  published contracts, the provider trait classes, and the descriptor factory.
-* :mod:`.base` -- :class:`.TrtllmGenFusedMoEBase`, the abstract root all eleven
-  share. Reads the two axes as leaf-declared attributes, never branches on
+  published contracts, and the descriptor factory.
+* :mod:`.base` -- :class:`.TrtllmGenFusedMoEBase`, the abstract root every leaf
+  shares. Reads the two axes as leaf-declared attributes, never branches on
   ``quant_config`` or the provider string.
 * :mod:`.fp4_block_scale` and :mod:`.fp8_block_scale` -- one module per kernel
-  ABI, each holding ``run_moe`` plus a class per format that calls it. Three
-  formats share the fp4 kernel; the fp8 one stands alone.
+  ABI, each holding ``run_moe`` plus a class per format that calls it.
+  Several formats share the fp4 kernel; the fp8 one stands alone.
 * :mod:`.eligibility` -- the checks each ``can_implement`` composes.
 * :mod:`.kernel_inputs` -- the ``run_moe`` prologue, as free functions.
 
@@ -37,8 +37,6 @@ providers; W4A8_NVFP4_FP8 and W4A8_MXFP4_FP8 are native-only, and the
 unquantized bf16 path is FlashInfer-only.
 """
 
-from typing import Optional
-
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ..impl_contract import canonical_quant, normalize_quant
@@ -48,6 +46,8 @@ from .eligibility import (
     check_flashinfer_provider,
     check_flashinfer_shard_alignment,
     check_mxfp4_flashinfer_shape,
+    check_no_activation_constants,
+    check_no_expert_bias,
     check_quant_matches_identity,
     check_trtllm_gen_capabilities,
     check_trtllm_gen_leaf,
@@ -72,8 +72,6 @@ from .identity import (
     TECHNIQUE_TRTLLM_GEN,
     TRTLLM_GEN_CAPABILITIES,
     TRTLLM_GEN_INPUT_REQUIREMENT,
-    FlashinferProviderTraits,
-    TrtllmProviderTraits,
     trtllm_gen_descriptor,
 )
 from .trtllm_fp8_block_scales import TrtllmTrtllmGenFp8BlockScalesImpl
@@ -84,7 +82,7 @@ from .trtllm_w4a8_nvfp4_fp8 import TrtllmTrtllmGenW4a8Nvfp4Fp8Impl
 from .trtllm_w4a16_mxfp4 import TrtllmTrtllmGenW4a16Mxfp4Impl
 
 
-def trtllm_gen_leaf(quant_algo: Optional[QuantAlgo], *, provider: Optional[str] = None) -> type:
+def trtllm_gen_leaf(quant_algo: QuantAlgo | None, *, provider: str | None = None) -> type:
     """The leaf implementing ``quant_algo``, on ``provider`` when given.
 
     For callers that know the format and want the class rather than a verdict.
@@ -113,14 +111,14 @@ def trtllm_gen_leaf(quant_algo: Optional[QuantAlgo], *, provider: Optional[str] 
     )
 
 
-def _providers_to_try(provider: Optional[str]) -> tuple:
+def _providers_to_try(provider: str | None) -> tuple:
     """The providers a lookup walks, in the order it walks them."""
     return (provider,) if provider is not None else (PROVIDER_TRTLLM, PROVIDER_FLASHINFER)
 
 
 def find_trtllm_gen_leaf(
-    quant_algo: Optional[QuantAlgo], *, provider: Optional[str] = None
-) -> Optional[type]:
+    quant_algo: QuantAlgo | None, *, provider: str | None = None
+) -> type | None:
     """The leaf implementing ``quant_algo``, or ``None`` if none publishes it.
 
     Goes through the registry rather than a table of its own, so a leaf that is
@@ -139,6 +137,29 @@ def find_trtllm_gen_leaf(
     return None
 
 
+def trtllm_gen_leaves_in_resolution_order(quant_algo: QuantAlgo | None) -> tuple[type, ...]:
+    """The leaves a resolution walk would try for a format, in its order.
+
+    For a caller asking "would a run serve this?" rather than "which class
+    implements this format?". ``IMPL_PRIORITY`` ranks each FlashInfer leaf
+    ahead of its native sibling and the opt-in flag is what makes the
+    FlashInfer ones reject, so resolution falls through to the native leaf on a
+    *rejection* and not only on an absent leaf. A caller that picks one class
+    and asks it cannot reproduce that, whichever provider it picks first.
+
+    Shorter than two entries where only one provider publishes the format.
+    """
+    quant = normalize_quant(canonical_quant(quant_algo))
+    leaves = []
+    for provider in (PROVIDER_FLASHINFER, PROVIDER_TRTLLM):
+        cls = MOE_IMPL_REGISTRY.lookup(
+            MoEImplId(provider, TECHNIQUE_TRTLLM_GEN, KERNEL_FUSED_MOE, quant)
+        )
+        if cls is not None:
+            leaves.append(cls)
+    return tuple(leaves)
+
+
 __all__ = [
     # trtllm provider
     "TrtllmTrtllmGenNvfp4Impl",
@@ -155,8 +176,6 @@ __all__ = [
     "FlashinferTrtllmGenBf16Impl",
     # shared layers
     "TrtllmGenFusedMoEBase",
-    "TrtllmProviderTraits",
-    "FlashinferProviderTraits",
     "TRTLLMGenFp4BlockScaleBase",
     "TRTLLMGenNvfp4Base",
     "TRTLLMGenW4a16Mxfp4Base",
@@ -171,6 +190,7 @@ __all__ = [
     "TRTLLM_GEN_INPUT_REQUIREMENT",
     "trtllm_gen_leaf",
     "find_trtllm_gen_leaf",
+    "trtllm_gen_leaves_in_resolution_order",
     "trtllm_gen_descriptor",
     "check_trtllm_gen_leaf",
     "check_trtllm_gen_capabilities",
@@ -178,5 +198,7 @@ __all__ = [
     "check_flashinfer_provider",
     "check_flashinfer_shard_alignment",
     "check_mxfp4_flashinfer_shape",
+    "check_no_activation_constants",
+    "check_no_expert_bias",
     "nvfp4_needs_padded_method",
 ]

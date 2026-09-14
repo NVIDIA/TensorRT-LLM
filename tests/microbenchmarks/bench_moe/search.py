@@ -42,7 +42,7 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from .backend import MoeBackendType, find_backend_class
+from .backend import MoeBackendType, find_backend_classes
 from .mapping import (
     _resolve_mapping_layout,
     default_hybrid_parallel_modes,
@@ -115,16 +115,17 @@ def _check_backend_can_implement(
         backend_type = MoeBackendType(backend_str.upper())
     except ValueError as exc:
         return False, f"unknown MoE backend {backend_str!r}: {exc}"
-    # ``find_backend_class``, not ``get_backend_class``: "TRTLLM publishes no
+    # ``find_backend_classes``, not ``get_backend_class``: "TRTLLM publishes no
     # leaf for this format" is a pruning answer, not an unknown backend name.
+    env = collect_moe_environment()
     # The broad ``except`` stays because the lookup lazy-imports backend
     # modules, so a missing optional wheel should cost the candidates that
     # need it rather than kill the sweep before it benchmarks anything.
     try:
-        backend_cls = find_backend_class(backend_type, quant_algo)
+        candidates = find_backend_classes(backend_type, quant_algo)
     except (ImportError, KeyError, RuntimeError, ValueError) as exc:
         return False, f"{backend_str} lookup failed: {type(exc).__name__}: {exc}"
-    if backend_cls is None:
+    if not candidates:
         quant = normalize_quant(canonical_quant(quant_algo))
         return False, f"no {backend_str} implementation for quant={quant}"
     problem = MoEProblem(
@@ -141,15 +142,23 @@ def _check_backend_can_implement(
         parallel_size=1,
         use_dp=False,
         num_slots=0,
-        env=collect_moe_environment(),
+        env=env,
     )
-    try:
-        verdict = backend_cls.can_implement(problem, deployment)
-    except Exception as exc:
-        return False, (f"{backend_cls.__name__}.can_implement raised {type(exc).__name__}: {exc}")
-    if verdict.eligible:
-        return True, None
-    return False, f"{verdict.reject_reason.value}: {verdict.detail}"
+    reason = None
+    for backend_cls in candidates:
+        try:
+            verdict = backend_cls.can_implement(problem, deployment)
+        except Exception as exc:
+            return False, (
+                f"{backend_cls.__name__}.can_implement raised {type(exc).__name__}: {exc}"
+            )
+        if verdict.eligible:
+            return True, None
+        # The last candidate's reason, not the first: without the opt-in flag
+        # every FlashInfer leaf rejects for the flag alone, which says nothing
+        # about why the configuration is unrunnable.
+        reason = f"{verdict.reject_reason.value}: {verdict.detail}"
+    return False, reason
 
 
 def _expand_axis(values: Iterable[Any], default: Any) -> Tuple[Any, ...]:

@@ -129,7 +129,7 @@ def create_moe_backend(
         )
 
     # ``issubclass``, not ``==``: ``TRTLLMGenFusedMoE`` is the family name and
-    # resolution hands over one of the eleven leaves, so an equality check
+    # resolution hands over one of the leaves, so an equality check
     # would miss all of them and fall through to the raise below.
     if issubclass(moe_cls, TRTLLMGenFusedMoE):
         return moe_cls(

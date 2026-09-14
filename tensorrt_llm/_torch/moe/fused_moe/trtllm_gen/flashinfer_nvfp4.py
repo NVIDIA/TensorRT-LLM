@@ -14,23 +14,22 @@
 # limitations under the License.
 """``flashinfer.trtllm_gen.fused_moe.nvfp4``."""
 
-from typing import Optional
-
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
 from ..quantization import NVFP4TRTLLMGenFusedMoEMethod
 from .eligibility import (
     check_flashinfer_provider,
     check_mxfp4_flashinfer_shape,
+    check_no_expert_bias,
     check_trtllm_gen_leaf,
     nvfp4_needs_padded_method,
 )
 from .fp4_block_scale import TRTLLMGenNvfp4Base
-from .identity import PROVIDER_FLASHINFER, FlashinferProviderTraits, trtllm_gen_descriptor
+from .identity import PROVIDER_FLASHINFER, trtllm_gen_descriptor
 
 
 @register_moe_impl
-class FlashinferTrtllmGenNvfp4Impl(FlashinferProviderTraits, TRTLLMGenNvfp4Base):
+class FlashinferTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     """``flashinfer.trtllm_gen.fused_moe.nvfp4``."""
 
     descriptor = trtllm_gen_descriptor(
@@ -40,11 +39,19 @@ class FlashinferTrtllmGenNvfp4Impl(FlashinferProviderTraits, TRTLLMGenNvfp4Base)
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_trtllm_gen_leaf(
-            cls, p, d, check_flashinfer_provider(cls, p, d), cls._check_shape(p, d)
+            cls,
+            p,
+            d,
+            check_flashinfer_provider(cls, p, d),
+            # Alongside the shape gate rather than inside it: this leaf's shape
+            # gate abstains for the unpadded method, and bias is rejected for
+            # both methods.
+            check_no_expert_bias(cls, p),
+            cls._check_shape(p, d),
         )
 
     @classmethod
-    def _check_shape(cls, p: MoEProblem, d: MoEDeployment) -> Optional[MoEEligibility]:
+    def _check_shape(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility | None:
         """Alignment gate, and only for the padded quant method.
 
         The unpadded ``NVFP4TRTLLMGenFusedMoEBaseMethod`` lays out any shape,

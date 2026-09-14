@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-style FP8 with 1x128 block scales, the format under two leaves.
+"""DeepSeek-style FP8 with 1x128 block scales, served on both providers.
 
 ``run_fp8_block_scale_moe`` is its own kernel ABI, and this format is also the
 only one that narrows the family's activation support and the only one whose
@@ -22,12 +22,12 @@ quant layer.
 """
 
 from dataclasses import replace
-from typing import Optional, Union
 
 import torch
 
-from ....model_config import ModelConfig
-from ....modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
 from ..activation import ActivationParamShape, MoEActivationSupport
 from ..impl_contract import MoERunContext
 from ..impl_environment import MoEEnvFlag, collect_moe_environment
@@ -101,7 +101,7 @@ class TRTLLMGenFp8BlockScalesBase(TrtllmGenFusedMoEBase):
         """This format's method sizes the expert dimension for the fused slots."""
         self.quant_method.create_weights(self, self.num_fused_shared_expert)
 
-    def fuse_shared_expert(self, shared_experts: GatedMLP):
+    def fuse_shared_expert(self, shared_experts: GatedMLP) -> None:
         assert self._weights_created
         self.quant_method.fuse_shared_expert(self, shared_experts, self.num_fused_shared_expert)
 
@@ -116,18 +116,20 @@ class TRTLLMGenFp8BlockScalesBase(TrtllmGenFusedMoEBase):
             f"{type(self).__name__} takes no expert bias and no swiglu alpha/beta constants."
         )
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         return DeepSeekFP8BlockScalesFusedMoEMethod()
 
-    def quantize_input(self, x, post_quant_comm: bool = True):
+    def quantize_input(
+        self, x: torch.Tensor, post_quant_comm: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return x, None
 
     def run_moe(
         self,
         ctx: MoERunContext,
         *,
-        workspace: Optional[dict] = None,
-    ) -> Union[torch.Tensor, tuple]:
+        workspace: dict | None = None,
+    ) -> torch.Tensor | tuple:
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
 

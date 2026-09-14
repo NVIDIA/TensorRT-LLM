@@ -24,14 +24,16 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
     MoEActivationSupport,
+    SiTuActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import _BACKEND_SYNC_ATTRS, ConfigurableMoE
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-# Every test here drives ``create_weights`` with construction stubbed out, so
-# nothing allocates. The marker is also what makes the file reachable: the CPU
-# stage lists this directory but collects only files that carry it.
+# Nothing here allocates: the quant-config tests drive ``create_weights`` with
+# construction stubbed out, and the activation test only builds a carrier. The
+# marker is also what makes the file reachable: the CPU stage lists this
+# directory but collects only files that carry it.
 pytestmark = pytest.mark.cpu_only
 
 
@@ -168,3 +170,19 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     assert wrapper.quant_config.quant_algo is None
     assert backend.quant_config.quant_algo is None
     backend.create_weights.assert_called_once_with()
+
+
+@pytest.mark.parametrize("missing", ["gate_softcap", "linear_softcap"])
+def test_situ_activation_rejects_a_missing_soft_cap(missing: str) -> None:
+    """Absence is a rejection for a soft cap, unlike for a clamp.
+
+    ``swiglu_limit`` has a value that encodes "unclamped", so omitting it is
+    how a caller asks for plain SwiGLU. A soft cap has no such value -- the
+    kernel divides by it -- so the two neighbouring constants cannot be given
+    one rule.
+    """
+    caps = {"gate_softcap": 1.0, "linear_softcap": 1.0}
+    caps[missing] = None
+
+    with pytest.raises(ValueError, match=f"SiTu {missing}"):
+        SiTuActivation(**caps)

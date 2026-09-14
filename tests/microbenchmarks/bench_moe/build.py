@@ -55,7 +55,7 @@ def _backend_name_from_module(moe) -> str:
     Read off ``BACKEND_FAMILY``, which is the table resolution itself uses, so
     a backend that gains or splits classes stays labelled without an edit
     here. A hand-written class-name table used to do this and went stale the
-    moment TRTLLM-Gen became eleven classes.
+    moment TRTLLM-Gen split into one class per identity.
     """
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import backend_family_of
 

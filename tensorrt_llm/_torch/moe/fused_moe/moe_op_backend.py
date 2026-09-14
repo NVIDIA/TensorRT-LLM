@@ -22,12 +22,16 @@ so the argument marshalling in ``trtllm_gen/fp4_block_scale.py`` and
 ``trtllm_gen/fp8_block_scale.py`` can be written once per weight format and
 shared by that format's native and FlashInfer leaves.
 
-Follow-up: this is a vtable, not a factory. Provider choice now happens in
-``can_implement`` plus ``IMPL_PRIORITY``, so ``get_op_backend(self.provider)``
-is a constant of the leaf class and the leaf ends up resolving
-(provider, format) twice -- once through its MRO, once through this object.
-Collapsing the two means moving these methods onto the provider traits in
-``trtllm_gen/identity.py``, which touches every kernel call site.
+Follow-up (TRTLLM-16387): this is a vtable, not a factory. Provider choice now
+happens in ``can_implement`` plus ``IMPL_PRIORITY``, so
+``get_op_backend(self.provider)`` is a constant of the leaf class, and the
+provider is already settled by the leaf's identity before this object is
+built. Collapsing the two means giving each provider one class that holds
+these methods and having a leaf inherit it, which touches every kernel call
+site. An earlier plan named the provider traits in ``trtllm_gen/identity.py``
+as that class; those were value-only and have since been folded into
+``TrtllmGenFusedMoEBase.__init_subclass__``, so the collapse now has to
+introduce the per-provider class rather than extend one.
 """
 
 import os

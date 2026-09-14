@@ -16,15 +16,15 @@
 
 Free functions taking the impl as a parameter, not methods on
 :class:`.TrtllmGenFusedMoEBase`: nothing here is part of what a MoE
-implementation *is*, it is the prologue the five ``run_moe`` bodies share.
+implementation *is*, it is the prologue the ``run_moe`` bodies share.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Union
 
 import torch
 
-from ....utils import ActivationType, ActType_TrtllmGen, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import ActivationType, ActType_TrtllmGen, Fp4QuantizedTensor
+
 from ..impl_contract import MoERunContext, require_comm_plan
 from ..routing import (
     BaseMoeRoutingMethod,
@@ -49,10 +49,10 @@ _TRTLLM_GEN_ACT_TYPE = {
 @dataclass
 class RoutingParams:
     top_k: int
-    routing_bias: Optional[torch.Tensor]
-    n_group: Optional[int]
-    topk_group: Optional[int]
-    routed_scaling_factor: Optional[float]
+    routing_bias: torch.Tensor | None
+    n_group: int | None
+    topk_group: int | None
+    routed_scaling_factor: float | None
 
 
 @dataclass
@@ -66,18 +66,18 @@ class KernelInputs:
     rather than in each body.
     """
 
-    x: Union[torch.Tensor, Fp4QuantizedTensor]
-    x_sf: Optional[torch.Tensor]  # flattened to 1D for the kernel ABI
-    router_logits: Optional[torch.Tensor]  # None when top-k is precomputed
-    token_selected_experts: Optional[torch.Tensor]
-    token_final_scales: Optional[torch.Tensor]
-    moe_output: Optional[torch.Tensor]
+    x: torch.Tensor | Fp4QuantizedTensor
+    x_sf: torch.Tensor | None  # flattened to 1D for the kernel ABI
+    router_logits: torch.Tensor | None  # None when top-k is precomputed
+    token_selected_experts: torch.Tensor | None
+    token_final_scales: torch.Tensor | None
+    moe_output: torch.Tensor | None
     do_finalize: bool
     top_k: int
-    routing_bias: Optional[torch.Tensor]
-    n_group: Optional[int]
-    topk_group: Optional[int]
-    routed_scaling_factor: Optional[float]
+    routing_bias: torch.Tensor | None
+    n_group: int | None
+    topk_group: int | None
+    routed_scaling_factor: float | None
 
 
 def to_trtllm_gen_act_type(activation_type: ActivationType) -> int:
@@ -88,7 +88,7 @@ def to_trtllm_gen_act_type(activation_type: ActivationType) -> int:
     return int(act_type)
 
 
-def get_data_or_none(module: torch.nn.Module, attr_name: str) -> Optional[torch.Tensor]:
+def get_data_or_none(module: torch.nn.Module, attr_name: str) -> torch.Tensor | None:
     """``module.<attr>.data``, or ``None`` if the parameter was never created.
 
     Several scale tensors exist only for some quantization formats, and the

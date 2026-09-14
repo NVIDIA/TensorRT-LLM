@@ -148,6 +148,25 @@ class MoEProblem:
         return QuantAlgo(self.quant)
 
     @property
+    def identity_quant(self) -> str:
+        """``quant`` as an identity's ``quant`` segment spells it.
+
+        Folds the calibration aliases, because the leaf lookups do: a gate
+        comparing a problem against an identity has to agree with the lookup
+        that maps the problem there, or the leaf turns down a format it is the
+        registered implementation of.
+
+        Tolerant of a ``quant`` that is not a ``QuantAlgo`` value: such a
+        string cannot be an alias, so it normalizes as it stands. A gate owes
+        its caller a verdict, not an exception.
+        """
+        try:
+            algo = self.quant_algo
+        except ValueError:
+            return normalize_quant(self.quant)
+        return normalize_quant(canonical_quant(algo))
+
+    @property
     def is_fully_specified(self) -> bool:
         """Whether this problem can key a persisted tuning result."""
         return None not in (self.hidden_size, self.intermediate_size, self.num_experts, self.top_k)

@@ -65,8 +65,11 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod, RoutingMethodType
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
+    FlashinferTrtllmGenBf16Impl,
     FlashinferTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    trtllm_gen_leaves_in_resolution_order,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.eligibility import check_flashinfer_provider
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -353,7 +356,14 @@ def test_trtllm_gen_identity_round_trips_through_registry(impl_id):
 
 @pytest.mark.parametrize("impl_id", _TRTLLM_GEN_IDS)
 def test_trtllm_gen_leaf_provider_agrees_with_its_identity(impl_id):
-    """``provider`` is the op-backend key and the id segment, so it is one value."""
+    """``provider`` is the op-backend key and the id segment, so it is one value.
+
+    Derived from the descriptor by ``__init_subclass__``, so this guards the
+    derivation rather than two hand-written declarations: a leaf that lands
+    outside the hook -- registered without a descriptor of its own, or built
+    by something that bypasses class creation -- would read the wrong
+    provider and pick the wrong op backend.
+    """
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     assert impl.provider == impl.descriptor.identity.provider
     assert impl.use_flashinfer == (impl.provider == "flashinfer")
@@ -523,6 +533,149 @@ def test_flashinfer_leaves_report_dep_missing_without_the_wheel():
         )
         assert not verdict.eligible
         assert verdict.reject_reason is MoERejectReason.DEP_MISSING
+
+
+@pytest.mark.parametrize(
+    "activation_constants",
+    [frozenset(), frozenset({"alpha"})],
+    ids=["unpadded_method", "padded_method"],
+)
+def test_flashinfer_nvfp4_declines_expert_bias_under_either_quant_method(activation_constants):
+    """Bias is a provider capability, so the shape gate cannot be its only home.
+
+    Which quant method this leaf picks depends on the activation constants,
+    and only one of the two goes through the shape gate. A bias answered there
+    alone is answered for half the problems, and the other half reaches an
+    ``__init__`` assert after resolution already named a winner.
+
+    Distinct from ``swiglu_gptoss_style``: that is the bias-plus-alpha-beta
+    package, and neither case here declares it.
+    """
+    verdict = FlashinferTrtllmGenNvfp4Impl.can_implement(
+        MoEProblem(
+            quant="NVFP4",
+            dtype_act=torch.bfloat16,
+            bias=True,
+            activation_constants=activation_constants,
+        ),
+        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+# The leaves whose runner reads no expert bias. Three because the FlashInfer
+# provider passes none for any quantized format, three because the fp8/fp4
+# activation cubins take none on either provider, and the unquantized one
+# because its FlashInfer runner is the same.
+_NO_EXPERT_BIAS_IDS = (
+    "flashinfer.trtllm_gen.fused_moe.nvfp4",
+    "flashinfer.trtllm_gen.fused_moe.w4a16_mxfp4",
+    "flashinfer.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
+    "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
+    "flashinfer.trtllm_gen.fused_moe.fp8_block_scales",
+    "trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8",
+    "flashinfer.trtllm_gen.fused_moe.none",
+)
+
+
+@pytest.mark.parametrize("impl_id", _NO_EXPERT_BIAS_IDS)
+def test_trtllm_gen_leaves_without_a_bias_runner_decline_during_selection(impl_id):
+    """A plain expert bias has to be a verdict, not a construction assert.
+
+    ``capabilities.supports_expert_bias`` is one declaration shared by the
+    whole family, and ``create_moe`` reads it against the class resolution
+    already picked -- so a leaf answering only there is chosen and then
+    refuses, with no chance for a sibling that can serve to be tried instead.
+
+    Distinct from ``swiglu_gptoss_style``, which is the bias-plus-alpha-beta
+    package: none of these problems declares it, and a checkpoint can carry a
+    plain bias without it.
+    """
+    impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+    quant = impl.descriptor.identity.quant
+    verdict = impl.can_implement(
+        MoEProblem(
+            quant=None if quant == "none" else quant.upper(),
+            dtype_act=torch.bfloat16,
+            bias=True,
+        ),
+        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+# The leaves whose runner reads no activation constant: their cubins have no
+# parameter for alpha, beta or the clamp and pin ``act_type``.
+_NO_ACTIVATION_CONSTANT_LEAVES = (
+    TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    FlashinferTrtllmGenBf16Impl,
+)
+
+
+@pytest.mark.parametrize(
+    "impl", _NO_ACTIVATION_CONSTANT_LEAVES, ids=lambda c: c.descriptor.identity.canonical()
+)
+@pytest.mark.parametrize("constant", ["clamp", "alpha"])
+def test_leaves_without_constant_support_decline_during_selection(impl, constant):
+    """A lone clamp is not the gpt-oss package, and has to be its own verdict.
+
+    ``swiglu_gptoss_style`` sees bias plus alpha and beta as one package, and
+    the clamp is not in it at all, so a checkpoint carrying only a clamp gets
+    past that gate. Answering it in ``_check_configs`` alone means resolution
+    names a winner and construction then asserts -- and for bf16 it forecloses
+    the fall back to ``CutlassFusedMoE`` that would have served the case.
+    """
+    quant = impl.descriptor.identity.quant
+    verdict = impl.can_implement(
+        MoEProblem(
+            quant=None if quant == "none" else quant.upper(),
+            dtype_act=torch.bfloat16,
+            activation_constants=frozenset({constant}),
+        ),
+        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)),
+    )
+
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+@pytest.mark.parametrize("alias", [QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC])
+def test_nvfp4_leaves_admit_the_calibration_aliases(alias):
+    """The identity gate has to fold the aliases its own lookup folds.
+
+    ``find_trtllm_gen_leaf`` maps NVFP4_AWQ and NVFP4_ARC onto the ``nvfp4``
+    leaf -- the recipes differ in calibration, the weights and the kernel do
+    not. A gate comparing the raw string would have that leaf turn down the
+    format it is the registered implementation of.
+    """
+    verdict = TrtllmTrtllmGenNvfp4Impl.can_implement(
+        MoEProblem(quant=alias.value, dtype_act=torch.bfloat16),
+        _single_rank_deployment(_trtllm_gen_environment()),
+    )
+
+    assert verdict.eligible, verdict.detail
+
+
+def test_resolution_order_lists_flashinfer_before_its_native_sibling():
+    """Filtering callers need resolution's order, not a lookup's.
+
+    ``IMPL_PRIORITY`` ranks each FlashInfer leaf ahead of its native sibling
+    and the opt-in flag is what makes the FlashInfer ones reject, so a caller
+    asking "would a run serve this?" has to walk both and fall through on a
+    rejection. Provider-exclusive formats yield the one leaf that exists.
+    """
+    assert trtllm_gen_leaves_in_resolution_order(QuantAlgo.NVFP4) == (
+        FlashinferTrtllmGenNvfp4Impl,
+        TrtllmTrtllmGenNvfp4Impl,
+    )
+    assert trtllm_gen_leaves_in_resolution_order(None) == (FlashinferTrtllmGenBf16Impl,)
+    assert trtllm_gen_leaves_in_resolution_order(QuantAlgo.W4A8_NVFP4_FP8) == (
+        TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
+    )
 
 
 # The two native leaves whose cubin family has a fused SiTu FC1 epilogue:

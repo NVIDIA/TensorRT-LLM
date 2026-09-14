@@ -16,13 +16,13 @@
 
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
-from .eligibility import check_flashinfer_provider, check_trtllm_gen_leaf
+from .eligibility import check_flashinfer_provider, check_no_expert_bias, check_trtllm_gen_leaf
 from .fp8_block_scale import TRTLLMGenFp8BlockScalesBase
-from .identity import PROVIDER_FLASHINFER, FlashinferProviderTraits, trtllm_gen_descriptor
+from .identity import PROVIDER_FLASHINFER, trtllm_gen_descriptor
 
 
 @register_moe_impl
-class FlashinferTrtllmGenFp8BlockScalesImpl(FlashinferProviderTraits, TRTLLMGenFp8BlockScalesBase):
+class FlashinferTrtllmGenFp8BlockScalesImpl(TRTLLMGenFp8BlockScalesBase):
     """``flashinfer.trtllm_gen.fused_moe.fp8_block_scales``.
 
     No alignment gate: the padding rules belong to the FP4 weight layouts, and
@@ -37,4 +37,6 @@ class FlashinferTrtllmGenFp8BlockScalesImpl(FlashinferProviderTraits, TRTLLMGenF
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        return check_trtllm_gen_leaf(cls, p, d, check_flashinfer_provider(cls, p, d))
+        return check_trtllm_gen_leaf(
+            cls, p, d, check_flashinfer_provider(cls, p, d), check_no_expert_bias(cls, p)
+        )

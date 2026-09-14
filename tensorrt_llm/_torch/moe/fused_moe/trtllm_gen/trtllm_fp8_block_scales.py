@@ -16,13 +16,13 @@
 
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
-from .eligibility import check_trtllm_gen_leaf
+from .eligibility import check_no_expert_bias, check_trtllm_gen_leaf
 from .fp8_block_scale import TRTLLMGenFp8BlockScalesBase
-from .identity import PROVIDER_TRTLLM, TrtllmProviderTraits, trtllm_gen_descriptor
+from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
 
 
 @register_moe_impl
-class TrtllmTrtllmGenFp8BlockScalesImpl(TrtllmProviderTraits, TRTLLMGenFp8BlockScalesBase):
+class TrtllmTrtllmGenFp8BlockScalesImpl(TRTLLMGenFp8BlockScalesBase):
     """``trtllm.trtllm_gen.fused_moe.fp8_block_scales``.
 
     ``supports_gptoss_style`` stays False: this format's separate-activation
@@ -37,4 +37,4 @@ class TrtllmTrtllmGenFp8BlockScalesImpl(TrtllmProviderTraits, TRTLLMGenFp8BlockS
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        return check_trtllm_gen_leaf(cls, p, d)
+        return check_trtllm_gen_leaf(cls, p, d, check_no_expert_bias(cls, p))

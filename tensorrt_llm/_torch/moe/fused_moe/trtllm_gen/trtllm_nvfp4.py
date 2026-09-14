@@ -18,11 +18,11 @@ from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
 from .eligibility import check_trtllm_gen_leaf
 from .fp4_block_scale import TRTLLMGenNvfp4Base
-from .identity import PROVIDER_TRTLLM, TrtllmProviderTraits, trtllm_gen_descriptor
+from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
 
 
 @register_moe_impl
-class TrtllmTrtllmGenNvfp4Impl(TrtllmProviderTraits, TRTLLMGenNvfp4Base):
+class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     """``trtllm.trtllm_gen.fused_moe.nvfp4``."""
 
     descriptor = trtllm_gen_descriptor(

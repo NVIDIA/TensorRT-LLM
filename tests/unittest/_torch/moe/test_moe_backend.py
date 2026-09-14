@@ -59,6 +59,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     MoEActivation,
     SiTuActivation,
     SwigluActivation,
+    SwigluBiasActivation,
     materialize_activation_params,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency

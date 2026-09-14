@@ -14,21 +14,19 @@
 # limitations under the License.
 """``trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8``."""
 
-from typing import Optional, Union
-
 import torch
 
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERunContext
 from ..impl_identity import register_moe_impl
 from ..quantization import W4A8NVFP4FP8TRTLLMGenFusedMoEMethod
 from .base import TrtllmGenFusedMoEBase
-from .eligibility import check_trtllm_gen_leaf
-from .identity import PROVIDER_TRTLLM, TrtllmProviderTraits, trtllm_gen_descriptor
+from .eligibility import check_no_activation_constants, check_no_expert_bias, check_trtllm_gen_leaf
+from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
 from .kernel_inputs import prepare_kernel_inputs
 
 
 @register_moe_impl
-class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmProviderTraits, TrtllmGenFusedMoEBase):
+class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmGenFusedMoEBase):
     """``trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8``.
 
     Single-provider, so there is no per-quant parent, and it calls its runner
@@ -46,7 +44,13 @@ class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmProviderTraits, TrtllmGenFusedMoEBas
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        return check_trtllm_gen_leaf(cls, p, d)
+        return check_trtllm_gen_leaf(
+            cls,
+            p,
+            d,
+            check_no_expert_bias(cls, p),
+            check_no_activation_constants(cls, p),
+        )
 
     def _check_configs(self) -> None:
         """No FC bias, no SwiGLU constants, no clamp: the runner takes none.
@@ -68,10 +72,12 @@ class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmProviderTraits, TrtllmGenFusedMoEBas
             f"constants, and no activation clamp."
         )
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         return W4A8NVFP4FP8TRTLLMGenFusedMoEMethod()
 
-    def quantize_input(self, x, post_quant_comm: bool = True):
+    def quantize_input(
+        self, x: torch.Tensor, post_quant_comm: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
             x, 1.0 / self.fc31_input_scale
         )
@@ -81,8 +87,8 @@ class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmProviderTraits, TrtllmGenFusedMoEBas
         self,
         ctx: MoERunContext,
         *,
-        workspace: Optional[dict] = None,
-    ) -> Union[torch.Tensor, tuple]:
+        workspace: dict | None = None,
+    ) -> torch.Tensor | tuple:
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
 
