@@ -580,7 +580,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         at K's base, then slices ``[:, :2]`` to extract K+V. The slice
         preserves the dim-0 stride (``scale * page_stride``), so
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
-        When omitted, ``kv_layout`` follows the selected sparse backend.
         """
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, kv_layout
@@ -588,6 +587,32 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
+
+    def get_kv_subpage_pool(
+        self, layer_idx: int, kv_layout: str = "HND"
+    ) -> Tuple[torch.Tensor, int]:
+        """Return (flat_pool, subpages_per_slot) for flat-block consumers.
+
+        trtllm-gen addresses K and V pages independently, through a
+        [batch, 2, max_blocks] block table into one flat
+        [num_subpages, *page_shape] pool. That is expressible here even though
+        the per-layer stride is not uniform: a slot packs scale equal-sized
+        sub-pages, of which this layer owns two adjacent ones, so rooting the
+        flat pool at this layer's K puts slot s's K at s * scale and its V at
+        s * scale + 1.
+
+        The view stops two sub-pages past the last slot's K rather than
+        spanning num_slots * scale, which would run off the pool by whatever
+        this layer's K offset is inside a slot.
+        """
+        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
+            layer_idx, kv_layout
+        )
+        num_subpages = (num_slots - 1) * scale + 2
+        flat = convert_to_torch_tensor(
+            TensorWrapper(addr_key, torch_dtype, [num_subpages, *page_shape])
+        )
+        return flat, scale
 
     def _kv_pool_mapping_offset(self, layer_id, layer_group_id, key_base_addr) -> int:
         """Pool-mapping offset from the layer's physical position in its pool.

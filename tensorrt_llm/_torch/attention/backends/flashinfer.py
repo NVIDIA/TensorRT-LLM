@@ -1861,6 +1861,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         kv_lens_buf[self.num_generations:batch_size].zero_()
 
         # Refresh captured FA2 schedules only after all page metadata updates.
+        # Under CUDA graphs every non-trtllm-gen decode wrapper carries
+        # fa2_plan_num_blocks, so this is what keeps replayed plans current;
+        # the deferral below only affects wrappers without a recorded tuple.
         # Defer ordinary multi-wrapper plans to forward_impl; single-wrapper
         # models still plan eagerly because forward_impl cannot plan during
         # graph capture.
@@ -2122,7 +2125,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 q_len_per_req=plan_params.q_len_per_req,
                 disable_split_kv=False,
             )
-            if use_graph_tensor_cores and decode_wrapper._backend == 'fa2':
+            # Graph replay reuses the split-KV schedule plan() computed, so
+            # record the page tuple this decode plan was built for; prepare()
+            # re-plans through _refresh_fa2_cuda_graph_plans() when the
+            # generation page counts change. trtllm-gen is excluded because it
+            # does its own per-step block-table/kv_lens refresh in prepare().
+            if self.is_cuda_graph and decode_wrapper._backend != 'trtllm-gen':
                 wrappers.fa2_plan_num_blocks = tuple(
                     self.num_blocks[self.num_contexts:])
             self._publish_decode_wrapper_kv_lens(decode_wrapper)

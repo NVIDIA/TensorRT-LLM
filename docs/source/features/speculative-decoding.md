@@ -152,7 +152,7 @@ Reference: [DFlash: Distilled Flash Speculative Decoding](https://arxiv.org/pdf/
 * `speculative_model`: Path or HuggingFace model ID for the DFlash draft model.
 * `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
 * `target_layer_ids`: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.
-* `attention_backend`: Cross-attention backend for the draft model. `"VANILLA"` (the default) uses contiguous FlashAttention context K/V. `"TRTLLM"` requires FlashInfer and an NVIDIA Blackwell GPU with SM100 or SM103, and uses TRTLLM-Gen FMHA with a private paged context K/V cache.
+* `attention_backend`: Cross-attention backend for the draft model, independent of the drafter's standard attention modules. `"VANILLA"` (the default) uses FlashAttention with a contiguous context K/V cache and runs anywhere. `"TRTLLM"` uses TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache and supports SM100/SM103 only. `"FA4"` uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.
 
 ```python
 from tensorrt_llm.llmapi import DFlashDecodingConfig
