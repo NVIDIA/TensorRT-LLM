@@ -151,10 +151,10 @@ def test_check_arguments_admits_drafter_modes():
     _check_arguments(spec_config, SamplingParams(min_tokens=16))
 
 
-# The executor-side helper decides these four from py_ fields alone, so a stub
+# The executor-side helper decides these from py_ fields alone, so a stub
 # request is enough. min_p and top_p_decay are decided from the C++
-# SamplingConfig instead and are covered by the frontend cases above plus the
-# shared constants.
+# SamplingConfig instead; their executor branches are exercised through the
+# full validate_request below.
 EXECUTOR_SIDE_CASES = [
     ("min_length", dict(py_min_length=16), UNSUPPORTED_MIN_LENGTH_MSG),
     ("bad_words", dict(py_bad_words=[[7]]), UNSUPPORTED_BAD_WORDS_MSG),
@@ -191,3 +191,79 @@ def test_executor_side_check_rejects_embedding_bias():
     with pytest.raises(ValueError) as excinfo:
         SpecSampler._validate_unsupported_logits_processors(request)
     assert str(excinfo.value) == UNSUPPORTED_EMBEDDING_BIAS_MSG
+
+
+def _executor_request(**sampling_config_overrides) -> types.SimpleNamespace:
+    """A stub LlmRequest for the full ``validate_request`` path.
+
+    ``validate_request`` and the ``_request_get_sampling_params`` helper it
+    reaches through ``top_p_decay_active`` read only these fields; every value
+    is neutral unless overridden.
+    """
+    sampling_config = types.SimpleNamespace(
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        top_p_decay=None,
+        top_p_min=None,
+        top_p_reset_ids=None,
+        beam_width=1,
+        length_penalty=None,
+        beam_search_diversity_rate=None,
+        early_stopping=None,
+        repetition_penalty=None,
+        presence_penalty=None,
+        frequency_penalty=None,
+    )
+    for name, value in sampling_config_overrides.items():
+        setattr(sampling_config, name, value)
+    return types.SimpleNamespace(
+        py_return_context_logits=False,
+        py_return_generation_logits=False,
+        py_return_log_probs=False,
+        py_min_length=None,
+        py_bad_words=None,
+        py_no_repeat_ngram_size=None,
+        py_embedding_bias=None,
+        py_beam_width=1,
+        is_context_init_state=True,
+        get_beam_width_by_iter=lambda for_next_iteration=False: 1,
+        sampling_config=sampling_config,
+    )
+
+
+def _validate_on_executor(request) -> None:
+    """Run the real ``validate_request`` against a minimal sampler stand-in."""
+    sampler = types.SimpleNamespace(
+        _validate_unsupported_logits_processors=(
+            SpecSampler._validate_unsupported_logits_processors
+        ),
+        _enable_penalty=False,
+        _penalty_supported=True,
+    )
+    SpecSampler.validate_request(sampler, request)
+
+
+# min_p and top_p_decay come from the C++ SamplingConfig, not py_ fields, so
+# they need the full validate_request rather than the logits-processor helper.
+# These are the backstops for submission paths that bypass the LLM API: a
+# regression here would return a different (or no) error after stream setup.
+@pytest.mark.cpu_only
+def test_executor_side_check_still_rejects_min_p():
+    with pytest.raises(ValueError) as excinfo:
+        _validate_on_executor(_executor_request(min_p=0.1))
+    assert str(excinfo.value) == UNSUPPORTED_MIN_P_MSG
+
+
+@pytest.mark.cpu_only
+def test_executor_side_check_still_rejects_top_p_decay():
+    with pytest.raises(ValueError) as excinfo:
+        _validate_on_executor(_executor_request(top_p_decay=0.5))
+    assert str(excinfo.value) == UNSUPPORTED_TOP_P_DECAY_MSG
+
+
+@pytest.mark.cpu_only
+def test_executor_side_check_admits_a_neutral_request():
+    """The stub covers every field the path reads; a neutral request passes."""
+    _validate_on_executor(_executor_request())
