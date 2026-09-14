@@ -1286,6 +1286,9 @@ class MTPForCausalLM(nn.Module):
             case "deepseek_v4":
                 from .modeling_deepseekv4 import DeepseekV4MTP
                 mtp_layer = DeepseekV4MTP
+            case "glm5_next" | "glm5_next_text":
+                from .modeling_glm5_next import Glm5NextMTP
+                mtp_layer = Glm5NextMTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")

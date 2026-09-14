@@ -134,7 +134,7 @@ def is_gemma4_hybrid(config):
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
-        is_kimi_linear(config) or is_qwen4_exp(config)
+        is_kimi_linear(config) or is_qwen4_exp(config) or is_glm5_next(config)
 
 
 def is_kimi_linear(config):
@@ -194,6 +194,71 @@ def get_kimi_linear_layer_masks(config):
 
 def get_kimi_linear_num_attention_layers(config):
     full_mask, _ = get_kimi_linear_layer_masks(config)
+    return sum(full_mask)
+
+
+def is_glm5_next(config: transformers.PretrainedConfig) -> bool:
+    """True for GLM-5.3-Flash ("glm5_next") hybrid KDA + sparse-MLA text models.
+
+    Handles both the flattened text config (model_type "glm5_next_text") and
+    the composite VLM config (model_type "glm5_next" with a nested
+    text_config).
+    """
+    model_type = getattr(config, "model_type", None)
+    if model_type == "glm5_next_text":
+        return getattr(config, "layer_types", None) is not None
+    if model_type == "glm5_next":
+        text_config = getattr(config, "text_config", None)
+        return text_config is not None and is_glm5_next(text_config)
+    return False
+
+
+def unwrap_glm5_next_text_config(
+        config: transformers.PretrainedConfig) -> transformers.PretrainedConfig:
+    """Return the flattened GLM-5.3-Flash text config.
+
+    ``is_glm5_next`` accepts both the flattened text config and the composite
+    "glm5_next" config with a nested ``text_config``; consumers read
+    text-level fields (``layer_types``, ``linear_attn_config``,
+    ``kv_lora_rank``, ...), so they must unwrap the composite form first.
+    """
+    if getattr(config, "model_type", None) == "glm5_next":
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            return text_config
+    return config
+
+
+def get_glm5_next_layer_masks(
+        config: transformers.PretrainedConfig) -> tuple[list[bool], list[bool]]:
+    """Return (full_attention_layer_mask, kda_layer_mask) for GLM-5.3-Flash.
+
+    The text config's literal ``layer_types`` list names every decoder layer
+    as exactly one of ``linear_attention`` (KDA) or
+    ``deepseek_sparse_attention`` (sparse MLA + indexer); 34 + 11 on the real
+    checkpoint.
+    """
+    config = unwrap_glm5_next_text_config(config)
+    if len(config.layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            "glm5_next layer_types must contain num_hidden_layers entries")
+    full_mask, kda_mask = [], []
+    for layer_idx, layer_type in enumerate(config.layer_types):
+        is_kda = layer_type == "linear_attention"
+        is_full = layer_type == "deepseek_sparse_attention"
+        if is_kda == is_full:
+            raise ValueError(
+                f"glm5_next layer {layer_idx} must be exactly one of "
+                f"linear_attention / deepseek_sparse_attention; got "
+                f"{layer_type!r}")
+        kda_mask.append(is_kda)
+        full_mask.append(is_full)
+    return full_mask, kda_mask
+
+
+def get_glm5_next_num_attention_layers(
+        config: transformers.PretrainedConfig) -> int:
+    full_mask, _ = get_glm5_next_layer_masks(config)
     return sum(full_mask)
 
 
@@ -583,6 +648,18 @@ def extract_mamba_kv_cache_params(
         n_groups = lin["num_heads"]
         head_dim = lin["head_dim"]
         target_full_attn_mask, mamba_mask = get_kimi_linear_layer_masks(config)
+    elif is_glm5_next(config):
+        # GLM-5.3-Flash KDA state uses the same mamba parametrization as
+        # Kimi K3: [q | k | v] short-conv sections of identical width and an
+        # [H, V, K] fp32 delta-rule recurrent state, with the KDA geometry
+        # coming from the text config's linear_attn_config.
+        lin = unwrap_glm5_next_text_config(config).linear_attn_config
+        state_size = lin["head_dim"]
+        conv_kernel = lin["short_conv_kernel_size"]
+        num_heads = lin["num_heads"]
+        n_groups = lin["num_heads"]
+        head_dim = lin["head_dim"]
+        target_full_attn_mask, mamba_mask = get_glm5_next_layer_masks(config)
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
@@ -602,12 +679,14 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = (resolve_ssm_cache_dtype(config)
                                  or resolve_hf_torch_dtype(config)
                                  or torch.bfloat16)
-    if is_kimi_linear(config) and mamba_ssm_cache_dtype != torch.float32:
+    if (is_kimi_linear(config)
+            or is_glm5_next(config)) and mamba_ssm_cache_dtype != torch.float32:
         # The KDA delta-rule recurrent state must be kept in fp32 for
         # numerical parity with the HF reference (fla chunk/fused_recurrent
-        # KDA kernels carry the state in fp32).
+        # KDA kernels carry the state in fp32; the GLM-5.3-Flash Stage-1
+        # parity was likewise validated with an fp32 recurrent state).
         logger.info(
-            f"Kimi K3: overriding mamba_ssm_cache_dtype "
+            f"KDA hybrid: overriding mamba_ssm_cache_dtype "
             f"{mamba_ssm_cache_dtype} -> torch.float32 (KDA recurrent state "
             "must be fp32)")
         mamba_ssm_cache_dtype = torch.float32
