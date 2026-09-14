@@ -559,7 +559,8 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     "manager_cls",
     [CppMambaHybridCacheManager, MixedMambaHybridCacheManager, MambaHybridCacheManagerV2],
 )
-def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls):
+@pytest.mark.parametrize("nested_vocab_size", [False, True])
+def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls, nested_vocab_size):
     captured = {}
 
     class RecordingManager(manager_cls):
@@ -575,6 +576,9 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls)
         num_key_value_heads=2,
         num_hidden_layers=2,
     )
+    if nested_vocab_size:
+        config.llm_config = SimpleNamespace(vocab_size=config.vocab_size)
+        config.vocab_size = None
     mamba_params = MambaKVCacheParams(
         state_size=8,
         conv_kernel=4,
@@ -612,7 +616,7 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls)
     )
 
     if manager_cls is MambaHybridCacheManagerV2:
-        assert captured["vocab_size"] == config.vocab_size
+        assert captured["vocab_size"] == 131072
     else:
         assert "vocab_size" not in captured
 

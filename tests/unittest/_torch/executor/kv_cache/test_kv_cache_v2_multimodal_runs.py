@@ -236,6 +236,7 @@ def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
 
     kv_cache.commit = commit
     manager.enable_block_reuse = True
+    manager._can_publish_block_reuse = True
     manager.is_draft = False
     manager.event_manager = object()
     manager.kv_cache_map = {req.py_request_id: kv_cache}
