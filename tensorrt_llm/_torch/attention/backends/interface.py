@@ -1080,6 +1080,11 @@ class AttentionBackend(Generic[TMetadata]):
         return False
 
     @classmethod
+    def support_fp4_kv_cache(cls) -> bool:
+        """Whether the backend can execute attention with an FP4 KV cache."""
+        return False
+
+    @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
 
