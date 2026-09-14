@@ -5171,6 +5171,12 @@ class PyTorchModelEngine(ModelEngine):
                 _all_gen_reqs)
             scheduled_requests.generation_requests = _all_gen_reqs
             if scheduled_requests.num_context_requests == 0:
+                # Split by position, not by placement: CUDA graph capture bakes the
+                # per-domain request counts in as launch scalars, so the split must
+                # depend only on the padded batch size. Placement-derived splits vary
+                # with batch composition -- capturing (half-2, half+2) and replaying
+                # (half+1, half-1) crashes. The assert keeps this to two domains: with
+                # four the expression still runs but silently stops balancing.
                 num_locality_domains_local = kv_cache_manager.num_locality_domains
                 assert num_locality_domains_local == 2, (
                     "balanced generation locality domain dispatch currently supports "
