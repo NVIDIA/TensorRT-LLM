@@ -772,7 +772,7 @@ class TestKvCacheManagerV2AutoResolution:
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
 
-    def test_registered_models_keep_v2_on_nixl(self):
+    def test_registered_models_keep_v2_on_nixl(self) -> None:
         """Models preferring V2 and the Python transceiver keep V2 on NIXL.
 
         Both sentinels start at 'auto'; production resolves the transceiver
@@ -785,6 +785,7 @@ class TestKvCacheManagerV2AutoResolution:
             get_registered_model_class
 
         architectures = (
+            "Llama4ForConditionalGeneration",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
