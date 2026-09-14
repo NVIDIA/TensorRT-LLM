@@ -439,10 +439,10 @@ def test_step3p7_clamped_mlp_applies_gate_up_and_down_lora(gate_value: float) ->
             lora_params=_LORA_PARAMS_SENTINEL,
         )
 
-    clamped_gate = min(gate_value, 5.0)
+    clamped_gate = torch.nn.functional.silu(torch.tensor(gate_value)).clamp(max=5.0)
     expected = torch.full_like(
         hidden_states,
-        torch.nn.functional.silu(torch.tensor(clamped_gate)) * 2 + 3,
+        clamped_gate * 2 + 3,
     )
     torch.testing.assert_close(output, expected)
 
