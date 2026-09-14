@@ -764,6 +764,9 @@ class TestKvCacheManagerV2AutoResolution:
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
@@ -804,6 +807,9 @@ class TestKvCacheManagerV2AutoResolution:
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
