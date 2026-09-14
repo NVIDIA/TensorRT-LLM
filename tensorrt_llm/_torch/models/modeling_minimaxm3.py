@@ -1826,7 +1826,11 @@ class MiniMaxM3Attention(Attention):
             assert idx_q is not None
             # On the FP8 indexer path idx_k is None: the fused producer already
             # inserted E4M3 index-K into the side cache, so only K/V are written.
-            self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
+            if k is not None:
+                self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
+            else:
+                # The horizontal producer has already written both caches.
+                assert idx_k is None
             # Publish the selected blocks so the FMHA runs the sparse path.
             # idx_k_prewritten: index-K is already in the cache (written above
             # on bf16, or by the FP8 producer), so run_indexer must not write it.
@@ -1839,7 +1843,8 @@ class MiniMaxM3Attention(Attention):
             )
         else:
             assert idx_q is None and idx_k is None
-            self.attn.write_layer_caches(k, v, None, attn_metadata)
+            if k is not None:
+                self.attn.write_layer_caches(k, v, None, attn_metadata)
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
         self.attn.forward(q, None, None, attn_metadata, forward_args=forward_args)

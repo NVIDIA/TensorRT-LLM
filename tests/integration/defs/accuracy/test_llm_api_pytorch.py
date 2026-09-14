@@ -7362,11 +7362,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("eval_mode", ["default", "inferencex"])
+    @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
     @parametrize_with_ids("overlap_scheduler", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, eval_mode):
+                          overlap_scheduler, fuse_qkv_index_projection, eval_mode):
         # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
         # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K, or
         # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy
@@ -7401,7 +7402,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                    implementation="msa", indexer_kv_dtype="fp8"),
+                    implementation="msa",
+                    indexer_kv_dtype="fp8",
+                    fuse_qkv_index_projection=fuse_qkv_index_projection),
                 moe_config=MoeConfig(backend="CUTLASS"),
                 max_seq_len=max_seq_len,
                 max_batch_size=max_batch_size,
