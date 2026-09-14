@@ -1494,7 +1494,7 @@ class _KVCache:
             all_pages[pg_idx][lvl].append(page)
 
         try:
-            storage.prefetch(target, all_pages)
+            storage.prefetch(target, all_pages, locality_domain_id=self.locality_domain_id)
         except OutOfPagesError:
             return False
         return True
