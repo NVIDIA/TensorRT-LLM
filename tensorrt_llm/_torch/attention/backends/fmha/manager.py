@@ -135,6 +135,12 @@ class _FmhaCacheKey(NamedTuple):
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
     has_block_sparse_inputs: bool
+    # These support conditions can change without changing the query grid.
+    has_k_input: bool
+    has_v_input: bool
+    has_attention_sinks: bool
+    has_sparse_indices: bool
+    fp4_mla_state_ready: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
@@ -317,6 +323,9 @@ class FmhaManager:
         q: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
+        *,
+        k: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
     ) -> _FmhaCacheKey:
         """Build the dynamic FMHA cache key for one attention instance.
 
@@ -367,14 +376,29 @@ class FmhaManager:
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
             )
 
-        block_sparse_inputs = forward_args.sparse_runtime_params.block_sparse_inputs
+        sparse = forward_args.sparse_runtime_params
+        has_sparse_indices = (
+            metadata.num_sparse_topk > 0
+            or (sparse.sparse_kv_indices is not None and sparse.sparse_kv_indices.numel() > 0)
+            or (sparse.sparse_attn_indices is not None and sparse.sparse_attn_indices.numel() > 0)
+        )
+        fp4_state = getattr(metadata, "fp4_mla_state", None)
         return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
-            has_block_sparse_inputs=block_sparse_inputs is not None,
+            has_block_sparse_inputs=sparse.block_sparse_inputs is not None,
+            has_k_input=k is not None,
+            has_v_input=v is not None,
+            has_attention_sinks=forward_args.attention_sinks is not None,
+            has_sparse_indices=has_sparse_indices,
+            fp4_mla_state_ready=(
+                fp4_state is not None
+                and fp4_state.hp_pool is not None
+                and fp4_state.v_scale_pool is not None
+            ),
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
         )
@@ -392,7 +416,7 @@ class FmhaManager:
         if not _is_fmha_cache_enabled():
             return self._select_uncached(attn, q, k, v, metadata, forward_args)
 
-        cache_key = self._make_cache_key(q, metadata, forward_args)
+        cache_key = self._make_cache_key(q, metadata, forward_args, k=k, v=v)
         fmha = self._cache.get(cache_key)
         if fmha is not None:
             if self._cache_sanity_check_enabled:

@@ -4,9 +4,6 @@
 
 """CuTeDSL helpers for repacking the paged FP4 MLA V cache."""
 
-import contextlib
-import os
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -14,72 +11,15 @@ import cuda.bindings.driver as cuda
 import cutlass as ctm
 import cutlass.cute as cute
 import torch
-from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_exp
 from cutlass.experimental import primitives
 
+from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
+
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 TRTLLM_PAGE_SIZE = 128
 SMEM_P4_V_N_PER_CTA = 128
-
-_CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
-_PYIR_STDOUT_LINES = frozenset(
-    {
-        "Enabling PyIR, it was False",
-        "Enabling PyIR, it is now True",
-        "Disabling PyIR, it was True",
-        "Disabling PyIR, it is now False",
-    }
-)
-
-
-class _PyIRStdoutFilter:
-    """Drop only CuTeDSL PyIR state transitions from a text stream."""
-
-    def __init__(self, output):
-        self._output = output
-        self._pending = ""
-
-    def write(self, text):
-        lines = (self._pending + text).split("\n")
-        self._pending = lines.pop()
-        for line in lines:
-            if line.rstrip("\r") not in _PYIR_STDOUT_LINES:
-                self._output.write(f"{line}\n")
-        return len(text)
-
-    def flush(self):
-        self._output.flush()
-
-    def finish(self):
-        if self._pending and self._pending.rstrip("\r") not in _PYIR_STDOUT_LINES:
-            self._output.write(self._pending)
-        self._pending = ""
-        self._output.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._output, name)
-
-
-def _compile_cutedsl(*args, **kwargs):
-    """Compile with PyIR while suppressing only its state-transition lines."""
-    verbose = os.getenv(_CUTEDSL_VERBOSE_COMPILE_ENV, "").strip().lower()
-    if verbose in {"1", "true", "yes", "on"}:
-        with BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-
-    stdout_filter = _PyIRStdoutFilter(sys.stdout)
-    try:
-        with contextlib.redirect_stdout(stdout_filter), BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    finally:
-        stdout_filter.finish()
-
-
-def _current_cu_stream() -> cuda.CUstream:
-    """Use the caller's stream for launch ordering and CUDA graph capture."""
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
 @dataclass(frozen=True)

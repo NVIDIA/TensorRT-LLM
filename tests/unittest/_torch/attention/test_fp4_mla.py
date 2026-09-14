@@ -10,6 +10,8 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm._torch.attention.backends.fp4_mla as fp4_mla_backend
+import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
+import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_BLOCK_SIZE,
     FP4_MLA_ATTENTION_BACKEND_ENV,
@@ -114,7 +116,7 @@ def test_fp4_mla_cuda_graph_generation_lengths_records_capture_once(monkeypatch)
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(
-        fp4_mla_backend,
+        fp4_mla_metadata,
         "populate_fp4_mla_generation_lengths",
         populate_generation_lengths,
     )
@@ -992,7 +994,7 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
             }
         )
 
-    monkeypatch.setattr(fp4_mla_backend, "_repack_cutedsl_v_packed_cache", record_repack)
+    monkeypatch.setattr(fp4_mla_cache_update, "_repack_cutedsl_v_packed_cache", record_repack)
 
     _assert_fp4_mla_attention_decode_accuracy(
         monkeypatch,

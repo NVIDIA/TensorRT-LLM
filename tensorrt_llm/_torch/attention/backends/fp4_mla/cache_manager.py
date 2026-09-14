@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from . import (
+from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
     _FP4_MLA_K_RESIDUAL_BACKENDS,
     FP4_BLOCK_SIZE,
@@ -35,8 +35,8 @@ from . import (
     HP_BLOCK_SIZE,
     _fp4_mla_attention_backend,
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
-    get_fp4_mla_v_scale_pool_size,
 )
+from .layout import get_fp4_mla_v_scale_pool_size
 
 
 @dataclass(frozen=True)

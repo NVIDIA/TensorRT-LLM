@@ -21,6 +21,7 @@ import torch
 import triton
 
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
@@ -92,6 +93,7 @@ class _Fp8MlaContextCacheManagerView:
     kv_cache_pool_pointers: torch.Tensor
     kv_cache_pool_mapping: torch.Tensor
     layer_offsets: Tuple[int, ...]
+    dtype: DataType = DataType.FP8
 
 
 @dataclass
@@ -276,23 +278,19 @@ class _Fp8MlaContextScratch:
 
 def _build_fp8_mla_context_attn(attn: "TrtllmAttention") -> "TrtllmAttention":
     """Build a direct-attribute FP8 view without per-access Python forwarding."""
-    from ..fmha.fallback import FallbackFmha
     from ..fmha.manager import FmhaManager
 
     fp8_attn = copy.copy(attn)
     fp8_attn.quant_mode = int(QuantMode(0).set_fp8_kv_cache())
     fp8_attn.has_fp4_kv_cache = False
     fp8_attn.has_fp8_kv_cache = True
-    # FMHA instances hold weak references to their owning attention object.
-    # Do not reuse the manager copied from the FP4 attention; bind this FP8
-    # view explicitly to TRTLLM's regular FMHA implementation.
-    fp8_manager = FmhaManager(fp8_attn)
-    fp8_manager.fmha_libs = [FallbackFmha(fp8_attn)]
-    fp8_attn._fmha_manager = fp8_manager
     fp8_attn.local_layer_idx = 0
     # This branch resolves local cache layers through layer_idx. The
     # disposable cache has exactly one layer, so bind the copied view to it.
     fp8_attn.layer_idx = 0
+    # Finalize the view before capability selection. FMHA instances must hold
+    # weak references to this FP8 view, not to the original FP4 attention.
+    fp8_attn._fmha_manager = FmhaManager(fp8_attn)
     return fp8_attn
 
 

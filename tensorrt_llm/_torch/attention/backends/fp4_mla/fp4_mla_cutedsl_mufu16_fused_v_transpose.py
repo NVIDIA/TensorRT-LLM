@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501, E741, F841
 
-import contextlib
 import math
-import os
 import sys
 import threading
 from collections import OrderedDict
@@ -21,11 +19,12 @@ import cutlass.pipeline as pipeline
 import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.array import EvictPriority
-from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
+
+from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 
 nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
 nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
@@ -33,15 +32,6 @@ nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode
 PREPARED_BUFFER_ALIGNMENT_BYTES = 32
 CUDA_GRID_Z_MAX = 65535
 INT32_MAX = (1 << 31) - 1
-_CUTEDSL_VERBOSE_COMPILE_ENV = "TRTLLM_CUTEDSL_VERBOSE_COMPILE"
-_PYIR_STDOUT_LINES = frozenset(
-    {
-        "Enabling PyIR, it was False",
-        "Enabling PyIR, it is now True",
-        "Disabling PyIR, it was True",
-        "Disabling PyIR, it is now False",
-    }
-)
 
 
 @ctm.dsl_user_op
@@ -69,45 +59,6 @@ def _mbarrier_arrive_shared_cluster(mbar, count=1, *, loc=None, ip=None) -> None
         loc=loc,
         ip=ip,
     )
-
-
-class _PyIRStdoutFilter:
-    def __init__(self, output):
-        self._output = output
-        self._pending = ""
-
-    def write(self, text):
-        lines = (self._pending + text).split("\n")
-        self._pending = lines.pop()
-        for line in lines:
-            if line.rstrip("\r") not in _PYIR_STDOUT_LINES:
-                self._output.write(f"{line}\n")
-        return len(text)
-
-    def flush(self):
-        self._output.flush()
-
-    def finish(self):
-        if self._pending and self._pending.rstrip("\r") not in _PYIR_STDOUT_LINES:
-            self._output.write(self._pending)
-        self._pending = ""
-        self._output.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._output, name)
-
-
-def _compile_cutedsl(*args, **kwargs):
-    verbose = os.getenv(_CUTEDSL_VERBOSE_COMPILE_ENV, "").strip().lower()
-    if verbose in {"1", "true", "yes", "on"}:
-        with BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    stdout_filter = _PyIRStdoutFilter(sys.stdout)
-    try:
-        with contextlib.redirect_stdout(stdout_filter), BaseDSL.enable_pyir():
-            return cute.compile(*args, **kwargs)
-    finally:
-        stdout_filter.finish()
 
 
 def _scale_words_for_k(k_dim: int, sf_vec_size: int) -> int:
@@ -500,11 +451,6 @@ SMEM_P4_PV_SFB_EXTRA_COL_STRIDE = -1
 SMEM_P4_PV_SFB_S2T_STRIDE_BYTES = 128
 SMEM_P4_PV_SFB_CP_GROUP_ONE = False
 SMEM_P4_QK_COMPLETION_MBARS = SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-
-
-def _current_cu_stream() -> cuda.CUstream:
-    """Use the caller's stream for launch ordering and CUDA graph capture."""
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
 @dataclass(frozen=True)
