@@ -638,22 +638,28 @@ def test_materializer_leaves_the_destination_alone_for_an_empty_batch(monkeypatc
     assert torch.all(output == _UNTOUCHED)
 
 
-def _build_manager(*, enable_swa_scratch_reuse: bool = False) -> KVCacheManagerV2:
+def _build_manager(
+    *, enable_swa_scratch_reuse: bool = False, heterogeneous: bool = False
+) -> KVCacheManagerV2:
     """A small manager; ``_DEVICE_PAGE_TABLE_ENV`` is read during construction."""
     init_cuda_once()
     return KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=False,
             max_gpu_total_bytes=16 << 20,
-            # Two distinct attention windows, so the layers land in separate
-            # pools and the per-pool index_scales/kv_offset are exercised.
-            max_attention_window=[_MANAGER_MAX_SEQ_LEN, _TOKENS_PER_BLOCK],
+            # Heterogeneous layers share a lifecycle but have different page
+            # strides. Otherwise use distinct windows to exercise two pools.
+            max_attention_window=(
+                [_MANAGER_MAX_SEQ_LEN] * 2
+                if heterogeneous
+                else [_MANAGER_MAX_SEQ_LEN, _TOKENS_PER_BLOCK]
+            ),
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         ),
         CacheType.SELF,
         num_layers=2,
         num_kv_heads=2,
-        head_dim=64,
+        head_dim=[64, 128] if heterogeneous else 64,
         tokens_per_block=_TOKENS_PER_BLOCK,
         max_seq_len=_MANAGER_MAX_SEQ_LEN,
         max_batch_size=_MANAGER_BATCH,
@@ -796,20 +802,40 @@ def test_forced_device_page_table_matches_the_native_kernel(monkeypatch):
 
 
 @requires_native_page_table_kernel
-def test_forced_device_page_table_matches_non_cc_swa(monkeypatch):
-    """Compare SWA's CC transport against its established non-CC path."""
+@pytest.mark.parametrize("heterogeneous", [False, True], ids=["swa", "heterogeneous_no_swa"])
+def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heterogeneous):
+    """Compare both reasons for per-layer conversion across CC transports."""
     request_ids = [1, 2]
     num_seqs = len(request_ids)
 
     def materialize(setting: str) -> torch.Tensor:
         monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
-        manager = _build_manager(enable_swa_scratch_reuse=True)
+        manager = _build_manager(
+            enable_swa_scratch_reuse=not heterogeneous,
+            heterogeneous=heterogeneous,
+        )
         try:
-            assert manager.enable_swa_scratch_reuse
+            assert manager.enable_swa_scratch_reuse is (not heterogeneous)
+            assert manager._use_per_layer_page_tables
+            if heterogeneous:
+                # Prove the setup selected the heterogeneous-stride route,
+                # rather than separating the layers into homogeneous groups.
+                assert any(
+                    len(
+                        {
+                            manager.impl.get_page_stride(
+                                layer_id, manager._get_pool_roles(pool_id)[0]
+                            )
+                            for layer_id in layer_ids
+                        }
+                    )
+                    > 1
+                    for pool_id, layer_ids in enumerate(manager.impl.layer_grouping)
+                )
             assert manager._device_kv_cache_block_offsets_input.ndim == 4
             assert manager._page_table_materializer.uses_device_expansion is (setting == "1")
             if setting == "1":
-                # Device staging is allocated lazily on the first copy.
+                # Per-layer conversion owns its own staging source.
                 assert manager._page_table_materializer._device_base_page_rows is None
             assert (
                 manager.add_dummy_requests(
@@ -839,6 +865,7 @@ def test_forced_device_page_table_matches_non_cc_swa(monkeypatch):
             )
             torch.cuda.synchronize()
             if setting == "1":
+                assert manager._page_table_materializer._device_base_page_rows is None
                 assert torch.all(manager._device_kv_cache_block_offsets_input[:, num_seqs:] == 0)
             return output.cpu()
         finally:
