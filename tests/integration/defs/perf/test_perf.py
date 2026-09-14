@@ -512,8 +512,6 @@ class PerfTestConfig:
         self.ad_compile_backend = ad_compile_backend
         self.extra_runtime = extra_runtime
         self.skip_loading_weights = skip_loading_weights
-        # Just build engines
-        self.build_only = False
 
     def to_string(self,
                   custom_server_name: str = None,
@@ -567,9 +565,6 @@ class PerfTestConfig:
         # Add kv cache free gpu mem fraction.
         if self.kv_cache_free_gpu_mem_fraction != 0.9:
             entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
-
-        if self.build_only:
-            entries.append(f"build_only")
 
         if self.batch_sizes[0] > 0:
             # Add batch size(s).
@@ -690,32 +685,26 @@ class PerfTestConfig:
             self.kv_cache_free_gpu_mem_fraction = float(
                 labels.pop(0).replace("kv_frac:", ""))
 
-        if labels[0] == "build_only":
-            self.build_only = True
-            labels.pop(0)
+        if labels[0].startswith("bs:"):
+            self.batch_sizes = [
+                int(x) for x in labels.pop(0).replace("bs:", "").split("+")
+            ]
+        else:
+            self.batch_sizes = [0]
 
-        if not self.build_only:
-            if labels[0].startswith("bs:"):
-                self.batch_sizes = [
-                    int(x) for x in labels.pop(0).replace("bs:", "").split("+")
-                ]
-            else:
-                self.batch_sizes = [0]
-
-            if labels[0].startswith("input_output_len"):
-                io_lens = labels.pop(0).replace("input_output_len:",
-                                                "").split("+")
-                self.input_lens = [int(x.split(",")[0]) for x in io_lens]
-                self.output_lens = [int(x.split(",")[1]) for x in io_lens]
-            elif labels[0].startswith("input_len"):
-                self.input_lens = [
-                    int(x)
-                    for x in labels.pop(0).replace("input_len:", "").split("+")
-                ]
-                self.output_lens = []
-            else:
-                raise RuntimeError(
-                    f"Unexpected test name label for seq lens: {labels[0]}!")
+        if labels[0].startswith("input_output_len"):
+            io_lens = labels.pop(0).replace("input_output_len:", "").split("+")
+            self.input_lens = [int(x.split(",")[0]) for x in io_lens]
+            self.output_lens = [int(x.split(",")[1]) for x in io_lens]
+        elif labels[0].startswith("input_len"):
+            self.input_lens = [
+                int(x)
+                for x in labels.pop(0).replace("input_len:", "").split("+")
+            ]
+            self.output_lens = []
+        else:
+            raise RuntimeError(
+                f"Unexpected test name label for seq lens: {labels[0]}!")
 
         if len(labels) > 0:
             self.num_beams = 1 if not labels[0].startswith("beams:") else int(
@@ -843,26 +832,24 @@ class PerfTestConfig:
         assert self.num_gpus == self.tp_size * self.pp_size, f"Num of GPU shall be equal to TP*PP: {self.num_gpus}, {self.tp_size}, {self.pp_size}"
         if self.gpu_weights_percent != -1:
             assert 0 <= self.gpu_weights_percent <= 1, f"Invalid gpu_weights_percent: {self.gpu_weights_percent}!"
-        if not self.build_only:
-            assert len(self.input_lens) > 0, f"Empty input_lens!"
-            if self.is_bert_like():
-                assert len(
-                    self.output_lens
-                ) == 0, f"BERT-like models must not have output_lens!"
-            else:
-                assert len(
-                    self.output_lens
-                ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
+        assert len(self.input_lens) > 0, f"Empty input_lens!"
+        if self.is_bert_like():
+            assert len(self.output_lens
+                       ) == 0, f"BERT-like models must not have output_lens!"
+        else:
+            assert len(
+                self.output_lens
+            ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
 
-            # BERT with small BS is very unstable. Try to avoid it.
-            if self.is_bert_like():
-                if self.runtime == "trtllm-bench":
-                    self.batch_sizes[
-                        0] = self.max_batch_size if self.max_batch_size > 0 else 1
-                    print(f"batch_sizes: {self.batch_sizes}")
-                assert all(
-                    [b >= 32 for b in self.batch_sizes]
-                ), f"BERT with small BS is very unstable! Please increase to at least 32."
+        # BERT with small BS is very unstable. Try to avoid it.
+        if self.is_bert_like():
+            if self.runtime == "trtllm-bench":
+                self.batch_sizes[
+                    0] = self.max_batch_size if self.max_batch_size > 0 else 1
+                print(f"batch_sizes: {self.batch_sizes}")
+            assert all(
+                [b >= 32 for b in self.batch_sizes]
+            ), f"BERT with small BS is very unstable! Please increase to at least 32."
 
         # Skip if not enough GPUs. TRTLLM_TOTAL_GPU_COUNT overrides
         # auto-detection for multi-node setups.
@@ -940,7 +927,7 @@ class PerfTestConfig:
 
     def get_fixed_dataset_sequence_length(self) -> int | None:
         """Return the common total length when every dataset shape is fixed."""
-        if self.build_only or not self.output_lens:
+        if not self.output_lens:
             return None
 
         if len(self.input_lens) != len(self.output_lens):
@@ -1799,8 +1786,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         metric_type),
                     cmd_idx=cmd_idx,
                 ))
-        if self._config.build_only:
-            return metrics
 
         # Then, construct inference latency and gpu mem usage metrics, for each
         # bs and each seq len.
