@@ -560,8 +560,10 @@ def _make_trtllm_gen_moe(
     top_k: int = 2,
     hidden_size: int = 512,
     intermediate_size: int = 256,
+    tp_size: int = 1,
+    tp_rank: int = 0,
 ) -> TRTLLMGenFusedMoE:
-    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override."""
+    """A TRTLLM-Gen MoE, with or without the SiTu override."""
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
     pretrained_config.hidden_size = hidden_size
@@ -570,7 +572,7 @@ def _make_trtllm_gen_moe(
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        mapping=Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank),
         moe_backend="TRTLLM",
     )
     return TRTLLMGenFusedMoE(
@@ -740,18 +742,20 @@ def test_nvfp4_trtllm_gen_resolve_alignments_matches_create_weights(
 
 
 @_situ_supported
-def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
-    """Why the MoE-TP check cannot read the class attribute.
+def test_nvfp4_trtllm_gen_tp_accepts_logical_group_aligned_shard() -> None:
+    """Logical TP alignment is independent of the padded kernel layout."""
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        situ=True,
+        hidden_size=7168,
+        intermediate_size=3072,
+        tp_size=16,
+    )
 
-    ``hidden=1536``/``intermediate=192`` resolves to a 128 weight alignment.
-    192 is divisible by the class default (32) but not by 128, so validating
-    against ``NVFP4TRTLLMGenFusedMoEMethod.weight_alignment`` admits a shard
-    the loader cannot lay out. Pins the gap, so reverting the check to the
-    class attribute fails here rather than in a multi-GPU accuracy run.
-    """
-    resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
-    assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
-    assert 192 % resolved != 0
+    assert backend.intermediate_size_per_partition == 192
+    assert backend.intermediate_size_per_partition % 16 == 0
+    assert backend.quant_method.weight_alignment == 128
+    assert backend.intermediate_size_per_partition % backend.quant_method.weight_alignment != 0
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():

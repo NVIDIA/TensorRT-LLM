@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -84,7 +84,8 @@ def getCUDAVersion():
     try:
         cuda_version = subprocess.run(['nvcc', '--version'],
                                       stdout=subprocess.PIPE,
-                                      universal_newlines=True)
+                                      universal_newlines=True,
+                                      timeout=60)
         output = cuda_version.stdout.split()
         release_version = output[-4].replace(',', '.').split('.')
         return int(release_version[0]) * 100 + int(release_version[1])

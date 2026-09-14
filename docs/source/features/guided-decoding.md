@@ -27,7 +27,7 @@ trtllm-serve nvidia/Llama-3.1-8B-Instruct-FP8 --config config.yaml
 
 You should see a log like the following, which indicates the grammar backend is successfully enabled.
 
-```txt
+```text
 ......
 [TRT-LLM] [I] Guided decoder initialized with backend: GuidedDecodingBackend.XGRAMMAR
 ......
@@ -83,7 +83,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 {
     "name": "Paris",
     "population": 2145200
@@ -127,7 +127,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 Paris
 ```
 
@@ -174,7 +174,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 Paris is the capital of France
 ```
 
@@ -310,7 +310,7 @@ print(message.content)
 ```
 
 The output would look like:
-```txt
+```text
 <function=get_current_date>{"timezone": "America/New_York"}</function>
 <function=get_current_weather>{"city": "New York", "state": "NY", "unit": "fahrenheit"}</function>
 ```
@@ -370,7 +370,7 @@ if __name__ == "__main__":
 ```
 
 The output would look like:
-```txt
+```text
 {
   "name": "Paris",
   "population": 2145206
@@ -409,7 +409,7 @@ if __name__ == "__main__":
 ```
 
 The output would look like:
-```txt
+```text
 Paris
 ```
 
@@ -450,7 +450,7 @@ country ::= "England" | "France" | "Germany" | "Italy"
 ```
 
 The output would look like:
-```txt
+```text
 Paris is the capital of France
 ```
 
@@ -583,7 +583,7 @@ You are a helpful assistant."""
 ```
 
 The output would look like:
-```txt
+```text
 <function=get_current_date>{"timezone": "America/New_York"}</function>
 <function=get_current_weather>{"city": "New York", "state": "NY", "unit": "fahrenheit"}</function>
 ```

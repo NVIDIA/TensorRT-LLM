@@ -13,7 +13,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, get_pp_layers
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -459,15 +459,9 @@ class DSACacheManagerV2(KVCacheManagerV2):
         total_num_layers = len(layer_mask) if layer_mask is not None else num_layers
         if spec_config is not None and layer_mask is None:
             total_num_layers += get_num_spec_layers(spec_config)
-        indexer_k_cache_layer_mask = derive_indexer_k_cache_layer_mask(
+        self._indexer_k_cache_layer_mask = derive_indexer_k_cache_layer_mask(
             sparse_attention_config, pretrained_config, total_num_layers
         )
-        pp_layers, _ = get_pp_layers(
-            num_layers, mapping, spec_config=spec_config, layer_mask=layer_mask
-        )
-        self.indexer_k_cache_local_layer_mask = [
-            indexer_k_cache_layer_mask[layer_idx] for layer_idx in pp_layers
-        ]
 
         super().__init__(
             kv_cache_config,
@@ -496,9 +490,10 @@ class DSACacheManagerV2(KVCacheManagerV2):
         self._primary_pool_page_index_params = [
             (int(converter.scale), int(converter.layer_offset)) for converter in primary_converters
         ]
+        local_indexer_mask = self.indexer_k_cache_local_layer_mask
         full_indexer_local_layers = [
             local_layer_idx
-            for local_layer_idx, has_indexer in enumerate(self.indexer_k_cache_local_layer_mask)
+            for local_layer_idx, has_indexer in enumerate(local_indexer_mask)
             if has_indexer
         ]
         indexer_converters = [
@@ -519,17 +514,21 @@ class DSACacheManagerV2(KVCacheManagerV2):
             raise ValueError("DSA requires a uniform shared INDEX_KEY page mapping across layers")
         self.num_blocks = self.blocks_in_primary_pool
         self.indexer_k_cache_pool_per_layer = [
-            self._get_indexer_k_cache_pool_data(local_layer_idx)
-            if self.indexer_k_cache_local_layer_mask[local_layer_idx]
-            else None
-            for local_layer_idx in range(self.num_local_layers)
+            self._get_indexer_k_cache_pool_data(local_layer_idx) if has_indexer else None
+            for local_layer_idx, has_indexer in enumerate(local_indexer_mask)
         ]
-        num_full = sum(self.indexer_k_cache_local_layer_mask)
+        num_full = sum(local_indexer_mask)
         if num_full < self.num_local_layers:
             logger.info(
                 f"[DSACacheManagerV2] Indexer k-cache: {num_full} of "
                 f"{self.num_local_layers} local layers own an indexer k-cache."
             )
+
+    @property
+    def indexer_k_cache_local_layer_mask(self) -> list[bool]:
+        """Project indexer ownership onto the wrapper's current local layers."""
+        # The base wrapper may remove empty layers while building the cache.
+        return [self._indexer_k_cache_layer_mask[layer_idx] for layer_idx in self.pp_layers]
 
     def get_primary_pool_page_index_params(self, local_layer_idx: int) -> Tuple[int, int]:
         """Return the formal V2 page scale and layer offset for sparse MLA."""
@@ -544,8 +543,8 @@ class DSACacheManagerV2(KVCacheManagerV2):
                     * tokens_per_block,
                 )
             ]
-            for local_layer_idx in range(self.num_local_layers)
-            if self.indexer_k_cache_local_layer_mask[local_layer_idx]
+            for local_layer_idx, has_indexer in enumerate(self.indexer_k_cache_local_layer_mask)
+            if has_indexer
         }
 
     @property
@@ -672,7 +671,10 @@ class DSACacheManagerV2(KVCacheManagerV2):
             elif data_role == Role.ALL:
                 cache_bytes += self.mla_kv_cache_residual_dim // 2
                 cache_bytes += self.mla_kv_cache_residual_dim // 16
-        if data_role == Role.ALL and self.indexer_k_cache_local_layer_mask[local_layer_idx]:
+        if (
+            data_role == Role.ALL
+            and self._indexer_k_cache_layer_mask[self.pp_layers[local_layer_idx]]
+        ):
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
         return cache_bytes
 
