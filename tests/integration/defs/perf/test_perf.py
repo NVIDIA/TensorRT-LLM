@@ -459,7 +459,7 @@ class PerfTestConfig:
     ):
         # The model name.
         self.model_name = model_name
-        # Python, cpp, bench, or serve runtime.
+        # Python, bench, or serve runtime.
         self.runtime = runtime
         # API Type: only executor is allowed
         self.api = api
@@ -528,22 +528,20 @@ class PerfTestConfig:
         if device_subtype:
             entries.append(f"subtype:{device_subtype}")
 
-        if self.runtime == "cpp":  # bertBenchmark runtime
-            entries.append(f"cpp")
-        elif self.runtime == "serve":
-            entries.append(f"serve")
+        if self.runtime == "serve":
+            entries.append("serve")
             if self.backend == 'pytorch':
-                entries.append(f"pytorch")
+                entries.append("pytorch")
             if self.streaming == "streaming":
-                entries.append(f"streaming")
-        elif self.runtime == "bench":  # trtllm-bench
-            entries.append(f"bench")
+                entries.append("streaming")
+        elif self.runtime == "bench":
+            entries.append("bench")
             if self.backend == 'pytorch':
-                entries.append(f"pytorch")
+                entries.append("pytorch")
             elif self.backend == '_autodeploy':
-                entries.append(f"_autodeploy")
+                entries.append("_autodeploy")
             if self.streaming == "streaming":
-                entries.append(f"streaming")
+                entries.append("streaming")
 
         # Add mode and dtype.
         if self.runtime not in ("bench", "serve"):
