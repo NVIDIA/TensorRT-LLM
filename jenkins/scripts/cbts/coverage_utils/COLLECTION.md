@@ -154,7 +154,7 @@ stays large, `py_executor` rows are still there).
 stage:
 
 - official post-merge pipeline only (`ENABLE_CBTS_COVERAGE && JOB_NAME ==~ /.*PostMerge.*/`)
-- not a perf stage, not a TensorRT / CPP / AutoDeploy stage
+- not a perf stage or a TensorRT / CPP stage
 - single-GPU stages only (name carries no `-<N>_GPUs` / `-<N>_Nodes`)
 - not listed in `CBTS_EXCLUDE_STAGES`
 

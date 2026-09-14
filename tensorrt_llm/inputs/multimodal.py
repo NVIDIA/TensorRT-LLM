@@ -204,9 +204,8 @@ class MultimodalInput:
     embedding vectors produced for this item.
 
     Current consumers overload this value: encoder-only split paths use it
-    as an encoder-output embedding count, the C++ KV hasher treats
-    `start + length` as a contiguous prompt span, and AutoDeploy forwards
-    it as VLM layout metadata.
+    as an encoder-output embedding count, and the C++ KV hasher treats
+    `start + length` as a contiguous prompt span.
     """
     # TODO(TRTLLM-12175): split this into explicit layout fields — per-item
     # MM-token offsets/lengths, per-item encoder-output embedding counts, and

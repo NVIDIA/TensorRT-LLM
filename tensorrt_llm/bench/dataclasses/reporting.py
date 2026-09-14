@@ -469,7 +469,7 @@ class ReportUtility:
             if kv_cache_mem_percent is not None else None
 
         # Engine/Backend details
-        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
+        if self.rt_cfg.backend != 'pytorch':
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -686,7 +686,7 @@ class ReportUtility:
             stats_dict.get("startup_metrics"))
 
         backend_info = ""
-        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
+        if self.rt_cfg.backend != 'pytorch':
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
