@@ -14,7 +14,7 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
 
 Visual generation models naturally operate on long image or video token sequences. Each denoising step is closer to a full-context prefill pass than to autoregressive decoding, and attention can dominate runtime for high-resolution image generation or long video generation.
 
-Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config, while `attention_config.backend` selects the kernel family. Algorithms produce their block-sparse routes through the core `block_sparse_attn_predict` hook: a backend either predicts inside that hook from the flattened Q/K/V, or predicts before the core forward and hands the complete `BlockSparseForwardInputs` through `AttentionForwardArgs.sparse_backend_args`, which the default hook passes through. `SparseRuntimeParams` is the single lowered runtime carrier passed as `AttentionForwardArgs.sparse_runtime_params`; its optional `block_sparse_inputs` field nests the algorithm-neutral routes for the general block-sparse FMHA. `None` means prediction has not run, while an empty `SparseRuntimeParams()` records that prediction ran without a sparse payload.
+Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config, while `attention_config.backend` selects the kernel family. Algorithms produce their block-sparse routes through the core `block_sparse_attn_predict` hook: a backend either predicts inside that hook from the flattened Q/K/V, or predicts before the core forward and hands the complete `BlockSparseForwardInputs` through `AttentionForwardArgs.sparse_backend_args`, which the default hook passes through. The VisualGen TRTLLM wrapper owns the timestep schedule those backends consult: it prepares the denoising timestep once per eager call and answers whether a layer runs sparse for it (dense layers and dense timestep phases do not). `SparseRuntimeParams` is the single lowered runtime carrier passed as `AttentionForwardArgs.sparse_runtime_params`; its optional `block_sparse_inputs` field nests the algorithm-neutral routes for the general block-sparse FMHA. `None` means prediction has not run, while an empty `SparseRuntimeParams()` records that prediction ran without a sparse payload.
 
 ### Algorithms
 
@@ -273,9 +273,13 @@ SOL uses a host-side graph break to prepare and own predictor plans, so
 `False` setting.
 
 When a cutoff is configured, VisualGen includes the dense-or-sparse phase in
-the CUDA Graph key. Each SOL backend prepares that phase during graph warmup
-and reuses it during capture, while predictor route buffers remain stable for
-replay. A dense capture therefore cannot be reused for the sparse phase.
+the CUDA Graph key. The TRTLLM attention wrapper reduces the timestep to a host
+value during graph warmup and reuses it during capture for every
+timestep-scheduled algorithm (Skip Softmax Attention and SOL), while SOL
+predictor route buffers remain stable for replay. Per-token timesteps, such as
+Wan I2V where the conditioning frame stays at timestep zero, reduce to their
+largest live value, so the schedule stays dense until every token is below the
+cutoff. A dense capture therefore cannot be reused for the sparse phase.
 
 ## Video Sparse Attention (VSA)
 

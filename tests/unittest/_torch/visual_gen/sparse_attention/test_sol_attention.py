@@ -75,7 +75,8 @@ def _make_backend(
     backend.sparse_params = None
     backend._fmha_manager = SimpleNamespace(fmha_libs=[object.__new__(PrimsTSBlockSparseFmha)])
     backend.sol_params = params
-    backend._prepared_graph_phase = None
+    backend._prepared_timestep = None
+    backend._timestep_prepared = False
     backend.predictor = predictor
     return backend
 
@@ -253,63 +254,58 @@ def _mixed_proxy_reference(
 
 
 @_CPU_ONLY
-def test_sol_params_requires_precomputed_phase_during_cuda_graph_capture(monkeypatch) -> None:
-    params = SolParams(tau=1.0, disabled_until_timestep=0.6)
-    timestep = torch.tensor(0.2)
+def test_sol_backend_reuses_prepared_timestep_during_cuda_graph_capture(monkeypatch) -> None:
+    backend, _predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
+    # Per-token timesteps reduce to the largest live value.
+    assert backend.resolve_timestep(torch.tensor([0.0, 0.2])) == pytest.approx(0.2)
+
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    prepared = backend.resolve_timestep(torch.tensor(0.8))
 
-    with pytest.raises(RuntimeError, match="precomputed"):
-        params.should_use_sparse(layer_idx=1, timestep=timestep)
-
-    assert params.should_use_sparse(layer_idx=1, timestep=timestep, graph_phase=1)
-    assert not params.should_use_sparse(layer_idx=1, timestep=timestep, graph_phase=0)
+    assert prepared == pytest.approx(0.2)
+    assert backend.should_use_sparse(prepared)
 
 
 @_CPU_ONLY
-def test_sol_backend_warmup_prepares_phase_for_capture(monkeypatch) -> None:
-    params = SolParams(tau=1.0, disabled_until_timestep=0.6)
+def test_sol_backend_warmup_prepares_dense_phase_for_capture(monkeypatch) -> None:
     q = _bshd()
-    backend, predictor = _stub_backend(params)
+    backend, predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
 
-    assert _predict(backend, q, q, q, timestep=torch.tensor(0.8)) is None
+    assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(torch.tensor(0.8))) is None
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert _predict(backend, q, q, q, timestep=torch.tensor(0.8)) is None
+    assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(torch.tensor(0.8))) is None
     predictor.predict.assert_not_called()
 
 
 @_CPU_ONLY
 def test_sol_backend_rejects_cutoff_capture_without_warmup(monkeypatch) -> None:
-    params = SolParams(tau=1.0, disabled_until_timestep=0.6)
-    q = _bshd()
-    backend, predictor = _stub_backend(params)
+    backend, predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with pytest.raises(RuntimeError, match="prepared before CUDA Graph capture"):
-        _predict(backend, q, q, q, timestep=torch.tensor(0.2))
+        backend.resolve_timestep(torch.tensor(0.2))
 
     predictor.predict.assert_not_called()
 
 
 @_CPU_ONLY
-def test_sol_backend_cutoff_requires_timestep_during_eager_forward() -> None:
-    params = SolParams(tau=1.0, disabled_until_timestep=0.6)
+def test_sol_backend_without_timestep_runs_sparse_like_skip_softmax() -> None:
     q = _bshd()
-    backend, predictor = _stub_backend(params)
+    backend, predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
 
-    with pytest.raises(ValueError, match="timestep is required"):
-        _predict(backend, q, q, q)
-
-    predictor.predict.assert_not_called()
+    assert _predict(backend, q, q, q, timestep=backend.resolve_timestep(None)) is not None
+    predictor.predict.assert_called_once()
 
 
 @_CPU_ONLY
 def test_sol_phase_waits_until_all_token_timesteps_are_below_cutoff() -> None:
-    params = SolParams(tau=1.0, disabled_until_timestep=0.6)
+    backend, _predictor = _stub_backend(SolParams(tau=1.0, disabled_until_timestep=0.6))
 
-    assert not params.should_use_sparse(layer_idx=1, timestep=torch.tensor([0.0, 0.8]))
-    assert params.should_use_sparse(layer_idx=1, timestep=torch.tensor([0.0, 0.2]))
+    assert not backend.should_use_sparse(backend.resolve_timestep(torch.tensor([0.0, 0.8])))
+    assert backend.should_use_sparse(backend.resolve_timestep(torch.tensor([0.0, 0.2])))
 
 
 @_CPU_ONLY
@@ -697,8 +693,8 @@ def test_sol_cuda_graph_phase_is_keyed_without_model_scope(monkeypatch) -> None:
 
     assert model(q, timestep=torch.tensor(0.8)).shape == (1, 64, 256)
     assert model(q, timestep=torch.tensor(0.2)).shape == (1, 64, 256)
-    assert ("sol_attn_phase", 0) in captured_keys[0]
-    assert ("sol_attn_phase", 1) in captured_keys[1]
+    assert ("sparse_attn_phase", 0) in captured_keys[0]
+    assert ("sparse_attn_phase", 1) in captured_keys[1]
     assert captured_keys[0] != captured_keys[1]
     assert predictor.predict.call_count == 2
 

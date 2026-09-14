@@ -43,25 +43,18 @@ class SOLTrtllmAttention(TrtllmAttention):
         if not isinstance(sparse_params, SolParams):
             raise TypeError("SOLTrtllmAttention requires SolParams")
         self.sol_params = sparse_params
-        self._prepared_graph_phase: int | None = None
         super().__init__(sparse_params=None, **kwargs)
         self.predictor = SOLSparsePredictor()
 
-    def _resolve_graph_phase(self, timestep: object) -> int | None:
-        """Resolve the dense-or-sparse phase, reusing the warmup value under capture."""
+    @property
+    def timestep_cutoff(self) -> Optional[float]:
+        """SOL keeps its parameters outside the core ``sparse_params`` slot."""
 
-        if self.sol_params.disabled_until_timestep is None:
-            return None
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            if self._prepared_graph_phase is None:
-                raise RuntimeError("SOL graph phase must be prepared before CUDA Graph capture")
-            return self._prepared_graph_phase
-        graph_phase = self.sol_params.get_graph_phase_for_timestep(
-            timestep,
-            disabled_until_timestep=self.sol_params.disabled_until_timestep,
-        )
-        self._prepared_graph_phase = graph_phase
-        return graph_phase
+        return self.sol_params.disabled_until_timestep
+
+    @property
+    def dense_layers(self) -> frozenset[int]:
+        return self.sol_params.dense_layers
 
     def block_sparse_attn_predict(
         self,
@@ -74,17 +67,11 @@ class SOLTrtllmAttention(TrtllmAttention):
         """Return SOL routes for sparse calls and ``None`` for dense calls.
 
         ``q``, ``k``, and ``v`` arrive in the flattened ``[B*S, H*D]`` core
-        layout; the batch layout comes from ``metadata`` and the timestep from
-        ``forward_args``.
+        layout; the batch layout comes from ``metadata`` and the timestep,
+        already prepared by the wrapper forward, from ``forward_args``.
         """
 
-        timestep = forward_args.timestep
-        graph_phase = self._resolve_graph_phase(timestep)
-        if not self.sol_params.should_use_sparse(
-            layer_idx=self.layer_idx,
-            timestep=timestep,
-            graph_phase=graph_phase,
-        ):
+        if not self.should_use_sparse(forward_args.timestep):
             return None
 
         if self.quant_attention_config is not None:

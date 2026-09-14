@@ -23,28 +23,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Literal
 
-import torch
-
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseParams
-
-
-def _as_timestep_float(timestep: object) -> float | None:
-    if timestep is None:
-        return None
-    if isinstance(timestep, torch.Tensor):
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("SOL graph phase must be precomputed before CUDA Graph capture")
-        if timestep.numel() == 0:
-            return None
-        # WAN I2V can carry one timestep per token, with reference tokens fixed
-        # at zero. Stay dense until every live token is below the cutoff.
-        timestep = timestep.amax().item()
-    if isinstance(timestep, bool) or not isinstance(timestep, numbers.Real):
-        raise TypeError("timestep must be a real scalar or tensor")
-    value = float(timestep)
-    if not math.isfinite(value):
-        raise ValueError("timestep must be finite")
-    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,49 +62,6 @@ class SolParams(SparseParams):
         ):
             raise ValueError("dense_layers must contain only non-negative integers")
         object.__setattr__(self, "dense_layers", dense_layers)
-
-    @staticmethod
-    def get_graph_phase_for_timestep(
-        timestep: object,
-        *,
-        disabled_until_timestep: float | None,
-    ) -> int | None:
-        """Return 0 for the dense prefix and 1 for the sparse suffix."""
-
-        if disabled_until_timestep is None:
-            return None
-        value = _as_timestep_float(timestep)
-        if value is None:
-            return None
-        return int(value < disabled_until_timestep)
-
-    def should_use_sparse(
-        self,
-        *,
-        layer_idx: int,
-        timestep: object,
-        graph_phase: int | None = None,
-    ) -> bool:
-        """Return whether this layer should execute the SOL sparse path."""
-
-        if layer_idx in self.dense_layers:
-            return False
-        if graph_phase is not None:
-            if graph_phase not in (0, 1):
-                raise ValueError("SOL graph_phase must be 0 or 1")
-            phase = graph_phase
-        else:
-            phase = self.get_graph_phase_for_timestep(
-                timestep,
-                disabled_until_timestep=self.disabled_until_timestep,
-            )
-        if phase is None:
-            if self.disabled_until_timestep is not None:
-                raise ValueError(
-                    "timestep is required when SOL disabled_until_timestep is configured"
-                )
-            return True
-        return phase == 1
 
 
 __all__ = ["SolParams"]

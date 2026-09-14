@@ -65,6 +65,21 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         """Lower user-facing config into SparseMetadataParams."""
         return None
 
+    def resolve_disabled_until_timestep(
+        self,
+        *,
+        checkpoint_config: Optional[Dict[str, Any]] = None,
+        pretrained_config: Any = None,
+    ) -> Optional[float]:
+        """Return the normalized timestep below which the algorithm runs sparse.
+
+        ``None`` means the algorithm has no dense prefix. Algorithms with a
+        ``disabled_until_timestep`` field return it; algorithms that also read a
+        checkpoint-provided cutoff override this method.
+        """
+        del checkpoint_config, pretrained_config
+        return getattr(self, "disabled_until_timestep", None)
+
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """SkipSoftmax sparse attention configuration for visual generation.

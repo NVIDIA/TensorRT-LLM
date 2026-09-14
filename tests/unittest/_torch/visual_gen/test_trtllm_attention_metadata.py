@@ -69,6 +69,10 @@ def _make_core_forward_metadata():
 def _make_wrapper(cls=visual_trtllm.TrtllmAttention, *, quant_attention_config=None):
     attention = object.__new__(cls)
     attention.quant_attention_config = quant_attention_config
+    attention.layer_idx = 0
+    attention.sparse_params = None
+    attention._prepared_timestep = None
+    attention._timestep_prepared = False
     return attention
 
 
@@ -209,15 +213,66 @@ def test_trtllm_attention_layers_share_block_sparse_plan_cache(monkeypatch):
     assert first_fmha._paged_wrappers is not other_fmha._paged_wrappers
 
 
-def test_visual_gen_wrapper_does_not_define_its_own_prediction_lifecycle():
+def test_visual_gen_wrapper_owns_only_the_timestep_schedule():
     assert not hasattr(visual_trtllm, "SparseForwardInputs")
-    for name in (
-        "block_sparse_attn_predict",
-        "sparse_post_process",
-        "_forward_impl",
-    ):
+    for name in ("block_sparse_attn_predict", "sparse_post_process", "_forward_impl"):
         assert name not in visual_trtllm.TrtllmAttention.__dict__
+    for name in ("resolve_timestep", "should_use_sparse"):
+        assert name in visual_trtllm.TrtllmAttention.__dict__
     assert getattr(visual_trtllm.TrtllmAttention, "__parameters__", ()) == ()
+
+
+def test_wrapper_schedule_follows_cutoff_and_dense_layers():
+    attention = _make_wrapper()
+    assert attention.should_use_sparse(0.8)
+    assert attention.should_use_sparse(None)
+
+    attention.layer_idx = 1
+    attention.sparse_params = SimpleNamespace(
+        disabled_until_timestep=0.6, dense_layers=frozenset({3})
+    )
+    assert not attention.should_use_sparse(0.8)
+    assert attention.should_use_sparse(0.2)
+    assert attention.should_use_sparse(None)
+    attention.layer_idx = 3
+    assert not attention.should_use_sparse(0.2)
+
+
+def test_wrapper_passes_timestep_through_without_a_cutoff():
+    attention = _make_wrapper()
+    timestep = torch.tensor([0.2])
+
+    assert attention.resolve_timestep(timestep) is timestep
+    assert attention.resolve_timestep(None) is None
+
+
+def test_wrapper_prepares_timestep_for_cuda_graph_capture(monkeypatch):
+    attention = _make_wrapper()
+    attention.sparse_params = SimpleNamespace(disabled_until_timestep=0.6)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="prepared before CUDA Graph capture"):
+        attention.resolve_timestep(torch.tensor([0.8]))
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    # Per-token timesteps reduce to the largest live value.
+    assert attention.resolve_timestep(torch.tensor([0.0, 0.8])) == pytest.approx(0.8)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert attention.resolve_timestep(torch.tensor([0.2])) == pytest.approx(0.8)
+
+
+def test_forward_hands_the_prepared_timestep_to_the_core(monkeypatch):
+    captured: dict = {}
+    _capture_core_forward(monkeypatch, captured)
+    attention = _make_wrapper()
+    attention.sparse_params = SimpleNamespace(disabled_until_timestep=0.6)
+    monkeypatch.setattr(attention, "support_fused_qkv", lambda: True, raising=False)
+    q = torch.randn(1, 4, 2, 8)
+
+    attention.forward(q, q, q, batch_size=1, seq_len=4, timestep=torch.tensor([0.0, 0.8]))
+
+    assert captured["forward_args"].timestep == pytest.approx(0.8)
 
 
 def test_forward_ignores_backend_specific_kwargs_like_other_backends(monkeypatch):

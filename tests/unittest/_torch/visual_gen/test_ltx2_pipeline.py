@@ -1398,16 +1398,18 @@ class TestLTX2TwoStageLoRAHelpers:
             video=modality(0.8), audio=None, text_cache=None, step_index=2
         )
 
-        assert "sol_attn_phase" in runner._extra_key_fns
-        assert ("sol_attn_phase", (("video", 0),)) in dense_key
-        assert ("sol_attn_phase", (("video", 1),)) in sparse_key
+        assert "sparse_attn_phase" in runner._extra_key_fns
+        assert ("sparse_attn_phase", (("video", 0),)) in dense_key
+        assert ("sparse_attn_phase", (("video", 1),)) in sparse_key
         assert dense_key != sparse_key
         assert dense_replay_key == dense_key
         assert captured_keys == [dense_key, sparse_key]
 
     def test_ltx2_threads_raw_modality_timestep_for_sol_phase(self):
         """SOL phase preparation must not use the AdaLN-transformed timestep."""
-        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+        from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import (
+            graph_phase_for_timestep,
+        )
         from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
         from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.transformer_args import (
             TransformerArgs,
@@ -1465,11 +1467,11 @@ class TestLTX2TwoStageLoRAHelpers:
                 )
                 observed_phases.append(
                     (
-                        SolParams.get_graph_phase_for_timestep(
+                        graph_phase_for_timestep(
                             video_timestep,
                             disabled_until_timestep=0.6,
                         ),
-                        SolParams.get_graph_phase_for_timestep(
+                        graph_phase_for_timestep(
                             audio_timestep,
                             disabled_until_timestep=0.6,
                         ),
