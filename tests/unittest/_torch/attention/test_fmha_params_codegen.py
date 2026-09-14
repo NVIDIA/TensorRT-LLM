@@ -308,4 +308,5 @@ int main()
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
