@@ -1897,6 +1897,8 @@ def test_moe_backend(
         # swiglu_gptoss_style is True when any swiglu parameter deviates from default
         # Default values: alpha=1, beta=0, limit=inf
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
+    expert_bias = swiglu_gptoss_style and not is_minimax_megamoe
 
     locality_domain_runtime_skip = should_skip_locality_domain_runtime(enable_locality_domains)
     if locality_domain_runtime_skip:
@@ -1957,7 +1959,7 @@ def test_moe_backend(
             intermediate_size=intermediate_size,
             hidden_size=hidden_size,
             quant_config=quant_config,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_gptoss_style=swiglu_gptoss_style,
             swiglu_alpha=swiglu_alpha if swiglu_gptoss_style else None,
             swiglu_beta=swiglu_beta if swiglu_gptoss_style else None,
@@ -1989,7 +1991,7 @@ def test_moe_backend(
             dtype=dtype_activation,
             quant_config=quant_config,
             mapping=mapping,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
             swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
