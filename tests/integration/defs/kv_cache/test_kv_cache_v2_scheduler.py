@@ -134,20 +134,32 @@ def _assert_all_completed(outputs, expected_count=None):
 
 
 def _assert_outputs_match(outputs_a, outputs_b, label_a="A", label_b="B"):
-    """Assert two output lists produce identical text."""
+    """Assert two output lists produce identical tokens and text."""
     assert len(outputs_a) == len(outputs_b), (
         f"Output count mismatch: {label_a}={len(outputs_a)}, {label_b}={len(outputs_b)}"
     )
     for i, (oa, ob) in enumerate(zip(outputs_a, outputs_b)):
-        assert oa.outputs[0].text == ob.outputs[0].text, (
+        assert (
+            oa.outputs[0].token_ids == ob.outputs[0].token_ids
+            and oa.outputs[0].text == ob.outputs[0].text
+        ), (
             f"Prompt {i}: {label_a} vs {label_b} outputs differ.\n"
+            f"{label_a} token IDs: {oa.outputs[0].token_ids}\n"
+            f"{label_b} token IDs: {ob.outputs[0].token_ids}\n"
             f"{label_a}: {oa.outputs[0].text[:500]}\n"
             f"{label_b}: {ob.outputs[0].text[:500]}"
         )
 
 
 def _run_v1_v2_compare(
-    model_path, prompts, sampling_params, kv_extra=None, *, assert_outputs_match=True, **llm_kwargs
+    model_path,
+    prompts,
+    sampling_params,
+    kv_extra=None,
+    *,
+    assert_outputs_match=True,
+    warmup_prompt=None,
+    **llm_kwargs,
 ):
     """Run same prompts on V1 and V2; optionally assert identical output.
 
@@ -156,17 +168,30 @@ def _run_v1_v2_compare(
         prompts: List of prompt strings.
         sampling_params: SamplingParams (should use temperature=0.0).
         kv_extra: Extra kwargs for both V1 and V2 KvCacheConfig (e.g. enable_block_reuse).
-        assert_outputs_match: If True, assert V1 and V2 outputs are identical (text).
+        assert_outputs_match: If True, assert V1 and V2 outputs are identical (tokens and text).
             Set False for MTP/speculative tests where scheduler differences can diverge.
+        warmup_prompt: Optional prompt to complete before the compared batch, so
+            both managers have a reusable source prefix available.
         **llm_kwargs: Extra kwargs for both V1 and V2 LLM (e.g. max_num_tokens).
     """
     kv_extra = kv_extra or {}
+
+    def generate_outputs(llm):
+        if warmup_prompt is not None:
+            # V1 publishes partial source blocks when the request is released;
+            # V2 publishes them when context finishes. Complete the same request
+            # first so reuse comparisons start with the same cached prefix.
+            warmup_outputs = llm.generate(
+                [warmup_prompt], sampling_params=SamplingParams(max_tokens=1, temperature=0.0)
+            )
+            _assert_all_completed(warmup_outputs, expected_count=1)
+        return llm.generate(prompts, sampling_params=sampling_params)
 
     outputs_v1 = None
     if assert_outputs_match:
         kv_v1 = KvCacheConfig(use_kv_cache_manager_v2=False, **kv_extra)
         with LLM(model_path, kv_cache_config=kv_v1, **llm_kwargs) as llm:
-            outputs_v1 = llm.generate(prompts, sampling_params=sampling_params)
+            outputs_v1 = generate_outputs(llm)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -174,7 +199,7 @@ def _run_v1_v2_compare(
     with LLM(
         model_path, kv_cache_config=kv_v2, scheduler_config=_V2_SCHEDULER_CONFIG, **llm_kwargs
     ) as llm:
-        outputs_v2 = llm.generate(prompts, sampling_params=sampling_params)
+        outputs_v2 = generate_outputs(llm)
 
     _assert_all_completed(outputs_v2, expected_count=len(prompts))
     if assert_outputs_match:
@@ -240,6 +265,10 @@ class TestKVCacheV2Llama:
         """Run V1 vs V2 with greedy sampling; assert outputs match."""
         kv_extra = {
             "max_tokens": _LLAMA_KV_CACHE_MAX_TOKENS,
+            # Cold requests can reuse short prefixes at different times in V1
+            # and V2. Keep their context computation comparable here; dedicated
+            # reuse tests establish a shared prefix before comparing outputs.
+            "enable_partial_reuse": False,
             **(kv_extra or {}),
         }
         return _run_v1_v2_compare(
@@ -267,7 +296,8 @@ class TestKVCacheV2Llama:
         self._compare(
             MEDIUM_PROMPTS,
             max_tokens=64,
-            # V2 can commit partial source blocks, while V1 only commits full blocks.
+            # V2 publishes partial source blocks during context; V1 waits until
+            # the request is released to publish them.
             # Disable reuse so both managers compute the same prompt tokens for this
             # output comparison.
             kv_extra={"enable_block_reuse": False},
@@ -310,15 +340,43 @@ class TestKVCacheV2Llama:
 
     # Block reuse — V2 matches V1
     def test_block_reuse(self):
-        self._compare(SHARED_PREFIX_PROMPTS, max_tokens=64, kv_extra={"enable_block_reuse": True})
+        tokens_per_block = 32
+        prompts = [_LONG_BLOCK + prompt for prompt in SHARED_PREFIX_PROMPTS]
+        outputs_v1, outputs_v2 = self._compare(
+            prompts,
+            max_tokens=64,
+            kv_extra={
+                "tokens_per_block": tokens_per_block,
+                "enable_block_reuse": True,
+                "enable_partial_reuse": False,
+            },
+            warmup_prompt=prompts[0],
+        )
+        cached_tokens = [output.cached_tokens for output in outputs_v1]
+        assert cached_tokens == [output.cached_tokens for output in outputs_v2]
+        assert all(count > 0 and count % tokens_per_block == 0 for count in cached_tokens)
 
     # Partial block reuse — V2 matches V1
     def test_partial_block_reuse(self):
-        self._compare(
+        tokens_per_block = 32
+        # Extend the source past one block so its first block has a child. V1
+        # then copies partial matches instead of consuming the source leaf,
+        # keeping the shared prefix available to every compared request.
+        outputs_v1, outputs_v2 = self._compare(
             SHARED_PREFIX_PROMPTS,
             max_tokens=64,
-            kv_extra={"enable_block_reuse": True, "enable_partial_reuse": True},
+            kv_extra={
+                "tokens_per_block": tokens_per_block,
+                "enable_block_reuse": True,
+                "enable_partial_reuse": True,
+            },
+            warmup_prompt=f"{SHARED_PREFIX_PROMPTS[0]} {_LONG_BLOCK}",
         )
+        cached_tokens = [output.cached_tokens for output in outputs_v1]
+        assert cached_tokens == [output.cached_tokens for output in outputs_v2]
+        # These requests share a prefix shorter than a block with the warmup,
+        # but have different endings: a positive hit must be partial reuse.
+        assert all(0 < count < tokens_per_block for count in cached_tokens[1:])
 
     # Chunked prefill + eviction — V2 matches V1
     def test_chunked_prefill_with_eviction(self):
