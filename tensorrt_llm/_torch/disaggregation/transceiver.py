@@ -364,19 +364,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return None
 
     def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
-        """Create a KV slice covering the request's whole prompt."""
+        """Positional KV slice covering the request's whole prompt.
+
+        Every paged group gets ``ceil(prompt_len / tpb)`` entries indexed by
+        block ordinal: the local pool slot, or -1 where this side has nothing
+        there. Eviction and allocation state come straight from the cache
+        manager (``get_block_ordinals``), so ctx and gen never have to agree on
+        *when* a block left the window -- the sender simply pairs the ordinals
+        both sides still hold. The only request-derived bound is prompt_len,
+        which drops the speculative tail and the ctx first-token block
+        (num_extra_kv_tokens slots are not transferred; both sides use
+        prompt_len, so the ranges stay consistent). On the receiver the
+        already-cached prefix is masked so the sender skips it.
+        """
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        # The transfer covers prompt_len tokens; num_extra_kv_tokens slots
-        # (speculative decoding) are not transferred. In the previously added
-        # support for ctx disabling speculative decoding while gen enables it,
-        # both sides currently use prompt_len as the transfer range, so the
-        # ranges stay consistent.
-        # TODO: the accuracy impact of not transferring num_extra_kv_tokens
-        # on MTP and other speculative decoding paths is currently unclear;
-        # revisit whether these extra KV slots need to be transferred.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request
@@ -386,58 +390,52 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
+        empty = np.array([], dtype=np.int64)
         groups = []
+        tails_per_lg = []
         for idx, lg in enumerate(layer_groups):
+            tails = empty
             if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
-                group = (
-                    np.array([slot], dtype=np.int64)
-                    if slot is not None
-                    else np.array([], dtype=np.int64)
-                )
-            elif req.py_beam_width == 1:
-                # Single beam (which is every MTP request -- spec decoding forces
-                # beam_width == 1): pick blocks by position. ordinal i holds
-                # tokens [i*tpb, ...), or -1 if the block is out-of-window or
-                # unbound. Keep [start:prompt_blocks): the upper bound drops the
-                # speculative tail and the ctx first-token block; start skips the
-                # receiver's cached prefix; the >= 0 filter drops stale/unbound
-                # holes.
-                ordinals = adapter.get_block_ordinals(req, idx, lg)
-                start = cached_per_lg[idx] // tpb
-                window = ordinals[start:prompt_blocks]
-                group = window[window >= 0].astype(np.int64)
+                group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
-                # Packed-beam layout: not positional, so keep the count path.
-                group = self._packed_beam_group(req, idx, lg, prompt_blocks, cached_per_lg[idx])
+                if req.py_beam_width == 1:
+                    ordinals = adapter.get_block_ordinals(req, idx, lg)
+                else:
+                    # Beam search (V1 only): beam-0's chain is positional; the
+                    # divergent per-beam final blocks are not, so they ride in
+                    # a separate field and are paired index-wise.
+                    ordinals, tails = adapter.get_beam0_ordinals_and_tails(req, idx, lg)
+                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+                if tails.size and not (group >= 0).any():
+                    # Receiver already holds all of beam-0: nothing to transfer.
+                    tails = empty
             groups.append(group)
+            tails_per_lg.append(tails)
 
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
+            beam_tails_per_layer_groups=(
+                tails_per_lg if any(t.size for t in tails_per_lg) else None
+            ),
         )
 
-    def _packed_beam_group(self, req, group_idx, lg, prompt_blocks, cached_tokens):
-        """Block ids for one layer group of a packed-beam (beam_width > 1) request.
+    @staticmethod
+    def _positional_window(
+        ordinals: np.ndarray, prompt_blocks: int, cached_blocks: int
+    ) -> np.ndarray:
+        """Fit a manager block table into the prompt's ordinal range.
 
-        beam-0's chain is positional, so select its window exactly like the
-        beam_width == 1 path: the prompt_blocks upper bound drops the ctx
-        first-token over-hang (always non-speculative -- spec forces
-        beam_width == 1), ``start`` skips the receiver's cached prefix, and -1
-        holes (stale/unbound) are filtered. The divergent per-beam tails are not
-        positional; carry them verbatim after the window. If the receiver already
-        holds all of beam-0 (window empty), the tails go with it -- matching the
-        legacy trim.
+        Pads with -1 when fewer blocks are allocated than the prompt spans
+        (incremental ctx allocation), truncates the speculative / first-token
+        tail, and masks the receiver's cached prefix.
         """
-        adapter = self._reuse_adapter
-        tpb = adapter.tokens_per_block
-        beam0_ordinals, tails = adapter.get_beam0_ordinals_and_tails(req, group_idx, lg)
-        start = cached_tokens // tpb
-        window = beam0_ordinals[start:prompt_blocks]
-        window = window[window >= 0].astype(np.int64)
-        if window.size == 0 or tails.size == 0:
-            return window
-        return np.concatenate([window, tails])
+        window = np.full(prompt_blocks, -1, dtype=np.int64)
+        n = min(int(ordinals.size), prompt_blocks)
+        window[:n] = ordinals[:n]
+        window[: min(cached_blocks, prompt_blocks)] = -1
+        return window
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
         """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
@@ -854,18 +852,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if window_size is not None and window_size < req.prompt_len:
                 # SWA pages can leave the active window between chunks. Defer
                 # the group and send its complete final active window at once.
-                chunk_block_ids.append(block_ids if is_last_chunk else block_ids[:0])
+                chunk_block_ids.append(block_ids if is_last_chunk else np.full_like(block_ids, -1))
             else:
-                # _build_kv_write_meta derives the chunk's start token from list length
-                # (total_blocks - len), which only agrees with the slice below
-                # once the group covers the chunk end.
-                assert block_ids.size >= chunk_end, (
-                    f"layer group holds {block_ids.size} blocks, fewer than the "
-                    f"chunk end {chunk_end}; cannot address chunk "
-                    f"[{chunk_start}, {chunk_end}) by position"
-                )
-                chunk_block_ids.append(block_ids[chunk_start:chunk_end])
-        if not is_last_chunk and not any(block_ids.size for block_ids in chunk_block_ids):
+                # Positional: keep the chunk's ordinals, blank everything else.
+                chunk = np.full_like(block_ids, -1)
+                chunk[chunk_start:chunk_end] = block_ids[chunk_start:chunk_end]
+                chunk_block_ids.append(chunk)
+        if not is_last_chunk and not any((ids >= 0).any() for ids in chunk_block_ids):
             return None
         return KVSlice(
             is_last_slice=is_last_chunk,

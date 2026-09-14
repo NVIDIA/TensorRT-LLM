@@ -159,22 +159,40 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         )
         return np.asarray(pool_indices, dtype=np.int64)
 
-    def get_block_ordinals(self, req, group_idx, lg):
-        # V1 keeps the whole pre-eviction chain in order (removeFrontBlock only
-        # bumps a counter, never drops the id), so the translated list is already
-        # positional. SWA-evicted front blocks are still real ids here; mask them
-        # to -1 using the manager's authoritative front-removed count so the
-        # positional contract matches V2 (which reports holes directly).
-        ids = self.get_block_ids(req, group_idx, lg)
-        if ids.size == 0:
-            return ids
+    def _translate_chain(self, req, chain, window_size) -> np.ndarray:
+        """Positional pool slots for one beam chain, SWA-evicted front masked to -1.
+
+        V1 keeps the whole pre-eviction chain in order (detachFrontBlock only
+        bumps a counter, never drops the id), so index == ordinal. The evicted
+        ids are released to the free pool and may already belong to another
+        request -- possibly offloaded to host, which the primary-pool translation
+        rejects -- so mask them *before* translating and only translate the
+        in-window ids.
+        """
+        ordinals = np.full(len(chain), -1, dtype=np.int64)
+        if not chain:
+            return ordinals
+        stale = min(
+            self._mgr.get_num_front_blocks_removed(req.py_request_id, window_size=window_size),
+            len(chain),
+        )
+        live = list(chain[stale:])
+        if live:
+            ordinals[stale:] = self._mgr.get_memory_pool_block_indices(
+                live, window_size=window_size
+            )
+        return ordinals
+
+    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
         window_size = lg.sliding_window_size
+        # V1 layer groups carry the manager's window key (full-attention layers get the
+        # max window), so this is always set; see kv_extractor.build_page_table.
         assert window_size is not None
-        stale = self._mgr.get_num_front_blocks_removed(req.py_request_id, window_size=window_size)
-        if stale > 0:
-            ids = ids.copy()
-            ids[: min(stale, ids.size)] = -1
-        return ids
+        beams = self._mgr.impl.get_batch_cache_block_ids([req.py_request_id], window_size)[0]
+        if not beams:
+            return np.array([], dtype=np.int64)
+        assert len(beams) == 1, "get_block_ordinals is single-beam only"
+        return self._translate_chain(req, list(beams[0]), window_size)
 
     def get_beam0_ordinals_and_tails(self, req, group_idx, lg):  # noqa: ARG002
         window_size = lg.sliding_window_size
@@ -189,16 +207,7 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         beam0 = list(beams[0])
         beam0_last = beam0[-1]
         tail_ids = [beam[-1] for beam in beams[1:] if beam and beam[-1] != beam0_last]
-        # Translate logical block ids to primary-pool slots (see get_block_ids).
-        beam0_pool = np.asarray(
-            self._mgr.get_memory_pool_block_indices(beam0, window_size=window_size),
-            dtype=np.int64,
-        )
-        # Mask the SWA-evicted front to -1 (authoritative count), matching the
-        # get_block_ordinals contract.
-        stale = self._mgr.get_num_front_blocks_removed(req.py_request_id, window_size=window_size)
-        if stale > 0:
-            beam0_pool[: min(stale, beam0_pool.size)] = -1
+        beam0_pool = self._translate_chain(req, beam0, window_size)
         tails = (
             np.asarray(
                 self._mgr.get_memory_pool_block_indices(tail_ids, window_size=window_size),
