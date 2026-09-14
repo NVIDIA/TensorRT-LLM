@@ -594,10 +594,11 @@ Key test files:
 - Do not bypass MLA's context dispatcher for chunked or cached-KV cases.
 - Do not duplicate RoPE handling before checking the fused path.
 
-## 8. Experimental Eager Scratch Reclamation
+## 8. Eager Scratch Reclamation
 
-Enable with `TRTLLM_EAGER_WORKSPACE_SHRINK=1` before engine construction
-(default: off). Successful warmup freezes the minimum eager capacity.
+Eager scratch reclamation is enabled automatically for supported execution
+paths after successful warmup, which freezes the minimum eager capacity.
+There is no environment-variable switch.
 
 - Native sizing reports the maximum required bytes across one model forward
   into a CPU scalar, without GPU synchronization. Three underfilled forwards

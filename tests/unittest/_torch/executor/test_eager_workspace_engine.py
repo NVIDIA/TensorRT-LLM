@@ -18,7 +18,6 @@ pytestmark = pytest.mark.cpu_only
 class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = object.__new__(PyTorchModelEngine)
-        self.engine._eager_workspace_shrink_enabled = True
         self.engine._eager_workspace_reclaimer = None
         self.engine.is_spec_decode = False
         self.engine.mapping = SimpleNamespace(cp_size=1)
@@ -65,12 +64,10 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
-    def test_disabled_flag_leaves_workspace_alone(self) -> None:
-        self.engine._eager_workspace_shrink_enabled = False
+    def test_supported_warmup_enables_reclamation_by_default(self) -> None:
         self.freeze()
-        self.assertIsNone(self.engine._eager_workspace_reclaimer)
-        self.assertEqual(self.call(), 42)
-        self.reclaimer_class.assert_not_called()
+        self.reclaimer_class.assert_called_once_with(self.metadata)
+        self.assertIs(self.engine._eager_workspace_reclaimer, self.reclaimer_class.return_value)
 
     def test_unsupported_modes_do_not_create_reclaimer(self) -> None:
         for name, value in [
