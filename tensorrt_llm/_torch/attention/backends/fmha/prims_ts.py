@@ -558,6 +558,9 @@ class PrimsTSFmha(PhasedFmha):
             window_left=window_left,
             sm_scale=sm_scale,
             output_scale=1.0,
+            # Preprocessing establishes this invariant for every context
+            # request admitted by this adapter.
+            paged_v_tail_is_zero=True,
         )
         self._context_wrappers[batch_size] = wrapper
         return wrapper
