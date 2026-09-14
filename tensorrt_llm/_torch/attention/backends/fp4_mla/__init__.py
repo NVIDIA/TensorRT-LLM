@@ -572,10 +572,10 @@ def configure_fp4_mla_device_page_table(
     table on the GPU. The materialization kernel decodes V2 page indices and
     refreshes rows from the final device KV lengths before cache update.
     """
-    metadata._fp4_mla_device_page_table = False
-    metadata._fp4_mla_device_page_table_valid = False
-    metadata.fp4_mla_page_table_stride = 0
-    metadata.fp4_mla_context_repack_max_touched_pages = 1
+    metadata.fp4_mla_state.device_page_table = False
+    metadata.fp4_mla_state.device_page_table_valid = False
+    metadata.fp4_mla_state.page_table_stride = 0
+    metadata.fp4_mla_state.context_repack_max_touched_pages = 1
 
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
     num_contexts = int(getattr(metadata, "num_contexts", 0))
@@ -585,9 +585,9 @@ def configure_fp4_mla_device_page_table(
     num_context_tokens = int(getattr(metadata, "num_ctx_tokens", 0))
     num_generation_tokens = num_tokens - num_context_tokens
     block_offsets = getattr(metadata, "kv_cache_block_offsets", None)
-    page_ids = getattr(metadata, "_paged_kv_indices", None)
-    paged_kv_indptr = getattr(metadata, "_paged_kv_indptr", None)
-    paged_kv_indptr_decode = getattr(metadata, "paged_kv_indptr_decode", None)
+    page_ids = getattr(metadata.fp4_mla_state, "_paged_kv_indices", None)
+    paged_kv_indptr = getattr(metadata.fp4_mla_state, "_paged_kv_indptr", None)
+    paged_kv_indptr_decode = getattr(metadata.fp4_mla_state, "paged_kv_indptr_decode", None)
     max_page_capacity = int(getattr(kv_cache_manager, "max_blocks_per_seq", 0) or 0)
     page_spec = _fp4_mla_page_table_spec(kv_cache_manager)
     page_index_scale = int(page_spec.cache_page_index_scale)
@@ -631,7 +631,7 @@ def configure_fp4_mla_device_page_table(
     if not supported:
         return False
 
-    hp_page_ids = getattr(metadata, "_fp4_mla_hp_page_indices", None)
+    hp_page_ids = getattr(metadata.fp4_mla_state, "hp_page_indices", None)
     max_pool_id = max(page_spec.cache_pool_id, page_spec.hp_pool_id)
     if (
         not isinstance(hp_page_ids, torch.Tensor)
@@ -640,10 +640,10 @@ def configure_fp4_mla_device_page_table(
         or block_offsets.shape[0] <= max_pool_id
     ):
         return False
-    metadata._fp4_mla_cache_pool_id = int(page_spec.cache_pool_id)
-    metadata._fp4_mla_cache_page_index_scale = int(page_spec.cache_page_index_scale)
-    metadata._fp4_mla_hp_pool_id = int(page_spec.hp_pool_id)
-    metadata._fp4_mla_hp_page_index_scale = int(page_spec.hp_page_index_scale)
+    metadata.fp4_mla_state.cache_pool_id = int(page_spec.cache_pool_id)
+    metadata.fp4_mla_state.cache_page_index_scale = int(page_spec.cache_page_index_scale)
+    metadata.fp4_mla_state.hp_pool_id = int(page_spec.hp_pool_id)
+    metadata.fp4_mla_state.hp_page_index_scale = int(page_spec.hp_page_index_scale)
 
     max_pages = max_page_capacity
     host_kv_lens_available = (
@@ -675,7 +675,7 @@ def configure_fp4_mla_device_page_table(
                 max_context_len,
                 FP4_MLA_TOKENS_PER_BLOCK,
             )
-            metadata.fp4_mla_context_repack_max_touched_pages = min(
+            metadata.fp4_mla_state.context_repack_max_touched_pages = min(
                 max_pages,
                 triton.next_power_of_2(max(1, max_context_pages)),
             )
@@ -700,14 +700,15 @@ def configure_fp4_mla_device_page_table(
     )
     if not buffers_cover_table:
         return False
-    if metadata._fp4_mla_hp_page_indices.numel() < required_page_ids:
+    if metadata.fp4_mla_state.hp_page_indices.numel() < required_page_ids:
         return False
 
-    metadata._fp4_mla_device_page_table = True
-    metadata.fp4_mla_page_table_stride = max_pages
-    metadata.num_blocks = None
-    metadata.num_context_blocks = num_contexts * max_pages
-    metadata.num_generation_blocks = num_generation_sequences * max_pages
+    metadata.fp4_mla_state.device_page_table = True
+    metadata.fp4_mla_state.num_sequences = num_sequences
+    metadata.fp4_mla_state.page_table_stride = max_pages
+    metadata.fp4_mla_state.num_blocks = None
+    metadata.fp4_mla_state.num_context_blocks = num_contexts * max_pages
+    metadata.fp4_mla_state.num_generation_blocks = num_generation_sequences * max_pages
     return True
 
 
@@ -717,15 +718,15 @@ def materialize_fp4_mla_device_page_table(
     generation_kv_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Refresh the fixed-stride context and generation page table once per forward."""
-    if not bool(getattr(metadata, "_fp4_mla_device_page_table", False)):
+    if not bool(getattr(metadata.fp4_mla_state, "device_page_table", False)):
         raise RuntimeError("FP4 MLA requires fixed-stride device page metadata.")
-    if bool(getattr(metadata, "_fp4_mla_device_page_table_valid", False)):
+    if bool(getattr(metadata.fp4_mla_state, "device_page_table_valid", False)):
         return
 
     num_contexts = int(metadata.num_contexts)
     num_sequences = int(metadata.num_seqs)
     num_generation_sequences = num_sequences - num_contexts
-    max_pages = int(metadata.fp4_mla_page_table_stride)
+    max_pages = int(metadata.fp4_mla_state.page_table_stride)
     if num_sequences <= 0 or max_pages <= 0:
         raise RuntimeError(
             "FP4 MLA device page metadata requires positive sequence and page capacities."
@@ -757,15 +758,15 @@ def materialize_fp4_mla_device_page_table(
             f"{num_generation_sequences} entries."
         )
 
-    cache_pool_id = int(getattr(metadata, "_fp4_mla_cache_pool_id", 0))
+    cache_pool_id = int(getattr(metadata.fp4_mla_state, "cache_pool_id", 0))
     block_offsets = metadata.kv_cache_block_offsets[
         cache_pool_id,
         :num_sequences,
         0,
         :max_pages,
     ]
-    page_ids = metadata._paged_kv_indices[: num_sequences * max_pages]
-    page_index_scale = int(metadata._fp4_mla_cache_page_index_scale)
+    page_ids = metadata.fp4_mla_state._paged_kv_indices[: num_sequences * max_pages]
+    page_index_scale = int(metadata.fp4_mla_state.cache_page_index_scale)
     if page_index_scale <= 0:
         raise RuntimeError("FP4 MLA device page metadata requires a positive page-index scale.")
     grid = (
@@ -774,8 +775,8 @@ def materialize_fp4_mla_device_page_table(
     )
     _fp4_mla_materialize_page_table_kernel[grid](
         page_ids,
-        metadata._paged_kv_indptr,
-        metadata.paged_kv_indptr_decode,
+        metadata.fp4_mla_state._paged_kv_indptr,
+        metadata.fp4_mla_state.paged_kv_indptr_decode,
         block_offsets,
         kv_lens,
         generation_kv_lens,
@@ -788,11 +789,11 @@ def materialize_fp4_mla_device_page_table(
         PAGE_TILE_SIZE=_FP4_MLA_PAGE_TABLE_TILE_SIZE,
         num_warps=4,
     )
-    hp_page_ids = getattr(metadata, "_fp4_mla_hp_page_indices", None)
+    hp_page_ids = getattr(metadata.fp4_mla_state, "hp_page_indices", None)
     if not isinstance(hp_page_ids, torch.Tensor):
         raise RuntimeError("FP4 MLA requires an HP page-table output tensor.")
-    hp_pool_id = int(metadata._fp4_mla_hp_pool_id)
-    hp_page_index_scale = int(metadata._fp4_mla_hp_page_index_scale)
+    hp_pool_id = int(metadata.fp4_mla_state.hp_pool_id)
+    hp_page_index_scale = int(metadata.fp4_mla_state.hp_page_index_scale)
     hp_block_offsets = metadata.kv_cache_block_offsets[
         hp_pool_id,
         :num_sequences,
@@ -801,8 +802,8 @@ def materialize_fp4_mla_device_page_table(
     ]
     _fp4_mla_materialize_page_table_kernel[grid](
         hp_page_ids,
-        metadata._paged_kv_indptr,
-        metadata.paged_kv_indptr_decode,
+        metadata.fp4_mla_state._paged_kv_indptr,
+        metadata.fp4_mla_state.paged_kv_indptr_decode,
         hp_block_offsets,
         kv_lens,
         generation_kv_lens,
@@ -815,7 +816,7 @@ def materialize_fp4_mla_device_page_table(
         PAGE_TILE_SIZE=_FP4_MLA_PAGE_TABLE_TILE_SIZE,
         num_warps=4,
     )
-    metadata._fp4_mla_device_page_table_valid = True
+    metadata.fp4_mla_state.device_page_table_valid = True
 
 
 @triton.jit
@@ -1126,7 +1127,7 @@ def get_fp4_mla_v_scale_pool_view(
     v_head_dim: int,
 ) -> torch.Tensor:
     """View the auxiliary MLA V-scale pool in Triton's block-scaled layout."""
-    pool = getattr(metadata, "fp4_mla_v_scale_pool", None)
+    pool = getattr(metadata.fp4_mla_state, "v_scale_pool", None)
     if pool is None:
         raise RuntimeError("FP4 MLA V scale pool is not allocated.")
 
@@ -1157,7 +1158,7 @@ def get_fp4_mla_v_scale_pool_view(
 
 
 def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata, "_fp4_mla_kv_global_scale", None)
+    global_scale = getattr(metadata.fp4_mla_state, "kv_global_scale", None)
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device
@@ -1169,7 +1170,7 @@ def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tens
 
 
 def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata, "_fp4_mla_q_global_scale", None)
+    global_scale = getattr(metadata.fp4_mla_state, "q_global_scale", None)
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device
@@ -1287,7 +1288,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     )
     rotary_cos_sin_ptr = rotary_cos_sin if rotary_cos_sin is not None else latent_cache
 
-    hp_pool = getattr(metadata, "high_precision_kv_pool", None)
+    hp_pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
     if not isinstance(hp_pool, torch.Tensor):
         raise TypeError("FP4 MLA high-precision KV pool must be a tensor.")
     if hp_pool.device != latent_cache.device:
@@ -1306,7 +1307,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         )
     if hp_pool.stride(-1) != 1:
         raise ValueError("FP4 MLA high-precision KV pool must be contiguous in head_dim.")
-    hp_page_ids = metadata._fp4_mla_hp_page_indices
+    hp_page_ids = metadata.fp4_mla_state.hp_page_indices
     if not isinstance(hp_page_ids, torch.Tensor):
         raise RuntimeError("FP4 MLA context cache update requires HP page metadata.")
     store_hp_tail = num_contexts > 0
@@ -1334,13 +1335,13 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         rotary_cos_sin_ptr,
         hp_pool,
         hp_page_ids,
-        metadata.batch_indices,
-        metadata.positions,
-        metadata.paged_kv_indices,
-        metadata.paged_kv_indptr,
-        metadata.paged_kv_indices.shape[0],
-        metadata.paged_kv_indptr.shape[0],
-        metadata.batch_indices.shape[0],
+        metadata.fp4_mla_state.batch_indices,
+        metadata.fp4_mla_state.positions,
+        metadata.fp4_mla_state.paged_kv_indices,
+        metadata.fp4_mla_state.paged_kv_indptr,
+        metadata.fp4_mla_state.paged_kv_indices.shape[0],
+        metadata.fp4_mla_state.paged_kv_indptr.shape[0],
+        metadata.fp4_mla_state.batch_indices.shape[0],
         v_sf.shape[1],
         v_sf.shape[0],
         num_contexts,
@@ -1388,7 +1389,7 @@ def _fp4_mla_generation_num_blocks_device(metadata: Any) -> torch.Tensor:
     slots are never consumed.
     """
     num_gen = metadata.num_seqs - metadata.num_contexts
-    return metadata.paged_kv_indptr_decode[num_gen : num_gen + 1]
+    return metadata.fp4_mla_state.paged_kv_indptr_decode[num_gen : num_gen + 1]
 
 
 def _fp4_mla_uniform_generation_lengths(
@@ -1402,8 +1403,8 @@ def _fp4_mla_uniform_generation_lengths(
     num_seqs = metadata.num_seqs
     kv_lens_gen = metadata.kv_lens_cuda_runtime[num_contexts:num_seqs]
     prompt_lens_gen = metadata.prompt_lens_cuda_runtime[num_contexts:num_seqs]
-    corrected_kv_lens = getattr(metadata, "fp4_mla_generation_kv_lens", None)
-    generation_lens = getattr(metadata, "fp4_mla_generation_append_lens", None)
+    corrected_kv_lens = getattr(metadata.fp4_mla_state, "generation_kv_lens", None)
+    generation_lens = getattr(metadata.fp4_mla_state, "generation_append_lens", None)
     tensors = (
         kv_lens_gen,
         prompt_lens_gen,
@@ -1421,17 +1422,13 @@ def _fp4_mla_uniform_generation_lengths(
     record_for_capture = bool(
         getattr(metadata, "is_cuda_graph", False)
         and torch.cuda.is_current_stream_capturing()
-        and not getattr(
-            metadata,
-            "_fp4_mla_generation_lengths_capture_recorded",
-            False,
-        )
+        and not getattr(metadata.fp4_mla_state, "generation_lengths_capture_recorded", False)
     )
     precomputed = (
         not record_for_capture
-        and metadata.fp4_mla_generation_lengths_num_tokens == num_gen_tokens
-        and metadata.fp4_mla_generation_lengths_num_seqs == num_gen
-        and metadata.fp4_mla_generation_lengths_num_contexts == num_contexts
+        and metadata.fp4_mla_state.generation_lengths_num_tokens == num_gen_tokens
+        and metadata.fp4_mla_state.generation_lengths_num_seqs == num_gen
+        and metadata.fp4_mla_state.generation_lengths_num_contexts == num_contexts
     )
     if not precomputed:
         populate_fp4_mla_generation_lengths(
@@ -1442,11 +1439,11 @@ def _fp4_mla_uniform_generation_lengths(
             num_gen_tokens=num_gen_tokens,
             num_gen=num_gen,
         )
-        metadata.fp4_mla_generation_lengths_num_tokens = num_gen_tokens
-        metadata.fp4_mla_generation_lengths_num_seqs = num_gen
-        metadata.fp4_mla_generation_lengths_num_contexts = num_contexts
+        metadata.fp4_mla_state.generation_lengths_num_tokens = num_gen_tokens
+        metadata.fp4_mla_state.generation_lengths_num_seqs = num_gen
+        metadata.fp4_mla_state.generation_lengths_num_contexts = num_contexts
         if record_for_capture:
-            metadata._fp4_mla_generation_lengths_capture_recorded = True
+            metadata.fp4_mla_state.generation_lengths_capture_recorded = True
     return corrected_kv_lens[:num_gen], generation_lens[:num_gen]
 
 
@@ -1455,9 +1452,9 @@ def _materialize_fp4_mla_device_page_table_for_forward(
     generation_kv_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Materialize all fixed-stride rows from final per-forward device lengths."""
-    if not bool(getattr(metadata, "_fp4_mla_device_page_table", False)):
+    if not bool(getattr(metadata.fp4_mla_state, "device_page_table", False)):
         raise RuntimeError("FP4 MLA cache update requires fixed-stride device page metadata.")
-    if bool(getattr(metadata, "_fp4_mla_device_page_table_valid", False)):
+    if bool(getattr(metadata.fp4_mla_state, "device_page_table_valid", False)):
         return
 
     num_contexts = int(metadata.num_contexts)
@@ -1528,7 +1525,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     kv_lens_gen, gen_lens_gen = _fp4_mla_uniform_generation_lengths(metadata, num_tokens, num_gen)
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens_gen)
 
-    pool = getattr(metadata, "high_precision_kv_pool", None)
+    pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
     if pool is None:
         raise RuntimeError("FP4 MLA 2D generation scatter requires the HP KV pool.")
     try:
@@ -1661,7 +1658,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             gen_lens_gen,
             page_ids,
             hp_page_ids,
-            metadata.paged_kv_indptr_decode,
+            metadata.fp4_mla_state.paged_kv_indptr_decode,
             page_ids_len,
             hp_page_ids.numel(),
             indptr_len,
@@ -1768,16 +1765,16 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         )
         preload_keys = _fp4_mla_triton_preload_key_set(metadata)
         if preload_key not in preload_keys:
-            context_page_ids = getattr(metadata, "_paged_kv_indices", None)
+            context_page_ids = getattr(metadata.fp4_mla_state, "_paged_kv_indices", None)
             if not isinstance(context_page_ids, torch.Tensor):
                 context_page_ids = page_ids
-            context_indptr = getattr(metadata, "_paged_kv_indptr", None)
+            context_indptr = getattr(metadata.fp4_mla_state, "_paged_kv_indptr", None)
             if not isinstance(context_indptr, torch.Tensor):
-                context_indptr = metadata.paged_kv_indptr_decode
-            context_batch_indices = getattr(metadata, "batch_indices", None)
+                context_indptr = metadata.fp4_mla_state.paged_kv_indptr_decode
+            context_batch_indices = getattr(metadata.fp4_mla_state, "batch_indices", None)
             if not isinstance(context_batch_indices, torch.Tensor):
                 context_batch_indices = hp_page_ids
-            context_positions = getattr(metadata, "positions", None)
+            context_positions = getattr(metadata.fp4_mla_state, "positions", None)
             if not isinstance(context_positions, torch.Tensor):
                 context_positions = hp_page_ids
             _fp4_mla_context_cache_update_kernel[(1, num_dim_blocks)](
@@ -1863,7 +1860,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     launch_generation_update(
         launch_grid,
         page_ids_len=page_ids.shape[0],
-        indptr_len=metadata.paged_kv_indptr_decode.shape[0],
+        indptr_len=metadata.fp4_mla_state.paged_kv_indptr_decode.shape[0],
         max_gen_tiles_variant=max(max_gen_tiles, 1),
         q_prefix_block_dim_variant=q_prefix_block_dim,
         q_prefix_blocks_variant=q_prefix_blocks,
@@ -1919,9 +1916,9 @@ def scatter_fp4_mla_kv_cache(
     phase updated the HP pool.
     """
     if phase == "generation":
-        metadata._fp4_mla_prequantized_q = None
-        metadata._fp4_mla_prequantized_q_sf = None
-        metadata._fp4_mla_q_batch_capacity = None
+        metadata.fp4_mla_state.prequantized_q = None
+        metadata.fp4_mla_state.prequantized_q_sf = None
+        metadata.fp4_mla_state.q_batch_capacity = None
     if latent_cache.numel() == 0:
         raise ValueError("FP4 MLA cache scatter requires at least one latent token.")
 
@@ -1932,8 +1929,8 @@ def scatter_fp4_mla_kv_cache(
         raise ValueError(
             f"FP4 MLA KV head_dim must be divisible by {FP4_BLOCK_SIZE}, got {head_dim}."
         )
-    indices_len = metadata.batch_indices.shape[0]
-    positions_len = metadata.positions.shape[0]
+    indices_len = metadata.fp4_mla_state.batch_indices.shape[0]
+    positions_len = metadata.fp4_mla_state.positions.shape[0]
     if token_offset + num_tokens > indices_len or token_offset + num_tokens > positions_len:
         raise RuntimeError(
             f"FP4 MLA scatter would read batch_indices[{token_offset}:"
@@ -1959,7 +1956,7 @@ def scatter_fp4_mla_kv_cache(
 
     if phase not in ("context", "generation"):
         raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
-    if getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
+    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -2009,9 +2006,9 @@ def scatter_fp4_mla_kv_cache(
             q_quant_input.shape[1],
             q_quant_input.device,
         )
-        metadata._fp4_mla_prequantized_q = q_fp4_out
-        metadata._fp4_mla_prequantized_q_sf = q_sf_out
-        metadata._fp4_mla_q_batch_capacity = q_batch_capacity
+        metadata.fp4_mla_state.prequantized_q = q_fp4_out
+        metadata.fp4_mla_state.prequantized_q_sf = q_sf_out
+        metadata.fp4_mla_state.q_batch_capacity = q_batch_capacity
         hp_pool_updated = True
     cutedsl_backend = _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
     fused_v_transpose = cutedsl_backend and _fp4_mla_cutedsl_fused_v_transpose_enabled()
@@ -2104,7 +2101,7 @@ def scatter_fp4_mla_kv_cache(
             v_packed_base=v_packed_base,
             v_page_offset=v_page_offset,
         )
-        v_pack_page_ids = metadata.paged_kv_indices
+        v_pack_page_ids = metadata.fp4_mla_state.paged_kv_indices
     else:
         generation_state = _scatter_fp4_mla_kv_cache_2d_generation(
             metadata,
@@ -2144,18 +2141,20 @@ def scatter_fp4_mla_kv_cache(
     if cutedsl_backend and not fused_v_transpose and not direct_v_packed_write:
         if phase == "context":
             num_contexts = metadata.num_contexts
-            cutedsl_v_pack_page_ids = metadata.paged_kv_indices[: metadata.num_context_blocks]
-            cutedsl_repack_page_indptr = metadata.paged_kv_indptr[: num_contexts + 1]
+            cutedsl_v_pack_page_ids = metadata.fp4_mla_state.paged_kv_indices[
+                : metadata.fp4_mla_state.num_context_blocks
+            ]
+            cutedsl_repack_page_indptr = metadata.fp4_mla_state.paged_kv_indptr[: num_contexts + 1]
             cutedsl_repack_kv_lens = metadata.kv_lens_cuda_runtime[:num_contexts]
             cutedsl_repack_generation_lens = metadata.prompt_lens_cuda_runtime[:num_contexts]
             cutedsl_repack_max_touched_pages = int(
-                metadata.fp4_mla_context_repack_max_touched_pages
+                metadata.fp4_mla_state.context_repack_max_touched_pages
             )
         elif generation_state is not None:
             kv_lens_gen, gen_lens_gen, generation_page_ids = generation_state
             num_gen = kv_lens_gen.numel()
             cutedsl_v_pack_page_ids = generation_page_ids
-            cutedsl_repack_page_indptr = metadata.paged_kv_indptr_decode
+            cutedsl_repack_page_indptr = metadata.fp4_mla_state.paged_kv_indptr_decode
             cutedsl_repack_kv_lens = kv_lens_gen
             cutedsl_repack_generation_lens = gen_lens_gen
             cutedsl_repack_max_touched_pages = _ceil_div(
@@ -2235,7 +2234,8 @@ def _ensure_workspace_tensor(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    tensor = getattr(metadata, attr_name, None)
+    workspaces = metadata.fp4_mla_state.workspaces
+    tensor = workspaces.get(attr_name)
     needs_alloc = (
         tensor is None
         or tensor.dtype != dtype
@@ -2250,7 +2250,7 @@ def _ensure_workspace_tensor(
                 "Run a warmup prepare/forward first."
             )
         tensor = torch.empty(shape, dtype=dtype, device=device)
-        setattr(metadata, attr_name, tensor)
+        workspaces[attr_name] = tensor
 
     slices = tuple(slice(0, dim) for dim in shape)
     return tensor[slices]
@@ -2483,19 +2483,15 @@ def _set_triton_v_packed_cache_valid(
         if _shared_v_pack_storage_enabled()
         else _triton_v_packed_valid_attr(layer_idx)
     )
-    setattr(
-        metadata,
-        valid_attr,
-        _triton_v_packed_cache_tag(
-            layer_idx,
-            kv_cache,
-            v_head_dim=v_head_dim,
-            page_size=page_size,
-            block_v=block_v,
-            local_layer=local_layer,
-            v_sf=v_sf,
-            page_ids=page_ids,
-        ),
+    metadata.fp4_mla_state.v_packed_cache_tags[valid_attr] = _triton_v_packed_cache_tag(
+        layer_idx,
+        kv_cache,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        block_v=block_v,
+        local_layer=local_layer,
+        v_sf=v_sf,
+        page_ids=page_ids,
     )
 
 
@@ -2516,7 +2512,7 @@ def _is_triton_v_packed_cache_valid(
         if _shared_v_pack_storage_enabled()
         else _triton_v_packed_valid_attr(layer_idx)
     )
-    return getattr(metadata, valid_attr, None) == _triton_v_packed_cache_tag(
+    return metadata.fp4_mla_state.v_packed_cache_tags.get(valid_attr) == _triton_v_packed_cache_tag(
         layer_idx,
         kv_cache,
         v_head_dim=v_head_dim,
@@ -2554,7 +2550,7 @@ def _get_triton_v_packed_cache(
         page_ids=page_ids,
     ):
         return None
-    v_packed = getattr(metadata, _triton_v_packed_attr(layer_idx), None)
+    v_packed = metadata.fp4_mla_state.workspaces.get(_triton_v_packed_attr(layer_idx))
     expected_shape = _v_packed_shape(kv_cache, v_head_dim, page_size, block_v)
     if (
         v_packed is None
@@ -2654,9 +2650,9 @@ def _max_generation_pages(metadata: Any) -> int:
     num_gen = metadata.num_seqs - metadata.num_contexts
     if num_gen <= 0:
         return 0
-    if not getattr(metadata, "_fp4_mla_device_page_table", False):
+    if not getattr(metadata.fp4_mla_state, "device_page_table", False):
         raise RuntimeError("FP4 MLA generation requires fixed-stride device page metadata.")
-    max_pages = int(metadata.fp4_mla_page_table_stride)
+    max_pages = int(metadata.fp4_mla_state.page_table_stride)
     if max_pages <= 0:
         raise RuntimeError("FP4 MLA device page-table stride must be positive.")
     return max_pages
@@ -2671,7 +2667,7 @@ def _fp4_mla_generation_page_ids(metadata: Any, num_gen_seqs: int) -> torch.Tens
             f"{num_gen_seqs} != {expected_num_gen}."
         )
     max_pages = _max_generation_pages(metadata)
-    page_ids = getattr(metadata, "_paged_kv_indices", None)
+    page_ids = getattr(metadata.fp4_mla_state, "_paged_kv_indices", None)
     start = metadata.num_contexts * max_pages
     end = start + num_gen_seqs * max_pages
     if (
@@ -2694,7 +2690,7 @@ def _fp4_mla_generation_hp_page_ids(metadata: Any, num_gen_seqs: int) -> torch.T
             f"{num_gen_seqs} != {expected_num_gen}."
         )
     max_pages = _max_generation_pages(metadata)
-    page_ids = getattr(metadata, "_fp4_mla_hp_page_indices", None)
+    page_ids = getattr(metadata.fp4_mla_state, "hp_page_indices", None)
     start = metadata.num_contexts * max_pages
     end = start + num_gen_seqs * max_pages
     if (
@@ -2727,7 +2723,7 @@ def _infer_assume_full_pages(metadata: Any, max_pages: int, page_size: int) -> b
 
     start = metadata.num_contexts
     end = metadata.num_seqs
-    block_counts = _host_int_list(getattr(metadata, "num_blocks", None), start, end)
+    block_counts = _host_int_list(getattr(metadata.fp4_mla_state, "num_blocks", None), start, end)
     if block_counts is not None and (
         not block_counts or min(block_counts) != max_pages or max(block_counts) != max_pages
     ):
@@ -2743,12 +2739,12 @@ def _infer_assume_full_pages(metadata: Any, max_pages: int, page_size: int) -> b
             tuple(block_counts) if block_counts is not None else None,
             kv_lens_cuda.data_ptr(),
         )
-        cache = getattr(metadata, "_fp4_mla_full_pages_cache", None)
+        cache = getattr(metadata.fp4_mla_state, "full_pages_cache", None)
         if cache is not None and cache[0] == cache_key:
             return bool(cache[1])
         kv_lens = [int(item) for item in kv_lens_cuda[start:end].detach().cpu().tolist()]
         result = bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
-        setattr(metadata, "_fp4_mla_full_pages_cache", (cache_key, result))
+        setattr(metadata.fp4_mla_state, "full_pages_cache", (cache_key, result))
         return result
 
     kv_cache_params = getattr(metadata, "kv_cache_params", None)
@@ -2990,7 +2986,7 @@ def _run_triton_attention_decode(
         global_scale,
         q_global_scale,
         src_page_ids,
-        metadata.paged_kv_indptr_decode,
+        metadata.fp4_mla_state.paged_kv_indptr_decode,
         kv_lens,
         src_page_ids.shape[0],
         kv_cache.shape[0],
@@ -3055,8 +3051,8 @@ def _run_triton_attention_decode(
     # reduce during capture so we never allocate mid-capture. The single-level
     # reduce is numerically identical (it just launches fewer CTAs).
     if num_reduce_groups > 1 and torch.cuda.is_current_stream_capturing():
-        gmax = getattr(metadata, "_fp4_mla_attention_group_max_buf", None)
-        gsum = getattr(metadata, "_fp4_mla_attention_group_sum_buf", None)
+        gmax = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_max_buf")
+        gsum = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_group_sum_buf")
         groups_ready = (
             gmax is not None
             and gsum is not None
@@ -3136,7 +3132,7 @@ def _run_triton_attention_decode(
         max_scores,
         denom,
         page_max,
-        metadata.paged_kv_indptr_decode,
+        metadata.fp4_mla_state.paged_kv_indptr_decode,
         kv_lens,
         src_page_ids.shape[0],
         max_scores.stride(0),
@@ -3206,7 +3202,7 @@ def _run_triton_attention_decode(
     # Fall back to the unsplit PV (numerically identical) during capture unless a
     # warmup forward already sized that workspace, so capture never allocates.
     if page_split > 1 and torch.cuda.is_current_stream_capturing():
-        pbuf = getattr(metadata, "_fp4_mla_attention_pv_partial_buf", None)
+        pbuf = metadata.fp4_mla_state.workspaces.get("_fp4_mla_attention_pv_partial_buf")
         partial_ready = (
             pbuf is not None
             and pbuf.shape[0] >= num_queries
@@ -3236,7 +3232,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                metadata.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -3285,7 +3281,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                metadata.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -3359,7 +3355,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                metadata.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -3400,7 +3396,7 @@ def _run_triton_attention_decode(
                 v_sf,
                 global_scale,
                 src_page_ids,
-                metadata.paged_kv_indptr_decode,
+                metadata.fp4_mla_state.paged_kv_indptr_decode,
                 kv_lens,
                 src_page_ids.shape[0],
                 kv_cache.shape[0],
@@ -3497,7 +3493,7 @@ def run_fp4_mla_attention_decode(
         raise ValueError("FP4 MLA attention output batch dimensions do not match.")
 
     backend = _fp4_mla_attention_backend()
-    if getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
+    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
         )
@@ -3549,7 +3545,7 @@ def run_fp4_mla_attention_decode(
     )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
 
-    v_sf_pool = metadata.fp4_mla_v_scale_pool
+    v_sf_pool = metadata.fp4_mla_state.v_scale_pool
     v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
         torch.float8_e4m3fn
     )
@@ -3717,7 +3713,7 @@ def run_fp4_mla_attention_decode(
             core_v_sf,
             global_scale,
             src_page_ids,
-            metadata.paged_kv_indptr_decode[: num_gen_seqs + 1],
+            metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
             kv_lens,
             kernel_output,
             max_kv_len=max_pages * metadata.page_size,

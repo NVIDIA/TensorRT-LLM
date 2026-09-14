@@ -341,7 +341,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_no_rubin
     @pytest.mark.skip_less_device_memory(60000)
-    def test_nvfp4_mla_gsm8k(self, monkeypatch):
+    def test_nvfp4_mla(self, monkeypatch):
         from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import \
             Fp4MlaFmha
         from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import \

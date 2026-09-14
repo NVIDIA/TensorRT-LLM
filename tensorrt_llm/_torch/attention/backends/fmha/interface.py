@@ -42,6 +42,7 @@ class Fmha(ABC):
 
     supports_skip_correction: ClassVar[bool] = False
     supports_block_sparse_inputs: ClassVar[bool] = False
+    supports_fp4_mla: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -74,6 +75,12 @@ class Fmha(ABC):
             logger.debug(
                 f"{cls.__name__} is unavailable: skip-correction is enabled and unsupported."
             )
+            return False
+        if (
+            getattr(attn, "is_mla_enable", False)
+            and getattr(attn, "has_fp4_kv_cache", False)
+            and not cls.supports_fp4_mla
+        ):
             return False
         return cls._is_available(attn)
 
