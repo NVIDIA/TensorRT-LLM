@@ -3503,14 +3503,13 @@ class PyExecutor:
         can_queue check, so no revert is needed.
         """
         if self._is_kv_manager_v2:
+            assert self.kv_cache_manager_pair is not None
             for req in scheduled_batch.generation_requests:
                 # The empty-batch padding dummy joins after scheduling, so its
                 # capacity was never grown; reverting would shrink it.
                 if getattr(req, "py_skip_gen_alloc_revert", False):
                     continue
-                self.kv_cache_manager.revert_allocate_generation(req)
-                if self.enable_joint_kv_cache_reuse:
-                    self.draft_kv_cache_manager.revert_allocate_generation(req)
+                self.kv_cache_manager_pair.revert_allocate_generation(req)
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Commit one context frontier to target and draft caches."""

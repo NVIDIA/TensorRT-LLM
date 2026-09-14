@@ -205,6 +205,7 @@ def make_kv_cache_manager(
         lambda req: True
     )
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
+    mgr.try_reserve_draft_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr._resume_and_restore.return_value = True
 
     def create_kv_cache(request_id, *_args, **_kwargs):
@@ -792,7 +793,7 @@ class TestKVCacheFailuresGen:
         """The draft pool mirrors the target pool, so a draft-side failure is
         an ordinary KV shortage: roll the target growth back and run the same
         last-resort self-suspend used for target-pool pressure."""
-        mgr = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
+        mgr = make_kv_cache_manager()
         draft_mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
         sched = make_scheduler(
             mgr,
@@ -805,7 +806,8 @@ class TestKVCacheFailuresGen:
 
         assert ids(out.paused_requests) == [0]
         mgr.try_allocate_generation.assert_called_once_with(req)
-        draft_mgr.try_allocate_generation.assert_called_once_with(req)
+        draft_mgr.try_reserve_draft_generation.assert_called_once_with(req)
+        draft_mgr.revert_reserve_draft_generation.assert_not_called()
         mgr.revert_allocate_generation.assert_called_once_with(req)
         mgr.suspend_request.assert_called_once_with(req)
         draft_mgr.suspend_request.assert_called_once_with(req)

@@ -1308,23 +1308,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
-        """Atomically admit one generation step in target and draft pools.
-
-        The draft pool mirrors the target pool (same requests, same block
-        boundaries, same ``tokens_per_block``), so a draft-side failure just
-        means this request does not fit. Roll the target growth back and report
-        a plain allocation failure, letting the caller run the same evict /
-        recompute-pause / self-suspend ladder it uses for target-pool pressure.
-        """
-        if not self.kv_cache_manager.try_allocate_generation(req):
-            return False
-
-        draft_manager = self._joint_draft_manager
-        if draft_manager is None or draft_manager.try_allocate_generation(req):
-            return True
-
-        self.kv_cache_manager.revert_allocate_generation(req)
-        return False
+        """Atomically admit one generation step in target and draft pools."""
+        return self.kv_cache_manager_pair.try_allocate_generation(req)
 
     # ---- Eviction ----
 
