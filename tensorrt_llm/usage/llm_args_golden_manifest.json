@@ -649,6 +649,35 @@
       "path": "kv_cache_config.kv_cache_event_hash_algo"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.buffer_steps"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.enable_kv_cache_events"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.hwm"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.max_queue_size"
+    },
+    {
+      "allowed_values": [
+        "null",
+        "zmq"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "kv_cache_config.kv_events_config.publisher"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",
@@ -1465,7 +1494,8 @@
     {
       "allowed_values": [
         "VANILLA",
-        "TRTLLM"
+        "TRTLLM",
+        "FA4"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
@@ -1520,11 +1550,6 @@
       "path": "speculative_config.eagle3_model_arch"
     },
     {
-      "capture_policy": "bool|none",
-      "kind": "value",
-      "path": "speculative_config.eagle3_one_model"
-    },
-    {
       "capture_policy": "list[list[int]]|none",
       "kind": "value",
       "path": "speculative_config.eagle_choices"
@@ -1548,11 +1573,6 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.global_pool_size"
-    },
-    {
-      "capture_policy": "bool|none",
-      "kind": "value",
-      "path": "speculative_config.greedy_sampling"
     },
     {
       "capture_policy": "bool",
@@ -1615,11 +1635,6 @@
       "path": "speculative_config.max_total_draft_tokens"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "speculative_config.mtp_eagle_one_model"
-    },
-    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.num_eagle_layers"
@@ -1628,11 +1643,6 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.num_nextn_predict_layers"
-    },
-    {
-      "capture_policy": "float|none",
-      "kind": "value",
-      "path": "speculative_config.posterior_threshold"
     },
     {
       "capture_policy": "float",

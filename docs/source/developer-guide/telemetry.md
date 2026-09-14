@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-301 captured fields.
+302 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -145,6 +145,11 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.host_cache_size` | `int\|none` | `value` |  |
 | `kv_cache_config.iteration_stats_interval` | `int` | `value` |  |
 | `kv_cache_config.kv_cache_event_hash_algo` | `literal` | `categorical` | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
+| `kv_cache_config.kv_events_config.buffer_steps` | `int` | `value` |  |
+| `kv_cache_config.kv_events_config.enable_kv_cache_events` | `bool` | `value` |  |
+| `kv_cache_config.kv_events_config.hwm` | `int` | `value` |  |
+| `kv_cache_config.kv_events_config.max_queue_size` | `int` | `value` |  |
+| `kv_cache_config.kv_events_config.publisher` | `literal\|none` | `categorical` | `null`, `zmq` |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `literal` | `categorical` | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `int` | `value` |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `bool` | `value` |  |
@@ -281,20 +286,18 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.acceptance_rate_window_size` | `int\|none` | `value` |  |
 | `speculative_config.advanced_sampling_mode` | `enum[AdvancedSamplingMode]` | `categorical` | `full`, `no_topk`, `no_topp`, `no_topk_no_topp` |
 | `speculative_config.allow_advanced_sampling` | `bool` | `value` |  |
-| `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM` |
+| `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM`, `FA4` |
 | `speculative_config.begin_thinking_phase_token` | `int` | `value` |  |
 | `speculative_config.block_size` | `int\|none` | `value` |  |
 | `speculative_config.decoding_type` | `literal` | `categorical` | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `int\|none` | `value` |  |
 | `speculative_config.eagle3_layers_to_capture` | `none\|set[int]` | `value` |  |
 | `speculative_config.eagle3_model_arch` | `literal` | `categorical` | `llama3`, `mistral_large3` |
-| `speculative_config.eagle3_one_model` | `bool\|none` | `value` |  |
 | `speculative_config.eagle_choices` | `list[list[int]]\|none` | `value` |  |
 | `speculative_config.enable_global_pool` | `bool` | `value` |  |
 | `speculative_config.enable_penalty` | `bool` | `value` |  |
 | `speculative_config.end_thinking_phase_token` | `int` | `value` |  |
 | `speculative_config.global_pool_size` | `int\|none` | `value` |  |
-| `speculative_config.greedy_sampling` | `bool\|none` | `value` |  |
 | `speculative_config.is_keep_all` | `bool` | `value` |  |
 | `speculative_config.is_public_pool` | `bool` | `value` |  |
 | `speculative_config.is_use_oldest` | `bool` | `value` |  |
@@ -306,10 +309,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_matching_ngram_size` | `int` | `value` |  |
 | `speculative_config.max_non_leaves_per_layer` | `int\|none` | `value` |  |
 | `speculative_config.max_total_draft_tokens` | `int\|none` | `value` |  |
-| `speculative_config.mtp_eagle_one_model` | `bool` | `value` |  |
 | `speculative_config.num_eagle_layers` | `int\|none` | `value` |  |
 | `speculative_config.num_nextn_predict_layers` | `int\|none` | `value` |  |
-| `speculative_config.posterior_threshold` | `float\|none` | `value` |  |
 | `speculative_config.relaxed_delta` | `float` | `value` |  |
 | `speculative_config.relaxed_topk` | `int` | `value` |  |
 | `speculative_config.sa_config.enable_global_pool` | `bool` | `value` |  |

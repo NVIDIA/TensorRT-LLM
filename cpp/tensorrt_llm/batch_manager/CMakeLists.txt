@@ -37,10 +37,8 @@ set(SRCS
     llmRequest.cpp
     microBatchScheduler.cpp
     peftCacheManager.cpp
-    rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    utils/staticThreadPool.cpp
     evictionPolicy.cpp
     cacheTransBuffer.cpp
     agentTree.cpp)

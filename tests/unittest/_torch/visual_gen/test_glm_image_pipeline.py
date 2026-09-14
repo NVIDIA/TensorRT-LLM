@@ -24,10 +24,11 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from diffusers import DiffusionPipeline
+from diffusers import DiffusionPipeline, FlowMatchEulerDiscreteScheduler
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.models.glm_image import GlmImageAttention, GlmImagePipeline
+from tensorrt_llm._torch.visual_gen.models.glm_image.pipeline_glm_image import retrieve_timesteps
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
 
@@ -241,6 +242,24 @@ def _assert_pipeline_matches_hf(
 # ============================================================================
 # Tests
 # ============================================================================
+
+
+@pytest.mark.parametrize("num_steps", [2, 30])
+@pytest.mark.parametrize("mu", [0.75, 3.25])
+def test_retrieve_timesteps_preserves_glm_labels_and_shifted_sigmas(num_steps, mu):
+    scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True, time_shift_type="linear")
+    explicit = np.linspace(1000, 1.0, num_steps + 1)[:-1].astype(np.int64).astype(np.float32)
+    sigmas = explicit / 1000
+
+    actual, count = retrieve_timesteps(scheduler, num_steps, "cpu", explicit, sigmas, mu=mu)
+
+    # Diffusers 0.39 kept explicit labels separate from its shifted sigmas.
+    torch.testing.assert_close(actual, torch.from_numpy(explicit), rtol=0, atol=0)
+    assert count == num_steps
+    expected_sigmas = mu / (mu + (1 / sigmas - 1))
+    torch.testing.assert_close(scheduler.sigmas[:-1], torch.from_numpy(expected_sigmas))
+    assert scheduler.sigmas[-1] == 0
+    assert not torch.equal(actual, scheduler.sigmas[:-1] * 1000)
 
 
 @pytest.mark.integration
