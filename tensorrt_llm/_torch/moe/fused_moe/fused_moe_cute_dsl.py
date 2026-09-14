@@ -1676,8 +1676,14 @@ class CuteDslFusedMoE(MoEImplBase):
         )
 
         # The fused finalize scatter-adds into moe_output, so the rows this
-        # rank produces must be zero on entry. Overlap the sparse memset with
-        # the routing metadata on the aux stream when one is available.
+        # rank produces must be zero on entry. In the dense case (the same
+        # condition under which moe_output_memset_inplace falls back to a full
+        # cudaMemsetAsync) the fused op clears the whole output inside its
+        # workspace reset launch, saving the memset launch and its aux-stream
+        # event pair. Alltoall with ep > top_k keeps the sparse row memset,
+        # overlapped with the routing metadata on the aux stream.
+        zero_output_in_kernel = (not enable_alltoall
+                                 or self.mapping.moe_ep_size <= effective_top_k)
         memset_kwargs = dict(
             input=moe_output,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -1690,7 +1696,7 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
         )
         has_aux_streams = self._has_moe_output_memset_aux_stream()
-        if has_aux_streams:
+        if not zero_output_in_kernel and has_aux_streams:
             memset_stream = self._moe_output_memset_run_stream()
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(memset_stream)
@@ -1699,7 +1705,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
                 self.event_dict[EventType.MoeOutputMemset].record()
             self.event_dict[EventType.MoeOutputMemset].wait()
-        else:
+        elif not zero_output_in_kernel:
             torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
 
         fc_alpha, fc1_norm_const = self._mxfp8_fused_fc12_constants(x.device)
@@ -1733,6 +1739,7 @@ class CuteDslFusedMoE(MoEImplBase):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             swiglu_limit=swiglu_limit,
+            zero_output=zero_output_in_kernel,
         )
         return moe_output
 

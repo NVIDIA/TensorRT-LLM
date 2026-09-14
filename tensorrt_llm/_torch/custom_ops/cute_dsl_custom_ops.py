@@ -16305,13 +16305,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              num_local_experts: int,
                              local_expert_offset: int,
                              tile_size: int,
-                             swiglu_limit: float = float("inf")):
+                             swiglu_limit: float = float("inf"),
+                             zero_output: bool = False):
                     super().__init__()
                     self.num_experts = num_experts
                     self.top_k = top_k
                     self.num_local_experts = num_local_experts
                     self.local_expert_offset = local_expert_offset
                     self.tile_size = tile_size
+                    # Clear the whole output inside the workspace reset launch
+                    # instead of a separate memset (dense case only; the caller
+                    # keeps its sparse row memset for alltoall with ep > top_k).
+                    self.zero_output = zero_output
                     # The kernel treats a negative limit as "no clamp".
                     swiglu_limit = float(swiglu_limit)
                     self.swiglu_limit = swiglu_limit if swiglu_limit >= 0 else float(
@@ -16336,6 +16341,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.local_expert_offset,
                         self.tile_size,
                         self.swiglu_limit,
+                        self.zero_output,
                     )
 
                 @property
@@ -16515,6 +16521,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     assert fc1_norm_const.numel() == 1
                     assert output.dtype == torch.bfloat16 and output.dim() == 2
                     assert token_final_scales.dtype == torch.float32
+                    if self.zero_output:
+                        # 128-bit vector stores in the workspace reset.
+                        assert output.is_contiguous() and output.numel() % 8 == 0 \
+                            and output.data_ptr() % 16 == 0, (
+                                "zero_output needs a contiguous, 16-byte aligned "
+                                "BF16 output with a multiple of 8 elements")
 
                     sf_vec = self.sf_vec_size
                     orig_m, k = fc1_a.size(0), fc1_a.size(1)
@@ -16858,15 +16870,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     else:
                         compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-                    # Clear the readiness flags and work-ID counters with one
-                    # launch. PDL lets it overlap the previous kernel's tail and
-                    # the fused GEMM's prologue; the GEMM's griddepcontrol_wait
-                    # precedes its first workspace access. Cluster launches keep
-                    # the plain ordering.
+                    # Clear the readiness flags and work-ID counters (and, with
+                    # zero_output, the output itself) with one launch. PDL lets
+                    # it overlap the previous kernel's tail and the fused GEMM's
+                    # prologue; the GEMM's griddepcontrol_wait precedes its
+                    # first workspace access. Cluster launches keep the plain
+                    # ordering.
                     use_reset_pdl = TRTLLM_ENABLE_PDL and (
                         cluster_shape_mn[0] * cluster_shape_mn[1] == 1)
+                    reset_key = (use_reset_pdl, self.zero_output)
                     compiled_reset = self.__class__.reset_kernel_cache.get(
-                        use_reset_pdl)
+                        reset_key)
                     if compiled_reset is None:
                         compiled_reset = cute.compile(
                             reset_fc12_sync_workspace,
@@ -16874,16 +16888,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             cutlass.Int32(m // 128),
                             fc1_scheduler_counter_ptr,
                             fc2_scheduler_counter_ptr,
+                            output_ptr,
+                            cutlass.Int32(output.numel()),
                             stream,
                             use_reset_pdl,
+                            self.zero_output,
                         )
                         self.__class__.reset_kernel_cache[
-                            use_reset_pdl] = compiled_reset
+                            reset_key] = compiled_reset
                     compiled_reset(
                         fc1_ready_ptr,
                         cutlass.Int32(m // 128),
                         fc1_scheduler_counter_ptr,
                         fc2_scheduler_counter_ptr,
+                        output_ptr,
+                        cutlass.Int32(output.numel()),
                         stream,
                     )
 
@@ -16944,6 +16963,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swiglu_limit: float,
                 precomputed_tactic: Optional[str],
                 tuner_key: str,
+                zero_output: bool = False,
             ) -> None:
                 tuner = AutoTuner.get()
                 runner = Sm107Mxfp8FusedFc12MoeRunner(
@@ -16953,6 +16973,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     local_expert_offset,
                     tile_size,
                     swiglu_limit=swiglu_limit,
+                    zero_output=zero_output,
                 )
                 # Input order matches Sm107Mxfp8FusedFc12InputsHelper.
                 inputs = [
@@ -16985,7 +17006,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
                 "SymInt local_expert_offset, SymInt tile_size, "
                 f"float swiglu_limit={SWIGLU_LIMIT_SCALAR_DISABLED}, "
-                "str? precomputed_tactic=None) -> ()",
+                "str? precomputed_tactic=None, bool zero_output=False) -> ()",
                 device_types="cuda")
             def cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
                 input: torch.Tensor,
@@ -17010,13 +17031,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size: int,
                 swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
                 precomputed_tactic: Optional[str] = None,
+                zero_output: bool = False,
             ) -> None:
                 """MXFP8 fused FC1+FC2 MoE on Rubin, scatter-adding into ``output``.
 
                 ``output`` must already be zero for the rows this rank produces
                 (see ``moe_output_memset_inplace``): the fused finalize
-                accumulates ``token_final_scales * fc2`` into it. A negative
-                ``swiglu_limit`` disables the SwiGLU clamp.
+                accumulates ``token_final_scales * fc2`` into it. With
+                ``zero_output`` the op clears the whole ``output`` itself, inside
+                its workspace reset launch, so the caller can skip the dense
+                memset. A negative ``swiglu_limit`` disables the SwiGLU clamp.
                 """
                 _run_mxfp8_fused_fc12_moe_rubin(
                     input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,
@@ -17026,7 +17050,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     output, token_final_scales, num_experts, top_k,
                     num_local_experts, local_expert_offset, tile_size,
                     swiglu_limit, precomputed_tactic,
-                    "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin")
+                    "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
+                    zero_output)
 
             @torch.library.register_fake(
                 "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin")
@@ -17053,6 +17078,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size: int,
                 swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
                 precomputed_tactic: Optional[str] = None,
+                zero_output: bool = False,
             ) -> None:
                 return None
 
