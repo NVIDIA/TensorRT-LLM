@@ -18,7 +18,7 @@ import torch
 
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
-    fused_qkv_gemma_rmsnorm_rope_gate,
+    fused_qkv_rmsnorm_rope_gate,
     fused_sigmoid_mul_inplace,
 )
 
@@ -44,6 +44,9 @@ def _reference(
     head_dim,
     rotary_dim,
     mrope_section=None,
+    use_gemma_weight=True,
+    q_scale=1.0,
+    is_neox=True,
 ):
     num_tokens = qkv.shape[0]
     q_size = num_q_heads * head_dim
@@ -54,13 +57,22 @@ def _reference(
     gate = q_gate[..., head_dim:]
     k = k.view(num_tokens, num_kv_heads, head_dim)
 
-    def _gemma_norm(x, weight):
+    def _norm(x, weight):
         x_float = x.float()
         inverse_rms = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + eps)
-        return (x_float * inverse_rms * (weight.float() + 1.0)).to(qkv.dtype)
+        scaled = x_float * inverse_rms
+        if use_gemma_weight:
+            scaled = scaled * (weight.float() + 1.0)
+        return scaled.to(qkv.dtype)
 
-    q = _gemma_norm(q, q_weight)
-    k = _gemma_norm(k, k_weight)
+    q = _norm(q, q_weight)
+    k = _norm(k, k_weight)
+    if q_scale != 1.0:
+        q = (q.float() * q_scale).to(qkv.dtype)
+    if cos_sin is None:
+        return torch.cat(
+            (q.reshape(num_tokens, q_size), k.reshape(num_tokens, kv_size), v), dim=-1
+        ), gate
     half_rotary = rotary_dim // 2
     if mrope_section is None:
         selected = cos_sin[positions.long()]
@@ -78,11 +90,19 @@ def _reference(
         sin = cos_sin[selected_positions, 1, rotary_offsets].unsqueeze(1)
 
     def _rope(x):
-        x_first = x[..., :half_rotary].float()
-        x_second = x[..., half_rotary:rotary_dim].float()
+        if is_neox:
+            x_first = x[..., :half_rotary].float()
+            x_second = x[..., half_rotary:rotary_dim].float()
+        else:
+            x_first = x[..., :rotary_dim:2].float()
+            x_second = x[..., 1:rotary_dim:2].float()
         first = x_first * cos - x_second * sin
         second = x_second * cos + x_first * sin
-        return torch.cat((first, second, x[..., rotary_dim:].float()), dim=-1).to(qkv.dtype)
+        if is_neox:
+            rotated = torch.cat((first, second), dim=-1)
+        else:
+            rotated = torch.stack((first, second), dim=-1).flatten(-2)
+        return torch.cat((rotated, x[..., rotary_dim:].float()), dim=-1).to(qkv.dtype)
 
     q = _rope(q).reshape(num_tokens, q_size)
     k = _rope(k).reshape(num_tokens, kv_size)
@@ -99,7 +119,7 @@ def _reference(
         (333, 16, 4, 256, 256),
     ),
 )
-def test_fused_qkv_gemma_rmsnorm_rope_gate_matches_reference(
+def test_fused_qkv_rmsnorm_rope_gate_matches_reference(
     dtype, num_tokens, num_q_heads, num_kv_heads, head_dim, rotary_dim
 ):
     torch.manual_seed(1234)
@@ -114,7 +134,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_matches_reference(
     positions = torch.randint(0, 2048, (num_tokens,), dtype=torch.int32, device="cuda")
     eps = 1e-6
 
-    actual_qkv, actual_gate = fused_qkv_gemma_rmsnorm_rope_gate(
+    actual_qkv, actual_gate = fused_qkv_rmsnorm_rope_gate(
         qkv,
         q_weight,
         k_weight,
@@ -159,7 +179,7 @@ def test_fused_sigmoid_mul_inplace_supports_strided_gate():
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_interleaved_mrope(dtype):
+def test_fused_qkv_rmsnorm_rope_gate_supports_interleaved_mrope(dtype):
     torch.manual_seed(2026)
     num_tokens, num_q_heads, num_kv_heads = 37, 16, 2
     head_dim, rotary_dim = 256, 64
@@ -176,7 +196,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_interleaved_mrope(dtype):
     ).unsqueeze(1)
     eps = 1e-6
 
-    actual_qkv, actual_gate = fused_qkv_gemma_rmsnorm_rope_gate(
+    actual_qkv, actual_gate = fused_qkv_rmsnorm_rope_gate(
         qkv,
         q_weight,
         k_weight,
@@ -187,7 +207,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_interleaved_mrope(dtype):
         num_kv_heads,
         head_dim,
         rotary_dim,
-        mrope_section,
+        mrope_section=mrope_section,
     )
     expected_qkv, expected_gate = _reference(
         qkv,
@@ -200,7 +220,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_interleaved_mrope(dtype):
         num_kv_heads,
         head_dim,
         rotary_dim,
-        mrope_section,
+        mrope_section=mrope_section,
     )
 
     torch.testing.assert_close(actual_qkv, expected_qkv, atol=0.02, rtol=0.02)
@@ -208,7 +228,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_interleaved_mrope(dtype):
 
 
 @pytest.mark.parametrize("num_tokens", (1, 37, 333))
-def test_fused_qkv_gemma_rmsnorm_rope_gate_matches_production_thop(num_tokens):
+def test_fused_qkv_rmsnorm_rope_gate_matches_production_thop(num_tokens):
     torch.manual_seed(9027)
     num_q_heads, num_kv_heads = 16, 2
     head_dim, rotary_dim = 256, 64
@@ -258,7 +278,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_matches_production_thop(num_tokens):
         mrope_section[2],
     )
 
-    actual_qkv, actual_gate = fused_qkv_gemma_rmsnorm_rope_gate(
+    actual_qkv, actual_gate = fused_qkv_rmsnorm_rope_gate(
         qkv,
         q_weight,
         k_weight,
@@ -269,7 +289,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_matches_production_thop(num_tokens):
         num_kv_heads,
         head_dim,
         rotary_dim,
-        mrope_section,
+        mrope_section=mrope_section,
     )
 
     torch.testing.assert_close(actual_qkv, expected_qkv, atol=0.02, rtol=0.02)
@@ -295,7 +315,7 @@ def test_fused_sigmoid_mul_inplace_supports_flat_gate():
     torch.testing.assert_close(actual.float(), expected, atol=0.005, rtol=0.005)
 
 
-def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile():
+def test_fused_qkv_rmsnorm_rope_gate_supports_torch_compile():
     torch.manual_seed(2027)
     num_tokens, num_q_heads, num_kv_heads = 7, 8, 2
     head_dim, rotary_dim = 128, 128
@@ -312,7 +332,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile():
     positions = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
 
     compiled = torch.compile(
-        fused_qkv_gemma_rmsnorm_rope_gate,
+        fused_qkv_rmsnorm_rope_gate,
         backend="eager",
         fullgraph=True,
     )
@@ -328,7 +348,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile():
         head_dim,
         rotary_dim,
     )
-    expected = fused_qkv_gemma_rmsnorm_rope_gate(
+    expected = fused_qkv_rmsnorm_rope_gate(
         qkv,
         q_weight,
         k_weight,

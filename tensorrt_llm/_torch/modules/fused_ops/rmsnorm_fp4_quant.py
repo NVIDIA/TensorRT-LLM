@@ -47,6 +47,7 @@ torch.compile, flashinfer's CuTe-DSL kernels unavailable, ...); see the
 pre-feedforward norm + gate_up quantize fusion in modeling_gemma4.py.
 """
 
+import os
 from typing import Tuple
 
 import torch
@@ -74,6 +75,8 @@ def rmsnorm_fp4_quant(
     norm_weight: torch.Tensor,
     eps: float,
     global_scale: torch.Tensor,
+    *,
+    is_sf_swizzled_layout: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused RMSNorm + NVFP4 block-scale quantize.
 
@@ -85,14 +88,20 @@ def rmsnorm_fp4_quant(
         eps: RMSNorm epsilon.
         global_scale: [1] fp32 tensor - the consumer Linear's static
             ``input_scale`` (448*6/amax convention).
+        is_sf_swizzled_layout: False emits row-major scales for MoE consumers.
+            Requires TRTLLM_RMSNORM_FP4_LINEAR_SCALES=1; existing callers
+            continue to receive swizzled scales even when the flag is set.
 
     Returns:
         (fp4, sf): the packed E2M1 payload [M, H//2] (uint8, element 2j in
-        the low nibble of byte j) and the E4M3 block scales (uint8, 1D,
-        swizzled 128x4 layout padded to 128 rows) - layout-compatible with
+        the low nibble of byte j) and the E4M3 block scales (uint8,
+        swizzled 128x4 layout padded to 128 rows by default, or linear
+        row-major layout when swizzling is disabled) - layout-compatible with
         ``trtllm::fp4_quantize``'s outputs and consumable as
         ``Fp4QuantizedTensor(fp4, sf)``.
     """
+    if not is_sf_swizzled_layout and os.getenv("TRTLLM_RMSNORM_FP4_LINEAR_SCALES", "0") != "1":
+        raise ValueError("Linear FP4 scales require TRTLLM_RMSNORM_FP4_LINEAR_SCALES=1")
     assert rmsnorm_fp4_quant_available()
     assert x.dim() == 2 and x.stride(-1) == 1
     assert x.dtype == torch.bfloat16
@@ -113,6 +122,6 @@ def rmsnorm_fp4_quant(
         eps=eps,
         block_size=16,
         scale_format="e4m3",
-        is_sf_swizzled_layout=True,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
     )
     return fp4.view(torch.uint8), sf.view(torch.uint8)

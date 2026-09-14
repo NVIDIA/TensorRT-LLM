@@ -27,7 +27,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .attention import Attention
 from .backends.interface import PositionalEmbeddingParams
-from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
+from .kernels.fused_qk_norm_rope_gate import (fused_qkv_rmsnorm_rope_gate,
                                               fused_sigmoid_mul_inplace)
 
 
@@ -175,6 +175,10 @@ class QKNormRoPEAttention(Attention):
         # qk_norm_rope kernel via the use_gemma flag threaded through below.
         self.use_gemma_rms_norm = use_gemma_rms_norm
         self._fuse_qk_norm_rope_gate = False
+        # Post-norm query multiplier folded into the fused preprocessing
+        # kernel. Subclasses whose source applies one after the Q norm set it
+        # instead of paying a separate elementwise pass per layer.
+        self.fused_prep_q_scale = 1.0
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
         # will be skipped in the overridden apply_rope.
@@ -232,6 +236,18 @@ class QKNormRoPEAttention(Attention):
             return False
         if qkv.dtype not in (torch.bfloat16, torch.float16):
             return False
+        # The kernel deinterleaves the gate out of the projection, so it only
+        # covers projections that carry one.
+        if not self.attn_output_gate:
+            return False
+        # It implements two norms: the Gemma ``1 + w`` form and the weightless
+        # one. A plain weighted RMSNorm is neither.
+        if self.is_qk_norm and not self.use_gemma_rms_norm:
+            return False
+        if self.skip_rope:
+            # NoPE layer: the norm is the whole transform, so there is no
+            # rotary table to index and the positions go unread.
+            return True
         if position_ids is None or position_ids.dim() > 3:
             return False
         if position_ids.dtype not in (torch.int32, torch.int64):
@@ -245,13 +261,13 @@ class QKNormRoPEAttention(Attention):
         expected_positions = qkv.shape[0] * (3 if use_mrope else 1)
         if position_ids.numel() != expected_positions:
             return False
-        if not (self.attn_output_gate and self.fuse_qk_norm_rope
-                and self.is_qk_norm and self.use_gemma_rms_norm
-                and not self.skip_rope):
-            return False
         if self.pos_embd_params is None or self.pos_embd_params.rope is None:
             return False
-        if not self.pos_embd_params.is_neox or self.rotary_emb is None:
+        if self.rotary_emb is None:
+            return False
+        # mRoPE picks a position per rotary half-dim, which is only defined
+        # against the NeoX half layout.
+        if use_mrope and not self.pos_embd_params.is_neox:
             return False
         rope = self.pos_embd_params.rope
         if rope.scale_type not in (RotaryScalingType.none,
@@ -264,25 +280,37 @@ class QKNormRoPEAttention(Attention):
                 and rotary_dim <= self.head_dim and rotary_dim % 2 == 0)
 
     def preprocess_qkv(self, qkv, position_ids):
-        """Fuse gate split + gemma QK norm + RoPE into a single Triton kernel
-        when supported; otherwise fall back to the generic unfused path."""
+        """Fuse gate split + QK norm + RoPE into a single Triton kernel when
+        supported; otherwise fall back to the generic unfused path."""
         if not self._can_use_fused_qk_norm_rope_gate(qkv, position_ids):
             return super().preprocess_qkv(qkv, position_ids)
-        use_mrope = position_ids.dim() == 3
-        positions = position_ids.reshape(
-            3, -1) if use_mrope else position_ids.reshape(-1)
-        qkv, gate = fused_qkv_gemma_rmsnorm_rope_gate(
+        if self.skip_rope:
+            cos_sin, positions, rotary_dim, mrope_section = None, None, 0, None
+            is_neox = True
+        else:
+            use_mrope = position_ids.dim() == 3
+            positions = (position_ids.reshape(3, -1) if use_mrope else
+                         position_ids.reshape(-1)).contiguous()
+            cos_sin = self.rotary_emb.rotary_cos_sin
+            rotary_dim = self._get_qk_norm_rotary_dim()
+            mrope_section = (tuple(self.pos_embd_params.mrope_section)
+                             if use_mrope else None)
+            is_neox = self.pos_embd_params.is_neox
+        qkv, gate = fused_qkv_rmsnorm_rope_gate(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
-            self.rotary_emb.rotary_cos_sin,
-            positions.contiguous(),
+            cos_sin,
+            positions,
             self.q_norm.variance_epsilon,
             self.num_heads,
             self.num_key_value_heads,
             self.head_dim,
-            self._get_qk_norm_rotary_dim(),
-            tuple(self.pos_embd_params.mrope_section) if use_mrope else None,
+            rotary_dim,
+            use_gemma_weight=self.use_gemma_rms_norm,
+            q_scale=self.fused_prep_q_scale,
+            is_neox=is_neox,
+            mrope_section=mrope_section,
         )
         return qkv, None, None, gate
 

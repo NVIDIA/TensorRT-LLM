@@ -13,14 +13,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused Qwen3.5 full-attention preprocessing and output gating.
+"""Fused full-attention preprocessing and output gating.
 
 The projection produces interleaved ``[q0, gate0, q1, gate1, ..., K, V]``.
 The preprocessing kernel reads that layout directly and writes packed
-``[Q, K, V]`` while applying per-head Gemma RMSNorm and NeoX RoPE to Q/K.
-Gate deinterleave is fused into the same pass.  Keeping the checkpoint layout
+``[Q, K, V]`` while applying a per-head RMSNorm and RoPE to Q/K.  Gate
+deinterleave is fused into the same pass.  Keeping the checkpoint layout
 unchanged avoids coupling the optimization to weight loading, quantization,
 LoRA, or attention-backend fallback behavior.
+
+Four axes are selected per call, so one kernel covers the models that share
+this projection layout:
+
+* the norm is either Gemma-weighted (``x * rsqrt(...) * (1 + w)``) or
+  weightless (``x * rsqrt(...)``);
+* the rotation is either NeoX (halves) or GPT-J (adjacent channel pairs);
+* RoPE can be skipped entirely, for the NoPE layers of models that alternate;
+* an optional post-norm query multiplier can be folded in.
+
+Each variant reproduces the unfused chain's rounding step for step -- every
+intermediate is rounded back to the activation dtype exactly where the eager
+modules round it -- so a model that switches to this kernel keeps whatever
+numerics it had, up to the reduction order of the RMSNorm sum.
 """
 
 from typing import Optional, Tuple
@@ -31,7 +45,36 @@ import triton.language as tl
 
 
 @triton.jit
-def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
+def _rms_scaled(
+    x,
+    inverse_rms,
+    weight,
+    head_multiplier,
+    use_gemma_weight: tl.constexpr,
+    has_head_multiplier: tl.constexpr,
+    output_dtype: tl.constexpr,
+):
+    """One head's RMSNorm tail, rounded exactly where the eager modules round.
+
+    ``x * inverse_rms [* (1 + w)]`` is evaluated left to right so the Gemma
+    form stays associatively identical to the expression it replaces, then
+    rounded to the activation dtype -- which is what ``RMSNorm.forward``
+    returns.  ``head_multiplier`` is the optional post-norm query scale; it is
+    ``1.0`` on key heads, and multiplying an already-rounded value by exactly
+    ``1.0`` is the identity, so the two head kinds share one code path instead
+    of branching.
+    """
+    value = x * inverse_rms
+    if use_gemma_weight:
+        value = value * (weight + 1.0)
+    value = value.to(output_dtype).to(tl.float32)
+    if has_head_multiplier:
+        value = (value * head_multiplier).to(output_dtype).to(tl.float32)
+    return value
+
+
+@triton.jit
+def _fused_qkv_rmsnorm_rope_gate_kernel(
     qkv_ptr,
     qkv_out_ptr,
     gate_out_ptr,
@@ -41,6 +84,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
     positions_ptr,
     num_tokens,
     max_positions,
+    q_scale,
     qkv_stride_token,
     qkv_out_stride_token,
     gate_out_stride_token,
@@ -55,6 +99,10 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
     eps: tl.constexpr,
     output_fp16: tl.constexpr,
     has_pass_through: tl.constexpr,
+    use_gemma_weight: tl.constexpr,
+    has_q_scale: tl.constexpr,
+    apply_rope: tl.constexpr,
+    is_neox: tl.constexpr,
     use_mrope: tl.constexpr,
     mrope_section1: tl.constexpr,
     mrope_section2: tl.constexpr,
@@ -78,70 +126,106 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
             input_base = qkv_ptr + token * qkv_stride_token + local_head * 2 * head_dim
             output_base = qkv_out_ptr + token * qkv_out_stride_token + local_head * head_dim
             weight_ptr = q_weight_ptr
+        head_multiplier = tl.where(is_k, 1.0, q_scale)
 
         head_offsets = tl.arange(0, head_block)
         head_mask = head_offsets < head_dim
         x = tl.load(input_base + head_offsets, mask=head_mask, other=0.0).to(tl.float32)
         weight = tl.load(weight_ptr + head_offsets, mask=head_mask, other=0.0).to(tl.float32)
         inverse_rms = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
-        normalized = (x * inverse_rms * (weight + 1.0)).to(output_dtype).to(tl.float32)
-
-        if has_pass_through:
-            pass_mask = head_mask & (head_offsets >= rotary_dim)
-            tl.store(output_base + head_offsets, normalized, mask=pass_mask)
-
-        rotary_offsets = tl.arange(0, rotary_block)
-        rotary_mask = rotary_offsets < half_rotary
-        x_first = tl.load(input_base + rotary_offsets, mask=rotary_mask, other=0.0).to(tl.float32)
-        x_second = tl.load(
-            input_base + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0
-        ).to(tl.float32)
-        weight_first = tl.load(weight_ptr + rotary_offsets, mask=rotary_mask, other=0.0).to(
-            tl.float32
+        normalized = _rms_scaled(
+            x, inverse_rms, weight, head_multiplier, use_gemma_weight, has_q_scale, output_dtype
         )
-        weight_second = tl.load(
-            weight_ptr + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0
-        ).to(tl.float32)
-        x_first = (x_first * inverse_rms * (weight_first + 1.0)).to(output_dtype).to(tl.float32)
-        x_second = (x_second * inverse_rms * (weight_second + 1.0)).to(output_dtype).to(tl.float32)
 
-        if use_mrope:
-            section = tl.where(
-                (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section1 * 3),
-                1,
-                tl.where(
-                    (rotary_offsets % 3 == 2) & (rotary_offsets < mrope_section2 * 3),
-                    2,
-                    0,
-                ),
-            )
-            position = tl.load(
-                positions_ptr + section * num_tokens + token,
-                mask=rotary_mask,
-                other=0,
-            ).to(tl.int64)
+        if not apply_rope:
+            # NoPE layer: the norm (and the query scale) is the whole
+            # transform, so the head is written out in one store.
+            tl.store(output_base + head_offsets, normalized, mask=head_mask)
         else:
-            position = tl.load(positions_ptr + token).to(tl.int64)
-        position_is_valid = (position >= 0) & (position < max_positions)
-        tl.device_assert(position_is_valid, "position is outside the RoPE table")
-        safe_position = tl.where(position_is_valid, position, 0)
-        cos_sin_base = cos_sin_ptr + safe_position * cos_sin_stride_position
-        cos = tl.load(cos_sin_base + rotary_offsets, mask=rotary_mask, other=0.0).to(tl.float32)
-        sin = tl.load(cos_sin_base + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0).to(
-            tl.float32
-        )
-        cos = tl.where(position_is_valid, cos, float("nan"))
-        sin = tl.where(position_is_valid, sin, float("nan"))
-        tl.store(
-            output_base + rotary_offsets,
-            x_first * cos - x_second * sin,
-            mask=rotary_mask,
-        )
-        tl.store(
-            output_base + half_rotary + rotary_offsets,
-            x_second * cos + x_first * sin,
-            mask=rotary_mask,
-        )
+            if has_pass_through:
+                pass_mask = head_mask & (head_offsets >= rotary_dim)
+                tl.store(output_base + head_offsets, normalized, mask=pass_mask)
+
+            rotary_offsets = tl.arange(0, rotary_block)
+            rotary_mask = rotary_offsets < half_rotary
+            # NeoX rotates a channel against its partner half a rotary dim
+            # away; GPT-J rotates adjacent channel pairs.  Only the element
+            # offsets differ -- the pair index, and so the cos/sin lookup, is
+            # the same in both layouts.
+            if is_neox:
+                first_offsets = rotary_offsets
+                second_offsets = half_rotary + rotary_offsets
+            else:
+                first_offsets = 2 * rotary_offsets
+                second_offsets = 2 * rotary_offsets + 1
+            x_first = tl.load(input_base + first_offsets, mask=rotary_mask, other=0.0).to(
+                tl.float32
+            )
+            x_second = tl.load(input_base + second_offsets, mask=rotary_mask, other=0.0).to(
+                tl.float32
+            )
+            weight_first = tl.load(weight_ptr + first_offsets, mask=rotary_mask, other=0.0).to(
+                tl.float32
+            )
+            weight_second = tl.load(weight_ptr + second_offsets, mask=rotary_mask, other=0.0).to(
+                tl.float32
+            )
+            x_first = _rms_scaled(
+                x_first,
+                inverse_rms,
+                weight_first,
+                head_multiplier,
+                use_gemma_weight,
+                has_q_scale,
+                output_dtype,
+            )
+            x_second = _rms_scaled(
+                x_second,
+                inverse_rms,
+                weight_second,
+                head_multiplier,
+                use_gemma_weight,
+                has_q_scale,
+                output_dtype,
+            )
+
+            if use_mrope:
+                section = tl.where(
+                    (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section1 * 3),
+                    1,
+                    tl.where(
+                        (rotary_offsets % 3 == 2) & (rotary_offsets < mrope_section2 * 3),
+                        2,
+                        0,
+                    ),
+                )
+                position = tl.load(
+                    positions_ptr + section * num_tokens + token,
+                    mask=rotary_mask,
+                    other=0,
+                ).to(tl.int64)
+            else:
+                position = tl.load(positions_ptr + token).to(tl.int64)
+            position_is_valid = (position >= 0) & (position < max_positions)
+            tl.device_assert(position_is_valid, "position is outside the RoPE table")
+            safe_position = tl.where(position_is_valid, position, 0)
+            cos_sin_base = cos_sin_ptr + safe_position * cos_sin_stride_position
+            cos = tl.load(cos_sin_base + rotary_offsets, mask=rotary_mask, other=0.0).to(tl.float32)
+            sin = tl.load(
+                cos_sin_base + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0
+            ).to(tl.float32)
+            cos = tl.where(position_is_valid, cos, float("nan"))
+            sin = tl.where(position_is_valid, sin, float("nan"))
+            tl.store(
+                output_base + first_offsets,
+                x_first * cos - x_second * sin,
+                mask=rotary_mask,
+            )
+            tl.store(
+                output_base + second_offsets,
+                x_second * cos + x_first * sin,
+                mask=rotary_mask,
+            )
 
         if not is_k:
             gate_input = input_base + head_dim
@@ -163,20 +247,23 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
 
 
 @torch.library.custom_op(
-    "trtllm::fused_qkv_gemma_rmsnorm_rope_gate",
+    "trtllm::fused_qkv_rmsnorm_rope_gate",
     mutates_args=(),
 )
-def _fused_qkv_gemma_rmsnorm_rope_gate(
+def _fused_qkv_rmsnorm_rope_gate(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    cos_sin: torch.Tensor,
-    positions: torch.Tensor,
+    cos_sin: Optional[torch.Tensor],
+    positions: Optional[torch.Tensor],
     eps: float,
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
+    use_gemma_weight: bool,
+    q_scale: float,
+    is_neox: bool,
     use_mrope: bool,
     mrope_section1: int,
     mrope_section2: int,
@@ -185,22 +272,33 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
     assert qkv.dtype in (torch.bfloat16, torch.float16)
     assert q_weight.shape == (head_dim,) and k_weight.shape == (head_dim,)
     assert q_weight.device == qkv.device and k_weight.device == qkv.device
-    assert cos_sin.dtype == torch.float32 and cos_sin.is_contiguous()
-    assert cos_sin.device == qkv.device and positions.device == qkv.device
-    assert rotary_dim > 0 and rotary_dim <= head_dim and rotary_dim % 2 == 0
-    assert cos_sin.shape == (cos_sin.shape[0], 2, rotary_dim // 2)
-    assert cos_sin.shape[0] > 0
+
+    # ``cos_sin is None`` is the NoPE layer of a model that alternates: the
+    # norm is the whole transform and there is no rotary table to index.
+    apply_rope = cos_sin is not None
+    assert (positions is not None) == apply_rope
+    if apply_rope:
+        assert cos_sin.dtype == torch.float32 and cos_sin.is_contiguous()
+        assert cos_sin.device == qkv.device and positions.device == qkv.device
+        assert rotary_dim > 0 and rotary_dim <= head_dim and rotary_dim % 2 == 0
+        assert cos_sin.shape == (cos_sin.shape[0], 2, rotary_dim // 2)
+        assert cos_sin.shape[0] > 0
+    else:
+        assert not use_mrope
+        rotary_dim = 0
 
     num_tokens = qkv.shape[0]
     if use_mrope:
+        assert is_neox, "interleaved mRoPE sections assume the NeoX half layout"
         assert mrope_section1 > 0 and mrope_section2 > 0
         assert positions.numel() == 3 * num_tokens
         positions = positions.reshape(3, num_tokens)
-    else:
+    elif apply_rope:
         assert positions.numel() == num_tokens
         positions = positions.reshape(-1)
-    assert positions.is_contiguous()
-    assert positions.dtype in (torch.int32, torch.int64)
+    if apply_rope:
+        assert positions.is_contiguous()
+        assert positions.dtype in (torch.int32, torch.int64)
 
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
@@ -213,9 +311,12 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
 
     half_rotary = rotary_dim // 2
     head_block = triton.next_power_of_2(head_dim)
-    rotary_block = triton.next_power_of_2(half_rotary)
+    rotary_block = triton.next_power_of_2(half_rotary) if half_rotary > 0 else 1
     grid = (num_tokens, num_q_heads + 2 * num_kv_heads)
-    _fused_qkv_gemma_rmsnorm_rope_gate_kernel[grid](
+    # One program covers one head, so a head narrower than 128 channels would
+    # leave most of a four-warp block idle.
+    num_warps = max(1, min(4, head_block // 32))
+    _fused_qkv_rmsnorm_rope_gate_kernel[grid](
         qkv,
         qkv_out,
         gate_out,
@@ -224,11 +325,12 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
         cos_sin,
         positions,
         num_tokens,
-        cos_sin.shape[0],
+        cos_sin.shape[0] if apply_rope else 0,
+        q_scale,
         qkv.stride(0),
         qkv_out.stride(0),
         gate_out.stride(0),
-        cos_sin.stride(0),
+        cos_sin.stride(0) if apply_rope else 0,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -239,26 +341,33 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
         eps=eps,
         output_fp16=qkv.dtype == torch.float16,
         has_pass_through=rotary_dim < head_dim,
+        use_gemma_weight=use_gemma_weight,
+        has_q_scale=q_scale != 1.0,
+        apply_rope=apply_rope,
+        is_neox=is_neox,
         use_mrope=use_mrope,
         mrope_section1=mrope_section1,
         mrope_section2=mrope_section2,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return qkv_out, gate_out
 
 
-@_fused_qkv_gemma_rmsnorm_rope_gate.register_fake
+@_fused_qkv_rmsnorm_rope_gate.register_fake
 def _(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    cos_sin: torch.Tensor,
-    positions: torch.Tensor,
+    cos_sin: Optional[torch.Tensor],
+    positions: Optional[torch.Tensor],
     eps: float,
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
+    use_gemma_weight: bool,
+    q_scale: float,
+    is_neox: bool,
     use_mrope: bool,
     mrope_section1: int,
     mrope_section2: int,
@@ -271,17 +380,20 @@ def _(
     )
 
 
-def fused_qkv_gemma_rmsnorm_rope_gate(
+def fused_qkv_rmsnorm_rope_gate(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    cos_sin: torch.Tensor,
-    positions: torch.Tensor,
+    cos_sin: Optional[torch.Tensor],
+    positions: Optional[torch.Tensor],
     eps: float,
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
+    use_gemma_weight: bool = True,
+    q_scale: float = 1.0,
+    is_neox: bool = True,
     mrope_section: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Prepare packed QKV and gate with one Triton kernel.
@@ -289,16 +401,25 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     Args:
         qkv: ``[num_tokens, 2 * q_size + 2 * kv_size]`` BF16/FP16 projection
             output in per-head interleaved Q/G layout.
-        q_weight: ``[head_dim]`` raw Gemma RMSNorm Q weights.
-        k_weight: ``[head_dim]`` raw Gemma RMSNorm K weights.
-        cos_sin: ``[max_positions, 2, rotary_dim // 2]`` FP32 NeoX table.
+        q_weight: ``[head_dim]`` RMSNorm Q weights; unread when
+            ``use_gemma_weight`` is False.
+        k_weight: ``[head_dim]`` RMSNorm K weights; unread when
+            ``use_gemma_weight`` is False.
+        cos_sin: ``[max_positions, 2, rotary_dim // 2]`` FP32 rotary table, or
+            ``None`` for a NoPE layer.
         positions: Flattenable ``[num_tokens]`` plain-RoPE positions, or
-            ``[3, ..., num_tokens]`` interleaved-MRoPE positions.
+            ``[3, ..., num_tokens]`` interleaved-MRoPE positions; ``None``
+            exactly when ``cos_sin`` is.
         eps: RMSNorm epsilon.
         num_q_heads: Local query-head count.
         num_kv_heads: Local key/value-head count.
         head_dim: Per-head Q/K/V dimension.
-        rotary_dim: Prefix dimension receiving NeoX RoPE.
+        rotary_dim: Prefix dimension receiving RoPE.
+        use_gemma_weight: Scale the norm by ``1 + weight`` (Gemma form). False
+            selects the weightless norm, and the weight arguments go unread.
+        q_scale: Post-norm multiplier applied to query heads only, rounded to
+            the activation dtype exactly as a separate ``q * scale`` would be.
+        is_neox: Rotate halves (NeoX) rather than adjacent pairs (GPT-J).
         mrope_section: Temporal/height/width rotary-half dimensions. ``None``
             selects plain RoPE; a tuple selects Qwen-style interleaved MRoPE.
 
@@ -315,7 +436,7 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     else:
         mrope_section1 = 0
         mrope_section2 = 0
-    return _fused_qkv_gemma_rmsnorm_rope_gate(
+    return _fused_qkv_rmsnorm_rope_gate(
         qkv,
         q_weight,
         k_weight,
@@ -326,6 +447,9 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
         num_kv_heads,
         head_dim,
         rotary_dim,
+        use_gemma_weight,
+        q_scale,
+        is_neox,
         use_mrope,
         mrope_section1,
         mrope_section2,

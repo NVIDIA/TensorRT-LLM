@@ -51,9 +51,9 @@ _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_LUT = _E2M1_LUT + [-v for v in _E2M1_LUT]
 
 
-def _reference(x, w, eps, gs):
+def _reference(x, w, eps, gs, swizzled=True):
     n = torch.ops.trtllm.flashinfer_rmsnorm(x, w, eps)
-    q, sf = torch.ops.trtllm.fp4_quantize(n, gs, 16, False)
+    q, sf = torch.ops.trtllm.fp4_quantize(n, gs, 16, False, swizzled)
     return q.view(torch.uint8), sf.view(torch.uint8)
 
 
@@ -62,31 +62,33 @@ def _norm_fp32(x, w, eps):
     return xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()
 
 
-def _block_scales(sf, m, h):
+def _block_scales(sf, m, h, swizzled=True):
     """Block scales [m, h//16] read at the swizzled offsets (as fp32)."""
+    if not swizzled:
+        return sf.view(torch.float8_e4m3fn).float().reshape(m, h // 16)
     valid = sf_swizzled_offsets(m, h // 16, sf.device)
     return sf.view(-1)[valid].view(torch.float8_e4m3fn).float().view(m, h // 16)
 
 
-def _dequant(q, sf, m, h, gs):
+def _dequant(q, sf, m, h, gs, swizzled=True):
     """Dequantize payload + swizzled scales to fp32 [m, h]."""
     lut = torch.tensor(_E2M1_LUT, device=q.device)
     vals = torch.empty((m, h), device=q.device, dtype=torch.float32)
     vals[:, 0::2] = lut[(q & 0xF).long()]
     vals[:, 1::2] = lut[(q >> 4).long()]
-    return vals * _block_scales(sf, m, h).repeat_interleave(16, dim=1) / gs
+    return vals * _block_scales(sf, m, h, swizzled).repeat_interleave(16, dim=1) / gs
 
 
-def _check(x, w, eps, gs):
-    fq, fsf = rmsnorm_fp4_quant(x, w, eps, gs)
-    rq, rsf = _reference(x.contiguous(), w, eps, gs)
+def _check(x, w, eps, gs, swizzled=True):
+    fq, fsf = rmsnorm_fp4_quant(x, w, eps, gs, is_sf_swizzled_layout=swizzled)
+    rq, rsf = _reference(x.contiguous(), w, eps, gs, swizzled)
     assert fq.shape == rq.shape and fsf.numel() == rsf.numel()
     assert fq.dtype == torch.uint8 and fsf.dtype == torch.uint8
 
     m, h = x.shape
     n32 = _norm_fp32(x.contiguous(), w, eps)
-    err_fused = (_dequant(fq, fsf, m, h, gs) - n32).abs().mean().item()
-    err_ref = (_dequant(rq, rsf, m, h, gs) - n32).abs().mean().item()
+    err_fused = (_dequant(fq, fsf, m, h, gs, swizzled) - n32).abs().mean().item()
+    err_ref = (_dequant(rq, rsf, m, h, gs, swizzled) - n32).abs().mean().item()
     # Both outputs are NVFP4 roundings of the same fp32 norm; the fused
     # path must not be a worse quantizer than the unfused chain (measured
     # equal to ~0.1% at serving shapes; the slack covers rounding-path
@@ -96,7 +98,7 @@ def _check(x, w, eps, gs):
     # crossed (~1.4% of bytes at serving shapes). Blocks whose e4m3 scale
     # underflows to zero are excluded: their payload never contributes to
     # the dequantized value and the implementations fill it differently.
-    live = (_block_scales(rsf, m, h) != 0) & (_block_scales(fsf, m, h) != 0)
+    live = (_block_scales(rsf, m, h, swizzled) != 0) & (_block_scales(fsf, m, h, swizzled) != 0)
     live_bytes = live.repeat_interleave(8, dim=1)  # 8 payload bytes / block
     if live_bytes.any():
         mm = (fq != rq)[live_bytes].float().mean().item()
@@ -107,7 +109,9 @@ def _check(x, w, eps, gs):
 # profiled serving prefill size; 333 exercises padded tail rows.
 @pytest.mark.parametrize("n_tokens", [1, 7, 228, 333, 7700])
 @pytest.mark.parametrize("hidden", [5376, 512])
-def test_rmsnorm_fp4_quant_quality(n_tokens, hidden):
+@pytest.mark.parametrize("swizzled", [True, False])
+def test_rmsnorm_fp4_quant_quality(n_tokens, hidden, swizzled, monkeypatch):
+    monkeypatch.setenv("TRTLLM_RMSNORM_FP4_LINEAR_SCALES", "1")
     torch.manual_seed(1234)
     x = (
         torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -117,7 +121,7 @@ def test_rmsnorm_fp4_quant_quality(n_tokens, hidden):
     w = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
     n = torch.ops.trtllm.flashinfer_rmsnorm(x, w, 1e-6)
     gs = (448.0 * 6.0 / n.abs().max().float()).reshape(1)
-    _check(x, w, 1e-6, gs)
+    _check(x, w, 1e-6, gs, swizzled)
 
 
 @pytest.mark.parametrize("gs_value", [1e6, 1.0, 1e-6])
@@ -155,31 +159,32 @@ def test_rmsnorm_fp4_quant_zero_row():
     _check(x, w, 1e-6, gs)
 
 
-def test_rmsnorm_fp4_quant_cuda_graph():
+@pytest.mark.parametrize("swizzled", [True, False])
+def test_rmsnorm_fp4_quant_cuda_graph(swizzled, monkeypatch):
     """The kernel must be CUDA-graph capturable and replay deterministically
     (the serving decode path replays it inside captured graphs)."""
+    monkeypatch.setenv("TRTLLM_RMSNORM_FP4_LINEAR_SCALES", "1")
     torch.manual_seed(11)
     x = torch.randn((228, 5376), dtype=torch.bfloat16, device="cuda")
     w = torch.rand((5376,), dtype=torch.bfloat16, device="cuda") + 0.5
     gs = torch.tensor([100.0], dtype=torch.float32, device="cuda")
-
-    eager_q, eager_sf = rmsnorm_fp4_quant(x, w, 1e-6, gs)  # also JIT warmup
+    rmsnorm_fp4_quant(x, w, 1e-6, gs, is_sf_swizzled_layout=swizzled)
     torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        graph_q, graph_sf = rmsnorm_fp4_quant(x, w, 1e-6, gs)
-    g.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(graph_q, eager_q)
-    valid = sf_swizzled_offsets(228, 5376 // 16, x.device)
-    assert torch.equal(graph_sf.view(-1)[valid], eager_sf.view(-1)[valid])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_q, graph_sf = rmsnorm_fp4_quant(x, w, 1e-6, gs, is_sf_swizzled_layout=swizzled)
+    for _ in range(3):
+        x.normal_()
+        eager_q, eager_sf = rmsnorm_fp4_quant(x, w, 1e-6, gs, is_sf_swizzled_layout=swizzled)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_q, eager_q)
+        if swizzled:
+            valid = sf_swizzled_offsets(228, 5376 // 16, x.device)
+            assert torch.equal(graph_sf.view(-1)[valid], eager_sf.view(-1)[valid])
+        else:
+            assert torch.equal(graph_sf, eager_sf)
 
 
 if __name__ == "__main__":
-    test_rmsnorm_fp4_quant_quality(7700, 5376)
-    test_rmsnorm_fp4_quant_quality(228, 5376)
-    test_rmsnorm_fp4_quant_extreme_scales(1e6)
-    test_rmsnorm_fp4_quant_strided_rows()
-    test_rmsnorm_fp4_quant_zero_row()
-    test_rmsnorm_fp4_quant_cuda_graph()
-    print("ALL QUALITY CHECKS PASSED")
+    raise SystemExit(pytest.main([__file__]))
