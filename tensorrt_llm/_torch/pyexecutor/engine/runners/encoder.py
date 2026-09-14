@@ -360,6 +360,10 @@ class EncoderMixin:
         """Select and prepare a token encoder graph, leaving eager fallback to the caller."""
         runner = self._encoder_cuda_graph_runner
         sequence_lengths = inputs["seq_lens"]
+        # `maybe_get_cuda_graph` returns an already-captured graph before it checks
+        # for multi-item scoring, so refusing here is what keeps such a batch eager.
+        if inputs.get("multi_item_part_lens") is not None:
+            return None
         with runner.pad_batch(inputs, len(sequence_lengths)) as padded_inputs:
             graph_metadata, key = runner.maybe_get_cuda_graph(padded_inputs, metadata)
             if key is None:

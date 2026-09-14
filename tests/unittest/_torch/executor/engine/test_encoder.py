@@ -198,8 +198,10 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
     assert build_metadata.call_args.kwargs["cache_indirection"] is None
 
 
-def test_multi_item_batch_leaves_the_graph_refusal_to_the_graph_runner() -> None:
-    """`maybe_get_cuda_graph` owns the multi-item policy and its one-time warning."""
+def test_multi_item_batch_stays_eager_even_when_a_graph_is_available() -> None:
+    """`maybe_get_cuda_graph` hands back a captured graph before it rejects multi-item
+    scoring, and its rejection sits behind `_capture_allowed`, so the runner must refuse
+    the batch itself or the replay would silently drop `multi_item_part_lens`."""
     runner = object.__new__(EncoderRunner)
 
     @contextmanager
@@ -208,7 +210,8 @@ def test_multi_item_batch_leaves_the_graph_refusal_to_the_graph_runner() -> None
 
     graph_runner = SimpleNamespace(
         pad_batch=pad_batch,
-        maybe_get_cuda_graph=Mock(return_value=(None, None)),
+        # A captured hit: what a runtime batch matching a warmed key would get.
+        maybe_get_cuda_graph=Mock(return_value=(object(), (1, 2, 2))),
         is_encoder_decoder=False,
     )
     runner._encoder_cuda_graph_runner = graph_runner
@@ -219,10 +222,7 @@ def test_multi_item_batch_leaves_the_graph_refusal_to_the_graph_runner() -> None
     }
 
     assert runner._prepare_encoder_graph_inputs(inputs, object()) is None
-
-    graph_runner.maybe_get_cuda_graph.assert_called_once()
-    consulted_inputs = graph_runner.maybe_get_cuda_graph.call_args.args[0]
-    assert consulted_inputs["multi_item_part_lens"] == [[1, 1]]
+    graph_runner.maybe_get_cuda_graph.assert_not_called()
 
 
 def test_encoder_runner_collects_scheduled_inputs_without_losing_request_boundaries() -> None:
