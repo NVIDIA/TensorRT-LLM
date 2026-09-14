@@ -3620,8 +3620,8 @@ class Linear(nn.Module):
         """
         Args:
             nvfp4_allowed_backends: List of backends to consider for NVFP4 GEMM auto-selection.
-                Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
-                Add 'cutedsl' for extreme performance at the cost of longer build time.
+                Default (via config): ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'].
+                CuTeDSL candidates may increase first-launch compilation time.
                 Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
                 Marlin is opt-in on SM89-99. W4A16 BF16 linear layers use
                 Marlin by default on SM120/121.
@@ -3652,9 +3652,8 @@ class Linear(nn.Module):
             if model_attrs:
                 nvfp4_allowed_backends = model_attrs.get(
                     'nvfp4_gemm_allowed_backends')
-        # Default: exclude cutedsl for faster build time
         self.nvfp4_allowed_backends = nvfp4_allowed_backends or [
-            'cutlass', 'cublaslt', 'cuda_core'
+            'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'
         ]
 
         if self.tp_mode not in (TensorParallelMode.ROW,

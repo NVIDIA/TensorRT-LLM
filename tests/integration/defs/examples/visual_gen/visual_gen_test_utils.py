@@ -50,6 +50,7 @@ VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP = os.path.join(
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
 
 QuantizationMode = Literal["none", "FP8_BLOCK_SCALES", "NVFP4"]
+QuantizationSource = Literal["dynamic", "static"]
 
 
 @dataclass(frozen=True)
@@ -58,13 +59,27 @@ class FeatureConfigState:
 
     ``quantization="none"`` means the unquantized BF16 VisualGen path. Model
     test modules remain responsible for validating which combinations they
-    support and for mapping this state to ``VisualGenArgs``. ``torch.compile``
-    is intentionally omitted because all feature tests disable it to match the
-    existing upstream LPIPS baseline configuration.
+    support and for mapping this state to ``VisualGenArgs``.
+    ``quantization_source="dynamic"`` quantizes a high-precision checkpoint at
+    load time. ``quantization_source="static"`` preserves the checkpoint's
+    embedded static quantization recipe, including its calibrated activation
+    scales and excluded modules. ``mha_quantize=True`` additionally selects
+    CUTEDSL static E4M3 attention and therefore requires calibrated Q/K/V amax
+    tensors from ModelOpt ``--quantize-mha``. ``torch.compile`` is intentionally
+    omitted because all feature tests disable it to match the existing upstream
+    LPIPS baseline configuration.
     """
 
     quantization: QuantizationMode = "none"
+    quantization_source: QuantizationSource = "dynamic"
+    mha_quantize: bool = False
     cuda_graph: bool = False
+
+    def __post_init__(self):
+        if self.mha_quantize and not (
+            self.quantization == "NVFP4" and self.quantization_source == "static"
+        ):
+            raise ValueError("MHA quantization requires a static NVFP4 checkpoint")
 
 
 def _enabled_feature_ids(features):
@@ -108,19 +123,40 @@ def _build_single_device_feature_args(
         AttentionConfig,
         CompilationConfig,
         CudaGraphConfig,
+        Nvfp4GemmConfig,
         ParallelConfig,
+        QuantAttentionConfig,
         TorchCompileConfig,
         VisualGenArgs,
     )
 
     if features.quantization == "none":
         quant_config = QuantConfig()
-    else:
+    elif features.quantization_source == "dynamic":
         quant_config = {
             "quant_algo": features.quantization,
             "dynamic": True,
             **(quantization_kwargs or {}),
         }
+    else:
+        if quantization_kwargs:
+            raise ValueError(
+                "Static feature cases must use the checkpoint's embedded quantization config"
+            )
+        quant_config = QuantConfig()
+    attention_config = AttentionConfig(backend="VANILLA")
+    if features.mha_quantize:
+        attention_config = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp8",
+                v_dtype="fp8",
+                q_block_size=0,
+                k_block_size=0,
+                v_block_size=0,
+            ),
+        )
+
     kwargs = dict(
         model=model_path,
         quant_config=quant_config,
@@ -128,7 +164,10 @@ def _build_single_device_feature_args(
             resolutions=[resolution],
             num_frames=[num_frames],
         ),
-        attention_config=AttentionConfig(backend="VANILLA"),
+        nvfp4_gemm_config=Nvfp4GemmConfig(allowed_backends=["cutlass"])
+        if features.quantization == "NVFP4"
+        else Nvfp4GemmConfig(),
+        attention_config=attention_config,
         parallel_config=ParallelConfig(
             parallel_vae_size=1,
             cfg_size=1,
@@ -163,13 +202,30 @@ def _assert_resolved_single_device_feature_config(
         "NVFP4": QuantAlgo.NVFP4,
     }[features.quantization]
     assert config.quant_config.quant_algo == expected_quant_algo
-    assert config.dynamic_weight_quant is (expected_quant_algo is not None)
+    expected_dynamic_quantization = (
+        expected_quant_algo is not None and features.quantization_source == "dynamic"
+    )
+    assert config.dynamic_weight_quant is expected_dynamic_quantization
     if features.quantization == "NVFP4":
-        assert config.force_dynamic_quantization is True
+        assert config.force_dynamic_quantization is expected_dynamic_quantization
+        assert config.nvfp4_gemm_config.allowed_backends == ["cutlass"]
+
+    assert config.torch_compile.enable_autotune
 
     assert config.cache_backend is None
     assert pipeline.cache_accelerator is None
-    assert config.attention.backend == "VANILLA"
+    expected_attention_backend = "CUTEDSL" if features.mha_quantize else "VANILLA"
+    assert config.attention.backend == expected_attention_backend
+    quant_attention_config = config.attention.quant_attention_config
+    if features.mha_quantize:
+        assert quant_attention_config is not None
+        assert quant_attention_config.qk_dtype == "fp8"
+        assert quant_attention_config.v_dtype == "fp8"
+        assert quant_attention_config.q_block_size == 0
+        assert quant_attention_config.k_block_size == 0
+        assert quant_attention_config.v_block_size == 0
+    else:
+        assert quant_attention_config is None
     assert config.attention.sparse_attention_config is None
 
     assert config.cuda_graph.enable is features.cuda_graph
@@ -190,7 +246,7 @@ def _transformer_components(pipeline):
 
 
 def _assert_feature_quantization_installed(pipeline, features):
-    """Verify that requested dynamic quantization changed real Linear modules."""
+    """Verify that requested quantization configured real Linear modules."""
     from tensorrt_llm._torch.modules.linear import Linear
 
     linears = [
@@ -220,6 +276,24 @@ def _assert_feature_quantization_installed(pipeline, features):
         assert sample.weight.shape[-1] * 2 == sample.in_features
         assert sample.scaling_vector_size == 16
         assert getattr(sample, "weight_scale_2", None) is not None
+        if features.quantization_source == "static":
+            assert sample.input_scale is not None
+            assert sample.pre_quant_scale is None
+            assert sample.force_dynamic_quantization is False
+
+    static_e4m3_attention_modules = [
+        module
+        for component in _transformer_components(pipeline)
+        for module in component.modules()
+        if getattr(module, "requires_static_e4m3_attention", False)
+    ]
+    if features.mha_quantize:
+        assert static_e4m3_attention_modules, "No static E4M3 attention modules were installed"
+        assert all(
+            module.static_e4m3_attention_scales_loaded for module in static_e4m3_attention_modules
+        )
+    else:
+        assert not static_e4m3_attention_modules
 
 
 def _assert_single_device_feature_executed(pipeline, features):
@@ -476,28 +550,22 @@ def _lpips_deterministic_algorithms(*, fully_eager=False):
 
 @contextlib.contextmanager
 def _fixed_nvfp4_quantization_backend(features):
-    """Pin NVFP4 golden runs to deterministic TRT-LLM and CUTLASS paths.
+    """Pin NVFP4 activation quantization to the TRT-LLM implementation.
 
     VisualGen normally autotunes between the TRT-LLM and FlashInfer activation
-    quantizers and among several GEMM backends. Those performance choices can
-    vary between processes, while fixed accuracy goldens require a stable
-    numerical path. Backend selection and parity are covered by the NVFP4
-    operator unit tests.
+    quantizers. Static accuracy cases disable GEMM autotuning separately; this
+    context only fixes the activation-quantization implementation.
     """
     if features.quantization != "NVFP4":
         yield
         return
 
     from tensorrt_llm._torch.custom_ops import torch_custom_ops
-    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
     previous_flashinfer_available = torch_custom_ops.IS_FLASHINFER_AVAILABLE
-    extra_attrs = dict(get_model_extra_attrs() or {})
-    extra_attrs["nvfp4_gemm_allowed_backends"] = ["cutlass"]
     try:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = False
-        with model_extra_attrs(extra_attrs):
-            yield
+        yield
     finally:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = previous_flashinfer_available
 
