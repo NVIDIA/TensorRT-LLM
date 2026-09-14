@@ -737,11 +737,13 @@ class TestKvCacheManagerV2AutoResolution:
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
 
-    def test_registered_models_prefer_v2(self):
+    def test_registered_models_prefer_v2(self) -> None:
         from tensorrt_llm._torch.models.modeling_utils import \
             get_registered_model_class
 
         architectures = (
+            "LlamaForCausalLM",
+            "Llama4ForConditionalGeneration",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
