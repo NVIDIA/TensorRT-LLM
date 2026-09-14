@@ -77,7 +77,10 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
             self.metadata.workspace_required_bytes.fill_(required)
 
     def test_layers_count_once_and_storage_is_replaced(self) -> None:
-        self.metadata.workspace.resize_(16384)
+        with self.reclaimer.forward(self.metadata):
+            self.assertIsNone(self.metadata.workspace_required_bytes)
+            self.metadata.workspace.resize_(16384)
+        self.assertEqual(self.reclaimer.policy.remaining, 3)
         previous = weakref.ref(self.metadata.workspace)
         for remaining in (2, 1, 3):
             with self.reclaimer.forward(self.metadata):
@@ -127,7 +130,8 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
             with self.subTest(multi_stream=multi_stream):
                 self.metadata.workspace_reclaimable = True
                 self.reclaimer = EagerWorkspaceReclaimer(self.metadata)
-                self.report_forward(4096)
+                with self.reclaimer.forward(self.metadata):
+                    self.assertIsNone(self.metadata.workspace_required_bytes)
                 if not multi_stream:
                     self.current_stream.return_value = object()
                 with with_multi_stream(multi_stream), self.reclaimer.forward(self.metadata):
