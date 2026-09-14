@@ -843,7 +843,7 @@ class PerfTestConfig:
 
         # BERT with small BS is very unstable. Try to avoid it.
         if self.is_bert_like():
-            if self.runtime == "trtllm-bench":
+            if self.runtime == "bench":
                 self.batch_sizes[
                     0] = self.max_batch_size if self.max_batch_size > 0 else 1
                 print(f"batch_sizes: {self.batch_sizes}")
