@@ -55,11 +55,10 @@ verl_config:
     # logprobs), so it must be set for that config to match TorchSampler.
     - "TLLM_USE_TORCHSAMPLER=1"
 
-  # Read-only CI model cache (flat layout: /scratch.../ModelName)
-  ci_model_cache: "/scratch.trt_llm_data/llm-models"
-
-  # Models needed by verl tests (symlinks created from HF-style to CI cache paths)
+  # Models needed by verl tests (symlinks created from HF-style to CI cache paths).
+  # Dictated by the pinned checkout (repo_tag above), which hardcodes them under
+  # $TRTLLM_TEST_MODEL_PATH_ROOT -- keep in sync when bumping repo_tag. Setup
+  # checks this list against those sources and fails on a mismatch.
   required_models:
-    - "Qwen/Qwen3-0.6B"
-    - "Qwen/Qwen3-8B"
-    - "Qwen/Qwen3-VL-2B-Instruct"
+    - "Qwen/Qwen2.5-0.5B-Instruct"
+    - "Qwen/Qwen2.5-1.5B-Instruct"
