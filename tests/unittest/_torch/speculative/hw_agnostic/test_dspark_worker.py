@@ -873,7 +873,8 @@ def test_worker_and_draft_kv_follow_the_draft_form(embedded, worker_cls, uses_se
     assert type(worker) is worker_cls
 
     # The embedded draft owns a rolling window and never reads the paged draft
-    # KV cache; the standalone one is DFlash lineage and does.
+    # KV cache; the standalone one conservatively keeps the default separate
+    # manager until upstream confirms it is unused there too.
     assert should_use_separate_draft_kv_cache(spec_config) is uses_separate_draft_kv
 
 

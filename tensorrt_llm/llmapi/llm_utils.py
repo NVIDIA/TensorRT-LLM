@@ -598,6 +598,7 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
             f"must return 'V1', 'V2', or None, got {preferred_version!r}.")
 
     use_v2 = preferred_version == "V2"
+    model_name = getattr(model_cls, "__name__", "the model")
 
     transceiver_config = llm_args.cache_transceiver_config
     if (use_v2 and transceiver_config is not None
@@ -605,10 +606,15 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
         effective_backend, _ = transceiver_config._resolve_default_backend()
         runtime = transceiver_config.transceiver_runtime
         if effective_backend != "NIXL" or runtime != "PYTHON":
-            logger.info(
-                "KV cache manager V2 is the model preference, but disaggregated "
-                "serving uses transceiver_runtime=%r with backend=%r; "
-                "falling back to V1.", runtime, effective_backend)
+            logger.warning(
+                "KV cache manager demoted to V1 by the disaggregated-serving "
+                f"arm: {model_name} declares a V2 preference, but this run "
+                f"uses transceiver_runtime={runtime!r} with "
+                f"backend={effective_backend!r}, and V2 is kept only on "
+                "backend='NIXL' with transceiver_runtime='PYTHON'. The model "
+                "preference is being overridden. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True to keep V2 on "
+                "this route.")
             use_v2 = False
 
     if (not use_v2 and llm_args.kv_cache_config.block_reuse_config.

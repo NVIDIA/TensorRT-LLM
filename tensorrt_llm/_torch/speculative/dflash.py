@@ -1303,7 +1303,14 @@ class DFlashWorker(SpecWorkerBase):
         is_capturing = torch.cuda.is_current_stream_capturing()
 
         if spec_metadata.is_cuda_graph and not is_capturing:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+            # kv_lens_cuda is a TRTLLM-metadata attribute; other backends
+            # (e.g. FlashInfer) keep no device-side KV lengths on the target
+            # metadata, so there is nothing to save there. The kv-length
+            # bump/rewind sites below hasattr-guard the same field.
+            fields = ["_seq_lens", "_seq_lens_cuda"]
+            if hasattr(attn_metadata, "kv_lens_cuda"):
+                fields.append("kv_lens_cuda")
+            attn_metadata.prepare_for_spec_dec(*fields)
         else:
             attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 

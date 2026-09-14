@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import math
 import re
 import tempfile
@@ -46,6 +47,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
+                                          DraftTargetDecodingConfig,
                                           DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -787,6 +789,31 @@ class TestModelDefaults:
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
 
 
+@pytest.fixture
+def tllm_caplog(caplog):
+    """Let ``caplog`` see tensorrt_llm logger records.
+
+    The TRT-LLM logger is a named Python logger with ``propagate = False`` and
+    a default minimum severity of "error", so caplog captures nothing unless
+    both are relaxed. Restored afterwards.
+    """
+    from tensorrt_llm.logger import logger as tllm_logger
+    py_logger = logging.getLogger(tllm_logger.PREFIX)
+    old_propagate = py_logger.propagate
+    old_py_level = py_logger.level
+    old_min_severity = tllm_logger._min_severity
+    py_logger.propagate = True
+    py_logger.setLevel(logging.WARNING)
+    tllm_logger._min_severity = "warning"
+    caplog.set_level(logging.WARNING, logger=tllm_logger.PREFIX)
+    try:
+        yield caplog
+    finally:
+        py_logger.propagate = old_propagate
+        py_logger.setLevel(old_py_level)
+        tllm_logger._min_severity = old_min_severity
+
+
 @pytest.mark.cpu_only
 class TestKvCacheManagerV2AutoResolution:
     """Test model preferences for the KV cache manager version."""
@@ -917,6 +944,87 @@ class TestKvCacheManagerV2AutoResolution:
         _resolve_kv_cache_manager_v2_auto(llm_args, self._PreferV2)
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    @staticmethod
+    def _warnings(caplog):
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ]
+
+    def test_disagg_demotion_warns(self, tllm_caplog):
+        """Arm 1 (disagg outside NIXL + Python transceiver) must be loud."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="CPP"),
+        )
+        # TorchLlmArgs construction warns on its own (gpus_per_node); only the
+        # resolver call is under test.
+        tllm_caplog.clear()
+
+        assert _resolve_kv_cache_manager_v2_auto(llm_args,
+                                                 self._PreferV2) is False
+
+        messages = self._warnings(tllm_caplog)
+        assert len(messages) == 1, messages
+        message = messages[0]
+        assert "disaggregated-serving arm" in message
+        assert "_PreferV2" in message
+        assert "transceiver_runtime='CPP'" in message
+        assert "backend='NIXL'" in message
+        assert "kv_cache_config.use_kv_cache_manager_v2=True" in message
+
+    def test_two_model_spec_dec_demotion_warns(self, tllm_caplog):
+        """Arm 2 (two-model speculative decoding) must be loud.
+
+        Every public two-model switch is currently deprecated to one-model --
+        ``eagle3_one_model=False`` and ``mtp_eagle_one_model=False`` are both
+        reset to True by their validators, and ``_draft_target_one_model`` is a
+        PrivateAttr pinned to True -- so the only way to reach the arm is to set
+        that private attribute directly. Do it before ``spec_dec_mode`` is read
+        (it is a cached_property).
+        """
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=3, speculative_model="/tmp/dummy_draft_model")
+        spec_config._draft_target_one_model = False
+        assert spec_config.spec_dec_mode.has_draft_model()
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                speculative_config=spec_config)
+        tllm_caplog.clear()
+
+        assert _resolve_kv_cache_manager_v2_auto(llm_args,
+                                                 self._PreferV2) is False
+
+        messages = self._warnings(tllm_caplog)
+        assert len(messages) == 1, messages
+        message = messages[0]
+        assert "two-model speculative-decoding arm" in message
+        assert "_PreferV2" in message
+        assert "draft model in a separate engine" in message
+        assert "kv_cache_config.use_kv_cache_manager_v2=True" in message
+
+    @pytest.mark.parametrize(
+        "cache_transceiver_config",
+        [
+            pytest.param(None, id="aggregated"),
+            pytest.param(CacheTransceiverConfig(backend="NIXL",
+                                                transceiver_runtime="PYTHON"),
+                         id="disagg-nixl-python"),
+        ],
+    )
+    def test_no_warning_when_v2_preference_is_kept(self, tllm_caplog,
+                                                   cache_transceiver_config):
+        """No demotion, no warning."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=cache_transceiver_config)
+        tllm_caplog.clear()
+
+        assert _resolve_kv_cache_manager_v2_auto(llm_args,
+                                                 self._PreferV2) is True
+        assert self._warnings(tllm_caplog) == []
 
     @pytest.mark.parametrize(("user_setting", "model_cls"), [
         pytest.param(False, _PreferV2, id="explicit-v1"),

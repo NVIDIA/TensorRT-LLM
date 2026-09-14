@@ -50,11 +50,24 @@ def dspark_layer_window_size(
     draft queries to the most recent ``swa_window`` context tokens plus the
     (nearby) draft block. Full-attention layers and drafters that do not enable
     the window keep flash-attn's default ``(-1, -1)`` (no window).
+
+    A drafter that enables ``use_swa`` while declaring *no* layer as
+    ``sliding_attention`` means the window on every layer. That is how the
+    windowed DFlash 2 drafters are exported -- ``layer_types`` is all
+    ``full_attention`` and the window lives in ``dflash_config`` -- and it is
+    the resolution the reference serving path applies to them. Reading those
+    ``layer_types`` literally would serve a windowed drafter with full
+    attention and silently lose acceptance, so the per-layer filter applies
+    only when the checkpoint actually distinguishes sliding layers from full
+    ones.
     """
     if not use_swa:
         return (-1, -1)
+    any_sliding = layer_types is not None and any(
+        str(layer_type) == "sliding_attention" for layer_type in layer_types
+    )
     if (
-        layer_types is not None
+        any_sliding
         and layer_idx < len(layer_types)
         and layer_types[layer_idx] != "sliding_attention"
     ):
@@ -528,6 +541,15 @@ class DFlashForCausalLM(nn.Module):
             dspark_layer_window_size(self._use_swa, self._swa_window, layer_types, i)
             for i in range(num_draft_layers)
         ]
+        # Logged because the window is resolved from three places at once
+        # (use_swa, swa_window_size, layer_types) and a wrong resolution costs
+        # acceptance without raising: a serve that believes it is windowed has
+        # no other way to check.
+        logger.info(
+            f"DFlash draft attention windows: use_swa={self._use_swa}, "
+            f"swa_window_size={self._swa_window}, layer_types={layer_types}, "
+            f"resolved window_size per layer: {self._layer_windows}"
+        )
 
         # DFlash 2 (https://inco.ai/blog/dflash2/) keeps the DFlash block decode
         # and adds per-sublayer convolutions plus a pairwise candidate selector.
