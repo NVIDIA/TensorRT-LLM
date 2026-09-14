@@ -264,6 +264,17 @@ class TestTypedSlotIds(unittest.TestCase):
 
 
 class TestCacheLevelStorage(unittest.TestCase):
+    def test_grains_to_slots_rejects_zero_divisors(self) -> None:
+        invalid_inputs = [
+            (1, [0], 16 << 20),
+            (1, [16 << 20], 0),
+        ]
+
+        for grains, slot_sizes, granularity in invalid_inputs:
+            with self.subTest(slot_sizes=slot_sizes, granularity=granularity):
+                with self.assertRaisesRegex((ValueError, RuntimeError), "must be positive"):
+                    _introspection.grains_to_slots(grains, slot_sizes, granularity)
+
     def test_grains_to_slots_refines_proportional_lower_bound(self) -> None:
         granularity = 16 << 20
         slot_size_list = [16_252_928, 4_063_232]

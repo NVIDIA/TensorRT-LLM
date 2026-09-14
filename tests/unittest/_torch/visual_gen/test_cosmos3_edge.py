@@ -1519,6 +1519,7 @@ def _policy_reference_forward(transformer, inputs: dict[str, object]):
             action_timesteps=inputs["action_timesteps"],
             action_noisy_frame_indexes=inputs["action_noisy_frame_indexes"],
             action_domain_ids=inputs["action_domain_ids"],
+            return_dict=False,
         )
     return video_out[0], action_out[0]
 
@@ -1619,7 +1620,7 @@ class TestDiffusersParity:
         The emitted tensors are one-step BF16 video and action velocities. The
         model-specific behavior is a clean state row followed by 32 noisy
         actions, with domain-selected input/output heads. The trusted reference
-        is pinned Diffusers 0.39.0 with identical synthetic weights and packed
+        is pinned Diffusers 0.40.0 with identical synthetic weights and packed
         inputs. This is transparent T1; its tolerance covers reduction
         reordering between SDPA and TRT-LLM's vanilla attention backend.
 
