@@ -9,8 +9,8 @@ x operation, which strategies are bitwise identical, and which combinations
 are silently wrong rather than loud. The names are kept apart so review does
 not read one as a copy of the other.
 
-The matrix itself lives in ``allgather_test.py``, which is its own 4-rank
-launcher; see ``_rank_job`` for why that is left intact.
+The matrix itself lives in ``catalog/comm/_allgather_op_matrix.py``, which is
+its own 4-rank launcher; see ``_rank_job`` for why that is left intact.
 """
 
 import pytest

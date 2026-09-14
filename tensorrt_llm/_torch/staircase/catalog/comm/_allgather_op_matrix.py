@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the allgather catalog entry.
+"""GPU certification matrix for the allgather catalog entry.
 
 A collective cannot be exercised in one process, so this script is its own
 launcher: run it plainly and it re-executes itself under `mpirun` with one
@@ -15,7 +15,21 @@ file covers what a serving engine adds: the engine's own attention-DP
 synchronisation interleaved with the op, the engine's stream switching, and
 what disagreeing on call order actually does.
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python catalog/comm/allgather_test.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python catalog/comm/_allgather_op_matrix.py
+
+Not a pytest module, despite the `check_*` bodies. They are one fixed
+sequence inside a single 4-rank job rather than independent cases: each reads
+module-global rank state that only `_run_one_rank` binds, and several assert
+on communicator state the previous one left behind. Collected as tests they
+would run at world size 1 against unbound globals — so neither this file's
+name nor its function names match pytest's collection patterns, which is what
+keeps it uncollectable however pytest is pointed at this tree.
+
+The collected entry point is
+`tests/unittest/_torch/staircase/comm/test_staircase_allgather_op_matrix.py`:
+it starts this job and turns its exit code into an assertion. This half stays
+in the package because the launcher re-execs it as `python -m`, and the ranks
+need the package context for their relative imports.
 """
 
 import os
@@ -175,7 +189,7 @@ def _warm_up_off_capture_stream(body, reps: int = 2) -> None:
 
     Two things have to be done before a capture and cannot be done inside one:
     the group's NCCL communicator has to exist (see
-    test_cuda_graph_capture_of_a_first_call_raises), and torch wants the work
+    check_cuda_graph_capture_of_a_first_call_raises), and torch wants the work
     warmed on a non-default stream.
     """
     side = torch.cuda.Stream()
@@ -261,7 +275,7 @@ def _verify_replay(
         _assert_bitwise(out, _gather_ref([rows] * WORLD, seed + 13 * site), f"{where} site={site}")
 
 
-def test_cuda_graph_capture_of_a_first_call_raises() -> None:
+def check_cuda_graph_capture_of_a_first_call_raises() -> None:
     """A group's first-ever call cannot be captured; the build inside fails.
 
     Must run before anything else touches GROUP — the failure is specifically
@@ -318,7 +332,7 @@ def test_cuda_graph_capture_of_a_first_call_raises() -> None:
     COMM.Barrier()
 
 
-def test_uniform_gather() -> None:
+def check_uniform_gather() -> None:
     """sizes=None: every rank holds `rows` rows, the result is WORLD * rows.
 
     Decode-like (1, 2, 8, 32) through prefill-like (2048) row counts, which is
@@ -335,7 +349,7 @@ def test_uniform_gather() -> None:
         COMM.Barrier()
 
 
-def test_ragged_gather() -> None:
+def check_ragged_gather() -> None:
     """sizes=[...]: per-rank row counts differ, the result is sum(sizes).
 
     Attention data parallelism produces exactly this — each rank owns its own
@@ -352,7 +366,7 @@ def test_ragged_gather() -> None:
         COMM.Barrier()
 
 
-def test_output_is_fresh_and_input_is_untouched() -> None:
+def check_output_is_fresh_and_input_is_untouched() -> None:
     """The op allocates its result; the caller keeps ownership of `input`."""
     rows, seed = 8, 4100
     x = _payload(RANK, rows, seed)
@@ -369,7 +383,7 @@ def test_output_is_fresh_and_input_is_untouched() -> None:
     COMM.Barrier()
 
 
-def test_trailing_dims_are_preserved() -> None:
+def check_trailing_dims_are_preserved() -> None:
     """dim 0 is the gather axis; every other dim is carried through untouched."""
     cases: List[Tuple[Tuple[int, ...], Optional[List[int]]]] = [
         ((2, HIDDEN // 2), None),
@@ -392,7 +406,7 @@ def test_trailing_dims_are_preserved() -> None:
         COMM.Barrier()
 
 
-def test_dtypes_move_bitwise() -> None:
+def check_dtypes_move_bitwise() -> None:
     """The payload dtypes an attention-DP dispatch moves, in both forms.
 
     bf16 hidden states, plus what a post-quantization dispatch carries next to
@@ -423,7 +437,7 @@ def test_dtypes_move_bitwise() -> None:
         COMM.Barrier()
 
 
-def test_group_selects_a_rank_subset() -> None:
+def check_group_selects_a_rank_subset() -> None:
     """`group` names MPI session ranks; ranks outside it must not call."""
     subset = [0, 1]
     rows, seed = 4, 7100
@@ -434,7 +448,7 @@ def test_group_selects_a_rank_subset() -> None:
     COMM.Barrier()
 
 
-def test_group_order_does_not_change_the_output_order() -> None:
+def check_group_order_does_not_change_the_output_order() -> None:
     """The result is ordered by ascending rank, whatever order `group` lists."""
     rows, seed = 4, 7200
     x = _payload(RANK, rows, seed)
@@ -443,7 +457,7 @@ def test_group_order_does_not_change_the_output_order() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_at_every_engine_batch_size() -> None:
+def check_cuda_graph_at_every_engine_batch_size() -> None:
     """Captured at all 35 engine batch sizes, then replayed interleaved.
 
     Capturing one row count proves nothing about an engine, which holds every
@@ -494,7 +508,7 @@ def test_cuda_graph_at_every_engine_batch_size() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
+def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
     """The decode graph this checkpoint captures, at all 35 batch sizes.
 
     1015 captured gathers, one memory pool. The sites are independent — each
@@ -528,7 +542,7 @@ def test_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
+def check_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
     """Between two decode replays, a server runs work no graph holds.
 
     A prefill runs eagerly at a row count far outside the captured set, and a
@@ -560,7 +574,7 @@ def test_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
     COMM.Barrier()
 
 
-def test_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
+def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
     """`sizes` is a host argument: a replay re-runs the split it was captured with.
 
     Two graphs with different sizes vectors are captured into one pool and
@@ -600,7 +614,7 @@ def test_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
     COMM.Barrier()
 
 
-def test_the_gate_discriminates_a_wrong_gather() -> None:
+def check_the_gate_discriminates_a_wrong_gather() -> None:
     """The bitwise gate rejects every plausible wrong gather, by a wide margin.
 
     A gate of exactly 0 cannot be too loose, but it can be blind: if every
@@ -660,7 +674,7 @@ def test_the_gate_discriminates_a_wrong_gather() -> None:
     COMM.Barrier()
 
 
-def test_the_engines_own_cross_rank_step_is_not_on_this_communicator() -> None:
+def check_the_engines_own_cross_rank_step_is_not_on_this_communicator() -> None:
     """What a serving engine synchronises with, next to what this op uses.
 
     Under attention data parallelism the engine agrees the per-rank token
@@ -682,7 +696,7 @@ def test_the_engines_own_cross_rank_step_is_not_on_this_communicator() -> None:
     COMM.Barrier()
 
 
-def test_interleaved_with_the_engines_attention_dp_synchronisation() -> None:
+def check_interleaved_with_the_engines_attention_dp_synchronisation() -> None:
     """The op inside a forward, between the engine's own cross-rank steps.
 
     The shape a served forward has: once per step the engine agrees the
@@ -720,7 +734,7 @@ def test_interleaved_with_the_engines_attention_dp_synchronisation() -> None:
     COMM.Barrier()
 
 
-def test_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
+def check_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
     """The op runs on whatever stream is current, and ranks need not agree.
 
     A serving engine moves the current stream under the model: the same
@@ -748,7 +762,7 @@ def test_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
         COMM.Barrier()
 
 
-def test_wrapper_guards_a_non_contiguous_input() -> None:
+def check_wrapper_guards_a_non_contiguous_input() -> None:
     """The wrapper's assert stands where the op itself is silently wrong."""
     rows, seed = 8, 92000
     values = _payload(RANK, rows, seed)
@@ -776,7 +790,7 @@ def test_wrapper_guards_a_non_contiguous_input() -> None:
     COMM.Barrier()
 
 
-def test_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
+def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     """A short `sizes` list silently drops the trailing ranks."""
     rows, seed = 4, 93000
     short = [rows] * (WORLD - 1)
@@ -796,7 +810,7 @@ def test_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     COMM.Barrier()
 
 
-def test_wrapper_guards_a_zero_dim_input() -> None:
+def check_wrapper_guards_a_zero_dim_input() -> None:
     """A 0-d input segfaults inside the op, so the wrapper stops it first.
 
     The op is deliberately not called here: the crash is in
@@ -811,7 +825,7 @@ def test_wrapper_guards_a_zero_dim_input() -> None:
     COMM.Barrier()
 
 
-def test_call_order_disagreement_corrupts_silently() -> None:
+def check_call_order_disagreement_corrupts_silently() -> None:
     """Ranks that disagree on the *order* of two equal-sized gathers get wrong
     data back, with no error and no hang.
 
@@ -866,32 +880,32 @@ def test_call_order_disagreement_corrupts_silently() -> None:
     COMM.Barrier()
 
 
-TESTS = (
+CHECKS = (
     # Stays first: it is the only test that can observe GROUP's first-ever
     # call, and every later test needs the communicator it builds.
-    test_cuda_graph_capture_of_a_first_call_raises,
-    test_uniform_gather,
-    test_ragged_gather,
-    test_output_is_fresh_and_input_is_untouched,
-    test_trailing_dims_are_preserved,
-    test_dtypes_move_bitwise,
-    test_group_selects_a_rank_subset,
-    test_group_order_does_not_change_the_output_order,
-    test_cuda_graph_at_every_engine_batch_size,
-    test_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph,
-    test_cuda_graph_replays_survive_eager_calls_of_other_shapes,
-    test_cuda_graph_holds_the_sizes_vector_it_captured,
-    test_the_gate_discriminates_a_wrong_gather,
-    test_the_engines_own_cross_rank_step_is_not_on_this_communicator,
-    test_interleaved_with_the_engines_attention_dp_synchronisation,
-    test_the_stream_the_call_lands_on_is_not_part_of_the_match,
-    test_wrapper_guards_a_non_contiguous_input,
-    test_wrapper_guards_a_sizes_list_of_the_wrong_length,
-    test_wrapper_guards_a_zero_dim_input,
+    check_cuda_graph_capture_of_a_first_call_raises,
+    check_uniform_gather,
+    check_ragged_gather,
+    check_output_is_fresh_and_input_is_untouched,
+    check_trailing_dims_are_preserved,
+    check_dtypes_move_bitwise,
+    check_group_selects_a_rank_subset,
+    check_group_order_does_not_change_the_output_order,
+    check_cuda_graph_at_every_engine_batch_size,
+    check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph,
+    check_cuda_graph_replays_survive_eager_calls_of_other_shapes,
+    check_cuda_graph_holds_the_sizes_vector_it_captured,
+    check_the_gate_discriminates_a_wrong_gather,
+    check_the_engines_own_cross_rank_step_is_not_on_this_communicator,
+    check_interleaved_with_the_engines_attention_dp_synchronisation,
+    check_the_stream_the_call_lands_on_is_not_part_of_the_match,
+    check_wrapper_guards_a_non_contiguous_input,
+    check_wrapper_guards_a_sizes_list_of_the_wrong_length,
+    check_wrapper_guards_a_zero_dim_input,
     # Stays last: it deliberately disagrees on call order, and although a
     # swapped pair realigns the communicator (its final assertion proves it),
     # nothing after it should depend on that.
-    test_call_order_disagreement_corrupts_silently,
+    check_call_order_disagreement_corrupts_silently,
 )
 
 
@@ -931,13 +945,13 @@ def _run_one_rank() -> int:
     )
     DIST = engine_dist
 
-    for test in TESTS:
+    for check in CHECKS:
         try:
-            test()
+            check()
         except BaseException:
             import traceback
 
-            print(f"[rank {RANK}] FAILED {test.__name__}", flush=True)
+            print(f"[rank {RANK}] FAILED {check.__name__}", flush=True)
             traceback.print_exc()
             sys.stdout.flush()
             sys.stderr.flush()
@@ -945,7 +959,7 @@ def _run_one_rank() -> int:
             # wedges every other rank in it.
             COMM.Abort(1)
     COMM.Barrier()
-    print(f"[rank {RANK}] {len(TESTS)} tests passed", flush=True)
+    print(f"[rank {RANK}] {len(CHECKS)} checks passed", flush=True)
     return 0
 
 
@@ -966,7 +980,7 @@ def _spawn_ranks() -> None:
         str(world_size),
         sys.executable,
         "-m",
-        "tensorrt_llm._torch.staircase.catalog.comm.allgather_test",
+        "tensorrt_llm._torch.staircase.catalog.comm._allgather_op_matrix",
         _WORKER_FLAG,
     ]
     print(f"[launcher] {' '.join(command)}", flush=True)
