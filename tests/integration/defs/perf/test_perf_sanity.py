@@ -864,9 +864,9 @@ CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
     r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
 )
-CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v3-postmerge-75-auto-25-native"
+CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v4-postmerge-50-auto-50-native"
 CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
-CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 4
+CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 2
 CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET = 0
 CHECKPOINT_IO_FALLBACK_REASON_LIMIT = 256
 CHECKPOINT_IO_FALLBACK_REASON_COUNT_LIMIT = 4
@@ -924,7 +924,7 @@ def assign_checkpoint_io_experiment(
     """Assign one deterministic policy and write it into generated configs.
 
     Pre-merge runs always exercise auto. Post-merge runs use the root Jenkins
-    build number to select one native bucket and three auto buckets. Explicit
+    build number to select native for even builds and auto for odd builds. Explicit
     config policy remains authoritative and excludes the launch from
     assignment. A valid override is intended for reproduction.
     """

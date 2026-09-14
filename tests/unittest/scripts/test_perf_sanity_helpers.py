@@ -42,9 +42,9 @@ def _assignment(
 
 @pytest.mark.parametrize(
     ("build_number", "expected_bucket", "expected_arm"),
-    [(100, 0, "native"), (101, 1, "auto"), (102, 2, "auto"), (103, 3, "auto")],
+    [(100, 0, "native"), (101, 1, "auto"), (102, 0, "native"), (103, 1, "auto")],
 )
-def test_checkpoint_io_experiment_uses_postmerge_build_for_deterministic_75_25_split(
+def test_checkpoint_io_experiment_uses_postmerge_build_for_deterministic_50_50_split(
     build_number: int,
     expected_bucket: int,
     expected_arm: str,
@@ -62,6 +62,7 @@ def test_checkpoint_io_experiment_uses_postmerge_build_for_deterministic_75_25_s
         },
     )
 
+    assert assignment.version == "checkpoint-io-v4-postmerge-50-auto-50-native"
     assert assignment.bucket == expected_bucket
     assert assignment.assigned_arm == expected_arm
     assert assignment.assignment_source == "postmerge_build_number"

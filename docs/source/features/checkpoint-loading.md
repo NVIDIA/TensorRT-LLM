@@ -162,9 +162,13 @@ activation logs also report the local reader assignment.
 Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
 built-in PyTorch/HF launches to the default `auto` policy, so merge decisions do
 not depend on an unrelated CI identifier. Post-merge telemetry runs use the
-numeric root Jenkins build number modulo 4 to assign one native bucket and
-three auto buckets before generated server configs are written. Every rank and
-node in one distributed startup therefore receives the same concrete policy.
+numeric root Jenkins build number modulo 2 to assign `native` to even builds and
+`auto` to odd builds before generated server configs are written. This gives a
+50/50 assignment across consecutive root builds without adding CI stages or
+model launches; successful observations may not be evenly split. Every rank
+and node in one distributed startup receives the same concrete policy. The
+experiment version is `checkpoint-io-v4-postmerge-50-auto-50-native`, distinct
+from the previous 75/25 assignment.
 Non-telemetry runs, invalid or missing post-merge build identities,
 incompatible configurations, and purpose-built configs with an explicit
 `checkpoint_io_policy` are not assigned and retain their normal configuration,
@@ -182,6 +186,14 @@ rows use `premerge_default` and are excluded from that comparison.
 Multiple client rows can share one server startup; use
 `s_startup_observation_id` to group them and filter
 `b_startup_observation_primary_row:true` to count each startup once.
+
+To compare rank-striped loading against native loading, separately report
+confirmed effective `rank_striped_read_ahead` observations and native controls
+with matching runtime-image identity, GPU, model/checkpoint, and parallelism
+configuration. Keep auto fallbacks and unknown effective policies separate;
+do not infer activation from the assigned arm. Preserve experiment versions
+and root build IDs when grouping repeated observations. This effective-policy
+comparison is observational, not a controlled head-to-head benchmark.
 
 This policy remains separate from ModelStreamer, MX, GMS, or snapshot
 integrations. Those systems may change the source or bypass raw loading without
