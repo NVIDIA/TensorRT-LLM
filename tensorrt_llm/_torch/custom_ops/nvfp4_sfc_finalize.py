@@ -118,8 +118,9 @@ def sfc_finalize(
 def nvfp4_sfc_finalize(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Finalize deferred-NVFP4 raw block scales: returns (sf, s, max_raw).
 
-    raw: fp32 [M, K/16] row-major contiguous (a/6 block scales from a
-    deferred-store producer). sf: uint8 [pad128(M) * pad4(K/16)] swizzled
+    raw: fp32 [M, K/16] row-major contiguous, with both dimensions non-zero
+    (a/6 block scales from a deferred-store producer).
+    sf: uint8 [pad128(M) * pad4(K/16)] swizzled
     e4m3 SF bytes, bitwise-identical to fp4_quantize's SF at the same s,
     pad rows/cols zero-filled. s = 448/max(raw) and max_raw are 0-d fp32
     device tensors (no host sync)."""
@@ -129,6 +130,8 @@ def nvfp4_sfc_finalize(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
         raise ValueError(f"raw: expected fp32, got {raw.dtype}")
     if not raw.is_cuda:
         raise ValueError("raw: expected a CUDA tensor")
+    if raw.shape[0] == 0 or raw.shape[1] == 0:
+        raise ValueError("raw: dimensions must be non-zero")
     if raw.stride(-1) != 1 or raw.stride(0) != raw.shape[1]:
         raise ValueError("raw: must be row-major contiguous")
     return sfc_finalize(raw)
@@ -137,8 +140,11 @@ def nvfp4_sfc_finalize(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, t
 @nvfp4_sfc_finalize.register_fake
 def _nvfp4_sfc_finalize_fake(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Meta/fake impl: sf is sized for the 128x4-padded swizzled layout; s and
-    max_raw are 0-d fp32 tensors, matching the eager return contract."""
+    max_raw are 0-d fp32 tensors. Both raw dimensions must be non-zero,
+    matching the eager input contract."""
     m, kb_tot = raw.shape
+    if m == 0 or kb_tot == 0:
+        raise ValueError("raw: dimensions must be non-zero")
     num_m_tiles = (m + 127) // 128
     num_k_tiles = (kb_tot + 3) // 4
     sf = raw.new_empty((num_m_tiles * 128 * num_k_tiles * 4,), dtype=torch.uint8)

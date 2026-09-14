@@ -501,7 +501,7 @@ def test_fused_act_flattens_3d_fp4_input(kind):
 @skip_rubin
 @pytest.mark.parametrize("all_zeros", [False, True])
 @pytest.mark.parametrize("use_bias", [False, True])
-@pytest.mark.parametrize("m, k, n", [(128, 256, 512), (256, 512, 2048)])
+@pytest.mark.parametrize("m, k, n", [(128, 256, 512), (129, 256, 512), (256, 512, 2048)])
 def test_dense_gemm_gelu_deferred_fp4out(
     m: int, k: int, n: int, use_bias: bool, all_zeros: bool
 ) -> None:
@@ -548,6 +548,16 @@ def test_dense_gemm_gelu_deferred_fp4out(
 
     assert _nibble_match(c, ref_fp4) > 0.95, "deferred fp4-out GELU nibble match < 95%"
     assert _sf_match(sf, ref_sf, m, n) > 0.95, "deferred fp4-out GELU SF match < 95%"
+
+    if m % 128:
+        # Check the partial tile separately: a missed final row could otherwise
+        # pass the aggregate 95% threshold across all 129 rows.
+        assert _nibble_match(c[-1:], ref_fp4[-1:]) > 0.95
+        sf_rows = unswizzle_sf(sf.view(-1), pad_up(m, 128), n).view(torch.uint8)
+        ref_sf_rows = unswizzle_sf(ref_sf.view(-1), pad_up(m, 128), n).view(torch.uint8)
+        tail_match = (sf_rows[m - 1].int() - ref_sf_rows[m - 1].int()).abs() <= 1
+        assert tail_match.float().mean().item() > 0.95
+        assert torch.count_nonzero(sf_rows[m:]) == 0
 
 
 def test_mlp_deferred_fp4out_min_m_switch():
@@ -772,6 +782,26 @@ def test_sfc_finalize_rejects_invalid_raw():
     assert padded.stride() == (16, 1)
     with pytest.raises(ValueError, match="row-major contiguous"):
         torch.ops.trtllm.nvfp4_sfc_finalize(padded)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
+@pytest.mark.parametrize("shape", [(0, 8), (128, 0), (0, 0)])
+def test_sfc_finalize_rejects_empty_raw(shape: tuple[int, int]) -> None:
+    """Eager finalization rejects either zero-sized dimension before reduction."""
+    raw = torch.empty(shape, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="dimensions must be non-zero"):
+        torch.ops.trtllm.nvfp4_sfc_finalize(raw)
+
+
+@pytest.mark.parametrize("shape", [(0, 8), (128, 0), (0, 0)])
+def test_sfc_finalize_fake_rejects_empty_raw(shape: tuple[int, int]) -> None:
+    """Fake finalization enforces the same non-empty shape contract as eager."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        raw = torch.empty(shape, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError, match="dimensions must be non-zero"):
+            torch.ops.trtllm.nvfp4_sfc_finalize(raw)
 
 
 def test_cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_fake():
