@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <functional>
@@ -126,7 +127,10 @@ class PlannedDropHandle
 public:
     // Deduplicates `pages` by identity, stores weak references, and increments
     // each page's plannedDropCount.
-    explicit PlannedDropHandle(std::vector<CommittedPage*> const& pages);
+    //
+    // The handle takes the manager's API lock here, in drop() and in ~PlannedDropHandle, so it
+    // holds a strong reference: Python may collect it after the manager it was created from.
+    PlannedDropHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages);
 
     // Mirrors Python's __del__: applies the plan if not already dropped.
     ~PlannedDropHandle();
@@ -138,10 +142,11 @@ public:
     //
     // A live page is removed from eviction tracking only when this is its final
     // plan and it is already droppable and queued for eviction. Calling this
-    // method twice throws (translated to Python ValueError).
+    // method twice throws (translated to Python RuntimeError).
     void drop();
 
 private:
+    std::shared_ptr<KvCacheManager> mManager;
     // nullopt once dropped (mirrors Python's `_page_refs is None`).
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
@@ -171,7 +176,7 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
 
     ~KvCache();
 
@@ -281,6 +286,18 @@ public:
         return static_cast<int>(mCommittedTokens.size());
     }
 
+    // Internal diagnostic: prefix supported by the attention pages alone,
+    // before recurrent-state (SSM) snapshot pruning shortened the reuse.
+    int numReusableTokensBeforeHybridPruning() const noexcept
+    {
+        return mNumReusableTokensBeforeHybridPruning;
+    }
+
+    int numReusableTokensBeforePruning() const noexcept
+    {
+        return mNumReusableTokensBeforePruning;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -299,6 +316,9 @@ public:
     // called after stopCommitting(). Returns nullptr without creating a plan if
     // any required SWA page is unavailable. Mirrors Python's
     // _KVCache.plan_committed_block_drop().
+    //
+    // Every returned handle must be dropped -- via drop() or destruction -- before the manager is
+    // shut down: applying a plan takes the manager's API lock and mutates its state.
     std::unique_ptr<PlannedDropHandle> planCommittedBlockDrop();
 
     int historyLength() const noexcept
@@ -474,6 +494,8 @@ private:
 
     bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
+    bool _shouldRecordManagerStats() const;
+    bool _shouldRecordRequestStats() const;
     bool _shouldRecordStats() const;
     void _refreshStatsDirtyState();
     void _recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIterationStatsDelta const& iterationStats);
@@ -485,7 +507,6 @@ private:
         TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration);
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
-    void _increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
 
     void _evictOutOfWindowBlocks(int historyLength)
@@ -505,6 +526,13 @@ private:
     // moves (vs copies) the live SSM page into the tree (caller must guarantee
     // no later writes to this KvCache's memory). Mirrors Python's _commit_block.
     void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false);
+
+    // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
+    // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the
+    // chain from the deepest surviving ancestor. The evicted page stays absent, which is
+    // fine: pruneMatch() truncates reuse before a block that lacks it.
+    // See https://nvbugs/6625710.
+    void _reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& root);
 
     struct TakenPage
     {
@@ -581,6 +609,9 @@ private:
     std::vector<TokenIdExt> mCommittedTokens;
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
+    int mNumReusableTokensBeforeHybridPruning;
+    int mNumReusableTokensBeforePruning;
+    bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

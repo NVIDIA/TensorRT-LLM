@@ -23,7 +23,7 @@
 import copy
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional
 
 import torch
 
@@ -35,30 +35,31 @@ from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.fused_shared_expert import \
-    fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.moe.fused_shared_expert import \
+    fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod,
-                                 RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
+                             RenormalizeMoeRoutingMethod,
+                             RenormalizeNaiveMoeRoutingMethod,
+                             RoutingMethodType, create_moe)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
@@ -146,6 +147,10 @@ def _experts_excluded_from_quant(model_config: ModelConfig[Qwen3NextConfig],
 
 class Qwen3NextGate(nn.Module):
 
+    # The router weight is a bare parameter, not a Linear, so the dispatcher's
+    # name-based scan needs an explicit opt-in to reach it.
+    _low_m_gemm_opt_in = True
+
     def __init__(
         self,
         hidden_size: int,
@@ -169,6 +174,13 @@ class Qwen3NextGate(nn.Module):
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The low-M kernels return the input dtype, so cublas_mm below still
+        # owns any out_dtype promotion.
+        if _should_apply_low_m_gemm(
+                hidden_states) and self.out_dtype == hidden_states.dtype:
+            logits = apply_low_m_gemm(self, hidden_states, self.weight, None)
+            if logits is not None:
+                return logits
         logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
@@ -192,6 +204,19 @@ class Qwen3NextGate(nn.Module):
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
+
+
+class _DeferredSharedExpertFinalize(NamedTuple):
+    """The three tensors the shared-expert finalize would have combined.
+
+    Returned in place of ``routed + sigmoid(gate) * shared`` when the caller
+    asks to defer and no collective follows, so that a downstream consumer can
+    fold that expression into a kernel it already runs over these rows.
+    """
+
+    routed_output: torch.Tensor
+    shared_output: torch.Tensor
+    shared_gate_logits: torch.Tensor
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -307,7 +332,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         lora_params: Optional[dict] = None,
-    ) -> torch.Tensor:
+        defer_shared_expert_finalize: bool = False,
+    ) -> torch.Tensor | _DeferredSharedExpertFinalize:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -359,6 +385,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return final_hidden_states
 
         shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
+        # Deferring is sound only where no collective follows the finalize,
+        # which is exactly the negation of the all-reduce condition below.
+        # DP padding and >2D inputs are excluded: the rows handed over would no
+        # longer line up with the Hyper-Connection residual.
+        no_collective_after_finalize = (self.enable_attention_dp
+                                        or self.mapping.tp_size == 1)
+        if (defer_shared_expert_finalize and no_collective_after_finalize
+                and not use_dp_padding and len(orig_shape) == 2):
+            return _DeferredSharedExpertFinalize(
+                final_hidden_states,
+                shared_expert_output,
+                shared_expert_gate_logits,
+            )
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             output_tensor, _ = torch.ops.trtllm.allocate_output(
                 final_hidden_states, self.allreduce.output_buffer_kind,
@@ -401,7 +440,10 @@ class _DenseMlpAdapter(nn.Module):
         all_reduce_params=None,
         do_finalize=True,
         lora_params=None,
+        defer_shared_expert_finalize=False,
     ):
+        assert not defer_shared_expert_finalize, \
+            "a dense MLP has no shared-expert finalize to defer"
         all_rank_num_tokens = (attn_metadata.all_rank_num_tokens
                                if attn_metadata is not None else None)
         return self.mlp(
@@ -881,44 +923,60 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        del all_rank_num_tokens
+        # Install this draft step's attention-DP token distribution: the draft
+        # loop passes it as a kwarg and leaves attn_metadata alone, matching
+        # Eagle3DraftModel.forward. The MoE below reads the per-rank counts off
+        # attn_metadata, and an MTP Eagle draft runs one token per sequence
+        # after step 0, so a stale target value mismatches collective sizes.
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        def norm_embeds():
-            return self.pre_fc_norm_embedding(embed_tokens(input_ids))
+        try:
 
-        def norm_hidden():
-            return self.pre_fc_norm_hidden(hidden_states)
+            def norm_embeds():
+                return self.pre_fc_norm_embedding(embed_tokens(input_ids))
 
-        inputs_embeds, hidden_states = maybe_execute_in_parallel(
-            norm_embeds,
-            norm_hidden,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-            disable_on_compile=True,
-        )
-        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+            def norm_hidden():
+                return self.pre_fc_norm_hidden(hidden_states)
 
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
-        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
-            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+            inputs_embeds, hidden_states = maybe_execute_in_parallel(
+                norm_embeds,
+                norm_hidden,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                disable_on_compile=True,
+            )
+            hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
 
-        hidden_states = self.fc(hidden_states)
+            tp_size = self.model_config.mapping.tp_size
+            tp_rank = self.model_config.mapping.tp_rank
+            if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+                hidden_states = torch.chunk(hidden_states, tp_size,
+                                            dim=-1)[tp_rank]
 
-        hidden_states, residual = super().forward(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            residual=None,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
-        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+            hidden_states = self.fc(hidden_states)
 
-        return hidden_states
+            hidden_states, residual = super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=None,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if spec_metadata is not None:
+                spec_metadata.maybe_capture_hidden_states(
+                    0, hidden_states, None)
+
+            return hidden_states
+        finally:
+            # Shared with the target forward, so restore on the exception path
+            # too; otherwise a failed draft step corrupts every later forward.
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
 ALL_DECODER_LAYER_TYPES = {

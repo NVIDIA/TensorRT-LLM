@@ -15,6 +15,8 @@
 
 """Single-GPU integration and accuracy tests for Cosmos3."""
 
+import contextlib
+import json
 import os
 from dataclasses import dataclass
 
@@ -35,6 +37,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _golden_media_path,
     _lpips_deterministic_algorithms,
     _lpips_model_path,
+    _lpips_pinned_fp32_matmul_precision,
     _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
@@ -51,7 +54,13 @@ COSMOS3_NANO_MODEL_SUBPATH = "Cosmos3-Nano"
 COSMOS3_LPIPS_PROMPT = "A serene mountain landscape with snow-capped peaks and a flowing river"
 COSMOS3_LPIPS_HEIGHT = 720
 COSMOS3_LPIPS_WIDTH = 1280
-COSMOS3_LPIPS_T2V_NUM_FRAMES = 189
+# 9 frames = 3 latent frames (temporal VAE: floor((F-1)/4)+1), 2,760 video
+# tokens -- the smallest T2V shape that still exercises multi-latent-frame
+# temporal attention. The 720P default of 189 frames (44,160 tokens) costs ~7
+# minutes of generation per CI run and adds no gate value: a golden catches
+# severe regressions, and cross-stepping drift only grows with trajectory
+# length (0.020 at 1 frame -> 0.151 at 189).
+COSMOS3_LPIPS_T2V_NUM_FRAMES = 9
 COSMOS3_LPIPS_T2I_NUM_FRAMES = 1
 # 9 frames = 3 latent frames: latents (0, 1) are pinned to the V2V reference,
 # latent 2 (pixel frames 5-8) is generated. Frame 8 is the golden-compared frame.
@@ -61,7 +70,23 @@ COSMOS3_LPIPS_NUM_INFERENCE_STEPS = 35
 COSMOS3_LPIPS_GUIDANCE_SCALE = 6.0
 COSMOS3_LPIPS_SEED = 42
 COSMOS3_LPIPS_FRAME_RATE = 24.0
-COSMOS3_LPIPS_THRESHOLD = 0.05
+# T2I stays at the original tight bar: the 1-frame shape has the smallest
+# cross-stepping exposure in the family (its B300-cut golden scores 0.020 on
+# the B200 lane), so 0.05 keeps ~2.5x margin over that floor without the
+# relaxed band the longer trajectories need.
+COSMOS3_LPIPS_T2I_THRESHOLD = 0.05
+# T2V/V2V gate at a relaxed KPI-backstop band, not at 0.05: Cosmos3-Nano
+# trajectories are not bit-stable across GPU steppings (nvbugs/6655359 --
+# B300-cut media measured LPIPS 0.020/0.075/0.151 on B200 at 1/9/189 frames
+# with everything else held fixed), so a tight bar just re-fires whenever the
+# media host and the CI lane disagree. The bars sit above the 9-frame
+# cross-stepping floor (0.075) so the gates catch model regressions and survive
+# a CI GPU change without re-cutting media. The one code-caused regression
+# these gates have caught measured 0.608404 (nvbugs/6418815), well above both
+# bars. The V2V golden is B300-cut and scores 0.070 on the B200 lane; the T2V
+# golden is cut on B200, the lane's own GPU.
+COSMOS3_LPIPS_T2V_THRESHOLD = 0.20
+COSMOS3_LPIPS_V2V_THRESHOLD = 0.15
 COSMOS3_I2V_4STEP_MODEL_SUBPATH = "Cosmos3-Super-Image2Video-4Step"
 COSMOS3_I2V_4STEP_LPIPS_PROMPT = (
     "The orange sphere slowly rises while the camera pans right across the scene"
@@ -160,7 +185,9 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
-            with torch.no_grad():
+            # Pin fp32-matmul arithmetic: the goldens are cut and compared
+            # under "highest" so they reproduce on both PyPI and NGC torch.
+            with torch.no_grad(), _lpips_pinned_fp32_matmul_precision():
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
                     # The goldens were generated against an empty uncond branch,
@@ -246,7 +273,22 @@ def _generate_cosmos3_feature_image(case, output_path):
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
         _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
-        with _lpips_deterministic_algorithms(), _fixed_nvfp4_quantization_backend(case.features):
+        # Pin fp32-matmul arithmetic only for the profiles whose goldens are
+        # re-baselined under it. NVFP4's golden is waived (nvbugs/6572800) and
+        # not re-cut here, so it keeps generating under the host default; pin
+        # it when that golden is re-cut. Note the NVFP4 profile reaches this
+        # same function inside a spawned process, so the guard has to be here
+        # rather than at the call site.
+        precision_context = (
+            contextlib.nullcontext()
+            if case.features.quantization == "NVFP4"
+            else _lpips_pinned_fp32_matmul_precision()
+        )
+        with (
+            _lpips_deterministic_algorithms(),
+            precision_context,
+            _fixed_nvfp4_quantization_backend(case.features),
+        ):
             args = _build_single_device_feature_args(
                 model_path,
                 case.features,
@@ -344,7 +386,7 @@ def test_cosmos3_nano_t2v_lpips_against_golden(_visual_gen_deps, tmp_path):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2V_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -364,7 +406,7 @@ def test_cosmos3_nano_v2v_lpips_against_golden(_visual_gen_deps, tmp_path):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_V2V_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -382,7 +424,7 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_T2I_THRESHOLD)
 
 
 def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
@@ -569,6 +611,12 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
+            # Deliberately NOT pinned with _lpips_pinned_fp32_matmul_precision:
+            # this golden is a diffusers cross-stack reference whose provenance
+            # records no fp32-matmul state, so whether pinning improves or
+            # degrades agreement is unknown. The test is skipped in CI anyway
+            # (checkpoint absent), and its golden is not re-cut here. Pin this
+            # path when the golden is re-cut and the flag can be recorded.
             with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_I2V_4STEP_LPIPS_PROMPT,
@@ -576,7 +624,10 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
                     # so pin it rather than inheriting the video-mode default.
                     negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
-                    image=image_path,
+                    # forward() takes an encoded reference, not a path: the serve
+                    # path resolves MediaRef to bytes on the coordinator, so
+                    # direct callers read the file themselves.
+                    image=image_path.read_bytes(),
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
                     num_frames=COSMOS3_I2V_4STEP_LPIPS_NUM_FRAMES,
@@ -616,7 +667,7 @@ def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_p
     regression against a past TRT-LLM run. Full provenance:
     ``golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json``.
     """
-    image_path = str(tmp_path / "cosmos3_i2v_4step_conditioning.png")
+    image_path = tmp_path / "cosmos3_i2v_4step_conditioning.png"
     _write_cosmos3_i2v_conditioning_image(image_path)
     generated_path = tmp_path / "cosmos3_i2v_4step_generated.mp4"
     golden_path = _golden_media_path(
@@ -706,11 +757,91 @@ def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
 
 
-# Edge LPIPS gates compare against diffusers-main reference goldens with the
-# scheduler patched to the cosmos-framework native flow schedule; full
+def _write_cosmos3_edge_policy_observation(path):
+    """Deterministic 736x544 three-view observation in the DROID layout."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (736, 544), (24, 24, 24))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, 0, 735, 271], fill=(75, 115, 170))
+    draw.rectangle([0, 272, 367, 543], fill=(150, 90, 55))
+    draw.rectangle([368, 272, 735, 543], fill=(55, 140, 90))
+    draw.ellipse([305, 180, 430, 305], fill=(230, 190, 45))
+    image.save(path)
+
+
+def test_cosmos3_edge_policy_droid_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the released Policy-DROID checkpoint through its documented API."""
+    from safetensors.torch import load_file
+
+    model_path = _lpips_model_path("Cosmos3-Edge-Policy-DROID")
+    _skip_if_missing(model_path, "Cosmos3-Edge-Policy-DROID checkpoint", is_dir=True)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(),
+        "visual_gen_output",
+        "cosmos3_edge_policy_droid_example",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    image_path = os.path.join(out_dir, "droid_observation.png")
+    state_path = os.path.join(out_dir, "current_state.json")
+    output_path = os.path.join(out_dir, "droid_policy.safetensors")
+    action_output_path = os.path.join(out_dir, "droid_policy.action.json")
+    _write_cosmos3_edge_policy_observation(image_path)
+    with open(state_path, "w", encoding="utf-8") as state_file:
+        json.dump([0.0] * 8, state_file)
+    for stale_path in (output_path, action_output_path):
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
+    prompt_path = os.path.join(
+        llm_root,
+        "examples",
+        "visual_gen",
+        "models",
+        "cosmos3",
+        "prompts",
+        "action_edge_policy_droid.json",
+    )
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--prompt_file",
+            prompt_path,
+            "--image_path",
+            image_path,
+            "--action_json",
+            state_path,
+            "--output_path",
+            output_path,
+            "--action_output_path",
+            action_output_path,
+        ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
+    )
+
+    payload = load_file(output_path)
+    assert payload["video"].shape == (33, 544, 736, 3)
+    assert payload["action"].shape == (32, 8)
+    assert payload["frame_rate"].item() == pytest.approx(15.0)
+    with open(action_output_path, encoding="utf-8") as action_file:
+        action_output = json.load(action_file)
+    assert action_output["action_mode"] == "policy"
+    assert action_output["shape"] == [32, 8]
+
+
+# Edge LPIPS gates compare against TRT-LLM self-goldens (originally cut from
+# diffusers-main references, re-baselined as self-goldens when the fp32-matmul
+# pin landed; cross-stack correctness is covered by TestDiffusersParity); full
 # provenance in golden/visual_gen_lpips/cosmos3_edge_*.json. The I2V gate runs
-# 10 steps (cross-stack drift accumulates per step; the deployed 50-step shape
-# is covered by test_cosmos3_edge_i2v_example).
+# 10 steps (drift accumulates per step; the deployed 50-step shape is covered
+# by test_cosmos3_edge_i2v_example).
 COSMOS3_EDGE_LPIPS_SEED = 42
 COSMOS3_EDGE_LPIPS_FRAME_RATE = 24.0
 COSMOS3_EDGE_LPIPS_NUM_FRAMES = 29
@@ -760,7 +891,7 @@ def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
             # The goldens were generated against an empty uncond branch, so pin it
             # here rather than inheriting the video-mode default negative prompt.
             forward_kwargs.setdefault("negative_prompt", "")
-            with torch.no_grad():
+            with torch.no_grad(), _lpips_pinned_fp32_matmul_precision():
                 result = pipeline.forward(
                     seed=COSMOS3_EDGE_LPIPS_SEED,
                     use_guardrails=False,
@@ -824,10 +955,13 @@ def test_cosmos3_edge_i2v_lpips_against_golden(_visual_gen_deps, request, tmp_pa
         tmp_path, "cosmos3_edge_i2v_lpips_golden_video.mp4", "Cosmos3-Edge I2V LPIPS golden video"
     )
     image_path = tmp_path / "cosmos3_edge_i2v_conditioning.png"
-    _write_cosmos3_edge_conditioning_image(str(image_path))
+    _write_cosmos3_edge_conditioning_image(image_path)
     result = _run_cosmos3_edge_lpips_pipeline(
         prompt=COSMOS3_EDGE_I2V_LPIPS_PROMPT,
-        image=str(image_path),
+        # forward() takes an encoded reference, not a path: the serve path
+        # resolves MediaRef to bytes on the coordinator, so direct callers
+        # read the file themselves.
+        image=image_path.read_bytes(),
         height=480,
         width=832,
         num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,

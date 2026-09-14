@@ -20,8 +20,8 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -97,6 +98,7 @@ def test_quota_from_max_tokens_models_context_swa_scratch():
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager._max_draft_len = 0
     manager._max_num_tokens = 1024
@@ -131,6 +133,7 @@ def test_needed_resource_uses_context_swa_scratch_slope():
     manager.head_dim = 512 + 64
     manager.index_head_dim = 128
     manager._indexer_k_dtype = "fp8"
+    manager.use_fp8_ds_mla = False
     manager._swa_window_size = 128
     manager.tokens_per_block = 128
     manager.num_extra_kv_tokens = 0
@@ -1730,13 +1733,7 @@ class TestDeepseekV4CacheManager:
         spec_config = SimpleNamespace(
             max_draft_len=7,
             max_total_draft_tokens=7,
-            spec_dec_mode=SimpleNamespace(
-                is_eagle3_one_model=lambda: False,
-                is_mtp_eagle_one_model=lambda: False,
-                is_mtp_one_model=lambda: False,
-                is_mtp_vanilla=lambda: False,
-                use_one_engine=lambda: True,
-            ),
+            spec_dec_mode=SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL,
         )
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,

@@ -29,28 +29,28 @@ from transformers import AutoConfig, NemotronHConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.utils import ActivationType, relu2
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
 
-from ..attention_backend import AttentionMetadata
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
-from ..modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from ..modules.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
-                                              W4A16NVFP4CutlassFusedMoEMethod)
 from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
                               W4A16NVFP4LinearMethod)
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
+from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
+                                          W4A16NVFP4CutlassFusedMoEMethod)
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
@@ -177,7 +177,7 @@ class NemotronHMOE(nn.Module):
         # Import here to avoid circular dependency.
         from .modeling_deepseekv3 import DeepseekV3Gate
 
-        self.activation_type = ActivationType.Relu2
+        self.moe_activation = SimpleActivation(kind=ActivationType.Relu2)
         self.reduce_results = False
 
         config = model_config.pretrained_config
@@ -273,7 +273,7 @@ class NemotronHMOE(nn.Module):
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,
-            activation_type=self.activation_type,
+            activation=self.moe_activation,
         )
 
         if reduce_output:
@@ -888,6 +888,13 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 re.sub(r"(model\.layers\.)?backbone", "model", k)
                 for k in model_config.quant_config.exclude_modules
             ]
+        else:
+            model_config.quant_config.exclude_modules = []
+        # Depthwise conv1d is stored in a Linear for TP, but it is not a GEMM.
+        # NVFP4 groups along in_features (d_conv, typically 4), which is not
+        # divisible by the block size of 16, so keep this Linear unquantized.
+        if "*.mixer.conv1d" not in model_config.quant_config.exclude_modules:
+            model_config.quant_config.exclude_modules.append("*.mixer.conv1d")
 
         # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
         # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use
@@ -912,13 +919,14 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
-            has_external_mtp = (
-                model_config.spec_config.loads_mtp_from_separate_checkpoint)
-            assert ckpt_nextn > 0 or has_external_mtp, (
+            has_mtp_head_replacement = (
+                model_config.spec_config.uses_replacement_heads)
+            assert ckpt_nextn > 0 or has_mtp_head_replacement, (
                 "There are not MTP modules in the checkpoint. "
                 "Set speculative_config.speculative_model to a separate MTP "
-                "heads checkpoint, or use a target checkpoint that embeds MTP.")
-            if ckpt_nextn == 0 and has_external_mtp:
+                "head replacement checkpoint, or use a target checkpoint that "
+                "embeds MTP.")
+            if ckpt_nextn == 0 and has_mtp_head_replacement:
                 # Neither checkpoint declares a head count: fall back to a
                 # single shared head, matching MTPForCausalLM's MTP-Eagle
                 # default.
@@ -987,9 +995,9 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                      weight_mapper: BaseWeightMapper,
                      allow_partial_loading: bool = False):
         from tensorrt_llm._torch.speculative.utils import (
-            filter_mtp_checkpoint_weights, loads_mtp_from_speculative_model)
+            filter_mtp_checkpoint_weights, uses_mtp_head_checkpoint)
 
-        if loads_mtp_from_speculative_model(self.model_config.spec_config):
+        if uses_mtp_head_checkpoint(self.model_config.spec_config):
             # Filter before preprocess: mapper remaps mtp.layers.* ->
             # model.layers.{N}.* and would otherwise load embedded MTP heads.
             weights = filter_mtp_checkpoint_weights(weights)

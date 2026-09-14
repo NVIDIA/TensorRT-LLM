@@ -946,9 +946,15 @@ def test_auto_detect_laguna(tmp_path):
     assert result == "poolside_v1"
 
 
-@pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
+@pytest.mark.parametrize("model_type",
+                         ["nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni"])
 def test_auto_detect_nemotron_h(tmp_path, model_type):
-    """Nemotron-H models → 'nemotron-v3' parser (preferred over 'nano-v3')."""
+    """Nemotron-H models → 'nemotron-v3' parser (preferred over 'nano-v3').
+
+    `nemotron_h_omni` (Nemotron 3.5 Super VL) has a `model_type` that diverges
+    from its architecture string, and the lookup is exact-match, so without its
+    own row `--reasoning_parser auto` resolves to None.
+    """
     model_dir = str(tmp_path / model_type)
     os.makedirs(model_dir)
     _write_config(model_dir, model_type)

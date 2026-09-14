@@ -295,6 +295,9 @@ def issue_dynamic_block_scaled_mma_tile(
                     _nvvm_raw.Tcgen05MMAScaleVecSize.X4,
                 }
             else:
+                # CUTLASS DSL 4.8 renamed the tcgen05.mma.block_scale operands
+                # and split Tcgen05MMAScaleVecSize into a 1X/2X/4X selector and
+                # Tcgen05MMABlockScale.
                 nvvm_args = {
                     "kind":
                     _nvvm_raw.Tcgen05MMAKind.MXF4NVF4,

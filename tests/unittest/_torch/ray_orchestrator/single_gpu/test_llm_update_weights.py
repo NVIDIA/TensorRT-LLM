@@ -7,7 +7,7 @@ from typing import Callable, List, Optional, Tuple
 import pytest
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
 from utils.util import getSMVersion, skip_pre_hopper
@@ -41,13 +41,36 @@ def release_shared_cuda_memory():
 
 
 class RefHFModelWithIPCHandles(RefHFModel):
-    def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: int = 4):
+    def __init__(
+        self,
+        model_dir: str,
+        device_id: int = 0,
+        *,
+        num_hidden_layers: Optional[int] = None,
+        layers_block_type: Optional[List[str]] = None,
+    ):
         self.device_id = device_id
-        config = AutoConfig.from_pretrained(model_dir)
-        config.num_hidden_layers = num_hidden_layers
+        model_kwargs = {}
+        if num_hidden_layers is not None:
+            model_kwargs["num_hidden_layers"] = num_hidden_layers
+        if layers_block_type is not None:
+            model_kwargs["layers_block_type"] = layers_block_type
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="eager"
+            model_dir,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+            **model_kwargs,
         ).to(f"cuda:{device_id}")
+        # Hybrid configs (e.g. NemotronH) derive num_hidden_layers from
+        # ``layers_block_type`` and silently ignore the num_hidden_layers
+        # override; callers must pass a truncated ``layers_block_type`` for
+        # such models. Catch a silently ignored override loudly here.
+        if num_hidden_layers is not None:
+            assert self.model.config.num_hidden_layers == num_hidden_layers, (
+                f"num_hidden_layers override silently ignored: "
+                f"HF loaded {self.model.config.num_hidden_layers}, "
+                f"expected {num_hidden_layers}"
+            )
         self.all_weights = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
         self._replicate_weights()
@@ -152,7 +175,7 @@ def run_generate(
     "model_dir",
     [
         "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "Qwen2.5-0.5B-Instruct",
+        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",
@@ -207,7 +230,7 @@ def test_llm_update_weights(model_dir):
     "model_dir",
     [
         "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        "Qwen2.5-0.5B-Instruct",
+        "Qwen3/Qwen3-0.6B",
         "Qwen3/Qwen3-8B",
         "Qwen3/Qwen3-30B-A3B",
         "Qwen3/Qwen3-8B-FP8",

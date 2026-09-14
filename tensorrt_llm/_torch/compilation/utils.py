@@ -171,6 +171,16 @@ def inplace_info():
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
         },
+        # kda_decode mutates three conv caches, the recurrent state and its
+        # output. Keys follow the ``Tensor(a!)..Tensor(e!)`` declaration order,
+        # not the positional argument index.
+        torch.ops.trtllm.kda_decode.default: {
+            1: "conv_state_q",
+            2: "conv_state_k",
+            3: "conv_state_v",
+            4: "state",
+            5: "output"
+        },
         torch.ops.trtllm.verify_dynamic_tree_rejection_out_op.default: {
             5: "acceptIndex",
             6: "acceptTokenNum",
@@ -191,6 +201,21 @@ def inplace_info():
         "gdn_custom_op_inplace": {
             1: "output"
         },
+        # Registered lazily: the op only exists once mamba2_mixer is imported
+        # (Mamba2/NemotronH family). Void boundary op mutating ssm_out:
+        # auto_functionalized returns (None, ssm_out), hence index 1.
+        "mamba2_custom_op_inplace": {
+            1: "ssm_out"
+        },
+        # Registered lazily: the op only exists once mamba2_mixer is
+        # imported (Mamba2/NemotronH family). Void op mutating (state, out):
+        # auto_functionalized returns (None, state, out), hence indices 1/2.
+        # Without this entry the pass leaves the functionalization clone of
+        # the full per-layer SSM state cache in every decode graph.
+        "flashinfer_selective_state_update": {
+            1: "state",
+            2: "out"
+        },
         "minimax_m3_attn_custom_op_inplace": {
             1: "output"
         },
@@ -206,6 +231,21 @@ def inplace_info():
         },
         "fp8_block_scaling_bmm_out": {
             1: "out"
+        },
+        "cute_dsl_bf16_bmm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_fp8_bmm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_nvfp4_gemm_inplace_rubin": {
+            1: "output_tensor"
+        },
+        "cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin": {
+            1: "output_tensor"
         },
         "gate_forward": {
             1: "out_weights",

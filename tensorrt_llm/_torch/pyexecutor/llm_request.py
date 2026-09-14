@@ -20,7 +20,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
-SamplingConfig = tensorrt_llm.bindings.SamplingConfig
+SamplingConfig = tllm_executor.SamplingConfig
 
 MAX_SPEC_DECODE_POSITIONS = 16
 '''
@@ -39,7 +39,6 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
-ExecutorSamplingConfig = tllm_executor.SamplingConfig
 FinishReason = tllm_executor.FinishReason
 
 REQUEST_TYPE_MAPPING = {
@@ -913,6 +912,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        # Owned entirely on the Python side: the TorchSampler is the only
+        # consumer, so the C++ request no longer carries a copy.
+        self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
+            "embedding_bias", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
@@ -946,16 +949,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if llm_request is not None:
             super().__init__(llm_request)
         else:
-            super().__init__(
-                *args,
-                client_id=client_id,
-                return_log_probs=return_log_probs,
-                return_context_logits=False,
-                return_generation_logits=False,
-                return_perf_metrics=return_perf_metrics,
-                stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
-                if stop_words_list else None,
-                **kwargs)
+            super().__init__(*args,
+                             client_id=client_id,
+                             return_log_probs=return_log_probs,
+                             return_context_logits=False,
+                             return_generation_logits=False,
+                             return_perf_metrics=return_perf_metrics,
+                             **kwargs)
         if encoder_output_len is not None and not hasattr(
                 self, "encoder_output_len"):
             self.encoder_output_len = int(encoder_output_len)
@@ -969,31 +969,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
         self.py_end_id = self.end_id
-        self.py_prompt_len = self.prompt_len
-        self.py_orig_prompt_len = self.orig_prompt_len
-        self.py_max_new_tokens = self.max_new_tokens
-        self.py_min_length = self.sampling_config.min_length
-        # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
-        self.seqlen_this_rank_cp = self.prompt_len
-        self.total_input_len_cp = self.prompt_len
+        self.py_min_length = self.sampling_config.min_tokens
         self.py_helix_is_inactive_rank = False
-        self.py_batch_idx = None
-        self.py_draft_pages_allocated = 0
-        self.py_rewind_len = 0
-        # Tokens physically evicted by KV-cache compression; deducted in the engine.
-        self.py_num_compressed_tokens = 0
-        self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
-        self.py_last_context_chunk = (None, None)
+        # Manager-owned helix decode-step counter; see
+        # KVCacheManagerV2._set_helix_rank_fields.
+        self.py_helix_decode_group_index = 0
         self.py_draft_logits = None
         self.py_target_probs = None
-        self.py_last_draft_tokens = None
-        self.py_num_accepted_draft_tokens = 0
-        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
-        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
-        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
-        self.py_needs_onehot_draft_probs = False
-        self.py_num_accepted_draft_tokens_indices = []
-        self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
@@ -1005,26 +987,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
-        # Denominator paired with py_num_accepted_draft_tokens: the number of
-        # genuinely proposed draft tokens the sampler verified in the step it
-        # wrote that numerator for (CUDA-graph padding excluded). Written by
-        # the samplers' update_requests, consumed (and reset to 0) by
-        # PyExecutor._accumulate_spec_dec_stats so each verified step is
-        # counted exactly once. py_draft_tokens itself cannot serve as the
-        # denominator: it is padded for CUDA graphs and, in the one-model
-        # flow, already holds the NEXT step's drafts by response time.
-        self.py_num_draft_tokens_verified = 0
-        # Number of real draft tokens installed for the upcoming step,
-        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
-        # py_draft_tokens to the static max. None when no drafter recorded a
-        # count (e.g. one-model flow, which tracks lengths in its sample
-        # state instead).
-        self.py_draft_tokens_effective_len = None
-        self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # Prevent recreation after a send session drops peer registration.
+        self.py_kv_send_session_retired = False
 
         # Encoder-decoder runtime state. ``py_encoder_output`` holds the
         # packed encoder hidden states produced by the encoder iteration as
@@ -1057,25 +1025,22 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_beam_width = cast(int, self.sampling_config.beam_width)
         self.py_is_draft = is_draft
-        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
-        self.py_seq_slot = seq_slot
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
-        self._cached_tokens = 0
-        self._cached_tokens_set = False
         # Whether the request is for the first forward of the draft model.
         self.py_is_first_draft = is_first_draft
         self.d2t = None
-        self.py_draft_use_greedy_sampling = False
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
         self.py_use_chunked_generation_logits = use_chunked_generation_logits
         self.py_logits_chunk_size = logits_chunk_size if not self.streaming else 1
 
-        # TODO: remove this when use DynamicDecodeOp in pytorch flow.
-        # currently, keep py_stop_words_list as python list, rather than tensor.
+        self._initialize_execution_state(seq_slot=seq_slot,
+                                         orig_prompt_len=self.orig_prompt_len)
+
+        # Keep py_stop_words_list as a python list, rather than a tensor.
         self.py_stop_words_list = stop_words_list
 
         self.py_logprobs_mode = LogprobMode(
@@ -1099,14 +1064,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             additional_outputs=additional_outputs)
         self.child_requests = []
 
-        self._py_embedding_bias_1d: Optional[torch.Tensor] = None
-        if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
-            # Pre-squeeze to 1D if needed (remove batch dimension)
-            if self.embedding_bias.dim() > 1:
-                self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
-            else:
-                self._py_embedding_bias_1d = self.embedding_bias
-
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         """Beam width of the current (or next) decoding step.
 
@@ -1125,14 +1082,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
         pins the agreement.
 
-        An empty array (``[]`` or ``[[]]``) falls through to the base
-        implementation rather than indexing it, matching the two emptiness
-        guards the C++ side checks before reading element 0.
+        An empty array falls through to the base implementation rather than
+        indexing it, matching the emptiness guard the C++ side checks before
+        reading element 0.
         """
         beam_width_array = self.sampling_config.beam_width_array
-        if beam_width_array:
-            if isinstance(beam_width_array[0], (list, tuple)):
-                beam_width_array = beam_width_array[0]
         if beam_width_array:
             iteration = self.decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)
@@ -1154,7 +1108,72 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self._cached_tokens = value
             self._cached_tokens_set = True
 
+    def _initialize_execution_state(self,
+                                    *,
+                                    seq_slot: Optional[int],
+                                    orig_prompt_len: int,
+                                    clear_draft_tokens: bool = False) -> None:
+        self.py_prompt_len = self.prompt_len
+        self.py_orig_prompt_len = orig_prompt_len
+        self.py_max_new_tokens = self.max_new_tokens
+        # CP sequence lengths are relevant to helix parallelism.
+        self.seqlen_this_rank_cp = self.prompt_len
+        self.total_input_len_cp = self.prompt_len
+        self.py_batch_idx = None
+        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
+        self.py_seq_slot = seq_slot
+        self.py_draft_pages_allocated = 0
+        self.py_rewind_len = 0
+        # Tokens physically evicted by KV-cache compression; deducted in the engine.
+        self.py_num_compressed_tokens = 0
+        if clear_draft_tokens:
+            self.draft_tokens = []
+            self.py_draft_tokens = []
+        else:
+            self.py_draft_tokens = ([] if self.draft_tokens is None else
+                                    self.draft_tokens)
+        # Number of real draft tokens installed for the upcoming step,
+        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
+        # py_draft_tokens to the static max. None when no drafter recorded a
+        # count (e.g. one-model flow, which tracks lengths in its sample
+        # state instead).
+        self.py_draft_tokens_effective_len = None
+        self.py_last_context_chunk = (None, None)
+        self.py_last_draft_tokens = None
+        self.py_num_accepted_draft_tokens = 0
+        # Denominator paired with py_num_accepted_draft_tokens: the number of
+        # genuinely proposed draft tokens the sampler verified in the step it
+        # wrote that numerator for (CUDA-graph padding excluded). Written by
+        # the samplers' update_requests, consumed (and reset to 0) by
+        # PyExecutor._accumulate_spec_dec_stats so each verified step is
+        # counted exactly once. py_draft_tokens itself cannot serve as the
+        # denominator: it is padded for CUDA graphs and, in the one-model
+        # flow, already holds the NEXT step's drafts by response time.
+        self.py_num_draft_tokens_verified = 0
+        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
+        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
+        self.py_needs_onehot_draft_probs = False
+        self.py_num_accepted_draft_tokens_indices = []
+        self.py_rewind_draft_token_separate_adjustment = 0
+        self.py_decoding_iter = 0
+        self.py_ctx_pre_resize_cap = None
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
+
+    def reset_for_recompute(self, max_input_len: int) -> None:
+        """Reset Python-side execution state so the request can replay prefill."""
+        self.pause(max_input_len)
+        self._initialize_execution_state(seq_slot=None,
+                                         orig_prompt_len=self.prompt_len,
+                                         clear_draft_tokens=True)
+
+    @property
     def is_generation_only_request(self):
+        # Must stay a property: the C++ base exposes this as a read-only
+        # property (nanobind/batch_manager/bindings.cpp), and a plain method
+        # here shadows it with something always-truthy for any caller that
+        # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
     def create_response(self,
@@ -1287,46 +1306,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         assert py_request.is_child
         assert py_request.request_id == child.request_id
         assert py_request.parent_request_id == self.request_id
-        assert py_request.sampling_config.random_seed != self.sampling_config.random_seed
+        assert py_request.sampling_config.seed != self.sampling_config.seed
 
         self.child_requests.append(py_request)
-
-
-def convert_wordlist(word_list) -> List[List[int]]:
-    """Converts a wordlist from format:
-
-    [[word_0 token_0, word_0 token_1, ...], [word_1 token_0, ...], ...]]
-
-    into the TRTLLM word list format. The TRTLLM format expects a list of tokens,
-    and an inclusive prefix sum. A word_list (either bad_words or stop_words) is
-    a list that encodes the list of words that have to be banned / trigger the stop from generated sequences.
-    Its shape is [2, badWordsLength], as explained below, or [batchSize, 2, badWordsLength]
-    when there is a different list for each sequence in the batch.
-
-    The badWordsList and stopWordsList tensors have the same shape [2, length]. Let's consider an example with three words to describe the
-    representation of those lists.  The first word contains tokens [5, 7, 3], the
-    second one contains [9, 2] and the third one is composed of tokens [6, 2, 4, 1]. In total, there are 9 tokens. That's the length. The shape of the tensor
-    is [2, 9].  The first row of the tensor must contain the 9 token IDs and the
-    second row must store the inclusive prefix-sum of the word lengths as shown on the following diagram:
-
-        0           3       5              9
-        |           |       |              |
-        V           V       V              V
-    [  5,  7,  3,  9,  2,  6,  2,  4,  1]
-    [  3,  5,  9, -1, -1, -1, -1, -1, -1]
-    """
-    if not word_list:
-        return []
-    tokens = []
-    offsets = []
-    current_offset = 0
-    for word_tokens in word_list:
-        tokens.extend(word_tokens)
-        current_offset += len(word_tokens)
-        offsets.append(current_offset)
-    if len(tokens) > len(offsets):
-        offsets.extend([-1] * (len(tokens) - len(offsets)))
-    return [tokens, offsets]
 
 
 def _validate_optional_int_list(values: Any,
@@ -1494,14 +1476,16 @@ def executor_request_to_llm_request(
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None) -> LlmRequest:
-    executor_sampling_config = executor_request.sampling_config
-    sampling_config = SamplingConfig(executor_sampling_config)
+    sampling_config = executor_request.sampling_config
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
-    stop_words_list = convert_wordlist(
-        executor_request.stop_words) if executor_request.stop_words else None
+    # Kept in its native list[list[int]] form, like py_bad_words. The
+    # [tokens, prefix_sum] layout convert_wordlist produced was the input format
+    # of the removed C++ stop-words kernel; every reader here just undid it.
+    stop_words_list = [list(word) for word in executor_request.stop_words
+                       ] if executor_request.stop_words else None
 
     # Extract multimodal fields from executor request
     multimodal_hashes = None
@@ -1566,9 +1550,6 @@ def executor_request_to_llm_request(
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
-        bad_words_list=torch.tensor(
-            convert_wordlist(executor_request.bad_words), dtype=torch.int32)
-        if executor_request.bad_words else None,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config
@@ -1648,7 +1629,7 @@ def executor_request_to_llm_request(
     # No-repeat-ngram size for the TorchSampler path, normalized once here so
     # the per-step sampler gate is a plain attribute read. The C++
     # SamplingConfig rejects negative values up front and 0 means disabled
-    # (same convention as the C++ banRepeatNgram kernel), so falsy == off.
+    # (same convention as the former C++ ban-repeat-ngram kernel), so falsy == off.
     ngram_size = executor_request.sampling_config.no_repeat_ngram_size
     llm_request.py_no_repeat_ngram_size = ngram_size if ngram_size else None
 

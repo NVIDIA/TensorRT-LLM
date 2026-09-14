@@ -32,6 +32,12 @@ __all__ = [
 class PostprocArgs:
     first_iteration: bool = True
     num_prompt_tokens: Optional[int] = None
+    # Subtracted from num_prompt_tokens when reporting usage. Lets servers
+    # exclude generation-prompt stub tokens the vendor accounting treats as
+    # pending output (e.g. Kimi K3's 3-token channel opener) without changing
+    # what the model sees. num_prompt_tokens itself is overwritten by the
+    # executor on the postproc-worker path, so the offset must be separate.
+    num_prompt_tokens_offset: int = 0
     tokenizer: Optional[TransformersTokenizer] = None
     ctx_usage: Optional[Any] = None
 
@@ -122,8 +128,12 @@ class PostprocWorker:
 
         self._q = deque()
 
-        # Load the tokenizer and share in all records
-        self._tokenizer = load_hf_tokenizer(tokenizer_dir)
+        # Load the tokenizer and share in all records.
+        # Guard against a None tokenizer_dir: transformers'
+        # PreTrainedConfig._get_config_dict coerces it via str(None) → "None",
+        # which then becomes a HEAD request to huggingface.co/None/...
+        self._tokenizer = load_hf_tokenizer(
+            tokenizer_dir) if tokenizer_dir is not None else None
 
         # Build the user post-processing hook once, like the
         # tokenizer above; threaded onto each record in ``_handle_input``.

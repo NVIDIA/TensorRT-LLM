@@ -148,7 +148,7 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
     padded (not shuffled), causing the trtllm-gen kernel to add the wrong
     bias to each output row.
     """
-    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w3_w1_permute_indices,
     )
 
@@ -203,7 +203,7 @@ def test_fc1_bias_is_shuffled_with_same_row_permutation_as_fc1_weights():
 
 def test_fc2_bias_is_shuffled_with_same_row_permutation_as_fc2_weights():
     """Regression: fc2 bias must follow the (non-gated) TMA row permute used by w2."""
-    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
         trtllmgen_maybe_get_cached_w2_permute_indices,
     )
 
@@ -254,7 +254,7 @@ def test_prep_against_pt_reference_loader_byte_identical():
     load_expert_w2_weight_scale_mxfp4}`` is the gold standard the AD prep
     helper must mirror.  Any divergence here is a kernel-layout bug.
     """
-    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
         _get_weight_alignment,
         maybe_pad_for_mxfp4,
         trtllmgen_maybe_get_cached_w2_permute_indices,

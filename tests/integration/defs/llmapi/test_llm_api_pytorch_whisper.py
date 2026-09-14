@@ -28,7 +28,14 @@ from pathlib import Path
 import pytest
 import soundfile
 
-from tensorrt_llm.llmapi import LLM, CudaGraphConfig, KvCacheConfig, SamplingParams, SchedulerConfig
+from tensorrt_llm.llmapi import (
+    LLM,
+    CudaGraphConfig,
+    EncodeCudaGraphConfig,
+    KvCacheConfig,
+    SamplingParams,
+    SchedulerConfig,
+)
 
 from ..conftest import llm_models_root
 
@@ -36,6 +43,9 @@ _MAX_NEW_TOKENS = 96
 _MIN_GPU_MEMORY_MB = 16_000
 _FREE_GPU_MEMORY_FRACTION = 0.2
 _CROSS_KV_CACHE_FRACTION = 0.5
+# Every Whisper request produces this many encoder positions, whatever the audio
+# length. It sets the cross-KV pool capacity and the encoder graph shapes.
+_ENCODER_OUTPUT_LEN = 1500
 # whisper-tiny fp32 greedy on 1221-135766-0002.wav (matches HF transformers).
 _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [
     1939,
@@ -104,15 +114,33 @@ def _make_llm(
     torch_dtype: str | None = None,
     cuda_graph_batch_sizes: list[int] | None = None,
     tensor_parallel_size: int = 1,
+    encoder_graphs: bool = False,
 ) -> LLM:
-    # CudaGraphConfig captures the decode step only; fp32 enc-dec declines
-    # graphs at engine init (workspace-sizing guard), so requesting them must
-    # still work for every dtype.
+    """Build a Whisper LLM for the test matrix, optionally with encoder CUDA graphs."""
+    # CudaGraphConfig captures the decode step; the enc-dec encoder step opts in
+    # separately through `encoder_cuda_graph_config`. Requesting decoder graphs
+    # must work for every dtype.
     cuda_graph_config = (
-        CudaGraphConfig(batch_sizes=cuda_graph_batch_sizes, enable_padding=True)
+        CudaGraphConfig(
+            batch_sizes=cuda_graph_batch_sizes,
+            enable_padding=True,
+        )
         if cuda_graph_batch_sizes is not None
         else None
     )
+    encoder_kwargs = {}
+    if encoder_graphs:
+        # Whisper's encoder emits a fixed `_ENCODER_OUTPUT_LEN` positions per
+        # request, so the graph key is the batch size alone; num_tokens and
+        # seq_lens are derived from the model and are not supplied here.
+        encoder_batch_sizes = list(cuda_graph_batch_sizes or [1])
+        encoder_kwargs = {
+            "encoder_max_batch_size": max(encoder_batch_sizes),
+            "encoder_cuda_graph_config": EncodeCudaGraphConfig(
+                batch_sizes=encoder_batch_sizes,
+                enable_padding=True,
+            ),
+        }
     dtype_kwargs = {}
     if torch_dtype is not None:
         # The checkpoint's torch_dtype wins over `dtype` in the PyTorch
@@ -134,10 +162,11 @@ def _make_llm(
         max_beam_width=max_beam_width,
         # Cross-KV pool capacity; the default (1024) is smaller than the
         # 1500 encoder positions every Whisper request produces.
-        max_input_len=1500,
-        max_num_tokens=3000,
+        max_input_len=_ENCODER_OUTPUT_LEN,
+        max_num_tokens=2 * _ENCODER_OUTPUT_LEN,
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
         tensor_parallel_size=tensor_parallel_size,
+        **encoder_kwargs,
         **dtype_kwargs,
     )
 
@@ -240,38 +269,66 @@ def test_whisper_pytorch_beam_search(
         )
         outputs = llm.generate([_audio_prompt(wave, sample_rate)], beam_params)
         assert _EXPECTED_TRANSCRIPT_FRAGMENT in outputs[0].outputs[0].text.lower()
-        _assert_decoder_cuda_graph_state(llm, captured=graphs_captured)
+        _assert_cuda_graph_state(llm, captured=graphs_captured)
 
 
-def _assert_decoder_cuda_graph_state(llm: LLM, captured: bool) -> None:
+def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = False) -> None:
     """Introspect the in-process engine (single-process mode only).
 
-    Decoder graphs captured (or not); the enc-dec encoder step stays eager.
+    The enc-dec encoder step shares `encoder_cuda_graph_runner` with the
+    `llm.encode()` path; feature mode is a mode of that one runner, selected by
+    `encoder_cuda_graph_config`, not a second runner.
     """
     model_engine = llm._executor.engine.model_engine
-    assert not model_engine.encoder_cuda_graph_runner.enabled
-    assert not model_engine.encoder_cuda_graph_runner.graphs
     assert model_engine.cuda_graph_runner.enabled == captured
     assert bool(model_engine.cuda_graph_runner.graphs) == captured
+
+    encoder_runner = model_engine.encoder_cuda_graph_runner
+    if not encoder_captured:
+        assert not encoder_runner.enabled
+        assert not encoder_runner.graphs
+        return
+    assert encoder_runner.enabled
+    assert encoder_runner.graphs
+    assert encoder_runner.feature_mode
+    assert encoder_runner.is_encoder_decoder
+    # Capture alone is not enough: `pad_batch` and the shape checks in
+    # `_maybe_forward_encoder_graph` can route every request to the eager
+    # encoder while `graphs` stays populated, and that silent fallback would
+    # pass every output assertion above. Only the replay counter rules it out,
+    # and only against the warmup baseline: the capture pass replays each key
+    # once immediately after capturing it, so anything at or below
+    # `len(graphs)` is still explainable by warmup alone.
+    assert encoder_runner.num_feature_replays > len(encoder_runner.graphs)
 
 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:
 # (torch_dtype override or None for checkpoint fp32, kv manager v2, decoder
-# cuda-graph batch sizes, graphs must capture, TP size). KVCacheManagerV2
-# requires beam width 1, so v2 rides greedy; the fp32+graphs-requested case
-# asserts the engine declines graphs (fp32 enc-dec guard) yet stays exact.
+# cuda-graph batch sizes, graphs must capture, TP size, encoder graphs).
+# KVCacheManagerV2 requires beam width 1, so v2 rides greedy; the
+# fp32+graphs-requested case covers fp32 enc-dec capturing decoder graphs. The
+# encoder-graphs case additionally captures the encoder step, which must not
+# change a single token.
 _FEATURE_COMBINATION_CASES = [
-    pytest.param(None, True, None, False, 1, id="fp32-kv-v2-graphs-off-greedy"),
-    pytest.param(None, False, [1, 2], False, 1, id="fp32-kv-v1-graphs-requested-greedy"),
-    pytest.param("bfloat16", False, [1, 2], True, 1, id="bf16-kv-v1-decoder-graphs-on-greedy"),
-    pytest.param("bfloat16", True, [1, 2], True, 1, id="bf16-kv-v2-decoder-graphs-on-greedy"),
-    pytest.param("float16", False, None, False, 1, id="fp16-kv-v1-graphs-off-greedy"),
+    pytest.param(None, True, None, False, 1, False, id="fp32-kv-v2-graphs-off-greedy"),
+    pytest.param(None, False, [1, 2], True, 1, False, id="fp32-kv-v1-graphs-requested-greedy"),
+    pytest.param(
+        "bfloat16", False, [1, 2], True, 1, False, id="bf16-kv-v1-decoder-graphs-on-greedy"
+    ),
+    pytest.param(
+        "bfloat16", True, [1, 2], True, 1, False, id="bf16-kv-v2-decoder-graphs-on-greedy"
+    ),
+    pytest.param(
+        "bfloat16", False, [1, 2], True, 1, True, id="bf16-kv-v1-encoder-graphs-on-greedy"
+    ),
+    pytest.param("float16", False, None, False, 1, False, id="fp16-kv-v1-graphs-off-greedy"),
     pytest.param(
         None,
         False,
         None,
         False,
         2,
+        False,
         id="fp32-kv-v1-graphs-off-greedy-tp2",
         marks=pytest.mark.skip_less_device(2),
     ),
@@ -279,7 +336,8 @@ _FEATURE_COMBINATION_CASES = [
 
 
 @pytest.mark.parametrize(
-    "torch_dtype,use_kv_cache_manager_v2,cuda_graph_batch_sizes,graphs_captured,tp_size",
+    "torch_dtype,use_kv_cache_manager_v2,cuda_graph_batch_sizes,graphs_captured,tp_size,"
+    "encoder_graphs",
     _FEATURE_COMBINATION_CASES,
 )
 def test_whisper_pytorch_feature_combinations(
@@ -289,6 +347,7 @@ def test_whisper_pytorch_feature_combinations(
     cuda_graph_batch_sizes,
     graphs_captured,
     tp_size,
+    encoder_graphs,
 ):
     """Greedy transcription across dtype/kv-cache-manager/CUDA-graph/TP combos.
 
@@ -308,6 +367,7 @@ def test_whisper_pytorch_feature_combinations(
         torch_dtype=torch_dtype,
         cuda_graph_batch_sizes=cuda_graph_batch_sizes,
         tensor_parallel_size=tp_size,
+        encoder_graphs=encoder_graphs,
     )
     with llm:
         for batch_size in (1, 2):
@@ -326,4 +386,4 @@ def test_whisper_pytorch_feature_combinations(
                 assert _EXPECTED_TRANSCRIPT_FRAGMENT in completion.text.lower()
 
         if tp_size == 1:
-            _assert_decoder_cuda_graph_state(llm, captured=graphs_captured)
+            _assert_cuda_graph_state(llm, captured=graphs_captured, encoder_captured=encoder_graphs)

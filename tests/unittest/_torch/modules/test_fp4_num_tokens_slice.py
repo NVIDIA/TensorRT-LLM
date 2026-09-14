@@ -41,9 +41,9 @@ gate on the boundary fold can be relaxed to cover non-DSA models.
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-from tests.unittest.utils.util import skip_pre_blackwell
 
 SF_VEC = 16
 

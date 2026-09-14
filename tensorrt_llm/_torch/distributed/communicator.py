@@ -8,6 +8,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+from numpy.typing import ArrayLike
 from torch.distributed.distributed_c10d import (_object_to_tensor,
                                                 _tensor_to_object)
 
@@ -30,7 +31,7 @@ from tensorrt_llm.mapping import Mapping
 try:
     import ray
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    from tensorrt_llm.executor.ray import stub as ray
 
 
 class ReduceOp(IntEnum):
@@ -208,14 +209,14 @@ class Distributed(ABC):
         return obj
 
     @abstractmethod
-    def tp_allgather(self, obj):
+    def tp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
     @abstractmethod
-    def cp_allgather(self, obj):
+    def cp_allgather(self, obj, *, small_payload: bool = False):
         pass
 
-    def tp_cp_allgather(self, obj):
+    def tp_cp_allgather(self, obj, *, small_payload: bool = False):
         """Allgather across both TP and CP dimensions.
 
         First gathers within CP group, then across TP groups, returning
@@ -223,18 +224,65 @@ class Distributed(ABC):
         """
         # Gather across CP dimension.
         if self.cp_size > 1:
-            obj = self.cp_allgather(obj)
+            obj = self.cp_allgather(obj, small_payload=small_payload)
         else:
             obj = [obj]  # Wrap to match cp_allgather output format.
 
         # Gather across TP dimension.
         if self.tp_size > 1:
-            obj = self.tp_allgather(obj)
+            obj = self.tp_allgather(obj, small_payload=small_payload)
         else:
             obj = [obj]  # Wrap to match tp_allgather output format.
 
         # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
         return [entry for tp_group in obj for entry in tp_group]
+
+    # Fixed-size int64 exchanges. MPIDist does each as one buffer collective
+    # (no pickle); the defaults below reuse the object paths, sending plain
+    # int lists so the pickled payload stays small on every backend.
+
+    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+        """All-gather a fixed-size int64 vector across the TP group.
+
+        Returns an int64 array of shape ``[tp_size, len(values)]`` whose row
+        *i* is rank *i*'s vector. Every rank must pass the same length.
+        """
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        gathered = self.tp_allgather(vec.tolist(), small_payload=True)
+        return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
+
+    def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+        """All-gather a fixed-size int64 vector across the CP group; rows are
+        ordered by CP rank."""
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        gathered = self.cp_allgather(vec.tolist(), small_payload=True)
+        return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
+
+    def tp_cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+        """Fixed-size int64 all-gather across TP x CP; rows are ordered like
+        :meth:`tp_cp_allgather` (tp-major, cp-minor)."""
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        n = vec.size
+        if self.cp_size > 1:
+            vec = self.cp_allgather_int64(vec).reshape(-1)
+        if self.tp_size > 1:
+            vec = self.tp_allgather_int64(vec).reshape(-1)
+        return vec.reshape(-1, n)
+
+    def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
+        """Broadcast a fixed-size int64 vector from *root* to every rank.
+        Non-root ranks pass a placeholder vector of the same length."""
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        return np.asarray(self.broadcast(vec.tolist(), root=root),
+                          dtype=np.int64)
+
+    def tp_cp_broadcast_int64(self,
+                              values: ArrayLike,
+                              root: int = 0) -> np.ndarray:
+        """Broadcast a fixed-size int64 vector from *root* across TP and CP."""
+        vec = np.asarray(values, dtype=np.int64).reshape(-1)
+        return np.asarray(self.tp_cp_broadcast(vec.tolist(), root=root),
+                          dtype=np.int64)
 
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
@@ -730,8 +778,16 @@ class MPIDist(Distributed):
             self._cp_comm = mpi_comm().Create_group(new_group)
         return self._cp_comm
 
-    def cp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+    def cp_allgather(self,
+                     obj,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     *,
+                     small_payload: bool = False):
         comm = self.cp_comm
+        if small_payload:
+            # mpi4py's native object allgather is cheaper for tiny payloads;
+            # callers must guarantee the payload stays small on every rank.
+            return comm.allgather(obj)
         return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def cp_broadcast(self,
@@ -742,8 +798,14 @@ class MPIDist(Distributed):
         comm = self.cp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
-    def tp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+    def tp_allgather(self,
+                     obj,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     *,
+                     small_payload: bool = False):
         comm = self.tp_comm
+        if small_payload:
+            return comm.allgather(obj)
         return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
@@ -776,6 +838,41 @@ class MPIDist(Distributed):
     def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         reduce_op = reduce_op_to_mpi(op)
         return self.tp_comm.allreduce(obj, reduce_op)
+
+    @staticmethod
+    def _allgather_int64_comm(comm, values: ArrayLike) -> np.ndarray:
+        sendbuf = np.ascontiguousarray(
+            np.asarray(values, dtype=np.int64).reshape(-1))
+        size = comm.Get_size()
+        recvbuf = np.empty(size * sendbuf.size, dtype=np.int64)
+        comm.Allgather([sendbuf, MPI.INT64_T], [recvbuf, MPI.INT64_T])
+        return recvbuf.reshape(size, sendbuf.size)
+
+    @staticmethod
+    def _broadcast_int64_comm(comm, values: ArrayLike, root: int) -> np.ndarray:
+        buf = np.ascontiguousarray(
+            np.asarray(values, dtype=np.int64).reshape(-1))
+        comm.Bcast([buf, MPI.INT64_T], root=root)
+        return buf
+
+    def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+        return self._allgather_int64_comm(self.tp_comm, values)
+
+    def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
+        return self._allgather_int64_comm(self.cp_comm, values)
+
+    def broadcast_int64(self, values: ArrayLike, root: int = 0) -> np.ndarray:
+        return self._broadcast_int64_comm(mpi_comm(), values, root)
+
+    def tp_cp_broadcast_int64(self,
+                              values: ArrayLike,
+                              root: int = 0) -> np.ndarray:
+        buf = np.asarray(values, dtype=np.int64).reshape(-1)
+        if self.tp_size > 1:
+            buf = self._broadcast_int64_comm(self.tp_comm, buf, root)
+        if self.cp_size > 1:
+            buf = self._broadcast_int64_comm(self.cp_comm, buf, root)
+        return buf
 
 
 class MultiHandleWrapper:
@@ -1034,7 +1131,7 @@ class TorchDist(Distributed):
         return obj
 
     @log_op
-    def tp_allgather(self, obj):
+    def tp_allgather(self, obj, *, small_payload: bool = False):
         if isinstance(obj, torch.Tensor):
             output_list = [
                 torch.empty_like(obj)
@@ -1106,7 +1203,7 @@ class TorchDist(Distributed):
             return ret[0]
 
     @log_op
-    def cp_allgather(self, obj):
+    def cp_allgather(self, obj, *, small_payload: bool = False):
         if isinstance(obj, torch.Tensor):
             output_list = [
                 torch.empty_like(obj)

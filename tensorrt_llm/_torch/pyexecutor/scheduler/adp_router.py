@@ -842,9 +842,14 @@ class ConversationAwareADPRouter(ADPRouter):
 
     @staticmethod
     def _conversation_id(req_item) -> "str | None":
+        # Read routing affinity before ExecutorRequest is merged into LlmRequest.
         req = req_item.request
         if req is None:
             return None
+        scheduling_params = getattr(req, "py_scheduling_params", None)
+        affinity_id = getattr(scheduling_params, "subagent_affinity_id", None)
+        if affinity_id:
+            return affinity_id
         conversation_params = req.py_conversation_params
         if conversation_params is None:
             return None
@@ -922,13 +927,16 @@ class ConversationAwareADPRouter(ADPRouter):
             max_num_active_requests,
         )
 
-        # 2) Loose soft cap for spreading new conversations across ranks; sticky
-        #    returns may exceed it (hard cap), so it is re-bumped after the loop.
+        # 2) Soft cap for spreading new conversations across ranks, clamped to
+        #    per-rank slot capacity so no placement path can overfill a rank.
+        #    Sticky returns gate on the hard cap and may still exceed this cap,
+        #    so the returned value is re-bumped after the loop.
         expected_num_active_requests = self._expected_num_active_requests(
             all_ranks_num_active_requests,
             len(remaining_unscheduled),
             tp_size,
             multiplier=self._fair_share_multiplier,
+            hard_cap=max_num_active_requests,
         )
 
         def _least_loaded(soft_cap: int) -> int:

@@ -133,6 +133,21 @@ def _lengths_by_modality(
     """Invert prompt-ordered `multimodal_embedding_lengths` (number of
     embedding rows per item) into per-modality per-item lengths, matching
     the per-modality item order used by `EncoderGroup.build_batched_input`.
+
+    Glossary used below:
+
+    * **group** — one `EncoderGroup` entry (a single tuple of modalities
+      that share an encoder call). E.g. Qwen3-VL registers one group
+      `("image", "video")`; Nano registers three groups
+      `("image",)`, `("video",)`, `("audio",)`.
+    * **group-local modalities** — the `modalities` tuple of the group
+      whose encoder is being invoked (this function's `modalities` arg).
+    * **cross-group mix** — a single request whose items span modalities
+      belonging to two *different* groups (e.g. one image + one audio
+      item for Nano, where image and audio live in separate groups).
+    * **multi-group model** — a model that registers more than one
+      `EncoderGroup`, so its group-local `modalities` tuples are each
+      strictly narrower than the full request-level modality set.
     """
     by_modality: Dict[str, List[int]] = {m: [] for m in modalities}
     for mp in multimodal_params:
@@ -145,13 +160,16 @@ def _lengths_by_modality(
         # Raw-prompt entrypoints (non chat-parsing) do not attach a manifest,
         # so this is the single enforcement point that a >1-modality request
         # must carry `mm_item_order` to make prompt-order reordering possible.
-        present = [m for m in modalities if mp.multimodal_data.get(m) is not None]
+        # Check the *request-level* modality set so multi-group models (each
+        # group with a single modality) still catch cross-group mixes — the
+        # group-local `modalities` tuple can have length 1 and never trip.
+        present = [m for m in _MM_DATA_INPUT_MODALITY_KEYS if mp.multimodal_data.get(m) is not None]
         if len(present) > 1:
             raise ValueError(
                 "Request with multiple modalities present "
                 f"({present}) must carry mm_item_order on MultimodalParams."
             )
-        if present:
+        if present and present[0] in by_modality:
             by_modality[present[0]].extend(flat)
     return by_modality
 
@@ -254,6 +272,7 @@ def encode_multimodal_by_groups(
 
 
 if TYPE_CHECKING:
+    from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
 
@@ -662,6 +681,17 @@ class MultimodalModelMixin:
     def infer_max_seq_len(self) -> int:
         """Return the inner language model's maximum sequence length."""
         return self.language_model.infer_max_seq_len()
+
+    def set_guided_decoder(self, guided_decoder: "CapturableGuidedDecoder") -> bool:
+        """Install a guided decoder on the inner language model.
+
+        Returns False when the inner model does not support guided decoding,
+        matching the contract ModelEngine.set_guided_decoder() expects.
+        """
+        inner = self.language_model
+        if not hasattr(inner, "set_guided_decoder"):
+            return False
+        return inner.set_guided_decoder(guided_decoder)
 
     def get_language_model_extra_forward_kwargs(
         self,

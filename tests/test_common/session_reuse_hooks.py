@@ -14,20 +14,22 @@ from test_common.session_reuse import REUSE
 # Node-id substrings that are opted out of session reuse as a class, in
 # addition to the per-test ``private_mpi_session`` marker. AutoDeploy's
 # executor adapter keeps worker-process state sized for the previous engine's
-# config (graph/sequence-length shaped buffers); on a reused pool the next
-# test hits e.g. "The expanded size of the tensor (128) must match the
-# existing size (256)". Remove entries once the underlying state is
-# re-initialized per engine.
+# config (graph/sequence-length shaped buffers). Torch compile's Userbuffers
+# Manager is also process-global and assumes one Engine per process, so it
+# cannot safely serve a later Engine whose pool size increases. Remove entries
+# once the underlying state is re-initialized per engine.
 _PRIVATE_NODEID_PATTERNS = (
     "autodeploy",
     "auto_deploy",
     "/test_ad_",
+    "torch_compile=true",  # Parameterized compile cases.
+    "piecewise_cuda_graph",  # Cases with an unconditional compile config.
 )
 
 
 def _is_private_nodeid(nodeid: str) -> bool:
     lowered = nodeid.lower()
-    return any(pat in lowered for pat in _PRIVATE_NODEID_PATTERNS)
+    return any(pat.lower() in lowered for pat in _PRIVATE_NODEID_PATTERNS)
 
 
 def pytest_configure(config):

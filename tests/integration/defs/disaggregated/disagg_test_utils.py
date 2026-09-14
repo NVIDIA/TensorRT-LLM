@@ -323,6 +323,32 @@ async def wait_for_port_released(port):
         return False
 
 
+def get_registered_worker_urls(port: int) -> tuple[list[str], list[str]]:
+    """Return ``(ctx_urls, gen_urls)`` as registered with the disagg server.
+
+    Workers launched with ``port=0`` pick their listening port inside the child
+    process, so the cluster registry is the only authoritative source for their
+    addresses. Call this once the server reports ready, i.e. once every worker
+    the test expects has registered.
+
+    Args:
+        port: Disagg server port
+
+    Returns:
+        tuple[list[str], list[str]]: Context and generation worker URLs, each
+        sorted so the ordering is stable across calls.
+    """
+    assert port > 0, "port must be positive"
+    info_resp = requests.get(f"http://localhost:{port}/cluster_info", timeout=5)
+    assert info_resp.status_code == 200, f"cluster_info returned {info_resp.status_code}"
+    workers = info_resp.json().get("current_workers", {})
+
+    def _urls(role_key: str) -> list[str]:
+        return sorted(f"http://{w['host']}:{w['port']}" for w in workers.get(role_key, []))
+
+    return _urls("context_servers"), _urls("generation_servers")
+
+
 def verify_cluster_info(ready, ctx_workers=-1, gen_workers=-1, port=0, expected_code=200):
     """Verify cluster info from /cluster_info endpoint.
 

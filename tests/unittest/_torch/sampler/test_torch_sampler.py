@@ -39,7 +39,6 @@ from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
-    convert_wordlist,
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
@@ -53,7 +52,11 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
+    SampleType,
+    UtilsSamplingParams,
+    _get_max_beam_width,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
@@ -154,7 +157,7 @@ class TestStrategySelection:
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
-            return self.sampling_config.beam_width
+            return cast(int, self.sampling_config.beam_width)
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -560,7 +563,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
@@ -572,7 +575,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         def _build_scheduled_requests() -> ScheduledRequests:
             scheduled_requests = ScheduledRequests()
@@ -761,6 +764,9 @@ def test_select_generated_logits(
 def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.MonkeyPatch):
     sampler = object.__new__(TorchSampler)
     sampler.max_beam_width = 1
+    # Bypassing __init__ skips the in-graph sampling state; the batch is sampled
+    # eagerly here, which is what FULL means.
+    sampler._current_sample_type = SampleType.FULL
     sampler._stable_greedy_request_ids = []
     sampler._stable_greedy_seq_slots = []
     sampler._stable_greedy_seq_slots_host = None
@@ -961,8 +967,8 @@ class TestFinishReasons:
                 new_tokens=new_tokens,
                 finish_reasons=None,
                 first_finish_reasons=None,
+                single_step_greedy=True,
             ),
-            single_step_greedy=True,
         )
 
         sampler.update_requests(state)
@@ -1001,9 +1007,7 @@ class TestFinishReasons:
                 seq_slot=seq_slot,
                 input_tokens=prompt,
                 max_new_tokens=max_new_tokens,
-                stop_words_list=convert_wordlist(stop_words_list)
-                if stop_words_list is not None
-                else None,
+                stop_words_list=stop_words_list,
                 end_id=end_id,
                 sampling_config=SamplingConfig(),
                 is_streaming=False,
@@ -1015,7 +1019,7 @@ class TestFinishReasons:
 
         def __repr__(self):
             return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, \
-            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.stop_words_list=})"
+            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.py_stop_words_list=})"
 
         @classmethod
         def build(
@@ -1986,7 +1990,7 @@ class TestBatchedSampling:
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
             host_new_tokens = sample_state.host.new_tokens
-            if sample_state.single_step_greedy:
+            if sample_state.host.single_step_greedy:
                 # The stable greedy path copies one token per active request instead of
                 # the full [step, slot, beam] buffer. This fixture uses dense sequence
                 # slots, so restore that layout before comparing sampling results.
@@ -3419,9 +3423,8 @@ class TestTopPDecay:
     """Minimal functional guards for Top-P Decay in TorchSampler.
 
     Covers strategy routing, the post-sample runtime update (parity with the
-    C++ computeToppDecay recurrence; cases ported from
-    topPSamplingLayerTest.cpp), and per-request rejection of unsupported
-    combinations.
+    recurrence the former C++ computeToppDecay implemented), and per-request
+    rejection of unsupported combinations.
     """
 
     VOCAB_SIZE = 1000
@@ -3615,3 +3618,24 @@ class TestTopPDecay:
             )
         # Same request without decay is accepted.
         sampler.validate_request(self._mock_request(SamplingParams(top_p=0.9), draft_tokens=[1, 2]))
+
+    @pytest.mark.parametrize(
+        "beam_width_array, expected_max_width",
+        [([], 1), (None, 1), ([1], 1), ([1, 2], 2), ([3, 5, 7], 7)],
+    )
+    def test_beam_width_array_max_handles_empty(
+        self, beam_width_array: list[int] | None, expected_max_width: int
+    ) -> None:
+        # An empty beam_width_array reaches the sampler: the executor's
+        # checkBeamWidthArray bounds only the array's length, so [] passes
+        # admission. _get_max_beam_width must fall back to beam_width instead of
+        # reducing over the empty array, and must still take the array's maximum
+        # when it has entries.
+        #
+        # Build the request through SamplingParams, the way production does.
+        request = self._mock_request(SamplingParams(top_p=0.9, beam_width_array=beam_width_array))
+        assert _get_max_beam_width(request) == expected_max_width
+        # The same request must survive admission: top_p_decay is unset, but
+        # TopPDecayHandler.validate_request resolves the sampling params -- and
+        # with them the beam width -- before it checks whether decay is active.
+        self._make_sampler().validate_request(request)

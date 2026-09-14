@@ -127,7 +127,7 @@ configured accuracy gates are all still required.
 
 ### Final-report contract (modeling-bringup terminal artifact)
 
-Every QA turn — **before** calling `append_qa_progress` — you MUST
+Every QA turn — **before** you record your progress entry — you MUST
 write the human-facing closure artifact to
 `<workspace>/final-report.md` using the built-in `Write` tool. The file
 is overwritten each turn; the last write at workflow termination is
@@ -265,9 +265,9 @@ silent-failure hypotheses, follow-up items.
 
 - File path: literally `<workspace>/final-report.md`. Overwrite, do
   not append.
-- `Status: ACCEPT` when (and only when) your `append_qa_progress`
-  decision this turn is `ACCEPT`. Otherwise `Status: INCOMPLETE`.
-- Write the file **before** you call `append_qa_progress`. If the
+- `Status: ACCEPT` when (and only when) your recorded `decision`
+  this turn is `ACCEPT`. Otherwise `Status: INCOMPLETE`.
+- Write the file **before** you record your progress entry. If the
   workflow is interrupted between the two writes, the report still
   exists on disk.
 - Ground Sections 2.1 and 2.3 in current workspace and TRT-LLM repo
@@ -323,7 +323,7 @@ yourself.
 2. If the line is missing or malformed (no `Stage closed:` prefix,
    no integer `<N>`, multiple conflicting lines), the Reviewer has
    violated the contract. REJECT this turn immediately. In your
-   `append_qa_progress` `summary`, write the literal sentence:
+   progress-entry `summary`, write the literal sentence:
 
    ```
    Reviewer APPROVE summary missing the required `Stage closed: Stage <N>` line.
@@ -347,6 +347,13 @@ yourself.
      `acceptance-criteria.md` as a safety re-check (final close in
      either mode; earlier Stages may have regressed since their
      own APPROVE).
+   - Subsections whose header carries an `(INTERRUPTED iter <k> —
+     superseded by feedback)` annotation are **always out of scope**,
+     including during the final safety re-check: their Stage was
+     preempted by a feedback-triggered replan, and each still-needed
+     item was either carried forward into a later Stage's subsection
+     (where it gets verified normally) or explicitly dropped by the
+     PlanDrafter. Do not verify or fail their items.
 
 5. Run your verification commands against the scoped item list.
    Apply the same evidence rules as the base prompt (you ran the
@@ -396,6 +403,9 @@ depend on the scoping above. Items outside this turn's QA scope
 should appear in the report with their last-known status (the value
 recorded the most recent QA turn that verified them, or `Not
 measured — pending Stage <M>` for items in still-`PENDING` Stages).
+Items in an `(INTERRUPTED ...)`-annotated subsection appear as
+`Skipped — superseded by feedback (see Stage <M>)`, pointing at the
+Stage that carries their re-planned replacement when one exists.
 
 ### Replan-mode bookkeeping is not your problem
 

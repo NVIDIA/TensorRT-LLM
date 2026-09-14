@@ -1111,6 +1111,7 @@ def _make_conv_request_item(
     target_dp_rank=None,
     attention_dp_relax=True,
     num_tokens=10,
+    subagent_affinity_id=None,
 ):
     """Mock RequestQueueItem carrying conversation params."""
     item = MagicMock()
@@ -1119,6 +1120,9 @@ def _make_conv_request_item(
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
+    # Default: no sub-agent affinity override (else a bare MagicMock attribute
+    # would be truthy and shadow conversation_id in _conversation_id).
+    scheduling_params.subagent_affinity_id = subagent_affinity_id
     item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
     item.request.py_conversation_params = None
@@ -1128,6 +1132,41 @@ def _make_conv_request_item(
     item.request.py_orig_prompt_len = num_tokens
     item.request.py_disaggregated_params = None
     return item
+
+
+class TestConversationAwareADPRouterConversationId:
+    """_conversation_id is the rank-affinity key: the sub-agent parent-affinity id
+    (from scheduling_params, set at the disagg edge from SUBAGENT_AFFINITY_HEADER)
+    when present, else the request's own conversation_id -- so sibling sub-agents
+    co-locate on the parent's rank without their conversation_id being rewritten."""
+
+    def test_prefers_subagent_affinity_id(self):
+        item = _make_conv_request_item(1, "own-id", subagent_affinity_id="parent-id")
+        assert ConversationAwareADPRouter._conversation_id(item) == "parent-id"
+
+    def test_falls_back_to_conversation_id(self):
+        item = _make_conv_request_item(1, "own-id")
+        assert ConversationAwareADPRouter._conversation_id(item) == "own-id"
+
+    def test_affinity_id_used_without_own_conversation_id(self):
+        # Parent-only request: no own conversation_id, but the affinity id pins it.
+        item = _make_conv_request_item(1, None, subagent_affinity_id="parent-id")
+        assert ConversationAwareADPRouter._conversation_id(item) == "parent-id"
+
+    def test_none_when_neither_present(self):
+        item = _make_conv_request_item(1, None)
+        assert ConversationAwareADPRouter._conversation_id(item) is None
+
+    def test_siblings_collapse_to_parent_rank_key(self):
+        # Two siblings with distinct own ids but the same parent affinity id must
+        # yield the same routing key, so the router pins them to one rank.
+        a = _make_conv_request_item(1, "own-a", subagent_affinity_id="parent-id")
+        b = _make_conv_request_item(2, "own-b", subagent_affinity_id="parent-id")
+        assert (
+            ConversationAwareADPRouter._conversation_id(a)
+            == ConversationAwareADPRouter._conversation_id(b)
+            == "parent-id"
+        )
 
 
 class TestConversationAwareADPRouter:
@@ -1342,6 +1381,23 @@ class TestConversationAwareADPRouter:
         final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
         assert all(expected >= f for f in final), (expected, final)
         assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
+
+    def test_new_conversations_never_exceed_slot_capacity(self):
+        """Regression: the spreading target must be clamped to
+        max_num_active_requests. Unclamped it reaches 2 * fair_share, so a rank
+        already holding every sequence slot still passes the `< soft_cap` gate
+        and add_slot later raises NoFreeSlotsError mid-collective."""
+        router = self._router(tp_size=4)
+        cap = 64
+        # 2 * ceil((184 + 8) / 4) = 96 > cap, so the unclamped target admits the
+        # full rank 3 and pushes it to 66 sequence slots.
+        states = self._states(4, active=[40, 40, 40, cap])
+        items = [_make_conv_request_item(i, None) for i in range(8)]
+        assign, expected = router.route_requests(states, items, max_num_active_requests=cap)
+        final = [states[r].num_active_requests + len(assign[r]) for r in range(4)]
+        assert all(f <= cap for f in final), final
+        assert expected <= cap
+        assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
 
 
 class TestNumInputTokens:

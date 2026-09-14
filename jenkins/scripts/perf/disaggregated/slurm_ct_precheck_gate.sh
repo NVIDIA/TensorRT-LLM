@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Cache-transceiver precheck gate for the disaggregated perf-sanity launch
 # script. submit.py splices this file into the generated launch script ahead
 # of slurm_launch_draft.sh, which calls run_cache_transceiver_precheck after
@@ -21,7 +24,7 @@ ct_xml_escape() {
 # First few root-cause-shaped lines of a step log — the tail alone can miss
 # the real error when it happened early and retry spam follows.
 ct_first_errors() {
-    grep -m 5 -nE "Traceback \(most recent call last\)|MPI_ABORT|MPIR_Err|srun: error|Segmentation fault|CUDA error|RuntimeError|AssertionError|INIT_ERROR|TRANSFER_ERROR" \
+    grep -m 5 -nE "Traceback \(most recent call last\)|MPI_ABORT|MPIR_Err|srun: error|Segmentation fault|CUDA error|RuntimeError|AssertionError|INIT_ERROR|TRANSFER_ERROR|WATCHDOG_KILL|EXTERNAL_TIMEOUT|EXTERNAL_KILL|PROCESS_EXIT" \
         "$1" 2>/dev/null || true
 }
 
@@ -38,6 +41,29 @@ ct_step_excerpt() {
     ct_first_errors "$stepLog"
     echo "Log tail ($stepLog):"
     tail -n 60 "$stepLog" 2>/dev/null || true
+}
+
+# The driver normally owns verdict files. If the external total-runtime
+# backstop or srun kills it first, synthesize a precise verdict here so junit
+# never degrades the failure to NO_STATUS.
+ct_record_step_exit() {
+    local name=$1 rc=$2
+    local statusFile="$precheckDir/status/$name.status"
+    # Preserve a driver's specific failure, but never let a stale/premature
+    # PASS mask the non-zero process exit observed by the gate.
+    if [ -f "$statusFile" ] && ! grep -q '^PASS' "$statusFile"; then
+        return 0
+    fi
+    if [ "$rc" -eq 124 ]; then
+        printf 'EXTERNAL_TIMEOUT %s: step exceeded the %ss total-runtime backstop\n' \
+            "$name" "${ctPrecheckTimeout:-900}" > "$statusFile"
+    elif [ "$rc" -eq 137 ]; then
+        printf 'EXTERNAL_KILL %s: step received SIGKILL (possibly timeout -k escalation) before the driver wrote a verdict\n' \
+            "$name" > "$statusFile"
+    else
+        printf 'PROCESS_EXIT %s: srun exited with code %s before the driver wrote a verdict\n' \
+            "$name" "$rc" > "$statusFile"
+    fi
 }
 
 # Console summary for a failed precheck: per-instance verdicts, first error
@@ -110,7 +136,7 @@ run_cache_transceiver_precheck() {
     fi
     echo "Starting cache transceiver precheck..."
     precheckDir="$testOutputDir/cache_transceiver_precheck"
-    mkdir -p "$precheckDir/logs"
+    mkdir -p "$precheckDir/logs" "$precheckDir/status"
     # A reused work dir (Slurm requeue reruns this batch script with the same
     # directories) may hold a previous run's rendezvous/status/csv/abort files:
     # stale addr files would point gen leaders at dead ports, stale status files
@@ -120,17 +146,21 @@ run_cache_transceiver_precheck() {
     # (the Python transceiver's perf_<uuid>_<rank>.csv are per-run and appended)
     # would make parse_python_bandwidth_gbps median over two runs' samples. The
     # driver also job-id-stamps addr files as a second line of defense.
-    rm -f "$precheckDir"/rendezvous/*.addr "$precheckDir"/status/*.status \
-        "$precheckDir"/status/*.json "$precheckDir"/precheck.abort 2>/dev/null || true
+    rm -f "$precheckDir"/rendezvous/*.addr "$precheckDir"/progress/*.json \
+        "$precheckDir"/status/*.status "$precheckDir"/status/*.json \
+        "$precheckDir"/precheck.abort 2>/dev/null || true
     rm -rf "$precheckDir"/csv 2>/dev/null || true
     precheckPids=()
     precheckNames=()
     # ct_launch_step <role> <idx> <nodes> <gpusPerNode> <nodeList> <pytestCmd>
     ct_launch_step() {
         local role=$1 i=$2 nodes=$3 gpusPerNode=$4 nodeList=$5 pytestCmd=$6
-        export DISAGG_SERVING_TYPE="${role^^}_PRECHECK_$i"
-        export pytestCommand="$pytestCmd --server-idx $i"
-        timeout -k 60 "${ctPrecheckTimeout:-900}" \
+        # Scope the launch identity and command to this precheck process. The
+        # parent shell subsequently launches the real perf workers, so these
+        # must not replace its DISAGG_SERVING_TYPE/pytestCommand values.
+        DISAGG_SERVING_TYPE="${role^^}_PRECHECK_$i" \
+            pytestCommand="$pytestCmd --server-idx $i" \
+            timeout -k 60 "${ctPrecheckTimeout:-900}" \
             srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
             -N "$nodes" \
             -w "$nodeList" \
@@ -158,6 +188,7 @@ run_cache_transceiver_precheck() {
         else
             rc=$?
             echo "Precheck step ${precheckNames[$k]} FAILED (exit $rc; 124 = external timeout)"
+            ct_record_step_exit "${precheckNames[$k]}" "$rc"
             precheckFailed=1
         fi
     done

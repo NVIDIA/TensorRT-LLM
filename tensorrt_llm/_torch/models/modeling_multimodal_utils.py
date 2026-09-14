@@ -43,9 +43,8 @@ def _is_mm_disagg() -> bool:
 
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
     multimodal_data = param.multimodal_data or {}
-    modality_type = multimodal_data.get("modality_type")
-    return (modality_type in ("image", "video", "audio")
-            and multimodal_data.get(modality_type) is not None)
+    return any(
+        multimodal_data.get(m) is not None for m in ("image", "video", "audio"))
 
 
 # Processor *output* keys that transformers 5.x's
@@ -543,8 +542,8 @@ def fuse_input_embeds(
         - Sync-free contract: passing both ``text_token_indices`` and
           ``mm_token_indices`` skips the GPU ``torch.where`` host sync. The
           executor (``model_engine._prepare_inputs`` /
-          ``_prepare_tp_inputs_no_cache``) precomputes them on a CPU
-          ``input_ids`` copy via ``_prepare_multimodal_indices`` (which uses
+          ``NoKVCacheRunner.prepare_inputs``) precomputes them on a CPU
+          ``input_ids`` copy via ``runners.prepare_multimodal_indices`` (which uses
           ``filter_mm_token_from_input_ids`` against ``self.model.mm_token_ids``
           when present, else the OOV fallback ``>= vocab_size``) and ships
           them as pinned async H2D tensors in the inputs dict. VLM forwards

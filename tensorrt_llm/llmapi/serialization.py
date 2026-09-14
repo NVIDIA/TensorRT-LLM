@@ -75,9 +75,8 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
         "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
-        "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
-        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
-        "KvCacheRetentionConfig",
+        "ExtendedRuntimePerfKnobConfig", "Response", "Result", "FinishReason",
+        "KvCacheConfig", "KvCacheTransferMode", "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
@@ -100,14 +99,13 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ParallelConfig", "CalibConfig", "CapacitySchedulerPolicy",
-        "KvCacheConfig", "LookaheadDecodingConfig", "SchedulerConfig",
-        "LoadFormat", "DynamicBatchConfig"
+        "KvCacheConfig", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
     ["CachedModelLoader._node_build_task", "LlmBuildStats"],
     "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],
-    "tensorrt_llm.lora_manager": ["LoraConfig"],
+    "tensorrt_llm._torch.peft.lora.config": ["LoraConfig"],
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
     ["QuantConfig", "SpeculativeDecodingMode"],
@@ -121,6 +119,16 @@ BASE_EXAMPLE_CLASSES = {
     ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
+    # Pre-move module paths, so older artifacts still load.  find_class()
+    # matches the key exactly and rejects before the forwarding module is
+    # imported, so the shims alone do not cover this path.  Removed together
+    # with the forwarding modules.
+    #
+    # lora_helper is the module a real pre-move LoraConfig pickle names -- it
+    # was absent here, so those artifacts have never loaded.  lora_manager is
+    # the key that was present; it is kept as it was.
+    "tensorrt_llm.lora_helper": ["LoraConfig"],
+    "tensorrt_llm.lora_manager": ["LoraConfig"],
 }
 
 

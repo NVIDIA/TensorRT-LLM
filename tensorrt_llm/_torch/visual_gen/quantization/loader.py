@@ -13,10 +13,23 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_blockwise,
     quantize_fp8_per_tensor,
+    quantize_fp8_rowwise,
     quantize_nvfp4,
 )
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils import fp4_utils
+
+# Checkpoint scale tensors each static (pre-quantized) recipe expects
+# alongside the quantized weight (e.g. as exported by ModelOpt). Used to
+# detect unquantized checkpoints when dynamic weight quantization is off.
+# Algos absent from this dict have no verified checkpoint layout in VisualGen;
+# the guard fails closed for them (a high-precision weight under any static
+# recipe is refused rather than silently cast over uninitialized scales).
+_STATIC_SCALE_KEYS = {
+    QuantAlgo.FP8: ("weight_scale",),
+    QuantAlgo.FP8_BLOCK_SCALES: ("weight_scale",),
+    QuantAlgo.NVFP4: ("weight_scale", "weight_scale_2"),
+}
 
 
 class DynamicLinearWeightLoader:
@@ -135,6 +148,57 @@ class DynamicLinearWeightLoader:
 
         return None
 
+    def _check_static_quant_scales(
+        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
+    ) -> None:
+        """Refuse static quant recipes against checkpoints without scales.
+
+        With ``dynamic_weight_quant=False`` the loader expects the checkpoint
+        to provide pre-quantized weights plus their scale tensors. If a module
+        was built for a quantized recipe but the checkpoint holds a
+        high-precision weight with no scales (an unquantized checkpoint),
+        ``Linear.load_weights`` would silently cast the weight into the
+        quantized buffer while the scales keep their default or uninitialized
+        values, corrupting the model without any error. Fail fast instead.
+
+        Algos without an entry in ``_STATIC_SCALE_KEYS`` (e.g. the AWQ
+        variants, which also allocate ``weight_scale`` uninitialized) fail
+        closed: a high-precision weight under any static recipe is refused
+        even when the expected scale names are unknown.
+        """
+        if quant_algo is None or self.dynamic_weight_quant:
+            return
+
+        if self.quant_config is not None:
+            if self.quant_config.is_module_excluded_from_quantization(name):
+                return
+
+        weight = weight_dict.get("weight")
+        if weight is None or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return
+
+        expected_scales = _STATIC_SCALE_KEYS.get(quant_algo)
+        if expected_scales is not None:
+            missing = [key for key in expected_scales if key not in weight_dict]
+            if not missing:
+                return
+            detail = f"without the expected scale tensor(s) {missing}"
+        else:
+            detail = (
+                "and no checkpoint scale layout is registered for this algo in "
+                "_STATIC_SCALE_KEYS, so the scales cannot be verified (the "
+                "guard fails closed for unverified algos)"
+            )
+        raise ValueError(
+            f"Static quantization ({quant_algo.name}) is configured for module "
+            f"'{name}', but the checkpoint provides a {weight.dtype} weight "
+            f"{detail}. The checkpoint appears to be unquantized; loading it "
+            "would silently corrupt the weights. Use a checkpoint that carries "
+            "quantized weights and scales (e.g. exported by ModelOpt), or "
+            "enable load-time quantization by setting 'dynamic': true in "
+            "quant_config."
+        )
+
     def _should_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
     ) -> bool:
@@ -152,7 +216,11 @@ class DynamicLinearWeightLoader:
             return False
 
         # For FP8 algorithms: quantize if weight is high precision
-        if quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES):
+        if quant_algo in (
+            QuantAlgo.FP8,
+            QuantAlgo.FP8_BLOCK_SCALES,
+            QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+        ):
             if weight.dtype == torch.float8_e4m3fn and "weight_scale" in weight_dict:
                 return False  # Already quantized
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
@@ -184,6 +252,9 @@ class DynamicLinearWeightLoader:
         elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             block_size = self.quant_config.group_size if self.quant_config else 128
             qweight, scale = quantize_fp8_blockwise(weight, block_size=block_size)
+            return {**weight_dict, "weight": qweight, "weight_scale": scale}
+        elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
+            qweight, scale = quantize_fp8_rowwise(weight)
             return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.NVFP4:
             qweight, weight_scale, weight_scale_2 = quantize_nvfp4(weight)
@@ -270,6 +341,11 @@ class DynamicLinearWeightLoader:
             quant_algo = module_quant_config.quant_algo
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
+
+        # Static (pre-quantized) recipes must not be loaded from checkpoints
+        # that do not carry the expected scale tensors.
+        for weight_dict in weight_dicts:
+            self._check_static_quant_scales(weight_dict, quant_algo, name)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER

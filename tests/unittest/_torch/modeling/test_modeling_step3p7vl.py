@@ -164,7 +164,7 @@ def _vision_attention_model_config(vision_config: PretrainedConfig) -> ModelConf
 
 def _vision_attn_metadata(seq_lens):
     """Context-only (no KV cache) attention metadata for a flat varlen stream."""
-    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
     md = get_attention_backend("TRTLLM").Metadata(
         # Non-fan-out: one attention sequence per image, so the request count is
@@ -183,7 +183,7 @@ def _vision_attn_metadata(seq_lens):
 
 
 def _setup_encoder_attn_metadata(module, max_num_tokens: int = _ENCODER_TEST_MAX_NUM_TOKENS):
-    """Mirror the engine's ``_set_up_multimodal_encoder_attn_metadata`` walk.
+    """Mirror the engine's ``setup_mm_encoder_attn_metadata`` walk.
 
     The encoder builds its ``AttentionMetadata`` via the engine-driven
     ``MultimodalEncoderMixin.setup_attn_metadata`` after model load; standalone
