@@ -36,6 +36,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SiTuActivation,
     SwigluBiasActivation,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEEnvFlag, collect_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
@@ -47,29 +48,22 @@ from .quantize import get_test_quant_params
 from .specs import ConfigSpec, ModelSpec
 from .utils import _ensure_dist_for_megamoe
 
-# Map concrete MoE module class names to short backend identifiers used in
-# results and the dashboard. Anything not in this table falls back to the
-# upper-case class name.
-_BACKEND_CLASS_TO_NAME: Dict[str, str] = {
-    "CutlassFusedMoE": "CUTLASS",
-    "TRTLLMGenFusedMoE": "TRTLLM",
-    "CuteDslFusedMoE": "CUTEDSL",
-    "DeepgemmCudaFp8BlockScalesImpl": "DEEPGEMM",
-    "DenseGEMMFusedMoE": "DENSEGEMM",
-    "DeepgemmCudaW4a8Mxfp4Mxfp8Impl": "MEGAMOE_DEEPGEMM",
-    "MegaMoECuteDsl": "MEGAMOE_CUTEDSL",
-    "VanillaMoE": "VANILLA",
-}
-
 
 def _backend_name_from_module(moe) -> str:
-    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules."""
+    """Resolve ``actual_backend`` for both ConfigurableMoE and legacy modules.
+
+    Read off ``BACKEND_FAMILY``, which is the table resolution itself uses, so
+    a backend that gains or splits classes stays labelled without an edit
+    here. A hand-written class-name table used to do this and went stale the
+    moment TRTLLM-Gen became eleven classes.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import backend_family_of
+
     backend_attr = getattr(moe, "backend", None)
-    if backend_attr is not None and backend_attr is not moe:
-        backend_cls = type(backend_attr).__name__
-    else:
-        backend_cls = type(moe).__name__
-    return _BACKEND_CLASS_TO_NAME.get(backend_cls, backend_cls.upper())
+    backend_cls = (
+        type(backend_attr) if backend_attr is not None and backend_attr is not moe else type(moe)
+    )
+    return backend_family_of(backend_cls) or backend_cls.__name__.upper()
 
 
 def _scheduler_kind_name(moe) -> Optional[str]:
@@ -291,10 +285,14 @@ def _build_moe_module(
 
     # Shared-expert fusion is opt-in in TRTLLMGenFusedMoE; "fused" cases must
     # enable it explicitly or they would silently benchmark the unfused path.
+    # The flag is read through the cached selection environment, which
+    # ``expand_and_prune`` already collected, so the write has to be followed
+    # by a re-collect or it lands behind the snapshot and is read by nothing.
     if model.n_shared_experts > 0 and model.shared_expert_mode != "unfused":
-        os.environ["TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"] = "1"
+        os.environ[MoEEnvFlag.SHARED_EXPERT_FUSION.value] = "1"
     else:
-        os.environ.pop("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", None)
+        os.environ.pop(MoEEnvFlag.SHARED_EXPERT_FUSION.value, None)
+    collect_moe_environment(force=True)
 
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style

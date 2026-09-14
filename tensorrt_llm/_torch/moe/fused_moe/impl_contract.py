@@ -43,7 +43,7 @@ class MoEStaticCapability:
     supports_dwdp: bool = False
     # Legacy gate: ``assert moe_cls in supported_load_balancer_backends`` in
     # ``create_moe_backend``. Not the same question as the instance-level
-    # ``_supports_load_balancer()``, which TRTLLMGenFusedMoE overrides to mean
+    # ``_supports_load_balancer()``, which TrtllmGenFusedMoEBase overrides to mean
     # "separated routing is used".
     supports_eplb: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
@@ -85,7 +85,7 @@ class MoEInputRequirement:
     # the design sketched one to replace the scheduler's router-logits filter.
     # A class-level bool cannot express that condition: it also depends on the
     # routing method instance and on an environment override, neither of which
-    # is known per class. ``TRTLLMGenFusedMoE._routes_outside_the_kernel``
+    # is known per class. ``TrtllmGenFusedMoEBase._routes_outside_the_kernel``
     # answers it instead, next to the kernel whose contract it describes.
 
 
@@ -171,6 +171,17 @@ def canonical_quant(quant_algo: Optional["QuantAlgo"]) -> Optional[str]:
     return None if resolved is None else str(resolved.value)
 
 
+def normalize_quant(quant: Optional[str]) -> str:
+    """A :func:`canonical_quant` result as an identity spells it.
+
+    ``canonical_quant`` yields the upper-case ``QuantAlgo`` value and ``None``
+    for unquantized; identities are lower case and spell that ``"none"``. One
+    definition, because eligibility, the construction check, and the two
+    diagnostics naming a layer's format all have to agree on the spelling.
+    """
+    return "none" if quant is None else quant.lower()
+
+
 def canonical_activation(activation_type: Optional["ActivationType"]) -> str:
     """Canonicalize an activation for the tuning key."""
     from tensorrt_llm._torch.utils import ActivationType
@@ -189,7 +200,9 @@ def canonical_routing(
     if routing is None:
         return None
     if not isinstance(routing, RoutingMethodType):
-        routing = routing.routing_method_type
+        # The algorithm, not the encoding its kernel is handed: two methods
+        # that share a kernel value are still two problems here.
+        routing = routing.resolution_routing_method_type
     return RoutingMethodType(routing).name
 
 
@@ -209,6 +222,18 @@ class MoEEnvironment:
 
     def has_dep(self, name: str) -> bool:
         return name in self.available_deps
+
+    def env_flag(self, name: str) -> Optional[str]:
+        """Value of a collected environment flag, or ``None`` if not collected.
+
+        The pairs are a tuple so the structure stays hashable and the
+        fingerprint stable. Lets ``can_implement`` name one flag rather than
+        reach for ``os.environ``.
+        """
+        for flag, value in self.env_flags:
+            if flag == name:
+                return value
+        return None
 
     def fingerprint(self) -> str:
         """Return a stable fingerprint for the selection environment."""
@@ -475,6 +500,23 @@ class MoEResolutionReport:
             f"{rejection.legacy_backend}={rejection.reason.value}" for rejection in self.rejected
         )
         return f"{head}; turned down: {turned_down}"
+
+    def describe_rejections(self) -> str:
+        """Every rejection with its detail, not just the reason code.
+
+        For the no-winner case, where the reasons are the outcome rather than
+        context for a choice and the operator needs them to know which
+        constraint to relax. :meth:`describe` stays the summary.
+        """
+        if not self.rejected:
+            # Nothing was turned down because nothing was asked: the candidate
+            # list is the bug, and that is a different diagnosis from silence.
+            return "(no candidate was considered)"
+        return "; ".join(
+            f"{rejection.legacy_backend}: {rejection.reason.value}"
+            + (f" ({rejection.detail})" if rejection.detail else "")
+            for rejection in self.rejected
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -27,6 +28,11 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import _BACKEND_SYNC_ATTRS, ConfigurableMoE
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+# Every test here drives ``create_weights`` with construction stubbed out, so
+# nothing allocates. The marker is also what makes the file reachable: the CPU
+# stage lists this directory but collects only files that carry it.
+pytestmark = pytest.mark.cpu_only
 
 
 def _wrapper() -> ConfigurableMoE:
