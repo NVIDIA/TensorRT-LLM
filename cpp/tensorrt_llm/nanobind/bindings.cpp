@@ -212,7 +212,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("RELATIVE", tk::PositionEmbeddingType::kRELATIVE)
         .value("CHATGLM", tk::PositionEmbeddingType::kCHATGLM)
         .value("YARN", tk::PositionEmbeddingType::kYARN)
-        .value("ROPE_M", tk::PositionEmbeddingType::kROPE_M);
+        .value("ROPE_M", tk::PositionEmbeddingType::kROPE_M)
+        .value("DEFERRED", tk::PositionEmbeddingType::kDEFERRED);
 
     nb::enum_<tk::RotaryScalingType>(m, "RotaryScalingType", nb::is_arithmetic())
         .value("NONE", tk::RotaryScalingType::kNONE)
