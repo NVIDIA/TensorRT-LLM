@@ -14,11 +14,10 @@
 # limitations under the License.
 """``flashinfer.trtllm_gen.fused_moe.none`` -- the unquantized path."""
 
-from typing import Optional, Union
-
 import torch
 
-from ....utils import ActivationType
+from tensorrt_llm._torch.utils import ActivationType
+
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -32,7 +31,12 @@ from ..interface import _reject
 from ..quantization import BF16TRTLLMGenFusedMoEMethod
 from ..routing import DeepSeekV3MoeRoutingMethod
 from .base import TrtllmGenFusedMoEBase
-from .eligibility import check_flashinfer_shard_alignment, check_trtllm_gen_leaf
+from .eligibility import (
+    check_flashinfer_shard_alignment,
+    check_no_activation_constants,
+    check_no_expert_bias,
+    check_trtllm_gen_leaf,
+)
 from .identity import PROVIDER_FLASHINFER, FlashinferProviderTraits, trtllm_gen_descriptor
 from .kernel_inputs import prepare_kernel_inputs, to_trtllm_gen_act_type
 
@@ -63,7 +67,14 @@ class FlashinferTrtllmGenBf16Impl(FlashinferProviderTraits, TrtllmGenFusedMoEBas
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        return check_trtllm_gen_leaf(cls, p, d, cls._check_bf16_path(p, d))
+        return check_trtllm_gen_leaf(
+            cls,
+            p,
+            d,
+            cls._check_bf16_path(p, d),
+            check_no_expert_bias(cls, p),
+            check_no_activation_constants(cls, p),
+        )
 
     def _requires_separated_routing(self) -> bool:
         """``trtllm_bf16_moe`` has no internal routing, so top-k comes from the host.
@@ -94,7 +105,7 @@ class FlashinferTrtllmGenBf16Impl(FlashinferProviderTraits, TrtllmGenFusedMoEBas
         ), f"{type(self).__name__} does not support bias/swiglu custom parameters."
 
     @classmethod
-    def _check_bf16_path(cls, p: MoEProblem, d: MoEDeployment) -> Optional[MoEEligibility]:
+    def _check_bf16_path(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility | None:
         if p.swiglu_gptoss_style:
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
@@ -122,18 +133,20 @@ class FlashinferTrtllmGenBf16Impl(FlashinferProviderTraits, TrtllmGenFusedMoEBas
         # what passing no ``input_hidden_alignment`` says.
         return check_flashinfer_shard_alignment(cls, p, d, weight_alignment=128)
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         return BF16TRTLLMGenFusedMoEMethod()
 
-    def quantize_input(self, x, post_quant_comm: bool = True):
+    def quantize_input(
+        self, x: torch.Tensor, post_quant_comm: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return x, None
 
     def run_moe(
         self,
         ctx: MoERunContext,
         *,
-        workspace: Optional[dict] = None,
-    ) -> Union[torch.Tensor, tuple]:
+        workspace: dict | None = None,
+    ) -> torch.Tensor | tuple:
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
 

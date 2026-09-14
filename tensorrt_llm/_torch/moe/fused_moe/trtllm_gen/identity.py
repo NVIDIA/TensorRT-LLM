@@ -31,7 +31,7 @@ PROVIDER_FLASHINFER = "flashinfer"
 TECHNIQUE_TRTLLM_GEN = "trtllm_gen"
 KERNEL_FUSED_MOE = "fused_moe"
 
-# All eleven leaves publish these two, so they are declared family-wide rather
+# Every leaf publishes these two, so they are declared family-wide rather
 # than per leaf.
 TRTLLM_GEN_CAPABILITIES = MoEStaticCapability(supports_expert_bias=True, supports_eplb=True)
 

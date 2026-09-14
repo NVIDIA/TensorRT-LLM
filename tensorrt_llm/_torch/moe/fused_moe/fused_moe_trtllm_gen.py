@@ -18,14 +18,14 @@ The implementation lives in the :mod:`.trtllm_gen` subpackage. Of the three
 names in ``__all__`` only ``TRTLLMGenFusedMoE`` is defined here; the two lookup
 helpers are forwarded so that this path resolves everything the pre-split one
 did. The split moved the code out and left the name behind on purpose: the
-eleven leaves are the addressable implementations, and this name stands for all
+leaves are the addressable implementations, and this name stands for all
 of them at once, which no descriptor can publish.
 
 Following the ``DeepGemmFusedMoE`` precedent in :mod:`.fused_moe_deepgemm`, it
 is an alias and not a parent, so there is no second class to keep in step.
 
 Every gate against it has to be ``issubclass`` / ``isinstance`` and not an
-equality check: this name is the family, and the eleven leaves are what
+equality check: this name is the family, and the leaves are what
 resolution actually hands over, so ``type(x) is TRTLLMGenFusedMoE`` matches
 nothing.
 """

@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The abstract root the eleven TRTLLM-Gen leaves share.
+"""The abstract root every TRTLLM-Gen leaf shares.
 
-Carries only what all eleven need: construction, the weight-creation skeleton,
+Carries only what every leaf needs: construction, the weight-creation skeleton,
 the two routing predicates the framework reads off a module, and the fake-output
 shapes. Anything varying by quantization format lives in
 :mod:`.fp4_block_scale` or :mod:`.fp8_block_scale`, anything varying by provider
@@ -25,18 +25,20 @@ implements none of ``MoEImplBase``'s four abstract methods and publishes no
 descriptor.
 """
 
-from typing import Dict, FrozenSet, List, Optional, Union
+from typing import ClassVar
 
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
+    fp4_block_scale_fake_output_without_finalize,
+)
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ....custom_ops.trtllm_gen_custom_ops import fp4_block_scale_fake_output_without_finalize
-from ....model_config import ModelConfig
-from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from ..activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -54,7 +56,7 @@ from .identity import TECHNIQUE_TRTLLM_GEN, TRTLLM_GEN_CAPABILITIES, TRTLLM_GEN_
 
 
 class TrtllmGenFusedMoEBase(MoEImplBase):
-    """Abstract root of the eleven ``*.trtllm_gen.fused_moe.*`` implementations.
+    """Abstract root of the ``*.trtllm_gen.fused_moe.*`` implementations.
 
     The split below this class is by ``quant`` x ``provider``, and the two axes
     own different things:
@@ -69,11 +71,11 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
       by the traits mixed into each registered leaf, so a leaf is just an
       identity, its provider traits, and a ``can_implement``.
 
-    One kernel call per forward for all eleven: routing (unless a leaf routes
+    One kernel call per forward: routing (unless a leaf routes
     outside it), scatter, gemm1, the fused activation, gemm2, and the combine
     reduction are a single cubin. Hence ``run_moe`` returns a finalized tensor
-    by default; eight leaves can be asked to stop short and hand back
-    per-expert outputs through ``_unfinalized``.
+    by default; a leaf whose runner supports it can be asked to stop short
+    and hand back per-expert outputs through ``_unfinalized``.
 
     No AllReduce is issued from here. With ``reduce_results=False`` the model
     definition owns it; ``ConfigurableMoE`` supplies it through the
@@ -86,30 +88,35 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     """
 
     # ---- identity-derived declarations, set by each registered leaf ------
+    # ``ClassVar``, not instance state: each is answered by the class, several
+    # of them at resolution time when there is no instance to ask.
     #: ``MoEImplId.provider``, and the ``moe_op_backend`` registry key
     #: ``__init__`` builds the op backend from.
-    provider: str
+    provider: ClassVar[str]
     #: ``provider == PROVIDER_FLASHINFER``, read from outside as a plain
     #: attribute by ``ConfigurableMoE`` and the backend tests.
-    use_flashinfer: bool
+    use_flashinfer: ClassVar[bool]
     #: Whether this format has a fused cubin for the gpt-oss SwiGLU package
     #: (expert bias plus alpha/beta). Read off the *class* at resolution time,
     #: where there is no instance to ask.
-    supports_gptoss_style: bool = False
+    supports_gptoss_style: ClassVar[bool] = False
     #: Whether this leaf can run SiTu. Per-leaf and not per-format: the format
     #: needs a fused SiTu FC1 cubin *and* the provider has to call it, so a
     #: FlashInfer sibling of a supported format may still be False.
-    supports_situ: bool = False
+    supports_situ: ClassVar[bool] = False
     #: Whether this format's cubins always read an FC bias, so a model without
     #: one still needs a zeroed buffer. Declarative rather than an override
     #: because its four setters sit on two inheritance levels.
-    needs_zero_expert_bias: bool = False
+    needs_zero_expert_bias: ClassVar[bool] = False
 
+    # Not ``ClassVar``: ``MoEExecutionContractMixin`` declares both as plain
+    # attributes, and a subclass cannot narrow an instance variable to a class
+    # variable. Their type comes from that declaration.
     capabilities = TRTLLM_GEN_CAPABILITIES
     input_requirement = TRTLLM_GEN_INPUT_REQUIREMENT
 
     @staticmethod
-    def situ_supported_quant_algos() -> FrozenSet[QuantAlgo]:
+    def situ_supported_quant_algos() -> frozenset[QuantAlgo]:
         """The quant algos some leaf of this family has a fused SiTu cubin for.
 
         Public because a model handing SiTu to this family has to decide,
@@ -154,12 +161,12 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         num_experts: int,
         hidden_size: int,
         intermediate_size: int,
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
+        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
         bias: bool = False,
         init_load_balancer: bool = False,
         activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
@@ -210,7 +217,7 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
 
         Separate from ``_check_configs`` because of when it runs: this fires
         from ``__init__`` even when ``skip_create_weights_in_init`` defers
-        weight creation, and it covers all eleven leaves, two of which declare
+        weight creation, and it covers every leaf, including those that declare
         no ``_check_configs`` at all. Resolution rejects the same
         configurations earlier from ``supports_situ``; this catches a leaf
         constructed directly.
@@ -288,8 +295,8 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
     def _requires_separated_routing(self) -> bool:
         """Whether this leaf's kernel takes top-k from the host, not the logits.
 
-        False for ten of the eleven: their cubins route internally from the
-        logits. The one leaf whose kernel has no internal routing overrides this.
+        False by default: these cubins route internally from the logits. A
+        leaf whose kernel has no internal routing overrides this.
         """
         return False
 
@@ -316,7 +323,7 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
             or FORCE_SEPARATED_ROUTING
         )
 
-    def create_weights(self):
+    def create_weights(self) -> None:
         """The allocation skeleton; format variation is a hook, not a test here.
 
         What differs is either an override of ``_create_quant_method_weights``
@@ -391,7 +398,7 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         )
         self.register_parameter("w2_bias", self.w2_bias)
 
-    def supports_moe_output_in_alltoall_workspace(self):
+    def supports_moe_output_in_alltoall_workspace(self) -> bool:
         """Whether ``run_moe`` fills a caller-supplied output buffer.
 
         Only the native provider's runners take an output tensor. A leaf that
@@ -399,28 +406,28 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         """
         return not self.use_flashinfer
 
-    def _unfinalized(self, outputs):
+    def _unfinalized(self, outputs: list[torch.Tensor]) -> list[torch.Tensor]:
         """Hand back per-expert outputs for the caller to combine."""
         assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
         return outputs
 
     def forward_fake(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: torch.Tensor | Fp4QuantizedTensor,
         router_logits: torch.Tensor,
         *,
         do_finalize: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
+        output_dtype: torch.dtype | None = None,
+        all_rank_num_tokens: list[int] | None = None,
+        use_dp_padding: bool | None = None,
         **kwargs,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    ) -> torch.Tensor | list[torch.Tensor]:
         """Meta-tensor shapes for both the finalized and un-finalized ABIs.
 
-        The finalized output is bf16 for all eleven because the shared
-        eligibility gate admits only bfloat16 activations. Eight leaves reach
-        the un-finalized layout, spread across three parents, so it is answered
-        here rather than on any one of them.
+        The finalized output is bf16 for every leaf because the shared
+        eligibility gate admits only bfloat16 activations. The un-finalized
+        layout is reached from more than one parent, so it is answered here
+        rather than on any one of them.
         """
         if do_finalize:
             return super().forward_fake(

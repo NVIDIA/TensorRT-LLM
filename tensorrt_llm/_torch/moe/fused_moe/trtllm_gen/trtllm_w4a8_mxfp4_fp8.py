@@ -14,8 +14,6 @@
 # limitations under the License.
 """``trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8``."""
 
-from typing import Optional, Union
-
 import torch
 
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERunContext
@@ -48,10 +46,12 @@ class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmProviderTraits, TrtllmGenFusedMoEBas
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_trtllm_gen_leaf(cls, p, d)
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         return W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
 
-    def quantize_input(self, x, post_quant_comm: bool = True):
+    def quantize_input(
+        self, x: torch.Tensor, post_quant_comm: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
         x = torch.nn.functional.pad(x, (0, pad_size))
         # Two static per-tensor scales, one per side of the fused FC1: the
@@ -64,11 +64,14 @@ class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmProviderTraits, TrtllmGenFusedMoEBas
         self,
         ctx: MoERunContext,
         *,
-        workspace: Optional[dict] = None,
-    ) -> Union[torch.Tensor, tuple]:
+        workspace: dict | None = None,
+    ) -> torch.Tensor | tuple:
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
 
+        assert k.do_finalize, (
+            "e4m3_mxe2m1_block_scale_moe_runner does not support do_finalize=False"
+        )
         intermediate_size_per_partition_padded = self.w3_w1_weight.shape[-2] // 2
 
         result = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(

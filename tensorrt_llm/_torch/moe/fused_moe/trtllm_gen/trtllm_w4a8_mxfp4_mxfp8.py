@@ -15,13 +15,12 @@
 """``trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8``."""
 
 import os
-from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 from tensorrt_llm._utils import is_sm_100f
 
-from ....utils import MxFp8QuantizedTensor
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
 from ..routing import DeepSeekV3MoeRoutingMethod
@@ -50,9 +49,9 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TrtllmProviderTraits, TRTLLMGenW4a8Mxfp4
 
     def try_fused_route_quant(
         self,
-        x: Union[torch.Tensor, MxFp8QuantizedTensor],
+        x: torch.Tensor | MxFp8QuantizedTensor,
         router_logits: torch.Tensor,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
 
         The op is MXFP8-activation and native-cubin only, which is exactly this

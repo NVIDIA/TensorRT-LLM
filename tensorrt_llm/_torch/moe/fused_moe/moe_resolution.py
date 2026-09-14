@@ -97,7 +97,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
     CuteDslFusedMoE,
-    # The eleven TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
+    # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
     # flag unset every FlashInfer leaf rejects in ``check_flashinfer_provider``
     # and resolution walks on to the native one below.
@@ -135,7 +135,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
     # The coarse literal still names the whole family, so ``moe_backend:
     # TRTLLM`` keeps meaning "any TRTLLM-Gen leaf" and IMPL_PRIORITY picks
-    # which. A pinned ``impl_id`` names exactly one of the eleven.
+    # which. A pinned ``impl_id`` names exactly one of them.
     "TRTLLM": frozenset(
         {
             FlashinferTrtllmGenNvfp4Impl,
@@ -463,7 +463,7 @@ def _reject_unsupported_activation(
 ) -> Optional[MoERejection]:
     """Decline a candidate whose declaration cannot carry this activation.
 
-    Central rather than repeated in eleven ``can_implement`` gates, because the
+    Central rather than repeated in every ``can_implement`` gate, because the
     answer is already written down: ``activation_support`` is the same
     declaration ``materialize_activation_params`` reads. A backend that forgot
     to re-derive it would not run the layer anyway -- it would raise from the

@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from itertools import product
-from typing import Callable, Optional, Type
+from typing import Callable, Optional
 
 import pytest
 import torch
@@ -55,6 +55,7 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDe
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import trtllm_gen_leaves_in_resolution_order
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -80,12 +81,12 @@ class MoeBackendType(str, Enum):
 
 
 def get_backend_class(
-    backend_type: MoeBackendType, quant_algo: Optional[QuantAlgo] = None
-) -> Type[MoE]:
+    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
+) -> type[MoE]:
     """Get the MoE backend class for a given backend type.
 
     Raises when TRTLLM-Gen publishes no leaf for the format. Callers enumerating
-    combinations to decide what is worth running want ``find_backend_class``.
+    combinations to decide what is worth running want ``find_backend_classes``.
     """
     backend_class = find_backend_class(backend_type, quant_algo)
     if backend_class is None:
@@ -96,11 +97,11 @@ def get_backend_class(
 
 
 def find_backend_class(
-    backend_type: MoeBackendType, quant_algo: Optional[QuantAlgo] = None
-) -> Optional[Type[MoE]]:
+    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
+) -> type[MoE] | None:
     """The MoE backend class, or ``None`` if TRTLLM-Gen has no leaf for the format.
 
-    ``TRTLLM`` is not one class but eleven leaves keyed by (provider, quant), so
+    ``TRTLLM`` is not one class but a set of leaves keyed by (provider, quant), so
     it needs ``quant_algo``. It prefers the native leaf for that format and
     falls back to the FlashInfer sibling, which is what "the TRTLLM backend"
     has to mean for the unquantized format: bf16 has no native leaf, only
@@ -126,6 +127,26 @@ def find_backend_class(
         MoeBackendType.MARLIN: MarlinFusedMoE,
     }
     return backend_class_map[backend_type]
+
+
+def find_backend_classes(
+    backend_type: MoeBackendType, quant_algo: QuantAlgo | None = None
+) -> tuple[type[MoE], ...]:
+    """The classes a resolution walk would try, in its order; empty if none.
+
+    A tuple and not one class because ``TRTLLM`` is a provider pair, and
+    ``IMPL_PRIORITY`` ranks each FlashInfer leaf ahead of its native sibling:
+    resolution falls through to the native one when the FlashInfer leaf
+    rejects -- a missing wheel, an unmet shape -- and not only when it is
+    absent. A caller asking whether a case is *supported* has to ask the same
+    way, or it skips cases the layer under test goes on to serve.
+
+    :func:`find_backend_class` stays for callers that want to name one class.
+    """
+    if backend_type is MoeBackendType.TRTLLM:
+        return trtllm_gen_leaves_in_resolution_order(quant_algo)
+    cls = find_backend_class(backend_type, quant_algo)
+    return () if cls is None else (cls,)
 
 
 # ============================================================================
@@ -1263,8 +1284,12 @@ def get_quick_skip_reason(
     trtllm_logger.setLevel(_logging.ERROR)
 
     try:
-        backend_cls = find_backend_class(backend_type, quant_algo)
-        if backend_cls is None:
+        # Every candidate a run would try, in resolution's order, because
+        # resolution falls through to the native leaf when the FlashInfer one
+        # rejects. Asking a single pre-picked class would skip cases the layer
+        # under test goes on to serve.
+        candidates = find_backend_classes(backend_type, quant_algo)
+        if not candidates:
             # No leaf publishes this (provider, quant) pair, which is the same
             # verdict the single TRTLLM-Gen ``can_implement`` used to return as
             # QUANT_UNSUPPORTED. Asked as a query, so any other failure in the
@@ -1281,8 +1306,16 @@ def get_quick_skip_reason(
         # and limit together, so stand-in values suffice. Still routed through
         # ``build_test_activation`` so the carrier matches the one the tests
         # build layers with.
-        present = 1.0 if swiglu_gptoss_style else None
-        activation = build_test_activation(activation_type, present, present, present)
+        #
+        # SiTu's soft caps are not part of that package and are required, so
+        # they get their own stand-ins: gating them on ``swiglu_gptoss_style``
+        # would have this query raise from the activation's own validator
+        # instead of answering with a skip reason.
+        if ActivationType(activation_type) is ActivationType.SiTu:
+            activation = build_test_activation(activation_type, 1.0, 1.0)
+        else:
+            present = 1.0 if swiglu_gptoss_style else None
+            activation = build_test_activation(activation_type, present, present, present)
         problem = MoEProblem(
             quant=canonical_quant(quant_algo),
             dtype_act=dtype,
@@ -1304,9 +1337,18 @@ def get_quick_skip_reason(
             num_slots=0 if model_config is None else model_config.num_experts,
             env=collect_moe_environment(),
         )
-        verdict = backend_cls.can_implement(problem, deployment)
-        if not verdict.eligible:
-            return f"{verdict.reject_reason.value}: {verdict.detail}"
+        reason = None
+        for backend_cls in candidates:
+            verdict = backend_cls.can_implement(problem, deployment)
+            if verdict.eligible:
+                reason = None
+                break
+            # The last candidate's reason, not the first: without the opt-in
+            # flag every FlashInfer leaf rejects for the flag alone, which says
+            # nothing about why the case is unsupported.
+            reason = f"{verdict.reject_reason.value}: {verdict.detail}"
+        if reason is not None:
+            return reason
 
         # Chain skip checks: routing method, then per-backend constraints
         skip_checks = [
