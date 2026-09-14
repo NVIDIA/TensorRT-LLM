@@ -157,7 +157,8 @@ def _assert_locality_close(actual, expected, *, fused=True):
 @pytest.mark.skipif(get_sm_version() not in (100, 103, 107), reason="requires Blackwell or Rubin")
 @pytest.mark.parametrize("nvfp4,tactic", [(False, (64, 0)), (True, (8, 18)), (True, (16, 12))])
 @pytest.mark.parametrize("reuse", [2, 4])
-def test_prims_ts_partitioned_persistent_graph(nvfp4, tactic, reuse, monkeypatch):
+@pytest.mark.parametrize("tokens", [16, 1024])
+def test_prims_ts_partitioned_persistent_graph(nvfp4, tactic, reuse, tokens, monkeypatch):
     """Exercise multiple expert tiles per resident cluster on ordinary streams."""
     from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.moe.custom_ops import prims_ts_moe as ops
@@ -180,8 +181,8 @@ def test_prims_ts_partitioned_persistent_graph(nvfp4, tactic, reuse, monkeypatch
     # One resident cluster guarantees work-tile iteration even for tiny batches.
     monkeypatch.setattr(ops, "_full_device_cluster_budget", lambda *args: 1)
     (_, baseline), _ = make_moe_pair(nvfp4, False, hidden=1024, intermediate=1024, localize=False)
-    x = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16) * 0.5
-    logits = torch.randn(16, 8, device="cuda")
+    x = torch.randn(tokens, 1024, device="cuda", dtype=torch.bfloat16) * 0.5
+    logits = torch.randn(tokens, 8, device="cuda")
     with torch.inference_mode(), AutoTuner.get().capture() as capture:
         baseline(x, logits)
     context = next(

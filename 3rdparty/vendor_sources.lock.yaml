@@ -27,6 +27,7 @@ vendors:
     - prims_ts/batched_gemm/gmem_ab_resources.py
     - prims_ts/batched_gemm/gmem_c_resources.py
     - prims_ts/batched_gemm/gmem_sf_resources.py
+    - prims_ts/batched_gemm/pdl_resources.py
     - prims_ts/batched_gemm/smem_ab_resources.py
     - prims_ts/batched_gemm/smem_deepseek_sf_resources.py
     - prims_ts/batched_gemm/smem_misc_resources.py
@@ -44,5 +45,5 @@ vendors:
     - prims_ts/moe/compile_cache.py
     - prims_ts/moe/prims_ts_moe_configs.json
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts-moe.patch
-    patch_digest: sha256:c046c1a04933d6565d240e21aeaefd27e3332341c563f1ba8563daaf7060b94c
-    digest: sha256-tree-v1:2a61e07f92dd0409424b857af3ce715737770291909ea54cc52180615f5b4e84
+    patch_digest: sha256:c8f692a2dce01fecaa7255da91b7020eaf786f4d093519e6d234d8d16ef9b1e6
+    digest: sha256-tree-v1:a1c491088ca2129427015b51caa6c8b3b8d6aa710990a0571a92b2a34e74a03b

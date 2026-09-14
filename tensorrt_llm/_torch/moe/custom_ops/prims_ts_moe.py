@@ -512,7 +512,7 @@ class PrimsTSMoERunner(TunableRunner):
 
     def unique_id(self):
         identity = (
-            "hybrid_routing_v5",
+            "hybrid_routing_v6",
             self.num_experts,
             self.local_expert_offset,
             self.activation_type,

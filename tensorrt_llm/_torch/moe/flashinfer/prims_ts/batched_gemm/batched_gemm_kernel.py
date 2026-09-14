@@ -52,14 +52,14 @@ from cutlass.experimental.task_scheduling.memory import (
     TmemAllocator,
 )
 from cutlass.experimental.task_scheduling.resources import (
-    PdlLaunchBarrier,
-    PdlWaitBarrier,
     PipelineConfig,
     TileSchedulerConfig,
     WorkQueue,
 )
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 from cutlass.experimental.task_scheduling.pipeline_group import PipelineGroup
+
+from .pdl_resources import PdlLaunchBarrier, PdlWaitBarrier
 
 from .batched_gemm_config import (
     BatchedGemmConfig,
@@ -2563,7 +2563,7 @@ def batched_gemm_kernel_bf16(
     early_exit_max_token_ctas: cutlass.Int32,
 ) -> None:
     if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas):
-        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        cute.arch.griddepcontrol_wait()
 
     if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):
         # Dynamic-batch kernels launch a max token-CTA grid for
@@ -2738,8 +2738,11 @@ def gemm(
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     else:
+        # Activations are stacked by routed token, and their expert coordinate
+        # is always zero. Only weights have a separate expert allocation axis.
+        a_batches = num_experts_dim if cutlass.const_expr(cfg.is_swap_ab) else 1
         a_layout = cute.make_layout(
-            (cute.assume(k, 32), m, num_experts_dim),
+            (cute.assume(k, 32), m, a_batches),
             stride=(
                 1,
                 cute.assume(k, 32),
@@ -2769,8 +2772,9 @@ def gemm(
             stride=(1, cute.assume(k, 32), TMA_XLARGE_N - k, cute.assume(k, 32)),
         )
     else:
+        b_batches = 1 if cutlass.const_expr(cfg.is_swap_ab) else num_experts_dim
         b_layout = cute.make_layout(
-            (cute.assume(k, 32), n, num_experts_dim),
+            (cute.assume(k, 32), n, b_batches),
             stride=(
                 1,
                 cute.assume(k, 32),

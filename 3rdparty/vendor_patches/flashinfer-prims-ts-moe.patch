@@ -540,7 +540,7 @@ index 087e8e2000d5a8e7e727b4063b623c17741e300d..5c80c7feaad263a55dca24d05dbe69cf
  
      if cfg.use_global_scales not in (0, 1):
 diff --git a/prims_ts/batched_gemm/batched_gemm_kernel.py b/prims_ts/batched_gemm/batched_gemm_kernel.py
-index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187db9243ce 100644
+index d92fc09e3e88c663984dad337fa9795601eff589..f62351edeabd7a626d4e1223ab722323a079b412 100644
 --- a/prims_ts/batched_gemm/batched_gemm_kernel.py
 +++ b/prims_ts/batched_gemm/batched_gemm_kernel.py
 @@ -1,4 +1,5 @@
@@ -565,11 +565,20 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
      TileSchedulerType,
  )
  from cutlass.experimental.task_scheduling.memory import (
-@@ -56,6 +59,7 @@ from cutlass.experimental.task_scheduling.resources import (
+@@ -49,13 +52,14 @@ from cutlass.experimental.task_scheduling.memory import (
+     TmemAllocator,
+ )
+ from cutlass.experimental.task_scheduling.resources import (
+-    PdlLaunchBarrier,
+-    PdlWaitBarrier,
+     PipelineConfig,
+     TileSchedulerConfig,
      WorkQueue,
  )
  from cutlass.experimental.task_scheduling.task_manager import TaskManager
 +from cutlass.experimental.task_scheduling.pipeline_group import PipelineGroup
++
++from .pdl_resources import PdlLaunchBarrier, PdlWaitBarrier
  
  from .batched_gemm_config import (
      BatchedGemmConfig,
@@ -1163,6 +1172,15 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
      per_token_sf_a_tensor: cute.Tensor,
      per_token_sf_b_tensor: cute.Tensor,
      tile_idx_tensor: cute.Tensor,
+@@ -2415,7 +2563,7 @@ def batched_gemm_kernel_bf16(
+     early_exit_max_token_ctas: cutlass.Int32,
+ ) -> None:
+     if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas):
+-        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
++        cute.arch.griddepcontrol_wait()
+ 
+     if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):
+         # Dynamic-batch kernels launch a max token-CTA grid for
 @@ -2444,6 +2592,7 @@ def batched_gemm_kernel_bf16(
                  gemm1_alpha_tensor,
                  gemm1_beta_tensor,
@@ -1224,11 +1242,17 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
          )
          a_tensor = cute.make_tensor(a_ptr, a_layout)
      elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
-@@ -2582,7 +2740,11 @@ def gemm(
+@@ -2580,9 +2738,16 @@ def gemm(
+         )
+         a_tensor = cute.make_tensor(a_ptr, a_layout)
      else:
++        # Activations are stacked by routed token, and their expert coordinate
++        # is always zero. Only weights have a separate expert allocation axis.
++        a_batches = num_experts_dim if cutlass.const_expr(cfg.is_swap_ab) else 1
          a_layout = cute.make_layout(
-             (cute.assume(k, 32), m, num_experts_dim),
+-            (cute.assume(k, 32), m, num_experts_dim),
 -            stride=(1, cute.assume(k, 32), cute.assume(m * k, 32)),
++            (cute.assume(k, 32), m, a_batches),
 +            stride=(
 +                1,
 +                cute.assume(k, 32),
@@ -1237,7 +1261,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
          )
          a_tensor = cute.make_tensor(a_ptr, a_layout)
  
-@@ -2594,12 +2756,12 @@ def gemm(
+@@ -2594,12 +2759,12 @@ def gemm(
                  1,
                  b_block_k,
                  cute.assume(n * b_block_k, 32),
@@ -1252,11 +1276,15 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
          )
      elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
          b_layout = cute.make_layout(
-@@ -2609,7 +2771,11 @@ def gemm(
+@@ -2607,9 +2772,14 @@ def gemm(
+             stride=(1, cute.assume(k, 32), TMA_XLARGE_N - k, cute.assume(k, 32)),
+         )
      else:
++        b_batches = 1 if cutlass.const_expr(cfg.is_swap_ab) else num_experts_dim
          b_layout = cute.make_layout(
-             (cute.assume(k, 32), n, num_experts_dim),
+-            (cute.assume(k, 32), n, num_experts_dim),
 -            stride=(1, cute.assume(k, 32), cute.assume(n * k, 32)),
++            (cute.assume(k, 32), n, b_batches),
 +            stride=(
 +                1,
 +                cute.assume(k, 32),
@@ -1265,7 +1293,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
          )
      b_tensor = cute.make_tensor(b_ptr, b_layout)
  
-@@ -2774,7 +2940,7 @@ def gemm(
+@@ -2774,7 +2944,7 @@ def gemm(
              # Pad sf_k to 16-byte alignment (TMA requirement).
              sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
              sfa_2d_layout = cute.make_layout(
@@ -1274,7 +1302,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
                  stride=(1, sf_k_total),
              )
              sfa_tensor = cute.make_tensor(
-@@ -2852,7 +3018,7 @@ def gemm(
+@@ -2852,7 +3022,7 @@ def gemm(
              # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4
              sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
              sfb_2d_layout = cute.make_layout(
@@ -1283,7 +1311,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
                  stride=(1, sf_k_total),
              )
              sfb_tensor = cute.make_tensor(
-@@ -2979,9 +3145,9 @@ def gemm(
+@@ -2979,9 +3149,9 @@ def gemm(
          else:
              launch_num_tiles_m = early_exit_max_token_ctas
      block = cfg.threads_per_cta
@@ -1295,7 +1323,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
          clc_raster_along_m = True
          tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
              (launch_num_tiles_m, launch_num_tiles_n, 1),
-@@ -2996,12 +3162,18 @@ def gemm(
+@@ -2996,12 +3166,18 @@ def gemm(
              (launch_num_tiles_m, launch_num_tiles_n, 1),
              cluster_shape,
          )
@@ -1315,7 +1343,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
      if cutlass.const_expr(cfg.is_swap_ab):
          # SwapAB: C is (M, N) in M-major (column-major) layout.
          # M = hidden dim (stride-1), N = tokens (stride-M).
-@@ -3039,7 +3211,7 @@ def gemm(
+@@ -3039,7 +3215,7 @@ def gemm(
          else:
              c_layout = cute.make_layout(
                  (cute.assume(output_m_for_c, 32), cute.assume(n, 16)),
@@ -1324,7 +1352,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
              )
      else:
          # Non-swapAB: C is (M, N) row-major.
-@@ -3131,6 +3303,7 @@ def gemm(
+@@ -3131,6 +3307,7 @@ def gemm(
      output_m_for_sf = m
      if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
          output_m_for_sf = m // Int32(2)
@@ -1332,7 +1360,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
      if cutlass.const_expr(cfg.has_epilogue_quant):
          sf_block_m = Int32(cfg.output_sf_block_size_c)
          sf_group_m = sf_block_m * Int32(4)
-@@ -3199,6 +3372,11 @@ def gemm(
+@@ -3199,6 +3376,11 @@ def gemm(
          per_token_sf_layout,
      )
  
@@ -1344,7 +1372,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
      # tile_idx and mn_limit: indexed by the TOKEN dimension tiles.
      # non-swapAB: tokens = M → num_tiles_m.  swapAB: tokens = N → num_tiles_n.
      if cutlass.const_expr(cfg.is_swap_ab):
-@@ -3209,7 +3387,7 @@ def gemm(
+@@ -3209,7 +3391,7 @@ def gemm(
      tile_idx_tensor = cute.make_tensor(tile_idx_raw_ptr, tile_idx_layout)
  
      # Route map (gather only; dummy 1-element when off)
@@ -1353,7 +1381,7 @@ index d92fc09e3e88c663984dad337fa9795601eff589..a30e3487c7c4829b36d34aa832b1f187
          num_total_tokens = n if cutlass.const_expr(cfg.is_swap_ab) else m
          route_map_layout = cute.make_layout((num_total_tokens,), stride=(1,))
      else:
-@@ -3300,6 +3478,7 @@ def gemm(
+@@ -3300,6 +3482,7 @@ def gemm(
          gemm1_alpha_tensor,
          gemm1_beta_tensor,
          gemm1_clamp_limit_tensor,
@@ -2182,6 +2210,49 @@ index 1dc5c99841e7fcee147104e8b05657ea5be539b0..41cfec9a62caf0324c225fe212756a9a
                              token_in_bounds = (
                                  n_subtile_offset + tmem_col
                              ) < token_limit
+diff --git a/prims_ts/batched_gemm/pdl_resources.py b/prims_ts/batched_gemm/pdl_resources.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a474c1d9ac90e92a908a5a3090e51021dabb2506
+--- /dev/null
++++ b/prims_ts/batched_gemm/pdl_resources.py
+@@ -0,0 +1,37 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""PDL resources with explicit compiler ordering for predecessor memory."""
++
++from dataclasses import dataclass
++
++import cutlass.cute as cute
++from cutlass.experimental.task_scheduling.resources import (
++    PdlLaunchBarrier as _PdlLaunchBarrier,
++    PdlWaitBarrier as _PdlWaitBarrier,
++    StageInfo,
++    consumer_work,
++    producer_work,
++)
++
++
++@dataclass(kw_only=True)
++class PdlWaitBarrier(_PdlWaitBarrier):
++    """Keep predecessor-dependent loads behind the grid wait."""
++
++    @consumer_work
++    @cute.jit
++    def wait_griddep(self, stage_info: StageInfo) -> None:
++        # The NVVM intrinsic carries no-memory effects. The CuTe PTX wrapper
++        # also supplies a compiler memory clobber, so routed-metadata loads
++        # cannot move ahead of predecessor completion.
++        cute.arch.griddepcontrol_wait()
++
++
++@dataclass(kw_only=True)
++class PdlLaunchBarrier(_PdlLaunchBarrier):
++    """Keep the launch hint ordered with the preceding PDL wait and loads."""
++
++    @producer_work
++    @cute.jit
++    def launch_griddep(self, stage_info: StageInfo) -> None:
++        cute.arch.griddepcontrol_launch_dependents()
 diff --git a/prims_ts/batched_gemm/smem_ab_resources.py b/prims_ts/batched_gemm/smem_ab_resources.py
 index cff0f9c9b28b2215ad560358b105cfa180e9876c..384c5aa0cc93f51996e87f43f498a39369f099f5 100644
 --- a/prims_ts/batched_gemm/smem_ab_resources.py
