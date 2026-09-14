@@ -17,8 +17,6 @@
 
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/include/nvrtcWrapper.h"
 
-#include "nvrtcLinkage.h"
-
 #include <cstring>
 #include <cuda.h>
 #include <nvrtc.h>
@@ -299,12 +297,6 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
 
 tllmXqaJitStatus tllmXqaJitCreateAndCompileProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const* context)
 {
-    auto const linkageError = tensorrt_llm::kernels::getNvrtcLinkageError();
-    if (!linkageError.empty())
-    {
-        setErrorString(linkageError);
-        return TLLM_XQA_JIT_INTERNAL_ERROR;
-    }
     CHECK_TLLM_XQA_JIT_ERROR(createProgram(prog, context));
     CHECK_TLLM_XQA_JIT_ERROR(compileProgram(*prog));
     return TLLM_XQA_JIT_SUCCESS;

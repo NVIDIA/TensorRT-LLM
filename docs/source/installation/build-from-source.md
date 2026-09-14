@@ -86,21 +86,6 @@ Key flags used above:
 | `--fast_build` | Skip compiling some kernels to speed up compilation -- for development only |
 | `--cpp_only` | Build only the C++ runtime library, without Python bindings |
 
-### NVRTC linkage
-
-TensorRT LLM links NVRTC statically by default (`NVRTC_DYNAMIC_LINKING=OFF`).
-Replacing `libnvrtc.so` or changing `LD_LIBRARY_PATH` does not replace that static
-copy. To intentionally use a different shared NVRTC library, rebuild with
-`--configure_cmake --extra-cmake-vars NVRTC_DYNAMIC_LINKING=ON`, and ensure that
-the intended NVRTC library and its matching builtins are available at runtime.
-
-On Linux, XQA checks its NVRTC API bindings before creating a compilation program.
-If a static build resolves an API to another shared library (for example through
-`LD_PRELOAD` or a dependency), it reports the symbol and library paths rather
-than proceeding with potentially mixed NVRTC implementations. Remove the
-conflicting dependency or preload, or rebuild in dynamic mode. Merely loading a
-separate dynamic NVRTC without interposing XQA's APIs is not an error.
-
 ### Building from a checkout on a network filesystem
 
 Network filesystems (Lustre, NFS, GPFS) handle large streaming I/O well but are slow for metadata-heavy workloads. A full build creates a very large number of small files (CMake state, object files, downloaded dependencies, the build virtual environment, wheel staging), so keeping that state in the checkout makes builds on such filesystems far slower than necessary.

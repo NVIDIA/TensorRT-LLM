@@ -1,5 +1,5 @@
 # ~~~
-# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,15 +19,12 @@
 add_subdirectory(${TRT_LLM_ROOT_DIR}/cpp/kernels/xqa xqa_build)
 
 add_library(nvrtc_wrapper_src STATIC include/nvrtcWrapper.h
-                                     src/nvrtcWrapper.cpp src/nvrtcLinkage.cpp)
+                                     src/nvrtcWrapper.cpp)
 add_dependencies(nvrtc_wrapper_src xqa_sources_h)
 target_include_directories(nvrtc_wrapper_src
                            PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/xqa_build)
 target_link_libraries(
   nvrtc_wrapper_src PUBLIC ${NVRTC_LIB} ${NVRTC_BUILTINS_LIB} ${CUDA_DRV_LIB}
-                           ${CUDA_RT_LIB} ${CMAKE_DL_LIBS})
-target_compile_definitions(
-  nvrtc_wrapper_src
-  PRIVATE TRTLLM_NVRTC_DYNAMIC_LINKING=$<BOOL:${NVRTC_DYNAMIC_LINKING}>)
+                           ${CUDA_RT_LIB})
 set_property(TARGET nvrtc_wrapper_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET nvrtc_wrapper_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

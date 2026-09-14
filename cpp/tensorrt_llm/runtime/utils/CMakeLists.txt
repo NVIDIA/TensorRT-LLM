@@ -23,8 +23,8 @@ target_include_directories(pg_utils PUBLIC ${PROJECT_SOURCE_DIR}/include
                                            ${TORCH_INCLUDE_DIRS})
 
 # ProcessGroup and intrusive_ptr only need the CPU-side PyTorch libraries.
-# TORCH_LIBRARIES also includes dynamic NVRTC, which can preempt the static
-# NVRTC linked into libtensorrt_llm through this library's dependency chain.
+# TORCH_LIBRARIES can include dynamic NVRTC, which can preempt the static NVRTC
+# linked into libtensorrt_llm through this library's dependency chain.
 target_link_libraries(pg_utils PUBLIC torch_cpu c10)
 
 # Find torch_python
