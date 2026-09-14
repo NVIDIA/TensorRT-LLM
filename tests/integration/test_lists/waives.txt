@@ -134,7 +134,6 @@ full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6771023)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6728119)
-full:B300/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8] SKIP (https://nvbugs/6770978)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6728119)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8] SKIP (https://nvbugs/6770977)
