@@ -150,6 +150,11 @@ def write_msa_phase_kv(
         )
     if k is None or v is None:
         return
+    # The fused per-layer scatter (metadata.msa_write_layer_caches) may have
+    # written this whole step's K/V for the layer already; both phases of a
+    # mixed step then skip, and prepare() clears the marker for the next step.
+    if getattr(metadata, "_msa_prewritten_layer", None) == attn.layer_idx:
+        return
     num_tokens = int(k.shape[0])
     if num_tokens == 0:
         return
