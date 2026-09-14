@@ -22,6 +22,7 @@ import pytest
 import torch
 from defs import conftest
 from defs.common import venv_check_call
+from defs.conftest import skip_pre_blackwell
 from defs.examples.visual_gen.visual_gen_test_utils import (
     FASTWAN_LPIPS_FRAME_RATE,
     FASTWAN_LPIPS_GUIDANCE_SCALE,
@@ -462,16 +463,8 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
 # =============================================================================
 
 
-@pytest.fixture
-def _wan_t2v_example_deps(request):
-    """Filter the release platforms before checking media dependencies."""
-    sm_version = conftest.get_sm_version()
-    if sm_version not in (100, 107):
-        pytest.skip("Wan 2.2 release tests target B200/GB200 (SM100) and Rubin (SM107)")
-    request.getfixturevalue("_visual_gen_deps")
-
-
-def test_wan_t2v_example(_wan_t2v_example_deps, llm_root, llm_venv):
+@skip_pre_blackwell
+def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_t2v.py with NVFP4 config end-to-end.
 
     Reuse the shared ``configs/wan2.2-t2v-fp4-1gpu.yaml`` configuration. Prefer
@@ -514,6 +507,7 @@ def test_wan_t2v_example(_wan_t2v_example_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
+@skip_pre_blackwell
 def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/wan_i2v.py with NVFP4 config end-to-end.
 

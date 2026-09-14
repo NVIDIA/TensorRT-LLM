@@ -36,6 +36,7 @@ import gc
 import pytest
 import torch
 from utils.llm_data import get_checkpoint
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TeaCacheConfig, VisualGenArgs
@@ -153,6 +154,7 @@ def _assert_dual_stage_teacache(pipeline, height: int, width: int) -> None:
 class TestWan22T2V_TeaCache:
     """Wan2.2-T2V-A14B  480x832  dual-stage TeaCache."""
 
+    @skip_pre_blackwell
     def test_wan22_t2v_teacache_forward_runs(self, wan22_t2v_pipeline):
         _assert_dual_stage_teacache(wan22_t2v_pipeline, height=480, width=832)
 
