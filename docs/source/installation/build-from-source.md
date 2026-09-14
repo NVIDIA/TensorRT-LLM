@@ -71,7 +71,7 @@ Key flags used above:
 | Flag | Purpose |
 |------|---------|
 | `--use_ccache` | Use ccache for faster incremental rebuilds |
-| `-a "90-real"` | Build only for a specific GPU architecture (e.g. Hopper). Reduces compile time significantly. See {ref}`support-matrix-hardware` for values. |
+| `-a "90-real"` | Build only for a specific GPU architecture (e.g. Hopper). Reduces compile time significantly. See [Supported Hardware](../supported-hardware.md) for values. |
 | `--skip_building_wheel` | Skip `.whl` packaging -- only needed for distribution, not development |
 | `--linking_install_binary` | Symlink built libraries instead of copying them |
 | `pip install -e .` | Editable install so Python changes take effect without reinstalling |

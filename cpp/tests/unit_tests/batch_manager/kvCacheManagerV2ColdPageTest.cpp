@@ -378,13 +378,16 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGpuTierSupportsSingleSlotRoundTrip)
     MemAddress const hotAddress
         = std::get<MemAddress>(storage.slotAddress(kHotLevel, hotPoolGroup, hotSlot.slotId(), PoolIndex{0}));
     constexpr uint8_t kPattern = 0xA7;
-    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(hotAddress), kPattern, hotPageBytes), cudaSuccess);
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    // Every operation on the hot page must be ordered against the migrations, so issue the memsets
+    // on `stream` too. cudaMemset() goes to the legacy NULL stream and is asynchronous with respect
+    // to the host for device memory; because `stream` is cudaStreamNonBlocking it does not
+    // implicitly synchronize with the legacy stream, so a plain cudaMemset() here would be free to
+    // land after the migration that is supposed to overwrite it.
+    ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(hotAddress), kPattern, hotPageBytes, stream), cudaSuccess);
 
     storage.copySlotData(
         lifeCycle, coldLevel, kHotLevel, coldSlot.slotId(), hotSlot.slotId(), reinterpret_cast<CUstream>(stream));
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(hotAddress), 0, hotPageBytes), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(hotAddress), 0, hotPageBytes, stream), cudaSuccess);
     storage.copySlotData(
         lifeCycle, kHotLevel, coldLevel, hotSlot.slotId(), coldSlot.slotId(), reinterpret_cast<CUstream>(stream));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);

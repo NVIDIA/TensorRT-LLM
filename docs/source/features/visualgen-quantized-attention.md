@@ -9,9 +9,9 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
   - [Choosing and Tuning a Recipe](#choosing-and-tuning-a-recipe)
   - [Configuration Surface](#configuration-surface)
 - [QK16PV8 Attention Kernels in the CUTEDSL Backend](#qk16pv8-attention-kernels-in-the-cutedsl-backend)
-- [SageAttention (TRTLLM)](#sageattention-trtllm)
+- [SageAttention (TRTLLM)](#sageattention-in-the-trtllm-backend)
 - [FP8 and MXFP8 in the cuDNN Backend](#fp8-and-mxfp8-in-the-cudnn-backend)
-- [MXFP8 / NVFP4 (CUTEDSL / FlashInfer)](#mxfp8--nvfp4-cutedsl--flashinfer)
+- [MXFP8 / NVFP4 (CUTEDSL / FlashInfer)](#mxfp8-and-nvfp4-in-the-cutedsl-and-flashinfer-backends)
 - [Interaction With Other Features](#interaction-with-other-features)
 
 ## Overview
