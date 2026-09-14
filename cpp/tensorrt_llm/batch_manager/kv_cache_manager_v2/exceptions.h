@@ -100,8 +100,8 @@ public:
 };
 
 // Mirrors a Python `assert` failure: the binding layer translates this to a
-// Python AssertionError so shared tests observe the same exception type as the
-// pure-Python backend.
+// Python AssertionError, so a configuration mistake surfaces to Python callers
+// as the exception type they would expect.
 class AssertionError : public std::logic_error
 {
 public:

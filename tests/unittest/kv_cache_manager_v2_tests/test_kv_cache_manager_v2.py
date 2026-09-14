@@ -2452,8 +2452,8 @@ class TestSSMSupport(unittest.TestCase):
 
         First resume of a cache reusing an SSM snapshot copies the snapshot
         into a private slot; the copy must appear in the SSM life cycle's
-        iteration stats (TRTLLM-15217). Runs against the selected backend, so
-        it checks the default C++ implementation and Python-backend parity.
+        iteration stats (TRTLLM-15217). Offload, onboard and host-drop for the
+        same life cycle are covered by KvCacheManagerV2StatsTest.
         """
         tokens_per_block = 32
         cfg = self._make_ssm_config(tokens_per_block=tokens_per_block)
