@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/eventManager.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/introspection.h"
@@ -2182,6 +2183,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
         nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
+
+    // CUDA virtual-memory primitives, reached through _introspection because they carry no
+    // stability promise: the native disaggregated bounce buffer reserves one contiguous fabric
+    // region with them and maps physical chunks into it up front.
+    nb::class_<kv::PooledPhysMemAllocator>(mIntrospection, "PooledPhysMemAllocator")
+        .def(nb::init<size_t>(), nb::arg("phys_mem_size"))
+        .def_prop_ro("device_id", &kv::PooledPhysMemAllocator::deviceId);
+    nb::class_<kv::VirtMem>(mIntrospection, "VirtMem")
+        // keep_alive<1, 3>: VirtMem holds PooledPhysMemAllocator by reference, so the allocator
+        // must outlive it. Argument 3 is the allocator (1 is self, 2 is vm_size).
+        .def(nb::init<size_t, kv::PooledPhysMemAllocator&, size_t>(), nb::arg("vm_size"), nb::arg("phys_mem_allocator"),
+            nb::arg("init_num_phys_mem") = 0, nb::keep_alive<1, 3>())
+        .def("destroy", &kv::VirtMem::destroy)
+        .def_prop_ro("address", &kv::VirtMem::address);
 
     // ---- Cold-page codec --------------------------------------------------
     nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");

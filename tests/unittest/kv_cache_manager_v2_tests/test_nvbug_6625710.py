@@ -72,10 +72,6 @@ PROMPT_BLOCKS = 2
 CHURN_REQUESTS = 100
 
 
-@unittest.skipUnless(
-    kv_test.KV_CACHE_MANAGER_V2_BACKEND == "cpp",
-    "the Python backend carries its own copy of this logic and is not fixed yet",
-)
 class TestNvBug6625710(unittest.TestCase):
     """Evicting an unheld SSM snapshot must not detach a still-referenced block."""
 

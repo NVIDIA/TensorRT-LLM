@@ -453,11 +453,12 @@ Use extra review and tests for changes involving:
   `radixBlockTreeTest.cpp`, `kvCacheManagerTest.cpp`,
   `kvCacheManagerV2DigestPoolTest.cpp`, `kvCacheManagerV2HostMemTest.cpp`,
   `kvCacheManagerV2StatsTest.cpp`, and `kvCacheManagerV2TypedIndexTest.cpp`.
-- Python behavior and backend-parity tests are in
-  `tests/unittest/kv_cache_manager_v2_tests/`. During development, prefer the
-  fast path below: set `PYTHONPATH` to `tensorrt_llm/runtime/` and execute the
-  test file directly with `python`. Do not use `pytest` for this fast path; the
-  file's test runner avoids importing the full `tensorrt_llm` package.
+- Python behavior tests are in `tests/unittest/kv_cache_manager_v2_tests/`, and
+  drive this C++ implementation through the nanobind bindings. During
+  development, prefer the fast path below: set `PYTHONPATH` to
+  `tensorrt_llm/runtime/` and execute the test file directly with `python`. Do
+  not use `pytest` for this fast path; the file's test runner avoids importing
+  the full `tensorrt_llm` package.
 
   ```bash
   REPO_ROOT="$(git rev-parse --show-toplevel)"

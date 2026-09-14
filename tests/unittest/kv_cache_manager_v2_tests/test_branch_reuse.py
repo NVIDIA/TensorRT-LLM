@@ -16,6 +16,7 @@
 import gc
 import itertools
 import os
+import sys
 import unittest
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
@@ -27,16 +28,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DataRole,
         KVCacheManager,
         LayerId,
+        MemAddress,
         TokenId,
         TokenIdExt,
-    )
-    from kv_cache_manager_v2._common import MemAddress
-    from kv_cache_manager_v2._utils import (
-        TemporaryCudaStream,
-        exact_div,
-        init_cuda_once,
-        round_up,
-        temporary_sys_path,
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -45,19 +39,24 @@ else:
         DataRole,
         KVCacheManager,
         LayerId,
+        MemAddress,
         TokenId,
         TokenIdExt,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._common import MemAddress
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
-        TemporaryCudaStream,
-        exact_div,
-        init_cuda_once,
-        round_up,
-        temporary_sys_path,
-    )
 
-with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TEST_DIR not in sys.path:
+    sys.path.insert(0, _TEST_DIR)
+
+from cuda_test_utils import (  # noqa: E402
+    TemporaryCudaStream,
+    exact_div,
+    init_cuda_once,
+    round_up,
+    temporary_sys_path,
+)
+
+with temporary_sys_path(_TEST_DIR):
     from kernels import check_values, fill_values
     from test_kv_cache_manager_v2 import create_config
 

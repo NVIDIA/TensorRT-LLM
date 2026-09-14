@@ -121,36 +121,6 @@ def _make_mock_kv_iter_stats(
     return {window_size: s}
 
 
-class _FakeStorageStatistics(SimpleNamespace):
-    @property
-    def unavailable(self):
-        return self.total - self.available
-
-
-class _FakePeakStorage:
-    num_pool_groups = 2
-    num_cache_levels = 2
-
-    def __init__(self):
-        self._levels = []
-        self.primary_stats = [
-            _FakeStorageStatistics(total=10, available=8, evictable=1),
-            _FakeStorageStatistics(total=10, available=9, evictable=0),
-        ]
-        self.secondary_stats = [
-            _FakeStorageStatistics(total=5, available=4, evictable=1),
-            _FakeStorageStatistics(total=5, available=5, evictable=0),
-        ]
-
-    def get_statistics(self, level):
-        if int(level) == 0:
-            return self.primary_stats
-        return self.secondary_stats
-
-    def destroy(self):
-        pass
-
-
 class TestStatsSerializer:
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
@@ -515,46 +485,3 @@ class TestStatsSerializer:
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["0"]
         assert "iterSuspendedRequests" not in pool_group
         assert "iterResumedRequests" not in pool_group
-
-    def test_v2_peak_block_stats_reset_tracks_interval_peak(self):
-        """Peak block stats should cover the interval since the previous reset."""
-        from tensorrt_llm.runtime.kv_cache_manager_v2._common import GPU_LEVEL, CacheLevel
-        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache_manager import KVCacheManager
-
-        storage = _FakePeakStorage()
-        manager = object.__new__(KVCacheManager)
-        manager._storage = storage
-        manager._radix_tree = SimpleNamespace(clear=lambda: [])
-        manager._reset_iteration_peak_num_blocks()
-
-        # Some gauges rise above the reset baseline, then fall before drain.
-        storage.primary_stats[0].available = 5  # primary used = 5
-        storage.primary_stats[0].evictable = 3
-        storage.primary_stats[1].available = 6  # primary used = 4
-        storage.primary_stats[1].evictable = 4
-        storage.secondary_stats[0].available = 2  # secondary used = 3
-        storage.secondary_stats[0].evictable = 2
-        manager._update_iteration_peak_num_blocks()
-        storage.primary_stats[0].available = 7  # primary used = 3
-        storage.primary_stats[0].evictable = 1
-        storage.secondary_stats[0].available = 4  # secondary used = 1
-        storage.secondary_stats[0].evictable = 1
-
-        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
-        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
-        assert [stats.available for stats in primary_peak] == [8, 9]
-        assert [stats.unavailable for stats in primary_peak] == [5, 4]
-        assert [stats.evictable for stats in primary_peak] == [3, 4]
-        assert [stats.available for stats in secondary_peak] == [4, 5]
-        assert [stats.unavailable for stats in secondary_peak] == [3, 0]
-        assert [stats.evictable for stats in secondary_peak] == [2, 0]
-
-        # The next interval starts from current usage, not zero.
-        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
-        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
-        assert [stats.available for stats in primary_peak] == [7, 6]
-        assert [stats.unavailable for stats in primary_peak] == [3, 4]
-        assert [stats.evictable for stats in primary_peak] == [1, 4]
-        assert [stats.available for stats in secondary_peak] == [4, 5]
-        assert [stats.unavailable for stats in secondary_peak] == [1, 0]
-        assert [stats.evictable for stats in secondary_peak] == [1, 0]

@@ -60,7 +60,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     SsmLayerConfig,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
@@ -305,7 +304,7 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    init_cuda_once()
+    torch.cuda.init()
     manager = KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
@@ -1357,7 +1356,7 @@ def max_num_turns() -> int:
 def manager(max_num_turns: int) -> KVCacheManagerV2:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    init_cuda_once()
+    torch.cuda.init()
     manager = KVCacheManagerV2(
         KvCacheConfig(
             enable_block_reuse=True,
