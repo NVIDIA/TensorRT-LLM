@@ -1429,6 +1429,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
     )
     request = SimpleNamespace(
+        request_id=rid,
         py_request_id=rid,
         py_disaggregated_params=params,
         py_kv_send_session_retired=False,
@@ -2417,10 +2418,12 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     params = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
         disagg_request_id=rid,
+        ctx_request_id=None,
     )
     kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[])
 
     send_req = SimpleNamespace(
+        request_id=rid,
         py_disaggregated_params=params,
         state=LlmRequestState.CONTEXT_INIT,
         set_kv_cache_transfer_start=lambda _timestamp: None,
@@ -2448,6 +2451,7 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     sender._finalize_send.assert_called_once_with(send_req, send_session)
 
     recv_req = SimpleNamespace(
+        request_id=rid,
         py_disaggregated_params=params,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         set_kv_cache_transfer_start=lambda _timestamp: None,
