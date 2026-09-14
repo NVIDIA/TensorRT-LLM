@@ -967,6 +967,104 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     manager.get_state_indices.assert_not_called()
 
 
+def _make_v2_state_index_manager(capacity, base_index_by_request_id, with_dummy_mask=True):
+    """Build a MambaHybridCacheManagerV2 carrying only what _setup_state_indices touches."""
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 1
+    manager.ssm_layer_group_id = 0
+    manager._host_state_indices = torch.zeros(capacity, dtype=torch.int32)
+    manager.cuda_state_indices = torch.zeros(capacity, dtype=torch.int32)
+    manager._dummy_request_mask = (
+        torch.zeros(capacity, dtype=torch.bool) if with_dummy_mask else None
+    )
+    manager._dummy_request_mask_host = (
+        torch.zeros(capacity, dtype=torch.bool) if with_dummy_mask else None
+    )
+    manager._request_id_to_state_index = {}
+    manager._request_id_to_is_dummy = {}
+    manager.kv_cache_map = {
+        request_id: SimpleNamespace(get_ssm_block_base_index=lambda _lg, b=base: b)
+        for request_id, base in base_index_by_request_id.items()
+    }
+    return manager
+
+
+def _v2_state_index_requests(base_index_by_request_id, dummy_request_ids=()):
+    return [
+        SimpleNamespace(py_request_id=request_id, is_dummy=request_id in dummy_request_ids)
+        for request_id in base_index_by_request_id
+    ]
+
+
+def test_v2_setup_state_indices_matches_per_request_scalar_stores():
+    """The batched host write must reproduce the per-request scalar stores exactly."""
+    capacity = 34
+    bases = {100 + i: (i * 3) % 29 for i in range(30)}
+    # A zero base index and a repeated one are both legal and must survive.
+    bases[100] = 0
+    bases[101] = 0
+    dummies = {103, 117}
+    requests = _v2_state_index_requests(bases, dummies)
+
+    manager = _make_v2_state_index_manager(capacity, bases)
+    manager._setup_state_indices(requests)
+
+    expected_host = torch.zeros(capacity, dtype=torch.int32)
+    for i, request in enumerate(requests):
+        expected_host[i] = bases[request.py_request_id]
+
+    assert torch.equal(manager._host_state_indices, expected_host)
+    assert torch.equal(manager.cuda_state_indices, expected_host)
+    assert manager._host_state_indices.dtype == torch.int32
+    assert manager._request_id_to_state_index == bases
+    assert manager._request_id_to_is_dummy == {rid: rid in dummies for rid in bases}
+    assert torch.equal(
+        manager._dummy_request_mask,
+        torch.tensor([r.is_dummy for r in requests] + [False] * (capacity - len(requests))),
+    )
+
+
+def test_v2_setup_state_indices_clears_slots_beyond_the_batch():
+    """A shorter batch must not inherit the previous batch's tail."""
+    capacity = 24
+    wide = {200 + i: i + 1 for i in range(20)}
+    manager = _make_v2_state_index_manager(capacity, wide)
+    manager._setup_state_indices(_v2_state_index_requests(wide))
+
+    narrow = {200: 5, 201: 6, 202: 7}
+    manager.kv_cache_map = _make_v2_state_index_manager(capacity, narrow).kv_cache_map
+    manager._setup_state_indices(_v2_state_index_requests(narrow))
+
+    assert manager._host_state_indices[:3].tolist() == [5, 6, 7]
+    assert not manager._host_state_indices[3:].any()
+    assert torch.equal(manager.cuda_state_indices, manager._host_state_indices)
+
+
+def test_v2_setup_state_indices_handles_empty_batch():
+    manager = _make_v2_state_index_manager(8, {}, with_dummy_mask=False)
+    manager._setup_state_indices([])
+
+    assert not manager._host_state_indices.any()
+    assert not manager.cuda_state_indices.any()
+    assert manager._request_id_to_state_index == {}
+
+
+@pytest.mark.parametrize(
+    "bases, drop_request_id, expected_message",
+    [
+        ({300: 1, 301: 2}, 301, "Missing V2 KV cache for request 301"),
+        ({300: 1, 301: -1}, None, "Invalid SSM state block index -1 for request 301"),
+    ],
+)
+def test_v2_setup_state_indices_guards_still_fire(bases, drop_request_id, expected_message):
+    manager = _make_v2_state_index_manager(8, bases)
+    if drop_request_id is not None:
+        del manager.kv_cache_map[drop_request_id]
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        manager._setup_state_indices(_v2_state_index_requests(bases))
+
+
 @pytest.mark.parametrize(
     "max_beam_width, has_connector, expected",
     [
