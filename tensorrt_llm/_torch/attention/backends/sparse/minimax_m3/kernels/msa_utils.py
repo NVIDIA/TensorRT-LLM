@@ -23,6 +23,21 @@ MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
 
+def check_decode_span_shape(kernel: str, total_q: int, batch: int, query_len: int) -> None:
+    """Reject a q that does not cover exactly the batch it was handed.
+
+    The decode kernels derive the request id as token // query_len, so a longer
+    q reads page table rows and lengths past the batch's last one. The caller
+    names itself so the error does too, rather than surfacing as an assert
+    several frames inside a kernel.
+    """
+    if total_q != batch * query_len:
+        raise ValueError(
+            f"{kernel}: total_q ({total_q}) must be batch ({batch}) * "
+            f"decode_query_len ({query_len})."
+        )
+
+
 def is_msa_layer(attn) -> bool:
     """Whether this layer's attention is served by the MiniMax-M3 MSA kernels."""
     sparse_params = attn.sparse_params
@@ -103,6 +118,8 @@ def write_msa_main_kv(
     out_cache_loc: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    num_live_tokens: int,
 ) -> None:
     """Write new-token K and V into the paged main cache at out_cache_loc.
 
@@ -116,10 +133,18 @@ def write_msa_main_kv(
     head_dim = int(k_view.shape[3])
     num_tokens = int(k.shape[0])
     write_kv_slots(
-        k_view, out_cache_loc, k.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        k_view,
+        out_cache_loc,
+        k.reshape(num_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=num_live_tokens,
     )
     write_kv_slots(
-        v_view, out_cache_loc, v.reshape(num_tokens, num_kv_heads, head_dim), layout="HND"
+        v_view,
+        out_cache_loc,
+        v.reshape(num_tokens, num_kv_heads, head_dim),
+        layout="HND",
+        num_live_tokens=num_live_tokens,
     )
 
 
@@ -159,6 +184,8 @@ def write_msa_phase_kv(
         metadata.msa_out_cache_loc[token_offset : token_offset + num_tokens],
         k,
         v,
+        # k and v are this phase's own token slice, so every row owns a slot.
+        num_live_tokens=num_tokens,
     )
 
 
@@ -264,6 +291,7 @@ __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
+    "check_decode_span_shape",
     "msa_package_available",
     "msa_paged_kv",
     "per_token_valid_blocks",
