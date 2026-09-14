@@ -1315,21 +1315,28 @@ def test_every_device_step_time_metric_is_a_minimize_metric() -> None:
         assert f"d_{name}" in perf_sanity.MINIMIZE_METRICS
 
 
-def test_add_perf_metric_value_skips_absent_statistics() -> None:
-    """TypeCheckForOpenSearchDB rejects both None and int for a d_ key."""
+@pytest.mark.parametrize("benchmark_mode", perf_sanity.DEVICE_STEP_TIME_MODES)
+def test_add_perf_metric_value_skips_absent_statistics(benchmark_mode: str) -> None:
+    """TypeCheckForOpenSearchDB rejects both None and int for a d_ key.
+
+    Parametrized over every mode in DEVICE_STEP_TIME_MODES -- not just
+    gen_only -- so this pins the positive side of the widening: if the tuple
+    is ever narrowed back to ("gen_only",), this test starts failing for the
+    dropped mode instead of staying silently green.
+    """
     metrics = dict.fromkeys(perf_sanity.PERF_METRIC_LOG_QUERIES, 1.0)
     metrics["mean_gen_worker_per_iter_device_step_time"] = 7
 
     new_data: dict = {}
-    perf_sanity.add_perf_metric_value(new_data, metrics, False, "gen_only")
+    perf_sanity.add_perf_metric_value(new_data, metrics, False, benchmark_mode)
 
     assert new_data["d_mean_gen_worker_per_iter_device_step_time"] == 7.0
     assert isinstance(new_data["d_mean_gen_worker_per_iter_device_step_time"], float)
     assert "d_p99_gen_worker_per_iter_device_step_time" not in new_data
 
 
-def test_add_perf_metric_value_omits_the_family_outside_gen_only() -> None:
-    """ctx_only never emits these lines, so they must not be uploaded."""
+def test_add_perf_metric_value_omits_the_family_outside_device_step_time_modes() -> None:
+    """ctx_only isn't in DEVICE_STEP_TIME_MODES, so it must not be uploaded."""
     metrics = dict.fromkeys(perf_sanity.PERF_METRIC_LOG_QUERIES, 1.0)
     metrics["mean_gen_worker_per_iter_device_step_time"] = 7.0
 
