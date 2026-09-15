@@ -87,6 +87,7 @@ def _run_attention_with_replicated_kv(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run attention with exact generated and replicated K/V prefixes.
 
+    Replicated text precedes generated K/V, matching unsharded Cosmos3 attention.
     Unequal prefixes are evaluated per sample so backends never receive padded
     keys or a dense padding mask. The helper is outside ``torch.compile`` so
     prompt-length values do not specialize generator-block graphs.
@@ -181,15 +182,15 @@ def _run_attention_with_replicated_kv(
         context_len = valid_context_lens[0]
         k_all = torch.cat(
             [
-                k[:, :valid_generated_seq_len],
                 replicated_k[:, context_start : context_start + context_len],
+                k[:, :valid_generated_seq_len],
             ],
             dim=1,
         )
         v_all = torch.cat(
             [
-                v[:, :valid_generated_seq_len],
                 replicated_v[:, context_start : context_start + context_len],
+                v[:, :valid_generated_seq_len],
             ],
             dim=1,
         )
@@ -201,21 +202,21 @@ def _run_attention_with_replicated_kv(
     for batch_idx, context_len in enumerate(valid_context_lens):
         k_all = torch.cat(
             [
-                k[batch_idx : batch_idx + 1, :valid_generated_seq_len],
                 replicated_k[
                     batch_idx : batch_idx + 1,
                     context_start : context_start + context_len,
                 ],
+                k[batch_idx : batch_idx + 1, :valid_generated_seq_len],
             ],
             dim=1,
         )
         v_all = torch.cat(
             [
-                v[batch_idx : batch_idx + 1, :valid_generated_seq_len],
                 replicated_v[
                     batch_idx : batch_idx + 1,
                     context_start : context_start + context_len,
                 ],
+                v[batch_idx : batch_idx + 1, :valid_generated_seq_len],
             ],
             dim=1,
         )
@@ -461,11 +462,11 @@ class UlyssesAttention(AttentionBackend):
                         f"sequence, got {global_generated_seq_len} for length {k.shape[1]}."
                     )
                 k = torch.cat(
-                    [k[:, :global_generated_seq_len], replicated_k],
+                    [replicated_k, k[:, :global_generated_seq_len]],
                     dim=1,
                 )
                 v = torch.cat(
-                    [v[:, :global_generated_seq_len], replicated_v],
+                    [replicated_v, v[:, :global_generated_seq_len]],
                     dim=1,
                 )
                 kv_seq_len_full = k.shape[1]
@@ -894,15 +895,15 @@ class Attention2DAttention(AttentionBackend):
             if replicated_k_lengths is None:
                 k = torch.cat(
                     [
-                        k[:, :valid_generated_seq_len],
                         replicated_k[:, context_start:context_end],
+                        k[:, :valid_generated_seq_len],
                     ],
                     dim=1,
                 )
                 v = torch.cat(
                     [
-                        v[:, :valid_generated_seq_len],
                         replicated_v[:, context_start:context_end],
+                        v[:, :valid_generated_seq_len],
                     ],
                     dim=1,
                 )
