@@ -75,8 +75,13 @@ def _generate(model_path, prompts, *, localized: bool):
             model_path,
             kv_cache_config=kv_config,
             scheduler_config=scheduler_config,
+            # Without this the localized arm runs ordinary mode and the
+            # comparison holds no matter what locality domains do.
+            enable_locality_domains=localized,
             env_overrides={
                 "TRT_LLM_MOCK_LOCALIZATION_SUPPORT": localization_override,
+                # Locality domains are only implemented in the Python backend.
+                "TLLM_KV_CACHE_MANAGER_V2_BACKEND": "python",
             },
         ) as llm:
             return llm.generate(prompts, sampling_params=sampling)
