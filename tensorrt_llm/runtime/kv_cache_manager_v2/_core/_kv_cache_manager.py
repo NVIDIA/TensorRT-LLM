@@ -401,7 +401,10 @@ class KVCacheManager:
             # must therefore span the largest displaced page index as well.
             scale = storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
             upper_bound += (
-                (pool_group.num_locality_domains - 1) * scale * pool_group._slot_id_offset
+                (pool_group.num_locality_domains - 1)
+                * scale
+                * pool_group._slot_id_offset
+                * attr.expansion
             )
         return upper_bound
 

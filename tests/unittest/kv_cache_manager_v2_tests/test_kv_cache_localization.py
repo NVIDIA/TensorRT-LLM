@@ -513,6 +513,62 @@ class TestKVCacheManagerLocalizedQueries(unittest.TestCase):
         finally:
             kv_cache.close()
 
+    def test_page_index_upper_bound_accounts_for_expansion(self) -> None:
+        """The locality displacement must be scaled by expansion, like the base term.
+
+        PageIndexConverter emits ``index * expansion + i``, so a page displaced
+        into locality domain 1 converts to an index carrying the displacement
+        times expansion. A bound that adds the displacement unscaled is short by
+        that factor and yields an undersized tensor view.
+        """
+        override = _TOKENS_PER_BLOCK // 2
+        config = KVCacheManagerConfig(
+            tokens_per_block=_TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=_256MB, enable_locality_domains=True)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(
+                            role=ROLE_KEY,
+                            size=_KV_BUF_SIZE,
+                            tokens_per_block_override=override,
+                        ),
+                        BufferConfig(
+                            role=ROLE_VALUE,
+                            size=_KV_BUF_SIZE,
+                            tokens_per_block_override=override,
+                        ),
+                    ],
+                    sliding_window_size=None,
+                )
+            ],
+        )
+        with _override_localization_mode("1"):
+            self.manager = KVCacheManager(config)
+
+        layer_id = LayerId(0)
+        storage = self.manager._storage
+        attr = storage.get_buffer_attr(layer_id, ROLE_KEY)
+        self.assertGreater(
+            attr.expansion, 1, "fixture must exercise heterogeneous tokens_per_block"
+        )
+
+        lc_id = storage._layer_to_life_cycle_ids[layer_id]
+        pg_idx = storage.get_pool_group_index(lc_id)
+        pool_group = storage._levels[GPU_LEVEL].storage._pool_groups[pg_idx]
+        self.assertGreater(pool_group.num_locality_domains, 1)
+
+        # Highest base page index a locality domain 1 slot can carry.
+        highest = pool_group._slot_id_offset + pool_group.num_slots(1) - 1
+        converted = self.manager.get_page_index_converter(layer_id, ROLE_KEY)([highest])
+        upper_bound = self.manager.get_page_index_upper_bound(layer_id, ROLE_KEY)
+        self.assertGreater(
+            upper_bound,
+            max(converted),
+            "get_page_index_upper_bound must cover expanded locality domain 1 indices",
+        )
+
     def test_page_index_upper_bound_ignores_page_stride_divisibility(self) -> None:
         """Localized upper bounds must use canonical slot offsets, not LOCALIZATION_OFFSET/page_stride."""
         from unittest.mock import patch
