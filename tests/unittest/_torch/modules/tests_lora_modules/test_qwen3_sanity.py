@@ -157,8 +157,8 @@ def _assert_lora_changes_output(out_lora, out_base):
     assert any_differ, "LoRA outputs identical to base model (same tokens AND same logprobs)"
 
 
-def _assert_outputs_match(actual, expected):
-    """Assert that two request outputs have identical tokens and logprobs."""
+def _assert_outputs_match(actual, expected, *, logprob_atol=1e-6):
+    """Require identical tokens and logprobs within the supplied absolute bound."""
     actual_completion = actual.outputs[0]
     expected_completion = expected.outputs[0]
     assert actual_completion.token_ids == expected_completion.token_ids
@@ -170,7 +170,7 @@ def _assert_outputs_match(actual, expected):
         assert actual_step.keys() == expected_step.keys()
         for token_id in actual_step:
             assert actual_step[token_id].logprob == pytest.approx(
-                expected_step[token_id].logprob, abs=1e-6
+                expected_step[token_id].logprob, rel=0, abs=logprob_atol
             )
 
 
@@ -245,30 +245,32 @@ def _run_mixed_lora_cuda_graph_test(
             ]
             lora_request = LoRARequest("test-lora", 0, lora_dir)
             mixed_lora_requests = [lora_request, None, lora_request, None]
-            if kv_cache_config.enable_block_reuse:
-                # Warm both adapter and base prefixes before either measured call.
-                # Comparing a cold prefill with a partial cache hit exercises
-                # different attention shapes, which can change BF16 logprobs.
-                llm.generate(prompts, sampling, lora_request=mixed_lora_requests)
             mixed_outputs = llm.generate(
                 prompts,
                 sampling,
                 lora_request=mixed_lora_requests,
             )
             base_outputs = llm.generate(prompts, sampling)
+            reused_mixed_outputs = llm.generate(prompts, sampling, lora_request=mixed_lora_requests)
 
-        for mixed_output, base_output in zip(mixed_outputs, base_outputs, strict=True):
-            expected_cached_tokens = 0
-            if kv_cache_config.enable_block_reuse:
-                # The final prompt token must still be computed to produce logits.
-                expected_cached_tokens = len(mixed_output.prompt_token_ids) - 1
-                assert expected_cached_tokens > 0
-            assert mixed_output.cached_tokens == expected_cached_tokens
-            assert base_output.cached_tokens == expected_cached_tokens
+        # Keep the cold-to-reused transition that exercises final-context
+        # promotion; a warmup or disabled reuse must not hide a regression.
+        assert all(output.cached_tokens == 0 for output in mixed_outputs)
+        for output in base_outputs + reused_mixed_outputs:
+            assert output.cached_tokens == len(output.prompt_token_ids) - 1
         for index in (1, 3):
-            _assert_outputs_match(mixed_outputs[index], base_outputs[index])
+            # Cold prefill and reused final-context decode use different BF16
+            # reductions, in both KVCM V1 and V2. Bound the resulting logprob
+            # drift (exp(0.1) is about 1.105), while keeping tokens identical.
+            _assert_outputs_match(mixed_outputs[index], base_outputs[index], logprob_atol=0.1)
+            # With the same cache state, retain the strict LoRA-isolation check.
+            _assert_outputs_match(reused_mixed_outputs[index], base_outputs[index])
         _assert_lora_changes_output(
             [mixed_outputs[index] for index in (0, 2)],
+            [base_outputs[index] for index in (0, 2)],
+        )
+        _assert_lora_changes_output(
+            [reused_mixed_outputs[index] for index in (0, 2)],
             [base_outputs[index] for index in (0, 2)],
         )
 
@@ -309,7 +311,7 @@ class TestQwen3LoRA:
     @pytest.fixture(autouse=True)
     def setup(self):
         self.model_path = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
-        self.kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+        self.kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True, enable_block_reuse=True)
         if not os.path.exists(self.model_path):
             pytest.skip(f"Model not found: {self.model_path}")
 
@@ -358,9 +360,7 @@ class TestQwen3LoRA:
             kv_cache_config=self.kv_cache_config,
         )
 
-    @pytest.mark.parametrize("enable_block_reuse", [False, True], ids=["no_reuse", "warmed_reuse"])
-    def test_qwen3_bf16_lora_cuda_graph_specialization_mixed_batch(self, enable_block_reuse):
-        self.kv_cache_config.enable_block_reuse = enable_block_reuse
+    def test_qwen3_bf16_lora_cuda_graph_specialization_mixed_batch(self):
         _run_mixed_lora_cuda_graph_test(
             self.model_path,
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
