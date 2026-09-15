@@ -495,7 +495,28 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
         _log(f"removing export from a previous run: {export_path}")
         os.remove(export_path)
     _log("running: " + " ".join(cmd))
-    completed = subprocess.run(cmd, timeout=_env_int("AGENTX_DURATION", 3600) + 600)
+    # AGENTX_DURATION bounds only aiperf's *measured* window
+    # (--benchmark-duration). Before that window opens aiperf also configures
+    # the dataset and runs a warmup of AGENTX_WARMUP_PER_LANE requests per
+    # lane, so the subprocess budget must be the measured window plus enough
+    # slack to cover both. The old hardcoded 600 s did not. Measured on the
+    # GB300 DSpark lanes, with a 3600 s window:
+    #
+    #   lane      config     warmup                   required
+    #   con1456   145.5 s    2166 s (5924 requests)   ~5950 s
+    #   con1156   150.2 s    3716 s (4700 requests)   ~7510 s
+    #
+    # Both exceed the old 4200 s budget, so aiperf was killed mid-profiling on
+    # every run -- with no export written, which surfaces as the
+    # unrelated-looking "wrote no profile_export_aiperf.json" below rather than
+    # as a timeout. Note warmup does not scale with lane count: con1156 has
+    # fewer lanes than con1456 but warms up 1.7x slower, because warmup drains
+    # a fixed request count through the generation servers and con1156's gen is
+    # dep8 against con1456's dep16. So size the grace by generation capacity,
+    # not concurrency, and override it for lanes that need more.
+    grace = _env_int("AGENTX_TIMEOUT_GRACE", 5400)
+    completed = subprocess.run(cmd,
+                               timeout=_env_int("AGENTX_DURATION", 3600) + grace)
 
     if not os.path.exists(export_path):
         # No export at all means aiperf died before writing results; its exit
