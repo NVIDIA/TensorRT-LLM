@@ -2252,7 +2252,10 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
     fn.alpha = gate_alpha;
     fn.beta = gate_bias;
     fn.limit = gate_limit;
-    fn.clampAfterSilu = activation_type.swiglu_clamp_after_silu;
+    if constexpr (std::is_same_v<ActFn, SwigluBiasAdaptor>)
+    {
+        fn.clampAfterSilu = activation_type.swiglu_clamp_after_silu;
+    }
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
         auto linear_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
@@ -2436,7 +2439,10 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
             fn.alpha = gate_alpha;
             fn.beta = gate_beta;
             fn.limit = gate_limit;
-            fn.clampAfterSilu = activation_params.swiglu_clamp_after_silu;
+            if constexpr (std::is_same_v<ActFn, SwigluBiasAdaptor>)
+            {
+                fn.clampAfterSilu = activation_params.swiglu_clamp_after_silu;
+            }
 
             // Each thread handles one vector at col_offset
             int64_t const elem_index = col_offset;

@@ -33,7 +33,6 @@ struct IdentityAdaptor
     float alpha = 1.0f;
     float beta = 0.0f;
     float limit = std::numeric_limits<float>::infinity();
-    bool clampAfterSilu = false;
 
     template <class T>
     __device__ T operator()(T const& x) const
@@ -50,7 +49,6 @@ struct GLUAdaptor
     float alpha = 1.0f;
     float beta = 0.0f;
     float limit = std::numeric_limits<float>::infinity();
-    bool clampAfterSilu = false;
 
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
@@ -89,7 +87,6 @@ struct SiTuAdaptor
     float alpha = 1.0f;
     float beta = 1.0f;
     float limit = std::numeric_limits<float>::infinity();
-    bool clampAfterSilu = false;
 
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
