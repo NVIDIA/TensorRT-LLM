@@ -766,7 +766,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_gen_only_spec_dec(self):
         ctx_server_config = {"disable_overlap_scheduler": True}
-        gen_server_config = {"disable_overlap_scheduler": False}
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
+        }
         cache_transceiver_config = {
             "backend": "NIXL",
             "max_tokens_in_buffer": 4096,
@@ -794,6 +798,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH,
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            assert_acceptance_length(
+                "disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec",
+                compute_disagg_acceptance_length(llm.serve_url))
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
@@ -917,6 +924,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "decoding_type": "MTP",
                 "max_draft_len": mtp_nextn
             }
+            gen_server_config["enable_iter_perf_stats"] = True
+            gen_server_config["iter_stats_max_iterations"] = -1
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
@@ -933,6 +942,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH,
                                       tensor_parallel_size=4) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length(
+                    "disagg::TestDeepSeekV3Lite::test_auto_dtype",
+                    compute_disagg_acceptance_length(llm.serve_url))
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
@@ -1034,6 +1047,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             }
             ctx_server_config["speculative_config"] = spec_config
             gen_server_config["speculative_config"] = spec_config
+            gen_server_config["enable_iter_perf_stats"] = True
+            gen_server_config["iter_stats_max_iterations"] = -1
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -1052,6 +1067,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length(
+                    "disagg::TestDeepSeekV3Lite::test_gen_first",
+                    compute_disagg_acceptance_length(llm.serve_url))
 
 
 @skip_pre_hopper
@@ -1928,6 +1947,8 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
             ctx_cfg["speculative_config"] = spec
             gen_cfg["speculative_config"] = spec
+            gen_cfg["enable_iter_perf_stats"] = True
+            gen_cfg["iter_stats_max_iterations"] = -1
         if block_reuse:
             ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
             gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
@@ -1940,6 +1961,10 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            if mtp_nextn > 0:
+                assert_acceptance_length(
+                    "disagg::TestNemotron3Super120B::test_auto_dtype",
+                    compute_disagg_acceptance_length(llm.serve_url))
 
     @pytest.mark.skip_less_device(8)
     def test_ctx_dp2_gen_tp4(self):

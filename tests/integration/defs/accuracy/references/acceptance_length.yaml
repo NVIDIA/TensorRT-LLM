@@ -78,3 +78,15 @@ TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
 TestKimiK3DSpark::test_gsm8k_tep8:
   ref_al: 4.323
   min_al: 4.0
+disagg::TestDeepSeekV3Lite::test_auto_dtype:
+  ref_al: 2.581477287026551
+  min_al: 2.452403422675223
+disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec:
+  ref_al: 2.257556020907877
+  min_al: 2.1446782198624827
+disagg::TestDeepSeekV3Lite::test_gen_first:
+  ref_al: 2.58277081324333
+  min_al: 2.4536322725811632
+disagg::TestNemotron3Super120B::test_auto_dtype:
+  ref_al: 3.542334313074808
+  min_al: 3.3652175974210676
