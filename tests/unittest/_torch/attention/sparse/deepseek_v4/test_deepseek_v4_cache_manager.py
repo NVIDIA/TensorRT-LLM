@@ -45,8 +45,12 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, KVCacheDesc, PageIndexMode
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    BatchDesc,
+    KVCacheDesc,
+    PageIndexMode,
+)
 
 _RequestCache = Dict[
     Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
