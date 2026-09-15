@@ -779,6 +779,9 @@ class Step3p7MoE(nn.Module):
             self._python_path_reason,
         ) = _select_python_expert_path(model_config, text_config, layer_idx)
         self._moe_lora_enabled = has_moe_lora_targets(model_config.lora_config)
+        # Routed-expert LoRA must execute in the fused backend. Otherwise the
+        # selected Python path owns expert execution and its dequantized weights.
+        self._use_python_experts = self._use_python_clamp and not self._moe_lora_enabled
 
         self.experts = create_moe(
             num_experts=self.num_experts,
@@ -793,15 +796,16 @@ class Step3p7MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             activation=SwigluActivation(
                 clamp=self._routed_swiglu_limit,
-                # Clamp-active layers use the Python reference path unless
-                # routed-expert LoRA requires the fused CUTLASS path. Only the
-                # latter backend execution needs to advertise this mode to the
-                # resolver; the Python path applies the same order directly.
-                clamp_after_silu=(self._routed_swiglu_limit is not None and self._moe_lora_enabled),
+                # Derive the backend mode from the expert dispatch decision.
+                # The Python path applies the same order directly and is kept
+                # fail-closed below if its weights cannot be materialized.
+                clamp_after_silu=(
+                    self._routed_swiglu_limit is not None and not self._use_python_experts
+                ),
             ),
         )
 
-        if self._use_python_clamp:
+        if self._use_python_experts:
             self._allocate_clamp_buffers(text_config.torch_dtype)
 
         self.allreduce = None
@@ -853,12 +857,7 @@ class Step3p7MoE(nn.Module):
     def _requires_python_clamp_weights(self) -> bool:
         """Whether falling through to the configured backend would change semantics."""
         limit = self._routed_swiglu_limit
-        return (
-            self._use_python_clamp
-            and limit is not None
-            and limit > 0.0
-            and not self._moe_lora_enabled
-        )
+        return self._use_python_experts and limit is not None and limit > 0.0
 
     def _local_expert_ids(self) -> list[int]:
         ep_size = max(1, self.mapping.moe_ep_size)
@@ -876,7 +875,7 @@ class Step3p7MoE(nn.Module):
         ``Step3p7ForCausalLM._capture_bf16_clamp_weights`` runs earlier (from
         the raw HF tensors) and this method short-circuits.
         """
-        if not self._use_python_clamp or self._clamp_weights_loaded:
+        if not self._use_python_experts or self._clamp_weights_loaded:
             return
         # ``self.experts`` is a ConfigurableMoE wrapper; weights live on the backend.
         e = getattr(self.experts, "backend", None) or self.experts
@@ -963,14 +962,15 @@ class Step3p7MoE(nn.Module):
 
         if self._requires_python_clamp_weights() and not self._clamp_weights_loaded:
             raise RuntimeError(
-                f"Step3p7 layer {self.layer_idx} requires post-SiLU clamp weights, "
-                "but they were not populated during model loading."
+                f"Step3p7 layer {self.layer_idx} requires dequantized expert weights "
+                "for its post-SiLU Python clamp path, but they were not populated "
+                "during model loading."
             )
 
         gate_input = h.to(torch.float32) if self.need_fp32_gate else h
         router_logits = self.gate(gate_input)
 
-        if self._use_python_clamp and self._clamp_weights_loaded and not self._moe_lora_enabled:
+        if self._use_python_experts and self._clamp_weights_loaded:
             # The Python loop consumes the same unscaled routing weights as the
             # separated CUTLASS path, then joins the common output scaling below.
             routed = self._python_clamped_moe_forward(h, router_logits)
@@ -1683,7 +1683,7 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
         captured: List[int] = []
         for layer in self.model.layers:
             moe = getattr(layer, "moe", None)
-            if moe is None or not getattr(moe, "_use_python_clamp", False):
+            if moe is None or not getattr(moe, "_use_python_experts", False):
                 continue
             if getattr(moe, "_clamp_weights_loaded", False):
                 continue
@@ -1761,7 +1761,7 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
         # Must run after the backend materialises w3_w1/w2.
         for layer in self.model.layers:
             moe = getattr(layer, "moe", None)
-            if moe is None or not getattr(moe, "_use_python_clamp", False):
+            if moe is None or not getattr(moe, "_use_python_experts", False):
                 continue
             try:
                 moe.load_clamp_weights_from_fp8_experts()
@@ -1769,7 +1769,8 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
                 if moe._requires_python_clamp_weights():
                     raise RuntimeError(
                         f"Step3p7 layer {moe.layer_idx} could not materialize the "
-                        "post-SiLU clamp weights required for correct execution."
+                        "dequantized expert weights required by its post-SiLU "
+                        "Python clamp path."
                     ) from e
                 _logger.warning(
                     "[Step3p7] failed to populate bf16 expert weights for layer %d (%s): %s. "
@@ -1780,7 +1781,7 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
                 )
             if moe._requires_python_clamp_weights() and not moe._clamp_weights_loaded:
                 raise RuntimeError(
-                    f"Step3p7 layer {moe.layer_idx} did not materialize the post-SiLU "
-                    "clamp weights required for correct execution."
+                    f"Step3p7 layer {moe.layer_idx} did not materialize the dequantized "
+                    "expert weights required by its post-SiLU Python clamp path."
                 )
         return rc

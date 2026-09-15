@@ -146,6 +146,28 @@ inline void moeLoraGroupedGemmRunImpl(::tensorrt_llm::kernels::cutlass_kernels::
     sync_check_cuda_error(stream);
 }
 
+static ActivationParams makeActivationParams(ActivationType activation_type,
+    torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
+    torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu)
+{
+    auto const* swiglu_alpha_ptr
+        = reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr);
+    auto const* swiglu_beta_ptr
+        = reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr);
+    auto const* swiglu_limit_ptr
+        = reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr);
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+    return ActivationParams(
+        activation_type, swiglu_alpha_ptr, swiglu_beta_ptr, swiglu_limit_ptr, swiglu_clamp_after_silu);
+#else
+    // The internal kernel archive uses the legacy four-argument ABI and does
+    // not implement this clamp order. Reject it instead of silently ignoring it.
+    TORCH_CHECK(
+        !swiglu_clamp_after_silu, "Post-SiLU SwiGLU clamping requires TensorRT-LLM's open-source CUTLASS MoE kernels.");
+    return ActivationParams(activation_type, swiglu_alpha_ptr, swiglu_beta_ptr, swiglu_limit_ptr);
+#endif
+}
+
 class FusedMoeRunner : public torch::CustomClassHolder
 {
 public:
@@ -576,11 +598,10 @@ public:
             "SiTu requires both swiglu_alpha and swiglu_beta.");
         TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
             "SiTu does not support swiglu_limit.");
-        auto activation_params = ActivationParams(base_activation_type,
-            reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr),
-            swiglu_clamp_after_silu);
+        // A SwiGLU clamp promotes base_activation_type to SwigluBias above,
+        // which selects the only CUTLASS adaptor that consumes clampAfterSilu.
+        auto activation_params = makeActivationParams(
+            base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit, swiglu_clamp_after_silu);
 
         // ===== Routed-expert LoRA activation flags =====
         // LoRA is activated by the per-request (fc1_lora_ranks) or slot-indexed
@@ -846,11 +867,8 @@ public:
             "SiTu requires both swiglu_alpha and swiglu_beta.");
         TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
             "SiTu does not support swiglu_limit.");
-        auto activation_params = ActivationParams(base_activation_type,
-            reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr),
-            swiglu_clamp_after_silu);
+        auto activation_params = makeActivationParams(
+            base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit, swiglu_clamp_after_silu);
 
         // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
         // non-gated) is finalized. INT8-woq uses a transposed weight layout, so its fc1/fc2 dim
