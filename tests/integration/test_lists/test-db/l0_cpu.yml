@@ -56,6 +56,7 @@ l0_cpu:
   - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_replicated_kv.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
   - unittest/_torch/visual_gen/sparse_attention/test_skip_softmax.py
