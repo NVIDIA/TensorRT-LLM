@@ -24,6 +24,7 @@ def _run_python(code: str, numexpr_threads: str | None = None) -> subprocess.Com
         capture_output=True,
         env=env,
         text=True,
+        timeout=300,
     )
 
 
