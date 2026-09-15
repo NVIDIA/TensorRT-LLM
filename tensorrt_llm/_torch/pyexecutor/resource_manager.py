@@ -3057,7 +3057,10 @@ class ResourceManager:
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True) -> None:
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
@@ -3069,7 +3072,8 @@ class ResourceManager:
         # run. See KVCacheManager.publish_connector_scheduler_output.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
+        if publish_connector_output and hasattr(
+                kv_cache_manager, "publish_connector_scheduler_output"):
             kv_cache_manager.publish_connector_scheduler_output(scheduled_batch)
 
     @nvtx_range("update_resources")
