@@ -35,8 +35,6 @@ semantics.
 Requires 1 Blackwell GPU, fla-core, nvidia-cutlass-dsl. Skips otherwise.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -51,6 +49,8 @@ try:
     # must stay behind the guard too or collection fails instead of skipping.
     from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
     from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import PythonMambaCacheManager
 except ImportError as e:
     _HAVE_DEPS = False
     _DEP_ERR = str(e)
@@ -128,9 +128,13 @@ def _make_pools(B, seed):
 
 
 def _make_fused_layer_cache(B, conv_pool):
-    """Replay caches shaped like PythonMambaCacheManager's KDA allocation,
-    with the committed conv window seeded from the base pool (the prefill
-    seeding contract: the base pool stores committed columns directly)."""
+    """A real per-layer SpeculativeState (what at_layer_idx hands the mixer)
+    with the KDA replay caches shaped like PythonMambaCacheManager's KDA
+    allocation, and the committed conv window seeded from the base pool (the
+    prefill seeding contract: the base pool stores committed columns
+    directly). ``has_kda_replay_caches`` is the class's own property (True:
+    kda_qkg_cache is allocated). The base conv/temporal fields are unused
+    here — the test passes the pools to forward_verify directly."""
     d = H * K
     S = W - 1 + M
 
@@ -139,7 +143,9 @@ def _make_fused_layer_cache(B, conv_pool):
         cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
         return cache
 
-    return SimpleNamespace(
+    return PythonMambaCacheManager.SpeculativeState(
+        conv=None,
+        temporal=None,
         kda_conv_q=_conv_cache(0),
         kda_conv_k=_conv_cache(1),
         kda_conv_v=_conv_cache(2),
@@ -147,7 +153,6 @@ def _make_fused_layer_cache(B, conv_pool):
         kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
         kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.float32),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
-        has_kda_replay_caches=True,
         intermediate_conv_window=None,
         intermediate_ssm=None,
     )
@@ -155,9 +160,10 @@ def _make_fused_layer_cache(B, conv_pool):
 
 def _make_seq_layer_cache(B):
     d = H * K
-    return SimpleNamespace(
+    return PythonMambaCacheManager.SpeculativeState(
+        conv=None,
+        temporal=None,
         kda_qkg_cache=None,
-        has_kda_replay_caches=False,
         intermediate_conv_window=torch.zeros(
             B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
         ),
@@ -183,8 +189,6 @@ def _rep(name, a, b):
 
 @torch.no_grad()
 def test_fused_vs_sequential_two_rounds():
-    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-
     torch.manual_seed(0)
     B = 4
     T = M + 1
