@@ -1420,11 +1420,13 @@ class DFlashWorker(SpecWorkerBase):
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
-            query_position_ids = (
-                ctx_len_gen.unsqueeze(1)
-                + gen_num_accepted.long().unsqueeze(1)
-                + j_block.unsqueeze(0)
-            )
+            # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
+            # tokens are folded in (see the update below), so the running length
+            # used here has to be clamped on its own -- otherwise a request that
+            # already sits at the ceiling indexes num_accepted positions past
+            # any position the sequence can legitimately reach.
+            ctx_len_now = (ctx_len_gen + gen_num_accepted.long()).clamp_(max=self._max_ctx)
+            query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
             # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
