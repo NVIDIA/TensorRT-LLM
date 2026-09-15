@@ -73,11 +73,13 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def_rw("src", &Task<MemAddress, MemAddress>::src);
 
     nb::class_<IndexMapper>(module, "IndexMapper")
-        .def(nb::init<SizeType32, SizeType32>(), nb::arg("max_batch_size"), nb::arg("max_beam_width"))
+        .def(nb::init<SizeType32, SizeType32, SizeType32>(), nb::arg("max_batch_size"), nb::arg("max_beam_width"),
+            nb::arg("max_copy_beam_width") = 0)
         .def("add_new_sequence", &IndexMapper::addNewSequence)
         .def("get_index", &IndexMapper::getIndex)
         .def("remove_sequence", &IndexMapper::removeSequence)
-        .def("get_copy_index", &IndexMapper::getCopyIndex)
+        .def("get_copy_index", &IndexMapper::getCopyIndex, nb::arg("request_ids"), nb::arg("num_context"),
+            nb::arg("beam_width"), nb::arg("replicate_beam_zero") = false)
         .def("gather_k_block_offsets", &IndexMapper::gatherKBlockOffsets, nb::arg("source"), nb::arg("destination"),
             nb::arg("request_ids"), nb::arg("num_blocks"))
         .def("size", &IndexMapper::size)

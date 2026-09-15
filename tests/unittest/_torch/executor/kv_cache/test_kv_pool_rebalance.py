@@ -211,9 +211,11 @@ class TestCanPauseForRebalance:
         exe = _make_executor(is_shutdown=True)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
 
-    def test_beam_width_gt_one_returns_false(self):
+    def test_beam_width_gt_one_is_allowed(self):
+        # suspend/resume already walk every beam and adjust() does not touch beam
+        # width; the tuner's target ratio is what had to become beam-aware.
         exe = _make_executor(max_beam_width=2)
-        assert PyExecutor._can_pause_for_rebalance(exe) is False
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
 
     def test_drafter_present_returns_false(self):
         exe = _make_executor(drafter=MagicMock())

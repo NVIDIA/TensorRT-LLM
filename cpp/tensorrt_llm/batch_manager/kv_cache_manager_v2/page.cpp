@@ -151,16 +151,17 @@ UncommittedPage::~UncommittedPage()
         if (!isSsm)
         {
             [[maybe_unused]] bool blockRemoved = kvCache->blocks().size() <= ordinal;
+            [[maybe_unused]] bool beamRemoved = !blockRemoved && kvCache->blocks()[ordinal].pages.size() <= beamIndex;
             [[maybe_unused]] bool pageOk = true;
-            if (!blockRemoved)
+            if (!blockRemoved && !beamRemoved)
             {
                 auto const& bp = kvCache->blocks()[ordinal].pages[beamIndex][lifeCycle];
                 auto page = blockPageGetPage(bp);
                 pageOk
                     = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
             }
-            TLLM_CHECK_WITH_INFO(
-                blockRemoved || pageOk, "UncommittedPage destroyed but slot still holds a different uncommitted page");
+            TLLM_CHECK_WITH_INFO(blockRemoved || beamRemoved || pageOk,
+                "UncommittedPage destroyed but slot still holds a different uncommitted page");
         }
     }
     // Delegate slot release to Page::~Page().

@@ -873,6 +873,11 @@ class StorageManager:
     def ratio_from_length(
         self, tokens_per_block: int, history_length: int, capacity: int
     ) -> TypedIndexList[LifeCycleId, float]:
+        # Beam width is deliberately absent here, unlike the C++ backend's
+        # StorageManager::ratioFromLength. This backend cannot run beam search at
+        # all (_KVCache.beam_width's setter raises, and KvCacheCreator falls back
+        # to V1 for beam width > 1 when it is selected), so every request it ever
+        # sizes for is beam width 1 and the beam split would be dead weight.
         if capacity < history_length:
             warnings.warn("Bad sampling for capacity and history_length")
             capacity = history_length
@@ -1012,6 +1017,10 @@ class StorageManager:
                 # Non-stale sys blocks for this request.
                 non_stale_sys = sys_blocks - len(intersect(stale, sys_range))
                 unique_non_stale = max(0, non_stale - non_stale_sys)
+                # KVCacheDesc.beam_width / prompt_length are carried for API
+                # parity with the C++ backend but ignored here: see
+                # ratio_from_length for why this backend only ever sees beam
+                # width 1.
                 if swa_scratch_reuse is not None:
                     scratch = compute_scratch_range(
                         lc,
