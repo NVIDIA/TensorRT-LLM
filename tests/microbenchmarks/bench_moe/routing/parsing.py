@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Tuple
 
 _COMM_PATTERN_NAMES: Tuple[str, ...] = (
@@ -114,6 +115,11 @@ def _parse_expert_pattern(spec: str) -> Tuple[str, Dict[str, Any]]:
         )
     if "alpha" in raw:
         kwargs["alpha"] = float(raw["alpha"])
-        if kwargs["alpha"] < 0.0:
-            raise ValueError(f"expert_pattern powerlaw alpha must be >= 0; got {kwargs['alpha']}")
+        # NaN/inf silently pass a plain ``< 0.0`` check (NaN compares False to
+        # everything; +inf collapses _powerlaw_weights to a degenerate all-on-
+        # one-bin distribution), so reject non-finite values explicitly.
+        if not math.isfinite(kwargs["alpha"]) or kwargs["alpha"] < 0.0:
+            raise ValueError(
+                f"expert_pattern powerlaw alpha must be a finite number >= 0; got {kwargs['alpha']}"
+            )
     return name, kwargs
