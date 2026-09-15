@@ -20,9 +20,13 @@ trace-time specialization of SwiGLU or SiTU (Kimi K3); Relu2 is not gated and
 is not supported. The locality-domain path is not enabled for this backend.
 
 ``quantize_input``, ``run_moe``, the weight lifecycle, capabilities, and EPLB
-are inherited from :class:`CuteDslFusedMoE`. The SiTU constants live on the
-parent (``situ_beta`` / ``situ_linear_beta``) and are forwarded into the fused
-op; they are part of the compiled-kernel cache key.
+are inherited from :class:`CuteDslFusedMoE`. The SiTU constants arrive in the
+generic activation slots ``act_alpha`` (gate soft-cap) and ``act_beta`` (linear
+soft-cap), written by ``_write_activation_slot`` from this class's own
+``activation_support``; they are forwarded into the fused op and are part of the
+compiled-kernel cache key. ``activation_support`` must be declared here rather
+than inherited: the parent executes SwiGLU/Relu2, this backend SwiGLU/SiTU, and
+``_reject_unsupported_activation`` reads the class declaration.
 
 .. note::
    The ``trtllm::cute_dsl_nvfp4_fc12_fused_rubin`` custom op that this backend
@@ -42,6 +46,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import AutoTuner
 from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from .activation import ActivationParamShape, MoEActivationSupport
 from .fused_moe_cute_dsl import CuteDslFusedMoE, CuteDslFusedMoENvfp4Runner, NvFp4WeightView
 from .impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERejectReason
 from .interface import _reject
@@ -69,6 +74,18 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
     SwiGLU and SiTU share the gated FC1 geometry; the fused kernel specializes
     the epilogue at trace time. The locality-domain path is not enabled for this backend.
     """
+
+    # Narrower and wider than the parent's: no Relu2 (the fused FC12 epilogue is
+    # gated-only), plus SiTU, whose two soft-caps ride the alpha/beta slots as
+    # baked scalars. Mirrors MegaMoEDeepGemm, the other SwiGLU/SiTU backend.
+    # ``limit_when_absent`` stays inf: the op takes ``swiglu_limit`` by value and
+    # has no "clamp absent" encoding.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.SiTu}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+        limit_when_absent=float("inf"),
+    )
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -117,6 +134,16 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             return _reject(
                 MoERejectReason.DEP_MISSING,
                 "CuteDslFc12FusedMoE (SM107 NVFP4) requires CuTE DSL internal",
+            )
+
+        # The fused op always scatter-adds into ``moe_output``; there is no
+        # unfused FC2 seam to hand back. ``can_implement`` does not chain to the
+        # parent, so this repeats the parent's SM107 guard rather than inheriting
+        # it (``fused_moe_cute_dsl.py``, FINALIZE_FUSION_REQUIRED).
+        if not d.fused_finalize_enabled:
+            return _reject(
+                MoERejectReason.FINALIZE_FUSION_REQUIRED,
+                "CuteDslFc12FusedMoE always fuses finalize and has no unfused FC2 path",
             )
 
         # See the module docstring: the fused op wrapper is not registered yet.
@@ -178,8 +205,8 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             # unique_id must too, or SwiGLU/SiTU share a tile-size tactic.
             workload_identity=(
                 int(self.activation_type),
-                self.situ_beta,
-                self.situ_linear_beta,
+                self.act_alpha,
+                self.act_beta,
             ),
         )
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output, weight_view]
@@ -201,8 +228,17 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
         weight_view: NvFp4WeightView,
         enable_alltoall: bool = False,
         tile_size: int = 128,
+        overlap_moe_output_memset: bool = True,
     ) -> torch.Tensor:
-        """Single fused FC1+FC2 op (replaces the parent's two-op sequence)."""
+        """Single fused FC1+FC2 op (replaces the parent's two-op sequence).
+
+        ``overlap_moe_output_memset`` is accepted and ignored: the inherited
+        ``CuteDslFusedMoENvfp4Runner.forward`` passes it when priming the tile
+        caches, but the fused op issues the ``moe_output`` memset internally so
+        the caller cannot sequence it. Priming output is discarded, so ignoring
+        it is safe.
+        """
+        del overlap_moe_output_memset
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
         slot_start = weight_view.slot_start
@@ -256,12 +292,12 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
-            swiglu_limit=self.swiglu_limit_scalar,
+            swiglu_limit=self.act_clamp,
             ep_size=self.mapping.moe_ep_size,
             enable_alltoall=enable_alltoall,
             scaling_vector_size=16,
             activation_type=int(self.activation_type),
-            situ_beta=self.situ_beta if situ else -1.0,
-            situ_linear_beta=self.situ_linear_beta if situ else -1.0,
+            situ_beta=self.act_alpha if situ else -1.0,
+            situ_linear_beta=self.act_beta if situ else -1.0,
         )
         return moe_output
