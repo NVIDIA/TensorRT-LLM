@@ -1488,7 +1488,7 @@ class TestConversationAwareADPRouter:
 
     def test_gather_all_rank_states_excludes_retiring(self):
         dist = _mock_dist(tp_rank=2)
-        router = ConversationAwareADPRouter(dist=dist)
+        router = ConversationAwareADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [
             Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
             _retiring_request(prompt_len=50),

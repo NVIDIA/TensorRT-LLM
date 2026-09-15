@@ -149,15 +149,19 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         # Pool sizing: effective_pool_size returns max_num_requests when
         # global pool is off, or max(64, max_num_requests) / explicit
-        # value when on. All slot-indexed sizing uses pool_size, so the
-        # live-slot count is a floor on it.
-        self.pool_size = max(sa_config.effective_pool_size, self._num_seq_slots)
-        if sa_config.global_pool_size is not None and self.pool_size > sa_config.global_pool_size:
-            logger.warning(
-                f"Growing the SA pool from the configured global_pool_size "
-                f"({sa_config.global_pool_size}) to {self.pool_size} to cover the "
-                f"executor's sequence slots."
+        # value when on. All slot-indexed sizing uses pool_size.
+        self.pool_size = sa_config.effective_pool_size
+        if self.pool_size < max_num_requests:
+            raise ValueError(
+                f"global_pool_size ({self.pool_size}) must be >= "
+                f"max_batch_size ({max_num_requests})"
             )
+        if self.pool_size < self._num_seq_slots:
+            logger.warning(
+                f"Growing the SA pool from {self.pool_size} to "
+                f"{self._num_seq_slots} to cover the executor's sequence slots."
+            )
+            self.pool_size = self._num_seq_slots
 
         # Calculate per-state size based on max_seq_len
         self.state_size = _sa_native.get_state_size(self.max_seq_len)

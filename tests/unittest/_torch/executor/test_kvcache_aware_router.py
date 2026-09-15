@@ -150,6 +150,7 @@ class TestKVCacheAwareADPRouter:
         router = KVCacheAwareADPRouter(
             dist=dist,
             kv_cache_manager=mgr,
+            has_seq_slot_headroom=True,
             async_transfer_manager=transfer_mgr,
             account_for_in_transfer=True,
         )

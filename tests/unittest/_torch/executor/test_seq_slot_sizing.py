@@ -514,6 +514,9 @@ def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) 
     c._is_disagg = False
     c._is_kv_cache_manager_v2 = is_v2
     c._disable_overlap_scheduler = disable_overlap_scheduler
+    c._llm_args = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(kv_events_config=None),
+    )
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True
     c._get_model_kv_cache_manager_cls = Mock(return_value=Mock())
@@ -536,6 +539,7 @@ def test_kv_cache_manager_receives_the_overlap_scheduler_flag(disable_overlap_sc
     creator = _make_kv_cache_creator(disable_overlap_scheduler)
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=SimpleNamespace(is_generation=True)),
+        is_draft_model=False,
     )
 
     with patch(
