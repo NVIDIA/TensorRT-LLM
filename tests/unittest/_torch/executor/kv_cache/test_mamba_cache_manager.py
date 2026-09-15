@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    _KDA_BETA_CACHE_ALIGNMENT_BYTES,
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     MambaCacheManager,
@@ -2211,6 +2212,7 @@ def _build_v2_hybrid_with_mamba_layer(
     kv_cache_dtype="auto",
     conv_state_layout="x_b_c",
     mamba_d_conv=4,
+    mamba_num_heads=4,
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
@@ -2245,7 +2247,7 @@ def _build_v2_hybrid_with_mamba_layer(
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
         mamba_d_conv=mamba_d_conv,
-        mamba_num_heads=4,
+        mamba_num_heads=mamba_num_heads,
         mamba_n_groups=mamba_n_groups,
         mamba_head_dim=8,
         mamba_num_layers=num_mamba_layers,
@@ -3449,7 +3451,8 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         spec_config=spec_config,
         conv_state_layout="q_k_v",
         mamba_d_conv=5,
-        mamba_n_groups=4,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
         mamba_ssm_cache_dtype=torch.float32,
         kda_replay_num_spec=2,
     )
@@ -3461,14 +3464,25 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
 
         layer_cache = mgr.mamba_layer_cache(0)
         cache_size = layer_cache.temporal.shape[0]
-        assert layer_cache.kda_conv_q.shape == (cache_size, 32, 6)
-        assert layer_cache.kda_conv_k.shape == (cache_size, 32, 6)
-        assert layer_cache.kda_conv_v.shape == (cache_size, 32, 6)
+        assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_q.dtype is torch.float32
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 32)
-        assert layer_cache.kda_v_cache.shape == (cache_size, 2, 32)
-        assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 4)
+        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 48)
+        assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
+        # Six fp32 heads are 24 bytes, so the row is padded to 32 (stride 8)
+        # to keep every nested per-draft view 16-byte aligned for CuTe.
+        assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
+        assert layer_cache.kda_beta_cache.stride(-2) == 8
+        for layer_idx in range(2):
+            for slot_idx in range(cache_size):
+                for draft_idx in range(2):
+                    assert (
+                        mgr.kda_beta_cache[layer_idx, slot_idx, draft_idx].data_ptr()
+                        % _KDA_BETA_CACHE_ALIGNMENT_BYTES
+                        == 0
+                    )
         assert layer_cache.kda_qkg_cache.dtype is torch.float32
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             mgr.prev_num_accepted_tokens.data_ptr()

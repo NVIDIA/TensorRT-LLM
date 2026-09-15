@@ -48,16 +48,16 @@ The split is EP-only unless the user sets ``moe_tensor_parallel_size`` /
 ``moe_expert_parallel_size`` explicitly. Routing is computed replicated; the
 routed partial sums — EP partials of whole experts, or TP partials over the
 intermediate shards — are all-reduced in the latent space (before
-``routed_expert_norm`` / ``routed_expert_up_proj``, which are
-nonlinear/linear layers applied to the full sum). When attention DP is off,
-the shared experts use standard MLP TP over the model TP group: gate/up are
-column-sharded and down is row-sharded. Direct MoE-TP combines the shared
-hidden-width partial and routed latent partial into one all-reduce after the
-two streams join, then splits them before the routed norm/up projection.
-Communication-backed routed paths keep the shared ``GatedMLP`` reduction,
-because their routed result is already combined. Under attention DP the
-shared experts stay replicated. ``lm_head`` uses the stock ``LMHead``
-(vocab-sharded + gather), so logits are identical on all ranks.
+``routed_expert_norm`` / ``routed_expert_up_proj``, which are nonlinear/linear
+layers applied to the full sum). When attention DP is off, the shared experts
+use standard MLP TP over the model TP group: gate/up are column-sharded and down
+is row-sharded. The shared down projection reduces on the auxiliary stream
+while the routed expert chain runs on the main stream. After the streams join,
+the routed latent partial is reduced before its norm/up projection.
+Fused-communication routed backends already return a complete routed result and
+need no outer reduction. Under attention DP the shared experts stay replicated.
+``lm_head`` uses the stock ``LMHead`` (vocab-sharded + gather), so logits are
+identical on all ranks.
 
 Speculative decoding: SA (suffix automaton, one-engine, draft-weight-free);
 the KDA/MLA runtimes implement multi-token verification with deferred
@@ -119,6 +119,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
+from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -359,6 +360,121 @@ KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
 _FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 
 
+KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
+"""Largest per-rank token count for which the fused epilogue is taken.
+
+Accepts any integer >= 1. The default follows ``KIMI_K3_ATTN_RES_TOPOLOGY``:
+1 when the persistent port is off (the pre-existing decode-only gate) and 32
+when it is on. Setting this explicitly overrides both.
+
+Read at import, so CUDA-graph capture and replay cannot disagree about it.
+"""
+
+KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
+"""Which fused attention-residual kernel topology to use.
+
+Accepted values:
+
+  ``per_token``   one CTA (N<=4) or one 8-CTA cluster (N>=5) per token; the
+                  persistent kernel is never used. This is the default, i.e.
+                  the feature is off and behaviour is unchanged.
+  ``persistent``  one CTA per SM looping over tokens, used at every shape the
+                  persistent kernel implements (H == 7168 and 2 <= N <= 9).
+  ``split``       persistent above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``
+                  tokens, per-token at or below it.
+  ``1``           the only accepted on-value; resolves to ``split``.
+
+Off by default because the persistent kernel measures as no-regression on
+NVFP4 but as a 2.98x context-phase regression on W4A8_MXFP4_MXFP8, through a
+downstream interaction with the TRTLLM-gen MoE rather than through this kernel.
+
+Read at import, so CUDA-graph capture and replay cannot disagree about it.
+"""
+
+_ATTN_RES_TOPOLOGIES = ("per_token", "persistent", "split")
+
+# Turning the port on should not require knowing which of the three topologies
+# is the right one: "1" selects the measured policy (``split``), so enabling the
+# feature and choosing the policy are one action through one variable.
+_ATTN_RES_TOPOLOGY_ON = "1"
+
+
+def _read_attn_res_topology() -> str:
+    """Default ``per_token``: the persistent kernel is opt-in.
+
+    ``1`` is the only accepted on-value and resolves to ``split``. The named
+    topologies stay available for measurement: ``persistent`` uses the
+    persistent kernel at every shape it implements, ``per_token`` at none.
+    """
+    raw = os.environ.get(KIMI_K3_ATTN_RES_TOPOLOGY_ENV, "per_token")
+    if raw == _ATTN_RES_TOPOLOGY_ON:
+        return "split"
+    if raw not in _ATTN_RES_TOPOLOGIES:
+        # Loudly, for the same reason as the token ceiling below: a mistyped A/B
+        # arm that silently fell back to the default would measure one side
+        # twice and report no difference.
+        raise ValueError(
+            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be one of "
+            f"{_ATTN_RES_TOPOLOGIES} or {_ATTN_RES_TOPOLOGY_ON!r} "
+            f"(which means 'split'), got {raw!r}"
+        )
+    return raw
+
+
+def _read_fused_attn_res_max_tokens() -> int:
+    """Resolved after the topology, because its default follows it.
+
+    With the persistent port off -- the default -- the ceiling is 1, the
+    pre-existing gate: the fused epilogue is taken at the single-token decode
+    shape and nowhere else. Enabling the port raises it to 32, the top of the
+    measured range, so that "off" keeps meaning "unchanged".
+    """
+    default = "1" if _ATTN_RES_TOPOLOGY == "per_token" else "32"
+    raw = os.environ.get(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, default)
+    try:
+        value = int(raw)
+    except ValueError:
+        # Failing loudly matters more than usual here: a mistyped A/B arm that
+        # silently fell back to the default would measure the candidate twice
+        # and report no difference.
+        raise ValueError(
+            f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be a positive integer, got {raw!r}"
+        ) from None
+    if value < 1:
+        raise ValueError(f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be >= 1, got {value}")
+    return value
+
+
+_ATTN_RES_TOPOLOGY = _read_attn_res_topology()
+_FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
+
+
+def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
+    """Shape gate for the persistent kernel: H == 7168 and 2 <= N <= 9.
+
+    No token ceiling: the persistent grid is sized by the SM count, not by the
+    token count, so prefill is the case it exists for.
+    """
+    del M  # deliberately unused; see above
+    return H == 7168 and 2 <= N <= 9
+
+
+def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
+    """Pick between the two fused kernels for this call site.
+
+    ``persistent`` takes the persistent kernel at every shape it implements;
+    ``split`` takes it only above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens,
+    which stands in for the prefill/decode boundary. Shapes the persistent
+    kernel does not implement fall through to the caller's existing gate and
+    land on the unfused path.
+    """
+    if not _persistent_attn_res_applicable(M, H, N):
+        return False
+    if _ATTN_RES_TOPOLOGY == "persistent":
+        return True
+    return _ATTN_RES_TOPOLOGY == "split" and M > _FUSED_ATTN_RES_MAX_TOKENS
+
+
 def _apply_attn_res_fused(
     prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm
 ) -> Optional[torch.Tensor]:
@@ -392,6 +508,158 @@ def _apply_attn_res_fused(
     return output.reshape(M, H)
 
 
+def _rms_norm_eps(norm: nn.Module) -> float:
+    if hasattr(norm, "eps"):
+        return float(norm.eps)
+    return float(norm.variance_epsilon)
+
+
+def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> None:
+    """Report whether the fused path was actually reached, once per shape.
+
+    ``_FUSED_ATTN_RES_ENABLED`` only says the feature is switched on, not that
+    the shape gate let the call through, and a rejected call looks exactly like
+    a disabled one in the logs. Emitted at debug level: it is once per distinct
+    shape, not once per process, so it is a diagnostic rather than a summary.
+    """
+    logger.debug_once(
+        f"Kimi K3 attn-res fusion [{site}]: "
+        f"{'FUSED' if fused else 'fallback'} (M={M}, H={H}, N={N})",
+        key=f"kimi_k3_attn_res_fusion_{site}_{fused}_{M}_{H}_{N}",
+    )
+
+
+def _apply_attn_res_rmsnorm_fused(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Optional[torch.Tensor]:
+    """Fuse attention-residual mixing with its immediately following norm."""
+    if (
+        prefix_sum.dtype is not torch.bfloat16
+        or not prefix_sum.is_cuda
+        or not block_residual.is_cuda
+    ):
+        return None
+    M, H = prefix_sum.shape
+    K = int(block_residual.shape[0])
+    N = K + 1
+    # The fused path is taken for M <= _FUSED_ATTN_RES_MAX_TOKENS, H == 7168 and
+    # N <= 12, which is the measured window; larger token counts have not been
+    # measured and fall back to the unfused add + attn_res_fwd + RMSNorm path.
+    if _use_persistent_attn_res(M, H, N):
+        try:
+            persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
+        except (AttributeError, RuntimeError):
+            return None
+        _, output = persistent_op(
+            prefix_sum.reshape(M, 1, H).contiguous(),
+            None,
+            block_residual.reshape(K, M, 1, H).contiguous(),
+            proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+            norm.weight.to(torch.bfloat16).contiguous(),
+            output_norm.weight.to(torch.bfloat16).contiguous(),
+            float(norm.eps),
+            _rms_norm_eps(output_norm),
+        )
+        _note_attn_res_fusion("attn_res+norm/persistent", True, M, H, N)
+        return output.reshape(M, H)
+
+    if M > _FUSED_ATTN_RES_MAX_TOKENS or H != 7168 or N > 12:
+        _note_attn_res_fusion("attn_res+norm", False, M, H, N)
+        return None
+    try:
+        attn_res_rmsnorm_op = torch.ops.trtllm.attn_res_rmsnorm_fwd
+    except (AttributeError, RuntimeError):
+        return None
+    layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
+    block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
+    output = attn_res_rmsnorm_op(
+        layer_kernel,
+        block_kernel,
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(),
+        output_norm.weight.to(torch.bfloat16).contiguous(),
+        float(norm.eps),
+        _rms_norm_eps(output_norm),
+    )
+    _note_attn_res_fusion("attn_res+norm", True, M, H, N)
+    return output.reshape(M, H)
+
+
+def _apply_attn_res_add_rmsnorm_fused(
+    prefix_sum: torch.Tensor,
+    addend: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Fuse ``prefix_sum + addend``, attention-residual, and trailing norm.
+
+    The production residual add produces a BF16 tensor that remains live across
+    the following MLP. The kernel therefore returns that materialized,
+    BF16-rounded prefix sum alongside the normalized attention-residual output,
+    while avoiding a separate add launch and a re-read of the intermediate by
+    attention-residual selection.
+    """
+    if (
+        prefix_sum.dtype is not torch.bfloat16
+        or addend.dtype is not torch.bfloat16
+        or not prefix_sum.is_cuda
+        or not addend.is_cuda
+        or not block_residual.is_cuda
+        or prefix_sum.shape != addend.shape
+    ):
+        return None
+    M, H = prefix_sum.shape
+    K = int(block_residual.shape[0])
+    N = K + 1
+    # Same measured window as _apply_attn_res_rmsnorm_fused above.
+    if _use_persistent_attn_res(M, H, N):
+        try:
+            persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
+        except (AttributeError, RuntimeError):
+            return None
+        updated_prefix_sum, output = persistent_op(
+            prefix_sum.reshape(M, 1, H).contiguous(),
+            addend.reshape(M, 1, H).contiguous(),
+            block_residual.reshape(K, M, 1, H).contiguous(),
+            proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+            norm.weight.to(torch.bfloat16).contiguous(),
+            output_norm.weight.to(torch.bfloat16).contiguous(),
+            float(norm.eps),
+            _rms_norm_eps(output_norm),
+        )
+        _note_attn_res_fusion("add+attn_res+norm/persistent", True, M, H, N)
+        return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
+
+    if M > _FUSED_ATTN_RES_MAX_TOKENS or H != 7168 or N > 12:
+        _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
+        return None
+    try:
+        attn_res_add_rmsnorm_op = torch.ops.trtllm.attn_res_add_rmsnorm_fwd
+    except (AttributeError, RuntimeError):
+        return None
+    layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
+    addend_kernel = addend.reshape(M, 1, H).contiguous()
+    block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
+    updated_prefix_sum, output = attn_res_add_rmsnorm_op(
+        layer_kernel,
+        addend_kernel,
+        block_kernel,
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(),
+        output_norm.weight.to(torch.bfloat16).contiguous(),
+        float(norm.eps),
+        _rms_norm_eps(output_norm),
+    )
+    _note_attn_res_fusion("add+attn_res+norm", True, M, H, N)
+    return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
+
+
 def _apply_attn_res(
     prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm
 ) -> torch.Tensor:
@@ -418,6 +686,42 @@ def _apply_attn_res(
     probs = scores.softmax(-1).unsqueeze(1)
     hidden_states = torch.matmul(probs, v_float).squeeze(1)
     return hidden_states.to(v.dtype)
+
+
+def _apply_attn_res_and_rmsnorm(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> torch.Tensor:
+    """Apply attention-residual selection and the next RMSNorm."""
+    if _FUSED_ATTN_RES_ENABLED:
+        fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
+        if fused is not None:
+            return fused
+    return output_norm(_apply_attn_res(prefix_sum, block_residual, proj, norm))
+
+
+def _apply_attn_res_add_and_rmsnorm(
+    prefix_sum: torch.Tensor,
+    addend: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Add an attention output to the running residual, then select and norm."""
+    if _FUSED_ATTN_RES_ENABLED:
+        fused = _apply_attn_res_add_rmsnorm_fused(
+            prefix_sum, addend, block_residual, proj, norm, output_norm
+        )
+        if fused is not None:
+            return fused
+    updated_prefix_sum = prefix_sum + addend
+    return updated_prefix_sum, _apply_attn_res_and_rmsnorm(
+        updated_prefix_sum, block_residual, proj, norm, output_norm
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1112,8 +1416,8 @@ class KimiK3MoERuntime(nn.Module):
             hidden_size=self.moe_hidden_size,
             intermediate_size=cfg.moe_intermediate_size,
             dtype=dtype,
-            # Kimi owns the latent reduction so direct MoE-TP can combine it
-            # with the shared-expert partial in one collective below.
+            # Kimi owns the latent reduction so it can order that collective
+            # after the shared expert's auxiliary-stream reduction.
             reduce_results=False,
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
@@ -1168,13 +1472,15 @@ class KimiK3MoERuntime(nn.Module):
         # Direct MoE-TP leaves both branches as partials for one concatenated
         # all-reduce.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
-        routed_all_reduce = self.routed_experts.all_reduce
-        if use_shared_tp and routed_all_reduce is None:
+        self._reduce_routed_output = (
+            use_shared_tp
+            and self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
+        )
+        if self._reduce_routed_output and self.routed_experts.all_reduce is None:
             raise RuntimeError(
                 "Kimi K3 direct MoE tensor parallelism requires the "
                 "ConfigurableMoE all-reduce even when reduce_results=False."
             )
-        self._use_combined_all_reduce = use_shared_tp
         self.shared_experts = GatedMLP(
             hidden_size=cfg.hidden_size,
             intermediate_size=shared_intermediate,
@@ -1187,7 +1493,7 @@ class KimiK3MoERuntime(nn.Module):
             dtype=dtype,
             config=shared_model_config,
             overridden_tp_size=1 if attention_dp else None,
-            reduce_output=False,
+            reduce_output=use_shared_tp,
             layer_idx=layer_idx,
             is_shared_expert=True,
         )
@@ -1395,7 +1701,7 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
-        moe_all_reduce = self.routed_experts.all_reduce if self._use_combined_all_reduce else None
+        moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -1414,7 +1720,7 @@ class KimiK3MoERuntime(nn.Module):
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
-            if self._use_combined_all_reduce:
+            if self._reduce_routed_output:
                 return y
             # Communication-backed paths return a complete routed result.
             y = self.routed_expert_norm(y)
@@ -1423,8 +1729,10 @@ class KimiK3MoERuntime(nn.Module):
         # Shared experts depend only on the block input, so overlap their GEMMs
         # with the routed dispatch/expert/combine chain. Multi-stream engages
         # only under CUDA graphs; otherwise both branches run in order on the
-        # default stream. Direct MoE-TP leaves both branches as partial sums
-        # until the streams join, then reduces them with one collective.
+        # default stream. The shared GatedMLP includes its output all-reduce on
+        # the auxiliary stream. The join below must precede the routed
+        # all-reduce: concurrent collectives on different streams can corrupt
+        # SYMM_MEM all-reduce state.
         routed_out, shared_out = maybe_execute_in_parallel(
             _routed_output,
             lambda: self.shared_experts(identity),
@@ -1433,16 +1741,9 @@ class KimiK3MoERuntime(nn.Module):
             self.shared_expert_stream,
             disable_on_compile=True,
         )
-        if self._use_combined_all_reduce:
-            combined = moe_all_reduce(torch.cat((shared_out, routed_out), dim=-1))
-            shared_out, routed_latent = torch.split(
-                combined,
-                (self.hidden_size, self.moe_hidden_size),
-                dim=-1,
-            )
-            # The column split is a strided view; FlashInfer RMSNorm expects
-            # a dense last dimension.
-            routed_latent = self.routed_expert_norm(routed_latent.contiguous())
+        if self._reduce_routed_output:
+            routed_latent = moe_all_reduce(routed_out)
+            routed_latent = self.routed_expert_norm(routed_latent)
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         return routed_out + shared_out
 
