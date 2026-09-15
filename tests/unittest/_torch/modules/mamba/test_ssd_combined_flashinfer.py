@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.mamba.ssd_combined import (
     _get_flashinfer_ssd_kernel,
     mamba_chunk_scan_combined,
 )
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 
 def _flashinfer_available():
@@ -39,8 +39,10 @@ def _flashinfer_available():
 
 
 skip_no_flashinfer = pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_sm_100f() and _flashinfer_available()),
-    reason="FlashInfer SSD requires SM100+ with flashinfer installed",
+    not (torch.cuda.is_available() and is_sm_100f() and _flashinfer_available())
+    or get_sm_version() == 107,
+    reason="FlashInfer SSD requires SM100+ with flashinfer installed; "
+    "SSDCombined's tcgen05 MMA path only lists SM100/SM103/SM110",
 )
 
 # Configurations that flashinfer SSD currently lowers cleanly.
