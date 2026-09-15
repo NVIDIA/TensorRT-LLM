@@ -2,17 +2,16 @@
 
 set -ex
 
-# Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
-CUDA_VER="13.4" # image reports CUDA_VERSION=13.4.1.012
+# Align with the pre-installed cuDNN / cuBLAS / NCCL versions from the DLFW release notes:
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/
+CUDA_VER="13.4" # the DLFW image's CUDA_VERSION, major.minor
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-# The DLFW 26.08 image ships cuDNN 9.25.0.28, an internal build the public CUDA repo does not
-# carry (it has 9.25.0.15-1, 9.25.1.1-1 and 9.26.0.51-1). Pin the closest published version so
-# that every image -- the DLFW-based one included -- ends up on a cuDNN anyone can install from
-# the public repo, and the tests therefore validate that combination rather than one only NGC
-# can reproduce. The version guard below does not match on DLFW, so its cuDNN is deliberately
-# purged and reinstalled at this version.
+# The DLFW image usually ships an internal cuDNN build the public CUDA repo does not carry, so
+# pin the closest published version instead: every image, the DLFW-based one included, then
+# ends up on a cuDNN anyone can install, and the tests validate that combination rather than
+# one only NGC can reproduce. The version guard below will not match on DLFW, so its cuDNN is
+# deliberately purged and reinstalled at this version.
 CUDNN_VER="9.25.1.1-1"
 NCCL_VER="2.30.7-1+cuda13.3"
 CUBLAS_VER="13.7.0.27-1"
@@ -20,9 +19,10 @@ CUBLAS_VER="13.7.0.27-1"
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"
 CUDA_RUNTIME="13.4.49-1" # rockylinux only
-# rockylinux only. CUDA 13.4.1 ships cuda-compat-13-4 at 615.71.09; the DLFW image itself
-# reports CUDA_DRIVER_VERSION=615.65.02, which was never published as an rpm.
-CUDA_DRIVER_VERSION="615.71.09-1.el8"
+# Pin the cuda-compat that ships with CUDA_VER; the DLFW image reports a CUDA_DRIVER_VERSION
+# of its own that is typically never published as a package.
+CUDA_DRIVER_VERSION="615.71.09-1.el8" # rockylinux only
+CUDA_COMPAT_VER="615.71.09-1ubuntu1" # ubuntu only
 
 for i in "$@"; do
     case $i in
@@ -60,8 +60,9 @@ install_ubuntu_requirements() {
     CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
     NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
-    # Skip remove+reinstall for any library already at the target version (e.g. pre-installed
+    # Skip remove+reinstall for a library already at the target version (e.g. pre-installed
     # by the base image at a version not yet published to the public CUDA apt repo).
+    # cuda-nvrtc-dev is deliberately exempt from that shortcut, see below.
     installed_pkg_version() {
         dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true
     }
@@ -81,9 +82,17 @@ install_ubuntu_requirements() {
         apt-get remove --purge -y --allow-change-held-packages libcublas* || true
         PKGS_TO_INSTALL+=(libcublas-${NVRTC_CUDA_VERSION}=${CUBLAS_VER} libcublas-dev-${NVRTC_CUDA_VERSION}=${CUBLAS_VER})
     fi
-    if [[ "$(installed_pkg_version cuda-nvrtc-dev-${NVRTC_CUDA_VERSION})" != "${NVRTC_VER}" ]]; then
-        apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* || true
-        PKGS_TO_INSTALL+=(cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER})
+    # Always reinstall cuda-nvrtc-dev: the DLFW base image ships NVRTC without
+    # libnvrtc_static.a, so a version match there does not mean the static library the cpp
+    # build needs (CUDA::nvrtc_static) is present. The public CUDA repo package has it.
+    apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* || true
+    PKGS_TO_INSTALL+=(cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER})
+
+    # Restore the cuda-compat providing libcuda.so.1, which the run-file reinstall purges and
+    # --toolkit does not bring back, and which the NIXL build needs. Test for the library, not
+    # the package: an image that kept its own CUDA also kept a cuda-compat of its own.
+    if [ -z "$(find /usr/local -name libcuda.so.1 -print -quit)" ]; then
+        PKGS_TO_INSTALL+=(cuda-compat-${NVRTC_CUDA_VERSION}=${CUDA_COMPAT_VER})
     fi
 
     if [ ${#PKGS_TO_INSTALL[@]} -gt 0 ]; then

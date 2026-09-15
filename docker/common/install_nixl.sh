@@ -52,4 +52,12 @@ cd ../..
 rm -rf nixl*  # Remove NIXL source tree to save space
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
+# Consumers import `nixl`, but the build above installs the backend as
+# `nixl_cu13`. Install the dispatching shim with --no-deps: the backend it would
+# otherwise pull from PyPI bundles a second UCX, which segfaults alongside the
+# one torch already links.
+pip3 install --no-deps "nixl==${NIXL_VERSION#v}"
+
 echo "export LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib/${ARCH_NAME}:/opt/nvidia/nvda_nixl/lib64:\$LD_LIBRARY_PATH" >> "${ENV}"
+# ninja installs the bindings outside site-packages, so the shim needs PYTHONPATH.
+echo "export PYTHONPATH=/opt/nvidia/nvda_nixl/lib/python3/dist-packages\${PYTHONPATH:+:\$PYTHONPATH}" >> "${ENV}"
