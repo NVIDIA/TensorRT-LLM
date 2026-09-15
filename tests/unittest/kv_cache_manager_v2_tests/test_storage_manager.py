@@ -579,20 +579,20 @@ class TestStorageManagerLocalized(unittest.TestCase):
         self.storage_manager = self._make_localized_sm(num_layers=2)
         sm = self.storage_manager
         # [1] = 1 slot requested for the single life cycle
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "locality_domain_id"):
             sm.new_slots(GPU_LEVEL, [1])
 
     def test_new_slots_for_pool_group_asserts_without_locality_domain_id(self) -> None:
         """new_slots_for_pool_group at GPU level must raise AssertionError when locality_domain_id is omitted."""
         self.storage_manager = self._make_localized_sm(num_layers=2)
         sm = self.storage_manager
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "locality_domain_id"):
             sm.new_slots_for_pool_group(GPU_LEVEL, PoolGroupIndex(0), 1)
 
     def test_num_slots_asserts_without_locality_domain_id(self) -> None:
         """num_slots at GPU level must raise AssertionError when locality_domain_id is omitted."""
         self.storage_manager = self._make_localized_sm(num_layers=2)
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "locality_domain_id"):
             self.storage_manager.num_slots(PoolGroupIndex(0))
 
     # ------------------------------------------------------------------
@@ -737,6 +737,16 @@ class TestStorageManagerLocalized(unittest.TestCase):
         self.storage_manager = self._make_localized_sm(num_layers=2, gpu_quota=_256MB)
         gpu_storage = self.storage_manager._levels[GPU_LEVEL].storage
         self.assertLessEqual(gpu_storage.total_quota, _256MB)
+        self.assertGreater(gpu_storage.total_quota, 0)
+        # A budget that is merely under the cap would also be satisfied by
+        # allocating nothing, or by giving one domain everything.
+        pg = PoolGroupIndex(0)
+        per_domain = [
+            self.storage_manager.num_slots(pg, GPU_LEVEL, locality_domain_id=d)
+            for d in range(gpu_storage.num_locality_domains)
+        ]
+        self.assertTrue(all(n > 0 for n in per_domain), per_domain)
+        self.assertEqual(len(set(per_domain)), 1, per_domain)
 
     # ------------------------------------------------------------------
     # Test 4: slot_id encoding — locality_domain0 below localized slot offset, locality_domain1 at or above it
