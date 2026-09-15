@@ -761,6 +761,27 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             "geometry is loaded; an explicit value below token_topk is raised "
             "to token_topk because it cannot reduce attention work."),
     )
+    enable_heuristic_topk: bool = Field(
+        default=False,
+        description=
+        "Whether to enable the Guess-Verify-Refine (GVR) Top-K for the QSA "
+        "indexer instead of the exact radix Top-K. QSA dispatches only the "
+        "hint-free self-sampling engine, which requires Blackwell (SM100/103), "
+        "the CUTLASS DSL, a compressed-group budget "
+        "(indexer_budget / indexer_compress_ratio) in {512, 1024, 2048}, and "
+        "an indexer_compress_ratio of 4. Falls back to the exact radix "
+        "Top-K with a one-time warning when the prerequisites are not met.")
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Whether the MTP draft loop reuses the indexer selection captured by "
+        "its draft-extend pass instead of re-running the indexer on every "
+        "draft decode step. The query advances by at most max_draft_len "
+        "positions, so the captured ranking is the one the indexer would "
+        "recompute; compressed groups that complete during the loop are "
+        "appended at lookup. When omitted, the checkpoint config supplies the "
+        "value, defaulting to off.")
     # Index projection dimensions, compression, and selection budget are part
     # of the checkpoint contract rather than serving-time tuning knobs.
     _resolved_params: Optional["QSASparseParams"] = PrivateAttr(default=None)
@@ -822,7 +843,16 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             compress_ratio=self._checkpoint_value(pretrained_config,
                                                   "indexer_compress_ratio"),
             seq_len_threshold=seq_len_threshold,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            mtp_index_share=self._mtp_index_share(pretrained_config),
         )
+
+    def _mtp_index_share(self, pretrained_config: object) -> bool:
+        """Resolve the draft-loop index-share opt-in from config or checkpoint."""
+        if self.index_share_for_mtp_iteration is not None:
+            return bool(self.index_share_for_mtp_iteration)
+        return bool(
+            getattr(pretrained_config, "index_share_for_mtp_iteration", False))
 
     def to_sparse_metadata_params(
             self, **kwargs: object) -> "QSASparseMetadataParams":
@@ -833,6 +863,7 @@ class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         return QSASparseMetadataParams(
             token_topk=params.token_topk,
             compress_ratio=params.compress_ratio,
+            mtp_index_share=params.mtp_index_share,
         )
 
 

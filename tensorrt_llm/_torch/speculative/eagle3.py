@@ -765,8 +765,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
-        from ..attention.backends.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                     is_dsa_cache_manager)
+        from ..attention.backends.sparse.dsa import is_dsa_cache_manager
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
@@ -775,9 +774,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
 
-        uses_dsa_mtp_metadata = self.is_mtp_eagle and isinstance(
-            attn_metadata, DSAtrtllmAttentionMetadata)
-        if uses_dsa_mtp_metadata:
+        # Sparse backends that can reuse one indexer selection across the draft
+        # loop expose this setter; each indexer still decides whether its own
+        # config turns the reuse on.
+        uses_mtp_index_share = self.is_mtp_eagle and hasattr(
+            attn_metadata, "set_in_mtp_draft_loop")
+        if uses_mtp_index_share:
             attn_metadata.set_in_mtp_draft_loop(True)
             # Accepted counts let the indexer stash each gen's last-accepted row.
             attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
@@ -786,7 +788,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 attn_metadata, draft_kv_cache_manager) as draft_attn_metadata:
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
-            if uses_dsa_mtp_metadata and is_dsa_cache_manager(
+            if uses_mtp_index_share and is_dsa_cache_manager(
                     draft_kv_cache_manager):
                 # Overlap scheduling corrects kv_lens_cuda from the runtime
                 # accepted-token counts inside the captured graph. The target
@@ -795,7 +797,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # writes the separate DSA indexer cache at the same positions.
                 attn_metadata.on_update_kv_lens()
             for i in range(runtime_draft_len):
-                if uses_dsa_mtp_metadata:
+                if uses_mtp_index_share:
                     attn_metadata.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
@@ -1004,7 +1006,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
-        if uses_dsa_mtp_metadata:
+        if uses_mtp_index_share:
             attn_metadata.set_skip_topk(False)
             attn_metadata.set_in_mtp_draft_loop(False)
             attn_metadata.set_mtp_num_accepted(None)

@@ -20,6 +20,7 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
+from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .fused_metadata import fused_dsa_decode_metadata
 from .indexer import (
@@ -31,7 +32,7 @@ from .indexer import (
     _pick_dsl_expand,
     _select_indexer_compress_ratio,
 )
-from .params import DSAMetadataParams, use_self_sampling_gvr
+from .params import DSAMetadataParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
