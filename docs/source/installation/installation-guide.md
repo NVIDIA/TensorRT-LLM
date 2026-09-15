@@ -57,7 +57,7 @@ The `cuda-compat-13-2` package may be required depending on your system's NVIDIA
 driver version. For additional information, refer to the [CUDA Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html).
 
 ```bash
-# By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+# By default, the PyTorch CUDA 13.0 package is installed. Install the PyTorch CUDA 13.2 package instead to better align with the CUDA version used to build the TensorRT LLM wheels.
 pip3 install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
 sudo apt-get -y install libopenmpi-dev
