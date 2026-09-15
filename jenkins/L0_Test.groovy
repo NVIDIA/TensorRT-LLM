@@ -6939,14 +6939,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
                             echo "###### Extra CUDA 13 PyTorch install Start ######"
-                            // cu130 is PyTorch's only CUDA 13 channel; it runs on the toolkit above
-                            // through CUDA minor version compatibility.
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // This must stay equal to what requirements.txt resolves to from the public
-                            // index, which is the highest public torch its ceiling admits: the wheel under
-                            // test is linked against that libtorch, and a mismatch fails the import with an
-                            // undefined c10 symbol rather than anything that names a version.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            // Must match what requirements.txt resolves to from the public index: the
+                            // wheel under test is linked against that libtorch, and a mismatch fails
+                            // the import with an undefined c10 symbol instead of a version error.
+                            // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.13.0+cu132 torchvision==0.28.0+cu132 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
