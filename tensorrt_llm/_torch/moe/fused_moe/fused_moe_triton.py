@@ -1567,10 +1567,15 @@ class TritonFusedMoE(MoE):
 
     Deprecated in TensorRT-LLM 1.3 (2026-09). The class remains functional
     during the 3-month migration period in the project deprecation policy,
-    then it is scheduled for removal. Prefer ``moe_config.backend="CUTLASS"``
-    for a functionally supported replacement on Hopper; performance may
-    differ. Construction logs a one-time warning. See
-    https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy
+    then it is scheduled for removal. Construction logs a one-time warning.
+
+    What it is kept for until then is one scenario: a modest performance edge
+    for gpt-oss on Hopper with ``W4A16_MXFP4``, which is what ``AUTO`` resolves
+    to TRITON for and the format an MXFP4 gpt-oss checkpoint takes on SM90.
+    ``CutlassFusedMoE`` serves that format on SM90 too, so
+    ``moe_config.backend="CUTLASS"`` replaces this backend functionally and is
+    already the automatic degradation target when a layer is declined here.
+    See https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy
     """
 
     capabilities = MoEStaticCapability(supports_expert_bias=True)
@@ -1685,9 +1690,10 @@ class TritonFusedMoE(MoE):
         logger.warning_once(
             "TritonFusedMoE (moe_config.backend='TRITON') is deprecated as of "
             "TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month "
-            "migration period. It remains functional on Hopper (SM90) until "
-            "then. Switch to moe_config.backend='CUTLASS' for a functionally "
-            "supported replacement; performance may differ. See "
+            "migration period, during which it stays functional on Hopper "
+            "(SM90). It is kept only for a modest performance edge on gpt-oss "
+            "W4A16_MXFP4; moe_config.backend='CUTLASS' serves that format on "
+            "SM90 and replaces this backend functionally. See "
             "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
             key="triton_fused_moe_deprecated",
         )
