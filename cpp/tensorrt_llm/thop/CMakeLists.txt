@@ -94,13 +94,13 @@ add_library(
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moe/cutlass/moeOp.cpp
-  moe/moeUtilOp.cpp
-  moe/moeGateOp.cpp
-  moe/moeCommOp.cpp
-  moe/moeAlltoAllOp.cpp
-  moe/moeLoadBalanceOp.cpp
-  moe/moeAlignOp.cpp
-  moe/megaMoePrepareOp.cpp
+  moe/utils/moeUtilOp.cpp
+  moe/routing/moeGateOp.cpp
+  moe/communication/moeCommOp.cpp
+  moe/communication/moeAlltoAllOp.cpp
+  moe/loadBalance/moeLoadBalanceOp.cpp
+  moe/utils/moeAlignOp.cpp
+  moe/communication/megaMoePrepareOp.cpp
   moe/trtllmGen/mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
@@ -123,7 +123,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  moe/customMoeRoutingOp.cpp
+  moe/routing/customMoeRoutingOp.cpp
   localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
