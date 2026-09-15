@@ -39,7 +39,7 @@ the intermediate bf16 round the unfused chain performs when materializing
 the normed tensor. Outputs are therefore near- but not byte-identical to the
 unfused pair (~1.4% of payload nibbles differ by one code step at Gemma4
 serving shapes); the quantization error against the fp32 norm is statistically
-identical (see tests/unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py).
+identical (see tests/unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py).
 
 Callers own enablement and keep the unfused pair as the fallback for
 configurations this kernel does not support (non-NVFP4 consumer, LoRA,

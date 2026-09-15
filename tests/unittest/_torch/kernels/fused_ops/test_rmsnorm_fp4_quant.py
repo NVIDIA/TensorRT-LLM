@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Quality test: fused RMSNorm+NVFP4-quantize (modules/fused_ops/
+"""Quality test: fused RMSNorm+NVFP4-quantize (kernels/fused_ops/
 rmsnorm_fp4_quant, backed by flashinfer's CuTe-DSL ``rmsnorm_fp4quant``) vs
 the unfused reference chain
 (trtllm::flashinfer_rmsnorm -> trtllm::fp4_quantize).
@@ -36,8 +36,8 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.fused_ops.gelu_tanh_mul_fp4_quant import sf_swizzled_offsets
-from tensorrt_llm._torch.modules.fused_ops.rmsnorm_fp4_quant import (
+from tensorrt_llm._torch.kernels.fused_ops.gelu_tanh_mul_fp4_quant import sf_swizzled_offsets
+from tensorrt_llm._torch.kernels.fused_ops.rmsnorm_fp4_quant import (
     rmsnorm_fp4_quant,
     rmsnorm_fp4_quant_available,
 )

@@ -47,7 +47,7 @@ def test_custom_pipeline_sync_factory_import(
 
     source = (
         pathlib.Path(__file__).resolve().parents[4]
-        / "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py"
+        / "tensorrt_llm/_torch/kernels/blackwell/custom_pipeline.py"
     )
     # Execute a fresh module without modifying the cached production module or
     # importing unrelated TensorRT-LLM dependencies. Dataclasses need sys.modules.

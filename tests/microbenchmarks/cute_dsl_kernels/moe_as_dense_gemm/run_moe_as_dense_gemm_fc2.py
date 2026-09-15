@@ -60,12 +60,13 @@ from cutlass.cute.runtime import from_dlpack
 
 # Import kernel module
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.moe_as_dense_gemm import (
-        fc2 as kernel_module,
-    )
+    from tensorrt_llm._torch.moe.kernels.blackwell.moe_as_dense_gemm import fc2 as kernel_module
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[4] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell.moe_as_dense_gemm import fc2 as kernel_module
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[4])
+    from tensorrt_llm._torch.moe.kernels.blackwell.moe_as_dense_gemm import fc2 as kernel_module
 
 Sm100BlockScaledPersistentDenseGemmKernel = kernel_module.Sm100BlockScaledPersistentDenseGemmKernel
 cvt_sf_MKL_to_M32x4xrm_K4xrk_L = kernel_module.cvt_sf_MKL_to_M32x4xrm_K4xrk_L
