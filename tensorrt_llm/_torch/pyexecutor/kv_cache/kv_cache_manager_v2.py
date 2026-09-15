@@ -1098,6 +1098,107 @@ def _rewind_context_cursor(req: LlmRequest, reuse: int) -> None:
         req.context_current_position = reuse
 
 
+class KVCacheManagerV2Pair:
+    """Coordinate target and draft KV operations that must stay paired.
+
+    The target manager is always present. A separate draft manager is optional,
+    but when configured its admission and lifecycle operations are performed by
+    this class so callers cannot update only one pool accidentally.
+    """
+
+    def __init__(
+        self,
+        target: "KVCacheManagerV2",
+        draft: Optional["KVCacheManagerV2"] = None,
+    ) -> None:
+        assert not getattr(target, "is_draft", False)
+        assert draft is None or getattr(draft, "is_draft", False)
+        self.target = target
+        self.draft = draft
+
+    def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
+        """Jointly reserve target and draft caches for disagg generation."""
+        if not self.target.prepare_disagg_gen_init(req):
+            return False
+        if self.draft is None or self.draft._prepare_draft_disagg_gen_init(req):
+            return True
+
+        self.suspend_request(req)
+        return False
+
+    def try_allocate_generation(self, req: LlmRequest) -> bool:
+        """Jointly grow target and draft caches for one generation step."""
+        if not self.target.try_allocate_generation(req):
+            return False
+        if self.draft is None:
+            return True
+
+        # The first disaggregated generation pass installs transferred draft
+        # state after scheduling, while the attention-DP dummy is initially
+        # created only in the target manager. Prepare their draft storage once
+        # those request views exist instead of rejecting them here.
+        defer_draft = (
+            getattr(req, "is_disagg_generation_transmission_complete", False) is True
+            or getattr(req, "is_attention_dp_dummy", False) is True
+        )
+        if defer_draft:
+            req.py_defer_draft_gen_allocation = True
+            return True
+
+        was_using_draft_model = req.use_draft_model
+        req.use_draft_model = True
+        try:
+            draft_success = self.draft.try_reserve_draft_generation(req)
+        finally:
+            req.use_draft_model = was_using_draft_model
+        if draft_success:
+            return True
+
+        self.target.revert_allocate_generation(req)
+        return False
+
+    def revert_allocate_generation(self, req: LlmRequest) -> None:
+        """Revert this iteration's generation growth in every KV pool."""
+        self.target.revert_allocate_generation(req)
+        if self.draft is not None:
+            if getattr(req, "py_defer_draft_gen_allocation", False) is True:
+                req.py_defer_draft_gen_allocation = False
+                return
+            was_using_draft_model = req.use_draft_model
+            req.use_draft_model = True
+            try:
+                self.draft.revert_reserve_draft_generation(req)
+            finally:
+                req.use_draft_model = was_using_draft_model
+
+    def suspend_request(self, req: LlmRequest) -> None:
+        """Suspend the request in every configured KV pool."""
+        self.target.suspend_request(req)
+        if self.draft is not None:
+            self.draft.suspend_request(req)
+
+    def free_resources(self, req: LlmRequest) -> None:
+        """Free the request in every configured KV pool."""
+        self.target.free_resources(req)
+        if self.draft is not None:
+            self.draft.free_resources(req)
+
+    def revert_allocate_context(self, req: LlmRequest) -> bool:
+        """Revert this iteration's context growth in every KV pool."""
+        target_kept_cache = self.target.revert_allocate_context(req)
+        if self.draft is not None:
+            draft_kept_cache = self.draft.revert_allocate_context(req)
+            if not target_kept_cache and draft_kept_cache:
+                self.draft.free_resources(req)
+        return target_kept_cache
+
+    def release_index_slot(self, request_id: int) -> None:
+        """Release the request's IndexMapper slot in every KV pool."""
+        self.target.release_index_slot(request_id)
+        if self.draft is not None:
+            self.draft.release_index_slot(request_id)
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
@@ -1626,6 +1727,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
 
         self._allocated_draft_lens: dict[int, int] = {}
+
+        # A separate draft pool keeps its generation reservation outside the
+        # target-side CUDA-graph padding ledger.
+        self._allocated_draft_gen_growth: dict[int, tuple[int, int]] = {}
+
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -3299,14 +3405,56 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{reverted_cap}"
             )
 
+    def try_reserve_draft_generation(self, req: LlmRequest) -> bool:
+        """Reserve one generation step in a separate draft-model KV pool."""
+        assert self.is_draft
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        if not self._resume_and_restore(req.py_request_id, kv_cache):
+            return False
+
+        draft_slots = self._generation_draft_slots(req)
+        old_capacity = kv_cache.capacity
+        new_capacity = old_capacity + 1 + draft_slots
+        if not kv_cache.resize(new_capacity):
+            return False
+        self._allocated_draft_gen_growth[req.py_request_id] = (
+            new_capacity - old_capacity,
+            draft_slots,
+        )
+        return True
+
+    def revert_reserve_draft_generation(self, req: LlmRequest) -> None:
+        """Undo a scheduler-time separate-draft reservation exactly."""
+        assert self.is_draft
+        allocation = self._allocated_draft_gen_growth.pop(req.py_request_id, None)
+        if allocation is None:
+            return
+        growth, _ = allocation
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        reverted_capacity = kv_cache.capacity - growth
+        if not kv_cache.resize(reverted_capacity):
+            raise RuntimeError(
+                f"Failed to revert draft KV cache capacity for request "
+                f"{req.py_request_id} to {reverted_capacity}"
+            )
+
     def revert_allocate_context(self, req: LlmRequest) -> bool:
-        """Undo this iteration's context resize. False means the cache was dropped,
-        not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
+        """Undo this iteration's context resize.
+
+        False means this cache was dropped rather than shrunk because its
+        history outran the pre-resize capacity.
         """
-        pre_cap = getattr(req, "py_ctx_pre_resize_cap", None)
+        pre_resize_attr = (
+            "py_draft_ctx_pre_resize_cap" if self.is_draft else "py_ctx_pre_resize_cap"
+        )
+        pre_cap = getattr(req, pre_resize_attr, None)
         if pre_cap is None:
             return True
-        req.py_ctx_pre_resize_cap = None
+        setattr(req, pre_resize_attr, None)
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return True
@@ -3674,11 +3822,67 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.stop_committing()
         return kv_cache
 
+    def _try_prepare_draft_context(
+        self, req: LlmRequest, *, record_pre_resize_capacity: bool = False
+    ) -> bool:
+        """Create, resume, and resize one draft context cache.
+
+        ``record_pre_resize_capacity`` is used by disaggregated generation
+        admission so transfer throttling can undo a successful reservation.
+        """
+        assert self.is_draft
+        if record_pre_resize_capacity:
+            req.py_draft_ctx_pre_resize_cap = None
+
+        kv_cache = self._mirror_draft_kv_cache(req)
+        if kv_cache is None:
+            return False
+        if not self._resume_and_restore(req.py_request_id, kv_cache):
+            return False
+
+        draft_len = (
+            get_draft_token_length(req)
+            if record_pre_resize_capacity or req.is_last_context_chunk
+            else 0
+        )
+        capacity = (
+            req.context_current_position
+            + req.context_chunk_size
+            + draft_len
+            + self.num_extra_kv_tokens
+        )
+        pre_cap = kv_cache.capacity
+        if not kv_cache.resize(capacity):
+            if req.is_first_context_chunk:
+                kv_cache.suspend()
+            return False
+        if record_pre_resize_capacity and capacity > pre_cap:
+            req.py_draft_ctx_pre_resize_cap = pre_cap
+        return True
+
+    def _prepare_draft_disagg_gen_init(self, req: LlmRequest) -> bool:
+        """Reserve the draft KV cache before admitting disagg generation.
+
+        The target manager prepares first and establishes the effective
+        context position/chunk after block reuse. The draft manager then
+        mirrors that exact context capacity. Returns False for ordinary
+        capacity or IndexMapper pressure so the scheduler can suspend both
+        caches and retry the request instead of failing in prepare_resources.
+        """
+        assert self.is_draft
+        was_using_draft_model = req.use_draft_model
+        req.use_draft_model = True
+        try:
+            return self._try_prepare_draft_context(req, record_pre_resize_capacity=True)
+        finally:
+            req.use_draft_model = was_using_draft_model
+
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
 
-        The main V2 scheduler manages capacity in the primary KV cache
-        manager. The draft manager mirrors scheduled requests so that its
+        The V2 scheduler jointly grows ordinary generation requests in the
+        target and draft managers. Context requests and attention-DP dummies
+        inserted after scheduling are still prepared here so the draft
         IndexMapper contains the correct request IDs. With block reuse, the
         scheduler pre-creates context caches to coordinate the reusable prefix.
         """
@@ -3686,6 +3890,14 @@ class KVCacheManagerV2(BaseResourceManager):
         # separate draft engine still uses the legacy draft request view.
         with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
             for req in scheduled_batch.context_requests:
+                if self.enable_joint_kv_cache_reuse:
+                    if not self._try_prepare_draft_context(req):
+                        raise RuntimeError(
+                            f"Draft KV cache context preparation failed for "
+                            f"request {req.py_request_id} after scheduler admission"
+                        )
+                    continue
+
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     # Retryable here, unlike the generation loop below: a
@@ -3714,6 +3926,18 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
             for req in scheduled_batch.generation_requests:
+                # Ordinary generation requests were already grown atomically
+                # by KVCacheManagerV2Pair. Dummies and the first post-transfer
+                # pass are deferred until their draft state exists here.
+                deferred = getattr(req, "py_defer_draft_gen_allocation", False) is True
+                if not getattr(req, "py_skip_gen_alloc_revert", False) and not deferred:
+                    kv_cache = self.kv_cache_map.get(req.py_request_id)
+                    if kv_cache is None or not kv_cache.is_active:
+                        raise RuntimeError(
+                            f"Draft KV cache is not active for generation "
+                            f"request {req.py_request_id} after joint scheduler admission"
+                        )
+                    continue
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     raise RuntimeError(
@@ -3724,16 +3948,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
-                # A paired scheduler already grew both pools atomically; the
-                # recorded width says so, so do not charge this step twice.
-                if req.py_request_id in self._allocated_draft_lens:
-                    continue
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
                 if not kv_cache.resize(new_cap):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                     )
+                if deferred:
+                    req.py_defer_draft_gen_allocation = False
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
         """Beam-0 tokens for block reuse, in the form the active backend consumes.
@@ -4605,6 +4827,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._allocated_draft_gen_growth.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_ca
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
+    KVCacheManagerV2Pair,
     Role,
     _extend_swa_windows_for_reuse,
     _KVCacheManagerInitStatus,
@@ -34,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -1076,6 +1078,362 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     assert kv_cache.stopped_committing
 
 
+def _draft_admission_manager(kv_cache: Mock | None) -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.num_extra_kv_tokens = 6
+    manager._mirror_draft_kv_cache = Mock(return_value=kv_cache)
+    manager._resume_and_restore = Mock(return_value=True)
+    return manager
+
+
+def _draft_admission_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=1,
+        context_current_position=128,
+        context_chunk_size=64,
+        py_draft_tokens=list(range(7)),
+        is_first_context_chunk=True,
+        use_draft_model=False,
+        py_draft_ctx_pre_resize_cap=999,
+    )
+
+
+def test_prepare_draft_disagg_gen_init_reserves_full_context() -> None:
+    kv_cache = Mock(capacity=64)
+
+    def resize(capacity: int) -> bool:
+        kv_cache.capacity = capacity
+        return True
+
+    kv_cache.resize.side_effect = resize
+    manager = _draft_admission_manager(kv_cache)
+    request = _draft_admission_request()
+
+    assert manager._prepare_draft_disagg_gen_init(request)
+
+    kv_cache.resize.assert_called_once_with(205)
+    assert request.py_draft_ctx_pre_resize_cap == 64
+    assert request.use_draft_model is False
+
+
+def test_prepare_draft_disagg_gen_init_resize_failure_is_retryable() -> None:
+    kv_cache = Mock(capacity=64)
+    kv_cache.resize.return_value = False
+    manager = _draft_admission_manager(kv_cache)
+    request = _draft_admission_request()
+
+    assert not manager._prepare_draft_disagg_gen_init(request)
+
+    kv_cache.suspend.assert_called_once_with()
+    assert request.py_draft_ctx_pre_resize_cap is None
+    assert request.use_draft_model is False
+
+
+def test_prepare_draft_disagg_gen_init_index_pressure_is_retryable() -> None:
+    manager = _draft_admission_manager(None)
+    request = _draft_admission_request()
+
+    assert not manager._prepare_draft_disagg_gen_init(request)
+
+    manager._resume_and_restore.assert_not_called()
+    assert request.py_draft_ctx_pre_resize_cap is None
+    assert request.use_draft_model is False
+
+
+def test_kv_cache_manager_v2_pair_coordinates_all_lifecycle_operations() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.prepare_disagg_gen_init.return_value = True
+    draft._prepare_draft_disagg_gen_init.return_value = True
+    target.try_allocate_generation.return_value = True
+    draft.try_reserve_draft_generation.return_value = True
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert pair.prepare_disagg_gen_init(request)
+    assert pair.try_allocate_generation(request)
+    pair.revert_allocate_generation(request)
+    pair.suspend_request(request)
+    pair.free_resources(request)
+    pair.revert_allocate_context(request)
+    pair.release_index_slot(request.py_request_id)
+
+    target.prepare_disagg_gen_init.assert_called_once_with(request)
+    draft._prepare_draft_disagg_gen_init.assert_called_once_with(request)
+    target.try_allocate_generation.assert_called_once_with(request)
+    target.revert_allocate_generation.assert_called_once_with(request)
+    draft.try_reserve_draft_generation.assert_called_once_with(request)
+    draft.revert_reserve_draft_generation.assert_called_once_with(request)
+    for manager in (target, draft):
+        manager.suspend_request.assert_called_once_with(request)
+        manager.free_resources.assert_called_once_with(request)
+        manager.revert_allocate_context.assert_called_once_with(request)
+        manager.release_index_slot.assert_called_once_with(request.py_request_id)
+
+
+def test_pair_stops_when_target_generation_allocation_fails() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.try_allocate_generation.return_value = False
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert not pair.try_allocate_generation(request)
+
+    target.try_allocate_generation.assert_called_once_with(request)
+    target.revert_allocate_generation.assert_not_called()
+    draft.try_reserve_draft_generation.assert_not_called()
+
+
+def test_pair_rolls_back_target_on_draft_generation_failure() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.try_allocate_generation.return_value = True
+    draft.try_reserve_draft_generation.return_value = False
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert not pair.try_allocate_generation(request)
+
+    target.try_allocate_generation.assert_called_once_with(request)
+    draft.try_reserve_draft_generation.assert_called_once_with(request)
+    target.revert_allocate_generation.assert_called_once_with(request)
+    draft.revert_reserve_draft_generation.assert_not_called()
+
+
+def test_pair_defers_first_disagg_draft_generation_allocation() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.try_allocate_generation.return_value = True
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+    request.is_disagg_generation_transmission_complete = True
+
+    assert pair.try_allocate_generation(request)
+
+    target.try_allocate_generation.assert_called_once_with(request)
+    draft.try_reserve_draft_generation.assert_not_called()
+    assert request.py_defer_draft_gen_allocation is True
+
+    pair.revert_allocate_generation(request)
+
+    target.revert_allocate_generation.assert_called_once_with(request)
+    draft.revert_reserve_draft_generation.assert_not_called()
+    assert request.py_defer_draft_gen_allocation is False
+
+
+def test_pair_defers_attention_dp_dummy_draft_generation_allocation() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.try_allocate_generation.return_value = True
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+    request.is_attention_dp_dummy = True
+
+    assert pair.try_allocate_generation(request)
+
+    target.try_allocate_generation.assert_called_once_with(request)
+    draft.try_reserve_draft_generation.assert_not_called()
+    assert request.py_defer_draft_gen_allocation is True
+
+    pair.revert_allocate_generation(request)
+
+    target.revert_allocate_generation.assert_called_once_with(request)
+    draft.revert_reserve_draft_generation.assert_not_called()
+    assert request.py_defer_draft_gen_allocation is False
+
+
+def test_pair_uses_draft_request_view_for_generation_operations() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.try_allocate_generation.return_value = True
+    request = _draft_admission_request()
+    draft_views = []
+    draft.try_reserve_draft_generation.side_effect = lambda req: (
+        draft_views.append(req.use_draft_model) or True
+    )
+    draft.revert_reserve_draft_generation.side_effect = lambda req: draft_views.append(
+        req.use_draft_model
+    )
+    pair = KVCacheManagerV2Pair(target, draft)
+
+    assert pair.try_allocate_generation(request)
+    pair.revert_allocate_generation(request)
+
+    assert draft_views == [True, True]
+    assert request.use_draft_model is False
+
+
+def test_kv_cache_manager_v2_pair_rolls_back_both_pools_on_draft_failure() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.prepare_disagg_gen_init.return_value = True
+    draft._prepare_draft_disagg_gen_init.return_value = False
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert not pair.prepare_disagg_gen_init(request)
+
+    target.suspend_request.assert_called_once_with(request)
+    draft.suspend_request.assert_called_once_with(request)
+
+
+def test_prepare_draft_generation_does_not_resize_after_joint_admission() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    kv_cache = Mock(is_active=True)
+    manager.kv_cache_map = {17: kv_cache}
+    request = SimpleNamespace(
+        py_request_id=17,
+        py_skip_gen_alloc_revert=False,
+        use_draft_model=False,
+    )
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests.append(request)
+
+    manager._prepare_draft_resources(scheduled_batch)
+
+    kv_cache.resize.assert_not_called()
+    assert request.use_draft_model is False
+
+
+def test_prepare_draft_generation_resizes_deferred_disagg_first_pass() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
+    kv_cache = Mock(is_active=True, capacity=128)
+    kv_cache.resize.return_value = True
+    manager.kv_cache_map = {19: kv_cache}
+    manager._mirror_draft_kv_cache = Mock(return_value=kv_cache)
+    manager._resume_and_restore = Mock(return_value=True)
+    manager._required_gen_capacity = Mock(return_value=143)
+    request = SimpleNamespace(
+        py_request_id=19,
+        py_skip_gen_alloc_revert=False,
+        py_defer_draft_gen_allocation=True,
+        use_draft_model=False,
+    )
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests.append(request)
+
+    manager._prepare_draft_resources(scheduled_batch)
+
+    kv_cache.resize.assert_called_once_with(143)
+    assert request.py_defer_draft_gen_allocation is False
+    assert request.use_draft_model is False
+
+
+def test_failed_generation_resize_does_not_record_allocation() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
+    manager.kv_cache_map = {23: Mock(is_active=True, capacity=128)}
+    manager.kv_cache_map[23].resize.return_value = False
+    manager._has_cp_helix = False
+    manager._allocated_draft_lens = {}
+    manager._generation_draft_slots = Mock(return_value=7)
+    request = SimpleNamespace(py_request_id=23, is_dummy_request=False)
+
+    assert not manager.try_allocate_generation(request)
+
+    assert manager._allocated_draft_lens == {}
+
+
+def test_draft_generation_reservation_avoids_target_padding_ledger() -> None:
+    kv_cache = Mock(is_active=True, capacity=128)
+
+    def resize(capacity: int) -> bool:
+        kv_cache.capacity = capacity
+        return True
+
+    kv_cache.resize.side_effect = resize
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.kv_cache_map = {37: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+    manager._generation_draft_slots = Mock(return_value=7)
+    manager._allocated_draft_lens = {}
+    manager._allocated_draft_gen_growth = {}
+    request = SimpleNamespace(py_request_id=37)
+
+    assert manager.try_reserve_draft_generation(request)
+
+    assert kv_cache.capacity == 143
+    assert manager._allocated_draft_lens == {}
+    assert manager._allocated_draft_gen_growth == {37: (15, 7)}
+
+    manager.revert_reserve_draft_generation(request)
+
+    assert kv_cache.capacity == 128
+    assert manager._allocated_draft_gen_growth == {}
+
+
+def test_kv_cache_manager_v2_pair_drops_draft_when_target_revert_drops_cache() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.revert_allocate_context.return_value = False
+    draft.revert_allocate_context.return_value = True
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert pair.revert_allocate_context(request) is False
+
+    target.revert_allocate_context.assert_called_once_with(request)
+    draft.revert_allocate_context.assert_called_once_with(request)
+    draft.free_resources.assert_called_once_with(request)
+
+
+def test_resource_manager_builds_one_shared_v2_pair() -> None:
+    target = object.__new__(KVCacheManagerV2)
+    target.is_draft = False
+    draft = object.__new__(KVCacheManagerV2)
+    draft.is_draft = True
+
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: target,
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
+        }
+    )
+
+    assert resource_manager.kv_cache_manager_pair.target is target
+    assert resource_manager.kv_cache_manager_pair.draft is draft
+
+
+def test_resource_manager_refreshes_v2_pair_when_draft_is_registered() -> None:
+    target = object.__new__(KVCacheManagerV2)
+    target.is_draft = False
+    draft = object.__new__(KVCacheManagerV2)
+    draft.is_draft = True
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: target})
+
+    target_only_pair = resource_manager.kv_cache_manager_pair
+    assert target_only_pair.target is target
+    assert target_only_pair.draft is None
+
+    resource_manager.register_resource_manager(ResourceManagerType.DRAFT_KV_CACHE_MANAGER, draft)
+
+    assert resource_manager.kv_cache_manager_pair is not target_only_pair
+    assert resource_manager.kv_cache_manager_pair.target is target
+    assert resource_manager.kv_cache_manager_pair.draft is draft
+
+
+def test_resource_manager_refreshes_v2_pair_when_target_is_registered() -> None:
+    target = object.__new__(KVCacheManagerV2)
+    target.is_draft = False
+    draft = object.__new__(KVCacheManagerV2)
+    draft.is_draft = True
+    resource_manager = ResourceManager({ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft})
+
+    assert resource_manager.kv_cache_manager_pair is None
+
+    resource_manager.register_resource_manager(ResourceManagerType.KV_CACHE_MANAGER, target)
+
+    assert resource_manager.kv_cache_manager_pair.target is target
+    assert resource_manager.kv_cache_manager_pair.draft is draft
+
+
 def test_generation_allocation_reserves_dynamic_width() -> None:
     request = SimpleNamespace(
         py_request_id=80,
@@ -1137,6 +1495,7 @@ def test_context_revert_drops_unshrinkable_cache_and_rewinds_progress() -> None:
     # request part-way through its prompt, so the cache cannot be shrunk back.
     kv_cache = Mock(is_active=True, capacity=128, history_length=256)
     manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
     manager.tokens_per_block = 64
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager.free_resources = Mock()
@@ -1158,6 +1517,7 @@ def test_context_revert_shrinks_in_place_when_history_fits() -> None:
     kv_cache = Mock(is_active=True, capacity=128, history_length=32)
     kv_cache.resize.return_value = True
     manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
     manager.tokens_per_block = 64
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager.free_resources = Mock()
