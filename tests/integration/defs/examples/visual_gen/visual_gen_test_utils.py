@@ -603,6 +603,7 @@ def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, gen
             stderr=subprocess.STDOUT,
             text=True,
             check=False,
+            timeout=600,
         )
     if result.returncode != 0:
         pytest.fail(f"LPIPS eval script failed for {sample_id}:\n{result.stdout}")

@@ -21,6 +21,7 @@ from typing import AsyncGenerator, Optional
 
 from .._utils import nvtx_range_debug
 from ..llmapi.utils import logger_debug
+from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
 
@@ -53,6 +54,158 @@ class RpcWorkerMixin:
 
         self.rpc_server = None
         self.rpc_addr = rpc_addr
+        self._postproc_pool = None
+        self._postproc_input_queues = None
+        self._postproc_collector = None
+        self._postproc_collector_thread = None
+        self._postproc_collector_stop = Event()
+        self._postproc_futures = []
+
+    def init_postproc_workers(self) -> None:
+        """Spawn local PostprocWorker processes feeding the RPC response stream.
+
+        The classic (MPI proxy) path gives each PostprocWorker a dedicated
+        push lane straight to the frontend process. Under RPC/Ray
+        orchestration no such lane exists: every record must travel the single
+        RPC response stream. Instead of teaching PostprocWorker a new
+        transport, its push pipe is pointed at a local collector socket whose
+        consumer thread enqueues the already-final ``PostprocWorker.Output``
+        batches into ``_response_queue`` — the same queue ``fetch_responses``
+        drains — so the stream, the proxy demux, and the client stay on the
+        code they already run for the classic postproc path.
+
+        Call on the response-producing rank only (rank 0), after
+        ``init_rpc_worker``.
+        """
+        import threading
+        from concurrent.futures import ProcessPoolExecutor
+
+        import zmq
+
+        from .ipc import IpcQueue
+        from .postproc_worker import PostprocWorker, postproc_worker_main
+
+        num = self.postproc_config.num_postprocess_workers
+        assert num > 0
+        self._postproc_collector_stop.clear()
+
+        self._postproc_input_queues = [
+            IpcQueue(is_server=True, name=f"rpc_worker_postproc_input_{i}") for i in range(num)
+        ]
+        self._postproc_collector = IpcQueue(
+            is_server=True, socket_type=zmq.PULL, name="rpc_worker_postproc_collector"
+        )
+        # Both the result_queue (RPC stream feed) and the postproc input
+        # queues are live on this worker — see set_postproc_queues docstring.
+        self.set_postproc_queues(self._postproc_input_queues, coexist_with_result_queue=True)
+
+        # fork (default), matching the classic path. spawn is NOT usable
+        # here: the spawn bootstrap re-imports the Ray worker's __main__,
+        # which deadlocks inside a Ray actor (verified empirically).
+        self._postproc_pool = ProcessPoolExecutor(max_workers=num)
+
+        from .utils import ErrorResponse
+
+        def _make_on_postproc_worker_done(shard: int):
+            def _on_postproc_worker_done(fut) -> None:
+                # ProcessPoolExecutor stores task exceptions on the Future and
+                # never raises them in the parent; a postproc child that dies
+                # outside per-request handling would otherwise fail silently.
+                if fut.cancelled():
+                    # pool.shutdown(wait=False) cancels never-started submits;
+                    # fut.exception() would raise CancelledError here.
+                    return
+                exc = fut.exception()
+                if exc is None or self.shutdown_event.is_set():
+                    return
+                logger.error(f"PostprocWorker process {shard} died: {exc}")
+                # Requests are sharded to postproc workers by
+                # client_id % num (see _send_rsp_to_postproc); the engine
+                # produces no further responses for records already handed to
+                # the dead child, so fail this shard's pending requests
+                # explicitly instead of poisoning an unrelated next response.
+                errors = [
+                    ErrorResponse(client_id, f"PostprocWorker process died: {exc}", -1)
+                    for client_id in list(self._results.keys())
+                    if client_id % num == shard
+                ]
+                if errors:
+                    for err in errors:
+                        self._pop_result(err.client_id)
+                    # fetch_responses drains _response_queue list-wise.
+                    self._response_queue.put(errors)
+                else:
+                    # No in-flight request on this shard: park the failure on
+                    # the background-error path so a later submission surfaces
+                    # it instead of hanging on the dead child.
+                    self._error_queue.put(exc)
+
+            return _on_postproc_worker_done
+
+        for i in range(num):
+            fut = self._postproc_pool.submit(
+                postproc_worker_main,
+                self._postproc_input_queues[i].address,
+                [self._postproc_collector.address],
+                self.postproc_config.postprocess_tokenizer_dir,
+                PostprocWorker.default_record_creator,
+                self.postproc_config.post_processor_hook,
+            )
+            fut.add_done_callback(_make_on_postproc_worker_done(i))
+            self._postproc_futures.append(fut)
+
+        def _collect_postproc_outputs() -> None:
+            # IpcQueue.get() has no timeout, so poll the underlying socket
+            # (the same pattern as IpcQueue.drain) to keep the loop observing
+            # the stop events; a live PostprocWorker also forwards a None
+            # sentinel on shutdown, either wakes the loop.
+            self._postproc_collector.setup_lazily()
+            while not (self.shutdown_event.is_set() or self._postproc_collector_stop.is_set()):
+                if not self._postproc_collector.socket.poll(timeout=1000):
+                    continue
+                batch = self._postproc_collector.get()
+                if batch is None:
+                    break
+                # fetch_responses drains _response_queue batch-wise; Output
+                # batches ride the RPC stream exactly like final responses.
+                self._response_queue.put(batch)
+
+        self._postproc_collector_thread = threading.Thread(
+            target=_collect_postproc_outputs, name="rpc_worker_postproc_collector", daemon=True
+        )
+        self._postproc_collector_thread.start()
+
+    def shutdown_postproc_workers(self) -> None:
+        """Best-effort teardown of the local postproc pool (idempotent)."""
+        if self._postproc_input_queues:
+            for q in self._postproc_input_queues:
+                try:
+                    q.put(None)  # PostprocWorker mainloop exits on None
+                except Exception:
+                    pass
+        if self._postproc_pool is not None:
+            self._postproc_pool.shutdown(wait=False)
+            self._postproc_pool = None
+        if self._postproc_collector_thread is not None:
+            # The collector loop polls with a 1s timeout and re-checks this
+            # event, so it self-terminates even if every child died without
+            # forwarding the None sentinel.
+            self._postproc_collector_stop.set()
+            self._postproc_collector_thread.join(timeout=5)
+            self._postproc_collector_thread = None
+        if self._postproc_input_queues:
+            for q in self._postproc_input_queues:
+                try:
+                    q.close()
+                except Exception:
+                    pass
+            self._postproc_input_queues = None
+        if self._postproc_collector is not None:
+            try:
+                self._postproc_collector.close()
+            except Exception:
+                pass
+            self._postproc_collector = None
 
     def start_rpc_server(self):
         if self.rank == 0:

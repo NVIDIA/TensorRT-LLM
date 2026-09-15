@@ -1,8 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-TestLlama3_1_8BInstruct::test_eagle3:
-  ref_al: 1.987311931289228
-  min_al: 1.8879463347247665
 TestQwen3_4B::test_eagle3:
   ref_al: 2.02809899228679
   min_al: 1.9266940426724504
@@ -12,27 +9,15 @@ TestDeepSeekV3Lite::test_bfloat16:
 TestNemotronV3Super::test_nvfp4_4gpus_block_reuse:
   ref_al: 3.4718918456404553
   min_al: 3.2982972533584323
-TestLlama3_1_8BInstruct::test_dflash:
-  ref_al: 3.0108915792789954
-  min_al: 2.8603470003150453
 TestGPTOSS::test_dflash:
   ref_al: 2.925596923467016
   min_al: 2.779317077293665
-TestLlama3_1_8BInstruct::test_pard:
-  ref_al: 3.3641240317850247
-  min_al: 3.195917830195773
 TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
   ref_al: 4.448784989234082
   min_al: 4.226345739772378
-TestLlama3_1_8BInstruct::test_ngram:
-  ref_al: 1.3434705770970525
-  min_al: 1.2762970482421998
-TestLlama3_1_8BInstruct::test_suffix_automaton:
-  ref_al: 1.449815006993638
-  min_al: 1.377324256643956
-TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len:
-  ref_al: 3.243380267550134
-  min_al: 3.0812112541726275
+TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4:
+  ref_al: 4.0738
+  min_al: 3.8701
 TestQwen3_5_4B::test_dflash:
   ref_al: 3.96417002949639
   min_al: 3.7659615280215704
@@ -93,15 +78,9 @@ TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
 TestKimiK3DSpark::test_gsm8k_tep8:
   ref_al: 4.323
   min_al: 4.0
-disagg::TestLlama3_1_8BInstruct::test_eagle3:
-  ref_al: 1.9861983570910848
-  min_al: 1.8868884392365306
 disagg::TestDeepSeekV3Lite::test_auto_dtype:
   ref_al: 2.581477287026551
   min_al: 2.452403422675223
-disagg::TestLlama3_1_8BInstruct::test_gen_only_spec_dec:
-  ref_al: 1.239129808384959
-  min_al: 1.177173317965711
 disagg::TestDeepSeekV3Lite::test_gen_only_spec_dec:
   ref_al: 2.257556020907877
   min_al: 2.1446782198624827
