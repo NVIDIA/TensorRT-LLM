@@ -18,11 +18,28 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from types import TracebackType
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, TypeVar
 
 import torch
 
 from .utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
+
+_SCOPED_MODULE_MARKER = "_trtllm_nccl_window_tensor_scoped"
+_ModuleType = TypeVar("_ModuleType", bound=type[torch.nn.Module])
+
+
+def nccl_window_tensor_scoped_module(module_type: _ModuleType) -> _ModuleType:
+    """Mark a module type for eager and compiler-inserted tensor scopes.
+
+    Python hooks disappear after Dynamo tracing, so the compiler backend uses
+    this marker to insert opaque begin/end operations into the captured graph.
+    """
+    setattr(module_type, _SCOPED_MODULE_MARKER, True)
+    return module_type
+
+
+def is_nccl_window_tensor_scoped_module(module_type: type[torch.nn.Module]) -> bool:
+    return getattr(module_type, _SCOPED_MODULE_MARKER, False)
 
 
 def _cuda_tensors(
@@ -117,17 +134,12 @@ def discard_nccl_window_tensor_outputs(inputs: Any) -> Iterator[None]:
         yield
 
 
-def install_eager_nccl_window_tensor_scopes(
-    model: torch.nn.Module,
+def install_module_nccl_window_tensor_scopes(
+    modules: Iterable[torch.nn.Module],
 ) -> list[torch.utils.hooks.RemovableHandle]:
-    """Install decoder-layer scopes without exposing Python hooks to Dynamo."""
-    from .modules.decoder_layer import DecoderLayer
-
+    """Install deterministic lease scopes around eager module calls."""
     handles = []
-    for layer in model.modules():
-        if not isinstance(layer, DecoderLayer):
-            continue
-
+    for layer in modules:
         active_scopes: ContextVar[tuple[_NCCLWindowTensorScope, ...]] = ContextVar(
             f"nccl_window_scopes_{id(layer)}", default=()
         )
@@ -162,3 +174,13 @@ def install_eager_nccl_window_tensor_scopes(
         handles.append(layer.register_forward_pre_hook(begin_scope, with_kwargs=True))
         handles.append(layer.register_forward_hook(end_scope, with_kwargs=True, always_call=True))
     return handles
+
+
+def install_eager_nccl_window_tensor_scopes(
+    model: torch.nn.Module,
+) -> list[torch.utils.hooks.RemovableHandle]:
+    """Install eager model scopes without exposing Python hooks to Dynamo."""
+    modules = (
+        module for module in model.modules() if is_nccl_window_tensor_scoped_module(type(module))
+    )
+    return install_module_nccl_window_tensor_scopes(modules)

@@ -3493,11 +3493,13 @@ class PyTorchModelEngine(ModelEngine):
                 raise RuntimeError(
                     "Encoder-decoder CUDA graph warmup requires every decoder "
                     "layer to expose a cross_attn module.")
-            cross_attn(hidden_states=hidden_states,
-                       encoder_hidden_states=encoder_hidden_states,
-                       attn_metadata=attn_metadata,
-                       cross_attn_metadata=cross_attn_metadata,
-                       skip_cross_kv_projection=False)
+            with discard_nccl_window_tensor_outputs(
+                (hidden_states, encoder_hidden_states)):
+                cross_attn(hidden_states=hidden_states,
+                           encoder_hidden_states=encoder_hidden_states,
+                           attn_metadata=attn_metadata,
+                           cross_attn_metadata=cross_attn_metadata,
+                           skip_cross_kv_projection=False)
 
     def _get_enc_dec_hidden_size(self) -> int:
         config = self.model.model_config.pretrained_config

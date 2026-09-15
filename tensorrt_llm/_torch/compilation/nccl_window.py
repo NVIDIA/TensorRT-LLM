@@ -7,7 +7,7 @@ from operator import getitem
 import torch
 from torch.fx import GraphModule, Node
 
-from ..modules.decoder_layer import DecoderLayer
+from ..nccl_window_tensor_scope import is_nccl_window_tensor_scoped_module
 
 _SCOPE_OPS = {
     torch.ops.trtllm.begin_nccl_window_tensor_scope.default,
@@ -15,7 +15,7 @@ _SCOPE_OPS = {
 }
 
 
-def _decoder_layer(node: Node) -> Hashable | None:
+def _scoped_module(node: Node) -> Hashable | None:
     module_stack = node.meta.get("nn_module_stack")
     if node.op in ("placeholder", "output"):
         return None
@@ -26,7 +26,7 @@ def _decoder_layer(node: Node) -> Hashable | None:
         if not isinstance(module, tuple) or len(module) != 2:
             continue
         module_type = module[1]
-        if isinstance(module_type, type) and issubclass(module_type, DecoderLayer):
+        if isinstance(module_type, type) and is_nccl_window_tensor_scoped_module(module_type):
             return path
     return None
 
@@ -74,21 +74,21 @@ def _insert_scope(graph, nodes: list[Node]) -> None:
 
 
 def insert_nccl_window_tensor_scopes(gm: GraphModule) -> GraphModule:
-    """Insert runtime lease boundaries around Dynamo-inlined decoder layers."""
+    """Insert runtime lease boundaries around Dynamo-inlined scoped modules."""
     regions: list[list[Node]] = []
-    current_layer = None
+    current_module = None
     current_nodes: list[Node] = []
 
     for node in gm.graph.nodes:
-        layer = _decoder_layer(node)
-        if layer == current_layer:
+        module = _scoped_module(node)
+        if module == current_module:
             current_nodes.append(node)
             continue
-        if current_layer is not None:
+        if current_module is not None:
             regions.append(current_nodes)
-        current_layer = layer
-        current_nodes = [node] if layer is not None else []
-    if current_layer is not None:
+        current_module = module
+        current_nodes = [node] if module is not None else []
+    if current_module is not None:
         regions.append(current_nodes)
 
     for nodes in regions:

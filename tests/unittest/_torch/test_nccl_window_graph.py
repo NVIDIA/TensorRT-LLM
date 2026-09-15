@@ -441,6 +441,77 @@ def test_eager_decoder_layer_hooks_scope_each_invocation(tensor_scope_events):
     assert tensor_scope_events[-1][-1] is False
 
 
+def test_eager_encoder_decoder_hooks_scope_stacks_and_layers(tensor_scope_events):
+    scoped = nccl_window_tensor_scope.nccl_window_tensor_scoped_module
+
+    @scoped
+    class TestLayer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    @scoped
+    class TestStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([TestLayer()])
+
+        def forward(self, hidden_states):
+            for layer in self.layers:
+                hidden_states = layer(hidden_states)
+            return hidden_states
+
+    class TestBody(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = TestStack()
+            self.decoder = TestStack()
+
+    class TestModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = type("Config", (), {"is_encoder_decoder": True})()
+            self.model = TestBody()
+
+    model = TestModel()
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(model)
+    output = [object()]
+    try:
+        assert model.model.encoder(output) is output
+        assert model.model.decoder(output) is output
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert [event[0] for event in tensor_scope_events] == [
+        "begin",
+        "begin",
+        "end",
+        "end",
+        "begin",
+        "begin",
+        "end",
+        "end",
+    ]
+
+
+def test_module_hooks_scope_arbitrary_modules(tensor_scope_events):
+    class TestModule(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    module = TestModule()
+    handles = nccl_window_tensor_scope.install_module_nccl_window_tensor_scopes([module])
+    output = [object()]
+    try:
+        assert module(output) is output
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert [event[0] for event in tensor_scope_events] == ["begin", "end"]
+    assert tensor_scope_events[-1][-1] is False
+
+
 def test_eager_decoder_layer_hook_allows_no_cuda_output(tensor_scope_events):
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 
@@ -529,6 +600,91 @@ def test_each_decoder_layer_scope_survives_torch_compile():
         active_scopes -= target == end
         assert active_scopes in (0, 1)
     assert active_scopes == 0
+
+
+def test_encoder_decoder_scopes_survive_torch_compile():
+    from tensorrt_llm._torch.compilation.nccl_window import insert_nccl_window_tensor_scopes
+    from tensorrt_llm._torch.models.modeling_bart import (
+        BartDecoder,
+        BartDecoderLayer,
+        BartEncoder,
+        BartEncoderLayer,
+    )
+    from tensorrt_llm._torch.models.modeling_t5 import (
+        T5Decoder,
+        T5DecoderLayer,
+        T5Encoder,
+        T5EncoderLayer,
+    )
+    from tensorrt_llm._torch.models.modeling_whisper import (
+        WhisperDecoder,
+        WhisperDecoderLayer,
+        WhisperEncoder,
+        WhisperEncoderLayer,
+    )
+
+    is_scoped = nccl_window_tensor_scope.is_nccl_window_tensor_scoped_module
+    assert all(
+        is_scoped(module_type)
+        for module_type in (
+            BartEncoder,
+            BartEncoderLayer,
+            BartDecoder,
+            BartDecoderLayer,
+            T5Encoder,
+            T5EncoderLayer,
+            T5Decoder,
+            T5DecoderLayer,
+            WhisperEncoder,
+            WhisperEncoderLayer,
+            WhisperDecoder,
+            WhisperDecoderLayer,
+        )
+    )
+
+    scoped = nccl_window_tensor_scope.nccl_window_tensor_scoped_module
+
+    @scoped
+    class TestLayer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states + 1
+
+    @scoped
+    class TestStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = TestLayer()
+
+        def forward(self, hidden_states):
+            hidden_states = hidden_states + 1
+            hidden_states = self.layer(hidden_states)
+            return hidden_states + 1
+
+    class TestModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.stack = TestStack()
+
+        def forward(self, hidden_states):
+            return self.stack(hidden_states)
+
+    graphs = []
+
+    def capture_graph(gm, _example_inputs):
+        insert_nccl_window_tensor_scopes(gm)
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    try:
+        result = torch.compile(TestModel(), backend=capture_graph, fullgraph=True)(torch.zeros(1))
+    finally:
+        torch._dynamo.reset()
+
+    assert torch.equal(result, torch.full((1,), 3.0))
+    targets = [node.target for node in graphs[0].graph.nodes]
+    assert targets.count(torch.ops.trtllm.begin_nccl_window_tensor_scope.default) == 3
+    assert targets.count(torch.ops.trtllm.end_nccl_window_tensor_scope.default) == 3
 
 
 def test_decoder_layer_scope_survives_aot_with_input_used_before_layer():
