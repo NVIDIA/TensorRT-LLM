@@ -47,6 +47,7 @@ from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
+from .._checkpoint_io_policy import RANK_STRIPED_IO_POLICIES, CheckpointIoPolicy
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
 
@@ -5885,24 +5886,28 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_io_policy: Literal[
-        "auto", "native", "rank_striped_read_ahead"] = Field(
-            default="auto",
-            description=
-            "Controls checkpoint storage I/O independently of checkpoint format. "
-            "'auto' selects rank-striped read-ahead for compatible built-in "
-            "PyTorch/HF loads and selects native I/O otherwise. "
-            "'native' preserves the existing loader. "
-            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
-            "SafeTensors extents while native mapping, materialization, and H2D "
-            "continue. Incompatible configurations select native I/O before "
-            "optimized reader or collective setup. Runtime-ineligible loads fall "
-            "back to native before model mutation.",
-            status="prototype",
-            json_schema_extra={
-                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
-            },
-        )
+    checkpoint_io_policy: CheckpointIoPolicy = Field(
+        default="auto",
+        description=
+        "Controls checkpoint storage I/O independently of checkpoint format. "
+        "'auto' selects rank-striped read-ahead for compatible built-in "
+        "PyTorch/HF loads and selects native I/O otherwise. "
+        "'native' preserves the existing loader. "
+        "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+        "SafeTensors extents while native mapping, materialization, and H2D "
+        "continue. Incompatible configurations select native I/O before "
+        "optimized reader or collective setup. Runtime-ineligible loads fall "
+        "back to native before model mutation. "
+        "'demand_ordered_rank_striped_read_ahead' is an explicit experimental "
+        "variant that prioritizes complete checkpoint chunks using "
+        "node-local demand hints. It preserves all chunks, existing memory "
+        "admission, and native materialization; it does not enable "
+        "consumption-based pacing or destination-selective reads.",
+        status="prototype",
+        json_schema_extra={
+            "type": str(CheckpointIoPolicy).replace("typing.", "")
+        },
+    )
 
     @property
     def is_partial_model_loading(self) -> bool:
@@ -6541,11 +6546,11 @@ class TorchLlmArgs(BaseLlmArgs):
         # requested policy for telemetry while reporting its native selection.
         # PyTorch requests are resolved at loader construction, where the actual
         # format and registered loader implementations are known.
-        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
+        if (self.checkpoint_io_policy in RANK_STRIPED_IO_POLICIES
                 and self.backend != "pytorch"):
             logger.warning(
                 "Checkpoint I/O policy resolved before loading: "
-                "requested=rank_striped_read_ahead, selected=native, "
+                f"requested={self.checkpoint_io_policy}, selected=native, "
                 "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 

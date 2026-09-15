@@ -7,13 +7,25 @@ import os
 import sys
 import traceback
 import warnings
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from enum import Enum
 from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._checkpoint_io_policy import \
+    AUTO_IO_POLICY as _AUTO_CHECKPOINT_IO_POLICY
+from tensorrt_llm._checkpoint_io_policy import \
+    CHECKPOINT_IO_POLICIES as _SUPPORTED_CHECKPOINT_IO_POLICIES
+from tensorrt_llm._checkpoint_io_policy import \
+    DEMAND_ORDERED_IO_POLICY as _DEMAND_ORDERED_CHECKPOINT_IO_POLICY
+from tensorrt_llm._checkpoint_io_policy import \
+    NATIVE_IO_POLICY as _NATIVE_CHECKPOINT_IO_POLICY
+from tensorrt_llm._checkpoint_io_policy import \
+    RANK_STRIPED_IO_POLICIES as _RANK_STRIPED_CHECKPOINT_IO_POLICIES
+from tensorrt_llm._checkpoint_io_policy import \
+    RANK_STRIPED_IO_POLICY as _RANK_STRIPED_CHECKPOINT_IO_POLICY
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -344,14 +356,6 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
-_AUTO_CHECKPOINT_IO_POLICY = "auto"
-_NATIVE_CHECKPOINT_IO_POLICY = "native"
-_RANK_STRIPED_CHECKPOINT_IO_POLICY = "rank_striped_read_ahead"
-_SUPPORTED_CHECKPOINT_IO_POLICIES = (
-    _AUTO_CHECKPOINT_IO_POLICY,
-    _NATIVE_CHECKPOINT_IO_POLICY,
-    _RANK_STRIPED_CHECKPOINT_IO_POLICY,
-)
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
 
 
@@ -407,13 +411,15 @@ def _resolve_checkpoint_io_policy(
                    f"requested={requested_policy}, "
                    f"selected={_NATIVE_CHECKPOINT_IO_POLICY}, "
                    f"reason={reason}.")
-        if requested_policy == _RANK_STRIPED_CHECKPOINT_IO_POLICY:
+        if requested_policy in _RANK_STRIPED_CHECKPOINT_IO_POLICIES:
             logger.warning(message)
         else:
             logger.info(message)
         return _NATIVE_CHECKPOINT_IO_POLICY, reason
 
-    return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
+    if requested_policy == _AUTO_CHECKPOINT_IO_POLICY:
+        return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
+    return requested_policy, None
 
 
 def _construct_checkpoint_loader(
@@ -499,6 +505,27 @@ def _open_checkpoint_weight_session(
         return _legacy_weight_session(checkpoint_loader, checkpoint_dir,
                                       **kwargs)
     return checkpoint_loader.open_weight_session(checkpoint_dir, **kwargs)
+
+
+def _activate_checkpoint_weight_session(
+    checkpoint_loader: Any,
+    metrics: dict[str, float],
+    preparation_metric_name: str,
+    readiness_error: BaseException | None = None,
+    *,
+    weight_mapper: Any = None,
+) -> None:
+    """Coordinate mapper readiness before activating deferred loader work."""
+    activate = getattr(checkpoint_loader, "activate_weight_session", None)
+    if activate is not None:
+        weight_loader = getattr(checkpoint_loader, "weight_loader", None)
+        timer = (timing_metric(preparation_metric_name, metrics) if getattr(
+            weight_loader, "checkpoint_io_policy", None)
+                 == _DEMAND_ORDERED_CHECKPOINT_IO_POLICY else nullcontext())
+        with timer:
+            activate(readiness_error, weight_mapper=weight_mapper)
+    if readiness_error is not None:
+        raise readiness_error
 
 
 @contextmanager
@@ -1946,20 +1973,33 @@ class ModelLoader:
                                         checkpoint_dir: str, model, config,
                                         load_weights_kwargs: dict) -> bool:
         """Keep loader-specific work alive through weight materialization."""
+        preparation_metric_name = ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value
         with _timed_checkpoint_weight_session(
                 checkpoint_loader, checkpoint_dir, self._metrics,
-                ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
+                preparation_metric_name,
                 ModelLoaderMetricNames.CHECKPOINT_FINALIZATION_SECONDS.value,
                 **load_weights_kwargs) as weights:
-            weights_preloaded = checkpoint_loader.is_weights_preloaded()
-            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                model, config)
+            try:
+                weights_preloaded = checkpoint_loader.is_weights_preloaded()
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                    model, config)
+            except BaseException as error:
+                _activate_checkpoint_weight_session(checkpoint_loader,
+                                                    self._metrics,
+                                                    preparation_metric_name,
+                                                    error)
+                raise
             _inspect_shadow_weight_load_plan(
                 checkpoint_loader,
                 checkpoint_dir,
                 self.weight_mapper,
                 **load_weights_kwargs,
             )
+            _activate_checkpoint_weight_session(
+                checkpoint_loader,
+                self._metrics,
+                preparation_metric_name,
+                weight_mapper=self.weight_mapper)
             if weights:
                 with timing_metric(
                         ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
@@ -1973,31 +2013,43 @@ class ModelLoader:
     def _materialize_draft_checkpoint_weights(self, checkpoint_loader,
                                               model) -> None:
         """Keep loader-specific work alive through draft materialization."""
+        preparation_metric_name = ModelLoaderMetricNames.DRAFT_CHECKPOINT_PREPARATION_SECONDS.value
         with _timed_checkpoint_weight_session(
                 checkpoint_loader,
                 self.spec_config.speculative_model,
                 self._metrics,
-                ModelLoaderMetricNames.DRAFT_CHECKPOINT_PREPARATION_SECONDS.
-                value,
+                preparation_metric_name,
                 ModelLoaderMetricNames.DRAFT_CHECKPOINT_FINALIZATION_SECONDS.
                 value,
                 mapping=self.mapping) as weights:
-            if model.draft_config is not None:
-                draft_model_arch = model.draft_config.pretrained_config.architectures[
-                    0]
-                draft_weight_mapper = AutoCheckpointMapper.get(
-                    checkpoint_loader.checkpoint_format, draft_model_arch)
-                draft_weight_mapper.init_model_and_config(
-                    model.draft_model, model.draft_config)
-            else:
-                # MTP one-model + separate MTP checkpoint: no draft HF architecture.
-                draft_weight_mapper = self.weight_mapper
+            try:
+                if model.draft_config is not None:
+                    draft_model_arch = model.draft_config.pretrained_config.architectures[
+                        0]
+                    draft_weight_mapper = AutoCheckpointMapper.get(
+                        checkpoint_loader.checkpoint_format, draft_model_arch)
+                    draft_weight_mapper.init_model_and_config(
+                        model.draft_model, model.draft_config)
+                else:
+                    # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+                    draft_weight_mapper = self.weight_mapper
+            except BaseException as error:
+                _activate_checkpoint_weight_session(checkpoint_loader,
+                                                    self._metrics,
+                                                    preparation_metric_name,
+                                                    error)
+                raise
             _inspect_shadow_weight_load_plan(
                 checkpoint_loader,
                 self.spec_config.speculative_model,
                 draft_weight_mapper,
                 mapping=self.mapping,
             )
+            _activate_checkpoint_weight_session(
+                checkpoint_loader,
+                self._metrics,
+                preparation_metric_name,
+                weight_mapper=draft_weight_mapper)
             with timing_metric(
                     ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.
                     value, self._metrics):

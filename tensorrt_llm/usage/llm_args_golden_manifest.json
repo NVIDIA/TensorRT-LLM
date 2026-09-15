@@ -168,6 +168,7 @@
     {
       "allowed_values": [
         "auto",
+        "demand_ordered_rank_striped_read_ahead",
         "native",
         "rank_striped_read_ahead"
       ],
