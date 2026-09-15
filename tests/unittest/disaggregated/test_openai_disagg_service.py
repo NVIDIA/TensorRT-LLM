@@ -518,8 +518,9 @@ async def test_subagent_affinity_http_worker_adp_placement(
             (ServerRole.GENERATION, service._gen_router, "_gen_client"),
         ):
             worker = await stack.enter_async_context(TestServer(make_worker(role)))
+            # Completion clients add the HTTP scheme to router host:port addresses.
             instance_router.get_next_server.return_value = (
-                str(worker.make_url("/")).rstrip("/"),
+                f"{worker.host}:{worker.port}",
                 {"server_info": {}},
             )
             setattr(
