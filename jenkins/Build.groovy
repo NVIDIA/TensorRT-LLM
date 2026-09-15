@@ -304,44 +304,50 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def downloadArtifacts(stageName, reuseArtifactPath, artifacts, serverId = 'Artifactory')
+def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
 {
-    def reused = true
+    def reused = false
     stage(stageName) {
-        for (downit in artifacts) {
-            def uploadpath = downit.key
-            try {
-                rtDownload(
-                    failNoOp: true,
-                    serverId: serverId,
-                    spec: """{
-                        "files": [
-                            {
-                            "pattern": "${reuseArtifactPath}/${uploadpath}"
-                            }
-                        ]
-                    }""",
-                )
-            } catch (Exception e) {
-                echo "failed downloading ${reuseArtifactPath}/${uploadpath}, need rebuild."
-                reused = false
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { throw e }
+        // The copy API does not support virtual repositories. Both paths point
+        // at the default deployment repository behind sw-tensorrt-generic.
+        def sourceRoot = reuseArtifactPath.replaceFirst(
+            /^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+        def targetRoot = UPLOAD_PATH.replaceFirst(
+            /^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE',
+            catchInterruptions: false) {
+            withCredentials([usernamePassword(
+                    credentialsId: 'urm-artifactory-creds',
+                    usernameVariable: 'ART_USER',
+                    passwordVariable: 'ART_PASS')]) {
+                for (artifact in artifacts) {
+                    def artifactPath = artifact.key
+                    def sourcePath = "${sourceRoot}/${artifactPath}"
+                    def targetPath = "${targetRoot}/${artifactPath}"
+                    echo "Copying cached artifact ${sourcePath} to ${targetPath}"
+                    withEnv([
+                        "ARTIFACTORY_COPY_SOURCE=${sourcePath}",
+                        "ARTIFACTORY_COPY_TARGET=${targetPath}",
+                    ]) {
+                        sh(
+                            script: '''artifactory_url="https://urm.nvidia.com/artifactory"
+                                copy_url="${artifactory_url}/api/copy/$ARTIFACTORY_COPY_SOURCE"
+                                curl -fsSL --max-time 300 --user "$ART_USER:$ART_PASS" --request POST \
+                                    "${copy_url}?to=/$ARTIFACTORY_COPY_TARGET"'''
+                        )
+                    }
+                }
             }
+            reused = true
         }
-
         if (!reused) {
-            return null
+            echo "Failed to copy cached artifacts from ${sourceRoot}; need rebuild."
         }
-
-        reuseArtifactPath = reuseArtifactPath.substring(reuseArtifactPath.indexOf('/')+1)
-        def newArtifacts = [:]
-        for (reuseit in artifacts) {
-            def uploadpath = reuseit.key
-            newArtifacts[reuseit.key] = "${reuseArtifactPath}/${uploadpath}"
-        }
-
-        return newArtifacts
     }
+    return reused
 }
 
 def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
@@ -371,10 +377,7 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
 {
     if (reuseArtifactPath) {
         stage(key) {
-            def newArtifacts = downloadArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)
-            if (newArtifacts != null) {
-                uploadArtifacts(newArtifacts)
-            } else {
+            if (!copyCachedArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)) {
                 reuseArtifactPath = null
             }
         }

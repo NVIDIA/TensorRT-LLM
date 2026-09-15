@@ -10,6 +10,7 @@ from typing import (
     ClassVar,
     Dict,
     List,
+    Literal,
     Mapping,
     Optional,
     Sequence,
@@ -2924,6 +2925,27 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         # (this VL wrapper), not the inner decoder, so delegate to keep block
         # reuse opt-in until a Mamba state snapshot policy is configured.
         return NemotronHForCausalLM.get_model_defaults(llm_args)
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Match the NemotronH backbone's hybrid-state preference.
+
+        Resolved off this wrapper, so the preference has to be restated here
+        or the backbone's is never consulted. `pretrained_config` is ignored:
+        at resolution time it is still the outer multimodal config, whose
+        `hybrid_override_pattern` lives one level down under `llm_config`, so
+        inspecting it would report a non-hybrid model.
+        """
+        return NemotronHForCausalLM.get_preferred_kv_cache_manager_version(pretrained_config)
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Match the NemotronH backbone's Python disaggregated route."""
+        return NemotronHForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
 
     def post_config(self):
         # use llm.config as config for pytorch model engine

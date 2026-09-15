@@ -770,6 +770,7 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
 
 def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
+    from tensorrt_llm._torch.models.modeling_nemotron_nano import NemotronH_Nano_VL_V2
     from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 
@@ -781,7 +782,12 @@ def test_hybrid_models_prefer_v2_and_python_transceiver(monkeypatch):
     ):
         monkeypatch.delenv(env_var, raising=False)
 
-    for model_cls in (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel):
+    for model_cls in (
+        NemotronHForCausalLM,
+        Qwen3NextForCausalLM,
+        Qwen3_5VLModel,
+        NemotronH_Nano_VL_V2,
+    ):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
@@ -2202,6 +2208,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_attention_dp=False,
     enable_swa_scratch_reuse=False,
     dtype=DataType.HALF,
+    kv_cache_dtype="auto",
     conv_state_layout="x_b_c",
     mamba_d_conv=4,
     mamba_n_groups=1,
@@ -2233,7 +2240,7 @@ def _build_v2_hybrid_with_mamba_layer(
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
             enable_branch_snapshot=enable_branch_snapshot,
         ),
-        dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
+        dtype=kv_cache_dtype,
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -2364,8 +2371,10 @@ def test_v2_hybrid_allocates_mamba_state_and_dummy_indices():
 
 
 @skip_no_cuda
-def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales():
-    mgr = _build_v2_hybrid_with_mamba_layer(dtype=DataType.NVFP4)
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "nvfp4"])
+def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales(kv_cache_dtype: str) -> None:
+    # "auto" keeps the user config unchanged when the checkpoint selects NVFP4.
+    mgr = _build_v2_hybrid_with_mamba_layer(dtype=DataType.NVFP4, kv_cache_dtype=kv_cache_dtype)
     try:
         ssm_pool_id = mgr.impl.get_layer_group_id(LayerId(0))
         attention_pool_id = mgr.impl.get_layer_group_id(LayerId(1))

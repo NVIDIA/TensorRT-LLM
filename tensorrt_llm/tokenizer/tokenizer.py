@@ -730,6 +730,7 @@ def load_custom_tokenizer(
     model_dir: Union[str, Path],
     trust_remote_code: bool = True,
     use_fast: bool = True,
+    **kwargs,
 ) -> TokenizerBase:
     """Load a custom tokenizer class by import path or alias.
 
@@ -740,14 +741,27 @@ def load_custom_tokenizer(
         model_dir: The model directory to load the tokenizer from.
         trust_remote_code: Whether to trust remote code.
         use_fast: Whether to use the fast tokenizer.
+        **kwargs: Forwarded to the tokenizer class's `from_pretrained`
+            (e.g. `padding_side`).
 
     Returns:
         An instance of the custom tokenizer class.
 
     Raises:
-        ValueError: If the tokenizer cannot be loaded due to invalid identifier,
-            import failure, or missing class.
+        ValueError: If the identifier is neither a registered alias nor a
+            dotted import path, or if the tokenizer cannot be loaded due to
+            an import failure or a missing class.
     """
+    # A dotless identifier that is not a registered alias would otherwise
+    # be split as an import path and fail inside `rsplit` with an unhelpful
+    # "not enough values to unpack"; name the actual problem instead.
+    if (tokenizer_identifier not in TOKENIZER_ALIASES
+            and '.' not in tokenizer_identifier):
+        raise ValueError(
+            f"Failed to load custom tokenizer '{tokenizer_identifier}': "
+            f"unknown alias. Known aliases: {sorted(TOKENIZER_ALIASES)}. "
+            "Expected format: 'module.path.ClassName' or a recognized alias.")
+
     # Resolve aliases to full import paths
     import_path = TOKENIZER_ALIASES.get(tokenizer_identifier,
                                         tokenizer_identifier)
@@ -757,7 +771,10 @@ def load_custom_tokenizer(
         module = importlib.import_module(module_path)
         tokenizer_class = getattr(module, class_name)
         return tokenizer_class.from_pretrained(
-            model_dir, trust_remote_code=trust_remote_code, use_fast=use_fast)
+            model_dir,
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
     except (ValueError, ImportError, AttributeError) as e:
         raise ValueError(
             f"Failed to load custom tokenizer '{tokenizer_identifier}': {e}. "
