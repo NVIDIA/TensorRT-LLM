@@ -1,20 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Multi-GPU checkpoint loading correctness for Kimi K3."""
+"""Check Kimi K3 checkpoint shards for one logical rank on a single GPU."""
 
 import math
-from pathlib import Path
 
 import pytest
 import torch
-from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 
 pytest.importorskip("fla")
 
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig  # noqa: E402
 from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM  # noqa: E402
+from tensorrt_llm.functional import AllReduceStrategy  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig  # noqa: E402
 
@@ -63,6 +61,8 @@ def _config(
         skip_create_weights_in_init=deferred,
         use_cute_dsl_blockscaling_mm=True,
         use_cute_dsl_blockscaling_bmm=cute_bmm,
+        # Loading executes no collectives; avoid allocating multi-GPU IPC buffers.
+        allreduce_strategy=AllReduceStrategy.NCCL,
     )
 
 
@@ -125,36 +125,8 @@ def test_checkpoint_loads_fp8_mla_values(
     cp: int,
     adp: bool,
 ) -> None:
-    world_size = tp * cp
-    if torch.cuda.device_count() < world_size:
-        pytest.skip(f"requires {world_size} GPUs")
-    args = (prefix, deferred, cute_bmm, fp8, scale_name, tp, cp, adp)
-    if world_size == 1:
-        _check_mla_checkpoint_values(*args)
-    else:
-        with MPIPoolExecutor(
-            max_workers=world_size, path=[str(Path(__file__).resolve().parent)]
-        ) as executor:
-            futures = [
-                executor.submit(_check_mla_checkpoint_values, *args) for _ in range(world_size)
-            ]
-            for future in futures:
-                future.result()
-
-
-def _check_mla_checkpoint_values(
-    prefix: str,
-    deferred: bool,
-    cute_bmm: bool,
-    fp8: bool,
-    scale_name: str,
-    tp: int,
-    cp: int,
-    adp: bool,
-) -> None:
-    rank = MPI.COMM_WORLD.Get_rank()
-    assert MPI.COMM_WORLD.Get_size() == tp * cp
-    torch.cuda.set_device(rank)
+    # Use the last logical rank to exercise nonzero TP/CP shard offsets.
+    rank = tp * cp - 1
     mapping = Mapping(
         world_size=tp * cp,
         tp_size=tp,
