@@ -58,7 +58,7 @@ driver version. For additional information, refer to the [CUDA Forward Compatibi
 
 ```bash
 # By default, the PyTorch CUDA 13.0 package is installed. Install the PyTorch CUDA 13.2 package instead to better align with the CUDA version used to build the TensorRT LLM wheels.
-pip3 install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+pip3 install torch==2.13.0 torchvision --index-url https://download.pytorch.org/whl/cu132
 
 sudo apt-get -y install libopenmpi-dev
 
