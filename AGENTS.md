@@ -165,6 +165,18 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+### PrimTS vendor promotion
+
+Use `scripts/maintain_prims_ts.py promote` for the lock-only maintainer follow-up
+after a PrimTS source-update PR merges. It defaults to dry-run; publication and
+auto-merge require explicit flags. For maintainer promotions, publish with
+`--publish --auto-merge`. Specify the maintainer fork explicitly with
+`--canonical-repo OWNER/REPO`. Publication posts
+`/bot skip --comment "skip CI since no code change"` after verifying the lock-only
+PR, before enabling optional auto-merge. See `3rdparty/vendor-sources.md`.
+Preserve its structured promotion metadata and DCO sign-off in the final squash
+message.
+
 ### Triggering CI
 
 CI is triggered by posting comments on the PR. Basic commands:
