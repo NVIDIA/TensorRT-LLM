@@ -77,6 +77,7 @@ class _LSEVanillaAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(head_dim)
         self._preferred_layout = AttentionTensorLayout.NHD
         self.kv_seq_lens = []
+        self.kv_inputs = []
         self.saw_key_padding_mask = False
 
     def _expand_kv_heads(
@@ -121,6 +122,7 @@ class _LSEVanillaAttention(nn.Module):
     def forward_with_lse(self, q, k, v, batch_size=None, seq_len=None, **kwargs):
         """Return (output [B, S, H, D], lse [B, H, S])."""
         self.kv_seq_lens.append(k.shape[1])
+        self.kv_inputs.append((k, v))
         q_t = q.transpose(1, 2).float()  # [B, H_q, S_q, D]
         k_t = k.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         v_t = v.transpose(1, 2).float()  # [B, H_kv, S_k, D]
@@ -361,19 +363,31 @@ def _logic_attn2d_replicated_kv_unequal_lengths_impl(
         assert inner.kv_seq_lens == expected_kv_seq_lens
         assert not inner.saw_key_padding_mask
 
+        context_start = context_len * (rank % col_size) // col_size
+        context_end = context_len * (rank % col_size + 1) // col_size
+        for call_idx, (k_input, v_input) in enumerate(inner.kv_inputs):
+            batched_call = k_input.shape[0] == batch
+            batch_slice = slice(None) if batched_call else slice(call_idx, call_idx + 1)
+            text_end = max(context_start, min(context_lengths[call_idx], context_end))
+            for actual, context in ((k_input, context_k), (v_input, context_v)):
+                expected_text = context[batch_slice, context_start:text_end]
+                torch.testing.assert_close(
+                    actual[:, : text_end - context_start], expected_text, rtol=0, atol=0
+                )
+
     reference = []
     for batch_idx, text_len in enumerate(context_lengths):
         k_valid = torch.cat(
             [
-                k_full[batch_idx : batch_idx + 1, :generated_len],
                 context_k[batch_idx : batch_idx + 1, :text_len],
+                k_full[batch_idx : batch_idx + 1, :generated_len],
             ],
             dim=1,
         )
         v_valid = torch.cat(
             [
-                v_full[batch_idx : batch_idx + 1, :generated_len],
                 context_v[batch_idx : batch_idx + 1, :text_len],
+                v_full[batch_idx : batch_idx + 1, :generated_len],
             ],
             dim=1,
         )

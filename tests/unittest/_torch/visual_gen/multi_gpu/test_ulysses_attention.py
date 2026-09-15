@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Multi-GPU tests for Ulysses Attention.
 
 These tests use torch.multiprocessing.spawn to launch multiple processes internally.
@@ -378,7 +380,7 @@ def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
 
 
 def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
-    """Replicated context excludes text and generated-sequence padding."""
+    """Match unpadded SDPA with text-first K/V under Ulysses (transparent)."""
     batch = 2
     generated_len = 5
     generated_padded_len = 6
@@ -406,10 +408,12 @@ def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.kv_seq_lens = []
+            self.kv_inputs = []
 
         def forward(self, q, k, v, *, key_padding_mask=None, **kwargs):
             assert key_padding_mask is None
             self.kv_seq_lens.append(k.shape[2])
+            self.kv_inputs.append((k, v))
             return super().forward(q, k, v, key_padding_mask=key_padding_mask, **kwargs)
 
     inner = _RecordingVanillaAttention(
@@ -436,19 +440,28 @@ def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
     )
     assert inner.kv_seq_lens == expected_kv_seq_lens
 
+    head_start = rank * (num_heads // world_size)
+    head_end = head_start + num_heads // world_size
+    for call_idx, (k_input, v_input) in enumerate(inner.kv_inputs):
+        batch_slice = slice(call_idx, call_idx + 1) if unequal_lengths else slice(None)
+        text_len = context_lengths[call_idx]
+        for actual, context in ((k_input, context_k), (v_input, context_v)):
+            expected_text = context[batch_slice, :text_len, head_start:head_end].transpose(1, 2)
+            torch.testing.assert_close(actual[:, :, :text_len], expected_text, rtol=0, atol=0)
+
     reference = []
     for batch_idx, text_len in enumerate(context_lengths):
         k_valid = torch.cat(
             [
-                k_full[batch_idx : batch_idx + 1, :generated_len],
                 context_k[batch_idx : batch_idx + 1, :text_len],
+                k_full[batch_idx : batch_idx + 1, :generated_len],
             ],
             dim=1,
         )
         v_valid = torch.cat(
             [
-                v_full[batch_idx : batch_idx + 1, :generated_len],
                 context_v[batch_idx : batch_idx + 1, :text_len],
+                v_full[batch_idx : batch_idx + 1, :generated_len],
             ],
             dim=1,
         )
