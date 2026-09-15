@@ -9,13 +9,16 @@ import fcntl
 import inspect
 import itertools
 import json
+import math
 import multiprocessing
 import os
+import stat
 import tempfile
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -1487,12 +1490,22 @@ class AutoTuner:
         if not self._is_subprocess_profiling_enabled(tuning_config):
             return []
 
-        subprocess_tactics = [
-            tactic for tactic in valid_tactics
-            if runner.should_profile_tactic_in_subprocess(
-                custom_op, input_tensors, tactic, tuning_config, **kwargs)
-        ]
-        min_tactics = int(os.getenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "2"))
+        try:
+            subprocess_tactics = [
+                tactic for tactic in valid_tactics
+                if runner.should_profile_tactic_in_subprocess(
+                    custom_op, input_tensors, tactic, tuning_config, **kwargs)
+            ]
+            min_tactics = int(os.getenv("TLLM_AUTOTUNER_MP_MIN_TACTICS", "2"))
+        except Exception as e:
+            # Runner hooks are extensible; a failed eligibility check must not
+            # prevent the existing in-process profiling path from running.
+            logger.warning_once(
+                f"[Autotuner] Subprocess eligibility failed for custom_op={custom_op}; "
+                f"falling back to local profiling. Error: {e!r}",
+                key=(custom_op, "warning_autotuning_subprocess_eligibility"),
+            )
+            return []
         if len(subprocess_tactics) < min_tactics:
             return []
 
@@ -1525,9 +1538,7 @@ class AutoTuner:
         return True
 
     def _get_subprocess_worker_count(self, num_tactics: int) -> int:
-        workers = int(os.getenv("TLLM_AUTOTUNER_MP_WORKERS", "0"))
-        if workers <= 0:
-            workers = max(1, min(2, (os.cpu_count() or 1) // 2))
+        workers = int(os.getenv("TLLM_AUTOTUNER_MP_WORKERS", "1"))
         return max(1, min(workers, num_tactics))
 
     def _get_subprocess_profile_lock_path(
@@ -1540,9 +1551,18 @@ class AutoTuner:
             return lock_path
 
         device_suffix = "cpu" if device_index is None else str(device_index)
-        lock_filename = (
-            f"tllm_autotuner_mp_profile_{os.getuid()}_{device_suffix}.lock")
-        return str(Path(tempfile.gettempdir()) / lock_filename)
+        lock_dir = Path(tempfile.gettempdir()) / f"tllm_autotuner_{os.getuid()}"
+        try:
+            lock_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        directory_stat = lock_dir.lstat()
+        if (not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.getuid()
+                or stat.S_IMODE(directory_stat.st_mode) != 0o700):
+            raise PermissionError(
+                f"Unsafe subprocess profiling lock directory: {lock_dir}")
+        return str(lock_dir / f"mp_profile_{device_suffix}.lock")
 
     def _profile_tactics_in_subprocesses(
         self,
@@ -1565,69 +1585,41 @@ class AutoTuner:
             return self._profile_tactics_locally_after_subprocess_failure(
                 runner, input_tensors, tactics, tuning_config, **kwargs)
         device_index = next(iter(cuda_devices), None)
-        worker_count = self._get_subprocess_worker_count(len(tactics))
-        profile_lock_path = self._get_subprocess_profile_lock_path(device_index)
-        input_specs = [
-            _serialize_subprocess_tensor_spec(t) for t in input_tensors
-        ]
-        worker_config = {
-            "custom_op": custom_op,
-            "runner": runner,
-            "runner_id": runner_id,
-            "input_specs": input_specs,
-            "use_cold_l2_cache": tuning_config.use_cold_l2_cache,
-            "use_cuda_graph": tuning_config.use_cuda_graph,
-            "warmup": self.warmup,
-            "repeat": self.repeat,
-            "stream_delay_micro_secs": self.stream_delay_micro_secs,
-            "use_global_timer": self._use_global_timer,
-            "device_index": device_index,
-            "profile_lock_path": profile_lock_path,
-            "kwargs": kwargs,
-        }
-
-        self._debug_logger(
-            f"[Autotuner] Profiling {len(tactics)} tactics for runner={runner} "
-            f"with {worker_count} subprocess workers; "
-            f"profile_lock_path={profile_lock_path}.")
-
-        results: List[Optional[Tuple[Any, float,
-                                     Optional[str]]]] = [None] * len(tactics)
-
         try:
-            ctx = multiprocessing.get_context("spawn")
-            process_failure_error = None
-            with ProcessPoolExecutor(max_workers=worker_count,
-                                     mp_context=ctx) as executor:
-                futures = {}
-                for idx, tactic in enumerate(tactics):
-                    future = executor.submit(
-                        _profile_tactic_in_subprocess,
-                        worker_config,
-                        tactic,
-                    )
-                    futures[future] = (idx, tactic)
-
-                for future in as_completed(futures):
-                    idx, tactic = futures[future]
-                    try:
-                        results[idx] = future.result()
-                    except Exception as e:
-                        process_failure_error = repr(e)
-                        results[idx] = (tactic, float('inf'),
-                                        process_failure_error)
-
-            if process_failure_error is not None and os.getenv(
-                    "TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
-                    "1") != "0":
-                logger.warning_once(
-                    f"[Autotuner] Multiprocess profiling failed for custom_op={custom_op}; falling back to local profiling. Error: {process_failure_error}",
-                    key=(custom_op,
-                         "warning_autotuning_subprocess_fallback_local"),
+            worker_count = self._get_subprocess_worker_count(len(tactics))
+            # This deadline covers the whole batch, including spawn, compilation
+            # and lock waits. Never allow an unbounded or non-finite wait.
+            timeout = float(
+                os.getenv("TLLM_AUTOTUNER_MP_TIMEOUT_SECONDS", "300"))
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError(
+                    "TLLM_AUTOTUNER_MP_TIMEOUT_SECONDS must be finite and positive"
                 )
-                return self._profile_tactics_locally_after_subprocess_failure(
-                    runner, input_tensors, tactics, tuning_config, **kwargs)
+            profile_lock_path = self._get_subprocess_profile_lock_path(
+                device_index)
+            input_specs = [
+                _serialize_subprocess_tensor_spec(t) for t in input_tensors
+            ]
+            worker_config = {
+                "custom_op": custom_op,
+                "runner": runner,
+                "runner_id": runner_id,
+                "input_specs": input_specs,
+                "use_cold_l2_cache": tuning_config.use_cold_l2_cache,
+                "use_cuda_graph": tuning_config.use_cuda_graph,
+                "warmup": self.warmup,
+                "repeat": self.repeat,
+                "stream_delay_micro_secs": self.stream_delay_micro_secs,
+                "use_global_timer": self._use_global_timer,
+                "device_index": device_index,
+                "profile_lock_path": profile_lock_path,
+                "kwargs": kwargs,
+            }
+            ctx = multiprocessing.get_context("spawn")
+            executor = ProcessPoolExecutor(max_workers=worker_count,
+                                           mp_context=ctx)
         except Exception as e:
+            # No tactic has been submitted, so local fallback is still safe.
             error = repr(e)
             if os.getenv("TLLM_AUTOTUNER_MP_FALLBACK_LOCAL_ON_PROCESS_FAILURE",
                          "1") != "0":
@@ -1638,14 +1630,82 @@ class AutoTuner:
                 )
                 return self._profile_tactics_locally_after_subprocess_failure(
                     runner, input_tensors, tactics, tuning_config, **kwargs)
+            logger.warning_once(
+                f"[Autotuner] Multiprocess profiling setup failed for custom_op={custom_op}: {error}",
+                key=(custom_op, "warning_autotuning_subprocess_setup_failure"),
+            )
             return [(tactic, float('inf'), error) for tactic in tactics]
 
-        return [
+        self._debug_logger(
+            f"[Autotuner] Profiling {len(tactics)} tactics for runner={runner} "
+            f"with {worker_count} subprocess workers and a {timeout}s batch timeout; "
+            f"profile_lock_path={profile_lock_path}.")
+        results = [None] * len(tactics)
+        futures = {}
+        process_failure_error = None
+        completed = False
+        deadline = time.monotonic() + timeout
+        try:
+            for idx, tactic in enumerate(tactics):
+                future = executor.submit(_profile_tactic_in_subprocess,
+                                         worker_config, tactic)
+                futures[future] = (idx, tactic)
+
+            for future in as_completed(futures,
+                                       timeout=max(0.0, deadline -
+                                                   time.monotonic())):
+                idx, tactic = futures[future]
+                try:
+                    results[idx] = future.result()
+                except BrokenProcessPool:
+                    raise
+                except Exception as e:
+                    results[idx] = (tactic, float('inf'), repr(e))
+            completed = True
+        except (BrokenProcessPool, TimeoutError) as e:
+            process_failure_error = repr(e)
+        except Exception as e:
+            # Submission may already have started a kernel. Do not retry in the
+            # parent even when the executor fails before returning a future.
+            process_failure_error = repr(e)
+        finally:
+            if completed:
+                executor.shutdown(wait=True)
+            else:
+                _terminate_subprocess_pool(executor)
+
+        # Keep results that completed just before a crash/timeout, even if
+        # as_completed had not yielded them yet. Pending tactics are unsafe to
+        # retry: BrokenProcessPool cannot identify which tactic killed a worker.
+        for future, (idx, tactic) in futures.items():
+            if results[idx] is None and future.done(
+            ) and not future.cancelled():
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    results[idx] = (tactic, float('inf'), repr(e))
+
+        if process_failure_error is not None:
+            logger.warning_once(
+                f"[Autotuner] Multiprocess profiling stopped for custom_op={custom_op}; "
+                f"unfinished tactics will be marked failed without local retry. Error: {process_failure_error}",
+                key=(custom_op,
+                     "warning_autotuning_subprocess_process_failure"),
+            )
+        results = [
             result if result is not None else
-            (tactic, float('inf'),
-             "Subprocess profiling did not return a result.")
+            (tactic, float('inf'), process_failure_error
+             or "Subprocess profiling did not return a result.")
             for result, tactic in zip(results, tactics)
         ]
+        if all(not math.isfinite(latency) for _, latency, _ in results):
+            logger.warning_once(
+                f"[Autotuner] All subprocess tactics failed for custom_op={custom_op}, runner={runner}; "
+                "the search will exclude these tactics. Check worker errors and GPU memory headroom; "
+                "reduce TLLM_AUTOTUNER_MP_WORKERS if necessary.",
+                key=(custom_op, "warning_autotuning_subprocess_all_failed"),
+            )
+        return results
 
     def _profile_tactics_locally_after_subprocess_failure(
         self,
@@ -2360,6 +2420,34 @@ class AutoTuner:
         self._has_received_cache = False
 
 
+def _terminate_subprocess_pool(executor: ProcessPoolExecutor) -> None:
+    """Stop failed workers without waiting for a hung kernel or profiling lock."""
+    # Python 3.10-3.13 have no public executor API for killing workers. Capture
+    # the handles before shutdown clears them; use kill so SIGTERM handlers
+    # cannot leave a worker holding the shared GPU profiling lock indefinitely.
+    processes = list(executor._processes.values())
+    manager_thread = executor._executor_manager_thread
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+    executor.shutdown(wait=False, cancel_futures=True)
+    deadline = time.monotonic() + 5.0
+    # Let the manager reap workers first: concurrent waitpid calls from its
+    # join and Process.join can otherwise briefly report a killed child alive.
+    if manager_thread is not None:
+        manager_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    for process in processes:
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
+
+
+def _validate_subprocess_tensor_layout(shape: tuple[int, ...],
+                                       stride: tuple[int, ...]) -> None:
+    if any(dim > 1 and step == 0 for dim, step in zip(shape, stride)):
+        raise ValueError(
+            f"Subprocess profiling cannot reconstruct expanded tensors (shape={shape}, stride={stride})"
+        )
+
+
 def _serialize_subprocess_tensor_spec(input_obj: Any) -> Dict[str, Any]:
     if not isinstance(input_obj, torch.Tensor):
         if input_obj is not None and not isinstance(input_obj,
@@ -2368,6 +2456,8 @@ def _serialize_subprocess_tensor_spec(input_obj: Any) -> Dict[str, Any]:
                 "Subprocess profiling supports tensors and scalar inputs only")
         return {"is_tensor": False, "value": input_obj}
 
+    _validate_subprocess_tensor_layout(tuple(input_obj.shape),
+                                       tuple(input_obj.stride()))
     return {
         "is_tensor": True,
         "shape": tuple(input_obj.shape),
@@ -2399,6 +2489,7 @@ def _make_subprocess_tensor(spec: Dict[str, Any],
 
     shape = tuple(spec["shape"])
     stride = tuple(spec["stride"])
+    _validate_subprocess_tensor_layout(shape, stride)
     tensor = torch.empty_strided(shape, stride, dtype=dtype, device=device)
 
     if dtype == getattr(torch, "float4_e2m1fn_x2", None):
@@ -2425,12 +2516,22 @@ def _subprocess_profile_lock(lock_path: Optional[str],
     lock_dir = os.path.dirname(lock_path)
     if lock_dir:
         os.makedirs(lock_dir, exist_ok=True)
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        lock_stat = os.fstat(lock_fd)
+        if (not stat.S_ISREG(lock_stat.st_mode)
+                or lock_stat.st_uid != os.getuid()
+                or stat.S_IMODE(lock_stat.st_mode) != 0o600
+                or lock_stat.st_nlink != 1):
+            raise PermissionError(
+                f"Unsafe subprocess profiling lock file: {lock_path}")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         try:
             yield
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
 
 
 def _profile_tactic_in_subprocess(
