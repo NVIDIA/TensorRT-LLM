@@ -67,6 +67,7 @@ struct AllReduceFusionParams
     void* quantOut = nullptr;           //!< Quantized RMSNorm output (used by quantized fusion patterns)
     void* scaleOut = nullptr;           //!< NVFP4 scale-factor output (used by NVFP4 fusion patterns)
     float const* scaleFactor = nullptr; //!< Quantization scale factor
+    int sfLeadingDim = 0;               //!< uint32 elements per packed-sf_k row (FP8 block-scale quant only)
     QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED; //!< NVFP4 scale-factor layout
     cudaStream_t stream;                                          //!< CUDA stream for asynchronous kernel execution
 
