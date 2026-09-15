@@ -951,20 +951,21 @@ class MnnvlMemory:
         probed_links = link_count
         for link_idx in range(link_count):
             try:
-                if pynvml.nvmlDeviceGetNvLinkCapability(
+                if not pynvml.nvmlDeviceGetNvLinkCapability(
                     handle, link_idx, pynvml.NVML_NVLINK_CAP_P2P_SUPPORTED
                 ):
-                    available_links += 1
-                    is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
-                    if is_active:
-                        active_links += 1
+                    continue
+                # NVML_NVLINK_MAX_LINKS is an upper bound over all architectures
+                # and the capability query answers for every index within it.
+                # Only the state query rejects the indices past this GPU's own
+                # link count, so a link counts as available once its state reads.
+                is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
             except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
+                probed_links = min(probed_links, link_idx)
                 continue
-            except pynvml.NVMLError_InvalidArgument:
-                # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures;
-                # the driver rejects indices past this GPU's link count (18 on GB200).
-                probed_links = link_idx
-                break
+            available_links += 1
+            if is_active:
+                active_links += 1
         supported = (
             active_links == available_links and available_links > 0
             if need_all_up

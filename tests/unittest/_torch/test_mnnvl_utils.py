@@ -204,6 +204,32 @@ def test_supports_mnnvl_accepts_full_fabric(
     mock_support_nvlink.assert_called_once_with(0, True)
 
 
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
+)
+@patch("tensorrt_llm._mnnvl_utils.pynvml.NVML_NVLINK_MAX_LINKS", 36)
+@patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetNvLinkCapability", return_value=True)
+def test_support_nvlink_ignores_indices_past_the_gpu_link_count(
+    mock_capability, mock_get_handle, mock_initialize
+) -> None:
+    """A GPU with fewer links than the probe bound still counts as fully up.
+
+    NVML answers the capability query for every index below
+    NVML_NVLINK_MAX_LINKS and only the state query rejects the surplus, so the
+    indices the GPU does not have must not enter the up/total ratio.
+    """
+    physical_links = 18
+
+    def link_state(handle, link_idx):
+        if link_idx >= physical_links:
+            raise pynvml.NVMLError_NotSupported()
+        return True
+
+    with patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetNvLinkState", side_effect=link_state):
+        assert MnnvlMemory.support_nvlink(0, True)
+
+
 @patch(
     "tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency.deep_ep_installed",
     True,
