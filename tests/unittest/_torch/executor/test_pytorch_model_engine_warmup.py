@@ -28,14 +28,10 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import CudaGraphConfig
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     DraftTargetDecodingConfig,
@@ -277,13 +273,14 @@ def _build_engine_and_resource_manager():
         model="dummy",
         max_batch_size=batch_size,
         max_num_tokens=max_tokens,
+        kv_cache_config=KvCacheConfig(max_tokens=max_tokens, use_kv_cache_manager_v2=True),
         cuda_graph_config=CudaGraphConfig(
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]
         ),
     )
     model_engine = _DummyModelEngine(llm_args, torch.half)
-    kv_cache_manager = KVCacheManager(
-        KvCacheConfig(max_tokens=max_tokens),
+    kv_cache_manager = KVCacheManagerV2(
+        llm_args.kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,
         num_kv_heads=model_engine.model.config.num_key_value_heads,
@@ -291,6 +288,7 @@ def _build_engine_and_resource_manager():
         tokens_per_block=tokens_per_block,
         max_seq_len=max_tokens,
         max_batch_size=batch_size,
+        max_num_tokens=max_tokens,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=tensorrt_llm.bindings.DataType.HALF,
     )
