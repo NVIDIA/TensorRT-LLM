@@ -65,13 +65,6 @@ from dataclasses import replace
 # isort: on
 
 
-def _kv_cache_config_for_transceiver_runtime(
-        config: KvCacheConfig,
-        transceiver_runtime: Optional[str]) -> KvCacheConfig:
-    return config.model_copy(
-        update={"use_kv_cache_manager_v2": transceiver_runtime == "PYTHON"})
-
-
 @force_ampere
 @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.part2
@@ -1171,7 +1164,7 @@ async def test_llm_rpc_get_stats_async():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 def test_llm_context_only_timed_out(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1184,11 +1177,9 @@ def test_llm_context_only_timed_out(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm = LLM(model=llama_model_path,
-              kv_cache_config=_kv_cache_config_for_transceiver_runtime(
-                  global_kvcache_config, transceiver_runtime),
+              kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               cache_transceiver_config=CacheTransceiverConfig(
                   backend=backend,
@@ -1263,15 +1254,11 @@ def test_llm_context_only_timed_out(transceiver_runtime):
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
-@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("backend", ["NIXL"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
                                                        backend,
                                                        transceiver_runtime):
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    if transceiver_runtime == "PYTHON" and backend == "UCX":
-        pytest.skip("Python transceiver (V2) does not support UCX backend")
-
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1283,10 +1270,9 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    kv_cache_config = _kv_cache_config_for_transceiver_runtime(
-        KvCacheConfig(free_gpu_memory_fraction=0.1,
-                      max_tokens=1000,
-                      enable_block_reuse=False), transceiver_runtime)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                    max_tokens=1000,
+                                    enable_block_reuse=False)
     llm = LLM(model=llama_model_path,
               kv_cache_config=kv_cache_config,
               tensor_parallel_size=tp_size,
@@ -1357,7 +1343,7 @@ _DISAGG_CANCEL_TEST_ITERATIONS = 2
 @pytest.mark.private_mpi_session
 @pytest.mark.timeout(600)
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 async def test_llm_disagg_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1370,11 +1356,9 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm_ctx = LLM(model=llama_model_path,
-                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
-                      global_kvcache_config_no_reuse, transceiver_runtime),
+                  kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,
@@ -1383,8 +1367,7 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
-                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
-                      global_kvcache_config_no_reuse, transceiver_runtime),
+                  kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,
@@ -1539,7 +1522,7 @@ def test_priority_request_completes_before_low_priority():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", ["PYTHON"])
 async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
@@ -1552,11 +1535,9 @@ async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    # Python transceiver (V2) only supports NIXL/DEFAULT backends
-    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
+    backend = "NIXL"
     llm_ctx = LLM(model=llama_model_path,
-                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
-                      global_kvcache_config_no_reuse, transceiver_runtime),
+                  kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,
@@ -1565,8 +1546,7 @@ async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
-                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
-                      global_kvcache_config_no_reuse, transceiver_runtime),
+                  kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,
