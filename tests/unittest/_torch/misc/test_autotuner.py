@@ -1545,3 +1545,71 @@ def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
                               *zip(*[(world_size, )] * world_size)))
     for got in results:
         assert got == ["rank0", "rank1"]
+
+
+class JitGemmRunner(GemmRunner):
+    """GemmRunner that compiles per tactic, like the CuTe DSL runners."""
+    kernel_cache = dict()
+    calls = []
+
+    def forward(self,
+                /,
+                inputs: List[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        self.__class__.kernel_cache.setdefault(tactic, True)
+        self.__class__.calls.append((tuple(inputs[0].shape), tactic))
+        return super().forward(inputs, tactic=tactic, **kwargs)
+
+
+def test_prime_cached_tactics_on_cache_hit(monkeypatch):
+    """A tuning-mode cache hit must run every cached winner once, so runners
+    that JIT-compile per tactic do so during warmup instead of serving."""
+    w = torch.randn(64, 128)
+    x = torch.randn(3, 64)
+    tuning_config = TuningConfig(dynamic_tensor_specs=(
+        DynamicTensorSpec(input_idx=0,
+                          dim_idx=0,
+                          gen_tuning_buckets=(3, 4, 5),
+                          map_to_tuning_buckets=lambda x: x),
+        DynamicTensorSpec(input_idx=1,
+                          dim_idx=1,
+                          gen_tuning_buckets=(64, 128, 256, 512),
+                          map_to_tuning_buckets=lambda x: x),
+    ), )
+    op = "test_prime_cached_tactics"
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    temp_dir = tempfile.TemporaryDirectory()
+    cache_path = os.path.join(temp_dir.name, "prime.json")
+    with autotune(cache_path=cache_path):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    winners = {
+        v[1]
+        for v in tuner.profiling_cache.get_specific_custom_op(op).values()
+    }
+    assert winners
+
+    # A fresh process: the persistent cache is loaded, nothing compiled yet.
+    tuner.profiling_cache.clear()
+    tuner._primed_cached_tactics = set()
+    JitGemmRunner.kernel_cache.clear()
+    JitGemmRunner.calls.clear()
+    with autotune(cache_path=cache_path):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    assert set(JitGemmRunner.kernel_cache) == winners
+    assert len(JitGemmRunner.calls) == len(winners)
+
+    # Already primed in this process: no further launches.
+    with autotune(cache_path=cache_path):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    assert len(JitGemmRunner.calls) == len(winners)
+
+    # Opt-out knob.
+    monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "0")
+    tuner._primed_cached_tactics = set()
+    JitGemmRunner.calls.clear()
+    with autotune(cache_path=cache_path):
+        tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
+    assert JitGemmRunner.calls == []

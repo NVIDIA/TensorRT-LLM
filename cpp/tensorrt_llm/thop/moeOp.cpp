@@ -38,8 +38,6 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
-#include <ATen/native/cuda/Resize.h>
-
 #include <algorithm>
 #include <functional>
 #include <map>

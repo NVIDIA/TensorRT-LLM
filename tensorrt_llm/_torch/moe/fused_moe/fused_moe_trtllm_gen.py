@@ -694,6 +694,28 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             self.act_alpha = nn.Parameter(self.act_alpha, requires_grad=False)
             self.act_beta = nn.Parameter(self.act_beta, requires_grad=False)
 
+        # SiTu reuses the swiglu_alpha/swiglu_beta storage: SiTu and SwiGLU are
+        # mutually exclusive (constructor-provided SwiGLU parameters are
+        # rejected by _validate_backend_local_activation) and feed the same
+        # gemm1_alpha/gemm1_beta op slots. Safe with respect to the
+        # `swiglu_alpha is not None` gates: create_moe.py checks the
+        # constructor kwargs (None for SiTu); _get_quant_method's nvfp4 branch
+        # keys off is_situ_activation rather than swiglu_alpha, so it returns
+        # the same method before and after this point; _check_configs runs
+        # after this point and its swiglu gate admits both nvfp4 and
+        # w4a8_mxfp4_mxfp8.
+        if self.is_situ_activation:
+            self.swiglu_alpha = nn.Parameter(torch.full(
+                (self.expert_size_per_partition, ),
+                float(self.trtllm_gen_activation_alpha),
+                dtype=torch.float32),
+                                             requires_grad=False)
+            self.swiglu_beta = nn.Parameter(torch.full(
+                (self.expert_size_per_partition, ),
+                float(self.trtllm_gen_activation_beta),
+                dtype=torch.float32),
+                                            requires_grad=False)
+
         self._weights_created = True
         self._check_configs()
 

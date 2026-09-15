@@ -19,6 +19,8 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.locality_domain_utils import \
+    optional_locality_domain_mem_pool
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
@@ -1168,6 +1170,8 @@ class AutoTuner:
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
+            self._prime_cached_tactics(custom_op, runners, tuning_config,
+                                       inputs, **kwargs)
             return (runners[best_runner_id], best_tactic)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
@@ -1236,6 +1240,88 @@ class AutoTuner:
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    def _prime_cached_tactics(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: List[torch.Tensor],
+        **kwargs,
+    ) -> None:
+        """Run every cached winner once so JIT runners compile during warmup.
+
+        A tuning-mode cache hit means the winners were selected by an earlier
+        process (persistent cache), so this process has never run them.
+        Runners that compile per tactic (class-level ``kernel_cache``) would
+        otherwise compile lazily at the first serving iteration that reaches
+        each (weight family, M bucket). Disable with
+        ``TLLM_AUTOTUNER_PRIME_CACHED_TACTICS=0``.
+        """
+        if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+            return
+        jit_classes = {
+            type(r)
+            for r in runners
+            if isinstance(getattr(type(r), "kernel_cache", None), dict)
+        }
+        if not jit_classes:
+            return
+        primed = getattr(self, "_primed_cached_tactics", None)
+        if primed is None:
+            primed = self._primed_cached_tactics = set()
+        before = {cls: len(cls.kernel_cache) for cls in jit_classes}
+        t0 = time.perf_counter()
+        n_launch = n_fail = 0
+        for p in self._optimization_profiles(tuning_config, inputs):
+            hit, runner_id, tactic, _ = self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                p.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            if not hit:
+                continue
+            runner = runners[runner_id]
+            if type(runner) not in jit_classes:
+                continue
+            key = (custom_op, type(runner).__name__, str(runner.unique_id()),
+                   str(tactic))
+            if key in primed:
+                continue
+            primed.add(key)
+            tensors = self._prepare_input_tensors(p, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = tuning_config.inputs_pre_hook(tensors)
+            try:
+                with nvtx_range(f"{custom_op} prime tactic {tactic}"), \
+                        optional_locality_domain_mem_pool():
+                    if "do_preparation" in inspect.signature(
+                            runner.forward).parameters:
+                        runner(tensors,
+                               tactic=-1,
+                               do_preparation=True,
+                               **kwargs)
+                    runner(tensors, tactic=tactic, **kwargs)
+                n_launch += 1
+            except Exception as e:
+                n_fail += 1
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                logger.warning(
+                    f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
+                    f"runner={type(runner).__name__}, tactic={tactic}, "
+                    f"shapes={p.get_opt_shapes()}. Error: {e}")
+        if n_launch or n_fail:
+            n_compiled = sum(
+                len(cls.kernel_cache) - before[cls] for cls in jit_classes)
+            logger.info(
+                f"[Autotuner] Primed {n_launch} cached tactics for {custom_op} "
+                f"({n_compiled} new JIT kernels, {n_fail} failures) in "
+                f"{time.perf_counter() - t0:.2f}s")
 
     def _profile_runners(
         self,

@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
@@ -134,6 +135,10 @@ class MegaMoeCuteDslUnavailable(RuntimeError):
 
 
 _RUNTIME_PROBE_CACHE: Optional[Union[bool, str]] = None
+
+# Process-global: MoE layers sharing one problem shape prime the ladder once.
+_MEGAMOE_PRIME_LADDER = os.environ.get("MEGAMOE_PRIME_LADDER", "1") == "1"
+_MEGAMOE_PRIMED_LADDERS: set = set()
 
 
 def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
@@ -1461,6 +1466,85 @@ class MegaMoECuteDsl(MoEImplBase):
         # output (TopkReduce form-A / REDG form-B); just drop the singleton.
         return combine_output[:num_tokens].squeeze(1).to(output_dtype)
 
+    def _prime_ladder(
+        self,
+        *,
+        live_T: int,
+        weight_view: MegaMoECuteDslWeightView,
+        top_k: int,
+        hidden: int,
+        device,
+        output_dtype: torch.dtype,
+    ) -> None:
+        """Warm-up: launch every other adaptive bucket once with zero live tokens.
+
+        Each bucket owns a compiled kernel, a local workspace and a one-time
+        barrier fence; serving never autotunes this op, so without this the
+        first chunk landing in a new bucket pays ``cute.compile`` inside a
+        serving iteration on every EP rank at once. Zero live tokens is the
+        existing scheduler-invariant path (``topk_idx == -1`` everywhere); the
+        ladder, the tuning-mode gate and the done-set are rank-identical.
+        """
+        key = (
+            tuple(self._maxt_buckets),
+            self.ep_size,
+            hidden,
+            int(self.intermediate_size_per_partition),
+            int(self.expert_size_per_partition),
+            top_k,
+            self.combine_format,
+            self.act_clamp,
+            str(device),
+            output_dtype,
+        )
+        if key in _MEGAMOE_PRIMED_LADDERS:
+            return
+        _MEGAMOE_PRIMED_LADDERS.add(key)
+        t0 = time.perf_counter()
+        primed = []
+        for max_T in self._maxt_buckets:
+            if max_T == live_T:
+                continue
+            bufs = self._acquire_buffers(
+                top_k=top_k,
+                hidden=hidden,
+                device=device,
+                output_dtype=output_dtype,
+                launch_max_T=max_T,
+            )
+            self._stage_inputs(
+                bufs=bufs,
+                x=None,
+                x_sf=None,
+                topk_idx=None,
+                topk_weights=None,
+                num_tokens=0,
+                top_k=top_k,
+            )
+            self._launch_megamoe_kernel(
+                activation=bufs.activation,
+                activation_sf=bufs.activation_sf,
+                topk_idx=bufs.topk_idx_local,
+                topk_weights=bufs.topk_weights[:, :top_k],
+                weight_view=weight_view,
+                combine_output=bufs.combine_output,
+                shared_workspace=bufs.shared_workspace,
+                world_size=self.ep_size,
+                local_rank=self.ep_rank,
+                top_k=top_k,
+                hidden=hidden,
+                peer_offsets=bufs.peer_offsets,
+                num_tokens=0,
+                output_dtype=output_dtype,
+                launch_max_T=max_T,
+            )
+            primed.append(max_T)
+        if self.ep_rank == 0:
+            logger.info(
+                f"[MegaMoECuteDsl] primed adaptive buckets {primed} (live bucket "
+                f"{live_T}) in {time.perf_counter() - t0:.1f}s"
+            )
+
     def _run_moe(
         self,
         *,
@@ -1505,6 +1589,16 @@ class MegaMoECuteDsl(MoEImplBase):
             )
         if num_tokens == 0 and self.ep_size == 1:
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
+
+        if self.ep_size > 1 and _MEGAMOE_PRIME_LADDER and AutoTuner.get().is_tuning_mode:
+            self._prime_ladder(
+                live_T=launch_max_T,
+                weight_view=weight_view,
+                top_k=top_k,
+                hidden=hidden,
+                device=device,
+                output_dtype=output_dtype,
+            )
 
         bufs = self._acquire_buffers(
             top_k=top_k,
