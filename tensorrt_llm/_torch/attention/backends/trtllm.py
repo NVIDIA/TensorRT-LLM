@@ -102,6 +102,7 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
+    workspace_reclaimable: bool = field(default=True, init=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -2070,6 +2071,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
+        if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
+            # Conservatively disable reclamation for metadata used by graphs
+            # or backends that can retain staged workspace state.
+            metadata.workspace_reclaimable = False
         try:
             fmha.forward(q, k, v, metadata, forward_args)
         except RuntimeError as exc:
