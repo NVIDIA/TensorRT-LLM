@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import Iterator, Optional
 
 import torch
+import inspect
 
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
@@ -73,6 +74,16 @@ class WorkerExtension:
 
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
+    
+    def supports_partial_loading(self) -> bool:
+        """Check if the model supports partial weight loading."""
+        try:
+            model = self.engine.model_engine.model
+            load_weights_args = inspect.getfullargspec(model.load_weights).args
+            return "allow_partial_loading" in load_weights_args
+        except Exception as e:
+            logger.warning(f"Failed to check partial loading support: {e}")
+            return False
 
     def finalize_weight_update(self) -> None:
         """Finalize a refit and refresh post-load state safely for CUDA Graph replay."""
@@ -178,8 +189,10 @@ class WorkerExtension:
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")
+                model = self.engine.model_engine.model
+
                 self.engine.model_engine.model_loader.reload(
-                    self.engine.model_engine.model, weights, allow_partial_loading=True
+                    model, weights, allow_partial_loading=self.supports_partial_loading()
                 )
                 del weights
                 torch.cuda.ipc_collect()
