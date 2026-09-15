@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/hostPageCopy.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -503,6 +504,7 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
+    TLLM_CHECK_WITH_INFO(mHostCopyPins.empty(), "Retained host copies must be released before storage shutdown");
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -772,6 +774,110 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
+void StorageManager::pinHostCopy(CacheLevel level, PoolGroupIndex group)
+{
+    ++mHostCopyPins[{level, group}];
+}
+
+void StorageManager::unpinHostCopy(CacheLevel level, PoolGroupIndex group, CachedCudaEvent event)
+{
+    auto it = mHostCopyPins.find({level, group});
+    TLLM_CHECK(it != mHostCopyPins.end() && it->second > 0);
+    if (--it->second == 0)
+        mHostCopyPins.erase(it);
+    auto [use, inserted] = mHostCopyRetireEvents.try_emplace(std::make_pair(level, group), std::move(event));
+    if (!inserted)
+    {
+        std::vector<CachedCudaEvent> events{use->second, std::move(event)};
+        use->second = mergeEvents(events);
+    }
+}
+
+void StorageManager::checkHostCopiesAllowResize(CacheLevel level, PoolGroupIndex group)
+{
+    if (mHostCopyPins.count({level, group}) != 0)
+        throw LogicError("Cannot move or resize a pool with retained host copies");
+    auto it = mHostCopyRetireEvents.find({level, group});
+    if (it != mHostCopyRetireEvents.end())
+    {
+        // Closed readers can still have GPU work in flight against this host address.
+        it->second.synchronize();
+        mHostCopyRetireEvents.erase(it);
+    }
+}
+
+void StorageManager::backupPageToHost(Page& page, CacheLevel hostLevel, int validTokens, CUstream stream)
+{
+    if (hostLevel <= kHotLevel || hostLevel >= numCacheLevels() || cacheTier(hostLevel) != CacheTier::HOST_MEM)
+        throw std::invalid_argument("Host backup requires a configured host-memory level");
+    if (page.manager != this || page.cacheLevel != kHotLevel || !page.hasValidSlot() || validTokens <= 0)
+        throw LogicError("Host backup requires a written GPU page owned by this manager");
+    auto copy = page.hostCopy();
+    if (copy && copy->level() != hostLevel)
+        throw LogicError("Cannot change a retained host copy's storage level");
+    if (copy && copy->validTokens() >= validTokens)
+        return; // Writes must explicitly invalidate before reaching this point.
+
+    if (!copy)
+    {
+        auto slots = newSlotsForPoolGroup(hostLevel, getPoolGroupIndex(hostLevel, page.lifeCycle), 1);
+        try
+        {
+            copy = std::make_shared<HostPageCopy>(*this, page.lifeCycle, hostLevel, slots.front());
+        }
+        catch (...)
+        {
+            releaseSlot(page.lifeCycle, hostLevel, std::move(slots.front()));
+            throw;
+        }
+    }
+    copy->beginBackup(stream);
+    page.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+    int submittedTokens = 0;
+    auto finish = FuncGuard(
+        [&]()
+        {
+            CachedCudaEvent event(reinterpret_cast<CudaStream>(stream));
+            page.readyEvent = event;
+            copy->finishBackup(std::move(event), submittedTokens);
+        });
+    copySlotData(page.lifeCycle, hostLevel, kHotLevel, copy->slotId(), page.slotId(), stream);
+    submittedTokens = validTokens;
+    finish.run();
+    page.mHostCopy = std::move(copy);
+    if (page.scheduledForEviction())
+        excludeFromEviction(page);
+}
+
+void StorageManager::offloadPageToHost(Page& page, int requiredTokens)
+{
+    auto const& copy = page.hostCopy();
+    if (page.manager != this || page.status() != PageStatus::HELD || !copy || requiredTokens <= 0
+        || copy->validTokens() < requiredTokens)
+        throw LogicError("Offload requires a held page and a host backup covering its written data");
+    if (copy->matches(page.cacheLevel, page.slotId()))
+        return;
+    if (page.cacheLevel != kHotLevel)
+        throw LogicError("Offload expects a GPU page");
+    if (page.scheduledForEviction())
+        excludeFromEviction(page);
+    std::vector<CachedCudaEvent> uses{page.readyEvent, copy->mBackupReady};
+    page.readyEvent = mergeEvents(uses);
+    Slot destination;
+    destination.setSlotId(copy->slotId());
+    destination.readyEvent = copy->mBackupReady;
+    Slot source = page.exchangeSlot(std::move(destination));
+    CacheLevel const sourceLevel = page.cacheLevel;
+    page.cacheLevel = copy->level();
+    releaseSlot(page.lifeCycle, sourceLevel, std::move(source));
+    if (mEventSink && page.isCommitted())
+    {
+        auto const& committed = static_cast<CommittedPage const&>(page);
+        if (committed.block && !committed.block->isOrphan())
+            mEventSink->addCacheLevelUpdated(committed.block->key, sourceLevel, page.cacheLevel, page.lifeCycle);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // isEvictable
 // ---------------------------------------------------------------------------
@@ -779,6 +885,17 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> level) const noexcept
 {
     PageStatus s = page.status();
+    // Active retained copies use explicit offload. Their host addresses must not
+    // move through ordinary eviction, including host-to-disk migration.
+    if (auto const& copy = page.hostCopy())
+    {
+        if (s != PageStatus::DROPPABLE)
+            return false;
+        // Dropping or migrating this page cannot free its primary host slot
+        // while an open reader still owns that slot. Do not count it as available.
+        if (copy->matches(page.cacheLevel, page.slotId()) && copy->mOpenReaders > 0)
+            return false;
+    }
     CacheLevel lvl = level.value_or(page.cacheLevel);
     return (s == PageStatus::DROPPABLE && page.isCommitted()) || (s == PageStatus::HELD && lvl < numCacheLevels() - 1);
 }
@@ -1238,8 +1355,17 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                     excludeFromEviction(*srcPages.at(i));
                 // Replace the page's source slot with its destination and release the source slot back to the pool.
                 Slot srcSlot = srcPages.at(i)->exchangeSlot(std::move(dstSlots.at(i)));
-                srcPoolGroup.release(std::move(srcSlot));
+                auto const& hostCopy = srcPages.at(i)->hostCopy();
+                if (hostCopy && hostCopy->matches(srcLevel, srcSlot.slotId()))
+                    hostCopy->recordUse(std::move(srcSlot.readyEvent));
+                else
+                    srcPoolGroup.release(std::move(srcSlot));
                 srcPages.at(i)->cacheLevel = dstLevel;
+                // An inactive page moving on to another tier no longer needs its
+                // retained source slot. In-flight readers still own their copy.
+                if (hostCopy && srcPages.at(i)->status() == PageStatus::DROPPABLE
+                    && !hostCopy->matches(dstLevel, srcPages.at(i)->slotId()))
+                    srcPages.at(i)->mHostCopy.reset();
                 if (emitCacheLevelUpdates && srcPages.at(i)->isCommitted())
                 {
                     auto const& page = static_cast<CommittedPage const&>(*srcPages.at(i));
@@ -1475,6 +1601,7 @@ float StorageManager::getOverallUtilization(CacheLevel level) const
 
 void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots)
 {
+    checkHostCopiesAllowResize(level, pgIdx);
     auto& pg = poolGroup(level, pgIdx);
     TLLM_CHECK_DEBUG(newNumSlots > pg.numSlots());
     pg.resizePools(newNumSlots);
@@ -1488,6 +1615,7 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 void StorageManager::shrinkPoolGroup(
     CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
 {
+    checkHostCopiesAllowResize(level, pgIdx);
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
     auto& ctrl = mLevels.at(level).controller;
@@ -1615,6 +1743,10 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
             + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
     }
     auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
+    // Check all affected groups before changing any allocation or quota.
+    for (PoolGroupIndex group{0}; group < newNumSlots.size(); ++group)
+        if (newNumSlots[group] != oldNumSlots[group])
+            checkHostCopiesAllowResize(level, group);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 

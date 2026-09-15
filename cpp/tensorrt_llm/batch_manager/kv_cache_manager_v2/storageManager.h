@@ -43,6 +43,7 @@ class Page;
 class KvCache;
 class CopyEngine;
 class StagingBufferManager;
+class HostPageCopy;
 struct BatchedLockTarget;
 
 using MigrationRecorder
@@ -197,6 +198,12 @@ public:
     void prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
+    //! Retain a host copy using the existing host-tier budget and cold-page codec.
+    //! Caller orders writes before backup on stream. validTokens describes the written prefix.
+    void backupPageToHost(Page& page, CacheLevel hostLevel, int validTokens, CUstream stream);
+    //! Adopt the retained host slot and release GPU storage. The page must be HELD.
+    void offloadPageToHost(Page& page, int requiredTokens);
+
     // ---- Query helpers -----------------------------------------------------
 
     LifeCycleRegistry const& lifeCycles() const noexcept
@@ -312,6 +319,14 @@ public:
     friend class KvCacheIntrospection;
 
 private:
+    friend class HostPageCopy;
+    int mHostReaders = 0;
+    void pinHostCopy(CacheLevel level, PoolGroupIndex group);
+    void unpinHostCopy(CacheLevel level, PoolGroupIndex group, CachedCudaEvent event);
+    void checkHostCopiesAllowResize(CacheLevel level, PoolGroupIndex group);
+    std::map<std::pair<CacheLevel, PoolGroupIndex>, size_t> mHostCopyPins;
+    std::map<std::pair<CacheLevel, PoolGroupIndex>, CachedCudaEvent> mHostCopyRetireEvents;
+
     using PageQueue = std::deque<SharedPtr<Page>>;
     using PagesByLifeCycle = TypedVec<LifeCycleId, PageQueue>;
     using MigrationBatchKey = std::pair<CacheLevel, LayerGroupId>;

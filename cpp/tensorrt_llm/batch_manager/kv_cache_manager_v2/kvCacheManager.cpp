@@ -148,6 +148,7 @@ void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
 void KvCacheManager::shutdown()
 {
     _checkNoLivingKvCaches("shutdown()");
+    TLLM_CHECK_WITH_INFO(mStorage->mHostReaders == 0, "Close host readers before storage shutdown");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
 

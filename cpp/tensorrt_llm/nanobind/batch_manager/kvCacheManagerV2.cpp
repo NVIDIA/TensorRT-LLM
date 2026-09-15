@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventManager.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/hostPageCopy.h"
 #include "kv_cache_manager_v2/introspection.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
@@ -1674,6 +1675,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
+    // Host readers own the host slot until close, then protect reuse with a CUDA event.
+    nb::class_<kv::HostPageRead>(m, "_HostPageRead")
+        .def("close", &kv::HostPageRead::close, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("ready", &kv::HostPageRead::ready)
+        .def_prop_ro("completed_tokens", &kv::HostPageRead::completedTokens)
+        .def_prop_ro("valid_tokens", [](kv::HostPageRead const& self) { return self.copy().validTokens(); })
+        .def_prop_ro("cache_level", [](kv::HostPageRead const& self) { return self.copy().level().value(); })
+        .def_prop_ro("pool_group_index", [](kv::HostPageRead const& self) { return self.copy().poolGroup().value(); })
+        .def_prop_ro("slot_id", [](kv::HostPageRead const& self) { return self.copy().slotId().value(); })
+        .def_prop_ro("address", [](kv::HostPageRead const& self) { return self.copy().address(); })
+        .def_prop_ro("pool_base_address", [](kv::HostPageRead const& self) { return self.copy().poolBaseAddress(); })
+        .def_prop_ro("page_bytes", [](kv::HostPageRead const& self) { return self.copy().pageBytes(); })
+        .def_prop_ro("pool_bytes", [](kv::HostPageRead const& self) { return self.copy().poolBytes(); });
+
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
@@ -1693,6 +1708,33 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCache& self, int layerGroupId, std::optional<int> windowSize, int numSinkTokens)
             { self.setResidencyWindow(kv::LayerGroupId{layerGroupId}, windowSize, numSinkTokens); },
             nb::arg("layer_group_id"), nb::arg("window_size").none(), nb::arg("num_sink_tokens") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_backup_to_host",
+            [](kv::KvCache& self, int group, int ordinal, int validTokens, int level, int beam)
+            {
+                self.backupToHost(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, validTokens,
+                    kv::CacheLevel{level}, kv::BeamIndex{beam});
+            },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("valid_tokens"), nb::arg("host_level") = 1,
+            nb::arg("beam") = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_invalidate_host_copy",
+            [](kv::KvCache& self, int group, int ordinal, int beam)
+            { self.invalidateHostCopy(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, kv::BeamIndex{beam}); },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("beam") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_offload_to_host",
+            [](kv::KvCache& self, int group, int ordinal, int beam)
+            { self.offloadToHost(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, kv::BeamIndex{beam}); },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("beam") = 0,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "_acquire_host_copy",
+            [](kv::KvCache& self, int group, int ordinal, int beam)
+            { return self.acquireHostCopy(kv::LayerGroupId{group}, kv::BlockOrdinal{ordinal}, kv::BeamIndex{beam}); },
+            nb::arg("layer_group_id"), nb::arg("block_ordinal"), nb::arg("beam") = 0,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },

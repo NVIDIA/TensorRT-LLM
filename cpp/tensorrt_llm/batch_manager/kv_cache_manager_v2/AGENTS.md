@@ -123,6 +123,23 @@ pages and performs final commit-state bookkeeping.
   must acquire the selected historical data before using it; held pages have invalid
   GPU page-table entries even when their storage has not yet moved off GPU.
 
+### Retained host copies
+
+- `KvCache::backupToHost()` retains a host-tier slot using the configured cold-page
+  codec. `HostPageCopy` owns that slot; `Page` may alias it as its primary slot.
+  Never release the alias through the ordinary page allocator a second time.
+- `offloadToHost()` requires a held page and enough backed-up tokens. It reuses
+  the retained slot and protects the released GPU source with completion events.
+  Full-page GPU restoration keeps the host copy.
+- Call `invalidateHostCopy()` before writing backed-up, uncommitted GPU data.
+  Open `HostPageRead` handles block invalidation. Closed reads still protect the
+  slot until their CUDA work finishes. Publish only completed host coverage.
+- Retained copies pin host addresses. Pool resize/defrag must reject live pins
+  and wait for retired copies' events. A reader also keeps `KvCacheManager` alive.
+- Active retained pages use explicit offload. Last-request cleanup releases extra
+  copies of cached GPU pages; inactive host pages remain normally evictable.
+- See [host-copy usage and layout](../../../../docs/source/developer-guide/kv-cache-host-copies.md).
+
 ### Page status
 
 - `LOCKED`: required on GPU; neither eviction nor dropping is permitted.

@@ -55,6 +55,7 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/coldPageCopy.cu
     kv_cache_manager_v2/coldPageCodec.cpp
     kv_cache_manager_v2/eventManager.cpp
+    kv_cache_manager_v2/hostPageCopy.cpp
     kv_cache_manager_v2/page.cpp
     kv_cache_manager_v2/storageManager.cpp
     kv_cache_manager_v2/introspection.cpp

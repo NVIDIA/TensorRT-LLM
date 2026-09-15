@@ -40,6 +40,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
+class HostPageRead;
 struct ScratchDesc;
 
 // ---------------------------------------------------------------------------
@@ -195,6 +196,18 @@ public:
     // Updating an active cache acquires newly required locks before releasing old
     // ones; allocation failure preserves the previous residency requirements.
     void setResidencyWindow(LayerGroupId group, std::optional<int> windowSize, int numSinkTokens = 0);
+
+    //! Backup a written attention-page prefix on the request stream. Host capacity
+    //! must already be configured. May restore a cold page through one GPU slot.
+    void backupToHost(LayerGroupId group, BlockOrdinal ordinal, int validTokens, CacheLevel hostLevel = CacheLevel{1},
+        BeamIndex beam = kDefaultBeamIndex);
+    //! Call before writing an existing uncommitted GPU page with a host copy.
+    void invalidateHostCopy(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam = kDefaultBeamIndex);
+    //! Release a cold held page's GPU storage after arranging its host backup.
+    void offloadToHost(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam = kDefaultBeamIndex);
+    //! Keep a copy's addresses alive through operations on the request stream.
+    std::unique_ptr<HostPageRead> acquireHostCopy(
+        LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam = kDefaultBeamIndex);
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
@@ -593,6 +606,9 @@ private:
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
     void _checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const;
     void _resizePageIndexBuffers(BlockOrdinal newNumBlocks);
+
+    SharedPtr<Page> const& hostCopyPage(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam) const;
+    int writtenTokensInPage(Page const& page, BlockOrdinal ordinal) const;
 
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;

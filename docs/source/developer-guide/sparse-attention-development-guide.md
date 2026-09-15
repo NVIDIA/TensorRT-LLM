@@ -355,8 +355,9 @@ The resolver does not divide positions by the compression ratio again.
 Duplicates keep their columns. Negative positions, positions outside the valid
 length, and masked entries are invalid.
 
-Build the layout from KVCM's pool/slot sizes and buffer offsets, plus the model's
-entry format. Do not infer entry stride from total buffer size. A component
+Build the layout from the **host** pool/slot sizes and buffer offsets, plus the model's
+entry format. The default cold-page codec joins GPU pools into one host pool;
+see [retained host copies](kv-cache-host-copies.md#host-layout-and-disk-restore). Do not infer entry stride from total buffer size. A component
 names one byte span per entry: its pool, offset in the slot, byte stride, and
 byte count. Use separate components for separate scale regions or heads when
 needed. For component `c`, the host byte offset is:
@@ -381,9 +382,10 @@ not discard that selection. One GPU entry hit says nothing about neighbouring
 entries or whole-page residency.
 
 The storage/cache owners must keep addresses stable and protect reads and
-copies. These interfaces do not provide that ownership, host backup, replacement,
-or model integration. Those are the next HiSparse implementation tasks. Prefix
-commit status does not determine whether a completed host entry may be read.
+copies. KVCM V2 now provides [retained host copies and read handles](kv-cache-host-copies.md).
+The views above still do not own memory. Selected-entry fetch, replacement, and
+model integration are later HiSparse steps. Prefix commit status does not
+determine whether a completed host entry may be read.
 
 ## Kernel-level sparse attention
 

@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/hostPageCopy.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -208,6 +209,85 @@ bool KvCache::_requiresGpuLock(BlockOrdinal ordinal, LifeCycleId lifeCycle, int 
 {
     auto const& window = mResidencyWindows.at(lifeCycle);
     return !window || !window->getStaleRange(historyLength, mTokensPerBlock).contains(ordinal);
+}
+
+SharedPtr<Page> const& KvCache::hostCopyPage(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam) const
+{
+    if (mStatus != Status::ACTIVE)
+        throw LogicError("Host-copy operations require an active request");
+    if (group < LifeCycleId{0} || group >= storageManager()->numLifeCycles()
+        || !std::holds_alternative<AttnLifeCycle>(storageManager()->getLifeCycle(group)))
+        throw std::invalid_argument("Host copies require an attention lifecycle");
+    if (ordinal < BlockOrdinal{0} || ordinal >= mBlocks.size() || beam < BeamIndex{0}
+        || beam >= mBlocks[ordinal].pages.size())
+        throw std::out_of_range("Host-copy page is outside the request");
+    auto const& page = blockPageGetPage(mBlocks[ordinal].pages[beam][group]);
+    if (!page)
+        throw LogicError("The request does not hold this page");
+    return page;
+}
+
+int KvCache::writtenTokensInPage(Page const& page, BlockOrdinal ordinal) const
+{
+    int const written = std::clamp(mHistoryLength - ordinal.value() * mTokensPerBlock, 0, mTokensPerBlock);
+    return page.isCommitted() ? std::min(written, static_cast<CommittedPage const&>(page).numTokensInBlock) : written;
+}
+
+void KvCache::backupToHost(
+    LayerGroupId group, BlockOrdinal ordinal, int validTokens, CacheLevel hostLevel, BeamIndex beam)
+{
+    auto page = hostCopyPage(group, ordinal, beam);
+    if (hostLevel <= kHotLevel || hostLevel >= storageManager()->numCacheLevels()
+        || storageManager()->cacheTier(hostLevel) != CacheTier::HOST_MEM)
+        throw std::invalid_argument("Host backup requires a configured host-memory level");
+    if (validTokens <= 0 || validTokens > writtenTokensInPage(*page, ordinal))
+        throw std::invalid_argument("Host backup exceeds the page's written token prefix");
+    if (page->hostCopy() && page->hostCopy()->level() == hostLevel && page->hostCopy()->validTokens() >= validTokens)
+        return;
+    // A cold codec may need GPU decoding. Restore one page at a time before
+    // producing a retained copy in the host codec layout.
+    if (page->cacheLevel != kHotLevel)
+    {
+        auto locks = batchedLockToGpu(*this, {BatchedLockTarget{page, beam, ordinal, group}});
+        // Record the lock's finish after the backup has been submitted.
+        auto unlock = FuncGuard(
+            [&]()
+            {
+                auto scope = recordEventScope();
+                locks.clear();
+            });
+        storageManager()->backupPageToHost(*page, hostLevel, validTokens, cudaStream());
+    }
+    else
+    {
+        storageManager()->backupPageToHost(*page, hostLevel, validTokens, cudaStream());
+    }
+    // Count the actual backup once. Switching the primary slot in offloadToHost
+    // does not transfer bytes, and repeated backup calls return above.
+    KVCacheIterationStatsDelta stats;
+    stats.iterOffloadBlocks = 1;
+    stats.iterOffloadBytes = page->hostCopy()->pageBytes();
+    _recordDirectIterationStats(group, stats);
+}
+
+void KvCache::invalidateHostCopy(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam)
+{
+    auto const& page = hostCopyPage(group, ordinal, beam);
+    if (page->isCommitted() || !std::holds_alternative<SharedPageLock>(mBlocks[ordinal].pages[beam][group]))
+        throw LogicError("Invalidate only a writable, GPU-locked request page");
+    if (page->hostCopy())
+        page->hostCopy()->invalidate();
+}
+
+void KvCache::offloadToHost(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam)
+{
+    auto const& page = hostCopyPage(group, ordinal, beam);
+    storageManager()->offloadPageToHost(*page, writtenTokensInPage(*page, ordinal));
+}
+
+std::unique_ptr<HostPageRead> KvCache::acquireHostCopy(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam)
+{
+    return std::make_unique<HostPageRead>(mManager, hostCopyPage(group, ordinal, beam)->hostCopy(), cudaStream());
 }
 
 void KvCache::setResidencyWindow(LayerGroupId group, std::optional<int> windowSize, int numSinkTokens)
