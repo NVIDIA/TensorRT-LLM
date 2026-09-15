@@ -30,6 +30,8 @@ from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    discard_nccl_window_tensor_outputs
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -573,22 +575,24 @@ def row_linear_residual_norm_fusion_forward(
         # Process each sequence length using the same AllReduce instance
         for i, (x, residual, reference_output) in enumerate(
                 zip(x_list, residual_list, reference_output_list)):
-            output = func(x.clone(), residual.clone(), norm_weight, eps, fusion)
+            with discard_nccl_window_tensor_outputs((x, residual)):
+                output = func(x.clone(), residual.clone(), norm_weight, eps,
+                              fusion)
 
-            torch.testing.assert_close(
-                output[0],
-                reference_output[0],
-                rtol=0.05,
-                atol=0.15,
-            )
-
-            if fusion:
                 torch.testing.assert_close(
-                    output[1],
-                    reference_output[1],
+                    output[0],
+                    reference_output[0],
                     rtol=0.05,
                     atol=0.15,
                 )
+
+                if fusion:
+                    torch.testing.assert_close(
+                        output[1],
+                        reference_output[1],
+                        rtol=0.05,
+                        atol=0.15,
+                    )
     finally:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()

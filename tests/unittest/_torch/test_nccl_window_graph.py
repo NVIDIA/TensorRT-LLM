@@ -440,6 +440,24 @@ def test_eager_decoder_layer_hooks_scope_each_invocation(tensor_scope_events):
     assert tensor_scope_events[-1][-1] is False
 
 
+def test_module_hooks_scope_arbitrary_modules(tensor_scope_events):
+    class TestModule(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    module = TestModule()
+    handles = nccl_window_tensor_scope.install_module_nccl_window_tensor_scopes([module])
+    output = [object()]
+    try:
+        assert module(output) is output
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert [event[0] for event in tensor_scope_events] == ["begin", "end"]
+    assert tensor_scope_events[-1][-1] is False
+
+
 def test_eager_decoder_layer_hook_allows_no_cuda_output(tensor_scope_events):
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 

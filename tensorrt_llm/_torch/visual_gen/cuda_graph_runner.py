@@ -11,6 +11,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ..nccl_window_graph import nccl_window_graph_capture
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..utils import make_weak_ref
 
 # One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
@@ -149,7 +150,8 @@ class CUDAGraphRunner:
 
         graph = torch.cuda.CUDAGraph()
         for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
+            with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
+                fn(*static_args, **static_kwargs)
             torch.cuda.synchronize()
             gc.collect()
             torch.cuda.empty_cache()

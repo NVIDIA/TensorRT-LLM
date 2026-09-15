@@ -44,6 +44,10 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture, release_nccl_window_graph_owner)
+from tensorrt_llm._torch.nccl_window_tensor_scope import (
+    discard_nccl_window_tensor_outputs, nccl_window_tensor_scope)
 from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
                                  nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
@@ -140,10 +144,11 @@ def profile_allreduce(
 
     def func(x, loop_num=inner_loop):
         for _ in range(loop_num):
-            if profile_gemm_allreduce:
-                output = linear(x, all_reduce_params=allreduce_params)
-            else:
-                output = allreduce(x, all_reduce_params=allreduce_params)
+            with discard_nccl_window_tensor_outputs((x, residual)):
+                if profile_gemm_allreduce:
+                    output = linear(x, all_reduce_params=allreduce_params)
+                else:
+                    output = allreduce(x, all_reduce_params=allreduce_params)
         return output if fusion == AllReduceFusionOp.NONE else output[0]
 
     start = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
@@ -152,6 +157,7 @@ def profile_allreduce(
 
     stream = torch.cuda.Stream()
     shape_hidden = gemm_in_features if profile_gemm_allreduce else input.size(1)
+    graph_pool = torch.cuda.graph_pool_handle() if enable_cudagraph else None
     with torch.cuda.stream(stream), nvtx_range(
             f"allreudce: shape={input.size(0)}x{shape_hidden} fusion={fusion} "
             f"strategy={strategy} mode={'gemm_ar' if profile_gemm_allreduce else 'allreduce'}"
@@ -160,12 +166,10 @@ def profile_allreduce(
             func(input, loop_num=1)
 
         if enable_cudagraph:
-            # Run one multi-iteration warmup, not repeated single-iteration
-            # warmups: `output = allreduce(x)` keeps the previous output alive
-            # while the next RHS allocates its output, seeding the same two
-            # reusable output windows that graph capture will need.
+            # Register every window size used by the captured loop eagerly;
+            # NCCL registration itself is not capture-safe.
             func(input, loop_num=3)
-            with torch.cuda.graph(graph, stream=stream):
+            with nccl_window_graph_capture(graph, graph_pool, stream=stream):
                 output = func(input)
 
         dist.barrier()
@@ -197,6 +201,13 @@ def profile_allreduce(
             rtol=1e-2,
             msg="Allreduce result mismatch",
         )
+    # A symmetric benchmark input may itself own a registered window.
+    with nccl_window_tensor_scope(input):
+        pass
+    if graph_pool is not None:
+        graph.reset()
+        release_nccl_window_graph_owner(graph_pool)
+
     return median_ms
 
 
