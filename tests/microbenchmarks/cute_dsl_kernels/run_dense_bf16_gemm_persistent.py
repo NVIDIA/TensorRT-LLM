@@ -53,12 +53,13 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin import (
-        dense_bf16_gemm_persistent as kernel_module,
-    )
+    from tensorrt_llm._torch.kernels.rubin import dense_bf16_gemm_persistent as kernel_module
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from rubin import dense_bf16_gemm_persistent as kernel_module
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[3])
+    from tensorrt_llm._torch.kernels.rubin import dense_bf16_gemm_persistent as kernel_module
 
 PersistentDenseGemmKernel = kernel_module.PersistentDenseGemmKernel
 

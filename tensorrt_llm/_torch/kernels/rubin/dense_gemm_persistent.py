@@ -48,7 +48,7 @@ from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # Customized epilogue with a_scale/b_scale support for FP8 per-tensor GEMM
-from tensorrt_llm._torch.cute_dsl_kernels.utils.gemm import sm100 as gemm_sm100
+from tensorrt_llm._torch.kernels.utils.gemm import sm100 as gemm_sm100
 
 from ..blackwell.dense_gemm_persistent import (
     PersistentDenseGemmKernel as SM100PersistentDenseGemmKernel,

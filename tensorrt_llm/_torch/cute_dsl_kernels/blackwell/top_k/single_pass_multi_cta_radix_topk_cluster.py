@@ -36,7 +36,11 @@ from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.hardware_info import HardwareInfo
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+from ....kernels.blackwell.utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel, st_release_gpu
 
 

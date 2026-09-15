@@ -24,7 +24,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from ..utils import (
+from tensorrt_llm._torch.kernels.blackwell.utils import (
     atomic_add_func,
     vectorized_atomic_add_bf16x8,
     vectorized_atomic_add_fp16x8,

@@ -24,7 +24,7 @@ This guide focuses on source-level integration where the kernel ships as either:
 | :---- | :---- | :---- | :---- |
 | CUDA C++ | `.cu` / `.h` | At wheel build time (CMake → `nvcc`) | [`cpp/tensorrt_llm/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels) |
 | [CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) (Python) | Python using `cutlass.cute` / `@cute.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) |
-| [cuTile](https://docs.nvidia.com/cuda/cutile-python/) (Python) | Python using `cuda.tile` / `@ct.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cuda_tile_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels) |
+| [cuTile](https://docs.nvidia.com/cuda/cutile-python/) (Python) | Python using `cuda.tile` / `@ct.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) (`rms_norm.py`, `rms_norm_fuse_residual.py`) |
 
 ---
 
@@ -167,7 +167,7 @@ CuTe DSL and cuTile kernels are written in Python and JIT-compiled at runtime. T
 | Flavor | Directory | Availability flag |
 | :---- | :---- | :---- |
 | CuTe DSL | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) (Blackwell variants under `blackwell/`) | `IS_CUTLASS_DSL_AVAILABLE` in [`cute_dsl_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_utils.py) |
-| cuTile | [`tensorrt_llm/_torch/cuda_tile_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cuda_tile_kernels) | `IS_CUDA_TILE_AVAILABLE` in [`cuda_tile_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_utils.py) |
+| cuTile | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) | `IS_CUDA_TILE_AVAILABLE` in [`cuda_tile_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_utils.py) |
 
 ### 4.2 Kernel skeleton
 
@@ -210,10 +210,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return out
 ```
 
-**cuTile.** The kernel is a Python function decorated with `@ct.kernel` that takes tensors plus `ct.Constant[...]` compile-time parameters, and is launched via `ct.launch(stream, grid, kernel, args)`. See [`cuda_tile_kernels/rms_norm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_kernels/rms_norm.py) and the corresponding Torch op wrapper in [`custom_ops/cuda_tile_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py).
+**cuTile.** The kernel is a Python function decorated with `@ct.kernel` that takes tensors plus `ct.Constant[...]` compile-time parameters, and is launched via `ct.launch(stream, grid, kernel, args)`. See [`kernels/rms_norm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/rms_norm.py) and the corresponding Torch op wrapper in [`custom_ops/cuda_tile_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cuda_tile_custom_ops.py).
 
 ```py
-# tensorrt_llm/_torch/cuda_tile_kernels/my_kernel.py
+# tensorrt_llm/_torch/kernels/my_kernel.py
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
 if IS_CUDA_TILE_AVAILABLE:
@@ -236,7 +236,7 @@ from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
 if IS_CUDA_TILE_AVAILABLE:
     import cuda.tile as ct
-    from ..cuda_tile_kernels import rms_norm_kernel  # the JIT kernel above
+    from ..kernels.rms_norm import rms_norm_kernel  # the JIT kernel above
 
     @torch.library.custom_op("trtllm::cuda_tile_rms_norm", mutates_args=())
     def cuda_tile_rms_norm(x, weight, eps, ...):
@@ -254,7 +254,7 @@ The same pattern (`@torch.library.custom_op("trtllm::...")`, `register_fake`, co
 
 ### 4.4 Runtime caveats
 
-- **Compute capability checks.** Kernels under `cute_dsl_kernels/blackwell/` and the entire `cuda_tile_kernels/` tree assume sm_100+. Always probe with `tensorrt_llm._utils.get_sm_version()` (see `_should_use_torch_fallback` in `argmax.py`) and route to a fallback otherwise.  
+- **Compute capability checks.** Kernels under `cute_dsl_kernels/blackwell/` assume sm_100+. The cuTile kernels under `tensorrt_llm/_torch/kernels/` do too. Always probe with `tensorrt_llm._utils.get_sm_version()` (see `_should_use_torch_fallback` in `argmax.py`) and route to a fallback otherwise.  
 - **DLPack/CUDA Graphs.** When exporting tensors via DLPack, use the stream override that mimics the `CUDAGraphCompatibleWrapper` in `argmax.py` so the capture replays cleanly.  
 - **JIT compile cache.** Always cache compiled kernels by the keys that affect codegen (dtype, last-dim size, hardware variant). `argmax.py` and the `cute_dsl_custom_ops.py` runners are good references.
 

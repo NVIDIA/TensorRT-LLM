@@ -38,7 +38,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .utils import (
+from tensorrt_llm._torch.kernels.blackwell.utils import (
     TRTLLM_ENABLE_PDL,
     fclip_xorsign,
     fmin,
