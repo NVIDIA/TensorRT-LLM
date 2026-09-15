@@ -851,7 +851,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # adopted verbatim and fail at creation on a non-NIXL backend.
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
                 "transceiver_runtime": "CPP",
             },
@@ -873,7 +872,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
-                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
                 "transceiver_runtime": "CPP",
             },
