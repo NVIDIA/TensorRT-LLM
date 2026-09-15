@@ -133,7 +133,17 @@ def inplace_info():
             2: "paged_score",
             3: "output"
         },
+        torch.ops.trtllm.compressor_paged_kv_compress_incremental.default: {
+            1: "paged_kv",
+            2: "paged_score",
+            3: "output"
+        },
         torch.ops.trtllm.compressor_prefill_reduction.default: {
+            1: "paged_kv",
+            2: "paged_score",
+            3: "output"
+        },
+        torch.ops.trtllm.compressor_prefill_reduction_incremental.default: {
             1: "paged_kv",
             2: "paged_score",
             3: "output"

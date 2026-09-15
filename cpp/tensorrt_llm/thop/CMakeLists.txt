@@ -151,7 +151,8 @@ add_library(
   trtllmGenQKVProcessOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
-  compressorOp.cpp)
+  compressorOp.cpp
+  compressorIncrementalOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
