@@ -22,6 +22,7 @@ import importlib.util
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
@@ -510,6 +511,15 @@ def test_local_shadow_does_not_create_binding_consumer() -> None:
     assert analysis.binding_consumers == set()
 
 
+def test_comprehension_target_does_not_shadow_outer_iterable_load() -> None:
+    source = "VALUE = (1, 2, 3)\n\ndef consumer():\n    return [VALUE for VALUE in VALUE]\n"
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+VALUE = (1, 2, 3)\n")
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"consumer"}
+
+
 def test_function_alias_marks_caller_graph_incomplete() -> None:
     source = (
         "VALUE = 521\n\n"
@@ -527,48 +537,83 @@ def test_function_alias_marks_caller_graph_incomplete() -> None:
     assert analysis.callable_escapes == {"helper"}
 
 
-def test_repository_reference_index_follows_import_relationships(tmp_path: Path) -> None:
-    package = tmp_path / "pkg"
+@pytest.fixture()
+def reference_root(tmp_path: Path) -> Path:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    return tmp_path
+
+
+def _stage_reference_files(reference_root: Path) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=reference_root, check=True)
+
+
+def test_repository_reference_index_follows_import_relationships(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
     package.mkdir()
     (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\nTHIRD = 3\n")
     (package / "direct.py").write_text("from pkg.owner import VALUE\n")
     (package / "module.py").write_text("import pkg.owner as owner\nprint(owner.OTHER)\n")
     (package / "relative.py").write_text("from . import owner\nprint(owner.THIRD)\n")
     (package / "unrelated.py").write_text("VALUE = 4\n")
+    _stage_reference_files(reference_root)
 
-    references = RepositoryReferenceIndex(tmp_path).external_references(
+    references = RepositoryReferenceIndex(reference_root).external_references(
         "pkg/owner.py", {"VALUE", "OTHER", "THIRD"}
     )
 
     assert references == {"VALUE", "OTHER", "THIRD"}
 
 
-def test_repository_reference_index_treats_module_escape_as_unresolved(tmp_path: Path) -> None:
-    package = tmp_path / "pkg"
+def test_repository_reference_index_treats_module_escape_as_unresolved(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
     package.mkdir()
     (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
     (package / "consumer.py").write_text("import pkg.owner as owner\nregister(owner)\n")
+    _stage_reference_files(reference_root)
 
-    references = RepositoryReferenceIndex(tmp_path).external_references(
+    references = RepositoryReferenceIndex(reference_root).external_references(
         "pkg/owner.py", {"VALUE", "OTHER"}
     )
 
     assert references == {"VALUE", "OTHER"}
 
 
-def test_repository_reference_index_tracks_simple_module_alias(tmp_path: Path) -> None:
-    package = tmp_path / "pkg"
+def test_repository_reference_index_tracks_simple_module_alias(reference_root: Path) -> None:
+    package = reference_root / "pkg"
     package.mkdir()
     (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
     (package / "consumer.py").write_text(
         "import pkg.owner as owner\nalias = owner\nprint(alias.OTHER)\n"
     )
+    _stage_reference_files(reference_root)
 
-    references = RepositoryReferenceIndex(tmp_path).external_references(
+    references = RepositoryReferenceIndex(reference_root).external_references(
         "pkg/owner.py", {"VALUE", "OTHER"}
     )
 
     assert references == {"OTHER"}
+
+
+def test_repository_reference_index_tracks_direct_import_module(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
+    (package / "consumer.py").write_text(
+        'from importlib import import_module\nowner = import_module("pkg.owner")\n'
+    )
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_references(
+        "pkg/owner.py", {"VALUE", "OTHER"}
+    )
+
+    assert references == {"VALUE", "OTHER"}
 
 
 def test_repository_reference_index_reports_direct_importers(tmp_path: Path) -> None:
@@ -586,6 +631,52 @@ def test_repository_reference_index_reports_direct_importers(tmp_path: Path) -> 
     assert importers.complete
     assert importers.paths == ("perf/test_prefixed.py", "perf/test_relative.py")
     assert not importers.limitation
+
+
+def test_repository_reference_index_ignores_non_code_leaf_mentions(tmp_path: Path) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    (package / "test_consumer.py").write_text("from .helper import VALUE\n")
+    (package / "unrelated.py").write_text(
+        'helper_fn = 1\nLABEL = "helper"\n# helper is not referenced\n'
+    )
+
+    importers = RepositoryReferenceIndex(tmp_path).direct_importers("perf/helper.py")
+
+    assert importers.complete
+    assert importers.paths == ("perf/test_consumer.py",)
+    assert not importers.limitation
+
+
+def test_repository_reference_index_reports_ambiguous_short_import(tmp_path: Path) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "consumer.py").write_text("import helper\n")
+
+    importers = RepositoryReferenceIndex(tmp_path).direct_importers("perf/helper.py")
+
+    assert not importers.complete
+    assert not importers.paths
+    assert importers.limitation == "ambiguous short import in other/consumer.py: helper"
+
+
+def test_repository_reference_index_reports_unresolved_module_reference(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    (tmp_path / "consumer.py").write_text("print(helper.VALUE)\n")
+
+    importers = RepositoryReferenceIndex(tmp_path).direct_importers("perf/helper.py")
+
+    assert not importers.complete
+    assert not importers.paths
+    assert importers.limitation == "unresolved module reference in consumer.py"
 
 
 def test_repository_reference_index_marks_dynamic_importers_incomplete(tmp_path: Path) -> None:

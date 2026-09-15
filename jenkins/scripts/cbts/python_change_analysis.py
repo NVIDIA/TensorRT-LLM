@@ -286,6 +286,18 @@ class _FunctionNames(ast.NodeVisitor):
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
         )
 
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._include_nested_loads(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._include_nested_loads(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._include_nested_loads(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._include_nested_loads(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.bound.add(node.name)
         self._include_nested_loads(node)
