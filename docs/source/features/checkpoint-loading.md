@@ -191,9 +191,19 @@ To compare rank-striped loading against native loading, separately report
 confirmed effective `rank_striped_read_ahead` observations and native controls
 with matching runtime-image identity, GPU, model/checkpoint, and parallelism
 configuration. Keep auto fallbacks and unknown effective policies separate;
-do not infer activation from the assigned arm. Preserve experiment versions
-and root build IDs when grouping repeated observations. This effective-policy
-comparison is observational, not a controlled head-to-head benchmark.
+do not infer activation from the assigned arm. Retain root build IDs when
+grouping repeated observations. This effective-policy comparison is
+observational, not a controlled head-to-head benchmark.
+
+Keep results from the old 75/25 split separate from the new 50/50 split using
+the experiment version, not bucket numbers alone. To check the split, use the
+assigned policy; to compare loading performance, use the loader that actually
+ran.
+
+Even builds use native loading, while odd builds use auto. Before comparing
+performance, check that both groups use comparable runtime images, hardware,
+CI configurations, and cache conditions—otherwise, those differences could be
+mistaken for a loader improvement.
 
 This policy remains separate from ModelStreamer, MX, GMS, or snapshot
 integrations. Those systems may change the source or bypass raw loading without
