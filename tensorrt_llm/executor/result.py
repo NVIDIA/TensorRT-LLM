@@ -541,6 +541,10 @@ class GenerationResultBase:
 
         if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
+            self.decoding_iter = response.decoding_iter
+            self.avg_decoded_tokens_per_iter = (
+                response.avg_decoded_tokens_per_iter)
+            self.cached_tokens = response.cached_tokens
             if isinstance(response.res, CompletionOutput):
                 # in streaming mode
                 self._outputs[0] = response.res

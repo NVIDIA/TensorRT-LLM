@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 
 #include <ATen/cuda/EmptyTensor.h>
-#include <ATen/native/cuda/Resize.h>
 
 #include <cstddef>
 #include <cuda_fp16.h>
