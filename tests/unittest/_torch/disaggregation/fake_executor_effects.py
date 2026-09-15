@@ -23,6 +23,8 @@ class FakeExecutorEffects(ExecutorEffects):
         self.staged_responses: List[Tuple[int, LlmResponse, Optional[LlmRequest]]] = []
         # (error_msg, requests, charge_budget)
         self.failed: List[Tuple[str, List[LlmRequest], bool]] = []
+        # Messages of collective-aligned fatal failures.
+        self.fatal: List[str] = []
         # Interleaved history of every effect, for relative-order assertions.
         self.history: List[Tuple[str, object]] = []
         # Optional exception raised from fail_requests, to model a fatal error.
@@ -48,6 +50,10 @@ class FakeExecutorEffects(ExecutorEffects):
         self.history.append(("fail", error_msg))
         if self.fail_raises is not None:
             raise self.fail_raises
+
+    def fail_fatal(self, error_msg: str) -> None:
+        self.fatal.append(error_msg)
+        self.history.append(("fatal", error_msg))
 
 
 class FakeRequestRegistry(ActiveRequestRegistry):

@@ -1420,8 +1420,6 @@ def test_send_disagg_ctx_kv_skips_retired_session_without_mutating_state(
 
 
 def test_context_send_failure_is_applied_at_next_loop_boundary():
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
     request = _make_send_kv_request(is_last_chunk=False)
     request.py_kv_transfer_timed_out = False
     coordinator, transceiver, transfer_manager = _make_send_kv_coordinator(
@@ -1439,17 +1437,13 @@ def test_context_send_failure_is_applied_at_next_loop_boundary():
     assert request.state == LlmRequestState.CONTEXT_INIT
     transfer_manager.end_transfer.assert_not_called()
 
-    executor = MagicMock()
-    executor.disagg = coordinator
-    executor.active_requests = [request]
-    executor.enable_attention_dp = False
-    executor.dist.world_size = 1
-
-    PyExecutor._handle_disagg_cache_errors_synced(executor)
+    coordinator.handle_errors_synced()
 
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert not coordinator.take_pending_context_failures()
-    executor._check_cache_transfer_errors.assert_called_with("context requests")
+    coordinator._effects.fail_requests.assert_called_once_with(
+        "Error in kv cache transfer for context requests", [request], charge_budget=False
+    )
 
 
 @pytest.mark.parametrize("is_last_chunk", [False, True])

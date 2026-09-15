@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    MAMBA_CONV_ROLE,
+    AttentionLayerGroup,
+    MambaLayerGroup,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -1797,6 +1801,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -1827,6 +1832,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -2054,6 +2060,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr._generation_kv_capacity_headroom = 1
         mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
         mgr.head_dim_per_layer = [64, 64]
@@ -3397,7 +3404,8 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         assert isinstance(mamba_group, MambaLayerGroup)
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        assert mamba_group.conv_section_bytes == [
+        conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
+        assert conv_view.section_bytes == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]
