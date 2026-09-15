@@ -260,6 +260,17 @@ class BasePipeline(nn.Module):
         """
         return (height, width, num_frames)
 
+    def warmup_cache_keys(self, shapes: List[Tuple[int, int, int]]) -> Set[tuple]:
+        """Return every cache key the warmup pass compiled for ``shapes``.
+
+        Override when one planned ``(height, width, num_frames)`` shape compiles
+        more than one graph — FLUX.2 also warms a reference-carrying pass, whose
+        key carries the reference shapes. Keys reported here must correspond to
+        graphs :meth:`_run_warmup` really ran, or the executor's un-warmed-shape
+        warning goes quiet on shapes that still recompile.
+        """
+        return {self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes}
+
     def request_warmup_cache_key(self, req: Any) -> tuple:
         """Return the warmup cache key for a prepared inference request."""
         return self.warmup_cache_key(
@@ -897,9 +908,7 @@ class BasePipeline(nn.Module):
         finally:
             self._is_warmup = False
 
-        self._warmed_up_shapes = set(
-            self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
-        )
+        self._warmed_up_shapes = self.warmup_cache_keys(shapes)
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 
