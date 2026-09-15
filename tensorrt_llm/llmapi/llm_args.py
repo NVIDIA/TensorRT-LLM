@@ -6010,12 +6010,17 @@ class TorchLlmArgs(BaseLlmArgs):
     use_cute_dsl_bf16_bmm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        "If true, use CuTe DSL BF16 BMM on Blackwell (SM100/SM103) and Rubin (SM107), "
+        "including the DeepSeek-V4 o_a projection on Rubin when DSL support and "
+        "dimension alignment permit. Defaults to false; automatically enabled "
+        "with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
     use_cute_dsl_bf16_gemm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
+        "If true, use CuTe DSL BF16 persistent GEMM for Linear layers on Blackwell "
+        "(SM100/SM103) and Rubin (SM107) when supported. Defaults to false; "
+        "automatically enabled with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
 
     # PrivateVars
@@ -6750,7 +6755,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if (not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
                 and self.pipeline_parallel_size > 1 and is_sm_100f()):
             logger.info("Automatically enabling CuTe DSL BF16 BMM and GEMM for "
-                        "SM100/SM103 PP.")
+                        "SM100/SM103/SM107 with pipeline_parallel_size > 1.")
             self.use_cute_dsl_bf16_bmm = True
             self.use_cute_dsl_bf16_gemm = True
 
@@ -6760,7 +6765,7 @@ class TorchLlmArgs(BaseLlmArgs):
             if sm < 100:
                 raise ValueError(
                     f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
-                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"supported on SM >= 100 (Blackwell or newer), but current device has "
                     f"sm {sm}.")
         return self
 
