@@ -157,6 +157,42 @@ class TestCaptureReplayStaticTensors:
                 ),
             )
 
+    @pytest.mark.parametrize("use_mrope", [False, True])
+    def test_replay_rejects_position_ids_shape_mismatch(self, use_mrope):
+        """A position_ids whose shape doesn't match input_ids' seqlen must
+        raise, rather than letting torch.Tensor.copy_() silently broadcast a
+        singleton axis across the static buffer.
+        """
+        batch_size = 4
+        runner = create_mock_cuda_graph_runner(batch_size, use_mrope=use_mrope, max_num_tokens=128)
+        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = object()
+
+        def forward_fn(inputs):
+            return inputs["input_ids"].clone()
+
+        runner.capture(
+            key,
+            forward_fn,
+            self._make_inputs(attn_metadata, num_tokens, batch_size, value=1, use_mrope=use_mrope),
+        )
+
+        replay_inputs = self._make_inputs(
+            attn_metadata, num_tokens, batch_size, value=2, use_mrope=use_mrope
+        )
+        # Collapse the token axis to a broadcastable singleton, mirroring the
+        # shape bug copy_() would otherwise silently paper over.
+        if use_mrope:
+            replay_inputs["position_ids"] = torch.full(
+                (3, 1, 1), 2, device="cuda", dtype=torch.int32
+            )
+        else:
+            replay_inputs["position_ids"] = torch.full((1, 1), 2, device="cuda", dtype=torch.int32)
+
+        with pytest.raises(ValueError, match="position_ids"):
+            runner.replay(key, replay_inputs)
+
     def test_replay_rejects_mrope_delta_read_seq_slots_length_mismatch(self):
         """A short mrope_delta_read_seq_slots must raise, not silently leave
         a stale tail in the static buffer.

@@ -792,6 +792,13 @@ class CUDAGraphRunner:
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
+            expected_position_ids_shape = (3, 1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
@@ -820,6 +827,13 @@ class CUDAGraphRunner:
                 static_tensors['mrope_delta_read_seq_slots'][:num_slots].fill_(
                     mrope_dummy_seq_slot)
         else:
+            expected_position_ids_shape = (1, seqlen)
+            if tuple(position_ids.shape) != expected_position_ids_shape:
+                raise ValueError(
+                    f"replay() got position_ids of shape {tuple(position_ids.shape)} "
+                    f"for key {key}, but expected {expected_position_ids_shape}. "
+                    "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
+                    "which would corrupt the static input buffer.")
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
