@@ -1282,6 +1282,51 @@ def test_single_pair_shortcut(monkeypatch):
         f"got {len(profile_calls)} ({profile_calls})")
 
 
+def test_single_pair_shortcut_failure_is_logged_as_inf(monkeypatch):
+    """A failing single-pair run still gets a Candidate record, as inf.
+
+    The timed path lists failed candidates as inf next to the ones that ran;
+    the shortcut must match, or a run whose only candidate crashed would show
+    neither a Candidate nor a Selected line and read as if the op was never
+    tuned. choose_one itself must not raise: the fallback (runner 0, tactic
+    -1) covers the op, same as an all-failed timed loop."""
+
+    class FailingRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    do_preparation: bool = False,
+                    **kwargs) -> torch.Tensor:
+            raise RuntimeError("single-pair candidate crash")
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    lines = _capture_autotuner_debug_lines(monkeypatch)
+    x = torch.randn(M, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+
+    op = "autotuner_test::single_pair_shortcut_failure"
+    with autotune():
+        runner, tactic = tuner.choose_one(op, [FailingRunner()], TuningConfig(),
+                                          [x, w])
+    assert tactic == -1, "an all-failed op must fall back to tactic -1"
+    assert any(
+        line.startswith(f"[Autotuner] Candidate: custom_op={op}, ")
+        and line.endswith("time=infms") for line in lines
+    ), (f"a failed single-pair candidate must be logged as inf; got {lines}")
+
+
 def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
     """End-to-end guard for the nvMatmulHeuristics tactic pruning.
 
