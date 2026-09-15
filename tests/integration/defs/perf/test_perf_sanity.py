@@ -910,6 +910,7 @@ def _checkpoint_io_experiment_config_eligible(config_data: dict) -> bool:
         backend == "pytorch"
         and checkpoint_format == "HF"
         and load_format == "auto"
+        and config_data.get("checkpoint_loader") is None
         and not config_data.get("extra_llm_api_config_path")
     )
 
