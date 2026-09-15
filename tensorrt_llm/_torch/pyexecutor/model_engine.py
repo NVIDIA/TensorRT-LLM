@@ -65,6 +65,7 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            prepare_attn_metadata_for_draft_replay,
@@ -467,9 +468,9 @@ class PyTorchModelEngine(ModelEngine):
             enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
         )
         self.dist = dist
+        self.llm_args = llm_args
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
-        self.llm_args = llm_args
         # Opt-in tiered sampling captured into the forward graph. Off by
         # default: it captures one extra graph per enabled tier, which costs
         # startup time and memory that deployments not bound by sampling
@@ -571,6 +572,19 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
+        # Router Replay (R3) capturer owned by this engine (None when disabled or
+        # for draft engines). Registered in the model extra attrs so the MoE
+        # routing hook reaches this engine's capturer during its forward, the
+        # same way ``moe_layers`` is looked up -- no process-wide state.
+        self.route_capture = RouteCapture.create(
+            rank=self.dist.rank if self.dist is not None else 0,
+            model_engine=self,
+            enabled=self.llm_args.enable_return_routed_experts,
+            pp_size=self.mapping.pp_size,
+            is_spec_decode=self.is_spec_decode,
+            is_draft_model=self.is_draft_model)
+        if self.route_capture is not None:
+            self.model.extra_attrs[ROUTE_CAPTURE_ATTR] = self.route_capture
         # Every MM item-scheduling decision -- policy, capability, feature
         # validation, budget resolution -- lives in engine/multimodal.py; the
         # engine only copies back the three budgets that are external contract.
