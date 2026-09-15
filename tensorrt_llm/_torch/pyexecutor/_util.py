@@ -873,7 +873,8 @@ class KvCacheCreator:
             draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
                 effective_draft_config,
                 draft_kv_cache_config,
-                is_disagg=self._is_disagg)
+                is_disagg=self._is_disagg,
+                cache_transceiver_config=self._cache_transceiver_config)
             draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
                 draft_kv_cache_manager_cls, effective_draft_config,
                 draft_kv_cache_config)
@@ -1704,7 +1705,10 @@ class KvCacheCreator:
                 f"draft manager: {draft_kv_config.max_attention_window}")
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+            effective_draft_config,
+            draft_kv_config,
+            is_disagg=self._is_disagg,
+            cache_transceiver_config=self._cache_transceiver_config)
         draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 

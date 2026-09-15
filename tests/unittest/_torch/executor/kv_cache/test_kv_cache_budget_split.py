@@ -64,6 +64,8 @@ def _make_creator(
     c._max_seq_len = 1024
     c._max_num_tokens = 0
     c._max_batch_size = 1
+    c._is_disagg = False
+    c._cache_transceiver_config = None
     c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
@@ -220,6 +222,7 @@ class TestSplitGpuBudgetForDraft:
         creator._max_num_tokens = 128
         creator._max_beam_width = 1
         creator._kv_connector_manager = None
+        creator._cache_transceiver_config = None
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
