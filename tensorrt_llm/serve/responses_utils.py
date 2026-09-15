@@ -163,6 +163,8 @@ def _parse_response_input(
         else:
             logger.warning("Responses API: Invalid input message type")
             msg = None
+    elif input_msg["type"] == "output_text":
+        msg = Message.from_role_and_content(Role.ASSISTANT, input_msg["text"])
     elif input_msg["type"] == "function_call_output":
         call_id = input_msg["call_id"]
         call_response: Optional[ResponseFunctionToolCall] = None
@@ -726,6 +728,8 @@ def _response_output_item_to_chat_completion_message(
                 return item
             else:
                 raise ValueError(f"Invalid input message item: {item}")
+        case "output_text":
+            return {"role": "assistant", "content": item["text"]}
         case "message" | "reasoning":
             if item_type == "message" and isinstance(item.get("content"), str):
                 return {

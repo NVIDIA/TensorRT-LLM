@@ -159,6 +159,38 @@ def test_returned_output_text_can_be_replayed(logprobs: list[object] | None) -> 
     assert item["content"][0]["logprobs"] is logprobs
 
 
+@pytest.mark.parametrize("harmony", [False, True])
+@pytest.mark.parametrize("text", ["APPLE", ""])
+def test_bare_output_text_replays_as_assistant(text: str, harmony: bool) -> None:
+    """Preserve assistant text and turn order through both prompt builders."""
+    import asyncio
+
+    from tensorrt_llm.serve.responses_utils import _construct_harmony_messages
+
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {"role": "user", "content": "Remember APPLE"},
+            {"type": "output_text", "text": text, "logprobs": None},
+            {"role": "user", "content": "Continue"},
+        ],
+    )
+    if harmony:
+        messages = _construct_harmony_messages(request, None)[2:]
+        assert [message.author.role for message in messages] == ["user", "assistant", "user"]
+        assert [message.content[0].text for message in messages] == [
+            "Remember APPLE",
+            text,
+            "Continue",
+        ]
+    else:
+        assert asyncio.run(_create_input_messages(request, [])) == [
+            {"role": "user", "content": "Remember APPLE"},
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": "Continue"},
+        ]
+
+
 def test_reasoning_summary_and_empty_reasoning_can_be_replayed() -> None:
     assert _response_output_item_to_chat_completion_message(
         {
