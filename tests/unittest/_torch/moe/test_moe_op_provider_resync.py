@@ -43,6 +43,10 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+# The l0_cpu stage runs pytest with ``-m cpu_only`` and its conftest drops any
+# test file that lacks this marker, so without it these tests never run in CI.
+pytestmark = pytest.mark.cpu_only
+
 
 class _RecordingOpBackendFactory:
     """Stand-in for ``get_op_backend``.
