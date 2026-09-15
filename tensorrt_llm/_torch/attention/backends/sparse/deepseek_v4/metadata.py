@@ -14,6 +14,7 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
+from .cache_manager import DeepseekV4CacheManager
 from .indexer import DeepseekV4Indexer
 from .params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
@@ -520,6 +521,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.request_ids,
             self.num_contexts,
         )
+        # MTP can use a separate DeepSeek-V4 draft KV cache manager; prepare
+        # its sliding-window tables before the base path copies draft block
+        # offsets. Plain draft managers do not own DeepSeek-V4 sparse tables.
+        draft_kv_cache_manager = self.draft_kv_cache_manager
+        if isinstance(draft_kv_cache_manager, DeepseekV4CacheManager):
+            draft_kv_cache_manager.compute_sliding_block_tables(
+                self.request_ids,
+                self.num_contexts,
+            )
 
         # Prepare the draft manager's tables before the generic prepare copies
         # its block offsets, and populate the dedicated DSv4 draft sparse table.
