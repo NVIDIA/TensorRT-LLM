@@ -4497,10 +4497,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             f"Question: what was the code word? Answer in one word."
             for n in needles
         ]
-        # Long generation so each suspend/resume round trip spans many decode
-        # steps and the suspended requests are held across a long active run of
-        # the request that owns the pool
-        sampling = SamplingParams(max_tokens=128, temperature=0.0)
+        # Keep every request resident for the full decode length. An early EOS
+        # can release enough pages to avoid the suspend/resume path. GPT-OSS
+        # has multiple EOS IDs, so min_tokens alone does not prevent early stops.
+        sampling = SamplingParams(max_tokens=128,
+                                  ignore_eos=True,
+                                  temperature=0.0)
 
         def _drain_stats() -> tuple[int, int, int, int, int]:
             # Single drain: llm.get_stats() consumes the per-iteration records,
@@ -4566,11 +4568,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             # Checked against the *measured* pool, never against max_tokens --
             # the manager inflates that knob by 1 / max_util_for_resume, so a
             # config-derived bound is wrong by ~1.43x (see the sizing note on
-            # kv_cache_config). Under VSWA the pool holds far more tokens per
-            # byte than a full-attention model, so it takes twelve requests to
-            # overflow it: observed on B200 at concurrent_peak ~4764 vs
-            # pool_tokens ~3328, a ~1.4x margin that reliably suspends/resumes a
-            # couple of in-flight requests. Failing here means the workload
+            # kv_cache_config). The allocated pool also depends on page-aligned
+            # window retention. Failing here means the workload
             # stopped being contended, NOT that the KV path broke.
             assert concurrent_peak > pool_tokens, (
                 f"workload precondition failed: the pool ({pool_tokens} tokens) "
@@ -4601,6 +4600,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
               f"common_prefix_tokens={prefixes}")
         for i in range(len(prompts)):
             print(f"[I-10 out {i}] needle={needles[i]} "
+                  f"ref_tokens={len(ref_ids[i])} con_tokens={len(con_ids[i])} "
                   f"ref_recall={needles[i] in ref_txt[i].upper()} "
                   f"con_recall={needles[i] in con_txt[i].upper()} "
                   f"ref={ref_txt[i]!r} con={con_txt[i]!r}")
@@ -4612,6 +4612,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         assert all(len(ids) > 0 for ids in con_ids), (
             "a request produced no tokens under suspend/resume contention "
             "(possible V2 scheduler deadlock or illegal-memory-access crash)")
+        assert all(len(ids) == sampling.max_tokens for ids in con_ids), (
+            "fixed-length contention workload ended early: "
+            f"expected {sampling.max_tokens} tokens per request, "
+            f"got {[len(ids) for ids in con_ids]}")
         # (2) The ACTIVE<->SUSPENDED state machine genuinely fired (not mere
         # queuing): an in-flight request was suspended under pressure and later
         # recovered. These per-iteration manager counters are the direct signal;
@@ -6379,11 +6383,16 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    check_acceptance_length: bool,
                    moe_expert_parallel_size: int = 1,
                    enable_attention_dp: bool = False,
-                   cover_guided_decoding: bool = False) -> LLM:
+                   cover_guided_decoding: bool = False,
+                   enable_block_reuse: bool = False) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
-                                        enable_block_reuse=False,
+                                        enable_block_reuse=enable_block_reuse,
                                         mamba_ssm_cache_dtype="bfloat16")
+        if enable_block_reuse:
+            # Attention pages alone cannot restore GDN or PLE state, so the
+            # runtime turns reuse back off without a snapshot policy.
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         cuda_graph_config = CudaGraphConfig(max_batch_size=self.MAX_BATCH_SIZE,
                                             enable_padding=True)
         mtp_config = (None if max_draft_len is None else MTPDecodingConfig(
@@ -6418,7 +6427,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    mocker,
                    moe_expert_parallel_size: int = 1,
                    enable_attention_dp: bool = False,
-                   cover_guided_decoding: bool = False) -> None:
+                   cover_guided_decoding: bool = False,
+                   enable_block_reuse: bool = False) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
@@ -6428,16 +6438,16 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             and tensor_parallel_size == 4 and moe_backend == "TRTLLM"
             and max_draft_len == 3 and moe_expert_parallel_size == 4
-            and enable_attention_dp)
-        with self._build_llm(
-                model_path,
-                tensor_parallel_size,
-                moe_backend,
-                max_draft_len,
-                check_acceptance_length,
-                moe_expert_parallel_size=moe_expert_parallel_size,
-                enable_attention_dp=enable_attention_dp,
-                cover_guided_decoding=cover_guided_decoding) as llm:
+            and enable_attention_dp and not enable_block_reuse)
+        with self._build_llm(model_path,
+                             tensor_parallel_size,
+                             moe_backend,
+                             max_draft_len,
+                             check_acceptance_length,
+                             moe_expert_parallel_size=moe_expert_parallel_size,
+                             enable_attention_dp=enable_attention_dp,
+                             cover_guided_decoding=cover_guided_decoding,
+                             enable_block_reuse=enable_block_reuse) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if cover_guided_decoding:
                 assert_guided_decoding_regex(llm)
@@ -6490,6 +6500,29 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         mocker=mocker,
                         moe_expert_parallel_size=4,
                         enable_attention_dp=True)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(82000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_fp8_adp4_mtp3_prefix_cache(self, monkeypatch: pytest.MonkeyPatch,
+                                        mocker) -> None:
+        """test_fp8_adp4_mtp3_trtllm_ple_offload with block reuse enabled.
+
+        A reused prefix restores the Gated DeltaNet and PLE state from a
+        recurrent-state snapshot instead of recomputing it, so accuracy holds
+        only if the snapshot carries every role in the recurrent page.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True,
+                        enable_block_reuse=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)

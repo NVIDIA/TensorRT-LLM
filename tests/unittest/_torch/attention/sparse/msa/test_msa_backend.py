@@ -403,10 +403,14 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
 
     pages, heads, page_size, head_dim = 5, 2, 128, 128
     outer_stride = heads * page_size * head_dim + 1
-    storage = torch.empty(
-        pages * outer_stride,
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
+    storage = (
+        torch.arange(
+            pages * outer_stride,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        .remainder(16)
+        .to(torch.float8_e4m3fn)
     )
     view = storage.as_strided(
         (pages, heads, page_size, head_dim),
@@ -417,7 +421,7 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
 
     assert prepared.is_contiguous()
     assert prepared.data_ptr() != view.data_ptr()
-    torch.testing.assert_close(prepared, view)
+    torch.testing.assert_close(prepared, view, rtol=0, atol=0)
 
 
 def test_per_token_valid_blocks_multi_token_decode():
