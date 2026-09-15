@@ -24,8 +24,9 @@ from unittest.mock import Mock
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
+import tensorrt_llm._torch.disaggregation.transceiver as python_transceiver_module
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation import diagnostics
+from tensorrt_llm._torch.disaggregation import diagnostics, kv_cache_transceiver
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
@@ -44,7 +45,9 @@ from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import MultimodalScheduler, SimpleScheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler, ScheduleAction
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -64,6 +67,158 @@ def _diagnostic_transceiver() -> KvCacheTransceiverV2:
     transceiver._instance_name = "diagnostic-test"
     transceiver._dp_rank = 2
     return transceiver
+
+
+@pytest.mark.parametrize("diagnostic_mode", ["disabled", "enabled", "failing"])
+@pytest.mark.parametrize(
+    ("configured_runtime", "pipelined", "expected_runtime"),
+    [
+        ("PYTHON", False, "PYTHON"),
+        ("CPP", False, "CPP"),
+        (None, False, "CPP"),
+        ("auto", False, "CPP"),
+        ("auto", True, "PYTHON"),
+    ],
+)
+def test_factory_reports_effective_diagnostic_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic_mode: str,
+    configured_runtime: str | None,
+    pipelined: bool,
+    expected_runtime: str,
+) -> None:
+    config = CacheTransceiverConfig(
+        backend="NIXL",
+        transceiver_runtime=configured_runtime,
+        enable_pipelined_transfer=pipelined,
+    )
+    transceiver = object()
+    constructors = {
+        "PYTHON": Mock(return_value=transceiver),
+        "CPP": Mock(return_value=transceiver),
+    }
+    monkeypatch.setattr(python_transceiver_module, "KvCacheTransceiverV2", constructors["PYTHON"])
+    monkeypatch.setattr(kv_cache_transceiver, "BindKvCacheTransceiver", constructors["CPP"])
+    monkeypatch.setattr(kv_cache_transceiver, "is_disagg_inflight_cancel_enabled", lambda: False)
+    monkeypatch.setattr(
+        diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", diagnostic_mode != "disabled"
+    )
+
+    def record_capabilities(*_args, **_kwargs) -> None:
+        constructors[expected_runtime].assert_called_once()
+        if diagnostic_mode == "failing":
+            raise RuntimeError("diagnostic emission failed")
+
+    emit_event = Mock(side_effect=record_capabilities)
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+
+    result = kv_cache_transceiver.create_kv_cache_transceiver(
+        SimpleNamespace(rank=4), Mock(), Mock(), Mock(), config
+    )
+
+    assert result is transceiver
+    constructors[expected_runtime].assert_called_once()
+    constructors["CPP" if expected_runtime == "PYTHON" else "PYTHON"].assert_not_called()
+    if diagnostic_mode == "disabled":
+        emit_event.assert_not_called()
+    else:
+        emit_event.assert_called_once_with(
+            "diagnostic_capabilities",
+            side="runtime",
+            request_id=None,
+            rank=4,
+            capability_schema_version=1,
+            transceiver_runtime=expected_runtime,
+            python_transfer_events=expected_runtime == "PYTHON",
+        )
+
+
+@pytest.mark.parametrize("runtime", ["PYTHON", "CPP"])
+def test_factory_does_not_report_capabilities_when_construction_fails(
+    monkeypatch: pytest.MonkeyPatch, runtime: str
+) -> None:
+    constructor = Mock(side_effect=RuntimeError("transceiver construction failed"))
+    monkeypatch.setattr(python_transceiver_module, "KvCacheTransceiverV2", constructor)
+    monkeypatch.setattr(kv_cache_transceiver, "BindKvCacheTransceiver", constructor)
+    monkeypatch.setattr(kv_cache_transceiver, "is_disagg_inflight_cancel_enabled", lambda: False)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+
+    with pytest.raises(RuntimeError, match="transceiver construction failed"):
+        kv_cache_transceiver.create_kv_cache_transceiver(
+            SimpleNamespace(rank=4),
+            Mock(),
+            Mock(),
+            Mock(),
+            CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime),
+        )
+
+    constructor.assert_called_once()
+    emit_event.assert_not_called()
+
+
+@pytest.mark.parametrize("diagnostic_mode", ["disabled", "enabled", "failing"])
+@pytest.mark.parametrize("scheduler_v2", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_executor_reports_scheduler_capabilities_independently_of_transceiver(
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic_mode: str,
+    scheduler_v2: bool,
+    wrapped: bool,
+) -> None:
+    scheduler = object.__new__(KVCacheV2Scheduler if scheduler_v2 else SimpleScheduler)
+    if wrapped:
+        wrapper = object.__new__(MultimodalScheduler)
+        wrapper.scheduler = scheduler
+        scheduler = wrapper
+    executor = object.__new__(PyExecutor)
+    executor.scheduler = scheduler
+    # Deliberately do not correlate scheduler V2 with the Python runtime.
+    executor.kv_cache_transceiver = SimpleNamespace(consumes_transfer_buffer=scheduler_v2)
+    executor.global_rank = 4
+    monkeypatch.setattr(
+        diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", diagnostic_mode != "disabled"
+    )
+    emit_event = Mock(
+        side_effect=RuntimeError("diagnostic emission failed")
+        if diagnostic_mode == "failing"
+        else None
+    )
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+
+    executor._emit_disagg_diagnostic_capabilities()
+
+    if diagnostic_mode == "disabled":
+        emit_event.assert_not_called()
+    else:
+        emit_event.assert_called_once_with(
+            "diagnostic_capabilities",
+            side="runtime",
+            request_id=None,
+            rank=4,
+            capability_schema_version=1,
+            executor_events=True,
+            scheduler_kv_admission_events=scheduler_v2,
+        )
+
+
+def test_capability_reporting_skips_disabled_transceiver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    emit_event = Mock()
+    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+
+    assert (
+        kv_cache_transceiver.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), None)
+        is None
+    )
+    executor._emit_disagg_diagnostic_capabilities()
+
+    emit_event.assert_not_called()
 
 
 def test_sender_reports_worker_dequeue_before_transfer_preparation(
