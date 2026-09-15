@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import tempfile
 import time
@@ -36,14 +37,16 @@ from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig, LlmArgs,
+                                          MTPDecodingConfig)
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
-                            get_accuracy_task)
+                            acceptance_length_from_iteration_stats,
+                            assert_acceptance_length, get_accuracy_task)
 
 
 class Result(GenerationResultBase):
@@ -62,7 +65,61 @@ class Result(GenerationResultBase):
         return self
 
 
-DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
+# ``serve_url`` is the disaggregated server's base URL. It defaults to None so
+# that callers building a DuckLLM by hand keep working; tests that need to
+# reach the workers (e.g. for iteration stats) read it off the harness.
+DuckLLM = namedtuple('DuckLLM',
+                     ['args', 'tokenizer', 'generate_async', 'serve_url'],
+                     defaults=(None, ))
+
+
+def pick_distinct_free_ports(count: int) -> List[int]:
+    """``count`` distinct free TCP ports, held open until all are chosen.
+
+    Binding every socket before closing any of them is what makes the ports
+    distinct; picking them one at a time can hand back the same port twice.
+    """
+    socks = []
+    try:
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("", 0))
+            socks.append(sock)
+        return [sock.getsockname()[1] for sock in socks]
+    finally:
+        for sock in socks:
+            sock.close()
+
+
+def compute_disagg_acceptance_length(serve_url: str) -> float:
+    """Acceptance length from the generation workers' iteration stats.
+
+    The disaggregated server does not proxy ``/metrics``, so the workers are
+    resolved through ``/cluster_info`` -- the only authoritative source for
+    their addresses, since the harness starts them with ``port=0`` -- and
+    polled directly. Only generation workers are asked: the drafter runs
+    during decode, so context workers report no speculative iterations.
+
+    Requires ``enable_iter_perf_stats`` on the generation workers, plus
+    ``iter_stats_max_iterations: -1`` so the server's stats buffer (default
+    1000 iterations) does not silently drop the earlier part of a long run.
+    """
+    info = requests.get(f"{serve_url}/cluster_info", timeout=10)
+    info.raise_for_status()
+    workers = info.json().get("current_workers", {})
+    gen_workers = workers.get("generation_servers", [])
+    assert gen_workers, f"No generation workers registered: {workers}"
+
+    stats = []
+    for worker in gen_workers:
+        # /metrics drains the buffer, so call it exactly once per worker,
+        # after the workload has finished.
+        response = requests.get(
+            f"http://{worker['host']}:{worker['port']}/metrics", timeout=60)
+        response.raise_for_status()
+        stats.extend(response.json())
+    return acceptance_length_from_iteration_stats(stats)
+
 
 # Timeout for the entire test
 DEFAULT_TEST_TIMEOUT = 3600
@@ -542,7 +599,8 @@ def launch_disaggregated_llm(
 
         tokenizer = load_hf_tokenizer(model_name)
         try:
-            yield DuckLLM(args, tokenizer, generate_async)
+            yield DuckLLM(args, tokenizer, generate_async,
+                          f"http://localhost:{serve_port}")
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
@@ -2051,6 +2109,124 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_blackwell
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(145000)
+@pytest.mark.skip_less_host_memory(98304)
+class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
+    """Block-FP8 Qwen3.8-Flash-Next over the Python NIXL transceiver."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8"
+
+    # Match the aggregate accuracy run: the chat template thinks by default,
+    # so cap the trace and ask for the bare answer to fit the output budget.
+    GSM8K_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        system_prompt=("Use at most three short reasoning sentences, then "
+                       "end with `#### NUMBER`. Do not restate the problem."),
+        chat_template_kwargs=dict(enable_thinking=True,
+                                  reasoning_effort="xhigh"),
+    )
+
+    @pytest.mark.parametrize(
+        "snapshot_policy", [None, "interval", "offsets"],
+        ids=["no_reuse", "prefix_cache", "prefix_cache_offsets"])
+    def test_fp8_nixl_python(self, mocker, snapshot_policy):
+        """Tensor/expert-parallel-2 context to attention-DP2 generation.
+
+        The handoff carries the QSA index state, the Gated DeltaNet state, and
+        the replicated PLE n-gram and convolution state alongside the KV pages.
+
+        The two sides shard recurrent state differently on purpose. The context
+        side splits Gated DeltaNet state across both ranks, while attention DP
+        leaves it unsharded on the generation side (MambaPolicy._mamba_tp
+        returns 1), so the transfer exercises the sharded-to-replicated path.
+        PLE state stays replicated on both sides throughout.
+
+        With block reuse the context worker restores part of its recurrent
+        state from a snapshot instead of computing it, so the transferred state
+        is only correct if the snapshot carries the PLE roles too. The two
+        reuse variants place snapshots differently: at a fixed token interval,
+        or at offsets measured from the prompt start and end.
+        """
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 8192,
+        }
+        kv_cache_config = {
+            "enable_block_reuse": snapshot_policy is not None,
+            "mamba_ssm_cache_dtype": "bfloat16",
+            "free_gpu_memory_fraction": 0.5,
+        }
+        # Attention pages alone cannot restore GDN or PLE state, so the runtime
+        # turns reuse back off unless a snapshot placement is configured.
+        if snapshot_policy == "interval":
+            kv_cache_config["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
+        elif snapshot_policy == "offsets":
+            kv_cache_config["mamba_state_config"] = {
+                "additional_snapshot_offsets_from_start": [256],
+                "additional_snapshot_offsets_from_end": [0],
+            }
+        common_config = {
+            "trust_remote_code": True,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "max_batch_size": 16,
+            "cache_transceiver_config": cache_transceiver_config,
+            "moe_config": {
+                "backend": "TRTLLM"
+            },
+            "kv_cache_config": kv_cache_config,
+        }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "enable_attention_dp": True,
+            "enable_lm_head_tp_in_adp": True,
+            "disable_overlap_scheduler": False,
+            "cuda_graph_config": {
+                "max_batch_size": 16,
+                "enable_padding": True,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                extra_env={"TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD": "1"},
+        ) as llm:
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME, ["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "zai-org/GLM-5.2"
@@ -2242,6 +2418,158 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                       server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
+
+
+@pytest.mark.timeout(14400)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
+    # Same target model as TestDeepSeekV4Flash above (identical architecture,
+    # 43 layers), so the accuracy reference is looked up under the plain
+    # V4-Flash entry. This checkpoint additionally ships the DSpark drafter
+    # weights for target layers 40-42, and has the routed experts cast
+    # MXFP4 -> NVFP4 (its own cast_mxfp4_to_nvfp4.log reports the cast as
+    # bit-lossless, so the score must not move relative to the native export).
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-nvfp4-DSpark"
+
+    @pytest.mark.skip_less_device(8)
+    def test_gsm8k_1p1d_dep4(self):
+        """Full GSM8K over 1 ctx + 1 gen on a single 8-GPU node.
+
+        Weights are ~165 GiB, i.e. ~42 GiB/rank at TP=4, so both the DEP4
+        context worker and the DEP4 generation worker fit in one 8x B200
+        (178 GiB/GPU) node with ~130 GiB/rank left for KV cache and the
+        DSpark drafter's activations.
+
+        DSpark runs on the generation worker only: the drafter proposes
+        tokens during decode, so on the context worker -- which only ever
+        prefills and hands the KV cache off -- it would load weights and
+        warm up for a phase that never runs.
+        """
+        model_path = self.MODEL_PATH
+        # V4 uses the pure-Python KVCacheManagerV2, so the transceiver has to
+        # be the Python one; NIXL (not DEFAULT) skips the
+        # TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        # The drafter runs between target steps and its hidden-state capture
+        # needs a whole-sequence prefill, hence no overlap scheduler and no
+        # chunked prefill on either worker -- the same pairing the aggregate
+        # TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm uses.
+        common_server_config = {
+            "attn_backend": "TRTLLM",
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            # MegaMoE CuTe DSL is the backend that serves the NVFP4 export.
+            "moe_config": {
+                "backend": "MEGAMOE_CUTEDSL"
+            },
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "enable_chunked_prefill": False,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        ctx_server_config = {**common_server_config}
+        gen_server_config = {
+            **common_server_config,
+            "cuda_graph_config": {
+                "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE
+            },
+            "speculative_config": {
+                "decoding_type": "DSpark",
+                "max_draft_len": 5,
+                "speculative_model": model_path,
+            },
+            # Acceptance length is read back off this worker's /metrics.
+            # Without return_perf_metrics the server never builds its tee
+            # buffer (openai_server.py gates it on the Prometheus collector),
+            # so /metrics drains the engine's iteration-stats queue directly
+            # and nothing is dropped. iter_stats_max_iterations is therefore
+            # inert here, and is set defensively: it becomes load-bearing the
+            # moment anything turns the collector on -- e.g.
+            # launch_disaggregated_llm(enable_perf=True) -- where the 1000
+            # default would silently drop the start of a full GSM8K run.
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        # MegaMoE CuTe DSL builds its EP ProcessGroup by reusing MASTER_ADDR
+        # / MASTER_PORT when both are set (mega_moe_cute_dsl.py
+        # _pick_rendezvous), and only falls back to picking a free port when
+        # they are not. Under a launcher that exports them -- Slurm in CI --
+        # the context and generation workers are two independent 4-rank jobs
+        # on one node that both inherit the *same* endpoint, so neither group
+        # ever forms: CI showed 68 failed bootstraps against a single
+        # host:port and the generation worker never registered. Hand each
+        # worker its own port so the two rendezvous cannot collide. The
+        # DeepGEMM sibling avoids this by requiring RANK/WORLD_SIZE to be set
+        # too before trusting the launcher's endpoint.
+        ctx_master_port, gen_master_port = pick_distinct_free_ports(2)
+
+        # Same long-init reason as TestDeepSeekV4Flash above, plus DSpark
+        # makes generation startup substantially slower than context startup.
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                model_path,
+                server_waiting_timeout=3600,
+                max_workers=64,
+                extra_env={"MASTER_PORT": str(ctx_master_port)},
+                gen_extra_env={"MASTER_PORT": str(gen_master_port)}) as llm:
+            # launch_disaggregated_llm builds a bare LlmArgs for the DuckLLM,
+            # so the specs behind the accuracy reference lookup have to be
+            # filled in to match the registered entry. MIXED_PRECISION is what
+            # the checkpoint's hf_quant_config declares: NVFP4 routed experts,
+            # attention / shared experts / head left alone.
+            llm.args.quant_config.quant_algo = "MIXED_PRECISION"
+            llm.args.speculative_config = DSparkDecodingConfig(
+                max_draft_len=5,
+                speculative_model=model_path,
+            )
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"], timeout=7200)
+
+            # Verified speculative decoding is lossless, so the score above
+            # cannot see a degraded drafter -- one that proposes garbage is
+            # rejected every step and only costs speed. Gate on acceptance
+            # length too, or this test covers everything except the feature
+            # it exists to exercise.
+            #
+            # The baseline in references/acceptance_length.yaml is the mean of
+            # 4 runs of this exact configuration (4.024/4.075/4.084/4.112).
+            # Across 13 runs total -- also spanning max_batch_size 64 and an
+            # FP8 KV variant -- AL stayed within 4.019-4.112 (sd 0.032), so
+            # min_al 3.8701 sits ~6 sd below the mean and 3.8% below the
+            # lowest value ever observed. Recorded here because
+            # acceptance_length.yaml cannot hold comments: the
+            # TRTLLM_POPULATE_ACCEPTANCE_LENGTH path rewrites it through
+            # yaml.safe_dump, which drops them.
+            acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
+            print(f"[AL] test_gsm8k_1p1d_dep4 "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4",
+                acceptance_length)
 
 
 @pytest.mark.timeout(14400)
