@@ -636,6 +636,8 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group(
     def emit_event(event: str, **kwargs) -> None:
         if event == "gen_request_data_sent":
             rank = kwargs["peer_rank"]
+            assert kwargs["writer_cohort_known"] is False
+            assert kwargs["expected_writers"] == 2
             assert kwargs["timestamp"] == publication_timestamps[rank]
             assert kwargs["timestamp"][0] < fast_response_timestamps[rank][0]
             publication_order.append(("emit", rank))
@@ -801,6 +803,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     assert request_data_events[0].kwargs["request_id"] == rid
     assert request_data_events[0].kwargs["peer_rank"] == 0
     assert request_data_events[0].kwargs["ownership_enabled"] is True
+    assert request_data_events[0].kwargs["writer_cohort_known"] is True
     if not writer_settles_before_failure:
         assert bounce.context is not None
         assert bounce.release_count == 0

@@ -2927,6 +2927,9 @@ class Receiver(ReceiverBase):
                             slice_id=receiver_req.slice_id,
                             peer_rank=rank,
                             expected_writers=task.expected_transfers,
+                            writer_cohort_known=(
+                                sender_dp_rank is not None or peer_infos.dp_size == 1
+                            ),
                             ownership_enabled=False,
                             timestamp=send_timestamp,
                         )
@@ -2996,6 +2999,9 @@ class Receiver(ReceiverBase):
                             slice_id=receiver_req.slice_id,
                             peer_rank=rank,
                             expected_writers=task.expected_transfers,
+                            writer_cohort_known=(
+                                sender_dp_rank is not None or peer_infos.dp_size == 1
+                            ),
                             ownership_enabled=True,
                             timestamp=send_timestamp,
                         )
