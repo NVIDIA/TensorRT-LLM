@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )
+from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import fmha as cute_dsl_fmha
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     CuTeDSLAttention,
@@ -393,6 +394,9 @@ class TestVisualGenSkipSoftmaxTimestepCutoff:
             (0.6, 0),
             (0.59, 1),
             (None, None),
+            # Per-token timesteps stay dense until every live token is below the cutoff.
+            (torch.tensor([0.0, 0.8]), 0),
+            (torch.tensor([0.0, 0.2]), 1),
         ],
     )
     def test_graph_phase_tracks_disabled_until_timestep_boundary(
@@ -402,13 +406,7 @@ class TestVisualGenSkipSoftmaxTimestepCutoff:
     ):
         # CUDA graph keys need a stable sparse-attention phase so captured
         # graphs are not reused across disabled and enabled skip-softmax states.
-        assert (
-            SkipSoftmaxScheduler.get_graph_phase_for_timestep(
-                timestep,
-                disabled_until_timestep=0.6,
-            )
-            == expected
-        )
+        assert graph_phase_for_timestep(timestep, disabled_until_timestep=0.6) == expected
 
 
 class TestVisualGenSkipSoftmaxCuTeDSL:
@@ -491,7 +489,7 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         runner = _Runner()
         model.register_cuda_graph_extra_key_fns(runner)
 
-        phase_fn = runner.extra_key_fns["skip_softmax_phase"]
+        phase_fn = runner.extra_key_fns["sparse_attn_phase"]
         assert phase_fn(timestep=0.6) == 0
         assert phase_fn(timestep=0.59) == 1
 
@@ -631,3 +629,48 @@ class TestVisualGenSkipSoftmaxPipelineConfig:
             _expected_threshold(-20.0, 4.0, 0.5)
         )
         assert transformer_disabled_params is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph capture requires CUDA")
+def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep():
+    """The wrapper prepares the timestep during warmup so capture never reads the tensor."""
+    from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+
+    params = SkipSoftmaxParams(
+        scheduler=SkipSoftmaxScheduler(
+            threshold_scale_factor_prefill=5000.0, disabled_until_timestep=0.6
+        )
+    )
+    attention = TrtllmAttention(
+        layer_idx=0,
+        num_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        attention_metadata_state=create_attention_metadata_state(),
+        sparse_params=params,
+    )
+    batch_size, seq_len = 1, 256
+    q = torch.randn(batch_size, seq_len, 2, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    timestep = torch.tensor([0.8], device="cuda")
+
+    def forward():
+        return attention.forward(q, k, v, batch_size=batch_size, seq_len=seq_len, timestep=timestep)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            eager = forward()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured, eager)
