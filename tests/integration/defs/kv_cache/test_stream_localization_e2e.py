@@ -15,20 +15,22 @@
 
 """Integration tests for stream localization equivalence.
 
-Verifies that running inference with mock locality domain localization
-(TRT_LLM_MOCK_LOCALIZATION_SUPPORT=1) produces identical outputs
-to running without localization, using the LLM API end-to-end.
+Verifies that running inference with locality domains enabled produces
+identical outputs to running without them, using the LLM API end-to-end.
+
+Rubin only: locality domains need hardware that exposes two locality domains.
+``TRT_LLM_MOCK_LOCALIZATION_SUPPORT`` is deliberately not used here -- it only
+reaches the KV cache allocator, so the fork/join runtime would still fail.
 
 Model: Llama-3.2-1B (same as test_kv_cache_v2_scheduler.py).
 """
 
 import gc
-import os
 
 import pytest
 import torch
 
-from ..conftest import llm_models_root
+from ..conftest import llm_models_root, skip_no_rubin
 
 # Model: Llama-3.2-1B (same as TestKVCacheV2Llama)
 _MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
@@ -58,38 +60,29 @@ def _gc_cleanup():
 
 
 def _generate(model_path, prompts, *, localized: bool):
-    """Run generation with or without mock localization."""
+    """Run generation with or without locality domains."""
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams, SchedulerConfig
 
-    env_backup = os.environ.get("TRT_LLM_MOCK_LOCALIZATION_SUPPORT")
-    try:
-        localization_override = "1" if localized else "0"
-        os.environ["TRT_LLM_MOCK_LOCALIZATION_SUPPORT"] = localization_override
+    kv_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    scheduler_config = SchedulerConfig(capacity_scheduler_policy="MAX_UTILIZATION")
+    sampling = SamplingParams(temperature=0.0, max_tokens=32)
 
-        kv_config = KvCacheConfig(use_kv_cache_manager_v2=True)
-        scheduler_config = SchedulerConfig(capacity_scheduler_policy="MAX_UTILIZATION")
-        sampling = SamplingParams(temperature=0.0, max_tokens=32)
-
-        with LLM(
-            model_path,
-            kv_cache_config=kv_config,
-            scheduler_config=scheduler_config,
-            # Without this the localized arm runs ordinary mode and the
-            # comparison holds no matter what locality domains do.
-            enable_locality_domains=localized,
-            env_overrides={
-                "TRT_LLM_MOCK_LOCALIZATION_SUPPORT": localization_override,
-                # Locality domains are only implemented in the Python backend.
-                "TLLM_KV_CACHE_MANAGER_V2_BACKEND": "python",
-            },
-        ) as llm:
-            return llm.generate(prompts, sampling_params=sampling)
-    finally:
-        if env_backup is not None:
-            os.environ["TRT_LLM_MOCK_LOCALIZATION_SUPPORT"] = env_backup
-        elif "TRT_LLM_MOCK_LOCALIZATION_SUPPORT" in os.environ:
-            del os.environ["TRT_LLM_MOCK_LOCALIZATION_SUPPORT"]
+    with LLM(
+        model_path,
+        kv_cache_config=kv_config,
+        scheduler_config=scheduler_config,
+        # Without this the localized arm runs ordinary mode and the comparison
+        # holds no matter what locality domains do. The capability is probed
+        # from the device rather than mocked: the mock only reaches the KV cache
+        # allocator, so the fork/join runtime still requires real hardware.
+        enable_locality_domains=localized,
+        env_overrides={
+            # Locality domains are only implemented in the Python backend.
+            "TLLM_KV_CACHE_MANAGER_V2_BACKEND": "python",
+        },
+    ) as llm:
+        return llm.generate(prompts, sampling_params=sampling)
 
 
 def _assert_outputs_match(baseline, localized, prompts):
@@ -102,11 +95,12 @@ def _assert_outputs_match(baseline, localized, prompts):
         )
 
 
+@skip_no_rubin
 class TestStreamLocalizationEquivalence:
     """Verify that localized (split->forward->merge) matches single-batch forward.
 
     Uses the LLM API with Llama-3.2-1B to run the same prompts with and
-    without mock localization, comparing generated text at temperature=0.
+    without locality domains, comparing generated text at temperature=0.
     """
 
     def test_generation_only_equivalence(self):
