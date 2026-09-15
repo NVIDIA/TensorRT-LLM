@@ -1226,7 +1226,9 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert parser._buf == ""
         assert parser._in_tool_call is False
 
-    def test_streaming_zero_arg_tool(self, parser):
+    @pytest.mark.parametrize("chunked", [False, True],
+                             ids=["one_delta", "chunked"])
+    def test_streaming_zero_arg_tool(self, parser, chunked):
         """A call without parameter blocks streams "{}" as its arguments."""
         tools = [
             ChatCompletionToolsParam(
@@ -1241,19 +1243,44 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 ),
             )
         ]
-        text = ("<tool_call>\n"
-                "<function=get_time>\n"
-                "</function>\n"
-                "</tool_call>")
+        deltas = [
+            "<tool_call>\n", "<function=get_time>\n", "</function>\n",
+            "</tool_call>"
+        ]
+        if not chunked:
+            deltas = ["".join(deltas)]
 
-        result = parser.parse_streaming_increment(text, tools)
+        calls = [
+            call for delta in deltas
+            for call in parser.parse_streaming_increment(delta, tools).calls
+        ]
 
-        names = [c.name for c in result.calls if c.name]
+        names = [c.name for c in calls if c.name]
         assert names == ["get_time"]
-        params = "".join(c.parameters for c in result.calls)
+        params = "".join(c.parameters for c in calls)
         assert params == "{}", f"Expected '{{}}', got {params!r}"
         assert params == self.make_parser().detect_and_parse(
-            text, tools).calls[0].parameters
+            "".join(deltas), tools).calls[0].parameters
+
+    def test_streaming_closes_arguments_with_brace_in_value(
+            self, sample_tools, parser):
+        """The closing brace is appended regardless of the streamed text."""
+        deltas = [
+            "<tool_call>\n<function=get_weather>\n",
+            "<parameter=location>a}b</parameter>\n",
+            "</function>\n</tool_call>",
+        ]
+
+        calls = [
+            call
+            for delta in deltas for call in parser.parse_streaming_increment(
+                delta, sample_tools).calls
+        ]
+
+        params = "".join(c.parameters for c in calls)
+        assert json.loads(params) == {"location": "a}b"}
+        assert params == self.make_parser().detect_and_parse(
+            "".join(deltas), sample_tools).calls[0].parameters
 
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):

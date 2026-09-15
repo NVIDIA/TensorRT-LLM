@@ -153,25 +153,18 @@ class Qwen3CoderToolParser(BaseToolParser):
                 if self.tool_call_end_token in self._buf:
                     end_pos = self._buf.find(self.tool_call_end_token)
 
-                    # The streamed arguments always end as a complete JSON object.
+                    # Streamed fragments never carry the outer closing brace, so the
+                    # arguments are completed here: "{}" when nothing was streamed.
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                    if not current_streamed:
-                        closing = "{}"
-                    elif current_streamed.count("{") > current_streamed.count("}"):
-                        closing = "}"
-                    else:
-                        closing = ""
-                    if closing:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=closing,
-                            )
+                    closing = "}" if current_streamed else "{}"
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=closing,
                         )
-                        self.streamed_args_for_tool[self.current_tool_id] = (
-                            current_streamed + closing
-                        )
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = current_streamed + closing
 
                     # Complete the tool call
                     self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
