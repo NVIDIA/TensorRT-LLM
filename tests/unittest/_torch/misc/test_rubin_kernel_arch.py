@@ -27,16 +27,26 @@ import pytest
 
 import tensorrt_llm
 
-RUBIN_KERNEL_ROOT = Path(tensorrt_llm.__file__).parent / "_torch" / "cute_dsl_kernels" / "rubin"
+_PACKAGE_ROOT = Path(tensorrt_llm.__file__).parent
+
+# TRTLLM-14558 split cute_dsl_kernels/ apart by domain owner, so the Rubin
+# kernels now live in three trees. Scanning fewer than all three narrows this
+# guard without failing it, so every tree has to be listed here -- add a root
+# whenever a fourth one appears.
+RUBIN_KERNEL_ROOTS = (
+    _PACKAGE_ROOT / "_torch" / "kernels" / "rubin",
+    _PACKAGE_ROOT / "_torch" / "attention" / "kernels" / "rubin",
+    _PACKAGE_ROOT / "_torch" / "moe" / "kernels" / "rubin",
+)
 
 # The base (non-accelerated) name is what the TMEM allocator recognises for
 # Rubin, and matches how the Blackwell base class spells its own ("sm_100").
 EXPECTED_ARCH = "sm_107"
 
 
-def _iter_arch_assignments():
+def _iter_arch_assignments(root):
     """Yield (path, lineno, value) for every ``self.arch = "..."`` literal."""
-    for path in sorted(RUBIN_KERNEL_ROOT.rglob("*.py")):
+    for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):
@@ -54,16 +64,18 @@ def _iter_arch_assignments():
 
 
 def test_rubin_kernels_declare_a_supported_tmem_arch():
-    assignments = list(_iter_arch_assignments())
+    wrong = []
+    for root in RUBIN_KERNEL_ROOTS:
+        assignments = list(_iter_arch_assignments(root))
 
-    # Guard against a vacuous pass: if the scan finds nothing, the invariant is
-    # untested rather than satisfied.
-    assert assignments, (
-        f"no 'self.arch = ...' assignment found under {RUBIN_KERNEL_ROOT}; "
-        "the regression this test exists for could not be detected"
-    )
+        # Guard against a vacuous pass, per root rather than in aggregate: two of
+        # the three roots can stop matching while the third keeps the test green.
+        assert assignments, (
+            f"no 'self.arch = ...' assignment found under {root}; "
+            "the regression this test exists for could not be detected"
+        )
 
-    wrong = [(path, lineno, value) for path, lineno, value in assignments if value != EXPECTED_ARCH]
+        wrong += [(p, ln, v) for p, ln, v in assignments if v != EXPECTED_ARCH]
     assert not wrong, "Rubin kernels declare an arch the TMEM allocator rejects:\n" + "\n".join(
         f"  {path.name}:{lineno} sets {value!r}, expected {EXPECTED_ARCH!r}"
         for path, lineno, value in wrong

@@ -10,7 +10,7 @@ import cutlass.cute as cute
 import torch
 
 from ..._utils import get_sm_version
-from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
+from ..attention.kernels.blackwell.dspark_rmsnorm_rope import (
     DSparkRMSNormRoPECacheWriteKernel,
     DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,

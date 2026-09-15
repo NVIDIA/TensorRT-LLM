@@ -692,8 +692,8 @@ class CuteDslFusedMoE(MoEImplBase):
 
     # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
     # There are two of them and ``run_moe_nvfp4`` picks between them by SM:
-    #   cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
-    #   cute_dsl_kernels/rubin/moe/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
+    #   moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+    #   moe/kernels/rubin/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py
     # SiTU is enabled here only for the Blackwell path. The Rubin kernels
     # also expose SiTU, but their end-to-end integration is outside this
     # enablement; ``can_implement`` keeps that path gated by SM.

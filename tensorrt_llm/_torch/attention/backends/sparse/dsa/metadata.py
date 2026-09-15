@@ -427,7 +427,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if cr not in (1, 4):
             return
         try:
-            from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+            from tensorrt_llm._torch.kernels.blackwell.top_k import (
                 gvr_topk_decode_self_sampling_host as _ss_host,
             )
         except ImportError:

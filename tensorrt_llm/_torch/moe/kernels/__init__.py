@@ -12,15 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Attention-owned fused kernels.
+"""MoE-owned fused kernels.
 
-Kernels whose production consumers are all inside the attention stack: the
-attention module and backend layers beside this package, and the attention
-custom ops that wrap them. Submodules are keyed by architecture
-(``blackwell/``, ``rubin/``) and below that by kernel family, so a submodule
-may host several related operators rather than exactly one. Callers own the
-enablement checks and keep the unfused op chains as fallbacks.
+Kernels whose only production consumer is the MoE module layer beside this
+package. Each submodule hosts one operator; callers own the enablement
+checks and keep the unfused op chains as fallbacks.
 
-Nothing is re-exported from this file on purpose, for the same reason as the
-parent package: importing one kernel must not drag in the others.
+Nothing is re-exported from this file on purpose: importing one kernel must
+not drag in the others, several of which are arch-gated.
 """

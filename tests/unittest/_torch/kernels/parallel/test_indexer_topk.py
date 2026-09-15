@@ -20,10 +20,10 @@ from utils.util import getSMVersion, skip_pre_blackwell, skip_pre_hopper
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLTopKPrefillSingleCTARunner
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
     cute_dsl_radix_filter_topk_wrapper,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for indexer_topk tests", allow_module_level=True)
@@ -815,7 +815,7 @@ def test_filtered_topk_varlen_odd_k(top_k, dtype_name):
     """
     import cutlass
 
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
+    from tensorrt_llm._torch.kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
         run_topk_decode,
     )
 

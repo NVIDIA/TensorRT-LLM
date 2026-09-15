@@ -48,7 +48,7 @@ if getSMVersion() not in (100, 103):
         allow_module_level=True,
     )
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+from tensorrt_llm._torch.kernels.blackwell.top_k import (
     gvr_topk_decode_self_sampling_host as ss_host,
 )
 
@@ -1632,9 +1632,7 @@ def test_prefill_slab_over_gridy_limit():
 def test_prefill_engine_key_distinct_from_decode():
     """The prefill compile shares the DSv3.2 decode varlen tuple (next_n=1,
     cr_shift=0) but has a distinct prologue, so the compile keys must differ."""
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-        gvr_topk_decode_self_sampling as dev,
-    )
+    from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as dev
 
     tpl = (256, 8, 4, 256, 2, False, False, 1, 0, 1)
     a = dev.get_compiled(tpl, hint_free=True)
@@ -1663,9 +1661,7 @@ def test_prefill_guards():
 
 
 def test_prefill_warmup_idempotent_and_no_rejit():
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-        gvr_topk_decode_self_sampling as dev,
-    )
+    from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as dev
 
     k = 512
     ss_host.warmup_prefill(k, 32768)

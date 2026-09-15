@@ -29,10 +29,13 @@ import cutlass.cute as cute
 import torch
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.paged_mqa_logits import FP8MQALogitsKernel
+    from tensorrt_llm._torch.attention.kernels.blackwell.paged_mqa_logits import FP8MQALogitsKernel
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[4] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell.paged_mqa_logits import FP8MQALogitsKernel
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[4])
+    from tensorrt_llm._torch.attention.kernels.blackwell.paged_mqa_logits import FP8MQALogitsKernel
 
 
 # ---- Constants --------------------------------------------------------------

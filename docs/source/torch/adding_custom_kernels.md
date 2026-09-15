@@ -23,7 +23,7 @@ This guide focuses on source-level integration where the kernel ships as either:
 | Flavor | Source language | When it is built | Where it lives |
 | :---- | :---- | :---- | :---- |
 | CUDA C++ | `.cu` / `.h` | At wheel build time (CMake → `nvcc`) | [`cpp/tensorrt_llm/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels) |
-| [CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) (Python) | Python using `cutlass.cute` / `@cute.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) |
+| [CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) (Python) | Python using `cutlass.cute` / `@cute.kernel` | JIT, on first call (cached in-process) | Beside the owning module layer — [`attention/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/attention/kernels), [`moe/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/moe/kernels), [`visual_gen/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen/kernels) — or, when no single layer owns them, [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) |
 | [cuTile](https://docs.nvidia.com/cuda/cutile-python/) (Python) | Python using `cuda.tile` / `@ct.kernel` | JIT, on first call (cached in-process) | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) (`rms_norm.py`, `rms_norm_fuse_residual.py`) |
 
 ---
@@ -166,15 +166,15 @@ CuTe DSL and cuTile kernels are written in Python and JIT-compiled at runtime. T
 
 | Flavor | Directory | Availability flag |
 | :---- | :---- | :---- |
-| CuTe DSL | [`tensorrt_llm/_torch/cute_dsl_kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/cute_dsl_kernels) (Blackwell variants under `blackwell/`) | `IS_CUTLASS_DSL_AVAILABLE` in [`cute_dsl_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_utils.py) |
+| CuTe DSL | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) plus the domain-owned [`attention/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/attention/kernels), [`moe/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/moe/kernels) and [`visual_gen/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen/kernels) (architecture variants under `blackwell/` and `rubin/`) | `IS_CUTLASS_DSL_AVAILABLE` in [`cute_dsl_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_utils.py) |
 | cuTile | [`tensorrt_llm/_torch/kernels/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/kernels) | `IS_CUDA_TILE_AVAILABLE` in [`cuda_tile_utils.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cuda_tile_utils.py) |
 
 ### 4.2 Kernel skeleton
 
-**CuTe DSL.** The kernel is a class (or a free function) decorated with `@cute.jit` for host code and `@cute.kernel` for the device entry point. Compilation is cached by the call site and reused across launches. See [`cute_dsl_kernels/argmax.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/argmax.py) for a self-contained reduction example, and [`cute_dsl_kernels/blackwell/dense_gemm_persistent.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_gemm_persistent.py) for a GEMM with TMA + persistent scheduling.
+**CuTe DSL.** The kernel is a class (or a free function) decorated with `@cute.jit` for host code and `@cute.kernel` for the device entry point. Compilation is cached by the call site and reused across launches. See [`kernels/argmax.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/argmax.py) for a self-contained reduction example, and [`kernels/blackwell/dense_gemm_persistent.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/kernels/blackwell/dense_gemm_persistent.py) for a GEMM with TMA + persistent scheduling.
 
 ```py
-# tensorrt_llm/_torch/cute_dsl_kernels/my_kernel.py
+# tensorrt_llm/_torch/kernels/my_kernel.py
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -254,7 +254,7 @@ The same pattern (`@torch.library.custom_op("trtllm::...")`, `register_fake`, co
 
 ### 4.4 Runtime caveats
 
-- **Compute capability checks.** Kernels under `cute_dsl_kernels/blackwell/` assume sm_100+. The cuTile kernels under `tensorrt_llm/_torch/kernels/` do too. Always probe with `tensorrt_llm._utils.get_sm_version()` (see `_should_use_torch_fallback` in `argmax.py`) and route to a fallback otherwise.  
+- **Compute capability checks.** CuTe DSL kernels under a `kernels/blackwell/` package assume sm_100+, and those under a `kernels/rubin/` package assume sm_107+. The cuTile kernels under `tensorrt_llm/_torch/kernels/` assume sm_100+ too. Always probe with `tensorrt_llm._utils.get_sm_version()` (see `_should_use_torch_fallback` in `argmax.py`) and route to a fallback otherwise.  
 - **DLPack/CUDA Graphs.** When exporting tensors via DLPack, use the stream override that mimics the `CUDAGraphCompatibleWrapper` in `argmax.py` so the capture replays cleanly.  
 - **JIT compile cache.** Always cache compiled kernels by the keys that affect codegen (dtype, last-dim size, hardware variant). `argmax.py` and the `cute_dsl_custom_ops.py` runners are good references.
 
