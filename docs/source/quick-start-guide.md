@@ -99,7 +99,7 @@ Here is a simple example to show how to use the LLM API with TinyLlama.
 ```
 
 You can also directly load pre-quantized models [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
-To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
+To learn more about the LLM API, check out the [](llm-api/index) and [LLM API examples](source:examples/llm-api/README.md).
 
 
 ## Run Offline Inference with VisualGen API
@@ -124,7 +124,7 @@ To continue your journey with TensorRT LLM, explore these resources:
 
 - **[Installation Guide](installation/index.rst)** - Detailed installation instructions for different platforms
 - **[Model-Specific Deployment Guides](deployment-guide/index.rst)** - Instructions for serving specific models with TensorRT LLM
-- **[Deployment Guide](examples/llm_api_examples)** - Comprehensive examples for deploying LLM inference in various scenarios
+- **[LLM API Examples](source:examples/llm-api/README.md)** - Comprehensive examples for deploying LLM inference in various scenarios
 - **[Model Support](models/supported-models.md)** - Check which models are supported and how to add new ones
 - **CLI Reference** - Explore TensorRT LLM command-line tools:
   - [`trtllm-serve`](commands/trtllm-serve/trtllm-serve.rst) - Deploy models for online serving
