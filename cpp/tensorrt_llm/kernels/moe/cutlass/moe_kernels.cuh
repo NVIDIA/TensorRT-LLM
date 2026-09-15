@@ -33,6 +33,7 @@ struct IdentityAdaptor
     float alpha = 1.0f;
     float beta = 0.0f;
     float limit = std::numeric_limits<float>::infinity();
+    bool clampAfterSilu = false;
 
     template <class T>
     __device__ T operator()(T const& x) const
@@ -49,6 +50,7 @@ struct GLUAdaptor
     float alpha = 1.0f;
     float beta = 0.0f;
     float limit = std::numeric_limits<float>::infinity();
+    bool clampAfterSilu = false;
 
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
@@ -64,12 +66,18 @@ struct SwigluBiasAdaptor
     float alpha = 1.0f;
     float beta = 0.0f;
     float limit = std::numeric_limits<float>::infinity();
+    bool clampAfterSilu = false;
 
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
     {
         cutlass::epilogue::thread::Sigmoid<T> fn{};
         T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
+        if (clampAfterSilu)
+        {
+            T gate_activated = gate * fn(gate * alpha);
+            return cutlass::minimum<T>{}(gate_activated, limit) * (linear_clamped + beta);
+        }
         T gate_clamped = cutlass::minimum<T>{}(gate, limit);
         return gate_clamped * fn(gate_clamped * alpha) * (linear_clamped + beta);
     }
@@ -81,6 +89,7 @@ struct SiTuAdaptor
     float alpha = 1.0f;
     float beta = 1.0f;
     float limit = std::numeric_limits<float>::infinity();
+    bool clampAfterSilu = false;
 
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const

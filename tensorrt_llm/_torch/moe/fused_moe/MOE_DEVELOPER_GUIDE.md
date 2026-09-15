@@ -591,7 +591,9 @@ activation. Three types in `activation.py` carry that instead.
 | Adapter | `install_activation_params` → `materialize_activation_params` | Not the backend: the `apply_moe_impl_construction_state()` every execution unit already calls installs the slots, and `ConfigurableMoE` re-installs after the EPLB sync and inside `create_weights`. A complete layer that owns kernels directly (`TritonFusedMoE`, `VanillaMoE`) calls it itself — `MoE.__init__` deliberately does not, because a wrapper's declaration is the backend's |
 
 The carrier names constants **semantically**, per kind; only the declaration and
-the adapter speak the ABI. `SwigluActivation` has just `clamp`;
+the adapter speak the ABI. `SwigluActivation` has `clamp` and the
+`clamp_after_silu` mode (false by default, preserving the historical
+pre-activation clamp);
 `SwigluBiasActivation` has `gate_sigmoid_scale` / `linear_offset` / `clamp`;
 `SiTuActivation` has `gate_softcap` / `linear_softcap` and no clamp at all;
 `SimpleActivation(kind)` covers the kinds that take no constants. `constants()`
@@ -607,8 +609,9 @@ the kind, which is exactly the lookup this split removes.
 backends quietly narrow an accepted kind to SwiGLU or SiLU, and those kinds must
 stay out of the declaration.
 
-The adapter assigns exactly three slots — `act_alpha`, `act_beta`, `act_clamp` —
-and those are the only names a forward path or a quantization method reads. The
+The adapter assigns the three constant slots — `act_alpha`, `act_beta`,
+`act_clamp` — plus the scalar `act_clamp_after_silu` mode, and those are the
+only names a forward path or a quantization method reads. The
 op schemas keep their historical spelling, so a backend passes
 `torch.ops.trtllm.fused_moe(swiglu_alpha=self.act_alpha, ...)`; only the Python
 plumbing was renamed. The slots' *types* come from the backend's declaration,

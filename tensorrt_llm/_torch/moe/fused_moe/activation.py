@@ -146,14 +146,22 @@ class ActivationConstants:
 
 @dataclass(frozen=True, eq=False)
 class SwigluActivation:
-    """``silu(gate) * linear``, optionally clamped."""
+    """``silu(gate) * linear``, optionally clamped.
+
+    The historical mode clamps ``gate`` before SiLU. ``clamp_after_silu``
+    selects ``clamp(silu(gate))`` while leaving the linear-branch clamp in its
+    existing pre-multiply position.
+    """
 
     clamp: ActivationConstant | None = None
+    clamp_after_silu: bool = False
 
     kind: ClassVar[ActivationType] = ActivationType.Swiglu
 
     def __post_init__(self) -> None:
         _reject_non_positive_clamp(self.clamp)
+        if self.clamp_after_silu and self.clamp is None:
+            raise ValueError("clamp_after_silu requires a clamp value.")
 
     def constants(self) -> ActivationConstants:
         return ActivationConstants(limit=self.clamp)
@@ -325,12 +333,17 @@ class MaterializedActivation:
     One field per register, not one per ABI form: a clamp reaches its kernel
     either as a ``float*`` indexed by expert or as a value, but which one is
     already pinned by the backend's ``MoEActivationSupport``.
+
+    ``clamp_after_silu`` is a mode rather than a register value. It stays a
+    scalar and defaults to false so existing clamped SwiGLU users keep the
+    pre-SiLU order.
     """
 
     activation_type: ActivationType
     alpha: ActivationConstant | None = None
     beta: ActivationConstant | None = None
     clamp: ActivationConstant | None = None
+    clamp_after_silu: bool = False
 
 
 def materialize_activation_params(
@@ -396,6 +409,9 @@ def materialize_activation_params(
         alpha=alpha,
         beta=beta,
         clamp=limit,
+        clamp_after_silu=(
+            activation.clamp_after_silu if isinstance(activation, SwigluActivation) else False
+        ),
     )
 
 
@@ -426,7 +442,7 @@ def install_activation_params(
     """Assign the ``act_*`` slots ``module``'s kernels read, from ``module.activation``.
 
     The one place a layer or execution unit turns its declared activation into
-    the three attributes the forward paths and the quantization layer read. Runs
+    the attributes the forward paths and the quantization layer read. Runs
     at construction, and again once ``ConfigurableMoE`` has synced
     ``expert_size_per_partition`` -- the only thing that changes the per-expert
     length -- before any weight is created.
@@ -446,6 +462,7 @@ def install_activation_params(
     _write_activation_slot(module, "act_alpha", params.alpha)
     _write_activation_slot(module, "act_beta", params.beta)
     _write_activation_slot(module, "act_clamp", params.clamp)
+    _write_activation_slot(module, "act_clamp_after_silu", params.clamp_after_silu)
 
 
 def _write_activation_slot(

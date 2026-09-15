@@ -791,7 +791,10 @@ class Step3p7MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
-            activation=SwigluActivation(clamp=self._routed_swiglu_limit),
+            activation=SwigluActivation(
+                clamp=self._routed_swiglu_limit,
+                clamp_after_silu=self._routed_swiglu_limit is not None,
+            ),
         )
 
         if self._use_python_clamp:

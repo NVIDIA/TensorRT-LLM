@@ -400,6 +400,9 @@ class TestStep3p7Helpers(unittest.TestCase):
                     moe = Step3p7MoE(model_config, layer_idx=0, aux_stream_dict={})
 
                 routing_method = create_moe.call_args.kwargs["routing_method"]
+                activation = create_moe.call_args.kwargs["activation"]
+                self.assertEqual(activation.clamp, 1.0)
+                self.assertTrue(activation.clamp_after_silu)
                 moe.router_bias.router_bias.data.zero_()
                 moe.gate.return_value = torch.zeros(1, text_config.moe_num_experts)
                 moe._clamp_weights_loaded = True
