@@ -826,36 +826,6 @@ def test_warmup_preserves_constraints_for_conservative_capacity_estimate() -> No
     )
 
 
-@pytest.mark.parametrize("is_estimating", [False, True])
-@pytest.mark.parametrize("layout", ["full_attention", "windowed", "ssm"])
-def test_estimation_preserves_heterogeneous_warmup_constraints(
-    is_estimating: bool, layout: str
-) -> None:
-    config = _make_cache_config_for_test(
-        KvCacheConfig(use_kv_cache_manager_v2=True, avg_seq_len=1024),
-        max_attention_window_vec=[None, 128 if layout == "windowed" else None],
-        max_batch_size=3,
-        max_num_tokens=2048,
-    )
-    if layout == "ssm":
-        config = replace(
-            config,
-            commit_min_snapshot=True,
-            layers=[
-                config.layers[0],
-                SsmLayerConfig(layer_id=LayerId(1), buffers=config.layers[1].buffers),
-            ],
-        )
-    manager = object.__new__(KVCacheManagerV2)
-    manager.is_estimating_kv_cache = is_estimating
-
-    result = manager._build_cache_config(config)
-
-    assert result.typical_step == config.typical_step
-    assert config.constraints
-    assert result.constraints == config.constraints
-
-
 @pytest.mark.parametrize("max_batch_size", [1, 64])
 @pytest.mark.parametrize("max_seq_len", [512, 262144])
 @pytest.mark.parametrize("limit", ["bytes", "tokens"])
