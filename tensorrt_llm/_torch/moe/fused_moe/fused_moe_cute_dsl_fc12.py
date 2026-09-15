@@ -48,6 +48,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import AutoTuner
 from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from ...utils import ActivationType
+from .activation import ActivationParamShape, MoEActivationSupport
 from .fused_moe_cute_dsl import CuteDslFusedMoE, CuteDslFusedMoENvfp4Runner, NvFp4WeightView
 from .impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERejectReason
 from .interface import _reject
@@ -79,14 +81,25 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
     unchanged. uGPU is not enabled for this backend (benchmarks run without it).
     """
 
+    # The fused FC12 kernel has no activation selector: FC1 weights are the
+    # gate/up pair and the epilogue is SwiGLU (+ clamp). Narrow the parent's
+    # {Swiglu, Relu2} so the resolver turns Relu2 layers down instead of
+    # running them through the SwiGLU path.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu}),
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+        limit_when_absent=float("inf"),
+    )
+
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """FC12 fused CuteDSL: NVFP4 on Rubin (SM107) only.
 
         Pure gate -- reads only ``p`` and ``d`` (no ``get_sm_version()``, no
         import probes, no ``os.environ``); the frozen environment lives in
-        ``d.env``. Narrower than the parent (SM107 + NVFP4 only) because the FC12
-        fused kernel targets Rubin NVFP4; broaden when other shapes are ported.
+        ``d.env``. Narrower than the parent (SM107 + NVFP4 only, and fused
+        finalize required) because the FC12 fused kernel targets Rubin NVFP4;
+        broaden when other shapes are ported.
         """
         sm_version = d.env.sm
 
@@ -113,6 +126,16 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
                 f"CuteDslFc12FusedMoE targets Rubin (SM107), got SM{sm_version}",
+            )
+
+        # The fused FC12 kernel scatter-adds FC2 straight into moe_output;
+        # there is no unfused FC2 variant, so a deployment that disabled
+        # finalize fusion (moe_disable_finalize_fusion, or any LoRA) cannot
+        # be served. Mirrors the SM107 gate in CuteDslFusedMoE.can_implement.
+        if not d.fused_finalize_enabled:
+            return _reject(
+                MoERejectReason.FINALIZE_FUSION_REQUIRED,
+                "CuteDslFc12FusedMoE only has a fused-finalize FC2",
             )
 
         if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:

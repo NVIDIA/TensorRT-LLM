@@ -17180,10 +17180,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 torch_stream = torch.cuda.current_stream()
                 stream = cuda.CUstream(torch_stream.cuda_stream)
-                # Match this branch's idiom (inline HardwareInfo); fc12 is
-                # non-uGPU, so the uGPU-aware helper used upstream is not needed.
-                hardware_info = cutlass.utils.HardwareInfo()
-                max_active_clusters = hardware_info.get_max_active_clusters(
+                # Cached occupancy lookup (same helper as the other Rubin
+                # runners): avoids re-querying HardwareInfo on every forward
+                # and during CUDA-graph capture. FC12 never runs inside a
+                # locality-domain context, so this is the full-device value.
+                max_active_clusters = get_max_activate_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
                 # The fused kernel exposes only ``__call__`` (cute.Tensor args),
