@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import (
@@ -33,6 +33,7 @@ from tensorrt_llm._utils import (
     binding_to_torch_dtype,
     convert_to_torch_tensor,
     get_size_in_bytes,
+    is_device_integrated,
     mpi_rank,
     nvtx_range,
     prefer_pinned,
@@ -125,11 +126,15 @@ KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_partial_reused_blocks",
     "iter_missed_blocks",
 )
+
 KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
     field_name
     for field_name in KV_CACHE_ITERATION_STATS_DELTA_FIELDS
     if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS
 )
+
+# Shared by capacity estimation and growth, in addition to speculative tokens.
+BASE_GENERATION_TOKEN_COUNT = 1
 
 # The guard page is a permanent sequence that must never collide with any other
 # permanent sequence id. The CUDA-graph machinery reserves a whole window below
@@ -332,6 +337,7 @@ def _compute_auto_host_tier_quota(
     local_ranks: int,
     mem_available: float,
     memlock_limit: float,
+    shares_device_memory: bool = False,
 ) -> int:
     """Compute the auto-provisioned host cache tier quota for a single rank.
 
@@ -340,6 +346,12 @@ def _compute_auto_host_tier_quota(
     per-node available-memory budget shared with co-located ranks and by the
     pinnable-memory (RLIMIT_MEMLOCK) limit.
 
+    On an integrated GPU the device pool and the host tier are the same
+    physical memory, so ``mem_available`` counts bytes the device quota is
+    about to consume. Charging the device quota against the budget keeps the
+    two tiers from double-counting; when nothing is left the tier is dropped
+    rather than falling back to the device quota.
+
     Args:
         quota: Device (GPU) KV cache quota in bytes; must be positive.
         local_ranks: Number of ranks co-located on this physical node.
@@ -347,10 +359,16 @@ def _compute_auto_host_tier_quota(
             if unknown.
         memlock_limit: RLIMIT_MEMLOCK soft limit in bytes, or
             ``float("inf")`` if unlimited or unknown.
+        shares_device_memory: Whether host and device memory are one physical
+            pool (integrated GPU). Charges ``quota`` against ``mem_available``
+            and allows a zero result.
 
     Returns:
-        Host cache tier quota in bytes (always positive).
+        Host cache tier quota in bytes. Positive, except on integrated GPUs
+        with no headroom left, where 0 means "provision no host tier".
     """
+    if shares_device_memory and mem_available != float("inf"):
+        mem_available = max(0.0, mem_available - quota)
     candidates = [quota]
     if mem_available != float("inf"):
         candidates.append(int(mem_available / local_ranks * 0.5))
@@ -358,6 +376,19 @@ def _compute_auto_host_tier_quota(
         candidates.append(int(memlock_limit * 0.8))
     host_quota = min(candidates)
     if host_quota <= 0:
+        if shares_device_memory:
+            # Falling back to the device quota here would request 2x the
+            # device quota from a single physical pool and get the process
+            # OOM-killed.
+            logger.warning(
+                "KV cache manager v2 auto host tier sizing has no headroom "
+                "left on this integrated GPU after reserving the "
+                f"{quota / (1 << 30):.2f}GiB device quota; provisioning no "
+                "host tier. Lower kv_cache_config.max_tokens or "
+                "free_gpu_memory_fraction, or set an explicit "
+                "kv_cache_config.host_cache_size."
+            )
+            return 0
         logger.warning(
             f"KV cache manager v2 auto host tier sizing computed a "
             f"non-positive quota ({host_quota}); falling back to the "
@@ -418,7 +449,7 @@ def _estimate_swa_cache_size(
     *,
     context: bool,
     scratch: bool,
-    generation_capacity_headroom: Optional[int] = None,
+    generation_capacity_headroom: int = BASE_GENERATION_TOKEN_COUNT,
 ) -> tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
@@ -426,15 +457,12 @@ def _estimate_swa_cache_size(
     scratch_keys = set()
     for layer_size, window_size in zip(layer_sizes, attention_windows):
         if window_size is not None and window_size > 0:
-            if generation_capacity_headroom is None:
-                window_blocks = math.ceil(window_size / tokens_per_block)
-            else:
-                # Match DFlash's retained boundary page and capacity reserved
-                # ahead of committed history for the next draft step.
-                window_blocks = (
-                    math.ceil((window_size + generation_capacity_headroom - 1) / tokens_per_block)
-                    + 1
-                )
+            # Match AttnLifeCycle.get_stale_range(): the live interval contains
+            # window_size + generation_capacity_headroom - 1 tokens. Across all
+            # page offsets, that interval touches at most the count below.
+            window_blocks = (
+                math.ceil((window_size + generation_capacity_headroom - 2) / tokens_per_block) + 1
+            )
             window_tokens = window_blocks * tokens_per_block
             if not context:
                 size_per_request += window_tokens * layer_size
@@ -450,16 +478,58 @@ def _estimate_swa_cache_size(
     return size_per_token, size_per_request
 
 
-def _get_dflash_generation_kv_capacity_headroom(spec_config) -> Optional[int]:
-    """DFlash KV capacity reserved ahead of committed history."""
-    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-
-    if spec_config is None or spec_config.spec_dec_mode != SpeculativeDecodingMode.DFLASH:
-        return None
-
+def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, int]:
+    """Return draft-token reserve and total capacity headroom over history."""
     from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 
-    return get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step
+    if spec_config is None:
+        return 0, BASE_GENERATION_TOKEN_COUNT
+    reserve = spec_config.max_total_draft_tokens
+    if (
+        is_draft
+        and getattr(spec_config, "use_dynamic_tree", False)
+        and getattr(spec_config, "dynamic_tree_max_topK", 0) > 0
+    ):
+        draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
+        reserve = max(reserve, draft_loop_tokens)
+    dynamic_reserve = reserve - spec_config.max_total_draft_tokens
+    headroom = (
+        get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
+    )
+    return reserve, headroom
+
+
+def _estimate_cache_size_components(
+    layer_sizes: Sequence[int],
+    attention_windows: Sequence[int | None],
+    tokens_per_block: int,
+    *,
+    scratch: bool,
+    generation_capacity_headroom: int,
+) -> tuple[int, int, int]:
+    """Return context/generation bytes per token and generation bytes per request.
+
+    Static profiling and runtime quota conversion must charge the same SWA
+    retention pages and context scratch space. Resume-watermark normalization
+    is separate from these usable-capacity costs.
+    """
+    full_attn_size = _estimate_full_attn_size_per_token(layer_sizes, attention_windows)
+    context_swa_size, _ = _estimate_swa_cache_size(
+        layer_sizes, attention_windows, tokens_per_block, context=True, scratch=scratch
+    )
+    generation_swa_size, generation_swa_per_request = _estimate_swa_cache_size(
+        layer_sizes,
+        attention_windows,
+        tokens_per_block,
+        context=False,
+        scratch=False,
+        generation_capacity_headroom=generation_capacity_headroom,
+    )
+    return (
+        full_attn_size + context_swa_size,
+        full_attn_size + generation_swa_size,
+        generation_swa_per_request,
+    )
 
 
 def _get_single_swa_pool_slot_bytes(
@@ -519,6 +589,7 @@ def _get_static_cache_size_layer_components(
     *,
     max_seq_len: Optional[int] = None,
     kv_cache_config: Optional[KvCacheConfig] = None,
+    is_external_draft: bool = False,
 ) -> tuple[List[int], List[Optional[int]]]:
     config = model_config.pretrained_config
 
@@ -581,6 +652,17 @@ def _get_static_cache_size_layer_components(
         )
         attention_windows = [
             normalize_window_size(window_size) for window_size in local_window_pattern
+        ]
+    layer_types = getattr(config, "layer_types", None)
+    if not is_external_draft and isinstance(layer_types, (list, tuple)) and layer_types:
+        # Estimate native full-attention layers as growing with token capacity,
+        # even when a cache-window override bounds their runtime retention.
+        # Charging max_batch_size saturated windows would turn a capacity cap
+        # into a mandatory reservation. Native SWA and external draft windows
+        # retain their existing fixed costs; runtime window sizing is unchanged.
+        attention_windows = [
+            None if layer_types[layer_idx % len(layer_types)] == "full_attention" else window
+            for layer_idx, window in zip(local_layer_ids, attention_windows)
         ]
     return layer_sizes, attention_windows
 
@@ -1150,15 +1232,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self._supports_reuse_match_backoff:
             self.reuse_match_backoff = 0
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
-        self._kv_reserve_draft_tokens = self.max_total_draft_tokens
-        if (
-            self.is_draft
-            and spec_config is not None
-            and getattr(spec_config, "use_dynamic_tree", False)
-            and getattr(spec_config, "dynamic_tree_max_topK", 0) > 0
-        ):
-            draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
-            self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens, draft_loop_tokens)
+        self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
+            _get_generation_kv_capacity(spec_config, is_draft=self.is_draft)
+        )
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.enable_stats = enable_stats
@@ -1371,7 +1447,11 @@ class KVCacheManagerV2(BaseResourceManager):
             except (ValueError, OSError):
                 memlock_limit = float("inf")
             host_quota = _compute_auto_host_tier_quota(
-                quota, local_ranks, mem_available, memlock_limit
+                quota,
+                local_ranks,
+                mem_available,
+                memlock_limit,
+                shares_device_memory=is_device_integrated(),
             )
             logger.info(
                 f"KV cache manager v2 auto host tier sizing: "
@@ -1535,6 +1615,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
+        # Lazily built map of layer-group id -> sliding window size, restricted
+        # to groups that are actually windowed. Only used by the debug-level
+        # window-crossing log below.
+        self._windowed_layer_group_sizes: Optional[Dict[int, int]] = None
+
         # Tracks the draft length allocated by try_allocate_generation per
         # request.  Used by extend_capacity_for_tokens to compute the exact
         # padding delta instead of blindly extending, which would cause
@@ -1565,11 +1650,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len = int(max_num_tokens)
 
         # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
-        # Account for max single-sequence capacity = seq_len + extra KV tokens +
-        # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
-        max_seq_capacity = (
-            self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
-        )
+        # Include the same maximum generation lead used by allocation and sizing.
+        max_seq_capacity = self.max_seq_len + self._generation_kv_capacity_headroom
         self.max_blocks_per_seq = (
             max_seq_capacity + self._ledger_tokens_per_block - 1
         ) // self._ledger_tokens_per_block
@@ -2168,33 +2250,26 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_max_tokens_from_quota_impl(self, quota: int) -> float:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
-        full_attn_size_per_token = _estimate_full_attn_size_per_token(
-            layer_sizes, attention_windows
-        )
-        context_swa_size_per_token, _ = _estimate_swa_cache_size(
+        (
+            context_size_per_token,
+            generation_size_per_token,
+            generation_swa_size_per_request,
+        ) = _estimate_cache_size_components(
             layer_sizes,
             attention_windows,
             self.tokens_per_block,
-            context=True,
             scratch=self.enable_swa_scratch_reuse,
-        )
-        (
-            generation_swa_size_per_token,
-            generation_swa_size_per_request,
-        ) = _estimate_swa_cache_size(
-            layer_sizes, attention_windows, self.tokens_per_block, context=False, scratch=False
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
         )
         size_per_batch = self.max_batch_size * generation_swa_size_per_request
         if quota < size_per_batch:
             return 0
-        context_size_per_token = full_attn_size_per_token + context_swa_size_per_token
         context_limit_quota = self.max_num_tokens * context_size_per_token + size_per_batch
         if quota <= context_limit_quota:
             if context_size_per_token <= 0:
                 return float("inf")
             return (quota - size_per_batch) / context_size_per_token
 
-        generation_size_per_token = full_attn_size_per_token + generation_swa_size_per_token
         if generation_size_per_token <= 0:
             return float("inf")
         return self.max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
@@ -2211,34 +2286,24 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_quota_from_max_tokens_impl(self, max_tokens: int) -> int:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
-        full_attn_size_per_token = _estimate_full_attn_size_per_token(
-            layer_sizes, attention_windows
-        )
         (
-            context_swa_size_per_token,
-            _,
-        ) = _estimate_swa_cache_size(
+            context_size_per_token,
+            generation_size_per_token,
+            generation_swa_size_per_request,
+        ) = _estimate_cache_size_components(
             layer_sizes,
             attention_windows,
             self.tokens_per_block,
-            context=True,
             scratch=self.enable_swa_scratch_reuse,
-        )
-        (
-            generation_swa_size_per_token,
-            generation_swa_size_per_request,
-        ) = _estimate_swa_cache_size(
-            layer_sizes, attention_windows, self.tokens_per_block, context=False, scratch=False
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
         )
         context_tokens = min(max_tokens, self.max_num_tokens)
         generation_tokens = max_tokens - context_tokens
-        generation_quota = (
-            max_tokens * full_attn_size_per_token
-            + generation_tokens * generation_swa_size_per_token
+        return int(
+            context_tokens * context_size_per_token
+            + generation_tokens * generation_size_per_token
             + self.max_batch_size * generation_swa_size_per_request
         )
-        context_extra_quota = context_tokens * context_swa_size_per_token
-        return int(generation_quota + context_extra_quota)
 
     def _get_event_num_blocks_per_cache_level(
         self,
@@ -2252,6 +2317,68 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_event_layer_group_ids(self) -> List[int]:
         return [int(layer_group_id) for layer_group_id in range(len(self.impl.layer_grouping))]
+
+    def _get_windowed_layer_group_sizes(self) -> Dict[int, int]:
+        """Layer-group id -> window size, for groups whose window is smaller than max_seq_len.
+
+        Groups whose window equals max_seq_len are not windowed and are skipped.
+        """
+        if self._windowed_layer_group_sizes is None:
+            self._windowed_layer_group_sizes = {
+                group_id: window_size
+                for group_id, window_size in self._get_event_window_sizes_by_layer_group().items()
+                if 0 < window_size < self.max_seq_len
+            }
+        return self._windowed_layer_group_sizes
+
+    def _describe_page_indices(self, kv_cache: _KVCache, layer_group_id: int) -> str:
+        """Block ids backing a layer group, abbreviated to a count and a range."""
+        try:
+            # get_base_page_indices() pads to max_blocks_per_seq with BAD_PAGE_INDEX;
+            # only the first num_blocks entries belong to the sequence, and recycled
+            # (windowed) blocks within that range are BAD_PAGE_INDEX too.
+            indices = [
+                p
+                for p in kv_cache.get_base_page_indices(layer_group_id)[: kv_cache.num_blocks]
+                if p != BAD_PAGE_INDEX
+            ]
+        except Exception as exc:  # pragma: no cover - diagnostics must never break a run
+            return f"<unavailable: {exc}>"
+        if not indices:
+            return "num_blocks=0"
+        return f"num_blocks={len(indices)}, block_range=[{min(indices)}, {max(indices)}]"
+
+    def _log_window_crossing(
+        self,
+        req: LlmRequest,
+        kv_cache: _KVCache,
+        pre_capacity: int,
+        new_capacity: int,
+        phase: str,
+    ) -> None:
+        """Log once per sequence per windowed pool when KV capacity crosses the window.
+
+        The crossing (capacity <= window before, > window after) is where a
+        windowed pool starts recycling blocks, so it is the first suspect when
+        an attention kernel fails at a sequence length near the window.
+        Capacity grows monotonically within a request, so the condition below
+        fires at most once per request per pool without extra bookkeeping.
+
+        Debug level only, and the guard runs before any of the strings or the
+        page-index scan are built, so a default run does no additional work.
+        """
+        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+            return
+        for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
+            if not (pre_capacity <= window_size < new_capacity):
+                continue
+            logger.debug(
+                f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
+                f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "
+                f"capacity {pre_capacity} -> {new_capacity} tokens, "
+                f"tokens_per_block={self.tokens_per_block}, "
+                f"{self._describe_page_indices(kv_cache, layer_group_id)}"
+            )
 
     def _get_event_window_sizes_by_layer_group(
         self, attention_only: bool = False
@@ -2767,6 +2894,17 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
+    def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
+        """Resharding geometry for roles whose mapper kind needs it.
+
+        SECTIONED roles declare ``section_bytes``; INDEXED roles whose head
+        count is not derivable from the attention topology declare
+        ``bytes_per_head``. Attention K/V and replicated roles need none, so
+        the base manager declares nothing. The page-table builder copies the
+        layout onto the role's ``PoolView``.
+        """
+        return {}
+
     @property
     def blocks_in_primary_pool(self) -> int:
         """
@@ -3083,7 +3221,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Grows *current_capacity* by 1 + draft tokens.
         """
-        return current_capacity + 1 + self._generation_draft_slots(req)
+        return current_capacity + BASE_GENERATION_TOKEN_COUNT + self._generation_draft_slots(req)
 
     def _generation_draft_slots(self, req: LlmRequest) -> int:
         """Physical draft width reserved for one iteration. Dynamic-tree draft pools
@@ -3115,9 +3253,12 @@ class KVCacheManagerV2(BaseResourceManager):
         is_helix_req = self._has_cp_helix and not req.is_dummy_request
         if is_helix_req:
             self._set_helix_rank_fields(req)
-        if not kv_cache.resize(kv_cache.capacity + 1 + draft_slots):
+        pre_capacity = kv_cache.capacity
+        new_capacity = pre_capacity + 1 + draft_slots
+        if not kv_cache.resize(new_capacity):
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
+        self._log_window_crossing(req, kv_cache, pre_capacity, new_capacity, "generation")
         if is_helix_req:
             # Commit only on success so a same-pass retry recomputes the
             # same step instead of skipping one.
@@ -3365,10 +3506,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         success = kv_cache.resize(capacity)
         if not success:
+            logger.debug(
+                f"[KVCacheManagerV2] request {req.py_request_id} failed to resize KV cache "
+                f"from {pre_cap} to {capacity} tokens on the context path "
+                f"(context_current_position={req.context_current_position}, "
+                f"num_tokens={num_tokens})"
+            )
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
+        self._log_window_crossing(req, kv_cache, pre_cap, capacity, "context")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
@@ -3418,6 +3566,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.suspend()
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
+        self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
@@ -4764,6 +4913,11 @@ class KVCacheManagerV2(BaseResourceManager):
             num_layers=num_layers,
             max_seq_len=max_seq_len,
             kv_cache_config=kv_cache_config,
+            is_external_draft=(
+                is_draft
+                and spec_config is not None
+                and spec_config.spec_dec_mode.is_external_drafter()
+            ),
         )
         reuse_backoff_enabled = (
             kv_cache_config is not None
@@ -4780,37 +4934,40 @@ class KVCacheManagerV2(BaseResourceManager):
                 backoff,
                 max_seq_len,
             )
-        full_attn_size_per_token = _estimate_full_attn_size_per_token(
-            layer_sizes, attention_windows
+        _, generation_capacity_headroom = _get_generation_kv_capacity(
+            spec_config, is_draft=is_draft
         )
-        dflash_headroom = _get_dflash_generation_kv_capacity_headroom(spec_config)
-        is_dflash_draft = is_draft and dflash_headroom is not None
-        generation_capacity_headroom = dflash_headroom if is_dflash_draft else None
-        swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
+        (
+            context_size_per_token,
+            cache_size_per_token,
+            swa_size_per_request,
+        ) = _estimate_cache_size_components(
             layer_sizes,
             attention_windows,
             tokens_per_block,
-            context=False,
-            scratch=False,
+            scratch=(
+                kv_cache_config is not None
+                and kv_cache_config.enable_swa_scratch_reuse
+                and not is_draft
+            ),
             generation_capacity_headroom=generation_capacity_headroom,
         )
-        context_swa_size_per_token = 0
-        if is_dflash_draft:
-            context_swa_size_per_token, _ = _estimate_swa_cache_size(
-                layer_sizes,
-                attention_windows,
-                tokens_per_block,
-                context=True,
-                scratch=False,
-            )
+        # The affine slope covers all tokens; context additionally retains SWA
+        # pages for the current token batch beyond the generation windows.
         fixed_cost = (
-            swa_size_per_request * max_batch_size + context_swa_size_per_token * max_num_tokens
+            swa_size_per_request * max_batch_size
+            + (context_size_per_token - cache_size_per_token) * max_num_tokens
         )
-        cache_size_per_token = full_attn_size_per_token + swa_size_per_token
         bytes_per_slot = _get_single_swa_pool_slot_bytes(
             layer_sizes, attention_windows, tokens_per_block
         )
-        if is_dflash_draft and bytes_per_slot is not None:
+        if is_draft and fixed_cost > 0 and bytes_per_slot is not None:
+            # Without a config, all windows are full attention, so no SWA slot exists.
+            assert kv_cache_config is not None
+            # The affine intercept is the configured quota needed to preserve
+            # the fixed usable capacity at V2's resume watermark. Keep the
+            # allocator's page rounding inside the manager estimator rather
+            # than extending the generic CacheCost model with pool geometry.
             required_slots = math.ceil(fixed_cost / bytes_per_slot)
             resume_util = float(np.float32(kv_cache_config.max_util_for_resume))
             fixed_cost = math.ceil(required_slots / resume_util) * bytes_per_slot
