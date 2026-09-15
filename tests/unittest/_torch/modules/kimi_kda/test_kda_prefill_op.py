@@ -20,6 +20,7 @@ from tensorrt_llm._torch.modules.kimi_kda import (
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
     copy_kda_replay_conv_window,
     fused_kda_post_conv,
+    is_kda_optimized_supported,
 )
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn  # noqa: E402
 
@@ -30,16 +31,18 @@ HIDDEN_SIZE = 7168
 
 
 def _has_supported_gpu() -> bool:
-    # SM100/SM103 (Blackwell) and SM107 (Rubin) -- must track
-    # _kda_kernels.is_kda_optimized_supported(), which accepts all three.
+    # Defer to the predicate the runtime actually dispatches on rather than
+    # restating its capability set. It accepts SM100/SM103 only; SM107 takes
+    # the FLA fallback in KDAKernelDispatch, so admitting it here would run
+    # these parity assertions against the unoptimized path.
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability(0) in {(10, 0), (10, 3), (10, 7)}
+    return is_kda_optimized_supported()
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 is supported only on Blackwell SM100/SM103 or Rubin SM107",
+    reason="KDA optimized prefill kernels require Blackwell SM100/SM103",
 )
 
 

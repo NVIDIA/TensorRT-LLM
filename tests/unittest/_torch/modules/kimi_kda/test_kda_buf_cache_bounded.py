@@ -232,11 +232,14 @@ OP_N_SHAPES = 24
 
 
 def _has_kda_gpu() -> bool:
-    # Mirrors _kda_kernels.is_kda_optimized_supported(): SM100/SM103 Blackwell,
-    # SM107 Rubin.
+    # Defer to the predicate rather than mirroring it: it accepts SM100/SM103
+    # only, and on SM107 KDAKernelDispatch takes the FLA fallback, which does
+    # not exercise the bounded allocation path this test measures.
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability(0) in {(10, 0), (10, 3), (10, 7)}
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import is_kda_optimized_supported
+
+    return is_kda_optimized_supported()
 
 
 def _op_set_bytes(t: int) -> int:
@@ -268,31 +271,73 @@ def test_prefill_scratch_plateaus_over_distinct_token_counts(clean_caches):
     shows up as a leak.
     """
     fla = pytest.importorskip("fla")  # noqa: F841  (the mixer imports it)
+    from types import SimpleNamespace
+
+    from kimi_kda_test_utils import get_production_prefill_kernel_path
+
     from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
 
     mod = clean_caches
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
 
-    mixer = KimiKDALinearAttention(
+    # The mixer takes a config object and a layer index, and reads its shapes
+    # out of ``linear_attn_config`` -- same construction as
+    # test_kda_prefill_op.py::_make_kda.
+    cfg = SimpleNamespace(
         hidden_size=OP_HIDDEN_SIZE,
-        num_heads=OP_NUM_HEADS,
-        head_dim=OP_HEAD_DIM,
-        conv_kernel_size=OP_CONV_KERNEL_SIZE,
-        use_full_rank_gate=True,
-        gate_lower_bound=-5.0,
         rms_norm_eps=1e-5,
-        dtype=torch.bfloat16,
-    ).to("cuda")
-    assert mixer.prefill_kernel_path == "optimized", (
-        f"this test is meaningless on the {mixer.prefill_kernel_path} path"
+        linear_attn_config={
+            "num_heads": OP_NUM_HEADS,
+            "head_dim": OP_HEAD_DIM,
+            "short_conv_kernel_size": OP_CONV_KERNEL_SIZE,
+            "use_full_rank_gate": True,
+            "gate_lower_bound": -5.0,
+        },
     )
+    mixer = KimiKDALinearAttention(cfg, layer_idx=0).to("cuda")
+    with torch.no_grad():
+        mixer.dt_bias.zero_()
+    # Allocates the fused projection buffers. It has to happen here, before the
+    # baseline below, or it reads as a leak.
+    mixer.finalize_decode_weights()
+
+    prefill_path = get_production_prefill_kernel_path(mixer)
+    assert prefill_path == "optimized", f"this test is meaningless on the {prefill_path} path"
+
+    # Pool tensors are shape-independent, so allocate them once: only the
+    # per-T scratch should move the measurement.
+    batch = 1
+    projection_size = OP_NUM_HEADS * OP_HEAD_DIM
+    conv_pool = torch.zeros(
+        batch, 3 * projection_size, OP_CONV_KERNEL_SIZE - 1, dtype=torch.bfloat16, device=dev
+    )
+    ssm_pool = torch.zeros(
+        batch, OP_NUM_HEADS, OP_HEAD_DIM, OP_HEAD_DIM, dtype=torch.float32, device=dev
+    )
+    slot_indices = torch.arange(batch, device=dev, dtype=torch.long)
+    has_initial_states = torch.zeros(batch, device=dev, dtype=torch.bool)
 
     def run(total_t: int) -> None:
         cu = torch.tensor([0, total_t], dtype=torch.long, device=dev)
-        hidden = torch.randn(1, total_t, OP_HIDDEN_SIZE, dtype=torch.bfloat16, device=dev) * 0.05
-        out = mixer.forward_prefill(hidden, cu_seqlens=cu)
-        del out, hidden, cu
+        # forward_prefill takes packed 2-D tokens, not [B, T, H].
+        x2d = torch.randn(total_t, OP_HIDDEN_SIZE, dtype=torch.bfloat16, device=dev) * 0.05
+        metadata = SimpleNamespace(
+            use_initial_states=False,
+            has_initial_states=has_initial_states,
+            state_indices=slot_indices.to(torch.int32),
+            query_start_loc=cu.to(torch.int32),
+        )
+        out = mixer.forward_prefill(
+            x2d,
+            cu,
+            metadata,
+            batch,
+            conv_pool,
+            ssm_pool,
+            slot_indices,
+        )
+        del out, x2d, cu, metadata
 
     # Warm: JIT + compile caches + one buffer set, all before the baseline.
     for i in range(2):

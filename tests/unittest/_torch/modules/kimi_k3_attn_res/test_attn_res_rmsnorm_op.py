@@ -35,7 +35,7 @@ def _has_supported_gpu() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 attention-residual kernels require SM100/SM103",
+    reason="Kimi K3 attention-residual kernels require SM100/SM103/SM107",
 )
 
 
