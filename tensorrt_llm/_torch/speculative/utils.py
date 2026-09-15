@@ -14,9 +14,9 @@ from tensorrt_llm.logger import logger
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+from ..pyexecutor.config_utils import match_nemotron_h_layer_types
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
-from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
@@ -24,9 +24,8 @@ from .draft_target import (DraftTargetOneModelSpecMetadata,
 from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
                      Eagle3OneModelSpecMetadata, Eagle3OneModelWorker,
-                     Eagle3ResourceManager, Eagle3SpecMetadata, MTPEagleWorker)
+                     Eagle3ResourceManager, MTPEagleWorker)
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
-from .model_drafter import ModelDrafter
 from .mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
 from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
                                MTPEagleDynamicTreeWorker)
@@ -261,23 +260,30 @@ def _merge_mtp_fields_from_speculative_model(spec_config,
 
     for field in _MTP_STRUCTURE_FIELDS_FROM_DRAFT:
         if field in draft_cfg and draft_cfg[field] is not None:
+            value = draft_cfg[field]
+            if field == "mtp_layers_block_type":
+                # draft_cfg is the draft checkpoint's config.json, read raw, so
+                # it may use the transformers 5.13 spelling.
+                value = match_nemotron_h_layer_types(model_config, value)
             _set_pretrained_config_attr(
                 model_config,
                 field,
-                draft_cfg[field],
+                value,
                 required=(field != "mtp_block_configs"),
             )
 
     # HF NemotronHConfig: mtp_hybrid_override_pattern is a read-only property
-    # derived from mtp_layers_block_type. Convert the pattern when the draft
-    # checkpoint only provides the legacy string form.
+    # derived from mtp_layers_block_type. Expand the pattern when the draft
+    # checkpoint provides only the packed string form.
     if (draft_cfg.get("mtp_layers_block_type") is None
             and draft_cfg.get("mtp_hybrid_override_pattern") is not None):
         _set_pretrained_config_attr(
             model_config,
             "mtp_layers_block_type",
-            _pattern_to_mtp_layers_block_type(
-                draft_cfg["mtp_hybrid_override_pattern"]),
+            match_nemotron_h_layer_types(
+                model_config,
+                _pattern_to_mtp_layers_block_type(
+                    draft_cfg["mtp_hybrid_override_pattern"])),
         )
 
     if draft_nextn is not None:
@@ -402,41 +408,6 @@ def _build_spec_metadata(spec_config,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
-    if spec_config.spec_dec_mode.is_mtp_eagle():
-        return Eagle3SpecMetadata(
-            max_draft_len=spec_config.max_draft_len,
-            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
-            spec_dec_mode=spec_config.spec_dec_mode,
-            max_num_requests=max_num_requests,
-            num_layers=model_config.num_hidden_layers,
-            hidden_size=model_config.hidden_size,
-            max_num_tokens=max_num_tokens,
-            dtype=model_config.torch_dtype,
-            is_draft_model=is_draft_model,
-            eagle3_resource_manager=spec_resource_manager,
-            layers_to_capture=None,
-            is_mtp_eagle=True,
-        )
-    if spec_config.spec_dec_mode.is_eagle3():
-        effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)
-        return Eagle3SpecMetadata(
-            max_draft_len=spec_config.max_draft_len,
-            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
-            spec_dec_mode=spec_config.spec_dec_mode,
-            max_num_requests=max_num_requests,
-            num_layers=model_config.num_hidden_layers,
-            hidden_size=model_config.hidden_size,
-            max_num_tokens=max_num_tokens,
-            dtype=model_config.torch_dtype,
-            is_draft_model=is_draft_model,
-            eagle3_resource_manager=spec_resource_manager,
-            layers_to_capture=spec_config.eagle3_layers_to_capture,
-            is_mtp_eagle=False,
-            eagle_choices=spec_config.eagle_choices,
-            is_spec_dec_tree=spec_config.eagle_choices is not None
-            or effective_dynamic_tree,
-            is_spec_dec_dynamic_tree=effective_dynamic_tree,
-        )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -535,9 +506,8 @@ def _build_spec_metadata(spec_config,
             sa_manager=spec_resource_manager,
             max_matching_ngram_size=spec_config.max_matching_ngram_size,
         )
-    if  spec_config.spec_dec_mode.is_draft_target() or \
-        spec_config.spec_dec_mode.is_ngram() or \
-        spec_config.spec_dec_mode.is_user_provided():
+    if spec_config.spec_dec_mode.is_ngram(
+    ) or spec_config.spec_dec_mode.is_user_provided():
         return SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -633,16 +603,6 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_tokens,
             sa_manager=sa_manager,
         )
-    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
-        assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
-        return Eagle3ResourceManager(
-            spec_config,
-            draft_model_engine.model.config.torch_dtype,
-            model_config.hidden_size,
-            max_num_requests,
-            max_seq_len,
-            max_num_tokens,
-        )
     if spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesResourceManager(
             spec_config,
@@ -671,11 +631,6 @@ def get_spec_decoder(
     spec_config: "DecodingBaseConfig",
 ):
     spec_dec_mode = spec_config.spec_dec_mode
-    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
-        # Two-model path: the target model emits logits, so the general-purpose
-        # TorchSampler does the actual sampling (and folds in the d2t vocab
-        # mapping). One-model modes below sample inside the worker kernel.
-        return TorchSampler(sampler_args)
     if spec_dec_mode.use_one_engine():
         # One sampler for every one-model mode (use_one_engine covers MTP,
         # MTP Eagle, Eagle3, PARD/DFlash/DSpark, DraftTarget and SA): it only
@@ -688,8 +643,7 @@ def get_spec_decoder(
         # -- _forward_draft_loop is linear over runtime_draft_len, which for a
         # non-linear tree is max_total_draft_tokens -- so max_draft_len only
         # describes a tree depth that is never used, and acceptance is bounded
-        # by the wire width instead. Tree-aware acceptance only exists in the
-        # two-model TorchSampler path, which is deprecated alongside this.
+        # by the wire width instead.
         accepted_path_len = None
         if getattr(spec_config, "eagle_choices", None):
             accepted_path_len = sampler_args.max_total_draft_tokens + 1
@@ -719,19 +673,6 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_user_provided():
         return spec_config.drafter
-
-    max_num_requests = model_engine.batch_size
-    if spec_config.spec_dec_mode.is_draft_target(
-    ) or spec_config.spec_dec_mode.is_eagle3(
-    ) or spec_config.spec_dec_mode.is_mtp_eagle():
-        return ModelDrafter(spec_config,
-                            draft_model_engine,
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1,
-                            SeqSlotManager(max_num_requests),
-                            sampler,
-                            spec_resource_manager=spec_resource_manager,
-                            guided_decoder=guided_decoder)
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)

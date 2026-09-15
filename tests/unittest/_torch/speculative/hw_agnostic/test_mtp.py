@@ -1772,7 +1772,6 @@ def test_mtp_shared_kv_draft_inputs():
     spec_config = MTPDecodingConfig(
         max_draft_len=3,
         speculative_model="/tmp/assistant",
-        mtp_eagle_one_model=True,
     )
     spec_config._use_shared_kv_cache = True
     worker = MTPEagleWorker(spec_config)
@@ -1862,7 +1861,6 @@ def test_mtp_eagle_one_model_rejection():
     spec_config = MTPDecodingConfig(
         max_draft_len=1,
         use_mtp_vanilla=False,
-        mtp_eagle_one_model=True,
         speculative_model=model_dir,
         use_rejection_sampling=True,
     )

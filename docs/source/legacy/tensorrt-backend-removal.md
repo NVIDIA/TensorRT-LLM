@@ -40,7 +40,7 @@ There is no separate checkpoint-conversion or engine-build step.
 
 PyTorch usage lives with the [LLM API examples](../examples/index.rst) (for example
 `quickstart_advanced.py`, `quickstart_multimodal.py`) and the model-specific
-[deployment guides](../deployment-guide/). The per-model `convert_checkpoint.py` /
+[deployment guides](../deployment-guide/index.rst). The per-model `convert_checkpoint.py` /
 `trtllm-build` example directories have been removed.
 
 ## Retained reference docs

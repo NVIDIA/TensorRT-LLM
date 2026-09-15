@@ -502,7 +502,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens: torch.Tensor
         """Device tensor containing latest sampled tokens.
 
-        Shape: ``NEW_TOKENS_SHAPE`` -- (max_tokens, max_num_sequences, max_beam_width).
+        Shape: ``NEW_TOKENS_SHAPE`` -- (max_tokens, max_num_sequences + 1, max_beam_width);
+        the trailing row is ``dummy_slot_row`` scratch, not a sequence slot.
         """
         beam_search_store: "BeamSearchStore | None" = None
         """Holds data related to beam search."""
@@ -735,7 +736,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
         """Whether this batch belongs to the draft model.
 
-        Batches are homogeneous by construction: ModelDrafter builds all-draft
+        Batches are homogeneous by construction: a drafter builds all-draft
         batches for its sample_async/update_requests calls on this shared
         sampler, and PyExecutor's batches are all-target. The pending-steps
         accounting relies on this to skip draft batches wholesale; assert it so
@@ -1755,7 +1756,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateTorch:
         # NB: The sampler is either called directly by PyExecutor, for the target model,
-        #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
+        #     or by a drafter's prepare_draft_tokens(), for the draft model. In the former
         #     case there are 1 + get_draft_token_length(request) tokens per request. In the
         #     latter case, there is always only 1 token per request because draft
         #     tokens are sampled one-by-one.
