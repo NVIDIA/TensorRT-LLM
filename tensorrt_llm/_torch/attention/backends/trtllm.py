@@ -17,7 +17,8 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -1878,6 +1879,62 @@ def _build_locality_domain_slices(metadata: TrtllmAttentionMetadata,
     }
 
 
+def _locality_domain_attention_enabled(metadata, forward_args) -> bool:
+    """Whether this call should be split across locality domains.
+
+    Restricted to generation-only batches: context and mixed batches still need
+    the per-domain q/k/v gather that ``_locality_domain_cat_slices`` provides.
+    """
+    if forward_args.attention_input_type != AttentionInputType.generation_only:
+        return False
+    if forward_args.output is None or forward_args.output_sf is not None:
+        return False
+    kv_cache_manager = metadata.kv_cache_manager
+    if kv_cache_manager is None:
+        return False
+    if getattr(kv_cache_manager, "num_locality_domains", 1) <= 1:
+        return False
+    return metadata.locality_domain_gen_req_splits is not None
+
+
+@contextmanager
+def _locality_domain_metadata(metadata, ld_slice, locality_domain_id):
+    """Point the shared metadata at one locality domain's rows for the duration.
+
+    The FMHA backends read their per-request tensors off ``metadata`` rather than
+    taking them as arguments, so a per-domain call is expressed by swapping those
+    fields for the domain's slices and restoring them afterwards.
+    """
+    overrides = {
+        "kv_lens_cuda_runtime": ld_slice["sequence_lengths"],
+        "kv_lens_runtime": ld_slice["kv_lengths"],
+        "prompt_lens_cuda_runtime": ld_slice["prompt_lengths_cuda"],
+        "prompt_lens_cpu_runtime": ld_slice["prompt_lengths_cpu"],
+        "host_request_types_runtime": ld_slice["request_types"],
+        "host_total_kv_lens": ld_slice["host_total_kv_lengths"],
+        "kv_cache_block_offsets": ld_slice["block_offsets"],
+        # pool pointers/mapping are read-only and identical for every domain.
+        "num_contexts": ld_slice["num_ctx_reqs"],
+        "_num_ctx_tokens": ld_slice["num_ctx_tokens"],
+    }
+    # Each domain needs its own scratch: the streams run concurrently, so a
+    # shared workspace would be a data race. ``effective_workspace`` picks
+    # between these two by ``is_cuda_graph``, so override both.
+    for name, per_domain in (("workspace", metadata.locality_domain_workspaces),
+                             ("cuda_graph_workspace",
+                              metadata.locality_domain_cuda_graph_workspaces)):
+        if per_domain is not None and locality_domain_id < len(per_domain):
+            overrides[name] = per_domain[locality_domain_id]
+    saved = {k: getattr(metadata, k) for k in overrides}
+    try:
+        for name, value in overrides.items():
+            setattr(metadata, name, value)
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(metadata, name, value)
+
+
 def _locality_domain_cat_slices(t, ctx_token_start, ctx_token_end,
                                 gen_token_start, gen_token_end, num_ctx_tokens,
                                 num_gen_tokens):
@@ -2630,12 +2687,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
-        fmha = self._fmha_manager.select(self, q, k, v, metadata, forward_args)
+        for q_part, k_part, v_part, part_args in self._attention_partitions(
+                q, k, v, metadata, forward_args):
+            fmha = self._fmha_manager.select(self, q_part, k_part, v_part,
+                                             metadata, part_args)
 
-        if fmha is None:
-            raise RuntimeError(
-                "No TRT-LLM attention FMHA library supports this request.")
-        fmha.forward(q, k, v, metadata, forward_args)
+            if fmha is None:
+                raise RuntimeError(
+                    "No TRT-LLM attention FMHA library supports this request.")
+            fmha.forward(q_part, k_part, v_part, metadata, part_args)
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat
@@ -2648,6 +2708,63 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return forward_args.output
         else:
             return forward_args.output, forward_args.output_sf
+
+    def _attention_partitions(self, q, k, v, metadata, forward_args):
+        """Yield the (q, k, v, forward_args) partitions this call must dispatch.
+
+        Without locality domains this yields the batch once, unchanged. With them
+        it yields once per domain -- inputs sliced to that domain's rows, its own
+        workspace and MLA state in place, and its stream current -- so the caller
+        keeps a single dispatch site for both paths.
+        """
+        if not _locality_domain_attention_enabled(metadata, forward_args):
+            yield q, k, v, forward_args
+            return
+
+        num_locality_domains = metadata.kv_cache_manager.num_locality_domains
+        if metadata.locality_domain_runtime is None:
+            metadata.locality_domain_runtime = LocalityDomainRuntime(
+                num_partitions=num_locality_domains)
+        runtime = metadata.locality_domain_runtime
+        output = forward_args.output
+
+        runtime.fork()
+        try:
+            for locality_domain_id in range(num_locality_domains):
+                ld_slice = _build_locality_domain_slices(
+                    metadata,
+                    locality_domain_id,
+                    forward_args.attention_input_type,
+                    total_gen_tokens=q.shape[0])
+                if ld_slice is None:
+                    continue
+                start = ld_slice["gen_token_start"]
+                end = ld_slice["gen_token_end"]
+                if end <= start:
+                    continue
+                ld_overrides = dict(output=output[start:end],
+                                    locality_domain_id=locality_domain_id)
+                # MLA generation carries per-domain RoPE/scheduler state and its
+                # own latent_cache / q_pe rows; without these the kernel would
+                # read whole-batch tensors for a single domain's requests.
+                for name in ("latent_cache", "q_pe"):
+                    tensor = getattr(forward_args, name)
+                    if tensor is not None:
+                        ld_overrides[name] = tensor[start:end]
+                mla_state = metadata.locality_domain_mla_gen_state
+                if (mla_state is not None
+                        and locality_domain_id < len(mla_state)
+                        and mla_state[locality_domain_id] is not None):
+                    ld_overrides.update(mla_state[locality_domain_id])
+                ld_args = replace(forward_args, **ld_overrides)
+                with _locality_domain_metadata(metadata, ld_slice,
+                                               locality_domain_id):
+                    with runtime.partition_context(locality_domain_id):
+                        yield (q[start:end],
+                               None if k is None else k[start:end],
+                               None if v is None else v[start:end], ld_args)
+        finally:
+            runtime.join()
 
     @classmethod
     def support_fused_rope(cls) -> bool:
