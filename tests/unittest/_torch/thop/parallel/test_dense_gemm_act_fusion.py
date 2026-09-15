@@ -196,6 +196,51 @@ def test_mlp_nvfp4_gelu_gather_output_is_ineligible() -> None:
         assert mlp._nvfp4_gelu_fusion_eligibility() == (False, False)
 
 
+@pytest.mark.parametrize(
+    "sm_version,has_nvfp4,static_input,expected",
+    [
+        (100, True, True, True),
+        (103, True, True, True),
+        (90, True, True, False),
+        (100, False, True, False),
+        (100, True, False, False),
+    ],
+)
+def test_mlp_nvfp4_gelu_compiler_disabled_activation_eligibility(
+    sm_version: int,
+    has_nvfp4: bool,
+    static_input: bool,
+    expected: bool,
+) -> None:
+    """The guarded fallback fuses only eligible static NVFP4 projections."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modules.mlp import is_nvfp4_gemm_gelu_fusion_eligible
+    from tensorrt_llm._torch.utils import gelu_tanh
+
+    activation = torch.compiler.disable(gelu_tanh)
+    up_proj = SimpleNamespace(
+        gather_output=False,
+        has_nvfp4_activation_quantization=has_nvfp4,
+        force_dynamic_quantization=not static_input,
+        input_scale=torch.ones(1) if static_input else None,
+        pre_quant_scale=None,
+    )
+    with (
+        mock.patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=sm_version),
+        mock.patch.object(
+            torch.ops.trtllm,
+            "cute_dsl_nvfp4_dense_gemm_gelu_blackwell",
+            object(),
+            create=True,
+        ),
+    ):
+        assert is_nvfp4_gemm_gelu_fusion_eligible(up_proj, activation) is expected
+
+    assert getattr(activation, "_torchdynamo_disable", False)
+    assert activation.__wrapped__ is gelu_tanh
+
+
 def _quantize_nvfp4(x_bf16: torch.Tensor):
     """Quantize [., K] bf16 -> (fp4 packed, swizzled SF, global_sf scalar)."""
     global_sf = x_bf16.abs().max().float() / (FP8_E4M3_MAX * FP4_E2M1_MAX)
