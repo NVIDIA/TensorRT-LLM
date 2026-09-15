@@ -396,6 +396,10 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        if dtype == DataType.NVFP4 and kv_cache_type == CacheTypeCpp.SELFKONLY:
+            raise ValueError(
+                "NVFP4 SELFKONLY cache storage requires "
+                "Fp4MlaKVCacheManagerV2; KVCacheManager V1 is not supported.")
         # Consumed by the disaggregation page-table builder to expose the DSA
         # indexer K cache pool as a REPLICATED pool view.
         self.enable_indexer_k_cache = enable_indexer_k_cache
