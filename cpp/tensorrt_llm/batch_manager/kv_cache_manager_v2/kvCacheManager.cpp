@@ -227,31 +227,6 @@ int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, boo
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
-std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
-    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
-{
-    // Keep the matched block pointers under the same shared lock as the walk.
-    auto const apiLock = lockShared();
-    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
-    int const blockSize = tokensPerBlock();
-    int const blockIndex = match.numTokens / blockSize;
-    size_t const begin = static_cast<size_t>(blockIndex) * static_cast<size_t>(blockSize);
-    if (begin + static_cast<size_t>(blockSize) > inputTokens.size())
-    {
-        return std::nullopt;
-    }
-
-    // A partial match may end inside a different block. Only the preceding
-    // complete block has the query's exact hash; append the query's next block
-    // to that key instead of hashing and marshalling the entire prefix again.
-    BlockKey const previousKey
-        = blockIndex == 0 ? Hasher(reuseScope).digest() : match.blocks[BlockOrdinal{blockIndex - 1}]->key;
-    Hasher hasher;
-    hasher.update(previousKey);
-    hasher.update(inputTokens.begin() + begin, static_cast<size_t>(blockSize), knownNoDigest);
-    return hasher.digest();
-}
-
 // ---- Memory pool queries --------------------------------------------------
 
 MemAddress KvCacheManager::getMemPoolBaseAddress(

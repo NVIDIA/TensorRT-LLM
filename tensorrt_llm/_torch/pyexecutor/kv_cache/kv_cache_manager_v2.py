@@ -5663,7 +5663,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # excluded, so there is nothing to look up and nothing to contribute.
             return None
         scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
-        return self.impl.probe_first_new_block_key(scope, tokens)
+        num_reusable = self.impl.probe_reuse(scope, tokens)
+        return _first_new_block_key(tokens, self.tokens_per_block, scope, num_reusable)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
         """Prefetch radix-tree blocks from disk→host for upcoming context requests.

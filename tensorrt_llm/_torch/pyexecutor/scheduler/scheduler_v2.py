@@ -746,14 +746,17 @@ class KVCacheV2Scheduler(RequestScheduler):
             result = self._try_schedule_context_full(req, budget)
 
         if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
-            # Unexecuted claims can hold reusable pages in every cache tier.
-            # Suspension retains those holds, preventing running requests from
-            # growing once the last tier fills. Drop the failed admission.
-            for manager in (self.kv_cache_manager, self.draft_kv_cache_manager):
+            # Failed admission must not retain prefix-reuse holds. Suspension
+            # alone cannot release them when the last cache tier is full.
+            for manager in (
+                self.kv_cache_manager,
+                self.draft_kv_cache_manager,
+                self.cross_kv_cache_manager,
+            ):
                 if manager is not None and req.py_request_id in manager.kv_cache_map:
                     manager.free_resources(req)
             req.set_prepopulated_prompt_len(0, self.tokens_per_block)
-            # Setting prepopulation to zero does not rewind the native cursor.
+            # Clearing prepopulation does not rewind the native cursor.
             req.context_current_position = 0
             req.context_chunk_size = req.prompt_len
             req.estimated_reusable_tokens = 0
@@ -872,8 +875,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 
         if chunk_size <= 0:
-            # The caller drops an unexecuted first-chunk admission. Keep
-            # continuation caches intact so their computed KV can be retried.
+            # TODO: consider suspending first-chunk KVCache to release
+            # GPU pages. Currently we skip without suspend to avoid
+            # pathological suspend/resume cycles. suspend_request is
+            # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(
