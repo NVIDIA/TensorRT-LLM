@@ -2543,14 +2543,20 @@ CUBIN_EXPORT __global__
 
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
         if (seqIterInit < nbSeqIters)
-        { // otherwise rcpRowSum will be NAN.
+        {
             // In multi-block mode, assign the virtual sink token to exactly one partial CTA.
             if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
             {
                 // Attention sinks are per head.
                 addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
             }
-            ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
+            // Fully masked partial rows have zero weight and must contribute zero when merged.
+            ThrdRegRowMax rcpRowSum;
+#pragma unroll
+            for (uint32_t i = 0; i < globalRowSum.size; i++)
+            {
+                rcpRowSum[i] = globalRowSum[i] == 0.F ? 0.F : __frcp_rn(globalRowSum[i]);
+            }
 #if LOW_PREC_OUTPUT
             voScale *= rcpOutScale[0];
 #endif
