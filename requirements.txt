@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://download.pytorch.org/whl/cu132
 -c constraints.txt
 accelerate>=1.7.0
 build
