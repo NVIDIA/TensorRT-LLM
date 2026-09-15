@@ -1666,9 +1666,14 @@ protected:
             ASSERT_GT(maxGate, mSwigluLimitValue) << "SwigluBias limit values don't change the result";
             if (mSwigluClampAfterSilu)
             {
-                ASSERT_GT(actfn(maxGate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue,
-                    mSwigluLimitValue)
-                    << "Post-SiLU clamp order is not observable";
+                float const postSiluGate
+                    = actfn(maxGate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue;
+                float const preSiluGate
+                    = actfn(std::min(maxGate, mSwigluLimitValue) * mSwigluAlphaValue, 0.0f, ActivationType::Silu)
+                    / mSwigluAlphaValue;
+                ASSERT_GT(postSiluGate, mSwigluLimitValue) << "Post-SiLU clamp order is not observable";
+                ASSERT_NE(std::min(postSiluGate, mSwigluLimitValue), preSiluGate)
+                    << "Pre- and post-SiLU clamp orders produce the same reference value";
             }
         }
 
@@ -1988,10 +1993,13 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluPostSiluClamp)
         GTEST_SKIP() << "W4A8 does not support gated activations";
     }
     this->mActType = ActivationType::SwigluBias;
-    this->mSwigluAlphaValue = 0.5f;
-    this->mSwigluBetaValue = 0.0f;
+    // MX uses a much larger clamp limit, so keep alpha small enough that the
+    // pre-SiLU reference does not round back to the same limit.
+    this->mSwigluAlphaValue = this->MX_QUANT_ACT ? 0.02f : 0.25f;
+    this->mSwigluBetaValue = this->MX_QUANT_ACT ? 0.0f : 1.25f;
     this->mSwigluClampAfterSilu = true;
     this->BasicPermuteTest();
+    this->BasicPermuteTest(3);
 }
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteNoSmemEpilogueSchedule)

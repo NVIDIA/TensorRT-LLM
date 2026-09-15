@@ -46,7 +46,6 @@ from transformers.configuration_utils import PretrainedConfig
 from utils.util import check_accuracy
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import fused_moe as fused_moe_custom_op
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
@@ -1340,10 +1339,9 @@ def test_post_silu_clamp_mode_requires_limit():
 
 
 def test_fused_moe_appends_post_silu_mode_to_positional_schema():
-    argument_list = fused_moe_custom_op._schema.removeprefix("(").split(") ->", maxsplit=1)[0]
-    final_argument = argument_list.rsplit(",", maxsplit=1)[-1]
+    registered_schema = torch.ops.trtllm.fused_moe.default._schema
 
-    assert "swiglu_clamp_after_silu" in final_argument
+    assert registered_schema.arguments[-1].name == "swiglu_clamp_after_silu"
 
 
 def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):

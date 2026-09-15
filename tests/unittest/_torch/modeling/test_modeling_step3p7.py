@@ -395,7 +395,7 @@ class TestStep3p7Helpers(unittest.TestCase):
                         return_value=moe_lora_enabled,
                     ),
                     patch.object(step3p7_module, "create_moe", return_value=experts) as create_moe,
-                    patch.object(Step3p7MoE, "_allocate_clamp_buffers"),
+                    patch.object(Step3p7MoE, "_allocate_clamp_buffers") as allocate_clamp_buffers,
                 ):
                     moe = Step3p7MoE(model_config, layer_idx=0, aux_stream_dict={})
 
@@ -403,6 +403,10 @@ class TestStep3p7Helpers(unittest.TestCase):
                 activation = create_moe.call_args.kwargs["activation"]
                 self.assertEqual(activation.clamp, 1.0)
                 self.assertEqual(activation.clamp_after_silu, moe_lora_enabled)
+                if moe_lora_enabled:
+                    allocate_clamp_buffers.assert_not_called()
+                else:
+                    allocate_clamp_buffers.assert_called_once()
                 moe.router_bias.router_bias.data.zero_()
                 moe.gate.return_value = torch.zeros(1, text_config.moe_num_experts)
                 python_output = MagicMock(return_value=torch.ones(1, text_config.hidden_size))
@@ -418,7 +422,9 @@ class TestStep3p7Helpers(unittest.TestCase):
                 lora_params = {"active": True} if moe_lora_enabled else None
                 if not moe_lora_enabled:
                     moe._clamp_weights_loaded = False
-                    with self.assertRaisesRegex(RuntimeError, "requires post-SiLU clamp weights"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "requires dequantized expert weights"
+                    ):
                         moe(
                             hidden_states,
                             types.SimpleNamespace(all_rank_num_tokens=[1]),
