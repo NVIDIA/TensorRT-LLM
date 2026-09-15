@@ -536,3 +536,11 @@ zai-org/GLM-5.3-Flash:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 92.91
+  # FP8 KV uses the same regression gates as BF16 KV.
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 92.57
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 92.91
