@@ -1022,16 +1022,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def _get_prefill_state_workspace(
         self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Reserve maximum state scratch during warmup and reuse it across layers."""
+        """Reserve maximum state scratch on first use and reuse it across layers."""
         # Blackwell uses indexed pool I/O directly, without state scratch.
         if not _use_flashinfer_gdn_prefill() or is_sm_100f():
             return None
         key = (ssm_states.device, ssm_states.shape[1:])
-        # Sequential layers share persistent input/output scratch, sized at warmup.
+        # First use during warmup reserves the configured maximum, not the current batch.
+        # Sequential layers share this persistent input/output scratch.
         workspaces = self.model_config.extra_attrs.setdefault("gdn_state_workspaces", {})
         workspace = workspaces.get(key)
-        if not attn_metadata.is_warmup:
-            return workspace
         capacity = min(
             attn_metadata.max_num_sequences or attn_metadata.max_num_requests,
             attn_metadata.max_num_tokens,

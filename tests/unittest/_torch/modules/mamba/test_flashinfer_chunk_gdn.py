@@ -230,28 +230,36 @@ def test_state_workspace_dispatch(monkeypatch, with_workspace):
     assert impl.call_args.kwargs == ({"state_workspace": workspace} if with_workspace else {})
 
 
+@pytest.mark.parametrize("metadata_backend", ["base", "trtllm"])
 @pytest.mark.parametrize("native_state", [False, True])
 @pytest.mark.parametrize(
     "max_sequences,max_tokens,capacity", [(512, 2048, 512), (512, 16, 16), (None, 2048, 512)]
 )
 def test_state_workspace_warmup_and_reuse(
-    monkeypatch, native_state, max_sequences, max_tokens, capacity
+    monkeypatch, native_state, max_sequences, max_tokens, capacity, metadata_backend
 ):
     """Warmup reserves the maximum, shared by layers, not the current batch."""
     from types import SimpleNamespace
 
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
     monkeypatch.setattr(mixer, "_use_flashinfer_gdn_prefill", lambda: True)
     monkeypatch.setattr(mixer, "is_sm_100f", lambda: native_state)
     config = SimpleNamespace(extra_attrs={})
     layer = SimpleNamespace(model_config=config)
-    metadata = SimpleNamespace(
-        is_warmup=True,
+    # Keep the real metadata contract; bypass only TRTLLM's unrelated CUDA buffers.
+    monkeypatch.setattr(
+        TrtllmAttentionMetadata, "_post_init_with_buffers", lambda self, buffers: None
+    )
+    metadata_cls = AttentionMetadata if metadata_backend == "base" else TrtllmAttentionMetadata
+    metadata = metadata_cls(
         max_num_sequences=max_sequences,
         max_num_requests=512,
         max_num_tokens=max_tokens,
     )
+    assert not hasattr(metadata, "is_warmup")
     state = torch.empty(1, 2, 4, 4, dtype=torch.bfloat16)
     get_workspace = mixer.Qwen3NextGatedDeltaNet._get_prefill_state_workspace
     workspace = get_workspace(layer, metadata, state)
@@ -265,7 +273,6 @@ def test_state_workspace_warmup_and_reuse(
         assert (
             workspace[0].untyped_storage().data_ptr() != workspace[1].untyped_storage().data_ptr()
         )
-    metadata.is_warmup = False
     other_layer = SimpleNamespace(model_config=config)
     with monkeypatch.context() as context:
         context.setattr(
@@ -275,8 +282,6 @@ def test_state_workspace_warmup_and_reuse(
             torch, "empty_like", lambda *args, **kwargs: pytest.fail("unexpected allocation")
         )
         assert get_workspace(layer, metadata, state) is workspace
-        assert get_workspace(other_layer, metadata, state) is workspace
-        metadata.is_warmup = True
         assert get_workspace(other_layer, metadata, state) is workspace
     monkeypatch.setattr(mixer, "_use_flashinfer_gdn_prefill", lambda: False)
     assert get_workspace(layer, metadata, state) is None
@@ -292,9 +297,7 @@ def test_state_workspace_warmup_growth(monkeypatch):
     monkeypatch.setattr(mixer, "_use_flashinfer_gdn_prefill", lambda: True)
     monkeypatch.setattr(mixer, "is_sm_100f", lambda: False)
     layer = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}))
-    metadata = SimpleNamespace(
-        is_warmup=True, max_num_sequences=16, max_num_requests=512, max_num_tokens=2048
-    )
+    metadata = SimpleNamespace(max_num_sequences=16, max_num_requests=512, max_num_tokens=2048)
     state = torch.empty(1, 2, 4, 4, dtype=torch.bfloat16)
     get_workspace = mixer.Qwen3NextGatedDeltaNet._get_prefill_state_workspace
     small = get_workspace(layer, metadata, state)
@@ -302,8 +305,8 @@ def test_state_workspace_warmup_growth(monkeypatch):
     metadata.max_num_sequences = 512
     large = get_workspace(layer, metadata, state)
     assert all(buffer.shape == (512, 2, 4, 4) for buffer in large)
+    assert large[0].untyped_storage().data_ptr() != large[1].untyped_storage().data_ptr()
     assert all(before.data_ptr() != after.data_ptr() for before, after in zip(small, large))
-    metadata.is_warmup = False
     with (
         patch.object(torch, "empty", side_effect=RuntimeError("unexpected allocation")),
         patch.object(torch, "empty_like", side_effect=RuntimeError("unexpected allocation")),
@@ -324,14 +327,11 @@ def test_state_workspace_maximum_batch_and_cuda_graph():
     from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 
     layer = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}))
-    metadata = SimpleNamespace(
-        is_warmup=True, max_num_sequences=512, max_num_requests=512, max_num_tokens=2048
-    )
+    metadata = SimpleNamespace(max_num_sequences=512, max_num_requests=512, max_num_tokens=2048)
     pool = torch.zeros(512, 16, 128, 128, dtype=torch.bfloat16, device="cuda")
     get_workspace = Qwen3NextGatedDeltaNet._get_prefill_state_workspace
     workspace = get_workspace(layer, metadata, pool)
     assert workspace is not None
-    metadata.is_warmup = False
     peaks = []
     for num_seqs in (1, 512):
         q, k, v, g, beta, cu = _make_inputs([2048 // num_seqs] * num_seqs)
