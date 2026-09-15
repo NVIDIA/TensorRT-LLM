@@ -11,7 +11,7 @@ from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 
 from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
-from ..flashinfer_utils import get_env_enable_pdl
+from ..flashinfer_utils import is_pdl_enabled
 
 _BACKEND_ENV = "TRTLLM_LOW_M_GEMM_BACKEND"
 
@@ -415,7 +415,7 @@ class LowMGemmDispatcher:
             # before reaching here, so the None-runner state is never observed by callers.
             self._prepared = True
             return
-        pdl = get_env_enable_pdl()
+        pdl = is_pdl_enabled()
         self._runner_no_bias = _SplitKGemmRunner(has_bias=False, pdl=pdl)
         self._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=pdl)
         # Direct SIMT runner: no-bias only; wins for M=1 with narrow N on K=8192.
