@@ -46,7 +46,6 @@ from ..attention.backends.interface import (AttentionMetadata,
                                             AttentionRuntimeFeatures)
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..attention.backends.utils import get_attention_backend
-from ..attention.workspace import EagerWorkspaceReclaimer
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
@@ -113,6 +112,7 @@ from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
+from .workspace import EagerWorkspaceReclaimer
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest,

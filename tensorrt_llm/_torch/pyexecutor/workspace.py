@@ -13,7 +13,7 @@ from tensorrt_llm.logger import logger
 from ..modules.multi_stream_utils import do_multi_stream
 
 if TYPE_CHECKING:
-    from .backends.trtllm import TrtllmAttentionMetadata
+    from ..attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 class WorkspaceShrinkPolicy:
