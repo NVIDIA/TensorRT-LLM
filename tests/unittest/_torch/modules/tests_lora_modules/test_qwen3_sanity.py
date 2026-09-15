@@ -31,6 +31,7 @@ from tensorrt_llm._torch.peft.lora import layer as lora_layer_module
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.llmapi import KvCacheConfig
 
 # HF module name -> block path relative to layers.{idx}.
 # Attention targets work on all architectures. MLP targets only apply to
@@ -110,12 +111,15 @@ def _create_lora_adapter(
     return output_dir
 
 
-def _run_with_and_without_lora(model_path, lora_config, lora_dir, prompts):
+def _run_with_and_without_lora(
+    model_path, lora_config, lora_dir, prompts, kv_cache_config: KvCacheConfig | None = None
+):
     """Run inference with and without LoRA, return (lora_outputs, base_outputs)."""
     with LLM(
         model=model_path,
         backend="pytorch",
         lora_config=lora_config,
+        kv_cache_config=kv_cache_config or KvCacheConfig(),
         tensor_parallel_size=1,
         max_batch_size=4,
         max_num_tokens=256,
@@ -154,7 +158,7 @@ def _assert_lora_changes_output(out_lora, out_base):
 
 
 def _assert_outputs_match(actual, expected):
-    """Assert that two request outputs have identical tokens and logprobs."""
+    """Require identical tokens and logprobs within the cold/warm BF16 bound."""
     actual_completion = actual.outputs[0]
     expected_completion = expected.outputs[0]
     assert actual_completion.token_ids == expected_completion.token_ids
@@ -166,7 +170,7 @@ def _assert_outputs_match(actual, expected):
         assert actual_step.keys() == expected_step.keys()
         for token_id in actual_step:
             assert actual_step[token_id].logprob == pytest.approx(
-                expected_step[token_id].logprob, abs=1e-6
+                expected_step[token_id].logprob, rel=0, abs=0.1
             )
 
 
@@ -177,6 +181,7 @@ def _run_lora_test(
     dtype=torch.bfloat16,
     overlap=False,
     specialize_cuda_graph=False,
+    kv_cache_config: KvCacheConfig | None = None,
 ):
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -200,11 +205,14 @@ def _run_lora_test(
             lora_config,
             lora_dir,
             ["The capital of France is", "Hello, how are you"],
+            kv_cache_config=kv_cache_config,
         )
         _assert_lora_changes_output(out_lora, out_base)
 
 
-def _run_mixed_lora_cuda_graph_test(model_path, target_modules, trtllm_modules):
+def _run_mixed_lora_cuda_graph_test(
+    model_path, target_modules, trtllm_modules, kv_cache_config: KvCacheConfig
+):
     """Verify base rows remain unchanged when sharing a LoRA-specialized graph."""
     with tempfile.TemporaryDirectory() as tmpdir:
         lora_dir = _create_lora_adapter(
@@ -223,6 +231,7 @@ def _run_mixed_lora_cuda_graph_test(model_path, target_modules, trtllm_modules):
             model=model_path,
             backend="pytorch",
             lora_config=lora_config,
+            kv_cache_config=kv_cache_config,
             tensor_parallel_size=1,
             max_batch_size=4,
             max_num_tokens=256,
@@ -242,7 +251,15 @@ def _run_mixed_lora_cuda_graph_test(model_path, target_modules, trtllm_modules):
             )
             base_outputs = llm.generate(prompts, sampling)
 
+        # Keep the cold-to-reused transition that exercises final-context
+        # promotion; a warmup or disabled reuse must not hide a regression.
+        assert all(output.cached_tokens == 0 for output in mixed_outputs)
+        for output in base_outputs:
+            assert output.cached_tokens == len(output.prompt_token_ids) - 1
         for index in (1, 3):
+            # Cold prefill and reused final-context decode use different BF16
+            # reductions, in both KVCM V1 and V2. Bound the resulting logprob
+            # drift (exp(0.1) is about 1.105), while keeping tokens identical.
             _assert_outputs_match(mixed_outputs[index], base_outputs[index])
         _assert_lora_changes_output(
             [mixed_outputs[index] for index in (0, 2)],
@@ -286,6 +303,7 @@ class TestQwen3LoRA:
     @pytest.fixture(autouse=True)
     def setup(self):
         self.model_path = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
+        self.kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True, enable_block_reuse=True)
         if not os.path.exists(self.model_path):
             pytest.skip(f"Model not found: {self.model_path}")
 
@@ -294,6 +312,7 @@ class TestQwen3LoRA:
             self.model_path,
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_fp8_lora(self):
@@ -302,6 +321,7 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             dtype=torch.float8_e4m3fn,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_bf16_lora_overlap(self):
@@ -310,6 +330,7 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             overlap=True,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_fp8_lora_overlap(self):
@@ -319,6 +340,7 @@ class TestQwen3LoRA:
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             dtype=torch.float8_e4m3fn,
             overlap=True,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_bf16_lora_cuda_graph_specialization(self):
@@ -327,6 +349,7 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             specialize_cuda_graph=True,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_bf16_lora_cuda_graph_specialization_mixed_batch(self):
@@ -334,6 +357,7 @@ class TestQwen3LoRA:
             self.model_path,
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            kv_cache_config=self.kv_cache_config,
         )
 
 
