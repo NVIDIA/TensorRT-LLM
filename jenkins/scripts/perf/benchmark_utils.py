@@ -14,6 +14,131 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The benchmark mode that runs generation with no context workers at all: the gen
+# worker fabricates its own KV blocks (the product side keys this off
+# TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1, see
+# tensorrt_llm/_torch/disaggregation/orchestration/coordinator.py) instead of
+# receiving them over the cache transceiver.
+#
+# The *topology* is disaggregated -- a disagg proxy in front of one gen worker,
+# zero ctx workers -- because the fake-KV shortcut is only reachable from the
+# disagg gen path: openai_disagg_service._check_gen_only_disagg is the only thing
+# that stamps request_type="generation_only" onto a request, and it lives in the
+# proxy. But the *launch path* is the aggregated one: a single pytest process owns
+# the gen worker, the proxy and the benchmark client as children, exactly like
+# ctx_only reads a disagg yaml and runs through the aggregated path. That is why
+# this mode is wired behind an `aggr-` prefix -- the prefix selects the launch
+# path, not the topology -- and why it needs no DISAGG_SERVING_TYPE role split.
+GEN_ONLY_NO_CONTEXT_MODE = "gen_only_no_context"
+
+# Every benchmark mode that runs the four-role disaggregated launch path, i.e. one
+# pytest per role (CTX_n / GEN_n / DISAGG_SERVER / BENCHMARK) rendezvousing through
+# the shared hostnames directory.
+DISAGG_BENCHMARK_MODES = ("e2e", "gen_only")
+
+# Every benchmark mode that reads a disaggregated config YAML but launches through
+# the aggregated single-pytest path. ctx_only synthesises an aggregated case out of
+# the ctx worker section; gen_only_no_context keeps the disagg topology but hosts
+# all of it under one pytest (see GEN_ONLY_NO_CONTEXT_MODE above).
+AGGREGATED_DISAGG_YAML_MODES = ("ctx_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+# Every benchmark mode whose config YAML lives in the disaggregated config folder,
+# regardless of which launch path it runs on.
+DISAGG_CONFIG_MODES = DISAGG_BENCHMARK_MODES + AGGREGATED_DISAGG_YAML_MODES
+
+# The modes whose gen worker does pure decode with no context phase of its own,
+# i.e. every mode that a `gen_only` special case has to cover. Compare against
+# this tuple rather than spelling `== "gen_only"`: the two modes must stay
+# treated identically everywhere except the ctx fleet and the injected env vars,
+# or an A/B between them measures the harness instead of the mode.
+GEN_ONLY_MODES = ("gen_only", GEN_ONLY_NO_CONTEXT_MODE)
+
+
+def is_gen_only_no_context(benchmark_mode, config):
+    """Return True when this case must run with zero context workers.
+
+    Two ways in, and they must agree everywhere, because the node arithmetic and
+    the env injection are separate call sites: get one and not the other and the
+    job is sized for no ctx fleet while the gen worker still waits for KV that
+    never arrives (or vice versa).
+
+    1. The test id names the mode outright (``aggr-gen_only_no_context-<stem>``).
+       This is the primary mechanism, and the only one that lets a single config
+       YAML be benchmarked both ways.
+    2. Legacy opt-in: the id says ``gen_only`` and the config YAML's
+       ``benchmark.mode`` contains ``gen_only_no_context``. Kept for back-compat
+       with the pre-existing behaviour (no checked-in config uses it today).
+
+    Args:
+        benchmark_mode: The mode parsed out of the test id, or None.
+        config: The parsed config YAML, or None.
+
+    Returns:
+        bool
+    """
+    if benchmark_mode == GEN_ONLY_NO_CONTEXT_MODE:
+        return True
+    if benchmark_mode != "gen_only":
+        return False
+    benchmark = (config or {}).get("benchmark") or {}
+    return GEN_ONLY_NO_CONTEXT_MODE in str(benchmark.get("mode", ""))
+
+
+def gen_only_no_context_world_size(config):
+    """GPU count for the single gen worker of a gen_only_no_context case.
+
+    The mode runs exactly ONE gen worker, whatever ``hardware.num_gen_servers``
+    says -- the same way it runs zero ctx workers whatever ``num_ctx_servers``
+    says. Both counts describe the *disaggregated* fleet the config was written
+    for; this mode reads the same file to measure one worker's decode loop in
+    isolation, so both are overridden (see gen_only_no_context_server_counts).
+
+    That is a deliberate reversal of the earlier behaviour, which refused
+    ``num_gen_servers != 1`` on the theory that one pytest process cannot host
+    several workers. True, but the conclusion was wrong: the fix is to launch one
+    worker, not to make the mode unreachable for the configs that scale out by
+    replicating gen servers (e.g. the DSv4-Pro con8 case, gen4 x tep8). Refusing
+    those left the cheapest arm of the comparison unavailable on exactly the
+    configs that most wanted it.
+
+    The per-worker shape (tp/pp/cp) is what determines the allocation, and it is
+    identical across replicas, so one replica is a faithful sample of the fleet.
+
+    Args:
+        config: The parsed disaggregated config YAML.
+
+    Returns:
+        int: worker_config.gen's world size, i.e. tp * pp * cp.
+
+    Raises:
+        ValueError: If worker_config.gen is missing.
+    """
+    gen_config = (config.get("worker_config", {}) or {}).get("gen", {}) or {}
+    if not gen_config:
+        raise ValueError("worker_config.gen is required for %s mode" % (GEN_ONLY_NO_CONTEXT_MODE,))
+    return gen_config.get("world_size") or (
+        gen_config.get("tensor_parallel_size", 1)
+        * gen_config.get("pipeline_parallel_size", 1)
+        * gen_config.get("context_parallel_size", 1)
+    )
+
+
+def gen_only_no_context_server_counts():
+    """The (num_ctx_servers, num_gen_servers) this mode launches, always (0, 1).
+
+    One expression, shared by every consumer, for the same reason
+    is_gen_only_no_context is: the node arithmetic in two generators and the
+    runner's expectation of what to find on disk are separate call sites, and if
+    they disagree the job is sized for one fleet while the runner waits for
+    another. The proxy is handed exactly these counts in server_config.<idx>.yaml,
+    so a generator that allocated for the config's own num_gen_servers would leave
+    the proxy expecting urls that never bind.
+
+    Returns:
+        tuple: (0, 1) -- no ctx fleet, exactly one gen worker.
+    """
+    return 0, 1
+
 
 def parse_positive_concurrency(value: object) -> int:
     """Parse a positive benchmark concurrency from YAML configuration.

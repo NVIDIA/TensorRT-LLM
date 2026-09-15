@@ -150,6 +150,44 @@ def test_autotuner_marker_does_not_hide_real_errors(tmp_path):
     assert "Error line 2" in str(e.value)
 
 
+def test_check_error_skips_the_waits_own_retry_messages(tmp_path):
+    """The readiness wait must not fail on its own progress output.
+
+    wait_for_endpoint_ready prints the exception it retried on, once per second, for
+    as long as the server is still starting -- and that line carries
+    ConnectionRefusedError, which is an ERROR_KEYWORD. Harmless while the poller's
+    stdout and the server's log are separate files, fatal once they are the same
+    file: perf-sanity's gen_only_no_context mode redirects the srun aggregate (which
+    is pytest's own stdout as well as the gen worker rank 0's) into gen_server_0.log
+    and then scans it, so without this the wait would fail itself after 30s of a
+    perfectly healthy startup.
+    """
+    log = _server_log(
+        tmp_path,
+        "endpoint http://h:8000/health is not ready, with exception: "
+        "ConnectionRefusedError(111, 'Connection refused')\n"
+        "loading weights\n",
+    )
+    assert check_error(log) == []
+
+
+def test_the_retry_marker_does_not_hide_a_real_connection_failure(tmp_path):
+    """Only the poller's own phrasing is benign, not the keyword on its own.
+
+    The exemption is anchored on "is not ready, with exception:", so a genuine
+    ConnectionRefusedError traceback out of the server itself still trips the scan.
+    Widening it to the bare keyword would silence the commonest real disagg failure.
+    """
+    log = _server_log(
+        tmp_path,
+        "endpoint http://h:8000/health is not ready, with exception: "
+        "ConnectionRefusedError(111, 'Connection refused')\n"
+        "ConnectionRefusedError: [Errno 111] connect to kv cache peer failed\n",
+    )
+    hits = check_error(log)
+    assert [idx for idx, _ in hits] == [2]
+
+
 def test_report_error_always_appends_tail_even_on_keyword_hit(tmp_path):
     """The first keyword hit may be noise; the fatal error can sit at EOF."""
     lines = ["ValueError: early benign-looking hit\n"]
