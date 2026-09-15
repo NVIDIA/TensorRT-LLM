@@ -31,9 +31,9 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
-  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
-  - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
@@ -231,8 +231,10 @@ l0_b200:
   # from tests/torch/ which test-db cannot list).
   - unittest/_torch/speculative/test_suffix_automaton.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
+  - unittest/_torch/kernels/serial
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_afmoe.py

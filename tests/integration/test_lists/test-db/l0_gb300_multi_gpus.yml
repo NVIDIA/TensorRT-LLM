@@ -25,8 +25,10 @@ l0_gb300_multi_gpus:
   #               every stage that collects them, including where the tests themselves skip.
   - unittest/_torch/attention TIMEOUT (120)
   - unittest/_torch/thop/parallel
+  - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
+  - unittest/_torch/kernels/serial
   - unittest/_torch/executor
   - unittest/_torch/disaggregation
   # ------------- modules (non-MoE) ---------------
