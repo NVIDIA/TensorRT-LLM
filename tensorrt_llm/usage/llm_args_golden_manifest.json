@@ -381,9 +381,7 @@
       "path": "enable_return_routed_experts"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "enable_speculative_beam_history_d2h"
     },

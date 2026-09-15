@@ -268,31 +268,31 @@ class RouteCapture:
 
         attach_routes can fire MULTIPLE times for the same finished request
         (_handle_responses revisits it). Attach + free EXACTLY ONCE, and only
-        once assemble succeeds: on an incomplete store (assemble None / gap) do
-        NOT free -- retry on a later call. Freeing eagerly corrupts the store."""
+        once assemble succeeds: on an incomplete store (assemble None) do NOT
+        free -- retry on a later call. Freeing eagerly corrupts the store.
+
+        Errors are NOT swallowed here: an internal gap in the store (assemble
+        raises ValueError) or a failed copy drain means the routes would be
+        wrong, so the exception propagates to the executor instead of the
+        request silently completing without ``routed_experts``."""
         if request.py_request_id in self._attached:
             return
         if self._copier is not None:
-            try:
-                self._copier.drain(self.commit, force=True)
-            except Exception:
-                pass
-        try:
-            pyr = getattr(request, "py_result", None)
-            if pyr is None:
-                return
-            rid = request.py_request_id
-            routes = self.assemble(rid)
-            if routes is not None:
-                if pyr._additional_generation_outputs is None:
-                    pyr._additional_generation_outputs = {}
-                pyr._additional_generation_outputs.setdefault("routed_experts", [])
-                pyr.append_additional_generation_outputs("routed_experts", routes)
-                self._attached.add(rid)
-                self._populate_prefix(request, rid)  # store this req's blocks for reuse
-                self.free(rid)  # bound memory once safely attached
-        except Exception:
-            pass
+            self._copier.drain(self.commit, force=True)
+        pyr = getattr(request, "py_result", None)
+        if pyr is None:
+            return
+        rid = request.py_request_id
+        routes = self.assemble(rid)
+        if routes is None:
+            return  # incomplete store: keep it and retry on a later call
+        if pyr._additional_generation_outputs is None:
+            pyr._additional_generation_outputs = {}
+        pyr._additional_generation_outputs.setdefault("routed_experts", [])
+        pyr.append_additional_generation_outputs("routed_experts", routes)
+        self._attached.add(rid)
+        self._populate_prefix(request, rid)  # store this req's blocks for reuse
+        self.free(rid)  # bound memory once safely attached
 
     # ------------------------------------------------------------------ #
     def __init__(self, *, rank: int, model_engine=None) -> None:

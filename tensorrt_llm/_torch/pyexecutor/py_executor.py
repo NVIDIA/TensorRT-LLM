@@ -8513,9 +8513,12 @@ class PyExecutor:
         self.kv_cache_manager.reset_reuse_state()
         if self.enable_joint_kv_cache_reuse:
             self.draft_kv_cache_manager.reset_reuse_state()
-        route_capture = getattr(self.model_engine, "route_capture", None)
+        # R3: invalidate cached routes together with the KV reuse state. Guard the
+        # engine lookup too -- minimal executors (unit tests) may have no engine.
+        route_capture = getattr(getattr(self, "model_engine", None),
+                                "route_capture", None)
         if route_capture is not None:
-            route_capture.clear_shared()  # R3: invalidate cached routes with KV
+            route_capture.clear_shared()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,

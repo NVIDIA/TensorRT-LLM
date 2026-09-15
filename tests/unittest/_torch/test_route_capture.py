@@ -67,6 +67,42 @@ def test_assemble_fail_closed_on_internal_gap():
         rc.assemble(9)
 
 
+def test_attach_routes_propagates_errors_and_attaches_once():
+    class _Result:
+        def __init__(self):
+            self._additional_generation_outputs = None
+            self.appended = []
+
+        def append_additional_generation_outputs(self, name, value):
+            self.appended.append((name, value))
+
+    class _Req:
+        def __init__(self, rid):
+            self.py_request_id = rid
+            self.py_result = _Result()
+
+    rc = RouteCapture(rank=0)
+    # Incomplete store (a single position): nothing to attach yet -> keep the
+    # store for a later call, no error.
+    rc._store[5] = {0: _row(1)}
+    rc.attach_routes(_Req(5))
+    assert 5 in rc._store and 5 not in rc._attached
+    # Internal gap: fail closed -- the error surfaces instead of the request
+    # silently completing without routed_experts.
+    rc._store[6] = {0: _row(1), 2: _row(3)}
+    with pytest.raises(ValueError):
+        rc.attach_routes(_Req(6))
+    # Complete store: attached exactly once and freed; a repeat call is a no-op.
+    rc._store[7] = {0: _row(1), 1: _row(2)}
+    req = _Req(7)
+    rc.attach_routes(req)
+    assert [name for name, _ in req.py_result.appended] == ["routed_experts"]
+    assert req.py_result.appended[0][1].shape == (2, _L, _K)
+    assert 7 in rc._attached and 7 not in rc._store
+    rc.attach_routes(req)
+    assert len(req.py_result.appended) == 1
+
+
 def test_prefix_hashes_deterministic_across_requests():
     rc = RouteCapture(rank=0)
     toks = list(range(100, 164))  # 64-token shared prefix
