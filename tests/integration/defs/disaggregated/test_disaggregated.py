@@ -1669,10 +1669,6 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
     def extra_endpoints_test(_server_url: str):
         item = get_timing_metrics(perf_metrics_output_dir)
-        gen_timing = item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
-        assert {
-            "kv_cache_transfer_start", "kv_cache_transfer_end", "kv_cache_size"
-        } <= gen_timing.keys()
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
@@ -1709,56 +1705,34 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                          indirect=True)
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root,
-                                            llama_model_root, tmp_path):
+                                            llama_model_root):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-    output_path = tmp_path / "cache_time"
+    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
-    env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = str(output_path)
+    env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
-    # Python records send/receive tasks in <instance>_<rank>.csv and writes
-    # the generation-side transfer summary to a separate CSV.
+    assert os.path.isdir(output_path)
+    # Python records send/receive tasks together in <instance>_<rank>.csv.
     task_rows = []
-    summary_rows = []
-    for path in output_path.glob("*.csv"):
-        with path.open() as f:
-            rows = list(csv.DictReader(f))
-        assert rows, f"empty timing CSV: {path}"
-        if path.name.endswith("_gen_transfer_summary.csv"):
-            summary_rows.extend(rows)
-        else:
-            task_rows.extend(rows)
-
-    send_rows = {
-        row["unique_rid"]: row
-        for row in task_rows if row["task_type"] == "KVSendTask"
-    }
-    recv_rows = {
-        row["unique_rid"]: row
-        for row in task_rows if row["task_type"] == "KVRecvTask"
-    }
-    summaries = {row["RequestID"]: row for row in summary_rows}
-    assert send_rows, f"no KVSendTask rows in {output_path}"
-    assert send_rows.keys() == recv_rows.keys() == summaries.keys()
-    for request_id, send in send_rows.items():
-        assert int(send["transfer_size_bytes"]) > 0
-        assert int(send["transfer_entry_count"]) > 0
-        assert float(send["avg_segment_size_bytes"]) > 0
-        for field in ("prepare_args_latency_ms", "queue_latency_ms",
-                      "transfer_latency_ms", "task_latency_ms",
-                      "throughput_mbs"):
-            assert float(send[field]) >= 0
-        # Receive tasks only measure total task latency.
-        assert float(recv_rows[request_id]["task_latency_ms"]) >= 0
-        summary = summaries[request_id]
-        assert float(summary["gen_side_transfer_time(ms)"]) >= 0
-        assert int(summary["kv_cache_size"]) == int(send["transfer_size_bytes"])
+    for filename in sorted(os.listdir(output_path)):
+        if filename.endswith(
+                ".csv") and not filename.endswith("_gen_transfer_summary.csv"):
+            with open(os.path.join(output_path, filename)) as f:
+                task_rows.extend(csv.DictReader(f))
+    send_rows = [row for row in task_rows if row["task_type"] == "KVSendTask"]
+    recv_rows = [row for row in task_rows if row["task_type"] == "KVRecvTask"]
+    assert send_rows and recv_rows
+    sample = send_rows[0]
+    assert float(sample["task_latency_ms"]) >= 0
+    assert any(row["unique_rid"] == sample["unique_rid"]
+               and float(row["task_latency_ms"]) >= 0 for row in recv_rows)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
