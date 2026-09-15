@@ -1166,8 +1166,6 @@ def test_dynamic_tree_resource_uses_full_qwen_hc_width(monkeypatch) -> None:
     assert utils.get_spec_resource_manager(model_engine) is captured
     assert captured["hidden_size"] == 512
     assert captured["max_num_requests"] == 16
-    # This engine stub does not opt into the overlap seq-slot headroom, so the
-    # manager must fall back to the max_num_requests sizing.
     assert captured["num_seq_slots"] is None
 
 

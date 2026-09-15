@@ -42,9 +42,6 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False, has_pp=False):
     # ADP scheduling assumes ``enable_attention_dp=True``, so ``dp_size``
     # mirrors ``tp_size`` (see ``Mapping.dp_size``).
     dist.mapping.dp_size = tp_size
-    # ADPRouter reads this to decide whether to route on the overlap-corrected
-    # active list; a bare MagicMock would make has_pp() truthy and silently
-    # disable the correction in every test.
     dist.mapping.has_pp.return_value = has_pp
     dist.has_cp_helix = has_cp_helix
     return dist
@@ -145,9 +142,6 @@ class TestKVCacheAwareADPRouter:
         assert states[0].num_active_tokens == 100
 
     def test_gather_all_rank_states_retiring_and_in_transfer(self):
-        # In-transfer requests have already left active_requests, so this router
-        # adds them back as load; retiring requests are still in it and are
-        # filtered out. The two corrections are independent and must compose.
         dist = _mock_dist(tp_rank=0)
         mgr = _mock_kv_cache_manager()
         transfer_mgr = MagicMock()

@@ -1824,9 +1824,7 @@ def _index_mapper_capacity_for(
         return _FakeManagerConfig(cache_tiers=cache_tiers)
 
     with (
-        # The guard-page diagnostic adds an index slot of its own when
-        # TRTLLM_KV_GUARD_PAGE is set, so an inherited value would shift every
-        # expected capacity below by one. Pin both diagnostics off.
+        # Pin both diagnostics off: the guard page would add an index slot.
         patch.dict(
             os.environ,
             {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
@@ -1840,11 +1838,7 @@ def _index_mapper_capacity_for(
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
     ):
         manager = KVCacheManagerV2(
-            # A quota must be set or __init__ asserts before it sizes anything
-            # ("Quota not set. Check kv_cache_config.max_tokens or
-            # kv_cache_config.max_gpu_total_bytes"). The value is irrelevant to the
-            # index-mapper arithmetic, which reads only max_batch_size, pp_size,
-            # is_disagg, disable_overlap_scheduler and num_reserved_index_slots.
+            # A quota must be set or __init__ asserts; the value is irrelevant here.
             KvCacheConfig(max_gpu_total_bytes=16 << 20),
             CacheType.SELFKONLY,
             num_layers=1,
@@ -1880,32 +1874,13 @@ def _index_mapper_capacity_for(
 # capacity == max_batch_size * pp_size
 #             * (2 if is_disagg or (overlap on and pp_size == 1) else 1)
 #             + reserved
-#
-# The overlap rows are the nvbug 6627795 case: the overlap scheduler defers a
-# terminal request's teardown past the point where its replacement is admitted,
-# so both cohorts hold index slots at once and a mapper sized at B+1 silently
-# defers requests one at a time. This predicate is deliberately broader than
-# _util.should_enable_overlap_headroom, which gates the *seat* pool and
-# additionally requires attention DP: the index pool widens on every non-PP
-# overlap run, while the seat pool widens only where admission can actually hand
-# the extra seats out. So the two are equal under ADP and the index pool runs
-# ahead elsewhere, which is why the startup check requires the index pool to
-# cover the seat pool rather than to equal it
-# (validate_seq_slot_pool_covers_admission).
 _INDEX_MAPPER_CAPACITY_CASES = [
     # Overlap on, no PP: both cohorts are resident, so the mapper needs 2B.
     pytest.param(2, 1, False, False, 1, 5, id="overlap_on"),
     pytest.param(8, 1, False, False, 1, 17, id="overlap_on_b8"),
-    # Overlap off: the retiring request is torn down in-line, so B+1 is enough --
-    # the pre-fix allocation.
     pytest.param(2, 1, True, False, 1, 3, id="overlap_off"),
-    # Disagg already carried its own 2x; the two reasons cover the same extra
-    # cohort (a request is either transferring or retiring), so they do not
-    # compound.
     pytest.param(2, 1, False, True, 1, 5, id="disagg_does_not_compound"),
     pytest.param(2, 1, True, True, 1, 5, id="disagg_only"),
-    # Pipeline parallelism: max_batch_size * pp_size already covers the in-flight
-    # micro-batches, so the overlap term is excluded rather than compounded.
     pytest.param(2, 4, True, False, 1, 9, id="pp4_plain"),
     pytest.param(2, 4, False, False, 1, 9, id="pp4_overlap_excluded"),
     # ... while the pre-existing disagg 2x under PP is left exactly as it was.
@@ -1937,8 +1912,6 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     )
     assert capacity == expected
     assert page_table_capacity == expected
-    # The published bound excludes the reserved slots, which only ever hold
-    # persistent dummies and are not available to admitted requests.
     assert max_admissible_sequences == expected - reserved
 
 

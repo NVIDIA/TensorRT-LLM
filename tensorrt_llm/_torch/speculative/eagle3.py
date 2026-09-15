@@ -52,16 +52,9 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         # Optional SA manager for EAGLE3+SA mode
         self.sa_manager = sa_manager
-        # ``slot_manager`` hands out slots keyed by request id and holds them for
-        # the request's whole lifetime, so the pool must span the executor's
-        # sequence-slot pool -- 2 * max_batch_size under the overlap headroom,
-        # where a retiring request keeps its slot for one more iteration while its
-        # replacement is admitted (nvbug-6627795). None means no headroom.
         self.num_seq_slots = max(num_seq_slots or 0, max_num_requests)
         # There could be dummy request for padding batch when using CUDA graph.
         # Reserve one more slot for the dummy request.
-        # NOTE: max_seq_len is kept as a floor purely to preserve the historical
-        # (over-)sizing; it is a token count, not a slot count.
         slot_size = max(self.num_seq_slots, self.max_seq_len) + 1
         self.slot_manager = SlotManager(slot_size)
         # This class is reused by MTP_EAGLE
@@ -180,9 +173,6 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
                  max_num_requests: int,
                  num_seq_slots: Optional[int] = None):
         self.max_num_requests = max_num_requests
-        # batch_indices_cuda is indexed by batch position, so it stays at
-        # max_batch_size; only the SpecTreeManager slot storage below is keyed by
-        # py_seq_slot and needs the executor's slot pool (nvbug-6627795).
         self.batch_indices_cuda = torch.empty(
             [max_num_requests],
             dtype=torch.int,

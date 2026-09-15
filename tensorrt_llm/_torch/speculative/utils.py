@@ -342,19 +342,6 @@ def get_spec_metadata(spec_config,
     # the per-mode constructors are easy to miss one of.
     if metadata is not None:
         metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
-        # Same reasoning for the sequence-slot pool size, which sizes every
-        # slot-indexed buffer (draft_probs, full_draft_probs, penalty_state) and
-        # the dummy scratch row appended after them. It used to be forwarded by
-        # the MTP-eagle branch alone, so every other one-engine mode -- vanilla
-        # MTP, Eagle3 one-model, PARD, DFlash/DSpark, draft-target one-model --
-        # sized those buffers at max_num_requests while py_seq_slot ranged over
-        # the wider pool, indexing past the end of the allocation.
-        #
-        # Assigning after construction is in time: both consumers allocate
-        # lazily, from prepare() and from update_one_model_sampling_state, never
-        # from __post_init__. Leaving the field at its 0 default when the caller
-        # passes None keeps the established `num_seq_slots or max_num_requests`
-        # fallback in those two allocators.
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
     return metadata
@@ -367,8 +354,6 @@ def _build_spec_metadata(spec_config,
                          spec_resource_manager=None,
                          is_draft_model=False,
                          max_seq_len=262144):
-    """Construct the per-mode metadata. The slot-pool size is applied by the
-    caller (``get_spec_metadata``) so no branch can forget it."""
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
     vocab_size = getattr(model_config, "vocab_size", 0)
@@ -535,26 +520,7 @@ def get_mtp_hidden_size(model_config) -> int:
 
 
 def seat_pool_or_none(model_engine) -> Optional[int]:
-    """The engine's sequence-slot pool size, or None if it publishes none.
-
-    Pools keyed by live-request identity must follow the executor's
-    SeqSlotManager pool rather than max_batch_size, because ``py_seq_slot`` --
-    the index they are addressed by -- ranges over that whole pool. Buffers
-    indexed by *batch position* deliberately keep max_batch_size: the
-    micro-batch scheduler caps every forward at max_batch_size.
-
-    Read unconditionally rather than behind the headroom gate.
-    ``max_num_seq_slots`` already exceeds max_batch_size for three independent
-    reasons -- pipeline depth, the overlap headroom (nvbug-6627795) and
-    disaggregation -- and the buffers here cannot tell them apart. Gating on
-    one of the three sized them at max_batch_size under the other two while
-    ``_set_up_spec_metadata`` sized the metadata at the full pool, so a
-    high-numbered slot indexed past the end of the allocation.
-
-    Returns None only for engines that publish no pool at all (unit-test stubs,
-    mm-encoder-only engines), which keeps the established
-    ``num_seq_slots or max_num_requests`` fallback in the allocators.
-    """
+    """The engine's sequence-slot pool size, or None if it publishes none."""
     return getattr(model_engine, "max_num_seq_slots", None)
 
 

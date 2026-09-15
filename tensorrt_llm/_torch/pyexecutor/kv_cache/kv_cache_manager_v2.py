@@ -1677,35 +1677,14 @@ class KVCacheManagerV2(BaseResourceManager):
         # simultaneously, so we need slots for all concurrent sequences.
         # Reserve stable slots for persistent request IDs such as CUDA-graph
         # padding requests. The default preserves the main-branch allocation.
-        #
-        # Two independent reasons to hold twice that many index leases, and they
-        # do not compose -- a request is either awaiting a transfer or retiring,
-        # never both -- so this is one doubling, not two:
-        #
-        # * Disaggregation: at any moment up to `max_num_sequences` requests can
-        #   be actively generating while another up to `max_num_sequences` are
-        #   still in KV transfer (TRANS_IN_PROGRESS) and continue to hold their
-        #   index slots. The extra capacity lets the next batch acquire slots
-        #   without waiting for the previous batch's transfers to finish.
-        # * The overlap scheduler: a terminal request's resources are released
-        #   one iteration after it leaves the batch, so with overlap enabled a
-        #   retiring cohort and its replacement hold index leases at the same
-        #   time. Pipeline parallelism is excluded because `pp_size` micro-batches
-        #   are already covered above.
-        #
-        # The overlap term is shared with the seat pool by construction:
-        # _util.should_enable_overlap_headroom uses the same `not has_pp() and
-        # overlap on` shape, so a retiring cohort that outlives its seat is
-        # covered on both sides and the two pools stay equal in the ordinary case.
-        # The disagg term has no seat-pool counterpart on purpose -- a
-        # transfer-phase request holds no sequence slot at all
-        # (SeqSlotManager.prepare_resources skips DISAGG_GENERATION_INIT) -- and
-        # the seat gate additionally suppresses itself for hybrid/SSM models and
-        # under the V1 capacity schedulers. So where the two disagree this pool is
-        # the more generous one: `validate_seq_slot_pool_covers_admission` requires
-        # it to cover the seat pool, not to equal it. Spare index leases cost a
-        # few page-table rows; spare seats would cost sampler and
-        # speculative-decoding state.
+        # In disaggregated mode, use a coefficient of 2: at any moment up to
+        # `max_num_sequences` requests can be actively generating while another
+        # up to `max_num_sequences` requests are still in KV transfer
+        # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
+        # capacity lets the next batch of active requests acquire slots without
+        # waiting for the previous batch's transfers to finish. With the overlap
+        # scheduler on (non-PP), a retiring request holds its lease one extra
+        # iteration and needs the same coefficient.
         max_num_sequences = max_batch_size * mapping.pp_size
         needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
@@ -1726,16 +1705,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
-        # Admission bound for real requests, excluding the reserved slots that
-        # only ever hold persistent dummies. Published so the sequence-slot pool
-        # can be checked against it at startup.
         self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
-        # longer be comparable with the run it is being read against. For the
-        # same reason it stays out of `max_admissible_sequences`, which is the
-        # bound the sequence-slot pool is validated against.
+        # longer be comparable with the run it is being read against.
         index_mapper_capacity = (
             self.max_admissible_sequences
             + num_reserved_index_slots

@@ -185,12 +185,6 @@ class ADPRouter(ABC):
 
     def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
         self.dist = dist
-        # Defaults off, and deliberately so: dropping retiring requests from the
-        # per-rank counts admission subtracts from its capacity lets residency
-        # exceed max_batch_size * pp_size, which is only safe when the seat pool
-        # was sized for it (_util.should_enable_overlap_headroom). A caller that
-        # forgets the flag should get the conservative accounting, not a pool
-        # overrun.
         self.exclude_retiring_requests = has_seq_slot_headroom
 
     @classmethod
@@ -207,8 +201,7 @@ class ADPRouter(ABC):
         Args:
             dist: Distributed communicator.
             has_seq_slot_headroom: Whether the executor's sequence-slot pool was
-                sized with the extra overlap headroom. The retiring-request
-                correction is only applied when those extra seats exist.
+                sized with the extra overlap headroom.
             kv_cache_manager: KV cache manager instance (may be None).
             attention_dp_config: AttentionDpConfig instance (may be None).
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
@@ -289,9 +282,6 @@ class ADPRouter(ABC):
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
         """
-        # A request whose teardown the overlap scheduler has merely deferred is
-        # not load, and must not hold admission capacity that nothing can spend
-        # (nvbug 6627795).
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
             num_retiring_requests = len(active_requests) - len(active_requests_for_overlap)
@@ -299,8 +289,6 @@ class ADPRouter(ABC):
             active_requests_for_overlap = active_requests
             num_retiring_requests = 0
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
-        # Reported separately so the executor loop can still tell that these
-        # ranks are not idle and keep its idle-fetch wait collective.
         local_state.num_retiring_requests = num_retiring_requests
         local_state.copy_iter_stats_from(iter_stats_payload)
         responses = self.dist.tp_allgather(local_state.serialize())

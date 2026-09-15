@@ -1117,8 +1117,6 @@ class MTPEagleDynamicTreeResourceManager(BaseResourceManager):
             num_seq_slots=num_seq_slots,
         )
         # MTP hidden-state slot pools (needed by MTPEagleWorker drafter inputs).
-        # num_seq_slots is forwarded because those pools are keyed by live-request
-        # identity; see MTPHiddenStatesManager.__init__.
         self._mtp_hidden_states_manager = MTPHiddenStatesManager(
             config,
             dtype,

@@ -255,14 +255,6 @@ class SpecTreeManager:
             self._internal_buf_dim = max_total_draft_tokens + 1
         self.eagle_choices = eagle_choices
         self.num_trees = max_num_requests if use_dynamic_tree else 1
-        # ``num_trees`` sizes the per-forward *work* buffers, which are indexed by
-        # batch position and so correctly stay at max_batch_size -- the micro-batch
-        # scheduler caps every forward there. ``num_slots`` sizes DynamicTreeSlotStorage,
-        # which is indexed by ``py_seq_slot`` and must therefore span the executor's
-        # sequence-slot pool: the overlap headroom makes that 2 * max_batch_size
-        # so a retiring request can keep its slot for one more iteration while
-        # its replacement is admitted (nvbug-6627795).
-        # None preserves the historical max_batch_size sizing.
         self.num_slots = max(num_seq_slots or 0, max_num_requests)
         self.dynamic_tree_max_topK = dynamic_tree_max_topK
         self.cur_draft_layer_idx = 0

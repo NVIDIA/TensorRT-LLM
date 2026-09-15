@@ -65,21 +65,10 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.mapping import Mapping
 
 # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
-#
-# The two terms are mutually exclusive rather than combined: pipeline depth
-# already puts pp_size micro-batches in flight, so the PP branch takes pp_size
-# and ignores the headroom entirely. The gate never turns the headroom on under
-# PP (see test_overlap_headroom_gate), so the pp>1 rows only pin that the branch
-# cannot start compounding.
-#
-# Disaggregation is absent from this table on purpose -- see
-# test_seat_pool_has_no_disagg_term.
 SIZING_CASES = [
     # No PP: aggregated baseline, then the extra micro-batch.
     (1, False, False, 1),
     (1, False, True, 2),
-    # The headroom is a no-op with the overlap scheduler off: the retiring cohort
-    # is torn down in-line, so it never coexists with its replacement.
     (1, True, True, 1),
     # PP: sized by pp_size, with or without the flag set.
     (4, False, False, 4),
@@ -94,36 +83,13 @@ SIZING_CASES = [
     [
         # The scenario this PR exists for: attention DP, no PP, overlap on, V2.
         (True, 1, False, True, False, True),
-        # Same shape without attention DP: the seat pool stays at B. Only the
-        # ADP branch of _fetch_new_requests consumes
-        # ADPRouter.exclude_retiring_requests; the else-branch subtracts
-        # len(active_requests) with retirees included, so residency cannot
-        # exceed max_batch_size and the extra seats would be allocated but never
-        # occupied. The index pool still widens here, which is why the startup
-        # check is one-directional.
         (False, 1, False, True, False, False),
-        # Overlap off: the retiring cohort is torn down before the next
-        # iteration's admission runs.
         (True, 1, True, True, False, False),
-        # Pipeline parallelism: already sized by pp_size, and only the last stage
-        # marks a generation request GENERATION_TO_COMPLETE, so the router's
-        # correction is not rank-consistent. Out of scope.
         (True, 2, False, True, False, False),
         (True, 4, False, True, False, False),
-        # V1: BindCapacityScheduler and PyCapacityScheduler both hardcode
-        # no_schedule_after_state=GENERATION_COMPLETE, so the retiring cohort is
-        # still inside the capacity budget and no overcommit is possible.
         (True, 1, False, False, False, False),
-        # Hybrid/SSM: recurrent state is sized from max_batch_size in every
-        # manager, so extra seats would let residency outrun the state slots.
         (True, 1, False, True, True, False),
-        # Both exclusions at once, as in
-        # examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml.
         (True, 1, False, False, True, False),
-        # Attention DP is necessary, not merely one term among several: with it
-        # off, every other combination stays closed too. These rows exist so that
-        # dropping the ADP conjunct cannot be a silent change -- it would have to
-        # flip a row here.
         (False, 1, True, True, False, False),
         (False, 2, False, True, False, False),
         (False, 1, False, False, False, False),
@@ -337,12 +303,8 @@ def test_sizing_matches_kv_manager_admission_bound(
     extra_leases = is_disagg or overlap_term
     admission_bound = max_batch_size * pp_size * (2 if extra_leases else 1)
 
-    # The invariant the startup validator enforces, and the whole point of this
-    # test: it must hold on all 16 combinations, not just the ADP ones.
     assert admission_bound >= seats
 
-    # Where the two differ, the manager is the wider one and the factor is
-    # exactly 2 -- never some other ratio, and never in the other direction.
     if extra_leases and not enable_overlap_headroom:
         assert admission_bound == 2 * seats
     else:

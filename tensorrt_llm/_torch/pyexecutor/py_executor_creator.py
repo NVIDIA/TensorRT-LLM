@@ -736,9 +736,6 @@ def _create_py_executor_impl(
             if mapping.is_last_pp_rank():
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The guided decoder's state is indexed by py_seq_slot
-                    # (guided_decoder.py: grammar_matchers[req.seq_slot], the
-                    # bitmask rows), so it must span the whole seat pool.
                     "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,

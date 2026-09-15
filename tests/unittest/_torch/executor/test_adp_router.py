@@ -51,9 +51,6 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False, has_pp=False):
     dist.tp_rank = tp_rank
     dist.tp_size = tp_size
     dist.has_cp_helix = has_cp_helix
-    # ADPRouter reads this to decide whether to route on the overlap-corrected
-    # active list; a bare MagicMock would make has_pp() truthy and silently
-    # disable the correction in every test.
     dist.mapping.has_pp.return_value = has_pp
     return dist
 
@@ -149,11 +146,6 @@ def _retiring_request(prompt_len=100):
 
 
 class TestBuildActiveRequestsForOverlap:
-    # Retiring requests linger in active_requests for one extra iteration when
-    # the overlap scheduler is on. They must not be charged against ADP
-    # admission capacity, because no scheduler can ever forward them again
-    # (nvbug-6627795). Every other lingering state still owns a seat and KV, so
-    # it must keep counting.
     def test_empty(self):
         assert build_active_requests_for_overlap([]) == []
         assert count_retiring_requests([]) == 0
@@ -189,9 +181,6 @@ class TestBuildActiveRequestsForOverlap:
         assert count_retiring_requests(reqs) == 2
 
     def test_returns_a_new_list(self):
-        # The filtered list is the ROUTER's view only; mutating it must never
-        # disturb PyExecutor.active_requests, whose teardown ordering is what
-        # created the bug in the first place.
         reqs = [Mock(state=LlmRequestState.GENERATION_IN_PROGRESS)]
         filtered = build_active_requests_for_overlap(reqs)
         assert filtered is not reqs
@@ -199,9 +188,6 @@ class TestBuildActiveRequestsForOverlap:
         assert len(reqs) == 1
 
     def test_bare_mock_is_not_retiring(self):
-        # Router tests build requests with bare Mocks that never set `state`.
-        # Identity comparison against the enum keeps those routable; a truthy
-        # bound-property check would drop every one of them.
         req = Mock(py_orig_prompt_len=10)
         assert build_active_requests_for_overlap([req]) == [req]
         assert count_retiring_requests([req]) == 0
@@ -368,9 +354,6 @@ class TestDefaultADPRouter:
         assert state.num_active_tokens == 300
 
     def test_create_rank_state_does_not_filter_retiring_itself(self):
-        # create_rank_state stays overlap-agnostic: it reports what it is given.
-        # The correction lives in gather_all_rank_states, so a router author
-        # cannot forget it.
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist)
         active = [
@@ -382,9 +365,6 @@ class TestDefaultADPRouter:
         assert state.num_active_tokens == 300
 
     def test_gather_all_rank_states_excludes_retiring(self):
-        # Two of three requests are retiring, so only one is routable load --
-        # and the tokens of the retiring pair go with them, because the filtered
-        # list is what create_rank_state sums.
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [
@@ -400,13 +380,9 @@ class TestDefaultADPRouter:
         assert states[0].num_active_requests == 1
         assert states[0].num_retiring_requests == 2
         assert states[0].num_active_tokens == 100
-        # The executor's own list is untouched -- only the router's view narrows.
         assert len(active) == 3
 
     def test_gather_all_rank_states_reports_zero_when_all_retiring(self):
-        # Nothing routable, but the rank is NOT idle: the retiring requests are
-        # still resident. num_retiring_requests carries that fact to every peer
-        # so the idle-fetch wait stays collective (nvbug-6627795).
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [_retiring_request(), _retiring_request()]
@@ -419,13 +395,6 @@ class TestDefaultADPRouter:
         assert states[0].num_retiring_requests == 2
 
     def test_gather_all_rank_states_keeps_retiring_without_headroom(self):
-        # Without seat headroom the correction is off, whatever the topology.
-        # The correction lets a rank hold more requests than it is charged for,
-        # so it is only sound when the sequence-slot pool was sized with the
-        # extra generation of seats -- e.g. hybrid/SSM architectures are excluded
-        # from the headroom because their state-slot pool is sized from
-        # max_batch_size alone, and the router must follow that exclusion rather
-        # than re-derive its own predicate.
         dist = _mock_dist(tp_rank=0, has_cp_helix=False, has_pp=True)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=False)
         assert router.exclude_retiring_requests is False
@@ -438,17 +407,11 @@ class TestDefaultADPRouter:
 
         states = router.gather_all_rank_states(active_requests=active)
 
-        # Same inputs as test_gather_all_rank_states_excludes_retiring, which
-        # asserts 1 / 2 / 100 -- here nothing is filtered.
         assert states[0].num_active_requests == 3
         assert states[0].num_retiring_requests == 0
         assert states[0].num_active_tokens == 600
 
     def test_exclude_retiring_requests_follows_the_seat_pool_headroom(self):
-        # The flag tracks the *engine's* headroom flag and nothing else, so the
-        # correction can only ever spend seats that were actually allocated. It
-        # used to re-derive the predicate as `not dist.mapping.has_pp()`, which
-        # is a second copy of a fact the sizing gate already owns.
         for has_pp in (False, True):
             dist = _mock_dist(has_pp=has_pp)
             assert (
@@ -461,27 +424,16 @@ class TestDefaultADPRouter:
             )
 
     def test_router_factory_requires_the_headroom_flag(self):
-        # Required rather than defaulted: a caller that silently got the
-        # aggressive behaviour would be re-introducing the skew this parameter
-        # exists to remove. There is exactly one production call site
-        # (PyExecutor.__init__), which passes the engine's flag.
         params = inspect.signature(ADPRouter.create).parameters
         assert params["has_seq_slot_headroom"].default is inspect.Parameter.empty
 
     def test_router_constructors_default_to_no_headroom(self):
-        # The constructors keep a default for direct instantiation, and it must
-        # be the conservative one: a router that drops retiring requests from
-        # the counts admission subtracts, without a seat pool sized for it, lets
-        # residency exceed max_batch_size * pp_size.
         for cls in (DefaultADPRouter, ConversationAwareADPRouter, KVCacheAwareADPRouter):
             default = inspect.signature(cls.__init__).parameters["has_seq_slot_headroom"].default
             assert default is False, cls.__name__
 
     @pytest.mark.parametrize("has_seq_slot_headroom", [True, False])
     def test_router_factory_propagates_the_headroom_flag(self, has_seq_slot_headroom):
-        # Every branch of the factory, not just the default one: the KV-cache-
-        # aware and conversation-affinity routers run the same admission
-        # correction and need the same gate.
         dist = _mock_dist(tp_size=2)
         mgr = Mock(enable_block_reuse=True)
         configs = [
@@ -1535,8 +1487,6 @@ class TestConversationAwareADPRouter:
         assert state.num_active_tokens == 150
 
     def test_gather_all_rank_states_excludes_retiring(self):
-        # The filter sits in the shared ADPRouter.gather_all_rank_states, so it
-        # applies to this router without a line of router-specific code.
         dist = _mock_dist(tp_rank=2)
         router = ConversationAwareADPRouter(dist=dist)
         active = [
@@ -1552,9 +1502,6 @@ class TestConversationAwareADPRouter:
         assert states[0].num_active_tokens == 100
 
     def test_factory_selects_conversation_router(self):
-        # has_seq_slot_headroom is required rather than defaulted (see
-        # test_router_factory_requires_the_headroom_flag), so every call site states
-        # it -- including the ones that are only about which class gets built.
         cfg = MagicMock()
         cfg.kv_cache_routing_conversation_affinity = True
         cfg.kv_cache_routing_max_sessions = 8

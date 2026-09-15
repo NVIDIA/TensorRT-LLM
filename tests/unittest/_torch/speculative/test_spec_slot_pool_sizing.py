@@ -139,8 +139,6 @@ def test_mtp_hidden_states_pool_spans_the_slot_pool(num_seq_slots, expected_pool
     assert mgr.mtp_past_hidden_states_pool.shape[0] == expected_pool
     assert mgr.mtp_past_tokens_pool.shape[0] == expected_pool
     assert mgr.mtp_relaxed_delta_pool.shape[0] == expected_pool
-    # Batch-position state is unaffected: the forward batch is still capped at
-    # max_batch_size by the micro-batch scheduler.
     assert mgr.get_max_resource_count() == R
 
 
@@ -164,19 +162,13 @@ def test_mtp_slot_pool_survives_a_full_overlap_turnover():
 
 
 # ---------------------------------------------------------------------------
-# Resource managers. Unlike SpecMetadata there is no single exit point to stamp
-# the pool onto, so the plumbing is per-branch -- which is exactly how three
-# managers were missed in a row. The AST guard below makes forgetting a branch a
-# test failure instead of a runtime IndexError.
+# Resource managers. The plumbing is per-branch, so the AST guard below makes
+# forgetting a branch a test failure rather than a runtime IndexError.
 # ---------------------------------------------------------------------------
 
-#: Managers that legitimately do not take a slot pool. Adding a name here must be
-#: a deliberate act with a reason, which is the point of the allow-list.
+#: Managers that legitimately do not take a slot pool.
 _MANAGERS_WITHOUT_A_SLOT_POOL = {
-    # The n-gram pool is keyed by pattern, not by request identity, and NGRAM is
-    # absent from SpeculativeDecodingMode.support_overlap_scheduler(), so
-    # py_executor_creator forces the overlap scheduler off and the headroom can
-    # never apply.
+    # Keyed by pattern, not request identity, and NGRAM never runs with overlap.
     "NGramPoolManager",
     # Hidden-state export path; no per-request slot pool.
     "SaveHiddenStatesResourceManager",
@@ -305,9 +297,7 @@ def test_marking_a_high_slot_invalid_needs_the_pool():
 
 
 def _eagle_config():
-    # Deliberately not an EagleDecodingConfig: that keeps max_total_draft_tokens
-    # on the max_draft_len branch and leaves spec_tree_manager unbuilt, so this
-    # exercises slot_manager sizing only.
+    # Deliberately not an EagleDecodingConfig: leaves spec_tree_manager unbuilt.
     return types.SimpleNamespace(
         max_draft_len=2,
         num_capture_layers=1,
