@@ -26,7 +26,7 @@ import aiohttp
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.conftest import get_sm_version, skip_no_hopper
+from defs.conftest import get_sm_version, llm_models_root, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
                                get_registered_worker_urls, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -231,7 +231,7 @@ class ConditionalWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs, internal_request_auth_key)
@@ -285,7 +285,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs, internal_request_auth_key)
@@ -406,7 +406,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  tokens_per_block: int = 32,
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
@@ -552,10 +552,9 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             assert info["matches"][0] < first_match
 
 
-def prepare_llama_model(llama_model_root: str, llm_venv):
+def prepare_llama_model(qwen_model_root: str, llm_venv):
     src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
@@ -677,14 +676,13 @@ def background_workers(llm_venv, config_file: str):
 
 
 @pytest.mark.skip(reason="https://nvbugs/5372970")
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_workers_conditional_disaggregation(disaggregated_test_root,
                                             disaggregated_example_root,
-                                            llm_venv, llama_model_root):
+                                            llm_venv):
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
-    prepare_llama_model(llama_model_root, llm_venv)
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -725,14 +723,12 @@ def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_workers_kv_cache_events(disaggregated_test_root,
-                                 disaggregated_example_root, llm_venv,
-                                 llama_model_root):
+                                 disaggregated_example_root, llm_venv):
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
-    prepare_llama_model(llama_model_root, llm_venv)
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -745,15 +741,13 @@ def test_workers_kv_cache_events(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts, 6))
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_workers_kv_cache_aware_router(disaggregated_test_root,
-                                       disaggregated_example_root, llm_venv,
-                                       llama_model_root):
+                                       disaggregated_example_root, llm_venv):
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
-    prepare_llama_model(llama_model_root, llm_venv)
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -797,14 +791,13 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
         asyncio.run(tester.test_multi_round_request(prompts, 8, 4))
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
                                                 disaggregated_example_root,
-                                                llm_venv, llama_model_root):
+                                                llm_venv):
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
-    prepare_llama_model(llama_model_root, llm_venv)
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers, _,
@@ -825,7 +818,7 @@ class ConversationRouterTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs, internal_request_auth_key)
@@ -1003,15 +996,13 @@ class ConversationRouterTester(BasicWorkerTester):
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(3)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_workers_conversation_router(disaggregated_test_root,
-                                     disaggregated_example_root, llm_venv,
-                                     llama_model_root):
+                                     disaggregated_example_root, llm_venv):
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_conversation_workers.yaml')
-    prepare_llama_model(llama_model_root, llm_venv)
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
                             config_file) as (ctx_servers, gen_servers,

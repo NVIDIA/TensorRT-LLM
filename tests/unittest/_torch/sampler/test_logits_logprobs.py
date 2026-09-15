@@ -99,7 +99,7 @@ def llm(
         )
 
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         disable_overlap_scheduler=disable_overlap_scheduler,
@@ -112,7 +112,7 @@ def llm(
 @pytest.fixture(scope="module")
 def simple_llm() -> LLM:
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         max_batch_size=8,
         kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
@@ -825,7 +825,7 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
 @force_ampere
 @pytest.mark.gpu2
 def test_logprobs_match_hf_tp2():
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     llm = LLM(
         model=model_path,
         tensor_parallel_size=2,
@@ -881,7 +881,7 @@ def test_logprobs_pp2():
     Without the fix, logprobs length = 2N-1 instead of N due to duplication
     in the PP ring broadcast diff mechanism.
     """
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     max_tokens = 16
     llm = LLM(
         model=model_path,

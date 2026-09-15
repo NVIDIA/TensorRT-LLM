@@ -640,7 +640,7 @@ class TestGenerateValidation:
 # End-to-end gRPC service tests (with real model)
 # ============================================================================
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3/Qwen3-0.6B"
 
 
 def get_model_path(model_name):

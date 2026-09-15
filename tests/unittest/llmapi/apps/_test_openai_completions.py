@@ -15,7 +15,7 @@ from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module", params=["pytorch"])

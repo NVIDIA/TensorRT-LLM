@@ -166,8 +166,8 @@ l0_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp[DeepSeek-V3-Lite-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_tinyllama_multi_orchestrator[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_load_balance
+  - disaggregated/test_disaggregated.py::test_disaggregated_tinyllama_multi_orchestrator
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-DeepSeek-V3-Lite-fp8/fp8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-DeepSeek-V3-Lite-fp8/fp8]
@@ -178,11 +178,11 @@ l0_h100:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-Qwen3-0.6B]
   # Encoder-decoder Hopper smoke: CUDA-graph beam/greedy, kv-v2, overlap.
   # The primary pre-merge set runs on L40S (l0_l40s.yml); the full
   # dtype/model-size matrix runs post-merge below.
@@ -241,10 +241,10 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
+    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-Qwen3-0.6B]
+    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-Qwen3-0.6B]
+    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-Qwen3-0.6B]
+    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-Qwen3-0.6B]
     - unittest/_torch/executor/test_overlap_scheduler.py
     - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp1" TIMEOUT (90)
     - unittest/executor/test_shim_ray.py

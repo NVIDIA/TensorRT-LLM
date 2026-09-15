@@ -44,7 +44,7 @@ class RemoteOpenAIServer:
 @pytest.fixture(scope="module")
 def model_name():
     """Use TinyLlama for faster testing"""
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")
