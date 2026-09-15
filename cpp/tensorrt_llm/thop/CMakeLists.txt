@@ -47,13 +47,13 @@ add_library(
   asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  moe/cuteDslMoeUtilsOp.cpp
+  moe/cuteDsl/cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   marlinNvfp4MM.cpp
-  moe/marlinNvfp4MoeMM.cpp
+  moe/marlin/marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
   fmhaPackMaskOp.cpp
@@ -93,7 +93,7 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
-  moe/moeOp.cpp
+  moe/cutlass/moeOp.cpp
   moe/moeUtilOp.cpp
   moe/moeGateOp.cpp
   moe/moeCommOp.cpp
@@ -101,12 +101,12 @@ add_library(
   moe/moeLoadBalanceOp.cpp
   moe/moeAlignOp.cpp
   moe/megaMoePrepareOp.cpp
-  moe/mxFp4BlockScaleMoe.cpp
+  moe/trtllmGen/mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
-  moe/fp8BlockScaleMoe.cpp
-  moe/fp8PerTensorScaleMoe.cpp
-  moe/fp4BlockScaleMoe.cpp
+  moe/trtllmGen/fp8BlockScaleMoe.cpp
+  moe/trtllmGen/fp8PerTensorScaleMoe.cpp
+  moe/trtllmGen/fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
