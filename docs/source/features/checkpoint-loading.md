@@ -110,12 +110,26 @@ checkpoint bytes reach host memory:
   is still queued or active can no longer improve first-token latency and is
   stopped. A worker already blocked in a synchronous `pread` must finish its
   current 8 MiB read before shutdown, so degraded storage can delay the join.
+- `demand_ordered_rank_striped_read_ahead` is an explicit experimental variant
+  that uses mapper demand hints to prioritize complete read-ahead chunks across
+  node-local ranks. It retains every chunk, existing full-checkpoint memory
+  admission, and native materialization. It does not add consumption-based
+  pacing, destination-selective reads, or a streaming materializer. `auto`
+  continues to select the original rank-striped policy.
 
 ```yaml
 checkpoint_format: HF
 load_format: auto
 checkpoint_io_policy: rank_striped_read_ahead
 ```
+
+Policy IDs and display metadata are centralized in
+`tensorrt_llm/_checkpoint_io_policy.py`. `auto` is a selector, not a separate
+loading implementation. Display names may evolve without changing the stable
+configuration IDs; future modes become selectable only when implemented.
+The generated LLM-args telemetry manifest records the accepted IDs for tools
+that must not import TRT-LLM. Eligibility, fallback, and CI allocation remain
+separate from the catalog.
 
 The optimized path currently requires identical policy configuration across
 all ranks, the automatically constructed built-in HF loader
@@ -156,6 +170,50 @@ node, not a host-wide arbitration mechanism across colocated independent
 TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
 effective policy, so `auto` selection and native fallback remain observable;
 activation logs also report the local reader assignment.
+
+### Demand-ordering qualification
+
+Select `checkpoint_io_policy: demand_ordered_rank_striped_read_ahead` in the
+normal HF configuration. The same eligibility restrictions apply to both
+rank-striped policies. Demand planning runs after mapper initialization and
+before the new readers are released. Opaque plans use physical order; qualified
+hints prioritize earlier demands while preserving physical locality among
+equal priorities and retaining an unmatched physical-order tail. Advisory
+ordering is not proof that source data can be omitted.
+
+The generic mapper prioritizes explicit native preload groups; concurrently
+loaded modules share a priority. It does not infer an exact tensor-consumption
+timeline or impose a serial layer order. Unsupported ordering stays opaque.
+
+For a planning-cost ablation, set
+`TRTLLM_DEMAND_ORDERED_READ_AHEAD_PHYSICAL_ORDER=1` on every rank. This still
+builds and validates the demand plan but applies physical read order. Leave it
+unset for demand ordering. The switch affects only the experimental policy.
+
+Compare four cases using the same TRT-LLM revision, runtime image, checkpoint,
+GPU/node, parallel configuration, and controlled source-cache conditions:
+
+| Case | Policy | Physical-order ablation |
+| --- | --- | --- |
+| Native control | `native` | Unset |
+| Original rank-striped | `rank_striped_read_ahead` | Unset |
+| Planning overhead | `demand_ordered_rank_striped_read_ahead` | `1` |
+| Demand ordering | `demand_ordered_rank_striped_read_ahead` | Unset |
+
+Repeat cold and warm trials with counterbalanced order. Start with Qwen,
+Llama Maverick, and a preprocessing-heavy model; include TP and PP/EP cases.
+Check generation/weight parity, memory peaks, effective policy and applied
+order, and net model-loading latency. Do not infer a speedup from read bandwidth
+or weight population alone. The experimental policy includes its additional
+planning/activation in preparation; existing native/v1 phase boundaries are
+unchanged. Compare total model-loading time as well as the checkpoint phases,
+so unclassified work such as mapper initialization is not hidden. These metrics
+do not measure process launch to first token.
+
+Explicit policy configurations bypass the regular CI `auto`/`native`
+assignment. Keep demand-ordered observations separate from the original
+rank-striped treatment and retain the physical-order ablation setting with
+benchmark results.
 
 ### CI startup experiment
 
