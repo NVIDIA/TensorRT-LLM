@@ -449,6 +449,49 @@ class TestStep3p7Helpers(unittest.TestCase):
                     python_output.assert_called_once()
                     experts.assert_not_called()
 
+    @parameterized.expand(
+        [
+            (
+                "materialization_raises",
+                ValueError("invalid expert layout"),
+                "could not materialize",
+            ),
+            ("weights_remain_unloaded", None, "did not materialize"),
+        ]
+    )
+    def test_load_weights_fails_closed_when_required_clamp_weights_are_unavailable(
+        self, _name, materialization_error, expected_message
+    ):
+        """Clamp-active Python experts must fail closed on both loader failure modes."""
+        import tensorrt_llm._torch.models.modeling_step3p7 as step3p7_module
+
+        moe = types.SimpleNamespace(
+            layer_idx=3,
+            _use_python_experts=True,
+            _clamp_weights_loaded=False,
+            _requires_python_clamp_weights=lambda: True,
+            load_clamp_weights_from_fp8_experts=MagicMock(side_effect=materialization_error),
+        )
+        model = types.SimpleNamespace(
+            ignored_key_prefixes=(),
+            text_config=object(),
+            model=types.SimpleNamespace(layers=[types.SimpleNamespace(moe=moe)]),
+            _capture_bf16_clamp_weights=MagicMock(),
+        )
+
+        with (
+            patch.object(step3p7_module, "rewrite_language_model_keys"),
+            patch.object(step3p7_module, "rewrite_mtp_weights_for_step3p7"),
+            patch.object(step3p7_module, "split_stacked_moe_weights"),
+            patch.object(
+                step3p7_module.DecoderModelForCausalLM,
+                "load_weights",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(RuntimeError, f"{expected_message}.*dequantized expert weights"),
+        ):
+            step3p7_module.Step3p7ForCausalLM.load_weights(model, {})
+
     def test_mtp_head_normalizes_before_output_projection(self):
         """Step3p7 MTP applies shared-head norm only when producing draft logits."""
         from tensorrt_llm._torch.model_config import ModelConfig
