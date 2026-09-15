@@ -294,8 +294,4 @@ unittest/scripts/test_perf_sanity_helpers.py::test_every_device_step_time_metric
 unittest/scripts/test_perf_sanity_helpers.py::test_every_gated_metric_is_actually_emitted SKIP (https://nvbugs/6770503)
 unittest/scripts/test_perf_sanity_helpers.py::test_every_written_line_parses_and_none_shadows_another SKIP (https://nvbugs/6770503)
 unittest/scripts/test_perf_sanity_helpers.py::test_sentinel_timeout_falls_back_to_current_gen_logs SKIP (https://nvbugs/6770503)
-verl/test_verl_cases.py::test_async_generate SKIP (https://nvbugs/6683838)
-verl/test_verl_cases.py::test_async_memory_management SKIP (https://nvbugs/6683838)
-verl/test_verl_cases.py::test_init_without_device_mesh SKIP (https://nvbugs/6683838)
-verl/test_verl_cases.py::test_inter_node_trtllm_rollout SKIP (https://nvbugs/6683838)
 verl/test_verl_cases.py::test_trtllm_abort SKIP (https://nvbugs/6272653)
