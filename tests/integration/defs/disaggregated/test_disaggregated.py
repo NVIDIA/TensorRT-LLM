@@ -1108,8 +1108,8 @@ def run_disaggregated_test(example_dir,
 
 
 def test_disaggregated_diff_max_tokens(disaggregated_test_root,
-                                       disaggregated_example_root, llm_venv,
-                                       qwen_model_root):
+                                       disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1121,8 +1121,8 @@ def test_disaggregated_diff_max_tokens(disaggregated_test_root,
 
 
 def test_disaggregated_single_gpu(disaggregated_test_root,
-                                  disaggregated_example_root, llm_venv,
-                                  qwen_model_root):
+                                  disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1196,7 +1196,8 @@ def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
 
 def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
                                                     disaggregated_example_root,
-                                                    llm_venv, qwen_model_root):
+                                                    llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1210,8 +1211,8 @@ def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
 
 
 def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
-                                          disaggregated_example_root, llm_venv,
-                                          qwen_model_root):
+                                          disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1227,7 +1228,8 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
                          ["load_balancing", "kv_cache_aware", "conversation"])
 def test_disaggregated_router(disaggregated_test_root,
                               disaggregated_example_root, llm_venv,
-                              qwen_model_root, router_type):
+                              router_type):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1238,11 +1240,11 @@ def test_disaggregated_router(disaggregated_test_root,
 
 
 def test_disaggregated_benchmark_gen_only_insufficient_kv(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        qwen_model_root):
+        disaggregated_test_root, disaggregated_example_root, llm_venv):
     """Test that gen-only benchmark mode raises an error when KV cache is too small to hold all benchmark requests, instead of hanging forever."""
     import openai
 
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1297,8 +1299,8 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
 
 @pytest.mark.skip_less_device(4)
 def test_disaggregated_genbs1(disaggregated_test_root,
-                              disaggregated_example_root, llm_venv,
-                              qwen_model_root):
+                              disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1312,8 +1314,8 @@ def test_disaggregated_genbs1(disaggregated_test_root,
 
 @pytest.mark.skip_less_device(2)
 def test_disaggregated_multi_gpu(disaggregated_test_root,
-                                 disaggregated_example_root, llm_venv,
-                                 qwen_model_root):
+                                 disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1324,7 +1326,8 @@ def test_disaggregated_multi_gpu(disaggregated_test_root,
 
 
 def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
-                                  disaggregated_example_root, qwen_model_root):
+                                  disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1335,7 +1338,8 @@ def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, qwen_model_root):
+                             disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1346,7 +1350,8 @@ def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
-                               disaggregated_example_root, qwen_model_root):
+                               disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     def post_client_test(server_url: str):
@@ -1365,7 +1370,8 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 @pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
 def test_disaggregated_overlap_gen_first(disaggregated_test_root,
                                          disaggregated_example_root, llm_venv,
-                                         qwen_model_root, ctx_pp):
+                                         ctx_pp):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     src_dst_dict = {
         qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
@@ -1388,8 +1394,8 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
 
 
 def test_disaggregated_overlap_transceiver_runtime_python(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        qwen_model_root):
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1408,8 +1414,8 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 # back to a non-fabric allocation, which would defeat the purpose of this test.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
 def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        qwen_model_root):
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1436,8 +1442,8 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 # test instead of passing quietly.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
 def test_disaggregated_overlap_transceiver_runtime_python_bounce(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        qwen_model_root):
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
@@ -1580,8 +1586,7 @@ def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
 
 
 def test_disaggregated_python_transceiver_host_offload(
-        disaggregated_test_root, llm_venv, disaggregated_example_root,
-        qwen_model_root):
+        disaggregated_test_root, llm_venv, disaggregated_example_root):
     """E2E regression for block_id -> primary-slot translation in the Python disagg cache transceiver.
 
     See `_verify_python_transceiver_under_host_offload` for what this
@@ -1590,6 +1595,7 @@ def test_disaggregated_python_transceiver_host_offload(
     that prefix reuse is forced through an offload+onboard cycle before
     each KV transfer.
     """
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
@@ -1607,8 +1613,8 @@ def test_disaggregated_python_transceiver_host_offload(
 
 
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
-                                    disaggregated_example_root, qwen_model_root,
-                                    tmp_path):
+                                    disaggregated_example_root, tmp_path):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     perf_metrics_output_dir = str(tmp_path / "perf_metrics")
@@ -1636,8 +1642,8 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
 def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                                                   llm_venv,
-                                                  disaggregated_example_root,
-                                                  qwen_model_root):
+                                                  disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1650,8 +1656,8 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
 
 
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
-                                            disaggregated_example_root,
-                                            qwen_model_root):
+                                            disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
@@ -1704,8 +1710,8 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
-                                    disaggregated_example_root,
-                                    qwen_model_root):
+                                    disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1716,8 +1722,8 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           qwen_model_root):
+                                           disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1728,7 +1734,8 @@ def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
-                                   disaggregated_example_root, qwen_model_root):
+                                   disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     run_disaggregated_test(disaggregated_example_root,
@@ -1739,7 +1746,8 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
-                             disaggregated_example_root, qwen_model_root):
+                             disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
@@ -1749,7 +1757,8 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_sa(disaggregated_test_root, llm_venv,
-                          disaggregated_example_root, qwen_model_root):
+                          disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "sa",
@@ -1759,12 +1768,13 @@ def test_disaggregated_sa(disaggregated_test_root, llm_venv,
 
 
 def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
-                                 disaggregated_example_root, qwen_model_root):
+                                 disaggregated_example_root):
     """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
 
     NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
     covers this split only on the C++ DEFAULT backend.
     """
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "sa_python",
@@ -1775,8 +1785,8 @@ def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
 
 @pytest.mark.skip_less_device(4)
 def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     qwen_model_root):
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_genpp2",
@@ -1787,8 +1797,8 @@ def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
 
 @pytest.mark.skip_less_device(4)
 def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     qwen_model_root):
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2_genpp2",
@@ -1799,8 +1809,8 @@ def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
 
 @pytest.mark.skip_less_device(4)
 def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     qwen_model_root):
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp2_gentp2",
@@ -1811,8 +1821,8 @@ def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
 
 @pytest.mark.skip_less_device(8)
 def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
-                                           disaggregated_example_root,
-                                           qwen_model_root):
+                                           disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
@@ -1823,8 +1833,8 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
 
 @pytest.mark.skip_less_device(8)
 def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     qwen_model_root):
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
@@ -1836,8 +1846,8 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
 #tiny llama pp4 will have uneven layer per pp. pp4
 @pytest.mark.skip_less_device(8)
 def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
-                                     disaggregated_example_root,
-                                     qwen_model_root):
+                                     disaggregated_example_root):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_gentp4",

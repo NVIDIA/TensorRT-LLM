@@ -26,7 +26,7 @@ import aiohttp
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.conftest import get_sm_version, skip_no_hopper
+from defs.conftest import get_sm_version, llm_models_root, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
                                get_registered_worker_urls, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -678,9 +678,10 @@ def background_workers(llm_venv, config_file: str):
 @pytest.mark.skip(reason="https://nvbugs/5372970")
 def test_workers_conditional_disaggregation(disaggregated_test_root,
                                             disaggregated_example_root,
-                                            llm_venv, qwen_model_root):
+                                            llm_venv):
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
@@ -723,10 +724,10 @@ def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
 
 
 def test_workers_kv_cache_events(disaggregated_test_root,
-                                 disaggregated_example_root, llm_venv,
-                                 qwen_model_root):
+                                 disaggregated_example_root, llm_venv):
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
@@ -741,11 +742,11 @@ def test_workers_kv_cache_events(disaggregated_test_root,
 
 
 def test_workers_kv_cache_aware_router(disaggregated_test_root,
-                                       disaggregated_example_root, llm_venv,
-                                       qwen_model_root):
+                                       disaggregated_example_root, llm_venv):
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_cache_aware_balance.yaml')
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
@@ -792,9 +793,10 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
 
 def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
                                                 disaggregated_example_root,
-                                                llm_venv, qwen_model_root):
+                                                llm_venv):
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,
@@ -995,11 +997,11 @@ class ConversationRouterTester(BasicWorkerTester):
 @skip_no_hopper
 @pytest.mark.skip_less_device(3)
 def test_workers_conversation_router(disaggregated_test_root,
-                                     disaggregated_example_root, llm_venv,
-                                     qwen_model_root):
+                                     disaggregated_example_root, llm_venv):
     config_file = os.path.join(
         disaggregated_test_root,
         'test_configs/disagg_config_conversation_workers.yaml')
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     prepare_llama_model(qwen_model_root, llm_venv)
 
     with background_workers(llm_venv,

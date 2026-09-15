@@ -674,17 +674,6 @@ def llama_v2_tokenizer_model_root():
 
 
 @pytest.fixture(scope="function")
-def qwen_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    qwen_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
-    assert os.path.exists(
-        qwen_model_root
-    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return qwen_model_root
-
-
-@pytest.fixture(scope="function")
 def llama_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"

@@ -16,10 +16,11 @@
 import os
 
 from defs.common import venv_mpi_check_call
+from defs.conftest import llm_models_root
 
 
-def test_llm_api_single_gpu_with_mpirun(llmapi_example_root, llm_venv,
-                                        qwen_model_root):
+def test_llm_api_single_gpu_with_mpirun(llmapi_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     src_dst_dict = {
         qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }

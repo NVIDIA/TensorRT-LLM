@@ -20,7 +20,7 @@ import subprocess
 import time
 
 import requests
-from defs.conftest import get_sm_version
+from defs.conftest import get_sm_version, llm_models_root
 
 from tensorrt_llm.logger import logger
 
@@ -434,8 +434,8 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
 
 
 def test_automated_disaggregated_complete(disaggregated_test_root,
-                                          disaggregated_example_root, llm_venv,
-                                          qwen_model_root):
+                                          disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     src_dst_dict = {
         qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
