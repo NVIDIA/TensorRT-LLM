@@ -850,6 +850,16 @@ class Step3p7MoE(nn.Module):
             return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         return dev
 
+    def _requires_python_clamp_weights(self) -> bool:
+        """Whether falling through to the configured backend would change semantics."""
+        limit = self._routed_swiglu_limit
+        return (
+            self._use_python_clamp
+            and limit is not None
+            and limit > 0.0
+            and not self._moe_lora_enabled
+        )
+
     def _local_expert_ids(self) -> list[int]:
         ep_size = max(1, self.mapping.moe_ep_size)
         num_local = max(1, self.num_experts // ep_size)
@@ -950,6 +960,12 @@ class Step3p7MoE(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_size
         orig_shape = hidden_states.shape
         h = hidden_states.view(-1, self.hidden_size)
+
+        if self._requires_python_clamp_weights() and not self._clamp_weights_loaded:
+            raise RuntimeError(
+                f"Step3p7 layer {self.layer_idx} requires post-SiLU clamp weights, "
+                "but they were not populated during model loading."
+            )
 
         gate_input = h.to(torch.float32) if self.need_fp32_gate else h
         router_logits = self.gate(gate_input)
@@ -1750,11 +1766,21 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
             try:
                 moe.load_clamp_weights_from_fp8_experts()
             except (AttributeError, KeyError, RuntimeError, ValueError) as e:
+                if moe._requires_python_clamp_weights():
+                    raise RuntimeError(
+                        f"Step3p7 layer {moe.layer_idx} could not materialize the "
+                        "post-SiLU clamp weights required for correct execution."
+                    ) from e
                 _logger.warning(
                     "[Step3p7] failed to populate bf16 expert weights for layer %d (%s): %s. "
-                    "Forward will fall back to the FP8 backend without the Python path.",
+                    "Forward will use the configured backend.",
                     moe.layer_idx,
                     getattr(moe, "_python_path_reason", ""),
                     str(e)[:256],
+                )
+            if moe._requires_python_clamp_weights() and not moe._clamp_weights_loaded:
+                raise RuntimeError(
+                    f"Step3p7 layer {moe.layer_idx} did not materialize the post-SiLU "
+                    "clamp weights required for correct execution."
                 )
         return rc
