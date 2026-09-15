@@ -3522,33 +3522,19 @@ class PyTorchModelEngine(ModelEngine):
         token_num = int(
             token_num)  # Ensure int for range() in add_dummy_requests
 
-        if mixed_context_encoder_output_lens:
-            max_seq_len_requests = kv_cache_manager.add_dummy_requests(
-                request_ids=[batch_size - 1],
-                token_nums=[token_num],
-                is_gen=True,
-                max_num_draft_tokens=runtime_draft_token_buffer_width,
-                kv_reserve_draft_tokens=self.max_draft_loop_tokens,
-                use_mrope=self.use_mrope,
-                max_beam_width=self.max_beam_width,
-                encoder_output_lens=[max_encoder_output_len]
-                if is_enc_dec else None,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-                capture_sampling_params=capture_sampling_params)
-        else:
-            max_seq_len_requests = kv_cache_manager.add_dummy_requests(
-                request_ids=max_seq_len_request_ids,
-                token_nums=[token_num] * num_long_requests,
-                is_gen=True,
-                max_num_draft_tokens=runtime_draft_token_buffer_width,
-                kv_reserve_draft_tokens=self.max_draft_loop_tokens,
-                use_mrope=self.use_mrope,
-                max_beam_width=self.max_beam_width,
-                encoder_output_lens=[max_encoder_output_len]
-                if is_enc_dec else None,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-                capture_sampling_params=capture_sampling_params,
-                **max_seq_len_dummy_request_kwargs)
+        max_seq_len_requests = kv_cache_manager.add_dummy_requests(
+            request_ids=max_seq_len_request_ids,
+            token_nums=[token_num] * num_long_requests,
+            is_gen=True,
+            max_num_draft_tokens=runtime_draft_token_buffer_width,
+            kv_reserve_draft_tokens=self.max_draft_loop_tokens,
+            use_mrope=self.use_mrope,
+            max_beam_width=self.max_beam_width,
+            encoder_output_lens=[max_encoder_output_len]
+            if is_enc_dec else None,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            capture_sampling_params=capture_sampling_params,
+            **max_seq_len_dummy_request_kwargs)
 
         if max_seq_len_requests is None:
             free_warmup_requests()
