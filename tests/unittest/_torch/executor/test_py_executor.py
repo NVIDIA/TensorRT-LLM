@@ -2834,6 +2834,7 @@ class TestOneModelMTPDraftTokenScheduling:
             spec_config=spec_config,
             max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
             max_total_draft_tokens=cls.MAX_TOTAL_DRAFT_TOKENS,
+            runtime_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
         )
         ex.kv_cache_transceiver = None
         ex.is_shutdown = False

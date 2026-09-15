@@ -882,6 +882,17 @@ def update_spec_config_from_model_config(spec_config,
     if not spec_config.use_dynamic_tree:
         spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
+    # Vanilla MTP opts out of dynamic draft length (support_dynamic_draft_len):
+    # running only mtp_layers[:runtime_draft_len] would leave the other modules'
+    # KV cache stale. The mode is only known once the checkpoint resolved it.
+    if is_vanilla and spec_config.max_draft_len > 1 and (
+            spec_config.draft_len_schedule is not None
+            or spec_config.max_concurrency is not None):
+        logger.warning(
+            "MTP: draft_len_schedule / max_concurrency are ignored for vanilla "
+            f"MTP with {spec_config.max_draft_len} MTP modules; speculation "
+            "stays at max_draft_len. Use MTP-Eagle for dynamic draft lengths.")
+
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:
     """Populate spec config fields from loaded target and draft model configs."""
@@ -908,7 +919,9 @@ class SpecDecodingTensor:
 
 
 def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
-                                 batch_size: int, max_draft_len: int) -> int:
+                                 batch_size: int,
+                                 max_draft_len: int,
+                                 min_draft_len: int = 0) -> int:
     """
     Get the appropriate draft length for the given batch size using binary search.
 
@@ -924,9 +937,11 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
                             - batch size 1-4:   use draft_len=4 (up to key 4)
                             - batch size 5-8:   use draft_len=2 (up to key 8)
                             - batch size 9-32:  use draft_len=1 (up to key 32)
-                            - batch size 33+:   use draft_len=0 (speculation disabled, implicit)
+                            - batch size 33+:   use draft_len=0 (implicit)
         batch_size: Current batch size.
         max_draft_len: Maximum draft length to use if no schedule is provided.
+        min_draft_len: Floor for the resolved draft length, the implicit tier
+                       included (DecodingBaseConfig.min_runtime_draft_len).
 
     Returns:
         The draft length to use for this batch size.
@@ -943,10 +958,10 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     idx = bisect_left(schedule_batch_sizes, batch_size)
 
     if idx < len(schedule_batch_sizes):
-        return draft_len_schedule[schedule_batch_sizes[idx]]
+        return max(draft_len_schedule[schedule_batch_sizes[idx]], min_draft_len)
 
-    # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
-    return 0
+    # batch_size > all batch sizes in draft_len_schedule: implicit 0, floored
+    return min_draft_len
 
 
 def get_static_draft_len(model_engine: "ModelEngine") -> int:
@@ -993,7 +1008,7 @@ def update_draft_len(model_engine: "ModelEngine",
                 and spec_config.spec_dec_mode.support_dynamic_draft_len()):
             draft_len = get_draft_len_for_batch_size(
                 spec_config.draft_len_schedule, scheduled_batch.batch_size,
-                model_engine.max_draft_len)
+                model_engine.max_draft_len, spec_config.min_runtime_draft_len)
         else:
             # Static decoding preserves the proposals produced by the drafter,
             # including requests intentionally entering with no draft tokens.
@@ -1002,13 +1017,21 @@ def update_draft_len(model_engine: "ModelEngine",
 
     draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
     rejection_on = getattr(spec_config, "use_rejection_sampling", False)
+    # One-model rejection: the drafter scattered draft_probs rows [0, K_prev)
+    # last iteration, so when K rises the rows [K_prev, K) are stale and
+    # _prepare_tp_inputs one-hots them. K_prev is the previous resolution, not
+    # len(py_draft_tokens), which lags one iteration under the overlap
+    # scheduler. A request without a prior proposal has no scatter at all.
+    onehot_start = min(model_engine.runtime_draft_len, draft_len)
     for request in scheduled_batch.generation_requests:
         current_num_draft_tokens = len(request.py_draft_tokens)
-        # A generation request without a prior proposal has no draft-probability
-        # scatter. Preserve that fact before padding so input preparation can
-        # populate the one-hot placeholder instead of reading a stale row.
-        request.py_needs_onehot_draft_probs |= (rejection_on and
-                                                current_num_draft_tokens == 0)
+        if request.py_needs_onehot_draft_probs or (
+                rejection_on and current_num_draft_tokens == 0):
+            request.py_needs_onehot_draft_probs = True
+            request.py_onehot_draft_probs_start = 0
+        elif rejection_on and onehot_start < draft_len:
+            request.py_needs_onehot_draft_probs = True
+            request.py_onehot_draft_probs_start = onehot_start
         if spec_config is not None and spec_config.spec_dec_mode.is_pard():
             # PARD carries K proposals followed by K-1 placeholders.
             buffer_width = spec_config.get_runtime_tokens_per_gen_step(

@@ -397,7 +397,9 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_external_drafter() or self.is_sa()
 
     def support_dynamic_draft_len(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        # Vanilla MTP is excluded: it runs only mtp_layers[:runtime_draft_len],
+        # so a shorter draft length leaves the other modules' KV cache stale.
+        return self.is_eagle3_one_model(
         ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
         ) or self.is_draft_target_one_model() or self.is_sa()
 
@@ -1033,18 +1035,20 @@ class SpecMetadata:
             if prompt is not None:
                 penalty_ops.seed_prompt(self, slot, prompt, ignore_len)
 
-    def write_padding_onehot_draft_probs(self, padding_slot_ids, draft_len):
-        """Write a one-hot draft-prob row (prob 1.0 at draft-vocab token id 0,
-        the placeholder token) into each padding gen request's stable slot row.
+    def write_padding_onehot_draft_probs(self, padding_slot_ids, draft_len,
+                                         start):
+        """Write one-hot draft-prob rows (prob 1.0 at draft-vocab token id 0,
+        the placeholder token) into rows [start, draft_len) of each padding gen
+        request's stable slot row.
 
-        Padding requests are gen requests that entered this iteration with 0 real
-        draft tokens (e.g. a runtime_draft_len K->0->K dynamic-draft-len toggle).
-        Their slot's draft_probs row was never scattered by the draft sampler, so
-        the next iteration's (possibly CUDA-graph-captured) rejection kernel would
-        read a stale/uninitialized distribution. Writing a legal one-hot row makes
-        acceptance reject the placeholder and resample from the target (equivalent
-        to strict acceptance) for those rows. Written eagerly before graph replay
-        into the stable draft_probs buffer, so the replayed kernel reads it.
+        Padding requests are gen requests whose drafter scattered only rows
+        [0, start) last iteration because the runtime draft length rose (e.g.
+        K->0->K or 2->4), so the next iteration's (possibly CUDA-graph-captured)
+        rejection kernel would read a stale/uninitialized distribution for the
+        padding tokens. A legal one-hot row makes acceptance reject the
+        placeholder and resample from the target (equivalent to strict
+        acceptance). Written eagerly before graph replay into the stable
+        draft_probs buffer, so the replayed kernel reads it.
 
         Idempotent w.r.t. context->gen transitions whose row was already one-hot'd
         by write_context_onehot_draft_probs. The width matches the value already
@@ -1061,8 +1065,8 @@ class SpecMetadata:
         slots = torch.tensor(padding_slot_ids,
                              dtype=torch.long,
                              device=self.draft_probs.device)
-        self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
-        self.draft_probs[slots, :draft_len, 0] = 1.0
+        self.draft_probs[slots, start:draft_len, :onehot_vocab] = 0.0
+        self.draft_probs[slots, start:draft_len, 0] = 1.0
 
     def dp_num_tokens(self) -> int:
         """Return the attention-DP token count for the current batch.
@@ -1681,7 +1685,11 @@ class SpecWorkerBase(nn.Module, ABC):
         draft_model,
     ):
         """
-        Used when speculation is disabled for dynamic draft length (e.g., large batch size).
+        Target-only step for runtime_draft_len == 0, i.e. after the
+        acceptance-rate gate disabled speculation. Scheduled draft lengths are
+        floored at DecodingBaseConfig.min_runtime_draft_len instead of reaching
+        0, because a skipped drafter's KV cache goes stale while the target
+        keeps decoding.
         """
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts

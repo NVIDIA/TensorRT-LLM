@@ -130,16 +130,18 @@ def _get_num_cuda_graph_padding_dummy_slots(
         spec_dec_mode, "support_dynamic_draft_len")
                                   and spec_dec_mode.support_dynamic_draft_len())
     if draft_len_schedule and supports_dynamic_draft_len:
+        # Same floor as get_draft_len_for_batch_size.
+        min_draft_len = spec_config.min_runtime_draft_len
         runtime_draft_lengths = set()
         first_uncovered_batch_size = 1
         for batch_size_threshold, draft_len in draft_len_schedule.items():
             if first_uncovered_batch_size > max_batch_size:
                 break
             if batch_size_threshold >= first_uncovered_batch_size:
-                runtime_draft_lengths.add(draft_len)
+                runtime_draft_lengths.add(max(draft_len, min_draft_len))
                 first_uncovered_batch_size = batch_size_threshold + 1
         if first_uncovered_batch_size <= max_batch_size:
-            runtime_draft_lengths.add(0)
+            runtime_draft_lengths.add(min_draft_len)
     else:
         max_draft_len = getattr(spec_config, "max_draft_len", 0) or 0
         max_total_draft_tokens = (getattr(spec_config, "max_total_draft_tokens",
