@@ -6,8 +6,8 @@ To run quantized models with TensorRT LLM:
   checkpoints published on the [NVIDIA Hugging Face hub](https://huggingface.co/nvidia)).
   Quantization settings are detected automatically when the model loads.
 - To quantize your own model, use the
-  [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
-  Hugging Face export flow (`examples/llm_ptq` in that repository).
+  [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
+  Hugging Face export flow (`examples/hf_ptq` in that repository).
 
 See the [quantization feature documentation](https://nvidia.github.io/TensorRT-LLM/features/quantization.html)
 for supported formats per GPU architecture.
