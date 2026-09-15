@@ -2694,16 +2694,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 # CUDA graph generation warmup uses one request at max_seq_len and
                 # enough minimal decode requests to fill max_batch_size.
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
-                quota = next(
-                    tier.quota for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)
-                )
-                remaining_tokens = self._get_max_tokens_from_quota(quota) - (
-                    self.max_batch_size - 1
-                ) * pad_up(min_decode_capacity, self._ledger_tokens_per_block)
                 warmup_seq_len = self.max_seq_len
-                # SWA estimates can be zero even when this mostly-minimal batch fits.
-                if remaining_tokens >= min_decode_capacity:
-                    warmup_seq_len = int(min(warmup_seq_len, remaining_tokens))
+                if self.is_estimating_kv_cache:
+                    quota = next(
+                        tier.quota for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)
+                    )
+                    remaining_tokens = self._get_max_tokens_from_quota(quota) - (
+                        self.max_batch_size - 1
+                    ) * pad_up(min_decode_capacity, self._ledger_tokens_per_block)
+                    # SWA estimates can be zero even when this mostly-minimal batch fits.
+                    if remaining_tokens >= min_decode_capacity:
+                        warmup_seq_len = int(min(warmup_seq_len, remaining_tokens))
                 constraints.append(
                     BatchDesc(
                         [

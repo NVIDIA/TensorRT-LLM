@@ -123,6 +123,7 @@ def _make_cache_config_for_test(
     max_attention_window_vec: list[int | None] | None = None,
     pp_layers: list[int] | None = None,
     max_tokens_for_warmup: float = float("inf"),
+    is_estimating_kv_cache: bool = False,
 ) -> KVCacheManagerConfig:
     if max_attention_window_vec is None:
         max_attention_window_vec = [None]
@@ -139,6 +140,7 @@ def _make_cache_config_for_test(
     cache_manager.enable_stats = False
     cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_config.policy)
     cache_manager.is_draft = is_draft
+    cache_manager.is_estimating_kv_cache = is_estimating_kv_cache
     cache_manager.num_local_layers = len(pp_layers)
     cache_manager.pp_layers = pp_layers
     cache_manager.max_attention_window_vec = max_attention_window_vec
@@ -794,7 +796,10 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("max_draft_len", [0, 128])
-def test_warmup_sequence_budget_reserves_other_requests(max_draft_len: int) -> None:
+@pytest.mark.parametrize("is_estimating_kv_cache", [True, False])
+def test_warmup_sequence_budget_reserves_other_requests(
+    max_draft_len: int, is_estimating_kv_cache: bool
+) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(use_kv_cache_manager_v2=True, avg_seq_len=262144),
         max_seq_len=262144,
@@ -802,9 +807,12 @@ def test_warmup_sequence_budget_reserves_other_requests(max_draft_len: int) -> N
         max_num_tokens=2048,
         max_draft_len=max_draft_len,
         max_tokens_for_warmup=4096,
+        is_estimating_kv_cache=is_estimating_kv_cache,
     )
     # Each of the other two requests needs its own whole 128-token blocks.
     expected_long_capacity = 3840 if max_draft_len == 0 else 3584
+    if not is_estimating_kv_cache:
+        expected_long_capacity = 262144
     assert config.constraints[0] == BatchDesc(
         [KVCacheDesc(capacity=expected_long_capacity, history_length=expected_long_capacity - 1)]
         + [KVCacheDesc(capacity=1 + max_draft_len, history_length=0)] * 2
@@ -822,6 +830,7 @@ def test_warmup_preserves_constraints_for_conservative_capacity_estimate(
         KvCacheConfig(use_kv_cache_manager_v2=True, avg_seq_len=1024),
         max_batch_size=3,
         max_tokens_for_warmup=max_tokens_for_warmup,
+        is_estimating_kv_cache=True,
     )
     assert config.constraints[0] == BatchDesc(
         [KVCacheDesc(capacity=1024, history_length=1023)]
