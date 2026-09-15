@@ -310,6 +310,9 @@ class TestSplitGpuBudgetForDraft:
         target_kv_config = KvCacheConfig(enable_block_reuse=False)
         mode = Mock()
         mode.is_external_drafter.return_value = False
+        # A Mock's truthy return would send get_num_extra_kv_tokens down the
+        # one-engine arm; this test's config is a two-model drafter.
+        mode.use_one_engine.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
         class RecordingKVCacheManager(KVCacheManagerV2):
@@ -332,7 +335,16 @@ class TestSplitGpuBudgetForDraft:
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0, 1, 2, 3]
         creator._mapping.is_last_pp_rank.return_value = True
-        creator._speculative_config = SimpleNamespace(spec_dec_mode=mode)
+        # Neutral speculative fields: _get_generation_kv_capacity reads them
+        # to size the generation headroom; these values keep it at the
+        # non-speculative baseline of one token so the window math below stays
+        # the point of the test.
+        creator._speculative_config = SimpleNamespace(
+            spec_dec_mode=mode,
+            max_total_draft_tokens=0,
+            max_draft_len=0,
+            tokens_per_gen_step=1,
+        )
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=target_model_config)
         )
@@ -348,11 +360,17 @@ class TestSplitGpuBudgetForDraft:
 
         # K and V, 8 heads x 128 dims, bf16.
         layer_bytes_per_token = 2 * 8 * 128 * 2
-        # Each sliding layer keeps a 512-token window per request.
-        sliding_bytes_per_request = 3 * 512 * layer_bytes_per_token
+        # Each sliding layer retains page-granular window blocks per request:
+        # a 512-token window with one headroom token spans
+        # ceil((512 + 1 - 2) / 64) + 1 = 9 blocks = 576 tokens. Context
+        # additionally retains each sliding layer for the in-flight token
+        # batch (max_num_tokens).
+        window_tokens = (math.ceil((512 + 1 - 2) / 64) + 1) * 64
+        sliding_bytes_per_request = 3 * window_tokens * layer_bytes_per_token
+        context_batch_bytes = 3 * layer_bytes_per_token * creator._max_num_tokens
         assert target_kv == CacheCost(
             slope=layer_bytes_per_token,
-            intercept=sliding_bytes_per_request * max_batch_size,
+            intercept=sliding_bytes_per_request * max_batch_size + context_batch_bytes,
         )
         assert draft_kv == CacheCost(slope=layer_bytes_per_token, intercept=0)
         target_windows = [
@@ -427,9 +445,14 @@ class TestSplitGpuBudgetForDraft:
 
         # K and V, 8 heads x 128 dims, bf16.
         layer_bytes_per_token = 2 * 8 * 128 * 2
+        # The rank's one sliding layer retains ceil((512 + 1 - 2) / 64) + 1 = 9
+        # blocks = 576 tokens per request, plus the context charge for the
+        # in-flight token batch (max_num_tokens).
+        window_tokens = (math.ceil((512 + 1 - 2) / 64) + 1) * 64
         assert target_kv == CacheCost(
             slope=layer_bytes_per_token,
-            intercept=512 * layer_bytes_per_token * max_batch_size,
+            intercept=window_tokens * layer_bytes_per_token * max_batch_size
+            + layer_bytes_per_token * creator._max_num_tokens,
         )
         # The cost model receives the global list; the projection onto the
         # rank's layers happens inside the manager's static estimator.
