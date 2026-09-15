@@ -29,6 +29,7 @@ import io
 import json
 import os
 from collections.abc import Generator
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -85,6 +86,35 @@ def _cleanup_gpu():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_encoder_latent_scaling_rounds_reciprocal(dtype: torch.dtype) -> None:
+    """L1: encoder-output scaling follows Framework's same-precision reciprocal path."""
+    generator = torch.Generator().manual_seed(42)
+    raw = torch.randn(1, 48, 1, 3, 5, generator=generator).to(dtype)
+    mean = torch.randn(48, generator=generator)
+    std = torch.rand(48, generator=generator) + 0.25
+    config = SimpleNamespace(latents_mean=mean.tolist(), latents_std=std.tolist())
+    vae = SimpleNamespace(
+        dtype=dtype,
+        config=config,
+        encode=lambda video: SimpleNamespace(latent_dist=SimpleNamespace(mode=lambda: raw)),
+    )
+    pipeline = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=dtype,
+        vae=vae,
+        offloader=SimpleNamespace(context_if_requested=lambda component: nullcontext()),
+    )
+    actual = Cosmos3OmniMoTPipeline._encode_video_tensor(pipeline, torch.zeros(1, 3, 1, 3, 5))
+    centered = raw - mean.to(dtype).view(1, -1, 1, 1, 1)
+    inverse_std = 1.0 / std.to(dtype)
+    expected = centered * inverse_std.view(1, -1, 1, 1, 1)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+    if dtype == torch.bfloat16:
+        divided = centered / std.to(dtype).view(1, -1, 1, 1, 1)
+        assert not torch.allclose(divided, expected, rtol=1e-3, atol=1e-3)
 
 
 def _llm_models_root() -> str:

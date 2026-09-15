@@ -1447,7 +1447,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 .view(1, -1, 1, 1, 1)
                 .to(latent.device, latent.dtype)
             )
-            latent = (latent - latents_mean) / latents_std
+            # Framework rounds the reciprocal in the latent dtype before multiplying.
+            latent = (latent - latents_mean) * (1.0 / latents_std)
         else:
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latent = latent * scaling_factor
