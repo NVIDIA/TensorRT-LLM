@@ -46,6 +46,7 @@ from transformers.configuration_utils import PretrainedConfig
 from utils.util import check_accuracy
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import fused_moe as fused_moe_custom_op
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
@@ -71,6 +72,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
@@ -1322,9 +1324,26 @@ def test_cutlass_materializes_post_silu_clamp_mode():
     assert params.clamp_after_silu is True
 
 
+def test_deepgemm_rejects_post_silu_clamp_materialization():
+    with pytest.raises(ValueError, match="does not implement post-SiLU clamping"):
+        materialize_activation_params(
+            SwigluActivation(clamp=5.0, clamp_after_silu=True),
+            DeepGemmFusedMoE.activation_support,
+            num_local_experts=2,
+            owner="DeepGemmFusedMoE",
+        )
+
+
 def test_post_silu_clamp_mode_requires_limit():
     with pytest.raises(ValueError, match="requires a clamp value"):
         SwigluActivation(clamp_after_silu=True)
+
+
+def test_fused_moe_appends_post_silu_mode_to_positional_schema():
+    argument_list = fused_moe_custom_op._schema.removeprefix("(").split(") ->", maxsplit=1)[0]
+    final_argument = argument_list.rsplit(",", maxsplit=1)[-1]
+
+    assert "swiglu_clamp_after_silu" in final_argument
 
 
 def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):

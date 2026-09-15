@@ -237,7 +237,6 @@ def fused_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
-    swiglu_clamp_after_silu: bool = False,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -281,6 +280,7 @@ def fused_moe(
     gated_slot_lora_ranks: Optional[torch.Tensor] = None,
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
+    swiglu_clamp_after_silu: bool = False,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -364,8 +364,8 @@ def fused_moe(
         input, token_selected_experts, token_final_scales, fc1_expert_weights,
         fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales,
         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
-        swiglu_clamp_after_silu, tp_size, tp_rank, ep_size, ep_rank,
-        cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
+        tp_size, tp_rank, ep_size, ep_rank, cluster_size,
+        cluster_rank, enable_alltoall, min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2
          ], activation_type, unpadded_hidden_size, tuner_num_tokens, out_tensor
     ]
@@ -381,6 +381,7 @@ def fused_moe(
             fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
+    run_moe_args.append(swiglu_clamp_after_silu)
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:
@@ -418,7 +419,6 @@ def _(input: torch.Tensor,
       swiglu_alpha: Optional[torch.Tensor] = None,
       swiglu_beta: Optional[torch.Tensor] = None,
       swiglu_limit: Optional[torch.Tensor] = None,
-      swiglu_clamp_after_silu: bool = False,
       tp_size: int = 1,
       tp_rank: int = 0,
       ep_size: int = 1,
@@ -455,7 +455,8 @@ def _(input: torch.Tensor,
       fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
-      token_to_slot: Optional[torch.Tensor] = None):
+      token_to_slot: Optional[torch.Tensor] = None,
+      swiglu_clamp_after_silu: bool = False):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,

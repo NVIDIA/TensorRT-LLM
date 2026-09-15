@@ -306,12 +306,17 @@ class MoEActivationSupport:
     alpha_beta: ActivationParamShape = ActivationParamShape.UNSUPPORTED
     limit: ActivationParamShape = ActivationParamShape.UNSUPPORTED
     limit_when_absent: float | None = None
+    clamp_after_silu: bool = False
 
     def __post_init__(self) -> None:
         if self.limit_when_absent is not None and self.limit is ActivationParamShape.UNSUPPORTED:
             raise ValueError(
                 "limit_when_absent names the value a clamp-less layer must still pass, so it "
                 "is meaningless with limit=UNSUPPORTED: declare a shape, or drop the value."
+            )
+        if self.clamp_after_silu and self.limit is ActivationParamShape.UNSUPPORTED:
+            raise ValueError(
+                "clamp_after_silu describes the ordering of a clamp, so it requires limit support."
             )
 
 
@@ -372,6 +377,12 @@ def materialize_activation_params(
             f"{owner} does not implement activation {kind.name}; it executes: {supported}."
         )
 
+    clamp_after_silu = (
+        activation.clamp_after_silu if isinstance(activation, SwigluActivation) else False
+    )
+    if clamp_after_silu and not support.clamp_after_silu:
+        raise ValueError(f"{owner} does not implement post-SiLU clamping.")
+
     constants = activation.constants()
     alpha = _materialize_to_declared_shape(
         constants.alpha,
@@ -409,9 +420,7 @@ def materialize_activation_params(
         alpha=alpha,
         beta=beta,
         clamp=limit,
-        clamp_after_silu=(
-            activation.clamp_after_silu if isinstance(activation, SwigluActivation) else False
-        ),
+        clamp_after_silu=clamp_after_silu,
     )
 
 
