@@ -54,10 +54,7 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
-from ..blackwell.dense_blockscaled_gemm_persistent import (
-    Sm100BlockScaledPersistentDenseGemmKernel,
-    scaled_mm,
-)
+from ..blackwell.dense_blockscaled_gemm_persistent import Sm100BlockScaledPersistentDenseGemmKernel
 
 """
 This example provides an implementation of the SM107 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
@@ -3691,6 +3688,61 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         return True
 
 
+def scaled_mm(
+    gemm_obj: Sm107BlockScaledPersistentDenseGemmKernel,
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    a_major: Literal["m", "k"],
+    b_major: Literal["n", "k"],
+    c_major: Literal["m", "n"],
+    max_active_clusters: cutlass.Constexpr,
+    stream: cuda.CUstream,
+    epilogue_op: cutlass.Constexpr = lambda x: x,
+    options: str = "",
+    *,
+    alpha_tensor: cute.Tensor,
+):
+    """Compile the base SM107 kernel through its pointer-based GEMM interface.
+
+    MixedClustersKernel is unsupported because its argument order differs.
+
+    Alpha must be a single-element FP32 device tensor. The returned function
+    takes A/B/SFA/SFB/C pointers, alpha, an (M, N, K, L) tuple, and a stream.
+    Keep alpha's backing allocation alive until execution completes.
+    """
+    if type(gemm_obj) is not Sm107BlockScaledPersistentDenseGemmKernel:
+        raise TypeError(
+            "scaled_mm only supports the base Sm107BlockScaledPersistentDenseGemmKernel"
+        )
+
+    a_ptr = make_ptr(a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    c_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    sfa_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
+    sfb_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
+
+    a_major_mode = OperandMajorMode.K if a_major == "k" else OperandMajorMode.MN
+    b_major_mode = OperandMajorMode.K if b_major == "k" else OperandMajorMode.MN
+    c_layout = utils.LayoutEnum.ROW_MAJOR if c_major == "n" else utils.LayoutEnum.COL_MAJOR
+    return cute.compile(
+        gemm_obj,
+        a_ptr,
+        b_ptr,
+        sfa_ptr,
+        sfb_ptr,
+        c_ptr,
+        alpha_tensor,
+        (a_major_mode, b_major_mode, c_layout),
+        (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
+        max_active_clusters,
+        stream,
+        epilogue_op,
+        options=options,
+    )
+
+
 def run_scaled_mm_with_emulated_dtype(
     gemm_obj: Sm107BlockScaledPersistentDenseGemmKernel,
     mnkl: Tuple[int, int, int, int],
@@ -3796,7 +3848,7 @@ def run_scaled_mm_with_emulated_dtype(
     )
 
     # Compile against the SM107 __call__ signature (alpha is a runtime tensor).
-    alpha_torch = torch.ones(1, dtype=torch.float32, device="cuda")
+    alpha_torch = torch.full((1,), 0.5, dtype=torch.float32, device="cuda")
     alpha_tensor = from_dlpack(alpha_torch, assumed_align=16)
     compiled_gemm = scaled_mm(
         gemm_obj,
@@ -3856,7 +3908,7 @@ def run_scaled_mm_with_emulated_dtype(
 
         res_a = torch.einsum("mkl,mkl->mkl", a_f32_ref, sfa_f32_ref.cuda())
         res_b = torch.einsum("nkl,nkl->nkl", b_f32_ref, sfb_f32_ref.cuda())
-        ref = torch.einsum("mkl,nkl->mnl", res_a, res_b)
+        ref = torch.einsum("mkl,nkl->mnl", res_a, res_b) * alpha_torch
         c_ref = ref.to(dtype=cutlass_torch.dtype(c_dtype))
 
         torch.testing.assert_close(c, c_ref, atol=tolerance, rtol=tolerance)
