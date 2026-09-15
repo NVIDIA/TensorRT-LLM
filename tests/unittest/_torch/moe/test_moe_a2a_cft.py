@@ -121,6 +121,11 @@ def test_destroy_releases_cft_manager_before_workspace_allocation(
     comm._dispatch_state = {"phase": "idle"}
 
     comm.destroy()
+    # Teardown is rank-coordinated and may be reached twice (explicit destroy
+    # plus a later sweep). The second call must be inert: releasing the CFT
+    # endpoint twice would destroy an endpoint this communicator no longer
+    # owns, and the workspace state has already been cleared.
+    comm.destroy()
 
     release_cft_manager.assert_called_once_with(workspace, 3)
     assert workspace_key not in NVLinkOneSided._WORKSPACES
@@ -129,3 +134,51 @@ def test_destroy_releases_cft_manager_before_workspace_allocation(
     assert workspace_state == {}
     assert comm.mnnvl_mem is None
     assert comm.workspace is None
+
+
+def test_destroy_drops_workspace_when_cft_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed CFT release must not leave a reusable workspace behind.
+
+    ``destroy`` decrements the refcount and unregisters the lifecycle before
+    calling ``_release_workspace``, so nothing retries. If the release raised
+    and the entry survived in ``_WORKSPACES``, the next communicator built on
+    the same key would adopt an allocation whose endpoint state is unknown.
+    """
+    workspace_key = ("cft-workspace-failing",)
+    workspace = object()
+    mnnvl_mem = object()
+    workspace_state = {
+        "cft_initialized": True,
+        "workspace": workspace,
+        "ep_rank": 3,
+        "mnnvl_mem": mnnvl_mem,
+    }
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {workspace_key: workspace_state})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {workspace_key: 1})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    release_cft_manager = MagicMock(side_effect=RuntimeError("cft release failed"))
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_release", release_cft_manager, raising=False)
+
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._destroyed = False
+    comm._workspace_key = workspace_key
+    comm._workspace_state = workspace_state
+    comm._workspace_lifecycle = None
+    comm._workspace_registered = True
+    comm.mnnvl_mem = mnnvl_mem
+    comm.workspace = workspace
+    comm._dispatch_state = {"phase": "idle"}
+
+    # The failure is reported rather than swallowed.
+    with pytest.raises(RuntimeError, match="cft release failed"):
+        comm.destroy()
+
+    release_cft_manager.assert_called_once_with(workspace, 3)
+    # ...but the workspace is gone either way, so nothing can adopt it.
+    assert workspace_key not in NVLinkOneSided._WORKSPACES
+    assert NVLinkOneSided._WORKSPACE is None
+    assert workspace_state == {}
