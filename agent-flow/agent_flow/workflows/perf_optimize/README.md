@@ -123,7 +123,9 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   integration worktree, resolves only conflicts and minimal combination
   defects, benchmarks the combined state, and emits the authoritative
   `APPROVE | FALLBACK_BEST | REJECT` verdict. It may diagnose/remediate twice;
-  after that it validates only the best standalone candidate, or rejects all.
+  after that it validates only the best standalone candidate, retaining it when
+  it remains above the noise floor and satisfies the curve regression rules, or
+  rejects all.
   Before applying the structured verdict, the Python orchestrator verifies
   that included ids are non-empty candidate-ready items and cross-checks the
   reported threshold, measured gain, and Pareto-curve regression budget.

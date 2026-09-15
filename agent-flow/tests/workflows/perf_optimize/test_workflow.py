@@ -168,6 +168,7 @@ def _stub_agents(
     analyzer_items: list[list[dict]] | None = None,
     evaluator_verdicts: list[tuple] | None = None,
     evaluator_native_changes: list[bool] | None = None,
+    integrator_verdict: dict | None = None,
     baseline_curve: list[dict] | None = None,
     evaluator_curve: list[dict] | None = None,
 ):
@@ -182,6 +183,8 @@ def _stub_agents(
       one list per invocation (later invocations default to adding none).
     - ``evaluator_verdicts`` — ``(decision, reason, gain, value)`` per
       evaluator invocation (the last one repeats).
+    - ``integrator_verdict`` — fields that override the default APPROVE
+      verdict emitted by the integrator stub.
     - ``baseline_curve`` — curve the analyzer stub writes on
       ``baseline``/``current_best`` (Pareto-curve mode runs).
     - ``evaluator_curve`` — ``curve`` field every evaluator entry carries.
@@ -318,6 +321,7 @@ def _stub_agents(
                 bool(candidate.get("has_native_changes", False)) for candidate in candidates
             ),
         }
+        verdict.update(integrator_verdict or {})
         if best.get("curve"):
             verdict["curve"] = best["curve"]
         _append(verdict)
@@ -422,6 +426,10 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     ("verdict_overrides", "error"),
     [
         ({"measured_gain_pct": 0.1}, "below required"),
+        (
+            {"decision": "FALLBACK_BEST", "measured_gain_pct": 0.1},
+            "below noise floor",
+        ),
         ({"required_gain_pct": 0.0}, "required_gain_pct mismatch"),
         ({"included_item_ids": []}, "included no candidates"),
         ({"included_item_ids": ["opt-failed"]}, "non-candidate item"),
@@ -477,6 +485,30 @@ def test_integrator_rejects_invalid_acceptance_verdict(
     assert (
         f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in integrator_prompts[0]
     )
+
+
+def test_integrator_accepts_fallback_best_below_combined_threshold(tmp_path, fake_git):
+    """A reproducibly beneficial fallback need not meet the combined target."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        integrator_verdict={
+            "decision": "FALLBACK_BEST",
+            "measured_gain_pct": 3.0,
+            "measured_value": 103.0,
+        },
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert "qa" in trace
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap["current_best"]["value"] == pytest.approx(103.0)
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
 
 
 def test_relative_workspace_resolves_reference_result_dir(tmp_path, fake_git, monkeypatch):

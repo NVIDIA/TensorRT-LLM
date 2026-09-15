@@ -1322,8 +1322,9 @@ class PerfOptimizeWorkflow:
                 f"applying your verdict. You may diagnose/remediate at most "
                 f"twice. If the combined "
                 f"state still fails, retain and validate only the highest standalone "
-                f"gain candidate (manifest order breaks ties); if that also fails, "
-                f"restore the base and REJECT.\n\n"
+                f"gain candidate (manifest order breaks ties). Return FALLBACK_BEST "
+                f"when it remains above the noise floor and satisfies the curve "
+                f"regression rules; if that also fails, restore the base and REJECT.\n\n"
                 f"Call `append_integrator_progress` exactly once with the final "
                 f"APPROVE, FALLBACK_BEST, or REJECT decision and all required "
                 f"fields, including whether the final retained state has native "
@@ -1366,10 +1367,15 @@ class PerfOptimizeWorkflow:
                     f"reported {reported_required_gain}, expected {expected_required_gain}"
                 )
             measured_gain = float(verdict["measured_gain_pct"])
-            if measured_gain < reported_required_gain:
+            if decision == "APPROVE" and measured_gain < reported_required_gain:
                 raise RuntimeError(
                     f"integrator {decision} gain {measured_gain} is below required "
                     f"{reported_required_gain}"
+                )
+            if decision == "FALLBACK_BEST" and measured_gain < noise_floor:
+                raise RuntimeError(
+                    f"integrator FALLBACK_BEST gain {measured_gain} is below noise floor "
+                    f"{noise_floor}"
                 )
             if self._curve_mode():
                 roadmap = roadmap_schema.load_roadmap(self.roadmap_path)

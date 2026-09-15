@@ -23,7 +23,8 @@ derived from the candidates' standalone measurements.
 You may diagnose and remediate a disappointing combination at most twice. If
 it still misses the requested threshold or curve rules, retain only the
 manifest candidate with the largest standalone measured gain (manifest order
-breaks ties), validate that state once, and return FALLBACK_BEST. If even that
+breaks ties), validate that state once, and return FALLBACK_BEST when it remains
+above the noise floor and satisfies the curve regression rules. If even that
 state fails, restore the integration worktree/config to the campaign base and
 return REJECT. APPROVE means the accepted integration state is already checked
 out in the worktree and represented by the final config.
