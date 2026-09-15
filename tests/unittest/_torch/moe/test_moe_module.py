@@ -1579,7 +1579,7 @@ def test_configurable_moe_single_gpu(
     )
 
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
-    # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
+    # See: cpp/tensorrt_llm/thop/moe/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
     if (
         moe_backend == MoeBackendType.TRTLLM.value
@@ -1799,7 +1799,7 @@ def test_configurable_moe_multi_gpu(
     )
 
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
-    # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
+    # See: cpp/tensorrt_llm/thop/moe/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
     if (
         moe_backend == MoeBackendType.TRTLLM.value

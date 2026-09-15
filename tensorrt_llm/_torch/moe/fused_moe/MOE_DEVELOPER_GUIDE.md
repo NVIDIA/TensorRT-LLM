@@ -246,6 +246,34 @@ is available.
 | `MOE_SCHEDULER_DESIGN.md` | Scheduler refactor design + `MoEScheduler` contract |
 | `mega_moe/CHUNKING_DESIGN.md` | MegaMoE chunking invariants |
 
+### C++ (`cpp/`)
+
+The C++ side mirrors this layout inside each link layer: `kernels/moe/`
+(`libtensorrt_llm.so`), `thop/moe/` (`libth_common.so`) and
+`tests/unit_tests/kernels/moe/`. Backend directories own their CMake targets;
+semantic directories compile into `kernels_src`.
+
+| Path | What lives there | Build target |
+|------|------------------|--------------|
+| `cpp/tensorrt_llm/kernels/moe/cutlass/` | CUTLASS fused-MoE runner (`CutlassMoeFCRunner`), grouped-GEMM launchers, LoRA helpers; public headers under `include/` | `moe_gemm_src` (+ per-arch OBJECT libraries, defined in `kernels/cutlass_kernels/CMakeLists.txt`) |
+| `cpp/tensorrt_llm/kernels/moe/trtllmGen/` | TRTLLM-Gen block-scale MoE runner and device kernels; `routing/` holds its routing kernels | `trtllm_gen_fp8_block_scale_moe`, `trtllm_gen_fp8_block_scale_moe_routing` |
+| `cpp/tensorrt_llm/kernels/moe/cuteDsl/` | Host-side utilities for the CuTe DSL MoE backends | `cute_dsl_src` |
+| `cpp/tensorrt_llm/kernels/moe/communication/` | MoE all-to-all, all-reduce fusion, fused-comm and prepare kernels | `kernels_src` |
+| `cpp/tensorrt_llm/kernels/moe/loadBalance/` | EPLB device kernels (host side: `runtime/moeLoadBalancer/`) | `kernels_src` |
+| `cpp/tensorrt_llm/kernels/moe/routing/` | Custom routing kernels | `kernels_src` |
+| `cpp/tensorrt_llm/kernels/moe/utils/` | `moe_align_block_size` and other small helpers | `kernels_src` |
+| `cpp/tensorrt_llm/thop/moe/` | All `torch.ops.trtllm` MoE ops; `moeOp.cpp` holds the primary `TORCH_LIBRARY(trtllm)` block | `th_common` |
+| `cpp/tensorrt_llm/runtime/moeLoadBalancer/`, `nanobind/runtime/moeBindings.*` | EPLB host runtime and its Python binding | `runtime_src`, nanobind module |
+| `cpp/tests/unit_tests/kernels/moe/` | gtests (`mixtureOfExpertsTest`, `routingKernelsTest`, ...) | per-test executables |
+
+Deliberately outside `moe/`: the shared headers
+`kernels/{moeCommKernelsCommon.h,moeTopKFuncs.cuh,moe_utils.cuh}` (they have
+non-MoE consumers), the MoE files inside mixed directories (`marlin/`,
+`llama4MinLatencyKernels/`, `dsv3MinLatencyKernels/`,
+`cutlass_kernels/fp8_blockscale_gemm/sm120_*`), `trtllmGenKernels/batchedGemm/`
+(shared GEMM backend), `internal_cutlass_kernels/` (prebuilt; mirrors
+`moe/cutlass/include/`), `deep_ep/` and `deep_gemm/`.
+
 ### Tests
 
 | File | Tests | Status |

@@ -16,7 +16,7 @@
 #
 
 add_subdirectory(cutlass_kernels)
-add_subdirectory(cuteDslKernels)
+add_subdirectory(moe)
 add_subdirectory(flashMLA)
 add_subdirectory(contextFusedMultiHeadAttention)
 add_subdirectory(decoderMaskedMultiheadAttention)
@@ -42,8 +42,12 @@ file(GLOB_RECURSE SRC_CU *.cu)
 # selectiveScan trtllmGenKernels folder
 list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
-list(FILTER SRC_CPP EXCLUDE REGEX "cuteDslKernels/.*")
-list(FILTER SRC_CU EXCLUDE REGEX "cuteDslKernels/.*")
+# Everything under moe/ is that directory's own business: its backend
+# sub-directories build their own targets, and moe/CMakeLists.txt hands the rest
+# back as MOE_KERNELS_SRC, which joins kernels_src below. Anchored on
+# "/kernels/" because the glob above yields absolute paths.
+list(FILTER SRC_CPP EXCLUDE REGEX "/kernels/moe/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "/kernels/moe/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "flashMLA/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "flashMLA/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
@@ -106,7 +110,7 @@ endif()
 
 add_library(
   kernels_src STATIC
-  ${SRC_CPP} ${SRC_CU}
+  ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
   $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
