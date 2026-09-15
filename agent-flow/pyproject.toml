@@ -9,7 +9,7 @@ dependencies = [
     "pyyaml>=6.0",
     "rich>=13.0",
     "claude-agent-sdk==0.2.143",
-    "openai-codex==0.147.0",
+    "openai-codex==0.154.0",
 ]
 
 [project.optional-dependencies]

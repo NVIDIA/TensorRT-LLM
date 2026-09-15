@@ -50,24 +50,28 @@ from threading import Lock
 from typing import Any
 
 import yaml
-from claude_agent_sdk import tool
 from rich.syntax import Syntax
 
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
+from agent_flow.workflow_tool import workflow_tool
+
+from .roles import ROLES
 
 OPTIMIZATION_STAGE = "optimization"
-_AGENTS = (
-    "benchmarker",
-    "projector",
-    "analyzer",
-    "optimizer",
-    "evaluator",
-    "integrator",
-    "qa",
-    "reporter",
-)
+_AGENTS = ROLES
 _READABLE_AGENTS = (*_AGENTS, "optimizer_evaluator")
+
+
+def tool(name: str, description: str, input_schema: dict[str, Any]):
+    """Build a workflow tool; append tools are required before stopping."""
+    return workflow_tool(
+        name,
+        description,
+        input_schema,
+        required_before_stop=name.startswith("append_"),
+    )
+
 
 # Structured decision vocabulary the orchestrator branches on. APPROVE
 # accepts the attempt; REJECT fails the item terminally (no retry would
@@ -304,9 +308,8 @@ def append_workflow_event(
 def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     """Build the per-agent tool lists for ``BackendConfig(tools=...)``.
 
-    Returns a dict keyed by agent name (one key per role in
-    ``_AGENTS``). The tool objects are ``SdkMcpTool`` instances, which
-    the claude-code backend wraps into an in-process MCP server.
+    Returns SDK-neutral tools keyed by workflow role. Each backend adapts
+    the same handlers to its native tool format.
     """
 
     def _base_entry(agent: str) -> dict[str, Any]:
@@ -335,15 +338,8 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         _append(ctx.path, entry)
         return entry
 
-    def _ack(agent: str) -> dict[str, Any]:
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"Recorded {agent} entry for step {ctx.current_step}.",
-                }
-            ]
-        }
+    def _ack(agent: str) -> str:
+        return f"Recorded {agent} entry for step {ctx.current_step}."
 
     def _make_summary_tool(agent: str, summary_description: str):
         @tool(
@@ -363,7 +359,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "required": ["summary"],
             },
         )
-        async def append_summary_progress(args: dict[str, Any]) -> dict[str, Any]:
+        async def append_summary_progress(args: dict[str, Any]) -> str:
             entry = _base_entry(agent)
             entry["summary"] = args["summary"]
             stored = _append_for_context(entry)
@@ -472,7 +468,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             ],
         },
     )
-    async def append_evaluator_progress(args: dict[str, Any]) -> dict[str, Any]:
+    async def append_evaluator_progress(args: dict[str, Any]) -> str:
         entry = _base_entry("evaluator")
         entry["summary"] = args["summary"]
         entry["decision"] = args["decision"]
@@ -484,18 +480,10 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             entry["curve"] = _coerce_curve(args["curve"])
         stored = _append_for_context(entry)
         _log_progress_write("evaluator", stored)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        f"Recorded evaluator entry for step {ctx.current_step} "
-                        f"(decision={entry['decision']}, "
-                        f"reason_category={entry['reason_category']})."
-                    ),
-                }
-            ]
-        }
+        return (
+            f"Recorded evaluator entry for step {ctx.current_step} "
+            f"(decision={entry['decision']}, reason_category={entry['reason_category']})."
+        )
 
     @tool(
         "append_integrator_progress",
@@ -550,7 +538,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             ],
         },
     )
-    async def append_integrator_progress(args: dict[str, Any]) -> dict[str, Any]:
+    async def append_integrator_progress(args: dict[str, Any]) -> str:
         entry = _base_entry("integrator")
         entry.update(
             {
@@ -570,17 +558,10 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             entry["curve"] = _coerce_curve(args["curve"])
         stored = _append_for_context(entry)
         _log_progress_write("integrator", stored)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        "Recorded authoritative integrator verdict "
-                        f"{entry['decision']} for step {ctx.current_step}."
-                    ),
-                }
-            ]
-        }
+        return (
+            "Recorded authoritative integrator verdict "
+            f"{entry['decision']} for step {ctx.current_step}."
+        )
 
     @tool(
         "append_qa_progress",
@@ -612,7 +593,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             "required": ["summary", "cumulative_improvement_pct"],
         },
     )
-    async def append_qa_progress(args: dict[str, Any]) -> dict[str, Any]:
+    async def append_qa_progress(args: dict[str, Any]) -> str:
         entry = _base_entry("qa")
         entry["summary"] = args["summary"]
         entry["cumulative_improvement_pct"] = float(args["cumulative_improvement_pct"])
@@ -620,18 +601,10 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             entry["curve"] = _coerce_curve(args["curve"])
         stored = _append_for_context(entry)
         _log_progress_write("qa", stored)
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        f"Recorded qa entry for step {ctx.current_step} "
-                        f"(cumulative_improvement_pct="
-                        f"{entry['cumulative_improvement_pct']})."
-                    ),
-                }
-            ]
-        }
+        return (
+            f"Recorded qa entry for step {ctx.current_step} "
+            f"(cumulative_improvement_pct={entry['cumulative_improvement_pct']})."
+        )
 
     # ``read_latest_progress`` is shared; each caller gets a closure so the
     # log attribution shows *who is reading*, not which agent's entries
@@ -666,7 +639,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "required": [],
             },
         )
-        async def read_latest_progress(args: dict[str, Any]) -> dict[str, Any]:
+        async def read_latest_progress(args: dict[str, Any]) -> str:
             steps = int(args.get("steps") or 6)
             agent = args.get("agent") or None
             selected = find_entries(ctx.path, agent=agent, last_steps=steps)
@@ -675,7 +648,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             else:
                 text = _yaml_dump(selected)
             _log_progress_read(caller, agent, steps, text)
-            return {"content": [{"type": "text", "text": text}]}
+            return text
 
         return read_latest_progress
 

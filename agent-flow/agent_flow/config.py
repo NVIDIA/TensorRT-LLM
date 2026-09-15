@@ -16,6 +16,9 @@ CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol")
 class BackendConfig:
     kind: BackendKind
     model: str
+    # Provider reasoning tier. ``None`` retains the backend's historical
+    # maximum-effort default.
+    reasoning_effort: str | None = None
     tools: list[Any] | None = None
     # Backend-specific hook configuration. Currently only the ``claude-code``
     # backend consumes this — it is forwarded verbatim to the Claude Agent
@@ -24,13 +27,8 @@ class BackendConfig:
     hooks: dict[str, Any] | None = None
     # Extra MCP servers to make available to the agent, keyed by the
     # server name the model sees (tools become ``mcp__<name>__<tool>``).
-    # Currently only the ``claude-code`` backend consumes this — values
-    # are forwarded verbatim into ``ClaudeAgentOptions.mcp_servers``
-    # alongside the in-process ``agent-tools`` server built from
-    # ``tools``. Typical use: wiring an HTTP MCP server into a single
-    # agent's session via
-    # ``{"knowledge-base": {"type": "http", "url": "..."}}``. Other backends
-    # accept and ignore the field.
+    # Claude receives these directly; Codex receives the portable
+    # STDIO/HTTP subset translated into its thread-scoped configuration.
     extra_mcp_servers: dict[str, Any] | None = None
     # Working directory the backend runs the agent in. Forwarded to the
     # SDK as the session ``cwd`` (Claude Code's

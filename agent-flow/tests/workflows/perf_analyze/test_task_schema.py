@@ -984,3 +984,27 @@ def test_profile_ranks_requires_nsys_in_methods(tmp_path):
     )
     with pytest.raises(TaskSchemaError, match="requires 'nsys' in 'profile.methods'"):
         load_and_validate_task_yaml(path)
+
+
+def test_agents_accept_only_perf_analyze_roles(tmp_path):
+    ckpt, repo = _paths(tmp_path)
+    valid = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "agents": {"roles": {"analyzer": {"backend": "codex"}}},
+        },
+    )
+    assert load_and_validate_task_yaml(valid)["agents"]["roles"]["analyzer"] == {"backend": "codex"}
+
+    invalid = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "agents": {"roles": {"optimizer": {"backend": "codex"}}},
+        },
+    )
+    with pytest.raises(TaskSchemaError, match="optimizer"):
+        load_and_validate_task_yaml(invalid)

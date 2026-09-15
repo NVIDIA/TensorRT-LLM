@@ -13,10 +13,12 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     PermissionResultAllow,
+    SdkMcpTool,
     create_sdk_mcp_server,
 )
 from claude_agent_sdk.types import (
     AssistantMessage,
+    HookMatcher,
     RateLimitEvent,
     ResultMessage,
     ServerToolUseBlock,
@@ -38,6 +40,7 @@ from ..types import (
     ToolCallEvent,
     UsageInfo,
 )
+from ..workflow_tool import ToolCompletion, WorkflowTool, required_tools
 from .base import Backend, BackendClient, BackendEvent, ResultEvent
 
 
@@ -219,8 +222,9 @@ def _assistant_error_detail(message: AssistantMessage) -> str:
 
 
 class ClaudeCodeClient(BackendClient):
-    def __init__(self, sdk_client) -> None:
+    def __init__(self, sdk_client, completion: ToolCompletion | None = None) -> None:
         self._client = sdk_client
+        self._completion = completion
         # Maps a subagent-spawning ToolUseBlock id (Agent/Task) to a
         # human-readable label (subagent_type or description). Child
         # messages reference it via ``parent_tool_use_id`` so we can
@@ -233,6 +237,8 @@ class ClaudeCodeClient(BackendClient):
         return self._subagent_labels.get(parent_id, "subagent")
 
     async def send_message(self, message: str) -> AsyncIterator[BackendEvent]:
+        if self._completion is not None:
+            self._completion.reset()
         got_result = False
         pending_result: ResultEvent | None = None
         try:
@@ -420,12 +426,46 @@ def _claude_backend_version() -> str:
 _REASONING_EFFORT = "max"
 
 
+def _claude_tool(tool: Any, completion: ToolCompletion) -> Any:
+    if not isinstance(tool, WorkflowTool):
+        return tool
+
+    async def handler(args: dict[str, Any]) -> dict[str, Any]:
+        text = await tool.handler(args)
+        completion.mark(tool.name)
+        return {"content": [{"type": "text", "text": text}]}
+
+    return SdkMcpTool(tool.name, tool.description, dict(tool.input_schema), handler)
+
+
+def _completion_hooks(
+    hooks: dict[str, Any] | None,
+    completion: ToolCompletion,
+) -> dict[str, Any] | None:
+    if not completion.required:
+        return hooks
+
+    async def stop(input_data, _tool_use_id, _context):
+        missing = completion.missing()
+        if not missing or input_data.get("stop_hook_active"):
+            return {}
+        names = ", ".join(f"`{name}`" for name in sorted(missing))
+        return {"decision": "block", "reason": f"Call {names} before stopping."}
+
+    merged = {event: list(matchers) for event, matchers in (hooks or {}).items()}
+    merged.setdefault("Stop", []).append(HookMatcher(hooks=[stop]))
+    return merged
+
+
 class ClaudeCodeBackend(Backend):
+    def __init__(self, reasoning_effort: str | None = None) -> None:
+        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+
     def version(self) -> str:
         return _claude_backend_version()
 
     def reasoning_effort(self) -> str:
-        return _REASONING_EFFORT
+        return self._reasoning_effort
 
     @asynccontextmanager
     async def create_client(
@@ -443,6 +483,7 @@ class ClaudeCodeBackend(Backend):
         # ``agent-tools`` server built from ``tools``. The keys are the
         # server names the model sees and must therefore not collide with
         # ``agent-tools``.
+        completion = ToolCompletion(required_tools(tools))
         mcp_servers: dict[str, object] = dict(extra_mcp_servers or {})
         if "agent-tools" in mcp_servers:
             raise ValueError(
@@ -453,7 +494,7 @@ class ClaudeCodeBackend(Backend):
         if tools:
             mcp_servers["agent-tools"] = create_sdk_mcp_server(
                 name="agent-tools",
-                tools=tools,
+                tools=[_claude_tool(item, completion) for item in tools],
             )
 
         async def _approve_tool(tool_name, tool_input, context):
@@ -468,14 +509,14 @@ class ClaudeCodeBackend(Backend):
             ),
             mcp_servers=mcp_servers,
             model=model,
-            effort=_REASONING_EFFORT,
+            effort=self._reasoning_effort,
             cwd=cwd or Path.cwd(),
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
             can_use_tool=_approve_tool,
-            hooks=hooks,
+            hooks=_completion_hooks(hooks, completion),
             disallowed_tools=list(disallowed_tools or []),
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:
-            yield ClaudeCodeClient(sdk_client)
+            yield ClaudeCodeClient(sdk_client, completion)

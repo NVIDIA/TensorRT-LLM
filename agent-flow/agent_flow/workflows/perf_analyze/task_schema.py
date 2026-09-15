@@ -45,6 +45,10 @@ from typing import Any, Mapping
 
 import yaml
 
+from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
+
+from .roles import ROLES
+
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
     "checkpoint_path",
     "trtllm_repo_path",
@@ -188,6 +192,7 @@ KNOWN_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "profile",
         SLURM_ENVIRONMENT_FIELD,
         SOL_FIELD,
+        AGENTS_FIELD,
     )
 )
 
@@ -420,7 +425,11 @@ def profile_ranks(data: Mapping[str, Any]) -> tuple[int, ...]:
     return (0,)
 
 
-def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
+def load_and_validate_task_yaml(
+    path: str | Path,
+    *,
+    agent_roles: tuple[str, ...] = ROLES,
+) -> dict[str, Any]:
     """Parse ``path`` as YAML and validate the perf-analyze schema.
 
     Returns the parsed mapping with the optional ``benchmark`` / ``profile``
@@ -460,7 +469,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             f"{task_path} must be a YAML mapping at the top level, got {type(data).__name__}"
         )
 
-    errors: list[str] = []
+    errors: list[str] = validate_agents(data, agent_roles)
 
     # Decided once, from the spec, before any path is looked at. In remote mode
     # the checkpoint is remote, but the checkout and optional tuning YAML remain

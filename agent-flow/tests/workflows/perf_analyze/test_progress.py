@@ -157,7 +157,7 @@ def test_read_latest_progress_tool_handler(tmp_path):
 
     # Analyzer fetches the benchmarker's entry by filter.
     out = _call(analyzer_read.handler, {"agent": "benchmarker"})
-    rendered = yaml.safe_load(out["content"][0]["text"])
+    rendered = yaml.safe_load(out)
     assert rendered == [
         {"step": 1, "agent": "benchmarker", "timestamp": "t1", "summary": "b1"},
     ]
@@ -172,7 +172,7 @@ def test_read_latest_progress_tool_handler(tmp_path):
         if t.name == "read_latest_progress"
     )
     out = _call(reporter_read2.handler, {})
-    assert "No analysis entries yet" in out["content"][0]["text"]
+    assert "No analysis entries yet" in out
 
 
 def test_read_latest_progress_default_spans_pipeline_with_step_gap(tmp_path):
@@ -200,7 +200,7 @@ def test_read_latest_progress_default_spans_pipeline_with_step_gap(tmp_path):
     reporter_read = next(t for t in tools["reporter"] if t.name == "read_latest_progress")
 
     out = _call(reporter_read.handler, {})
-    rendered = yaml.safe_load(out["content"][0]["text"])
+    rendered = yaml.safe_load(out)
     assert [e["step"] for e in rendered] == [1, 3, 4]
 
 
