@@ -149,8 +149,9 @@ modes.
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
-* Positive Min-P is not supported in combination with one-model speculative decoding. Such
-  requests are rejected at admission.
+* Positive Min-P is supported with one-model speculative decoding under the default
+  `advanced_sampling_mode: full`; the `no_*` specializations reject such requests at
+  admission (see [Advanced sampling mode](#advanced-sampling-mode-speculative-decoding)).
 
 * Occurrence penalties are supported: `repetition_penalty`, `presence_penalty` and
   `frequency_penalty` discourage (or encourage) the model from reusing tokens it has
@@ -222,12 +223,18 @@ speculative config) lets you skip those redundant kernels for a fixed deploy
 config. The output is identical to `FULL` whenever the skipped filter is already
 disabled, so this is a lossless throughput optimization for advanced use cases:
 
-| Mode | `top_k` kernel | `top_p` kernel |
-|---|---|---|
-| `full` (default) | applied | applied |
-| `no_topk` | **skipped** | applied |
-| `no_topp` | applied | **skipped** |
-| `no_topk_no_topp` | **skipped** | **skipped** |
+| Mode | `top_k` kernel | `top_p` kernel | `min_p` kernel |
+|---|---|---|---|
+| `full` (default) | applied | applied | applied |
+| `no_topk` | **skipped** | applied | **rejected** |
+| `no_topp` | applied | **skipped** | **rejected** |
+| `no_topk_no_topp` | **skipped** | **skipped** | **rejected** |
+
+`full` applies all three in one fused kernel, which is why it is the only mode that takes
+`min_p`; the others have no `min_p` input, so such a request is **rejected at admission**
+rather than skipped like a disabled `top_k` or `top_p`. That kernel also skips a filter a
+request left at its neutral value, so the `no_*` modes save work only for requests that
+wanted the filter anyway.
 
 Notes:
 
