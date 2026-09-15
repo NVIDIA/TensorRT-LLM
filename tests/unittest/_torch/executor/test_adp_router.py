@@ -7,11 +7,13 @@ Tests for:
 - Strict/relaxed attention-DP request routing while respecting rank capacity
 """
 
+import inspect
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
@@ -22,6 +24,9 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     RankIterStatsPayload,
     RankState,
     _num_input_tokens,
+    build_active_requests_for_overlap,
+    count_retiring_requests,
+    is_retiring_request,
 )
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.scheduling_params import SchedulingParams
@@ -40,12 +45,13 @@ class _MockRequest(MagicMock):
         return len(self.input_token_ids)
 
 
-def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
+def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False, has_pp=False):
     """Create a mock Distributed object for testing."""
     dist = MagicMock()
     dist.tp_rank = tp_rank
     dist.tp_size = tp_size
     dist.has_cp_helix = has_cp_helix
+    dist.mapping.has_pp.return_value = has_pp
     return dist
 
 
@@ -130,6 +136,63 @@ def all_ranks_num_active_tokens():
     return [10, 5, 15, 8]
 
 
+def _retiring_request(prompt_len=100):
+    """Active request that has produced its final token (state 14)."""
+    return Mock(
+        py_orig_prompt_len=prompt_len,
+        cached_tokens=0,
+        state=LlmRequestState.GENERATION_TO_COMPLETE,
+    )
+
+
+class TestBuildActiveRequestsForOverlap:
+    def test_empty(self):
+        assert build_active_requests_for_overlap([]) == []
+        assert count_retiring_requests([]) == 0
+
+    def test_drops_generation_to_complete(self):
+        reqs = [_retiring_request(), _retiring_request(), _retiring_request()]
+        assert build_active_requests_for_overlap(reqs) == []
+        assert count_retiring_requests(reqs) == 3
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_IN_PROGRESS,
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS,
+            LlmRequestState.DISAGG_TRANS_ERROR,
+        ],
+    )
+    def test_other_states_still_count_as_load(self, state):
+        req = Mock(state=state)
+        assert is_retiring_request(req) is False
+        assert build_active_requests_for_overlap([req]) == [req]
+        assert count_retiring_requests([req]) == 0
+
+    def test_mixed_preserves_order_of_survivors(self):
+        keep_a = Mock(state=LlmRequestState.GENERATION_IN_PROGRESS)
+        keep_b = Mock(state=LlmRequestState.DISAGG_GENERATION_INIT)
+        reqs = [keep_a, _retiring_request(), keep_b, _retiring_request()]
+        assert build_active_requests_for_overlap(reqs) == [keep_a, keep_b]
+        assert count_retiring_requests(reqs) == 2
+
+    def test_returns_a_new_list(self):
+        reqs = [Mock(state=LlmRequestState.GENERATION_IN_PROGRESS)]
+        filtered = build_active_requests_for_overlap(reqs)
+        assert filtered is not reqs
+        filtered.clear()
+        assert len(reqs) == 1
+
+    def test_bare_mock_is_not_retiring(self):
+        req = Mock(py_orig_prompt_len=10)
+        assert build_active_requests_for_overlap([req]) == [req]
+        assert count_retiring_requests([req]) == 0
+
+
 class TestRankState:
     # RankState is the wire payload shared across attention-DP ranks. Keep its
     # serialization stable because iter-stats now ride on the same allgather.
@@ -141,7 +204,7 @@ class TestRankState:
 
     def test_serialize(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100, 0, -1, 0, 0, 0, 0, 0, 0, 0]
+        assert state.serialize() == [0, 5, 100, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -154,10 +217,22 @@ class TestRankState:
         restored = RankState.deserialize(data=original.serialize())
         assert original == restored
 
+    def test_roundtrip_with_retiring_requests(self):
+        original = RankState(
+            rank=1,
+            num_active_requests=10,
+            num_active_tokens=200,
+            num_retiring_requests=3,
+        )
+        restored = RankState.deserialize(data=original.serialize())
+        assert original == restored
+        assert restored.num_retiring_requests == 3
+
     def test_defaults(self):
         state = RankState(rank=0)
         assert state.num_active_requests == 0
         assert state.num_active_tokens == 0
+        assert state.num_retiring_requests == 0
         assert state.iter_stats.has_iter_stats == 0
         assert state.iter_stats.iter_stats_iter == -1
 
@@ -277,6 +352,124 @@ class TestDefaultADPRouter:
         assert state.rank == 0
         assert state.num_active_requests == 2
         assert state.num_active_tokens == 300
+
+    def test_create_rank_state_does_not_filter_retiring_itself(self):
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False)
+        router = DefaultADPRouter(dist=dist)
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=200),
+        ]
+        state = router.create_rank_state(active_requests=active, new_requests=[])
+        assert state.num_active_requests == 2
+        assert state.num_active_tokens == 300
+
+    def test_gather_all_rank_states_excludes_retiring(self):
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False)
+        router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=200),
+            _retiring_request(prompt_len=300),
+        ]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        assert len(states) == 1
+        assert states[0].num_active_requests == 1
+        assert states[0].num_retiring_requests == 2
+        assert states[0].num_active_tokens == 100
+        assert len(active) == 3
+
+    def test_gather_all_rank_states_reports_zero_when_all_retiring(self):
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False)
+        router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
+        active = [_retiring_request(), _retiring_request()]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        assert states[0].num_active_requests == 0
+        assert states[0].num_active_tokens == 0
+        assert states[0].num_retiring_requests == 2
+
+    def test_gather_all_rank_states_keeps_retiring_without_headroom(self):
+        dist = _mock_dist(tp_rank=0, has_cp_helix=False, has_pp=True)
+        router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=False)
+        assert router.exclude_retiring_requests is False
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=200),
+            _retiring_request(prompt_len=300),
+        ]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        assert states[0].num_active_requests == 3
+        assert states[0].num_retiring_requests == 0
+        assert states[0].num_active_tokens == 600
+
+    def test_exclude_retiring_requests_follows_the_seat_pool_headroom(self):
+        for has_pp in (False, True):
+            dist = _mock_dist(has_pp=has_pp)
+            assert (
+                DefaultADPRouter(dist=dist, has_seq_slot_headroom=True).exclude_retiring_requests
+                is True
+            )
+            assert (
+                DefaultADPRouter(dist=dist, has_seq_slot_headroom=False).exclude_retiring_requests
+                is False
+            )
+
+    def test_router_factory_requires_the_headroom_flag(self):
+        params = inspect.signature(ADPRouter.create).parameters
+        assert params["has_seq_slot_headroom"].default is inspect.Parameter.empty
+
+    def test_router_constructors_default_to_no_headroom(self):
+        for cls in (DefaultADPRouter, ConversationAwareADPRouter, KVCacheAwareADPRouter):
+            default = inspect.signature(cls.__init__).parameters["has_seq_slot_headroom"].default
+            assert default is False, cls.__name__
+
+    @pytest.mark.parametrize("has_seq_slot_headroom", [True, False])
+    def test_router_factory_propagates_the_headroom_flag(self, has_seq_slot_headroom):
+        dist = _mock_dist(tp_size=2)
+        mgr = Mock(enable_block_reuse=True)
+        configs = [
+            None,
+            Mock(
+                kv_cache_routing_conversation_affinity=False,
+                enable_kv_cache_aware_routing=True,
+                kv_cache_routing_load_balance_weight=1.0,
+                kv_cache_routing_match_rate_threshold=0.1,
+                kv_cache_routing_fair_share_multiplier=2.0,
+                kv_cache_routing_cold_start_warmup=False,
+                kv_cache_routing_account_for_in_transfer=False,
+            ),
+            Mock(
+                kv_cache_routing_conversation_affinity=True,
+                kv_cache_routing_max_sessions=1 << 16,
+                kv_cache_routing_fair_share_multiplier=2.0,
+                kv_cache_routing_new_conv_placement="round_robin",
+            ),
+        ]
+        built = set()
+        for attention_dp_config in configs:
+            router = ADPRouter.create(
+                dist=dist,
+                has_seq_slot_headroom=has_seq_slot_headroom,
+                kv_cache_manager=mgr,
+                attention_dp_config=attention_dp_config,
+            )
+            built.add(type(router).__name__)
+            assert router.exclude_retiring_requests is has_seq_slot_headroom
+        # Anti-vacuity: the three configs must actually reach three branches.
+        assert built == {
+            "DefaultADPRouter",
+            "KVCacheAwareADPRouter",
+            "ConversationAwareADPRouter",
+        }
 
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)
@@ -1293,11 +1486,31 @@ class TestConversationAwareADPRouter:
         assert state.num_active_requests == 2
         assert state.num_active_tokens == 150
 
+    def test_gather_all_rank_states_excludes_retiring(self):
+        dist = _mock_dist(tp_rank=2)
+        router = ConversationAwareADPRouter(dist=dist, has_seq_slot_headroom=True)
+        active = [
+            Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
+            _retiring_request(prompt_len=50),
+        ]
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+
+        states = router.gather_all_rank_states(active_requests=active)
+
+        assert states[0].num_active_requests == 1
+        assert states[0].num_retiring_requests == 1
+        assert states[0].num_active_tokens == 100
+
     def test_factory_selects_conversation_router(self):
         cfg = MagicMock()
         cfg.kv_cache_routing_conversation_affinity = True
         cfg.kv_cache_routing_max_sessions = 8
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=cfg,
+        )
         assert isinstance(router, ConversationAwareADPRouter)
         assert router._max_sessions == 8
         # A mocked (non-string) placement value must fall back to round_robin.
@@ -1352,7 +1565,12 @@ class TestConversationAwareADPRouter:
         cfg.kv_cache_routing_conversation_affinity = True
         cfg.kv_cache_routing_max_sessions = 8
         cfg.kv_cache_routing_new_conv_placement = "least_queued"
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=cfg,
+        )
         assert router._new_conv_placement == "least_queued"
         bad = ConversationAwareADPRouter(dist=_mock_dist(tp_size=4), new_conv_placement="banana")
         assert bad._new_conv_placement == "round_robin"
@@ -1361,7 +1579,12 @@ class TestConversationAwareADPRouter:
         cfg = MagicMock()
         cfg.kv_cache_routing_conversation_affinity = False
         cfg.enable_kv_cache_aware_routing = False
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=cfg,
+        )
         assert isinstance(router, DefaultADPRouter)
 
     def test_returned_expected_covers_every_rank(self):

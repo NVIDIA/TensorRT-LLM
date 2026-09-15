@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+import os
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -1815,6 +1816,132 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
         Role.ALL: MapperKind.INDEXED,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+
+
+def _index_mapper_capacity_for(
+    *,
+    max_batch_size: int,
+    pp_size: int = 1,
+    is_disagg: bool = False,
+    num_reserved_index_slots: int = 1,
+    disable_overlap_scheduler: bool = True,
+) -> tuple[int, int, int]:
+    """Construct a manager and return the three sizes it derives.
+
+    ``(IndexMapper capacity, page-table capacity, max_admissible_sequences)``.
+
+    The first two must agree: ``host_kv_cache_block_offsets`` is indexed by the
+    index the mapper hands out, so a page table sized below the mapper's capacity
+    would be an out-of-bounds write. The third is the published admission bound
+    that ``validate_seq_slot_pool_covers_admission`` checks the seat pool against
+    at startup, and it is the capacity minus the reserved dummy slots.
+    """
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+    fake_impl = Mock()
+    fake_impl.layer_grouping = [[0]]
+    fake_impl.pool_group_descs = []
+    fake_impl.get_layer_group_id.side_effect = lambda _: 0
+
+    def build_base_config(
+        self: KVCacheManagerV2,
+        config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        cache_tiers: list[object],
+    ) -> _FakeManagerConfig:
+        del self, config, tokens_per_block
+        return _FakeManagerConfig(cache_tiers=cache_tiers)
+
+    with (
+        # Pin both diagnostics off: the guard page would add an index slot.
+        patch.dict(
+            os.environ,
+            {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
+        ),
+        patch(f"{module}.IndexMapper") as index_mapper_cls,
+        patch(f"{module}.KVCacheManagerPy", Mock(return_value=fake_impl)),
+        patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", lambda self, config: config),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor") as page_table,
+        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+    ):
+        manager = KVCacheManagerV2(
+            # A quota must be set or __init__ asserts; the value is irrelevant here.
+            KvCacheConfig(max_gpu_total_bytes=16 << 20),
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=max_batch_size,
+            mapping=Mapping(
+                world_size=pp_size,
+                rank=0,
+                tp_size=1,
+                pp_size=pp_size,
+            ),
+            dtype=DataType.HALF,
+            vocab_size=16,
+            execution_stream=Mock(),
+            is_disagg=is_disagg,
+            num_reserved_index_slots=num_reserved_index_slots,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+        )
+    index_mapper_cls.assert_called_once()
+    page_table.assert_called_once()
+    return (
+        index_mapper_cls.call_args.args[0],
+        page_table.call_args.args[0],
+        manager.max_admissible_sequences,
+    )
+
+
+# (max_batch_size, pp_size, disable_overlap_scheduler, is_disagg, reserved, expected)
+#
+# capacity == max_batch_size * pp_size
+#             * (2 if is_disagg or (overlap on and pp_size == 1) else 1)
+#             + reserved
+_INDEX_MAPPER_CAPACITY_CASES = [
+    # Overlap on, no PP: both cohorts are resident, so the mapper needs 2B.
+    pytest.param(2, 1, False, False, 1, 5, id="overlap_on"),
+    pytest.param(8, 1, False, False, 1, 17, id="overlap_on_b8"),
+    pytest.param(2, 1, True, False, 1, 3, id="overlap_off"),
+    pytest.param(2, 1, False, True, 1, 5, id="disagg_does_not_compound"),
+    pytest.param(2, 1, True, True, 1, 5, id="disagg_only"),
+    pytest.param(2, 4, True, False, 1, 9, id="pp4_plain"),
+    pytest.param(2, 4, False, False, 1, 9, id="pp4_overlap_excluded"),
+    # ... while the pre-existing disagg 2x under PP is left exactly as it was.
+    pytest.param(2, 4, True, True, 1, 17, id="pp4_disagg_unchanged"),
+    # Reserved slots are still added on top of the widened pool.
+    pytest.param(2, 1, False, False, 5, 9, id="reserved_slots_still_added"),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "max_batch_size,pp_size,disable_overlap_scheduler,is_disagg,reserved,expected",
+    _INDEX_MAPPER_CAPACITY_CASES,
+)
+def test_index_mapper_capacity_covers_the_overlapping_cohorts(
+    max_batch_size: int,
+    pp_size: int,
+    disable_overlap_scheduler: bool,
+    is_disagg: bool,
+    reserved: int,
+    expected: int,
+) -> None:
+    capacity, page_table_capacity, max_admissible_sequences = _index_mapper_capacity_for(
+        max_batch_size=max_batch_size,
+        pp_size=pp_size,
+        is_disagg=is_disagg,
+        num_reserved_index_slots=reserved,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+    )
+    assert capacity == expected
+    assert page_table_capacity == expected
+    assert max_admissible_sequences == expected - reserved
 
 
 @pytest.mark.parametrize(

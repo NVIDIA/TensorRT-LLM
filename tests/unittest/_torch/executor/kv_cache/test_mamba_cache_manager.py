@@ -2506,7 +2506,10 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         request_ids = [101, 102, 103, 104]
 
         assert mgr._num_reserved_dummy_slots == 5
-        assert mgr.index_mapper.num_free_slots() == len(request_ids) + 5
+        # The reserved dummy slots sit on top of the admission pool, whose width
+        # depends on the overlap/disagg lease coefficient.
+        initial_free_slots = mgr.index_mapper.num_free_slots()
+        assert initial_free_slots >= len(request_ids) + 5
 
         assert (
             mgr.add_dummy_requests(request_ids, token_nums=[1] * len(request_ids), is_gen=False)
@@ -2529,7 +2532,7 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         all_request_ids = request_ids + cuda_graph_dummy_ids + [ATTENTION_DP_DUMMY_REQUEST_ID]
         state_indices = mgr.get_state_indices(all_request_ids, [False] * len(all_request_ids))
         assert len(set(state_indices)) == len(all_request_ids)
-        assert mgr.index_mapper.num_free_slots() == 0
+        assert mgr.index_mapper.num_free_slots() == initial_free_slots - len(all_request_ids)
     finally:
         mgr.shutdown()
 

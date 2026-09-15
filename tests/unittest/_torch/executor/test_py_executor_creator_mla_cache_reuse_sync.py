@@ -254,6 +254,8 @@ def _run_create_py_executor(
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
+        pp_size=1,
+        has_pp=lambda: False,
         enable_attention_dp=False,
         is_last_pp_rank=lambda: True,
     )
