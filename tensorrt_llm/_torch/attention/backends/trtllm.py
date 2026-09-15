@@ -3091,3 +3091,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_done_elsewhere,
             quant_scale_qkv,
         )
+
+        # RoPE generation stays a single full-batch op; only the metadata the
+        # per-domain FMHA calls consume is split.
+        if (metadata.kv_cache_manager is not None and getattr(
+                metadata.kv_cache_manager, "num_locality_domains", 1) > 1):
+            _prepare_locality_domain_mla_gen_state_from_full(
+                metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                fused_q.shape[0],
+            )
