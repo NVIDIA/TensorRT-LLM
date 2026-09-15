@@ -14,10 +14,12 @@ import contextlib
 import os
 import sys
 import unittest
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import pytest
 import torch
 
 import tensorrt_llm
@@ -33,8 +35,186 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 )
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DraftTargetDecodingConfig,
+    Eagle3DecodingConfig,
+    PARDDecodingConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
+@pytest.mark.parametrize("batch_sizes", [[1], [1, 4, 8]])
+@pytest.mark.parametrize("fail_forward", [False, True])
+def test_generation_capture_restores_runtime_draft_length(
+    config_cls: type[DecodingBaseConfig], batch_sizes: list[int], fail_forward: bool
+) -> None:
+    """Graph warmup must not change the width used by a later generic warmup."""
+    config = config_cls(max_draft_len=3, speculative_model="dummy")
+    # Capture sorts shapes in reverse order, so its final shape has K=1;
+    # the exception case stops at K=2. Both differ from the initial K=3.
+    shapes = [(batch_size, draft_len) for batch_size in batch_sizes for draft_len in (3, 2, 1)]
+    observations = []
+    engine = SimpleNamespace(
+        cuda_graph_runner=SimpleNamespace(
+            enabled=True, is_warmup_only=True, set_capture_sample_type=Mock()
+        ),
+        _cuda_graph_batch_sizes=batch_sizes,
+        _get_graphs_to_capture=Mock(return_value=shapes),
+        max_seq_len=32,
+        mapping=None,
+        sparse_attention_config=None,
+        _force_lora_graph_for_capture=None,
+        runtime_draft_len=3,
+        batch_size=max(batch_sizes),
+        spec_config=config,
+        spec_metadata=SimpleNamespace(is_all_greedy_sample=True),
+        is_draft_model=False,
+        is_spec_decode=True,
+        cuda_graph_lora_manager=None,
+        _release_batch_context=lambda batch, _: contextlib.nullcontext(batch),
+        _update_draft_inference_state_for_warmup=Mock(),
+        _is_encoder_decoder_model=lambda: False,
+    )
+
+    def make_batch(
+        _: object, batch_size: int, draft_len: int, max_seq_len: int, **kwargs: object
+    ) -> SimpleNamespace:
+        width = config.get_runtime_tokens_per_gen_step(draft_len) - 1
+        return SimpleNamespace(draft_tokens=torch.ones(batch_size, width, dtype=torch.int32))
+
+    def forward(batch: SimpleNamespace, **kwargs: object) -> None:
+        width = config.get_runtime_tokens_per_gen_step(engine.runtime_draft_len) - 1
+        assert batch.draft_tokens.shape[1] == width
+        observations.append((batch.draft_tokens.shape[0], engine.runtime_draft_len))
+        if fail_forward and engine.runtime_draft_len == 2:
+            raise RuntimeError("capture failed")
+
+    engine._create_cuda_graph_warmup_request = make_batch
+    engine.forward = forward
+    with patch("torch.cuda.synchronize"):
+        # Memory estimation and final initialization warm up the same engine.
+        for warmup_only in (True, False):
+            engine.cuda_graph_runner.is_warmup_only = warmup_only
+            if fail_forward:
+                with pytest.raises(RuntimeError, match="capture failed"):
+                    PyTorchModelEngine._capture_generation_cuda_graphs(engine, object())
+            else:
+                PyTorchModelEngine._capture_generation_cuda_graphs(engine, object())
+            assert engine.runtime_draft_len == 3
+            assert engine._force_lora_graph_for_capture is None
+
+            # Generic warmup uses the configured physical buffer capacity;
+            # PARD's 2K-1 entries must not become the logical draft length K.
+            generic_width = config.tokens_per_gen_step - 1
+            assert (
+                config.get_runtime_tokens_per_gen_step(engine.runtime_draft_len) - 1
+                == generic_width
+            )
+
+    assert observations
+    if not fail_forward:
+        # Greedy and advanced sampling each visit every shape on both passes.
+        assert observations == sorted(shapes, reverse=True) * 4
+
+
+@pytest.mark.parametrize("incoming_draft_len", [0, 2])
+@pytest.mark.parametrize(
+    "config,expected_draft_len",
+    [
+        pytest.param(
+            DraftTargetDecodingConfig(
+                max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2, 8: 0}
+            ),
+            3,
+            id="draft-target",
+        ),
+        pytest.param(
+            PARDDecodingConfig(
+                max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2, 8: 0}
+            ),
+            3,
+            id="pard",
+        ),
+        pytest.param(
+            Eagle3DecodingConfig(
+                max_draft_len=3,
+                speculative_model="dummy",
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=2,
+                max_total_draft_tokens=6,
+            ),
+            6,
+            id="tree",
+        ),
+        pytest.param(None, 0, id="non-speculative"),
+    ],
+)
+def test_warmup_resets_draft_length_after_profiling(
+    config: DecodingBaseConfig | None, expected_draft_len: int, incoming_draft_len: int
+) -> None:
+    """Profiling can leave a shorter schedule length on the reused engine."""
+    engine = Mock(spec=PyTorchModelEngine)
+    engine._runner = None
+    engine.enable_in_graph_sampling = False
+    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.spec_config = config
+    engine.max_draft_len = config.max_draft_len if config is not None else 0
+    engine.max_total_draft_tokens = config.tokens_per_gen_step - 1 if config is not None else 0
+    engine.is_draft_model = False
+    engine.guided_decoder = None
+    engine.mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    engine.cuda_graph_runner = Mock()
+    engine.cuda_graph_runner.allow_capture.side_effect = contextlib.nullcontext
+    engine.set_warmup_flag.side_effect = contextlib.nullcontext
+    engine.no_cuda_graph.side_effect = contextlib.nullcontext
+    engine.maybe_autotune_lora.side_effect = contextlib.nullcontext
+    engine._is_encoder_decoder_model.return_value = False
+    engine._agree_warmup_flag.side_effect = lambda flag: flag
+    engine._agree_warmup_shapes.side_effect = lambda shapes: shapes
+    resource_manager = Mock()
+    kv_cache_manager = resource_manager.get_resource_manager.return_value
+    kv_cache_manager.check_invalid_values_in_kv_cache.return_value = False
+    phases: list[str] = []
+
+    def check_warmup_width(phase: str) -> Callable[..., None]:
+        def check(*args: object, **kwargs: object) -> None:
+            assert engine.runtime_draft_len == expected_draft_len
+            if config is not None:
+                # Generic warmup always constructs buffers at full physical
+                # capacity, including PARD's 2K-1 and the entire tree width.
+                width = config.get_runtime_tokens_per_gen_step(engine.runtime_draft_len) - 1
+                assert width == engine.max_total_draft_tokens
+            phases.append(phase)
+
+        return check
+
+    engine._run_attention_warmup.side_effect = check_warmup_width("attention")
+    engine._general_warmup.side_effect = check_warmup_width("general")
+    engine._run_autotuner_warmup.side_effect = check_warmup_width("autotuner")
+    engine._run_cuda_graph_warmup.side_effect = check_warmup_width("graphs")
+    with (
+        patch("tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module"),
+        patch("tensorrt_llm._torch.pyexecutor.model_engine.AutoTuner.get"),
+        patch("tensorrt_llm._torch.pyexecutor.model_engine.log_mem_snapshot"),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine._moe_a2a_steady_state_budget_for_capture",
+            side_effect=contextlib.nullcontext,
+        ),
+        patch("tensorrt_llm._torch.custom_ops.torch_custom_ops.MoERunner.clear_all_workspaces"),
+        patch("tensorrt_llm._torch.bolt_profiling.maybe_bolt_clear_counters"),
+        patch("torch.cuda.empty_cache"),
+        patch("gc.collect"),
+    ):
+        # Both the profiling executor and final executor invoke warmup on the
+        # same engine. The profiling workload uses normal schedule resolution.
+        for incoming in (expected_draft_len, incoming_draft_len):
+            engine.runtime_draft_len = incoming
+            PyTorchModelEngine.warmup(engine, resource_manager)
+
+    assert phases == ["attention", "general", "autotuner", "graphs", "graphs", "general"] * 2
 
 
 # Minimal fixtures mirroring sibling test_pytorch_model_engine.py — duplicated
