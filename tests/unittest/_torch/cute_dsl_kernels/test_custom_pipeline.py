@@ -24,7 +24,9 @@ from cutlass.pipeline import sm100
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("factory_kind", ["missing", "inherited_sm90", "non_callable", "supported"])
+@pytest.mark.parametrize(
+    "factory_kind", ["missing", "missing_class", "inherited_sm90", "non_callable", "supported"]
+)
 def test_custom_pipeline_sync_factory_import(
     monkeypatch: pytest.MonkeyPatch, factory_kind: str
 ) -> None:
@@ -32,6 +34,8 @@ def test_custom_pipeline_sync_factory_import(
     if factory_kind == "missing":
         # Deleting the override alone would expose the inherited SM90 factory.
         monkeypatch.setattr(sm100, "PipelineTmaUmma", types.SimpleNamespace())
+    elif factory_kind == "missing_class":
+        monkeypatch.delattr(sm100, "PipelineTmaUmma")
     elif factory_kind == "inherited_sm90":
         monkeypatch.setattr(
             sm100.PipelineTmaUmma,
