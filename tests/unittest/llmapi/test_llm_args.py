@@ -737,11 +737,13 @@ class TestKvCacheManagerV2AutoResolution:
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
 
-    def test_registered_models_prefer_v2(self):
+    def test_registered_models_prefer_v2(self) -> None:
         from tensorrt_llm._torch.models.modeling_utils import \
             get_registered_model_class
 
         architectures = (
+            "LlamaForCausalLM",
+            "Llama4ForConditionalGeneration",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
@@ -764,13 +766,16 @@ class TestKvCacheManagerV2AutoResolution:
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
 
-    def test_registered_models_keep_v2_on_nixl(self):
+    def test_registered_models_keep_v2_on_nixl(self) -> None:
         """Models preferring V2 and the Python transceiver keep V2 on NIXL.
 
         Both sentinels start at 'auto'; production resolves the transceiver
@@ -783,6 +788,7 @@ class TestKvCacheManagerV2AutoResolution:
             get_registered_model_class
 
         architectures = (
+            "Llama4ForConditionalGeneration",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
@@ -804,6 +810,9 @@ class TestKvCacheManagerV2AutoResolution:
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
@@ -2590,7 +2599,6 @@ class TestTorchLlmArgs:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model_dir="/path/to/model",
-            eagle3_one_model=False,
         )
 
         args = TorchLlmArgs(model=llama_model_path,

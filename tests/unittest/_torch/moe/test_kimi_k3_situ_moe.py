@@ -49,7 +49,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate, KimiK3MoERuntime
 from tensorrt_llm._torch.moe.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm import _MEGA_MOE_SYMM_BUFFER_CACHE
-from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._torch.utils import ActType_TrtllmGen, AuxStreamType
 from tensorrt_llm._utils import get_free_port, get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -633,7 +633,12 @@ def test_kimi_k3_trtllm_accepts_nvfp4_routed_experts():
         num_shared_experts=1,
     )
 
-    runtime = KimiK3MoERuntime(model_config, cfg, layer_idx=0)
+    runtime = KimiK3MoERuntime(
+        model_config,
+        cfg,
+        layer_idx=0,
+        aux_stream_dict={stream_type: torch.cuda.Stream() for stream_type in AuxStreamType},
+    )
 
     assert runtime.expert_ckpt_spec is modeling_kimi_linear._K3_EXPERT_CKPT_SPECS[QuantAlgo.NVFP4]
     assert isinstance(

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-
 import pytest
 
 from tensorrt_llm import LLM
@@ -31,7 +29,6 @@ from tensorrt_llm.llmapi import (
     SchedulingParams,
 )
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import (
@@ -39,6 +36,7 @@ from .accuracy_core import (
     ForceTokenLogitsProcessor,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
 )
 
 
@@ -56,7 +54,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # so gate on GB300-class device memory. B300 clears this memory gate but
     # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) -- do not
     # schedule these tests on B300; that exclusion is enforced by QA's
-    # platform selection, not by this marker.
+    # platform selection and by the CI stage's gb300-only gpu wildcard,
+    # not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
     @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa", "dspark"])
     def test_w4a16_mxfp4(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -68,6 +67,11 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         decoding. The reuse mode requires an observed hybrid-cache hit. The SA
         and DSpark modes also guard acceptance length for the two speculative
         decoding techniques advertised in the model-feature matrix.
+
+        The baseline and sa modes run post-merge in the GB300 16-GPU 4-node CI
+        stage (test-db list l0_gb300_multi_nodes_node4_gpu16.yml); all four
+        modes also run in QA's weekly multinode pipeline
+        (qa/llm_function_multinode.txt).
         """
         if mode == "baseline":
             monkeypatch.setenv("TLLM_METRICS_ALL_RANKS", "1")
@@ -144,7 +148,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             if mode == "baseline":
                 self._assert_attention_dp(llm)
                 self._assert_logits_processor(llm)
-                self._assert_guided_decoding(llm)
+                assert_guided_decoding_regex(llm)
             elif mode == "reuse":
                 self._assert_kv_cache_reuse(llm)
 
@@ -290,22 +294,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         assert isinstance(outputs, list)
         assert len(outputs) == 1
         assert outputs[0].outputs[0].token_ids == [forced_token_id] * output_length
-
-    @staticmethod
-    def _assert_guided_decoding(llm: LLM) -> None:
-        prompt_token_ids = llm.tokenizer.encode("Return exactly two decimal digits:")
-        outputs = llm.generate(
-            [prompt_token_ids],
-            sampling_params=SamplingParams(
-                max_tokens=8,
-                guided_decoding=GuidedDecodingParams(regex=r"[0-9]{2}"),
-            ),
-            use_tqdm=False,
-        )
-
-        assert isinstance(outputs, list)
-        assert len(outputs) == 1
-        assert re.fullmatch(r"[0-9]{2}", outputs[0].outputs[0].text)
 
 
 @pytest.mark.timeout(3600)

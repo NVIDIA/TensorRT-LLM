@@ -47,6 +47,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         merge_attention_forward_args)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
+from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -1332,9 +1333,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 2: static tree (target model only)
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert (spec_metadata.spec_dec_mode.is_eagle3()
-                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-                        ), "Tree decoding is only supported for Eagle3 now"
+                assert spec_metadata.spec_dec_mode.is_eagle3_one_model(
+                ), "Tree decoding is only supported for Eagle3 now"
                 assert not getattr(spec_metadata, 'is_draft_model', False), (
                     "Static tree spec-dec params are only prepared for the target model"
                 )
@@ -2070,7 +2070,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
-        fmha.forward(q, k, v, metadata, forward_args)
+        try:
+            fmha.forward(q, k, v, metadata, forward_args)
+        except RuntimeError as exc:
+            log_attention_failure_context(
+                type(self).__name__, self.layer_idx, metadata,
+                forward_args.attention_window_size, exc)
+            raise
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat

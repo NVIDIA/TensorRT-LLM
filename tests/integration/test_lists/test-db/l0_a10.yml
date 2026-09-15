@@ -24,6 +24,8 @@ l0_a10:
   - unittest/_torch/test_mnnvl_memory_lifecycle.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
+  - unittest/_torch/modeling/test_modeling_nemotron_nas.py
+  - unittest/_torch/modeling/test_modeling_bart.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
@@ -52,6 +54,11 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
   - unittest/grpc/smg/test_smg.py
+  # The one OpenEngine test needing a GPU: it builds a real LLM, because a
+  # stubbed engine would accept whatever its fake generate_async accepts and so
+  # would agree with an advertisement the real engine rejects. Any GPU will do
+  # -- the model is TinyLlama-1.1B -- so it sits with the other gateway tests.
+  - unittest/grpc/openengine/test_capability_conformance.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py
@@ -73,7 +80,6 @@ l0_a10:
   - unittest/tools/test_host_profiler.py
   - unittest/tools/test_infra_dry_run_pipeline.py
   - unittest/tools/test_infra_dry_run_pytest.py
-  - unittest/tools/test_perf_sanity_matching.py
   - unittest/tools/test_unittest_culprits.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
