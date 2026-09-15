@@ -1588,7 +1588,7 @@ CUBIN_EXPORT __global__
 
     // Include the sink in both GEMMs' initial maxima before computing softmax weights.
     auto initialRowMax = ThrdRegRowMax::filled(safeInitRowMax);
-    if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
+    if (attentionSinks != nullptr)
     {
         for (uint32_t i = 0; i < initialRowMax.size; i++)
         {
@@ -2036,7 +2036,6 @@ CUBIN_EXPORT __global__
             // load hint
             QuadRegRowMax initRowMaxQuad = smem.ctaRowMax[warpIdx.y].loadToRegForQuad<true>(warp);
 #endif
-            initRowMaxQuad = fmaxf(initRowMaxQuad, replicateForQuad(warp, initialRowMax));
             // masking
             uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if SPEC_DEC
@@ -2075,6 +2074,7 @@ CUBIN_EXPORT __global__
 #endif
 
             // find max and update acc into exp(acc-max).
+            initRowMaxQuad = fmaxf(initRowMaxQuad, replicateForQuad(warp, initialRowMax));
             QuadRegRowMax const regRowMax = warpTileOnlineSoftmax(warp, initRowMaxQuad, acc);
 
             // store result and max to shared memory.
