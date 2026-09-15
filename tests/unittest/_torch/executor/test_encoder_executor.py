@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.encoder_executor import EncoderExecutor
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedEncoderBatch
 
 pytestmark = pytest.mark.cpu_only
 
@@ -18,13 +19,13 @@ def test_encoder_executor_warms_up_through_model_engine() -> None:
     executor = EncoderExecutor(model_engine, SimpleNamespace())
 
     assert executor.model_engine is model_engine
-    model_engine.warmup.assert_called_once_with(None)
+    model_engine.warmup.assert_called_once_with()
 
 
 def test_batch_forward_hands_the_packed_batch_to_the_engine() -> None:
     expected = {"logits": torch.tensor([1.0, 2.0])}
     model_engine = Mock()
-    model_engine.forward_encode_batch.return_value = expected
+    model_engine.forward.return_value = expected
     executor = object.__new__(EncoderExecutor)
     executor.model_engine = model_engine
     inputs = {
@@ -43,12 +44,12 @@ def test_batch_forward_hands_the_packed_batch_to_the_engine() -> None:
         "multi_item_part_lens",
         "token_type_ids",
     }
-    model_engine.forward_encode_batch.assert_called_once_with(
-        [11, 12, 21, 22, 23],
-        [2, 3],
-        multi_item_part_lens=[[1, 1], [2, 1]],
-        token_type_ids=inputs["token_type_ids"],
+    model_engine.forward.assert_called_once_with(
+        PackedEncoderBatch(
+            input_ids=[11, 12, 21, 22, 23],
+            sequence_lengths=[2, 3],
+            multi_item_part_lens=[[1, 1], [2, 1]],
+            model_inputs={"token_type_ids": inputs["token_type_ids"]},
+        ),
         gather_context_logits=True,
     )
-    # The tokens must not be split into requests only to be repacked downstream.
-    model_engine.forward.assert_not_called()

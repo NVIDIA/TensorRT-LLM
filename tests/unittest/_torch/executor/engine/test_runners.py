@@ -249,6 +249,7 @@ def _model_engine_with_runner(
     engine.model = SimpleNamespace(extra_attrs={})
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine._runner = runner
+    engine._is_packed_runner = False
     engine.cuda_graph_lora_manager = None
     engine.runtime_draft_len = 0
     engine.moe_load_balancer = None
@@ -266,13 +267,8 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         kv_cache_manager=None,
     )
     batch = ScheduledRequests()
-    model_input = object()
 
-    actual_outputs = engine.forward(
-        batch,
-        resource_manager,
-        token_type_ids=model_input,
-    )
+    actual_outputs = engine.forward(batch, resource_manager)
 
     assert actual_outputs is expected_outputs
     runner.forward.assert_called_once_with(
@@ -281,7 +277,6 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         cuda_graph_lora_manager=None,
         runtime_draft_len=0,
         gather_context_logits=False,
-        token_type_ids=model_input,
     )
 
 
@@ -313,6 +308,7 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
         model_config=SimpleNamespace(is_encoder_decoder=True),
     )
     engine._runner = runner
+    engine._is_packed_runner = False
     requests = [object(), object()]
     resource_manager = object()
 
@@ -330,20 +326,6 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
     )
 
 
-def test_model_engine_legacy_decoder_rejects_runner_model_inputs() -> None:
-    engine, resource_manager = _model_engine_with_runner(
-        None,
-        kv_cache_manager=object(),
-    )
-
-    with pytest.raises(NotImplementedError, match="token_type_ids"):
-        engine.forward(
-            ScheduledRequests(),
-            resource_manager,
-            token_type_ids=object(),
-        )
-
-
 def test_model_engine_releases_runner_owned_graphs() -> None:
     engine = object.__new__(PyTorchModelEngine)
     engine._runner = Mock(spec=EncoderRunner)
@@ -353,7 +335,7 @@ def test_model_engine_releases_runner_owned_graphs() -> None:
 
     engine._release_cuda_graphs()
 
-    engine._runner.release_graph.assert_called_once_with()
+    engine._runner.cleanup.assert_called_once_with()
 
 
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:

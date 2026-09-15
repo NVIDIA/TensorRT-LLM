@@ -194,6 +194,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = Mock(spec=NoKVCacheRunner)
+        model_engine._is_packed_runner = False
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
 
@@ -215,6 +216,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = Mock(spec=NoKVCacheRunner)
+        model_engine._is_packed_runner = False
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = object()
 
@@ -233,6 +235,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.enable_in_graph_sampling = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = None
+        model_engine._is_packed_runner = False
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
 
@@ -255,6 +258,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine._runner = Mock(spec=EncoderDecoderRunner)
+        model_engine._is_packed_runner = False
         resource_manager = object()
 
         model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)

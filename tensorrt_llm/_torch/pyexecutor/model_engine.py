@@ -11,7 +11,7 @@ import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
-                    Union)
+                    Union, cast)
 
 import torch
 import torch._dynamo.config
@@ -94,7 +94,8 @@ from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig)
-from .engine.runners.interface import ModelRunner, RunnerDeps
+from .engine.runners.interface import (ModelRunner, PackedEncoderBatch,
+                                       PackedModelRunner, RunnerDeps)
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -189,17 +190,14 @@ class ModelEngine(ABC):
                 new_tensors_device: Optional[SampleStateTensors],
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
-                num_accepted_tokens_device: Optional[torch.Tensor] = None,
-                **model_inputs: Any):
-        """Execute a batch with implementation-supported model-specific inputs."""
+                num_accepted_tokens_device: Optional[torch.Tensor] = None):
         raise NotImplementedError
 
     def warmup(self, resource_manager: Optional[ResourceManager]) -> None:
         """
         This method is called after runtime resources are initialized. The
-        resource manager is absent for model variants that do not use one.
-        Override to perform warmup actions such as instantiating CUDA graphs
-        or running torch.compile.
+        resource manager is absent for drivers that allocate none. Override to
+        perform warmup actions: instantiating CUDA graphs, torch.compile, etc.
         """
         return
 
@@ -321,7 +319,9 @@ class PyTorchModelEngine(ModelEngine):
 
         self.forward_pass_callable = None
         self._cleanup_done = False
-        self._runner: Optional[ModelRunner] = None
+        self._runner: Optional[Union[ModelRunner, PackedModelRunner]] = None
+        # Which of the two runner contracts `_runner` implements.
+        self._is_packed_runner = False
         # Transitional snapshot for decoder capture and encoder scheduling.
         # Encoder graph resources and lifecycle remain entirely runner-owned.
         self._encoder_graph_shapes: frozenset[tuple[int, int]] = frozenset()
@@ -816,6 +816,7 @@ class PyTorchModelEngine(ModelEngine):
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
         self._runner = self._initialize_runner(runner_cls)
+        self._is_packed_runner = isinstance(self._runner, EncoderRunner)
 
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = \
@@ -885,8 +886,8 @@ class PyTorchModelEngine(ModelEngine):
         return BreakableCUDAGraphRunner(decoder_model.model)
 
     def _initialize_runner(
-            self,
-            runner_cls: Optional[Type[ModelRunner]]) -> Optional[ModelRunner]:
+        self, runner_cls: Optional[Type[Union[ModelRunner, PackedModelRunner]]]
+    ) -> Optional[Union[ModelRunner, PackedModelRunner]]:
         if runner_cls is None:
             return None
         if issubclass(runner_cls, EncoderRunner):
@@ -1238,7 +1239,9 @@ class PyTorchModelEngine(ModelEngine):
         """
 
         @functools.wraps(method)
-        def wrapper(self, resource_manager: Optional[ResourceManager], *args,
+        def wrapper(self,
+                    resource_manager: Optional[ResourceManager] = None,
+                    *args,
                     **kwargs):
             result = method(self, resource_manager, *args, **kwargs)
             kv_cache_manager = (resource_manager.get_resource_manager(
@@ -1327,11 +1330,12 @@ class PyTorchModelEngine(ModelEngine):
     ) -> None:
         if not self._is_encoder_decoder_model():
             return
-        if self._runner is None:
+        if self._runner is None or self._is_packed_runner:
             raise RuntimeError(
                 "Encoder-decoder model did not initialize a model runner.")
-        self._runner.warmup(resource_manager)
-        self._runner.capture_graphs(resource_manager)
+        runner = cast(ModelRunner, self._runner)
+        runner.warmup(resource_manager)
+        runner.capture_graphs(resource_manager)
 
     def _get_encoder_cuda_graph_batch_sizes(
             self, max_batch_size: int) -> tuple[int, ...]:
@@ -1341,39 +1345,21 @@ class PyTorchModelEngine(ModelEngine):
             max_batch_size,
             pad_to_limit=self._encoder_graph_pad_to_limit)
 
-    def forward_encode_batch(
-        self,
-        input_ids: List[int],
-        sequence_lengths: List[int],
-        *,
-        multi_item_part_lens: Optional[List[List[int]]] = None,
-        gather_context_logits: bool = False,
-        **model_inputs: Any,
-    ) -> Dict[str, Any]:
-        """Run one already-packed encode-only batch, for the direct Encode API."""
-        if not isinstance(self._runner, EncoderRunner):
-            raise RuntimeError(
-                "Encode-only execution requires an initialized encoder runner.")
-        return self._runner.forward_packed(
-            input_ids,
-            sequence_lengths,
-            multi_item_part_lens=multi_item_part_lens,
-            gather_context_logits=gather_context_logits,
-            **model_inputs,
-        )
-
     def forward_encoder(
         self,
         encoder_requests: List[LlmRequest],
         resource_manager: Optional[ResourceManager] = None,
     ) -> Tuple[torch.Tensor, List[int]]:
-        if not self._is_encoder_decoder_model() or self._runner is None:
+        if (not self._is_encoder_decoder_model() or self._runner is None
+                or self._is_packed_runner):
             raise RuntimeError(
                 "Encoder phase requires an initialized encoder-decoder model runner."
             )
+        assert resource_manager is not None, (
+            "the encoder phase requires a resource manager")
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = list(encoder_requests)
-        outputs = self._runner.forward(
+        outputs = cast(ModelRunner, self._runner).forward(
             scheduled_requests,
             resource_manager=resource_manager,
             cuda_graph_lora_manager=None,
@@ -1387,20 +1373,28 @@ class PyTorchModelEngine(ModelEngine):
 
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
-    def warmup(self, resource_manager: Optional[ResourceManager]) -> None:
+    def warmup(self,
+               resource_manager: Optional[ResourceManager] = None) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
-        kv_cache_manager = (resource_manager.get_resource_manager(
+        if self._is_packed_runner:
+            packed_runner = cast(PackedModelRunner, self._runner)
+            packed_runner.warmup()
+            packed_runner.capture_graphs()
+            return
+        assert resource_manager is not None, (
+            "scheduled warmup requires a resource manager")
+        kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-                            if resource_manager is not None else None)
         if self._runner is not None and not self._is_encoder_decoder_model():
             assert kv_cache_manager is None, (
                 "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
             )
-            self._runner.warmup(resource_manager)
-            self._runner.capture_graphs(resource_manager)
+            runner = cast(ModelRunner, self._runner)
+            runner.warmup(resource_manager)
+            runner.capture_graphs(resource_manager)
             return
 
         # Ahead of the legacy early returns below: only the advanced-sampling
@@ -3588,6 +3582,7 @@ class PyTorchModelEngine(ModelEngine):
         # clearing the engine's attribute alone would leave the weights
         # reachable past `release_gc()` below.
         self._runner = None
+        self._is_packed_runner = False
         self._mm_item_scheduler = None
         self.model = None
 
@@ -3707,7 +3702,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _release_cuda_graphs(self):
         if self._runner is not None:
-            self._runner.release_graph()
+            self._runner.cleanup()
         if self._torch_compile_backend is not None:
             self._torch_compile_backend.clear_piecewise_cuda_graphs()
         if hasattr(self,
@@ -5894,33 +5889,54 @@ class PyTorchModelEngine(ModelEngine):
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(self,
-                scheduled_requests: ScheduledRequests,
-                resource_manager: Optional[ResourceManager],
+                batch: Union[ScheduledRequests, PackedEncoderBatch],
+                resource_manager: Optional[ResourceManager] = None,
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
-                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-                **model_inputs: Any):
-        kv_cache_manager = (resource_manager.get_resource_manager(
+                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        if isinstance(batch, PackedEncoderBatch):
+            assert self._is_packed_runner, (
+                "a packed batch requires a packed-batch runner")
+            return cast(PackedModelRunner, self._runner).forward(
+                batch, gather_context_logits=gather_context_logits)
+        assert resource_manager is not None, (
+            "scheduled execution requires a resource manager")
+        return self._forward_scheduled(
+            batch,
+            resource_manager,
+            new_tensors_device=new_tensors_device,
+            gather_context_logits=gather_context_logits,
+            cache_indirection_buffer=cache_indirection_buffer,
+            num_accepted_tokens_device=num_accepted_tokens_device,
+            req_id_to_old_request=req_id_to_old_request,
+        )
+
+    def _forward_scheduled(self, scheduled_requests: ScheduledRequests,
+                           resource_manager: ResourceManager, *,
+                           new_tensors_device: Optional[SampleStateTensors],
+                           gather_context_logits: bool,
+                           cache_indirection_buffer: Optional[torch.Tensor],
+                           num_accepted_tokens_device: Optional[torch.Tensor],
+                           req_id_to_old_request: Optional[Dict[int,
+                                                                LlmRequest]]):
+        assert not self._is_packed_runner, (
+            "a packed-batch runner cannot execute scheduled requests")
+        kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-                            if resource_manager is not None else None)
         if self._runner is not None and not self._is_encoder_decoder_model():
             assert kv_cache_manager is None, (
                 "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
             )
-            return self._runner.forward(
+            runner = cast(ModelRunner, self._runner)
+            return runner.forward(
                 scheduled_requests,
                 resource_manager=resource_manager,
                 cuda_graph_lora_manager=self.cuda_graph_lora_manager,
                 runtime_draft_len=self.runtime_draft_len,
                 gather_context_logits=gather_context_logits,
-                **model_inputs,
             )
-        if model_inputs:
-            raise NotImplementedError(
-                "The legacy decoder path does not support additional model "
-                f"inputs. Unsupported keys: {sorted(model_inputs)}")
         assert kv_cache_manager is not None, (
             "the legacy runner requires a KV cache manager")
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(

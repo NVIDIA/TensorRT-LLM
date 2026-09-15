@@ -61,19 +61,6 @@ def test_encoder_decoder_rejects_mixed_token_and_feature_batch() -> None:
         )
 
 
-def test_encoder_decoder_rejects_unhandled_model_inputs() -> None:
-    runner = object.__new__(EncoderDecoderRunner)
-
-    with pytest.raises(NotImplementedError, match="position_ids"):
-        runner.prepare_inputs(
-            ScheduledRequests(),
-            resource_manager=None,
-            cuda_graph_lora_manager=None,
-            runtime_draft_len=0,
-            position_ids=object(),
-        )
-
-
 def test_token_encoder_stack_applies_shared_embedding_scale_and_positions() -> None:
     embedding = Mock(side_effect=lambda input_ids: input_ids.to(torch.float32).unsqueeze(1))
     expected = torch.tensor([[2.0], [4.0], [6.0]])

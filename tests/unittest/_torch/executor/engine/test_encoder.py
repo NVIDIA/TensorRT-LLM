@@ -21,7 +21,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderDecoderRunner,
     EncoderDecoderRunnerConfig,
 )
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedEncoderBatch
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -246,81 +246,7 @@ def test_packed_inputs_reject_inconsistent_request_boundaries(
     runner = object.__new__(EncoderRunner)
 
     with pytest.raises(ValueError, match=message):
-        runner.prepare_packed_inputs(
-            input_ids,
-            sequence_lengths,
-            multi_item_part_lens=multi_item_part_lens,
-        )
-
-
-def test_scheduled_inputs_are_prepared_through_the_packed_path() -> None:
-    """Both entry points share one preparation, so they cannot drift apart."""
-    runner = object.__new__(EncoderRunner)
-    runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=False)
-    runner.prepare_packed_inputs = Mock(return_value="prepared")
-    requests = [
-        SimpleNamespace(
-            get_tokens=lambda _: [11, 12],
-            py_multi_item_part_lens=None,
-            is_last_context_chunk=True,
-        ),
-        SimpleNamespace(
-            get_tokens=lambda _: [21],
-            py_multi_item_part_lens=None,
-            is_last_context_chunk=True,
-        ),
-    ]
-    scheduled_requests = ScheduledRequests()
-    scheduled_requests.reset_context_requests(requests)
-
-    actual = runner.prepare_inputs(
-        scheduled_requests,
-        resource_manager=None,
-        cuda_graph_lora_manager=None,
-        runtime_draft_len=0,
-        token_type_ids="passthrough",
-    )
-
-    assert actual == "prepared"
-    runner.prepare_packed_inputs.assert_called_once_with(
-        [11, 12, 21],
-        [2, 1],
-        multi_item_part_lens=None,
-        token_type_ids="passthrough",
-    )
-
-
-def test_encoder_runner_collects_scheduled_inputs_without_losing_request_boundaries() -> None:
-    requests = [
-        SimpleNamespace(
-            get_tokens=lambda _: [11, 12],
-            py_multi_item_part_lens=[1, 1],
-        ),
-        SimpleNamespace(
-            get_tokens=lambda _: [21, 22, 23],
-            py_multi_item_part_lens=[2, 1],
-        ),
-    ]
-    scheduled_requests = ScheduledRequests()
-    scheduled_requests.context_requests_last_chunk = requests
-
-    assert EncoderRunner._collect_scheduled_inputs(scheduled_requests) == (
-        [11, 12, 21, 22, 23],
-        [2, 3],
-        [[1, 1], [2, 1]],
-    )
-
-
-def test_encoder_runner_rejects_partial_multi_item_metadata() -> None:
-    requests = [
-        SimpleNamespace(get_tokens=lambda _: [11], py_multi_item_part_lens=[1]),
-        SimpleNamespace(get_tokens=lambda _: [21], py_multi_item_part_lens=None),
-    ]
-    scheduled_requests = ScheduledRequests()
-    scheduled_requests.context_requests_last_chunk = requests
-
-    with pytest.raises(ValueError, match="provided for all requests or for none"):
-        EncoderRunner._collect_scheduled_inputs(scheduled_requests)
+        runner.prepare_inputs(PackedEncoderBatch(input_ids, sequence_lengths, multi_item_part_lens))
 
 
 @pytest.mark.parametrize(
@@ -339,11 +265,7 @@ def test_encoder_runner_rejects_model_inputs_owned_by_the_runner(reserved_name: 
 
     with pytest.raises(ValueError, match=reserved_name):
         runner.prepare_inputs(
-            ScheduledRequests(),
-            resource_manager=None,
-            cuda_graph_lora_manager=None,
-            runtime_draft_len=0,
-            **{reserved_name: object()},
+            PackedEncoderBatch([11, 12], [2], model_inputs={reserved_name: object()})
         )
 
 
@@ -351,21 +273,14 @@ def test_encoder_runner_forwards_model_inputs_to_eager_preparation() -> None:
     expected = EncoderPreparedInputs({}, sequence_lengths=[2])
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = SimpleNamespace(enabled=False)
-    runner._collect_scheduled_inputs = Mock(return_value=([11, 12], [2], None))
     runner._prepare_encoder_batch = Mock(return_value=expected)
-    scheduled_requests = ScheduledRequests()
     token_type_ids = torch.tensor([0, 1])
 
     actual = runner.prepare_inputs(
-        scheduled_requests,
-        resource_manager=None,
-        cuda_graph_lora_manager=None,
-        runtime_draft_len=0,
-        token_type_ids=token_type_ids,
+        PackedEncoderBatch([11, 12], [2], model_inputs={"token_type_ids": token_type_ids})
     )
 
     assert actual is expected
-    runner._collect_scheduled_inputs.assert_called_once_with(scheduled_requests)
     runner._prepare_encoder_batch.assert_called_once_with(
         [11, 12],
         [2],
@@ -380,11 +295,7 @@ def test_encoder_runner_rejects_model_inputs_for_cuda_graph_execution() -> None:
 
     with pytest.raises(NotImplementedError, match="token_type_ids"):
         runner.prepare_inputs(
-            ScheduledRequests(),
-            resource_manager=None,
-            cuda_graph_lora_manager=None,
-            runtime_draft_len=0,
-            token_type_ids=object(),
+            PackedEncoderBatch([11, 12], [2], model_inputs={"token_type_ids": object()})
         )
 
 
@@ -525,6 +436,6 @@ def test_encoder_release_clears_owned_graph_backend() -> None:
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = Mock()
 
-    runner.release_graph()
+    runner.cleanup()
 
     runner._encoder_cuda_graph_runner.clear.assert_called_once_with()

@@ -80,17 +80,11 @@ class EncoderDecoderRunner(EncoderMixin):
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager | None,
+        resource_manager: ResourceManager,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-        **model_inputs: Any,
     ) -> EncoderPreparedInputs:
         """Pack one scheduled encoder batch into the model's input contract."""
-        if model_inputs:
-            raise NotImplementedError(
-                "EncoderDecoderRunner does not support additional model inputs. "
-                f"Unsupported keys: {sorted(model_inputs)}"
-            )
         del cuda_graph_lora_manager, runtime_draft_len
         encoder_requests = scheduled_requests.encoder_requests
         if not encoder_requests:
@@ -117,7 +111,7 @@ class EncoderDecoderRunner(EncoderMixin):
         self,
         encoder_requests: list[LlmRequest],
         *,
-        resource_manager: ResourceManager | None,
+        resource_manager: ResourceManager,
     ) -> EncoderPreparedInputs:
         input_ids: list[int] = []
         position_ids: list[int] = []
@@ -159,7 +153,7 @@ class EncoderDecoderRunner(EncoderMixin):
         self,
         encoder_requests: list[LlmRequest],
         *,
-        resource_manager: ResourceManager | None,
+        resource_manager: ResourceManager,
     ) -> EncoderPreparedInputs:
         features: list[torch.Tensor] = []
         sequence_lengths: list[int] = []
@@ -247,10 +241,10 @@ class EncoderDecoderRunner(EncoderMixin):
         packed.record_stream(consumer_stream)
         return packed
 
-    def warmup(self, resource_manager: ResourceManager | None) -> None:
+    def warmup(self, resource_manager: ResourceManager) -> None:
         """Encoder-decoder warmup is performed while capturing graph shapes."""
 
-    def capture_graphs(self, resource_manager: ResourceManager | None) -> None:
+    def capture_graphs(self, resource_manager: ResourceManager) -> None:
         self._capture_encoder_cuda_graphs(
             lambda sequence_lengths: self._prepare_capture_inputs(
                 sequence_lengths, resource_manager
@@ -260,7 +254,7 @@ class EncoderDecoderRunner(EncoderMixin):
         )
 
     def _prepare_capture_inputs(
-        self, sequence_lengths: list[int], resource_manager: ResourceManager | None
+        self, sequence_lengths: list[int], resource_manager: ResourceManager
     ) -> EncoderPreparedInputs:
         request_ids = list(range(len(sequence_lengths)))
         position_ids: list[int] = []
@@ -283,7 +277,7 @@ class EncoderDecoderRunner(EncoderMixin):
         position_ids: list[int],
         sequence_lengths: list[int],
         request_ids: list[int],
-        resource_manager: ResourceManager | None,
+        resource_manager: ResourceManager,
     ) -> EncoderPreparedInputs:
         input_ids_cpu = torch.tensor(
             input_ids,
@@ -322,11 +316,10 @@ class EncoderDecoderRunner(EncoderMixin):
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager | None,
+        resource_manager: ResourceManager,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
         gather_context_logits: bool,
-        **model_inputs: Any,
     ) -> dict[str, Any]:
         del gather_context_logits
         prepared = self.prepare_inputs(
@@ -334,7 +327,6 @@ class EncoderDecoderRunner(EncoderMixin):
             resource_manager=resource_manager,
             cuda_graph_lora_manager=cuda_graph_lora_manager,
             runtime_draft_len=runtime_draft_len,
-            **model_inputs,
         )
         hidden_states = self._execute_prepared(prepared)
         return {

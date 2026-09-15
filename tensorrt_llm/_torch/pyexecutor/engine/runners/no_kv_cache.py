@@ -133,18 +133,10 @@ class NoKVCacheRunner(ABC):
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager | None,
+        resource_manager: ResourceManager,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-        **model_inputs: Any,
     ) -> PreparedInputs:
-        if model_inputs:
-            raise NotImplementedError(
-                "NoKVCacheRunner does not support additional model inputs. "
-                f"Unsupported keys: {sorted(model_inputs)}"
-            )
-        if resource_manager is None:
-            raise ValueError("NoKVCacheRunner requires a resource manager.")
         runner_config = self._config
         attn_metadata = self.setup_attn_metadata()
         spec_metadata = self.setup_spec_metadata(
@@ -373,31 +365,29 @@ class NoKVCacheRunner(ABC):
 
         return PreparedInputs(inputs)
 
-    def warmup(self, resource_manager: ResourceManager | None) -> None:
+    def warmup(self, resource_manager: ResourceManager) -> None:
         return
 
-    def capture_graphs(self, resource_manager: ResourceManager | None) -> None:
+    def capture_graphs(self, resource_manager: ResourceManager) -> None:
         return
 
-    def release_graph(self) -> None:
+    def cleanup(self) -> None:
         return
 
     def forward(
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager | None,
+        resource_manager: ResourceManager,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
         gather_context_logits: bool,
-        **model_inputs: Any,
     ) -> dict[str, Any]:
         prepared = self.prepare_inputs(
             scheduled_requests,
             resource_manager=resource_manager,
             cuda_graph_lora_manager=cuda_graph_lora_manager,
             runtime_draft_len=runtime_draft_len,
-            **model_inputs,
         )
         with MoeLoadBalancerIterContext(self._deps.moe_load_balancer):
             return self._forward_step(

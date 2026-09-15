@@ -27,7 +27,7 @@ from .mm_encoder import MultimodalEncoderRunner
 from .pooling import PoolingRunner
 
 if TYPE_CHECKING:
-    from .interface import ModelRunner
+    from .interface import ModelRunner, PackedModelRunner
 
 __all__ = [
     "apply_position_id_offset",
@@ -35,6 +35,7 @@ __all__ = [
     "get_padding_params",
     "get_position_id_offset",
     "get_top_level_model",
+    "EncoderDecoderRunner",
     "EncoderRunner",
     "prepare_multimodal_indices",
     "resolve_runner_type",
@@ -46,7 +47,7 @@ __all__ = [
 def resolve_runner_type(
     model: nn.Module,
     llm_args: TorchLlmArgs,
-) -> type[ModelRunner] | None:
+) -> type[ModelRunner] | type[PackedModelRunner] | None:
     """Resolve the startup runner class without constructing its dependencies."""
     if llm_args.encode_only and not llm_args.mm_encoder_only:
         return EncoderRunner
