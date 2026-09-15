@@ -27,7 +27,11 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+from ....kernels.blackwell.utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
 from .block_scan import block_prefix_sum_kernel
 from .filtered_top_k_varlen_util import float_as_uint32, half_as_ushort
 
