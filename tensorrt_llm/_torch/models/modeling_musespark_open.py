@@ -428,6 +428,7 @@ def _gated_residual_after_rmsnorm_kernel(
     BLOCK_H: tl.constexpr,
     HAS_GAIN: tl.constexpr,
     FUSE_NEXT_NORM: tl.constexpr,
+    NORM_FP32_RESIDUAL: tl.constexpr,
 ):
     """``alpha*residual + beta*rmsnorm(branch)`` for one token, in one kernel.
 
@@ -443,6 +444,14 @@ def _gated_residual_after_rmsnorm_kernel(
     fused path, and the norm result is rounded again before the gated add reads
     it. Dropping either round would make this MORE accurate and therefore not a
     fusion of this chain.
+
+    ``NORM_FP32_RESIDUAL`` selects the ordering of the fused NEXT prenorm
+    (``FUSE_NEXT_NORM``) only: unset, the updated FP32 residual is rounded to
+    the activation dtype before the next variance (the historical ordering);
+    set, the variance and the normalization read the FP32 residual directly and
+    the single round to the activation dtype happens on the output, after the
+    ``(1 + w)`` gain. The residual stream written to ``out_ptr`` is identical
+    either way.
     """
     token = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -463,8 +472,14 @@ def _gated_residual_after_rmsnorm_kernel(
     updated = alpha * residual + beta * normed
     tl.store(out_ptr + base, updated, mask=mask)
     if FUSE_NEXT_NORM:
-        # Preserve the explicit activation cast before the consuming RMSNorm.
-        next_input = updated.to(branch.dtype).to(tl.float32)
+        if NORM_FP32_RESIDUAL:
+            # Reference ordering: the next variance and normalization read the
+            # FP32 residual; the store below takes the single activation-dtype
+            # round, after the gain.
+            next_input = updated
+        else:
+            # Preserve the explicit activation cast before the consuming RMSNorm.
+            next_input = updated.to(branch.dtype).to(tl.float32)
         next_variance = tl.sum(next_input * next_input, axis=0) / HIDDEN
         next_weight = tl.load(next_weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         next_output = next_input * tl.rsqrt(next_variance + next_eps)
@@ -501,6 +516,50 @@ def _fused_residual_enabled() -> bool:
         "no",
         "off",
     )
+
+
+def _preqkv_norm_fp32_residual_enabled() -> bool:
+    """Whether the pre-QKV prenorm reads the FP32 residual (cast after norm).
+
+    Off unless MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL names a truthy value. This
+    is an opt-in, unlike the accepted fusion levers, because it selects between
+    two well-defined numerics orderings rather than fusing an unchanged one:
+    set, the pre-QKV RMSNorm in later layers computes its variance on the FP32
+    residual stream and rounds to the activation dtype once, on its output
+    (the reference training recipe's ordering); unset, the residual is rounded
+    to the activation dtype before the norm reads it (the historical serving
+    ordering, applied uniformly to both prenorm boundaries). The pre-FFN
+    prenorm is cast-first in both recipes and is not affected.
+
+    The default stays on the historical side until the served numerics are
+    confirmed to switch; flipping it is a bf16-grain change to every later
+    layer's attention input. Both arms exist in one build so the A/B is a
+    one-image environment flip, the same reason every other lever here keeps
+    its control leg. Resolved at module construction, before warmup and any
+    graph capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _rmsnorm_fp32_in(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
+    """Gemma RMSNorm over the FP32 residual, one round to the weight dtype.
+
+    The unfused arm of the reference pre-QKV ordering. ``RMSNorm`` itself
+    cannot serve it: the flashinfer branch only accepts fp16/bf16 inputs, and
+    the torch branch returns the input dtype (fp32 here). The variance, the
+    normalization, and the ``(1 + w)`` gain all evaluate in fp32 -- the same
+    single-round chain as the fused kernels' NORM_FP32_RESIDUAL arm, so the
+    arms differ only in reduction order.
+    """
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    normed = x * torch.rsqrt(variance + norm.variance_epsilon)
+    return (normed * (norm.weight.to(torch.float32) + 1.0)).to(norm.weight.dtype)
 
 
 def _routing_memo_enabled() -> bool:
@@ -961,6 +1020,10 @@ class MuseSparkOpenGatedResidual(nn.Module):
         # variable says afterwards. Fixing it at construction makes the engine's
         # choice a property of the engine.
         self._fused_enabled = _fused_residual_enabled()
+        # Same construction-time read, for the same graph-capture reason: the
+        # ordering of the fused next prenorm must not change between capture
+        # and replay.
+        self._preqkv_norm_fp32 = _preqkv_norm_fp32_residual_enabled()
 
     def _compute_coefficients(self) -> Tuple[torch.Tensor, torch.Tensor]:
         scaled = self.gate.to(torch.float32) / self.TEMPERATURE
@@ -1049,6 +1112,9 @@ class MuseSparkOpenGatedResidual(nn.Module):
 
         Retain the branch-normalization and residual-to-BF16 rounding points.
         The next variance reduction may differ from FlashInfer's reduction order.
+        The residual-to-BF16 round feeding the next prenorm is itself switched
+        by ``_preqkv_norm_fp32`` (see ``_preqkv_norm_fp32_residual_enabled``):
+        set, all three arms norm the FP32 residual and round once on the output.
         """
         if not (
             self._fused_enabled
@@ -1066,6 +1132,8 @@ class MuseSparkOpenGatedResidual(nn.Module):
             and (gain is None or (gain.dtype == branch.dtype and gain.is_contiguous()))
         ):
             updated = self.add_after_rmsnorm(residual, branch, eps, gain)
+            if self._preqkv_norm_fp32:
+                return updated, _rmsnorm_fp32_in(updated, next_norm)
             return updated, next_norm(updated.to(branch.dtype))
 
         alpha, beta = self.coefficients()
@@ -1086,6 +1154,7 @@ class MuseSparkOpenGatedResidual(nn.Module):
                     next_norm.weight,
                     eps,
                     next_norm.variance_epsilon,
+                    norm_fp32_residual=self._preqkv_norm_fp32,
                 )
         updated = torch.empty_like(residual)
         next_input = torch.empty_like(branch)
@@ -1105,6 +1174,7 @@ class MuseSparkOpenGatedResidual(nn.Module):
             BLOCK_H=triton.next_power_of_2(hidden_size),
             HAS_GAIN=gain is not None,
             FUSE_NEXT_NORM=True,
+            NORM_FP32_RESIDUAL=self._preqkv_norm_fp32,
             num_warps=_RESIDUAL_NUM_WARPS,
         )
         return updated, next_input
@@ -1203,6 +1273,7 @@ class MuseSparkOpenGatedResidual(nn.Module):
             BLOCK_H=triton.next_power_of_2(hidden_size),
             HAS_GAIN=gain is not None,
             FUSE_NEXT_NORM=False,
+            NORM_FP32_RESIDUAL=False,
             num_warps=_RESIDUAL_NUM_WARPS,
         )
         return out
@@ -1963,11 +2034,19 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         # hidden_states is the FP32 residual stream; each branch reads a BF16
         # cast of it and writes back through the gated add.
         with self.nvtx("pre_qkv_proj_norm"):
-            attn_input = (
-                self.pre_qkv_proj_norm(hidden_states.to(self.dtype))
-                if precomputed_attn_input is None
-                else precomputed_attn_input
-            )
+            # This arm is layer 0's (later layers receive precomputed_attn_input
+            # from the previous layer's fused boundary). The ordering switch is
+            # read off the gated residual -- the single construction-time
+            # resolution point -- rather than re-consulting the environment.
+            # Layer 0's residual is bf16-representable, so both orderings
+            # produce identical values there; honoring the switch keeps the
+            # arms the same function by construction.
+            if precomputed_attn_input is not None:
+                attn_input = precomputed_attn_input
+            elif self.add_attn._preqkv_norm_fp32:
+                attn_input = _rmsnorm_fp32_in(hidden_states, self.pre_qkv_proj_norm)
+            else:
+                attn_input = self.pre_qkv_proj_norm(hidden_states.to(self.dtype))
         # The attention row-parallel o_proj all-reduce (bf16) is emitted inside
         # this range; it is the only collective in it.
         with self.nvtx("attn"):

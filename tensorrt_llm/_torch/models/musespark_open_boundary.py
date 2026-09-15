@@ -14,7 +14,9 @@
 # limitations under the License.
 """GB300 residual join and following prenorm across a CTA cluster.
 
-Keep the BF16 branch-normalization and residual-to-prenorm rounding points.
+Keep the BF16 branch-normalization and residual-to-prenorm rounding points
+(the latter switchable: ``norm_fp32_residual`` lets the second norm read the
+FP32 residual and round once on the output instead).
 Different reduction orders can still move values across BF16 thresholds.
 Each reduction owns a separate DSM inbox/barrier; graph replays read live inputs.
 """
@@ -37,10 +39,21 @@ if HAS_CUTEDSL:
 
     class _ClusterBoundaryKernel:
         def __init__(
-            self, m: int, cluster: int, threads: int, gain: bool, post_eps: float, pre_eps: float
+            self,
+            m: int,
+            cluster: int,
+            threads: int,
+            gain: bool,
+            post_eps: float,
+            pre_eps: float,
+            norm_fp32: bool,
         ):
             self.m, self.cluster, self.threads, self.gain = m, cluster, threads, gain
             self.post_eps, self.pre_eps = float(post_eps), float(pre_eps)
+            # Ordering of the second (pre-QKV) norm: False rounds the updated
+            # residual to BF16 before its variance (historical); True reads the
+            # FP32 residual and takes the single BF16 round on the output.
+            self.norm_fp32 = norm_fp32
             self.iters = 8192 // (cluster * threads * 8)
             self.warps = threads // 32
             self.slots = cluster * self.warps
@@ -161,9 +174,13 @@ if HAS_CUTEDSL:
                     value = Float32(cutlass.BFloat16(scaled[v, p] * inv))
                     u = a[v, p] * r[v, p] + b[v, p] * value
                     updated[v, p] = u
-                    rounded = Float32(cutlass.BFloat16(u))
-                    scaled[v, p] = rounded
-                    total += rounded * rounded
+                    if cutlass.const_expr(self.norm_fp32):
+                        scaled[v, p] = u
+                        total += u * u
+                    else:
+                        rounded = Float32(cutlass.BFloat16(u))
+                        scaled[v, p] = rounded
+                        total += rounded * rounded
             total = self.reduce(total, partials, bars, 1)
             inv = cute.math.rsqrt(total / Float32(8192) + Float32(self.pre_eps), fastmath=True)
             for p in cutlass.range_constexpr(self.iters):
@@ -193,7 +210,12 @@ if HAS_CUTEDSL:
 
     @functools.lru_cache(maxsize=128)
     def _compile_boundary(
-        tokens: int, has_gain: bool, post_eps: float, pre_eps: float, device_index: int
+        tokens: int,
+        has_gain: bool,
+        post_eps: float,
+        pre_eps: float,
+        device_index: int,
+        norm_fp32: bool,
     ):
         cluster = 16 if tokens == 1 else (8 if tokens <= 8 else 4)
         threads = min(256, 8192 // (cluster * 8))
@@ -210,7 +232,9 @@ if HAS_CUTEDSL:
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
-                _ClusterBoundaryKernel(tokens, cluster, threads, has_gain, post_eps, pre_eps),
+                _ClusterBoundaryKernel(
+                    tokens, cluster, threads, has_gain, post_eps, pre_eps, norm_fp32
+                ),
                 *[
                     make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
                     for dtype in dtypes
@@ -275,14 +299,27 @@ def cluster_boundary(
     next_weight: torch.Tensor,
     post_eps: float,
     pre_eps: float,
+    norm_fp32_residual: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the measured M1–32/H8192 boundary; caller retains the fallback."""
+    """Run the measured M1–32/H8192 boundary; caller retains the fallback.
+
+    ``norm_fp32_residual`` selects the second (pre-QKV) norm's ordering; see
+    ``_ClusterBoundaryKernel``. The default keeps the historical BF16-first
+    ordering.
+    """
     if not cluster_boundary_supported(residual, branch, gain, alpha, beta, next_weight):
         raise ValueError("Unsupported cluster boundary inputs, device, or alignment")
     tokens = residual.shape[0]
     gain_arg = next_weight if gain is None else gain
     updated, normalized = torch.empty_like(residual), torch.empty_like(branch)
-    compiled = _compile_boundary(tokens, gain is not None, post_eps, pre_eps, residual.device.index)
+    compiled = _compile_boundary(
+        tokens,
+        gain is not None,
+        post_eps,
+        pre_eps,
+        residual.device.index,
+        norm_fp32_residual,
+    )
     dtypes = (
         cutlass.BFloat16,
         Float32,
