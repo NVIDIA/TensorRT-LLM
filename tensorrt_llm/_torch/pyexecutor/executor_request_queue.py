@@ -303,10 +303,14 @@ class ExecutorRequestQueue:
         try:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
-                # if queue is empty and want to wait, wait
+                # if queue is empty and want to wait, wait. Outside
+                # enqueue_lock: blocking under it would stall producers.
                 items.append(self.request_queue.get(timeout=timeout_secs))
-            else:
-                # if not empty or don't want to wait, just return all items in queue
+
+            # Drain under the lock _enqueue_impl holds across a batch, so a
+            # batch enqueued together is observed together. Non-blocking gets
+            # only, against an unbounded queue: no deadlock cycle.
+            with self.enqueue_lock:
                 while True:
                     queue_item = self.request_queue.get_nowait()
                     items.append(queue_item)
@@ -331,6 +335,15 @@ class ExecutorRequestQueue:
                 items.append(item)
             except queue.Empty:
                 break
+
+            # That item may be the first of a batch still being enqueued; take
+            # the rest under the lock rather than returning a strict subset.
+            with self.enqueue_lock:
+                try:
+                    while True:
+                        items.append(self.request_queue.get_nowait())
+                except queue.Empty:
+                    pass
 
         return items
 

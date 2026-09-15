@@ -348,9 +348,13 @@ class BaseWorker(GenerationExecutor):
             model_config=self._runtime_model_config,
             uids=[str(prompt_adapter_request.adapter_id)])
 
-    def _enqueue_request(self,
-                         request: GenerationRequest,
-                         result_wait_queue=None) -> int:
+    def _build_executor_request(self,
+                                request: GenerationRequest) -> tllm.Request:
+        """Build the C++ request, without admitting it.
+
+        Separate from admission so a batch can be prepared before any of it
+        becomes visible to the scheduler.
+        """
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
@@ -558,12 +562,19 @@ class BaseWorker(GenerationExecutor):
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
+            return executor_request
+        except Exception as e:
+            raise RequestError(str(e)) from e
+
+    def _enqueue_request(self,
+                         request: GenerationRequest,
+                         result_wait_queue=None) -> int:
+        executor_request = self._build_executor_request(request)
+        try:
             if self._is_pytorch_backend and result_wait_queue is not None:
-                req_id = self.engine.enqueue_request(
+                return self.engine.enqueue_request(
                     executor_request, result_wait_queue=result_wait_queue)
-            else:
-                req_id = self.engine.enqueue_request(executor_request)
-            return req_id
+            return self.engine.enqueue_request(executor_request)
         except Exception as e:
             raise RequestError(str(e)) from e
 
@@ -593,6 +604,13 @@ class BaseWorker(GenerationExecutor):
 
         self._results[client_id] = result
 
+        if self._deferring:
+            # Prepare now, admit at flush.
+            self._defer(
+                (client_id, request, self._build_executor_request(request)))
+            self._handle_background_error()
+            return result
+
         request_id = self._enqueue_request(request)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
@@ -600,6 +618,40 @@ class BaseWorker(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def _deferral_limit(self) -> int:
+        """Cap the deferral buffer at what the engine can schedule at once."""
+        max_batch_size = self.llm_args.max_batch_size if self.llm_args else None
+        return max_batch_size or super()._deferral_limit()
+
+    def _discard_deferred(self, pending: List[tuple]) -> None:
+        """Unregister results for rows that were never admitted."""
+        for client_id, _, _ in pending:
+            self._results.pop(client_id, None)
+
+    def _flush_deferred(self, pending: List[tuple]) -> None:
+        """Admit what was held back, in one enqueue."""
+        client_ids = [client_id for client_id, _, _ in pending]
+        try:
+            request_ids = self.engine.enqueue_requests(
+                [executor_request for _, _, executor_request in pending])
+        except Exception as e:
+            for client_id in client_ids:
+                self._results.pop(client_id, None)
+            raise RequestError(str(e)) from e
+
+        for client_id, request_id in zip(client_ids, request_ids):
+            self._client_id_to_request_id[client_id] = request_id
+        for _, request, _ in pending:
+            self._release_request_memory(request)
+
+        self._handle_background_error()
+
+    def submit_batch(
+            self, requests: List[GenerationRequest]) -> List[GenerationResult]:
+        """Admit a batch that crossed the IPC queue as one item."""
+        with self.deferred_admission():
+            return [self.submit(request) for request in requests]
 
     def _check_sleep_wakeup_preconditions(self, method: str) -> None:
         """Validate preconditions shared by sleep() and wakeup().

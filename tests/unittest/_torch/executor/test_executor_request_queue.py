@@ -18,6 +18,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestAdmissionState,
     RequestQueueItem)
+from tensorrt_llm.executor.utils import RequestError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -367,3 +368,216 @@ def test_queue_size_methods(executor_queue):
     # Add some data and test
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
     assert executor_queue.get_request_queue_size() == 1
+
+
+def test_batch_enqueue_is_never_observed_partially(executor_queue):
+    """A drain must see a whole batch or none of it.
+
+    _enqueue_impl holds enqueue_lock across the batch, but that only helps if
+    the reader respects the same lock -- queue.Queue serialises single
+    operations, not sequences. Without it a drain lands between two puts and
+    admits a subset, which splits one generate() call across engine iterations.
+    """
+    batch_size = 6
+    slow_put_delay = 0.01
+
+    real_put = executor_queue.request_queue.put
+    stop = threading.Event()
+
+    def slow_put(item, *args, **kwargs):
+        # Widen the window a drain could slip into, so the test fails without
+        # the lock rather than relying on scheduling luck.
+        time.sleep(slow_put_delay)
+        return real_put(item, *args, **kwargs)
+
+    executor_queue.request_queue.put = slow_put
+
+    def enqueue_batch():
+        with patch.object(executor_queue, '_generate_child_request_ids'):
+            executor_queue.enqueue_requests([Mock() for _ in range(batch_size)])
+
+    observed = []
+
+    def drain_repeatedly():
+        while not stop.is_set():
+            items = executor_queue.get_from_request_queue(datetime.timedelta(0))
+            if items:
+                observed.append(len(items))
+
+    reader = threading.Thread(target=drain_repeatedly)
+    reader.start()
+    try:
+        writer = threading.Thread(target=enqueue_batch)
+        writer.start()
+        writer.join()
+        time.sleep(slow_put_delay * batch_size + 0.2)
+    finally:
+        stop.set()
+        reader.join()
+        executor_queue.request_queue.put = real_put
+
+    assert sum(observed) == batch_size, (
+        f"expected the {batch_size} requests to arrive, saw {observed}")
+    assert observed == [
+        batch_size
+    ], (f"the batch was admitted in pieces ({observed}); a drain observed a "
+        "strict subset, so one generate() call can span engine iterations")
+
+
+def test_deferred_admission_without_transport_support_still_submits():
+    """A transport that does not implement deferral is unaffected.
+
+    The guarantee does not hold for it, but every request must still be
+    submitted inside the block, in order, and the block must not try to flush
+    anything it never buffered.
+    """
+    from tensorrt_llm.executor.executor import GenerationExecutor
+
+    submitted = []
+
+    class _Executor(GenerationExecutor):
+
+        def __init__(self):
+            # Only the deferral state is needed; GenerationExecutor.__init__
+            # would build queues and register an atexit hook.
+            self._deferral = threading.local()
+
+        def submit(self, request):
+            submitted.append(request)
+            return f"result-{request}"
+
+        def abort_request(self, request_id):
+            raise NotImplementedError
+
+        def shutdown(self):
+            pass
+
+    executor = _Executor()
+    with executor.deferred_admission():
+        results = [executor.submit(r) for r in ("a", "b", "c")]
+
+    assert submitted == ["a", "b", "c"]
+    assert results == ["result-a", "result-b", "result-c"]
+    assert executor._deferring is False
+
+
+def test_deferred_admission_flushes_once_a_batch_has_piled_up():
+    """Deferral is capped, so a large generate() keeps submit/execute overlap.
+
+    Holding more than the engine can schedule into one forward pass buys no
+    extra guarantee and would idle the GPU for the whole submit phase.
+    """
+    from tensorrt_llm.executor.executor import GenerationExecutor
+
+    flushed = []
+
+    class _Executor(GenerationExecutor):
+
+        def __init__(self):
+            self._deferral = threading.local()
+
+        def _deferral_limit(self):
+            return 3
+
+        def submit(self, request):
+            self._defer(request)
+            return request
+
+        def _flush_deferred(self, pending):
+            flushed.append(list(pending))
+
+        def abort_request(self, request_id):
+            raise NotImplementedError
+
+        def shutdown(self):
+            pass
+
+    executor = _Executor()
+    with executor.deferred_admission():
+        for r in range(7):
+            executor.submit(r)
+
+    assert flushed == [[0, 1, 2], [3, 4, 5], [6]]
+    assert executor._deferring is False
+
+
+def test_deferred_admission_admits_nothing_when_the_block_raises():
+    """A failure mid-batch must not leave earlier rows admitted.
+
+    They would otherwise be answered twice: once with real output, and once
+    with the error their caller reports for the whole batch.
+    """
+    from tensorrt_llm.executor.executor import GenerationExecutor
+
+    flushed, discarded = [], []
+
+    class _Executor(GenerationExecutor):
+
+        def __init__(self):
+            self._deferral = threading.local()
+
+        def submit(self, request):
+            if request == "boom":
+                raise RequestError("boom")
+            self._defer(request)
+            return request
+
+        def _flush_deferred(self, pending):
+            flushed.append(list(pending))
+
+        def _discard_deferred(self, pending):
+            discarded.append(list(pending))
+
+        def abort_request(self, request_id):
+            raise NotImplementedError
+
+        def shutdown(self):
+            pass
+
+    executor = _Executor()
+    with pytest.raises(RequestError):
+        with executor.deferred_admission():
+            for r in ("a", "b", "boom"):
+                executor.submit(r)
+
+    assert flushed == []
+    assert discarded == [["a", "b"]]
+    assert executor._deferring is False
+
+
+def test_batch_is_not_split_by_the_batch_wait_topup(executor_queue):
+    """The batch_wait top-up must not return a strict subset either.
+
+    Reached only when the producer starts after the reader is already waiting:
+    the top-up's blocking get runs outside enqueue_lock, so its deadline can
+    expire with only the first rows of a batch collected.
+    """
+    batch_size = 6
+    put_delay = 0.03
+    executor_queue.batch_wait_timeout_ms = 100.0
+
+    real_put = executor_queue.request_queue.put
+
+    def slow_put(item, *args, **kwargs):
+        time.sleep(put_delay)
+        return real_put(item, *args, **kwargs)
+
+    executor_queue.request_queue.put = slow_put
+
+    def enqueue_batch():
+        # Start once the reader is past the drain and inside the top-up wait.
+        time.sleep(0.01)
+        with patch.object(executor_queue, '_generate_child_request_ids'):
+            executor_queue.enqueue_requests([Mock() for _ in range(batch_size)])
+
+    writer = threading.Thread(target=enqueue_batch)
+    writer.start()
+    try:
+        items = executor_queue.get_from_request_queue(datetime.timedelta(0))
+    finally:
+        writer.join()
+        executor_queue.request_queue.put = real_put
+
+    assert len(items) in (0, batch_size), (
+        f"the top-up returned {len(items)} of {batch_size}; a producer's batch "
+        "was observed part-way through")

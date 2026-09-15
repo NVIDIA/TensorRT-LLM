@@ -23,7 +23,8 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+from .request import (CancellingRequest, GenerationRequest,
+                      GenerationRequestBatch, StartProfileRequest,
                       StopProfileRequest)
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
@@ -490,6 +491,16 @@ def worker_main(
                             logger.error(traceback.format_exc())
                             worker._await_response_helper.temp_error_responses.put(
                                 ErrorResponse(req.id, e, req.id))
+                    elif isinstance(req, GenerationRequestBatch):
+                        try:
+                            worker.submit_batch(req.requests)
+                        except RequestError as e:
+                            logger.error(f"submit batch failed: {e}")
+                            logger.error(traceback.format_exc())
+                            # Nothing was admitted, so every row is owed one.
+                            for batched in req.requests:
+                                worker._await_response_helper.temp_error_responses.put(
+                                    ErrorResponse(batched.id, e, batched.id))
                     else:
                         raise ValueError(f"Unknown request type: {type(req)}")
 

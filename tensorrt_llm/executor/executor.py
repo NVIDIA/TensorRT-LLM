@@ -1,17 +1,19 @@
 import atexit
+import contextlib
 import faulthandler
 import json
 import multiprocessing
 import os
 import platform
 import signal
+import threading
 import traceback
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
+from typing import (TYPE_CHECKING, Any, AsyncIterable, Dict, Generator, List,
                     Optional, Union)
 
 import numpy as np
@@ -50,6 +52,9 @@ __all__ = [
     "GenerationExecutor",
     "CppExecutorError",
 ]
+
+# Matches BaseLlmArgs.max_batch_size, for transports with no args to read.
+DEFAULT_DEFERRAL_LIMIT = 2048
 
 if enable_llm_debug():
     # Mainly enable more detailed logging from cpp runtime.
@@ -114,9 +119,79 @@ class GenerationExecutor(ABC):
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
 
+        # Per-thread: one thread's generate() must not make another thread's
+        # generate_async() wait on its flush.
+        self._deferral = threading.local()
+
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
         pass
+
+    @property
+    def _deferral_state(self):
+        state = self._deferral
+        if not hasattr(state, "active"):
+            state.active = False
+            # Contents are the flushing transport's business, not this class's.
+            state.buffer: List[Any] = []
+        return state
+
+    @property
+    def _deferring(self) -> bool:
+        """True while this thread is inside deferred_admission()."""
+        return self._deferral_state.active
+
+    @contextlib.contextmanager
+    def deferred_admission(self):
+        """Hold admissions inside the block, then admit them as one batch.
+
+        Submission itself stays on the per-request path. Transports without
+        deferral support submit as usual and get no batching guarantee.
+        """
+        state = self._deferral_state
+        if state.active:
+            # Nested: the outermost block owns the flush.
+            yield
+            return
+        state.active = True
+        try:
+            yield
+        except BaseException:
+            state.active = False
+            pending, state.buffer = state.buffer, []
+            # Admit nothing on the way out: a half-admitted batch would answer
+            # some rows twice, once with output and once with the error.
+            if pending:
+                self._discard_deferred(pending)
+            raise
+        state.active = False
+        pending, state.buffer = state.buffer, []
+        if pending:
+            self._flush_deferred(pending)
+
+    def _deferral_limit(self) -> int:
+        """How many admissions to hold before flushing early.
+
+        Nothing above what the engine schedules at once is worth holding.
+        Transports that know their own max_batch_size override this.
+        """
+        return DEFAULT_DEFERRAL_LIMIT
+
+    def _defer(self, item: Any) -> None:
+        """Buffer one admission, flushing once a schedulable batch has piled up."""
+        state = self._deferral_state
+        state.buffer.append(item)
+        if len(state.buffer) >= self._deferral_limit():
+            pending, state.buffer = state.buffer, []
+            self._flush_deferred(pending)
+
+    def _discard_deferred(self, pending: List[Any]) -> None:
+        """Drop what submit() held back, unadmitted, after an error."""
+
+    def _flush_deferred(self, pending: List[Any]) -> None:
+        """Admit what submit() held back."""
+        raise NotImplementedError(
+            f"{type(self).__name__} buffered admissions but cannot flush them")
 
     @abstractmethod
     def abort_request(self, request_id: int) -> None:
@@ -150,10 +225,61 @@ class GenerationExecutor(ABC):
 
         self._maybe_initialize_iteration_results()
 
+        request = self.build_request(
+            prompt_token_ids,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            streaming=streaming,
+            kv_cache_retention_config=kv_cache_retention_config,
+            disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
+            postproc_params=postproc_params,
+            multimodal_params=multimodal_params,
+            scheduling_params=scheduling_params,
+            conversation_params=conversation_params,
+            cache_salt=cache_salt,
+            arrival_time=arrival_time,
+            encoder_input_token_ids=encoder_input_token_ids,
+            priority=priority)
+        result = self.submit(request)
+        if not self._deferring:
+            # Deferred requests are released by _flush_deferred instead.
+            self._release_request_memory(request)
+        return result
+
+    def build_request(
+        self,
+        prompt_token_ids: List[int],
+        sampling_params: SamplingParams,
+        lora_request: Optional[LoRARequest] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        streaming: bool = False,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        postproc_params: Optional[PostprocParams] = None,
+        multimodal_params: Optional[MultimodalParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
+        cache_salt: Optional[str] = None,
+        arrival_time: Optional[float] = None,
+        encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                                list]] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
+    ) -> GenerationRequest:
+        """Build a request without submitting it.
+
+        Separate from submission so several requests can be built and then
+        admitted together.
+        """
+        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(sampling_params, SamplingParams)
+
         if postproc_params:
             postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
-        request = GenerationRequest(
+        return GenerationRequest(
             prompt_token_ids,
             sampling_params=sampling_params,
             postproc_params=postproc_params,
@@ -170,11 +296,12 @@ class GenerationExecutor(ABC):
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority)
-        result = self.submit(request)
-        # release memory in time
+
+    @staticmethod
+    def _release_request_memory(request: GenerationRequest) -> None:
+        """Drop the multimodal payload once the request has been submitted."""
         if hasattr(request, "multimodal_params"):
             del request.multimodal_params
-        return result
 
     def generate(
         self,
