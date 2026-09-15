@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import csv
 import json
 import os
 import platform
@@ -1668,16 +1669,15 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
     def extra_endpoints_test(_server_url: str):
         item = get_timing_metrics(perf_metrics_output_dir)
+        gen_timing = item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+        assert {
+            "kv_cache_transfer_start", "kv_cache_transfer_end", "kv_cache_size"
+        } <= gen_timing.keys()
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
-    # This test validates the C++ transceiver's timing-metric semantics: the
-    # config pins transceiver_runtime=CPP, and DEFAULT is forced to UCX.
-    env = llm_venv._new_env | {
-        "TRTLLM_USE_NIXL_KVCACHE": "0",
-        "TRTLLM_USE_UCX_KVCACHE": "1",
-        "UCX_TLS": get_ucx_tls(),
-    }
+    # The config explicitly selects KVCM V2 and the Python/NIXL transceiver.
+    env = llm_venv._new_env | {"UCX_TLS": get_ucx_tls()}
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
                            env=env,
@@ -1709,57 +1709,56 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                          indirect=True)
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                                             disaggregated_example_root,
-                                            llama_model_root):
+                                            llama_model_root, tmp_path):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    output_path = tmp_path / "cache_time"
     env = llm_venv._new_env.copy()
-    # This test validates the C++ transceiver's CSV format: the config pins
-    # transceiver_runtime=CPP, and DEFAULT is forced to UCX.
-    env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
-    env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
+    env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = str(output_path)
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
-    assert os.path.isdir(output_path)
-    # The C++ transceiver names timing files "<instanceId>_<rank>_<tag>.csv"
-    # (instanceId is a runtime UUID that disambiguates instances sharing an
-    # output directory), so match by the "_<tag>.csv" suffix instead of a fixed
-    # "rank_0" prefix.
-    send_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_send.csv"))
-    recv_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_recv.csv"))
-    assert send_files, f"no *_send.csv in {output_path}: {os.listdir(output_path)}"
-    assert recv_files, f"no *_recv.csv in {output_path}: {os.listdir(output_path)}"
-    send_file = os.path.join(output_path, send_files[0])
-    recv_file = os.path.join(output_path, recv_files[0])
-    with open(send_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        assert lines[0].startswith(
-            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
-        )
-        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
-        # get a send sample and match the recv
-        sample = lines[1].split(',')
-        assert len(sample) >= 9
-    with open(recv_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        matched = False
-        for line in lines:
-            sample_recv = line.split(',')
-            if sample_recv[0] == sample[0]:
-                matched = True
-                assert float(sample_recv[1]) <= float(sample[1])
-                break
-        assert matched
+    # Python records send/receive tasks in <instance>_<rank>.csv and writes
+    # the generation-side transfer summary to a separate CSV.
+    task_rows = []
+    summary_rows = []
+    for path in output_path.glob("*.csv"):
+        with path.open() as f:
+            rows = list(csv.DictReader(f))
+        assert rows, f"empty timing CSV: {path}"
+        if path.name.endswith("_gen_transfer_summary.csv"):
+            summary_rows.extend(rows)
+        else:
+            task_rows.extend(rows)
+
+    send_rows = {
+        row["unique_rid"]: row
+        for row in task_rows if row["task_type"] == "KVSendTask"
+    }
+    recv_rows = {
+        row["unique_rid"]: row
+        for row in task_rows if row["task_type"] == "KVRecvTask"
+    }
+    summaries = {row["RequestID"]: row for row in summary_rows}
+    assert send_rows, f"no KVSendTask rows in {output_path}"
+    assert send_rows.keys() == recv_rows.keys() == summaries.keys()
+    for request_id, send in send_rows.items():
+        assert int(send["transfer_size_bytes"]) > 0
+        assert int(send["transfer_entry_count"]) > 0
+        assert float(send["avg_segment_size_bytes"]) > 0
+        for field in ("prepare_args_latency_ms", "queue_latency_ms",
+                      "transfer_latency_ms", "task_latency_ms",
+                      "throughput_mbs"):
+            assert float(send[field]) >= 0
+        # Receive tasks only measure total task latency.
+        assert float(recv_rows[request_id]["task_latency_ms"]) >= 0
+        summary = summaries[request_id]
+        assert float(summary["gen_side_transfer_time(ms)"]) >= 0
+        assert int(summary["kv_cache_size"]) == int(send["transfer_size_bytes"])
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
