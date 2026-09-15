@@ -43,6 +43,7 @@ from transformers import AutoProcessor, PretrainedConfig
 
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
@@ -71,7 +72,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
-from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+from tensorrt_llm.serve.tool_parser.base_tool_parser import (
+    BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.web_search import load_web_search_config
@@ -1301,6 +1303,8 @@ def _apply_tool_parser(
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
+        if not streaming:
+            warn_if_tool_call_unparsed(tool_parser_id, tool_parser, text, calls)
     else:
         normal_text, calls = text, []
 
@@ -2652,15 +2656,17 @@ class ServerArrivalTimeMiddleware:
     See: https://github.com/encode/starlette/discussions/2094
     """
 
-    def __init__(self, app):
+    def __init__(self,
+                 app,
+                 adjusted_clock: Optional[AdjustedSteadyClock] = None):
         self.app = app
+        self._adjusted_clock = adjusted_clock or AdjustedSteadyClock()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             # Add arrival time to scope
             scope["state"] = {}
-            scope["state"][
-                "server_arrival_time"] = get_steady_clock_now_in_seconds()
+            scope["state"]["server_arrival_time"] = self._adjusted_clock.now()
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)

@@ -15,6 +15,7 @@
 from typing import Optional
 
 import click
+import yaml
 
 import tensorrt_llm.profiler as profiler
 
@@ -22,18 +23,21 @@ from .. import LLM as PyTorchLLM
 from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
                         ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
                         GPQAExtended, GPQAMain, GPQANemoSkills, IFBench,
-                        JsonModeEval, LongBenchV1, LongBenchV2, MMMUPro,
-                        SciCode)
+                        ImageGenerationEval, JsonModeEval, LongBenchV1,
+                        LongBenchV2, MMMUPro, SciCode)
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
-from ..llmapi.llm_utils import update_llm_args_with_extra_options
+from ..llmapi.llm_utils import update_llm_args_with_extra_dict
 from ..logger import logger, severity_map
+from ..usage import apply_usage_session_config
 from ..usage import config as _telemetry_config
+from ._telemetry import TelemetryGroup, apply_raw_config_telemetry_opt_out
 from .utils import collect_explicit_cli_keys
 
 # CLI defaults are sourced from the TorchLlmArgs field defaults so they stay in
 # lock-step with the args class and can't drift.
 _LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+_IMAGE_GENERATION_EVAL_COMMAND = "image_generation_eval"
 
 # Map Click parameter names to the LlmArgs field name (or merge-function CLI
 # scalar name) used by `update_llm_args_with_extra_options`.
@@ -46,18 +50,21 @@ _CLICK_TO_LLM_ARG = {
 }
 
 
-@click.group()
+@click.group(
+    cls=TelemetryGroup,
+    telemetry_usage_context=_telemetry_config.UsageContext.CLI_EVAL,
+    telemetry_component="llm",
+)
 @click.option(
     "--model",
     required=True,
     type=str,
-    help="model name | HF checkpoint path | TensorRT engine path",
+    help="Model name or Hugging Face checkpoint path.",
 )
 @click.option("--tokenizer",
               type=str,
               default=None,
-              help="Path | Name of the tokenizer."
-              "Specify this value only if using TensorRT engine as model.")
+              help="Path or name of the tokenizer.")
 @click.option(
     "--custom_tokenizer",
     type=str,
@@ -69,8 +76,10 @@ _CLICK_TO_LLM_ARG = {
 @click.option(
     "--backend",
     type=click.Choice(["pytorch"]),
-    default="pytorch",
-    help="The backend to use for evaluation. Default is pytorch backend.")
+    default=None,
+    help=
+    "The backend to use for evaluation. This option is deprecated and will be removed in future versions."
+)
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -82,7 +91,7 @@ _CLICK_TO_LLM_ARG = {
 @click.option("--max_batch_size",
               type=int,
               default=_LLM_ARGS_FIELDS["max_batch_size"].default,
-              help="Maximum number of requests that the engine can schedule.")
+              help="Maximum number of requests that can be scheduled.")
 @click.option(
     "--max_num_tokens",
     type=int,
@@ -150,6 +159,24 @@ def main(ctx, model: str, tokenizer: Optional[str],
          telemetry: bool):
     logger.set_level(log_level)
 
+    if backend is not None:
+        logger.warning(
+            "The --backend option is deprecated and will be removed in future versions."
+        )
+        if backend != "pytorch":
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
+
+    if ctx.invoked_subcommand == _IMAGE_GENERATION_EVAL_COMMAND:
+        ctx.obj = {
+            "model": model,
+            "extra_llm_api_options": extra_llm_api_options,
+            "log_level": log_level,
+            "telemetry": telemetry,
+        }
+        return
+
     explicit_cli_keys = collect_explicit_cli_keys(
         exclude=("extra_llm_api_options", "config"),
         translate=_CLICK_TO_LLM_ARG)
@@ -183,27 +210,46 @@ def main(ctx, model: str, tokenizer: Optional[str],
         _telemetry_config.TelemetryConfig(
             disabled=not telemetry,
             usage_context=_telemetry_config.UsageContext.CLI_EVAL),
+        "max_batch_size":
+        max_batch_size,
+        "max_num_tokens":
+        max_num_tokens,
+        "max_beam_width":
+        max_beam_width,
+        "max_seq_len":
+        max_seq_len,
     }
 
-    if backend == 'pytorch':
-        llm_cls = PyTorchLLM
-        llm_args.update(max_batch_size=max_batch_size,
-                        max_num_tokens=max_num_tokens,
-                        max_beam_width=max_beam_width,
-                        max_seq_len=max_seq_len)
-    else:
-        raise click.BadParameter(
-            f"{backend} is not a known backend, check help for available options.",
-            param_hint="backend")
-
+    # Pre-check YAML telemetry settings before full config validation.
     if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(
+        with open(extra_llm_api_options, 'r') as f:
+            llm_args_extra_dict = yaml.safe_load(f)
+        if llm_args_extra_dict is None:
+            llm_args_extra_dict = {}
+        elif not isinstance(llm_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+        apply_raw_config_telemetry_opt_out(
+            llm_args_extra_dict,
+            usage_context=_telemetry_config.UsageContext.CLI_EVAL,
+            component="llm",
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
+        llm_args = update_llm_args_with_extra_dict(
             llm_args,
+            llm_args_extra_dict,
             extra_llm_api_options,
             explicit_cli_keys=explicit_cli_keys)
 
+    # Update telemetry state or disable the early session.
+    apply_usage_session_config(
+        llm_args.get("telemetry_config"),
+        default_usage_context=_telemetry_config.UsageContext.CLI_EVAL.value,
+        component="llm",
+        lifecycle_phase="config_validation",
+    )
+
     profiler.start("trtllm init")
-    llm = llm_cls(**llm_args)
+    llm = PyTorchLLM(**llm_args)
     profiler.stop("trtllm init")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
     logger.info(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")
@@ -230,6 +276,7 @@ main.add_command(AIME2026.command)
 main.add_command(GPQANemoSkills.command)
 main.add_command(IFBench.command)
 main.add_command(SciCode.command)
+main.add_command(ImageGenerationEval.command)
 main.add_command(HLE.command)
 main.add_command(AALCR.command)
 main.add_command(ArenaHard.command)

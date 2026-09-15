@@ -15,7 +15,6 @@
 
 add_gtest(executorSamplingConfigTest samplingConfigTest.cpp)
 add_gtest(kvCacheConfigTest kvCacheConfigTest.cpp)
-add_gtest(decodingConfigTest decodingConfigTest.cpp)
 add_gtest(requestTest requestTest.cpp)
 add_gtest(responseTest responseTest.cpp)
 

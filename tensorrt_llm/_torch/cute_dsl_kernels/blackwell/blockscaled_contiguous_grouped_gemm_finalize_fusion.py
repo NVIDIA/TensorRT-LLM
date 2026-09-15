@@ -2465,6 +2465,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        c_stride_row: cutlass.Int64 = cutlass.Int64(0),
     ):
         """Single-B wrapper.
 
@@ -2480,8 +2481,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 (32, 4, m // 128, 4, scale_k // 4, 1), order=(2, 1, 4, 0, 3, 5)
             ),
         )
+        # c supports strided output for locality domain shared buffers.
+        # c_stride_row: row stride in output elements (0 = default = n)
+        actual_c_stride_row = n if c_stride_row == 0 else c_stride_row
         c = cute.make_tensor(
-            c_ptr, layout=cute.make_ordered_layout((num_tokens, n, 1), order=(1, 0, 2))
+            c_ptr,
+            layout=cute.make_layout(
+                (num_tokens, n, 1),
+                stride=(actual_c_stride_row, 1, num_tokens * actual_c_stride_row),
+            ),
         )
 
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))

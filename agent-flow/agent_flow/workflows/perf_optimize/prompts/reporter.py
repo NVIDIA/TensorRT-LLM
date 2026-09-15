@@ -36,9 +36,18 @@ inventing it.
   none. These files are large — extract
   the kernel-summary rows with shell tools (`grep`/`head`/`awk`) rather
   than reading them whole.
-- `rounds/round_<n>/item_<j>_<id>/attempt_<k>/profile/nsys_stats.txt` —
-  each **accepted** attempt's accept-evidence capture: the kernel
-  picture with that item (and everything accepted before it) applied.
+- `rounds/round_<n>/analysis/nsys_analysis/` — the same round's
+  `internal-perf-nsight-system-analysis` products: small JSON holding the
+  per-iteration time, the busy rungs and the compute-absent split.
+  Present only where the skill ran; read `summary.json` and the
+  per-rank `busy.json` / `gap.json` rather than the whole tree.
+- `rounds/round_<n>/item_<j>_<id>/attempt_<k>/profile/nsys_stats.txt`
+  — and `profile/nsys_analysis/` beside it, on the same terms as the
+  round-level products above — each **accepted** attempt's
+  accept-evidence capture: the kernel picture with that item (and
+  everything accepted before it) applied. This is the **after** side of
+  the comparison below, so it is where that side's `nsys_analysis/` has
+  to come from.
   Round profiles are captured *before* that round's accepts land, so
   the last accepted attempt's capture is normally the profile of the
   final accepted state — except when the campaign closed by spending a
@@ -143,7 +152,13 @@ that came in under its estimate is still reported under its estimate.>
 ## Kernel-Level Comparison
 
 <The before-vs-after GPU story at kernel granularity, built from the
-`cuda_gpu_kern_sum` tables. "Before" is round 1's
+`cuda_gpu_kern_sum` tables — the only artifact carrying per-kernel call
+counts. Read them for the *relative* shift between two comparable
+captures, never as a per-iteration magnitude: `kern_sum` sums
+overlapping streams over the whole capture, where the iteration budget
+that opens this section is a union clipped to the window. Where the two
+disagree about which kernel dominates, the budget is the one describing
+an iteration. "Before" is round 1's
 `analysis/nsys_stats.txt` (the baseline build). For "After", use the
 capture directory your driving instructions name as freshest. It is
 usually the last accepted attempt's `profile/`, but a closing analyzer
@@ -154,7 +169,13 @@ Open with one provenance line per profile: its round (or the accepted
 item it captured), its capture window, and **which accepted items were in
 effect** when it was captured; never imply full coverage when the named
 fallback lacks later accepts, and note any capture mismatch (different
-iteration window / load) that weakens comparability. Then compare over
+iteration window / load) that weakens comparability. Where **both**
+sides carry a `nsys_analysis/`, open the section with the iteration
+budget before the kernel table — per-iteration time, the busy rungs and
+the compute-absent split (launch-starved / blocking /
+dependency-stalled), before vs after — because that is what says whether
+the campaign bought GPU work or bought back host exposure; where either
+side lacks it, say so and compare on kernels alone. Then compare over
 the union of both profiles' top ~10 kernels by total GPU time:
 | kernel | before % | before ms | before calls | after % | after ms | after calls | Δ ms % |
 Abbreviate template-heavy kernel names to a distinctive stem,

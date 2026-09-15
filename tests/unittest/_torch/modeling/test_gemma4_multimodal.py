@@ -300,7 +300,7 @@ def _build_trt_vision_tower(vision_cfg, dtype=torch.float32, device="cuda"):
     )
     tower = Gemma4VisionModel(mc).to(device).to(dtype).eval()
     # The engine builds the encoder AttentionMetadata after model load via
-    # `_set_up_multimodal_encoder_attn_metadata`; standalone tests must mirror
+    # `setup_mm_encoder_attn_metadata`; standalone tests must mirror
     # that before the encoder forward.
     tower.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
     return tower

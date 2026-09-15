@@ -42,7 +42,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
@@ -1236,7 +1236,7 @@ class VilaModel(PreTrainedModel):
         self.llm.to(device=device, dtype=self.model_dtype)
 
         # Surface the in-vocab media token IDs (image, video, ...) to the
-        # model engine's ``_prepare_multimodal_indices``. ``init_llm`` populates
+        # ``runners.prepare_multimodal_indices``. ``init_llm`` populates
         # ``self.tokenizer.media_token_ids`` as ``{name: id}``.
         media_ids = list(self.tokenizer.media_token_ids.values())
         self._mm_token_ids = torch.tensor(media_ids, dtype=torch.int32)

@@ -12,11 +12,11 @@ from utils.llm_data import llm_models_root
 from utils.util import default_dtype, getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     _update_kv_cache_draft_token_location
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -623,7 +623,7 @@ class TestLlama(unittest.TestCase):
                 max_num_requests=1,
                 max_draft_len=max_draft_1,
                 max_total_draft_tokens=max_draft_1,
-                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
         attn_metadata_gen_phase_0.update_spec_dec_param(
             batch_size=batch_size,
@@ -697,7 +697,7 @@ class TestLlama(unittest.TestCase):
                 max_num_requests=1,
                 max_draft_len=max_draft_ref,
                 max_total_draft_tokens=max_draft_ref,
-                spec_dec_mode=SpeculativeDecodingMode.EAGLE3,
+                spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
             )
         attn_metadata_ref.update_spec_dec_param(
             batch_size=batch_size,

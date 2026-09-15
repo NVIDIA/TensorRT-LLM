@@ -27,12 +27,15 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/reentrantSharedMutex.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <set>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -231,6 +234,19 @@ public:
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();
 
+    // Count one ACTIVE->SUSPENDED transition for the current iteration window.
+    void recordRequestSuspended();
+    // Count one preemption recovery for the current iteration window. Only a
+    // previously-ACTIVE cache that was suspended and then successfully resumed
+    // counts; a freshly-created cache is activated by its first resume(), but
+    // that is an admission, not a recovery, and is not counted.
+    void recordRequestResumed();
+    // Return {suspended, resumed} counts since the last drain and reset them.
+    // Both counters track the same population, so the running
+    // (suspended - resumed) total is the number of requests still parked in
+    // the SUSPENDED state.
+    std::pair<int64_t, int64_t> getAndResetIterationSuspendResumeStats();
+
     void markStatsDirty(std::optional<RequestIdType> kvCacheId);
     void clearStatsDirty(std::optional<RequestIdType> kvCacheId);
     std::unordered_set<RequestIdType> getDirtyStatsKvCacheIds() const;
@@ -298,11 +314,39 @@ public:
     // Try to rebalance memory pool ratios based on usage statistics.
     void tryUpdateTargetRatios();
 
+    // ---- Thread safety ----------------------------------------------------
+    //
+    // One ReentrantSharedMutex guards all mutable state reachable from this manager: the radix
+    // tree, the storage manager and the living-KvCache set. Mutating APIs take it exclusively,
+    // read-only queries take it shared.
+    //
+    // SCOPE: it protects state shared *between* KvCaches, not the fields of one KvCache. Each
+    // KvCache is driven by its owning thread; calling into the same KvCache from two threads is
+    // unsupported. So a KvCache method locks only if it reaches the manager, storage or the tree.
+    //
+    // See AGENTS.md ("Concurrency model") for the rationale, the granularity trade-off and the
+    // rules for adding new APIs, and utils/reentrantSharedMutex.h for the lock's semantics.
+
+    //! Exclusive lock for mutating APIs. Held by KvCache too, via its owning manager.
+    [[nodiscard]] ReentrantSharedMutex::Guard lockExclusive() const
+    {
+        return mApiMutex.lockExclusive();
+    }
+
+    //! Shared lock for read-only queries.
+    [[nodiscard]] ReentrantSharedMutex::Guard lockShared() const
+    {
+        return mApiMutex.lockShared();
+    }
+
     // White-box introspection (incl. test-only auto-tuner state mutation) reaches
     // private members directly rather than widening the public API.
     friend class KvCacheIntrospection;
 
 private:
+    //! Guards all mutable state reachable from this manager. See the scope note above.
+    mutable ReentrantSharedMutex mApiMutex;
+
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.
     void _checkNoLivingKvCaches(char const* api) const;
@@ -348,6 +392,8 @@ private:
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
+    int64_t mIterSuspendedRequests{0};
+    int64_t mIterResumedRequests{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

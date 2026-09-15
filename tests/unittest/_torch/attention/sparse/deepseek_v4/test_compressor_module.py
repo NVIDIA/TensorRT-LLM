@@ -25,26 +25,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     MLAParams,
     PositionalEmbeddingParams,
     PositionEmbeddingType,
     RotaryScalingType,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.compressor import (
     Compressor,
     KVCacheDtype,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
-from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
+from tensorrt_llm._torch.attention.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import get_sm_version
@@ -929,7 +929,7 @@ class CompressorWrapper:
         # of the architecture-specific attention layout. Keep that coverage on
         # H100 without selecting the Hopper-required footer-scale cache.
         with mock.patch(
-            "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager.get_sm_version",
             return_value=100,
         ):
             cache_manager = DeepseekV4CacheManager(

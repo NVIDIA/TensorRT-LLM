@@ -1,6 +1,6 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.2** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.7** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
@@ -31,9 +31,9 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.2"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.7"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
-| `sessionId` | string | Unique hex UUID per server lifetime. Use this to correlate initial report with heartbeats. |
+| `sessionId` | string | Unique hex UUID per telemetry session. Use this to correlate initial, heartbeat, and terminal events. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
 
 Privacy/identity fields (`osVersion`, `geoInfo`, `deviceGUID`, etc.) are
@@ -44,7 +44,9 @@ login context.
 
 ### `trtllm_initial_report`
 
-Sent once at server startup. Contains system info and serving configuration.
+Sent once after the first successful LLM initialization. Contains system info
+and the first successfully reported LLM's serving configuration. A process that
+fails earlier can send a terminal report without an initial report.
 
 #### System fields
 
@@ -79,7 +81,8 @@ Sent once at server startup. Contains system info and serving configuration.
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| `architectureClassName` | LongString | HuggingFace model architecture class. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"` |
+| `architectureClassName` | LongString | Exact model architecture class when it appears in the checked-in public Hugging Face architecture allowlist; otherwise empty. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"`, `""` |
+| `architectureClassHash` | LongString | Pseudonymous, deterministic SHA-256 grouping key for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
 | `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
 | `quantizationAlgo` | ShortString | Quantization algorithm. Empty string if none. | `""`, `"fp8"`, `"w4a16_awq"` |
@@ -93,8 +96,43 @@ Sent once at server startup. Contains system info and serving configuration.
 | `featuresJson` | string | Legacy JSON-serialized summary of feature flags. See [featuresJson keys](#featuresjson-keys). | `'{"lora":false,...}'` |
 | `llmApiConfigJson` | string | JSON-serialized sanitized, type-driven effective LLM API configuration. See [LLM API config capture](#llm-api-config-capture). | `'{"tensor_parallel_size":2,...}'` |
 | `llmApiConfigMetaJson` | string | JSON-serialized metadata for LLM API configuration capture. | `'{"capture_succeeded":true,...}'` |
-| `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"` |
+| `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"`, `"coordinator"`, `"server_coordinator"`, `"ctx0"`, `"gen0"` |
 | `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
+
+##### Architecture privacy policy
+
+`architectureClassName` and `architectureClassHash` are mutually exclusive.
+Plaintext is reported only for an exact match in
+`tensorrt_llm/usage/architecture_allowlist.py`. Other valid names are omitted and
+represented by `sha256:` plus SHA-256 of
+`"trtllm-architecture-class-v1\0<UTF-8 name>"`, allowing repeated unknown names to
+be grouped without transmitting them.
+
+This hash provides pseudonymization, not confidentiality. Architecture names are
+often predictable, and the domain separator is public, so a telemetry recipient
+can hash candidate names offline and identify a match. The fixed domain also
+makes the same unknown architecture globally correlatable across deployments.
+The intended guarantee is only that the raw name is not transmitted while stable
+grouping remains possible; the hash must not be treated as anonymous or secret.
+
+Extraction uses the first Hugging Face `architectures` value and also supports
+legacy singular values and nested engine configs. Invalid or empty values leave
+both fields empty. The conservative allowlist is maintained manually; custom
+names remain excluded until reviewed.
+
+#### Aggregate LLM lifecycle counters
+
+These process-local snapshots are present on the initial report, every
+heartbeat, and the terminal report. Cumulative counters saturate at uint32 max;
+`activeLlmInstances` is a gauge.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `llmInitializationAttempts` | PositiveInt | Number of entries into `LLM.__init__`. |
+| `llmInstancesCreated` | PositiveInt | Number of LLM objects initialized successfully. |
+| `activeLlmInstances` | PositiveInt | Successfully initialized objects not yet shut down. |
+| `maxConcurrentLlmInstances` | PositiveInt | Maximum active objects observed in the process session. |
+| `llmInitializationFailures` | PositiveInt | Initialization attempts that raised a handled Python exception. |
 
 ### `trtllm_heartbeat`
 
@@ -104,6 +142,46 @@ heartbeats per session.
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `seq` | PositiveInt | Zero-based heartbeat sequence number. | `0`, `1`, `42` |
+| `ingressPoint` | ShortString | Invocation boundary for the process session. | `"cli_serve"` |
+| `disaggRole` | ShortString | Disaggregated role: `context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. | `"dep-abc123"` |
+
+Every heartbeat also contains the five aggregate LLM lifecycle counters above.
+
+### `trtllm_exit_report`
+
+Sent at most once when TRT-LLM or a surviving observer can classify the session
+outcome. Missing terminal events remain unknown; they are not confirmed crashes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exitCodeKnown` | boolean | Whether an authoritative process-style exit code is available. |
+| `exitCode` | PositiveInt | Exit code, or `0` when unknown. |
+| `signalNumber` | PositiveInt | Signal number, or `0` when not applicable or unknown. |
+| `terminationKind` | enum | `clean`, `exception`, `signal`, `worker_failure`, `timeout`, or `unknown`. |
+| `lifecyclePhase` | enum | Last known phase reached before termination: `cli_parsing`, `config_validation`, `model_initialization`, `serving`, or `unknown`. |
+| `component` | enum | `llm`, `server`, `engine_worker`, `disagg_worker`, or `unknown`. |
+| `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
+| `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |
+| `disaggRole` | ShortString | Disaggregated role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy `ctx0`/`gen0`), or empty when unavailable/not applicable. |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. |
+
+Every terminal report also contains the five aggregate LLM lifecycle counters
+above. Delivery is best-effort and waits no more than 0.5 seconds; the local
+terminal lock permits at most one delivery attempt per process session.
+
+When a surviving parent observes a subprocess return code such as `-9`, it is
+normalized to shell-style `exitCode=137` with `signalNumber=9`.
+
+Terminal fields are deliberately bounded and categorical. Exception messages,
+stack traces, commands, paths, model identifiers, and configuration text are
+not collected.
+
+V1 signal coverage is boundary-specific. The generic CLI boundary observes
+Ctrl+C/SIGINT, while Uvicorn serving and explicitly instrumented disaggregated
+boundaries observe both SIGINT and SIGTERM. A default SIGTERM delivered to
+another CLI, such as `trtllm-bench` or `trtllm-eval`, may terminate the process
+before it can send a terminal report.
 
 ## Type Reference
 
@@ -123,6 +201,7 @@ The `ingressPoint` field identifies which TRT-LLM entry point started the sessio
 | `"cli_bench"` | Started via `trtllm-bench` CLI |
 | `"cli_eval"` | Started via evaluation CLI |
 | `"llm_class"` | Started via `LLM()` Python API directly |
+| `"disaggregated"` | Started as a disaggregated coordinator or fleet worker |
 | `"unknown"` | Entry point not identified |
 
 ## `featuresJson` Keys
@@ -146,28 +225,28 @@ flags such as LoRA/speculative decoding have explicit safe config fields.
 
 The `llmApiConfigJson` field is a JSON-serialized dict containing a type-driven
 subset of the validated, effective LLM API configuration. Capture is
-**type-driven**: a field is captured automatically when its type is categorical
-(`Literal`/`Enum`/`bool`) or numeric (`int`/`float`), or a safe collection of
-those. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are not captured unless the
-field carries an explicit allowlist (`TelemetryField.categorical(...)`). Any field
-can opt out with `telemetry=False`.
+automatic for `bool`, `int`, finite `float`, `Literal`, `Enum`, supported unions,
+and homogeneous sequences. Unsafe scalar `str`, `Any`, and `object` branches
+require `TelemetryField.categorical(...)`; paths, mappings, callables, and
+unsupported structures always fail closed. Use `telemetry=False` to exclude a
+field.
 
 Captured values must be safe primitives. Raw strings are excluded unless the
-field is a `Literal[...]` or uses an explicit `allowlist` converter. Paths,
+field is a `Literal[...]`/`Enum` or matches explicit `allowed_values`. Paths,
 tokenizer locations, dicts, objects, callables, raw `Any` values, non-finite
 floats (`nan`/`inf`), and unsafe or heterogeneous sequences are excluded.
+Union branches are compiled and sanitized independently: explicit
+`allowed_values` opt in only otherwise unsafe scalar branches and do not filter
+safe numeric, boolean, `Literal`, or `Enum` branches in the same union.
 Captured sequences are capped at a fixed length and any clipping is reported in
 `llmApiConfigMetaJson`. Exclusion is fail-closed: the value is omitted instead
 of being serialized, and `llmApiConfigMetaJson` reports whether any resolved field
 was excluded as unsafe.
 
-The table below is a non-exhaustive set of examples for readers building
-dashboards. The exhaustive source of truth is
-`tensorrt_llm/usage/llm_args_golden_manifest.json` (regenerated from
-`build_capture_manifest`), after the safety sanitizer has excluded unsafe values.
-Use `llmApiConfigMetaJson` digests and field counts to track the exact capture
-manifest for a given release. The rendered documentation generates the
-exhaustive field table at docs build time under **Developer Guide > Telemetry**.
+The table below gives common dashboard examples. The committed manifest is the
+canonical list of `TorchLlmArgs` capturable paths, merged policies, and
+categorical domains. `llmApiConfigMetaJson` identifies that manifest by digest.
+The docs build renders the full table under **Developer Guide > Telemetry**.
 
 | Key | Description |
 |-----|-------------|
@@ -177,7 +256,7 @@ exhaustive field table at docs build time under **Developer Guide > Telemetry**.
 | `moe_expert_parallel_size` | MoE expert parallelism degree (None/unset when runtime decides). |
 | `moe_tensor_parallel_size` | MoE tensor parallelism degree (None/unset when runtime decides). |
 | `moe_cluster_parallel_size` | MoE cluster parallelism degree (None/unset when runtime decides). |
-| `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args, and through an explicit allowlist (`pytorch`, `tensorrt`, `_autodeploy`) on the base/TRT args. |
+| `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args, and through explicit allowed values (`pytorch`, `tensorrt`, `_autodeploy`) on the base/TRT args. |
 | `dtype` | Model dtype, captured through an explicit allowlist. |
 | `load_format` | Weight load format, captured as a low-cardinality enum/string value. |
 | `quant_config.quant_algo` | Quantization algorithm, captured as a closed `QuantAlgo` enum value (TRT args only). Empty/absent when unquantized. |
@@ -211,7 +290,7 @@ over time.
 | `TRTLLM_USAGE_STATS_SERVER` | `https://events.gfe.nvidia.com/v1.1/events/json` | Override the GXT endpoint URL. Use for staging. |
 | `TRTLLM_USAGE_HEARTBEAT_INTERVAL` | `600` | Heartbeat interval in seconds. |
 | `TRTLLM_USAGE_FORCE_ENABLED` | `0` | Set to `1` to force-enable telemetry in CI/test environments. |
-| `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context` or `generation`). |
+| `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`). |
 | `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment ID across disaggregated workers. |
 
 ## For Developers: Adding a New Field
@@ -242,9 +321,10 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    exclusion sentinel keeps a categorical/numeric field out of capture.
 4. **Do not capture unsafe data.** No model/tokenizer/file paths, prompts,
    outputs, secrets/tokens/URLs/hostnames, free-form user strings, raw
-   dict/object payloads, or callables. The sanitizer fails closed regardless:
-   bare `str`, `Any`, `object`, `Path`, `dict`, callables, permissive unions, and
-   non-finite floats are dropped unless an approved `allowlist` converter applies.
+   dict/object payloads, or callables. Paths, mappings, callables, arbitrary
+   non-scalars, heterogeneous sequences, and non-finite floats always fail
+   closed. A `str`/`Any`/`object` scalar branch is emitted only when it exactly
+   matches the field's finite `allowed_values`.
 5. **`tests/unittest/usage/test_llmapi_config_capture.py`** — Add behavior
    coverage: assert the value is captured, and for a categorical bare-string
    field assert that an out-of-allowlist value is redacted (dropped) while an
@@ -259,8 +339,9 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    important enough for dashboard users to know by name.
 
 Dashboard note: payloads carry `capture_version` and `field_policy_version` in
-`llmApiConfigMetaJson`. During release adoption, v1 (opt-in) and v2 (type-driven)
-payloads coexist in the same index — **bucket by these before aggregating**
+`llmApiConfigMetaJson`. During release adoption, v1 (opt-in), v2 (initial
+type-driven), and v3 (composed branch-policy) payloads coexist in the same index
+— **bucket by these before aggregating**
 `captured_field_count` or any `llmApiConfigJson.<field>`.
 
 ### Conventions

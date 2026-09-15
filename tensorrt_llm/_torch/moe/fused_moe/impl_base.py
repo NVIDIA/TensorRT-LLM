@@ -25,6 +25,7 @@ import torch.nn as nn
 
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, is_gated_activation
+from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation, install_activation_params
 from .impl_blocks import MoEEplbWeightLayoutMixin, MoEExecutionContractMixin, MoEWeightOwnerMixin
 from .impl_contract import MoEDeployment, MoEEligibility, MoEEplbBinding, MoEProblem, MoERunContext
 from .interface import MoESchedulerKind, MoEWeightLoadingMode, _compute_ep_partition
@@ -55,12 +56,8 @@ def apply_moe_impl_construction_state(
     aux_stream_dict: Optional[dict[AuxStreamType, torch.cuda.Stream]] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     bias: bool = False,
-    swiglu_alpha: Optional[torch.Tensor] = None,
-    swiglu_beta: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[torch.Tensor] = None,
-    swiglu_limit_scalar: Optional[float] = None,
+    activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     layer_idx: Optional[int] = None,
-    activation_type: ActivationType = ActivationType.Swiglu,
     init_load_balancer: bool = False,
 ) -> None:
     """Install the construction state backends used to get from ``MoE.__init__``.
@@ -96,19 +93,21 @@ def apply_moe_impl_construction_state(
     module.routing_method = routing_method
     module.num_experts = num_experts
     module.hidden_size = hidden_size
+    # The pre-padding value: a backend that rounds ``hidden_size`` up for its
+    # weight layout reads this back to slice the padding off again.
+    module.unpadded_hidden_size = hidden_size
     module.intermediate_size = intermediate_size
     module.weight_loading_mode = weight_loading_mode
     module.bias = bias
     module.dtype = dtype
     module.reduce_results = reduce_results
-    module.swiglu_alpha = swiglu_alpha
-    module.swiglu_beta = swiglu_beta
-    module.swiglu_limit = swiglu_limit
-    module.swiglu_limit_scalar = swiglu_limit_scalar
     module.layer_idx = layer_idx
     module.layer_idx_str = str(layer_idx) if layer_idx is not None else None
-    module.activation_type = int(activation_type)
-    module.is_gated_activation = is_gated_activation(activation_type)
+    module.activation = activation
+    # ``ActivationType``, not a bare int: as an ``IntEnum`` it still reads as an
+    # int for op schemas and tuning keys, and rejection messages get ``.name``.
+    module.activation_type = ActivationType(activation.kind)
+    module.is_gated_activation = is_gated_activation(activation.kind)
     module.intermediate_size_expand_ratio = 2 if module.is_gated_activation else 1
 
     module.quant_config = model_config.quant_config
@@ -152,6 +151,11 @@ def apply_moe_impl_construction_state(
     module.initial_local_expert_ids = list(range(slot_start, slot_end))
     module.initial_global_assignments = list(range(module.num_experts))
     module.allreduce = None
+
+    # Last, because a PER_EXPERT_TENSOR constant is sized by
+    # ``expert_size_per_partition`` set just above. An impl built directly --
+    # as unit tests and microbenchmarks do -- has no other installer.
+    install_activation_params(module)
 
 
 class MoEImplBase(
@@ -246,6 +250,21 @@ class MoEImplBase(
     # do.
     @abc.abstractmethod
     def run_moe(self, ctx: MoERunContext) -> torch.Tensor: ...
+
+    def try_fused_route_quant(
+        self, x: "torch.Tensor", router_logits: "torch.Tensor"
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None":
+        """Offer to fuse routing and input quantization into one launch.
+
+        Accepting returns what the scheduler otherwise assembles from two calls,
+        in that order: ``routing_method.apply``'s selected experts and scales,
+        then ``quantize_input``'s quantized activations and scaling factors.
+
+        Declining is the default and the common case: the one implementation
+        that accepts is shape-, SM-, and quant-specialized and checks all of
+        that itself. Overriding this is how a backend opts in.
+        """
+        return None
 
     # ---- impl-owned resources: produced here, never passed in -------------
     def get_workspaces(self, *args: object, **kwargs: object) -> "list[dict] | None":

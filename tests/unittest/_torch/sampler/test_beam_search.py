@@ -1846,6 +1846,7 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     # code.
     executor = types.SimpleNamespace(
         max_beam_width=request.py_beam_width,
+        kv_cache_transceiver=None,
         _validate_token_id_range=lambda _request: None,
         sampler=types.SimpleNamespace(validate_request=lambda _request: None),
         _validate_request_budget=lambda _request: None,

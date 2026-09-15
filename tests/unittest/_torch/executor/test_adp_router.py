@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for ADP (Attention Data Parallelism) abstractions.
 
 Tests for:
@@ -24,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     _num_input_tokens,
 )
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.llmapi.llm_args import AttentionDpConfig
 from tensorrt_llm.scheduling_params import SchedulingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -1111,6 +1127,7 @@ def _make_conv_request_item(
     target_dp_rank=None,
     attention_dp_relax=True,
     num_tokens=10,
+    subagent_affinity_id=None,
 ):
     """Mock RequestQueueItem carrying conversation params."""
     item = MagicMock()
@@ -1119,6 +1136,9 @@ def _make_conv_request_item(
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
+    # Default: no sub-agent affinity override (else a bare MagicMock attribute
+    # would be truthy and shadow conversation_id in _conversation_id).
+    scheduling_params.subagent_affinity_id = subagent_affinity_id
     item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
     item.request.py_conversation_params = None
@@ -1130,13 +1150,50 @@ def _make_conv_request_item(
     return item
 
 
+class TestConversationAwareADPRouterConversationId:
+    """_conversation_id is the rank-affinity key: the sub-agent parent-affinity id
+    (from scheduling_params, set at the disagg edge from SUBAGENT_AFFINITY_HEADER)
+    when present, else the request's own conversation_id -- so sibling sub-agents
+    co-locate on the parent's rank without their conversation_id being rewritten."""
+
+    def test_prefers_subagent_affinity_id(self):
+        item = _make_conv_request_item(1, "own-id", subagent_affinity_id="parent-id")
+        assert ConversationAwareADPRouter._conversation_id(item) == "parent-id"
+
+    def test_falls_back_to_conversation_id(self):
+        item = _make_conv_request_item(1, "own-id")
+        assert ConversationAwareADPRouter._conversation_id(item) == "own-id"
+
+    def test_affinity_id_used_without_own_conversation_id(self):
+        # Parent-only request: no own conversation_id, but the affinity id pins it.
+        item = _make_conv_request_item(1, None, subagent_affinity_id="parent-id")
+        assert ConversationAwareADPRouter._conversation_id(item) == "parent-id"
+
+    def test_none_when_neither_present(self):
+        item = _make_conv_request_item(1, None)
+        assert ConversationAwareADPRouter._conversation_id(item) is None
+
+    def test_siblings_collapse_to_parent_rank_key(self):
+        # Two siblings with distinct own ids but the same parent affinity id must
+        # yield the same routing key, so the router pins them to one rank.
+        a = _make_conv_request_item(1, "own-a", subagent_affinity_id="parent-id")
+        b = _make_conv_request_item(2, "own-b", subagent_affinity_id="parent-id")
+        assert (
+            ConversationAwareADPRouter._conversation_id(a)
+            == ConversationAwareADPRouter._conversation_id(b)
+            == "parent-id"
+        )
+
+
 class TestConversationAwareADPRouter:
     """Routing behavior of ConversationAwareADPRouter (explicit conv->rank)."""
 
     @staticmethod
-    def _router(tp_size=4, max_sessions=1 << 16):
+    def _router(tp_size=4, max_sessions=1 << 16, placement="round_robin"):
         return ConversationAwareADPRouter(
-            dist=_mock_dist(tp_size=tp_size), max_sessions=max_sessions
+            dist=_mock_dist(tp_size=tp_size),
+            max_sessions=max_sessions,
+            new_conv_placement=placement,
         )
 
     @staticmethod
@@ -1166,9 +1223,10 @@ class TestConversationAwareADPRouter:
         pos = self._route(router, self._states(4), items)
         assert sorted(pos.values()) == [0, 1, 2, 3]
 
-    def test_subsequent_turns_are_sticky(self):
+    @pytest.mark.parametrize("placement", ["round_robin", "least_queued", "least_tokens"])
+    def test_subsequent_turns_are_sticky(self, placement: str) -> None:
         """Later turns of a conversation return to its first-turn rank."""
-        router = self._router(tp_size=4)
+        router = self._router(tp_size=4, placement=placement)
         convs = ["A", "B", "C", "D"]
         first = [_make_conv_request_item(i, convs[i]) for i in range(4)]
         pos1 = self._route(router, self._states(4), first)
@@ -1190,14 +1248,18 @@ class TestConversationAwareADPRouter:
         counts = [sum(1 for v in pos.values() if v == r) for r in range(4)]
         assert max(counts) - min(counts) <= 1
 
-    def test_routing_is_deterministic_across_ranks(self):
+    @pytest.mark.parametrize("placement", ["round_robin", "least_queued", "least_tokens"])
+    def test_routing_is_deterministic_across_ranks(self, placement: str) -> None:
         """Two independent instances (= two TP ranks) must agree exactly, or
         the no-broadcast allgather protocol would deadlock."""
         convs = ["A", "B", "C", None, "A", "B", "E", None, "C"]
 
         def run():
-            router = self._router(tp_size=4)
-            items = [_make_conv_request_item(i, convs[i]) for i in range(len(convs))]
+            router = self._router(tp_size=4, placement=placement)
+            items = [
+                _make_conv_request_item(i, convs[i], num_tokens=(i + 1) * 13)
+                for i in range(len(convs))
+            ]
             return self._route(router, self._states(4), items)
 
         assert run() == run()
@@ -1227,13 +1289,14 @@ class TestConversationAwareADPRouter:
         assert self._route(router, self._states(4), [second])[2] == 2
         assert router._conv_to_rank["A"] == 2
 
-    def test_sticky_overflow_keeps_mapping(self):
+    @pytest.mark.parametrize("placement", ["round_robin", "least_queued", "least_tokens"])
+    def test_sticky_overflow_keeps_mapping(self, placement: str) -> None:
         """When the home rank is saturated at the HARD cap (max_num_active_requests),
         the turn overflows off home but the conversation stays mapped home (so it
         returns home next batch once that rank has capacity). Stickiness uses the
         hard cap -- not the soft fair-share -- so a conversation's KV prefix stays
         resident on one rank in the common case."""
-        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
+        router = self._router(tp_size=2, placement=placement)
         # Seed conv A -> rank 0.
         self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
         home = router._conv_to_rank["A"]
@@ -1307,16 +1370,83 @@ class TestConversationAwareADPRouter:
 
         assert run() == run()
 
-    def test_new_conv_placement_config(self):
-        """Factory forwards the knob; unknown values fall back to round_robin."""
-        cfg = MagicMock()
-        cfg.kv_cache_routing_conversation_affinity = True
-        cfg.kv_cache_routing_max_sessions = 8
-        cfg.kv_cache_routing_new_conv_placement = "least_queued"
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
-        assert router._new_conv_placement == "least_queued"
+    @pytest.mark.parametrize(
+        "placement, expected_rank",
+        [("round_robin", 0), ("least_queued", 1), ("least_tokens", 2)],
+    )
+    def test_new_conv_placement_config(self, placement: str, expected_rank: int) -> None:
+        """The serialized public config selects each strategy."""
+        cfg = AttentionDpConfig(
+            kv_cache_routing_conversation_affinity=True,
+            kv_cache_routing_max_sessions=8,
+            kv_cache_routing_new_conv_placement=placement,
+        )
+        cfg = AttentionDpConfig.model_validate(cfg.model_dump())
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=3), kv_cache_manager=None, attention_dp_config=cfg
+        )
+        assert isinstance(router, ConversationAwareADPRouter)
+        assert router._max_sessions == 8
+        assert router._new_conv_placement == placement
+        states = [
+            RankState(rank=0, num_active_requests=3, num_active_tokens=1000),
+            RankState(rank=1, num_active_requests=1, num_active_tokens=500),
+            RankState(rank=2, num_active_requests=2, num_active_tokens=10),
+        ]
+        assert self._route(router, states, [_make_conv_request_item(1, "A")])[1] == expected_rank
+
+    def test_unknown_new_conv_placement(self) -> None:
+        with pytest.raises(ValueError, match="kv_cache_routing_new_conv_placement"):
+            AttentionDpConfig(kv_cache_routing_new_conv_placement="banana")
+        # Keep the direct-constructor fallback for callers without validated config.
         bad = ConversationAwareADPRouter(dist=_mock_dist(tp_size=4), new_conv_placement="banana")
         assert bad._new_conv_placement == "round_robin"
+
+    @pytest.mark.parametrize("has_conversation_id", [True, False])
+    def test_least_tokens_accumulates_same_batch_load(self, has_conversation_id: bool) -> None:
+        router = self._router(tp_size=4, placement="least_tokens")
+        items = [
+            _make_conv_request_item(i, f"c{i}" if has_conversation_id else None, num_tokens=tokens)
+            for i, tokens in enumerate([500, 500, 100, 100, 100])
+        ]
+        pos = self._route(router, self._states(4), items)
+        assert [pos[i] for i in range(5)] == [0, 1, 2, 3, 2]
+        if has_conversation_id:
+            assert dict(router._conv_to_rank) == {f"c{i}": pos[i] for i in range(5)}
+        else:
+            assert dict(router._conv_to_rank) == {}
+
+    def test_least_tokens_ties_use_request_count_then_rotating_cursor(self) -> None:
+        router = self._router(tp_size=3, placement="least_tokens")
+        states = [
+            RankState(rank=r, num_active_requests=count, num_active_tokens=100)
+            for r, count in enumerate([2, 1, 1])
+        ]
+        assert self._route(router, states, [_make_conv_request_item(1, "A")])[1] == 1
+        # Fresh rank snapshots replace prior load; only the tie cursor persists.
+        states = [RankState(rank=r, num_active_requests=1, num_active_tokens=100) for r in range(3)]
+        assert self._route(router, states, [_make_conv_request_item(2, "B")])[2] == 2
+        assert self._route(router, states, [_make_conv_request_item(3, "C")])[3] == 0
+
+    @pytest.mark.parametrize("placement_source", ["explicit", "sticky"])
+    def test_least_tokens_counts_explicit_and_sticky_batch_load(
+        self, placement_source: str
+    ) -> None:
+        router = self._router(tp_size=2, placement="least_tokens")
+        if placement_source == "sticky":
+            self._route(router, self._states(2), [_make_conv_request_item(0, "A")])
+            first = _make_conv_request_item(1, "A", num_tokens=500)
+        else:
+            first = _make_conv_request_item(
+                1, "A", target_dp_rank=0, attention_dp_relax=False, num_tokens=500
+            )
+        states = [
+            RankState(rank=0, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=1, num_active_requests=1, num_active_tokens=100),
+        ]
+        pos = self._route(router, states, [first, _make_conv_request_item(2, "B")])
+        assert pos == {1: 0, 2: 1}
+        assert router._conv_to_rank["A"] == 0
 
     def test_factory_default_when_disabled(self):
         cfg = MagicMock()
@@ -1325,13 +1455,14 @@ class TestConversationAwareADPRouter:
         router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
         assert isinstance(router, DefaultADPRouter)
 
-    def test_returned_expected_covers_every_rank(self):
+    @pytest.mark.parametrize("placement", ["round_robin", "least_queued", "least_tokens"])
+    def test_returned_expected_covers_every_rank(self, placement: str) -> None:
         """Regression: returned expected_num_active_requests must be >= every
         rank's post-assignment active count, else
         py_executor._pad_attention_dp_dummy_request asserts and the executor
         hangs. A sticky storm (one conversation hammered) must not push its home
         rank past expected."""
-        router = self._router(tp_size=8)
+        router = self._router(tp_size=8, placement=placement)
         states = self._states(8)
         # 40 requests for the SAME conversation: hard-cap stickiness concentrates
         # all of them on the home rank, pushing it well past the pre-loop soft
@@ -1343,16 +1474,19 @@ class TestConversationAwareADPRouter:
         assert all(expected >= f for f in final), (expected, final)
         assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
 
-    def test_new_conversations_never_exceed_slot_capacity(self):
+    @pytest.mark.parametrize("placement", ["round_robin", "least_queued", "least_tokens"])
+    def test_new_conversations_never_exceed_slot_capacity(self, placement: str) -> None:
         """Regression: the spreading target must be clamped to
         max_num_active_requests. Unclamped it reaches 2 * fair_share, so a rank
         already holding every sequence slot still passes the `< soft_cap` gate
         and add_slot later raises NoFreeSlotsError mid-collective."""
-        router = self._router(tp_size=4)
+        router = self._router(tp_size=4, placement=placement)
         cap = 64
-        # 2 * ceil((184 + 8) / 4) = 96 > cap, so the unclamped target admits the
-        # full rank 3 and pushes it to 66 sequence slots.
+        # 2 * ceil((184 + 8) / 4) = 96 > cap, so an unclamped target would
+        # incorrectly admit the full rank 3.
         states = self._states(4, active=[40, 40, 40, cap])
+        # Make the full rank token-light so least_tokens must check capacity.
+        states[3].num_active_tokens = cap
         items = [_make_conv_request_item(i, None) for i in range(8)]
         assign, expected = router.route_requests(states, items, max_num_active_requests=cap)
         final = [states[r].num_active_requests + len(assign[r]) for r in range(4)]

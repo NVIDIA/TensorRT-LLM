@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -5261,7 +5261,7 @@ For more information, please refer to <http://unlicense.org>
   - `Tracker`: https://github.com/tox-dev/py-filelock/issues
 
 
-## flashinfer-python (0.6.16)
+## flashinfer-python (0.6.18)
 
 ### Licenses
 License: `Apache-2.0`
@@ -33239,7 +33239,7 @@ License: `NVIDIA Proprietary Software`
   - `Homepage`: https://developer.nvidia.com/cusparselt
 
 
-## nvidia-cutlass-dsl (4.6.2)
+## nvidia-cutlass-dsl (4.8.0.dev0)
 
 ### Licenses
 License: `None`
@@ -48450,7 +48450,7 @@ SOFTWARE.
 
 
 
-## polygraphy (0.49.26)
+## polygraphy (0.53.4)
 
 ### Licenses
 License: `Apache 2.0`

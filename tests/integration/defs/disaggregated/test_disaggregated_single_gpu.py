@@ -16,6 +16,13 @@ from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
 
+# Skip every test in this module: the MPI publish/lookup control channel these
+# tests rely on does not work with the Open MPI 5 shipped by the DLFW 26.08 base
+# image. See https://nvbugs/6770878.
+pytestmark = pytest.mark.skip(
+    reason="Disaggregated single-GPU tests are broken on Open MPI 5, "
+    "see https://nvbugs/6770878")
+
 
 def get_ucx_tls():
     """Get UCX_TLS value based on GPU architecture.
@@ -29,22 +36,8 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
-    if sm == 90:
-        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
-        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
-        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
-        return "^gdr_copy"
     return "^ib,gdr_copy"
 
-
-# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -527,16 +520,12 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 @pytest.mark.parametrize("model", ["Llama-3.1-8B-Instruct"])
 @pytest.mark.parametrize("spec_dec_model_path", ["EAGLE3-LLaMA3.1-Instruct-8B"])
 @pytest.mark.parametrize("generation_overlap", [False])
-@pytest.mark.parametrize("eagle3_one_model", [True, False])
 def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
-                                                 generation_overlap,
-                                                 eagle3_one_model):
+                                                 generation_overlap):
     # Test whether the batch slots are properly released when using speculative decoding
     # with disaggregated serving.
     spec_dec_config = Eagle3DecodingConfig(
-        speculative_model=model_path(spec_dec_model_path),
-        eagle3_one_model=eagle3_one_model,
-        max_draft_len=3)
+        speculative_model=model_path(spec_dec_model_path), max_draft_len=3)
 
     worker_pytorch_configs = []
 

@@ -20,13 +20,15 @@ dequantized FP4→BF16 in registers, using BF16 m16n8k16 MMA.
 No activation quantization overhead.  In-kernel topk_weights multiplication.
 """
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import (
     ActivationType,
+    AuxStreamType,
     Fp4QuantizedTensor,
     is_gated_activation,
     is_nvfp4_marlin_supported_sm,
@@ -34,17 +36,20 @@ from tensorrt_llm._torch.utils import (
 )
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from .fused_moe_cutlass import CutlassFusedMoE
+from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation, MoEActivationSupport
+from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
+    MoEInputRequirement,
     MoEProblem,
     MoERejectReason,
     MoERunContext,
     MoEStaticCapability,
 )
 from .interface import _reject
-from .quantization import NVFP4MarlinFusedMoEMethod
+from .quantization import MoEWeightLoadingMode, NVFP4MarlinFusedMoEMethod
+from .routing import BaseMoeRoutingMethod
 
 # Block size for moe_align_block_size — must match TILE_M in the kernel
 _MOE_BLOCK_SIZE = 16
@@ -55,7 +60,7 @@ def _has_fused_moe_kernel() -> bool:
     return hasattr(torch.ops.trtllm, "marlin_nvfp4_moe_gemm")
 
 
-class MarlinFusedMoE(CutlassFusedMoE):
+class MarlinFusedMoE(MoEImplBase):
     """MoE backend using Marlin W4A16 NVFP4 GEMM for SM89-SM99.
 
     Uses ``marlin_nvfp4_moe_gemm`` with BF16 activations to process all experts
@@ -64,9 +69,18 @@ class MarlinFusedMoE(CutlassFusedMoE):
     compatible. Requires the fused kernel to be built (no fallback path).
     """
 
-    # Restated rather than inherited from CutlassFusedMoE, whose exact-class
-    # LoRA comparison answered False for this backend.
-    capabilities = MoEStaticCapability(supports_moe_lora=False)
+    # Sorted-token dispatch has no EPLB slot layout, which is also why
+    # ``can_implement`` rejects ``d.eplb_enabled`` below.
+    capabilities = MoEStaticCapability(supports_apply_router_weight_on_input=True)
+
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
+    # The Marlin epilogue takes no activation constants, and
+    # ``_apply_activation`` only distinguishes these three -- any other gated
+    # kind would silently run SiLU, any other non-gated kind ReLU.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu, ActivationType.Relu2})
+    )
 
     _QUANT_SUPPORT_TABLE = {
         QuantAlgo.NVFP4: {
@@ -118,6 +132,58 @@ class MarlinFusedMoE(CutlassFusedMoE):
 
         return MoEEligibility.ok()
 
+    def __init__(
+        self,
+        *,
+        routing_method: BaseMoeRoutingMethod,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        model_config: ModelConfig = ModelConfig(),
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+        bias: bool = False,
+        apply_router_weight_on_input: bool = False,
+        layer_idx: Optional[int] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
+        init_load_balancer: bool = False,
+    ):
+        """Construct the backend.
+
+        ``bias`` is accepted because ``create_moe`` passes it on the branch this
+        class shares with CutlassFusedMoE, but is always False here: the factory
+        rejects it against ``capabilities.supports_expert_bias``.
+        """
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=reduce_results,
+            model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
+            weight_loading_mode=weight_loading_mode,
+            bias=bias,
+            layer_idx=layer_idx,
+            activation=activation,
+            init_load_balancer=init_load_balancer,
+        )
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        self._weights_created = False
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+
+    def _check_configs(self):
+        assert self._weights_created
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+
     def quantize_input(
         self, x: torch.Tensor | Fp4QuantizedTensor, post_quant_comm: bool = True, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor | None]:
@@ -130,9 +196,6 @@ class MarlinFusedMoE(CutlassFusedMoE):
             )
             return NVFP4MarlinFusedMoEMethod()
         raise ValueError(f"MarlinFusedMoE only supports NVFP4, got {self.quant_config}")
-
-    def _supports_load_balancer(self) -> bool:
-        return False
 
     def _apply_activation(self, gemm1_out: torch.Tensor) -> torch.Tensor:
         """Apply the activation function to the gemm1 output.
@@ -174,9 +237,8 @@ class MarlinFusedMoE(CutlassFusedMoE):
     # ====================================================================
 
     def supports_moe_output_in_alltoall_workspace(self):
-        # Overrides the CutlassFusedMoE "True": this kernel always allocates
-        # and returns its own output tensor, so a workspace-backed buffer
-        # would be filled by nobody while combine() read from it.
+        # This kernel always allocates and returns its own output tensor, so
+        # nothing would fill a workspace-backed buffer that ``combine()`` reads.
         return False
 
     def run_moe(

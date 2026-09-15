@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -19,23 +19,12 @@ set(SRCS
     utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
-    utils/speculativeChoicesUtils.cpp
     locality_domain/locality_domain_utils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
-    decodingLayerWorkspace.cpp
-    eagleBuffers.cpp
-    explicitDraftTokensBuffers.cpp
-    lookaheadBuffers.cpp
-    loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
-    decodingOutput.cpp
-    decoderState.cpp
-    gptDecoder.cpp
-    gptDecoderBatched.cpp
-    gptJsonConfig.cpp
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp
@@ -48,8 +37,6 @@ set(SRCS
     moeLoadBalancer/moeLoadBalancer.cpp
     moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
-    promptTuningParams.cpp
-    runtimeKernels.cu
     tllmBuffers.cpp
     workerPool.cpp
     worldConfig.cpp

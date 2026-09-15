@@ -14,8 +14,8 @@
 # limitations under the License.
 
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Dict, FrozenSet, List, Optional, Union
 
 import torch
 from torch import nn
@@ -30,10 +30,13 @@ from ...model_config import ModelConfig
 from ...modules.gated_mlp import GatedMLP
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
                       Fp4QuantizedTensor, MxFp8QuantizedTensor)
+from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
+                         MoEActivation, MoEActivationSupport,
+                         materialize_activation_params)
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
-                            require_comm_plan)
+                            MoEStaticCapability, require_comm_plan)
 from .impl_environment import MoEDep
 from .interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode, _reject
 from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
@@ -91,6 +94,9 @@ class TRTLLMGenFusedMoE(MoEImplBase):
     There should be at lease `num_experts` slots in the model engine. More than that is OK, in that case, some experts may have multiple replicas.
     """
 
+    capabilities = MoEStaticCapability(supports_expert_bias=True,
+                                       supports_eplb=True)
+
     # bfloat16 routing scales are what these kernels read, and the DeepEP
     # dispatch has to mark unfilled rows before they reach them.
     input_requirement = MoEInputRequirement(
@@ -112,9 +118,8 @@ class TRTLLMGenFusedMoE(MoEImplBase):
     }
 
     # Quantization algorithms that support full swiglu_gptoss_style.
-    # FP8_BLOCK_SCALES supports the DSV4-style uniform swiglu_limit_scalar
-    # through the DeepSeek FP8 separate-activation path, but not bias or
-    # swiglu_alpha/beta.
+    # FP8_BLOCK_SCALES is absent on purpose: its separate-activation path takes
+    # the DSV4-style scalar clamp, but no bias and no alpha/beta.
     _GPTOSS_SUPPORTED_ALGOS = {
         QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
@@ -137,6 +142,63 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         QuantAlgo.NVFP4,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
+
+    # The fused-activation cubins index alpha/beta/clamp by expert
+    # (``gemm1_alpha`` / ``gemm1_beta`` / per-expert clamp tensor). The clamp is
+    # quant-dependent, so ``resolve_activation_support`` narrows it per instance.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({
+            ActivationType.Swiglu,
+            ActivationType.SwigluBias,
+            ActivationType.Relu2,
+            ActivationType.Silu,
+            ActivationType.SiTu,
+        }),
+        alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
+        limit=ActivationParamShape.PER_EXPERT_TENSOR,
+    )
+
+    # ActivationType -> the batched-GEMM ``ActType`` encoding the cubins are
+    # keyed by. SwigluBias shares the SwiGlu kernel (the gpt-oss constants
+    # travel as separate per-expert tensors, not as a distinct act type).
+    _TRTLLM_GEN_ACT_TYPE = {
+        ActivationType.Swiglu: ActType_TrtllmGen.SwiGlu,
+        ActivationType.SwigluBias: ActType_TrtllmGen.SwiGlu,
+        ActivationType.Relu2: ActType_TrtllmGen.Relu2,
+        ActivationType.Silu: ActType_TrtllmGen.Silu,
+        ActivationType.SiTu: ActType_TrtllmGen.SiTu,
+    }
+
+    def resolve_activation_support(self) -> MoEActivationSupport:
+        """Narrow the clamp ABI to what this instance's quant path reads.
+
+        The DeepSeek FP8 block-scale path runs the clamp in a separate
+        activation kernel (``DevKernel.cu::activationDeepSeekKernel``) that
+        takes one ``double`` by value, so a per-expert tensor would be silently
+        ignored there. Every other quant path consumes the per-expert tensor
+        the class attribute declares.
+        """
+        support = type(self).activation_support
+        # Reads ``quant_config`` rather than ``has_deepseek_fp8_block_scales``:
+        # this runs while construction state is being installed, before
+        # create_weights sets the ``_weights_created`` those properties assert.
+        quant_config = self.quant_config
+        if (quant_config is not None
+                and quant_config.layer_quant_mode.has_fp8_block_scales()):
+            return replace(support, limit=ActivationParamShape.UNIFORM_SCALAR)
+        return support
+
+    @classmethod
+    def situ_supported_quant_algos(cls) -> FrozenSet[QuantAlgo]:
+        """The quant algos this backend has a fused SiTu FC1 cubin for.
+
+        Public because a model that hands SiTu to this backend has to decide,
+        before construction, whether the handoff can work at all -- and the
+        only alternative to asking is restating the set. Restating it is what
+        broke once already: ``modeling_kimi_linear`` carried its own copy,
+        the NVFP4 cubins landed here, and the copy stayed at MXFP4-only.
+        """
+        return frozenset(cls._SITU_SUPPORTED_QUANT_ALGOS)
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -246,15 +308,8 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         VANILLA,
         layer_idx: Optional[int] = None,
         bias: bool = False,
-        swiglu_alpha: Optional[torch.Tensor] = None,
-        swiglu_beta: Optional[torch.Tensor] = None,
-        swiglu_limit: Optional[torch.Tensor] = None,
-        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = False,
-        activation_type: ActivationType = ActivationType.Swiglu,
-        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
-        trtllm_gen_activation_alpha: Optional[float] = None,
-        trtllm_gen_activation_beta: Optional[float] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     ):
         super().__init__(eplb=None)
         apply_moe_impl_construction_state(
@@ -269,21 +324,12 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
+            activation=activation,
         )
 
-        self.trtllm_gen_activation_type = (
-            ActType_TrtllmGen(trtllm_gen_activation_type)
-            if trtllm_gen_activation_type is not None else None)
-        self.trtllm_gen_activation_alpha = trtllm_gen_activation_alpha
-        self.trtllm_gen_activation_beta = trtllm_gen_activation_beta
-        self._validate_backend_local_activation()
+        self._validate_situ_activation()
 
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
@@ -291,11 +337,38 @@ class TRTLLMGenFusedMoE(MoEImplBase):
 
         # Eligibility (SM / smart_router / BF16 FlashInfer dep) is owned by
         # ``can_implement``. Keep only the provider selection for the op.
-        self.use_flashinfer = self._check_flashinfer_backend_support()
-        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
-        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
+        self._select_op_provider()
 
         self._weights_created = False
+
+        # Not all models that use this backend define shared experts (e.g. non-DeepSeek
+        # MoEs), so fall back to 0 when the config has no `n_shared_experts`. Retain the
+        # scalar so ``_resolve_fused_shared_expert`` can recompute the fused-expert count
+        # without holding onto the whole pretrained config.
+        self._n_shared_experts = getattr(model_config.pretrained_config,
+                                         "n_shared_experts", 0) or 0
+
+        # ``num_fused_shared_expert`` is derived from the op backend, so resolve it here
+        # for the provider chosen above (recomputed in ``create_weights`` if the provider
+        # is re-resolved once the per-layer quant config is known).
+        self._resolve_fused_shared_expert()
+
+        # create_weights must see the final fused-expert count so the fused shared
+        # slots are allocated when fusion is enabled.
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+        self.layer_idx = layer_idx
+
+    def _resolve_fused_shared_expert(self) -> None:
+        """(Re)compute how many shared experts are folded into the routed-expert
+        grouped GEMM, given the *current* ``self.op_backend``.
+
+        The count depends on the op backend, which ``create_weights`` can switch
+        when it re-resolves the provider for the final per-layer quant config
+        (see ``_select_op_provider``). Recomputing here keeps
+        ``num_fused_shared_expert`` consistent with that provider instead of
+        relying on the value settled at ``__init__`` time.
+        """
         self.num_fused_shared_expert = 0
 
         # Fusing the shared experts into the routed-expert grouped GEMM is opt-in:
@@ -312,16 +385,11 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         # local); gate it out here so EP configs fall back to the unfused path instead
         # of tripping the runtime EP check in the TRTLLM-Gen runner.
         fusion_supported = (
-            fusion_enabled and on_trtllm_backend
-            and model_config.mapping.dp_size == 1
-            and model_config.mapping.moe_ep_size == 1
-            and self.quant_config is not None
+            fusion_enabled and on_trtllm_backend and self.mapping.dp_size == 1
+            and self.mapping.moe_ep_size == 1 and self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_fp8_block_scales())
         if fusion_supported:
-            # Not all models that use this backend define shared experts (e.g. non-DeepSeek
-            # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
-            self.num_fused_shared_expert = getattr(
-                model_config.pretrained_config, "n_shared_experts", 0) or 0
+            self.num_fused_shared_expert = self._n_shared_experts
             if self.num_fused_shared_expert > 0:
                 logger.info_once(
                     f"Shared-expert fusion enabled: folding "
@@ -329,51 +397,29 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                     f"routed-expert grouped GEMM.",
                     key="trtllm_gen_shared_expert_fusion")
 
-        # create_weights must see the final fused-expert count so the fused shared
-        # slots are allocated when fusion is enabled.
-        if not model_config.skip_create_weights_in_init:
-            self.create_weights()
-        self.layer_idx = layer_idx
-
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
-        if self.trtllm_gen_activation_type is not None:
-            return int(self.trtllm_gen_activation_type)
-        if activation_type == ActivationType.Swiglu:
-            return 0
-        elif activation_type == ActivationType.SwigluBias:
-            # SwigluBias uses the same SwiGlu kernel path (ActType::SwiGlu == 0);
-            # the per-expert alpha/beta/clamp_limit are passed as separate tensors.
-            return 0
-        elif activation_type == ActivationType.Relu2:
-            return 1
-        elif activation_type == ActivationType.Silu:
-            return 2
-        else:
+        act_type = self._TRTLLM_GEN_ACT_TYPE.get(
+            ActivationType(activation_type))
+        if act_type is None:
             raise ValueError(f"Unsupported activation type: {activation_type}")
+        return int(act_type)
 
     @property
     def is_situ_activation(self) -> bool:
-        return self.trtllm_gen_activation_type == ActType_TrtllmGen.SiTu
+        return self.activation.kind is ActivationType.SiTu
 
-    def _validate_backend_local_activation(self) -> None:
-        # Runs from __init__, before create_weights, so the swiglu_* attributes
-        # checked below are still the constructor-provided values. For SiTu,
-        # create_weights later reuses the swiglu_alpha/swiglu_beta storage for
-        # the backend-local activation parameters (SiTu and SwiGLU are mutually
-        # exclusive and feed the same gemm1_alpha/gemm1_beta op slots).
-        if self.trtllm_gen_activation_type is None:
-            if (self.trtllm_gen_activation_alpha is not None
-                    or self.trtllm_gen_activation_beta is not None):
-                raise ValueError(
-                    "TRTLLM-Gen backend-local activation alpha/beta require "
-                    "trtllm_gen_activation_type.")
-            return
+    def _validate_situ_activation(self) -> None:
+        """Hardware / quant preconditions the SiTu cubins carry.
 
+        Kind and constant shape are already settled: the activation carrier only
+        admits two positive soft-caps for SiTu and no clamp, and
+        ``install_activation_params`` has materialized them as the per-expert
+        ``gemm1_alpha`` / ``gemm1_beta`` buffers the cubin indexes. What remains
+        is that trtllm-gen ships SiTu for exactly one dtype/quant combination.
+        """
         if not self.is_situ_activation:
-            raise ValueError(
-                "Only the SiTu TRTLLM-Gen backend-local activation is "
-                f"supported, got {self.trtllm_gen_activation_type.name}.")
+            return
         if self.dtype != torch.bfloat16:
             raise ValueError(
                 "TRTLLM-Gen SiTu requires bfloat16 activations, got "
@@ -392,22 +438,21 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         if self.tp_size > 1:
             # Intra-expert MoE TP: w1/w3 column-shard and w2 row-shard along
             # the intermediate dim (the stock MXFP4/NVFP4 quant-method loaders
-            # slice the packed bytes and scales per rank). Require the
-            # per-rank shard to stay a whole multiple of the quant method's
-            # weight alignment so per-shard scale groups and the padded
-            # weight buffers line up without fractional groups.
+            # slice the packed bytes and scales per rank). Require every rank
+            # to own whole scale groups. The padded NVFP4/MXFP4 loaders then
+            # pad each logical shard independently to the physical kernel
+            # alignment selected for that quantization method.
             if quant_algo == QuantAlgo.NVFP4:
-                # NVFP4 picks its alignment from the layer shape in
-                # create_weights (32 -> 128 or 256), which runs after this
-                # check. Ask for the resolved value: the class attribute is
-                # only the starting point, and validating against it would
-                # admit shards the loader cannot lay out.
-                alignment, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(
-                    self.hidden_size, self.intermediate_size_per_partition)
+                # NVFP4 uses group-16 scales. Its resolved physical alignment
+                # remains shape-dependent (32/128/256), but that is a local
+                # storage constraint rather than a logical TP constraint.
+                alignment = NVFP4TRTLLMGenFusedMoEMethod.scaling_vector_size
             else:
-                # MXFP4's alignment is a fixed class attribute.
+                # MXFP4 TP shards only have to preserve whole group-32 scale
+                # groups. The loader pads each logical shard independently to
+                # the kernel's physical 128-element alignment.
                 alignment = (
-                    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment)
+                    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.scaling_vector_size)
             if (self.intermediate_size % self.tp_size != 0
                     or self.intermediate_size_per_partition % alignment != 0):
                 raise ValueError(
@@ -416,28 +461,10 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                     f"({self.tp_size}) with the per-rank shard a multiple of "
                     f"{alignment}, got "
                     f"{self.intermediate_size_per_partition}.")
-        if self.activation_type != ActivationType.Swiglu:
+        if self.bias:
             raise ValueError(
-                "TRTLLM-Gen SiTu must use generic SwiGLU geometry so FC1 "
-                "contains gate and up projections.")
-        if self.bias or any(
-                value is not None
-                for value in (self.swiglu_alpha, self.swiglu_beta,
-                              self.swiglu_limit, self.swiglu_limit_scalar)):
-            raise ValueError(
-                "TRTLLM-Gen SiTu does not support bias or SwiGLU-specific "
-                "alpha/beta/limit parameters.")
-        if (self.trtllm_gen_activation_alpha is None
-                or self.trtllm_gen_activation_beta is None):
-            raise ValueError(
-                "TRTLLM-Gen SiTu requires both backend-local activation "
-                "alpha and beta.")
-        if (self.trtllm_gen_activation_alpha <= 0.0
-                or self.trtllm_gen_activation_beta <= 0.0):
-            raise ValueError(
-                "TRTLLM-Gen SiTu activation alpha/beta must be positive, got "
-                f"{self.trtllm_gen_activation_alpha} and "
-                f"{self.trtllm_gen_activation_beta}.")
+                "TRTLLM-Gen SiTu does not support expert bias; the cubin adds "
+                "no FC1 bias before the soft-caps.")
 
     @staticmethod
     def _is_flashinfer_fused_moe_available() -> bool:
@@ -458,6 +485,24 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         if not (self.use_flashinfer and self._is_unquantized_path()):
             return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+
+    def _select_op_provider(self) -> None:
+        """Pick the op provider (native TRTLLM-Gen or FlashInfer) for the
+        quant config currently installed.
+
+        Called twice: once in ``__init__``, and again from ``create_weights``.
+        The second call is what makes layerwise quantization work. A checkpoint
+        can leave individual MoE layers unquantized while the model-level config
+        says NVFP4; ``ConfigurableMoE.create_weights`` only installs that final
+        per-layer config on the backend just before calling ``create_weights``,
+        so at ``__init__`` time such a layer still looks quantized. Since only
+        FlashInfer implements the BF16 kernels, re-resolving here is what keeps
+        the provider and ``_get_quant_method`` in agreement; otherwise the layer
+        keeps the native provider and dies in ``run_bf16_moe`` at warmup.
+        """
+        self.use_flashinfer = self._check_flashinfer_backend_support()
+        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
+        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
 
     def _check_flashinfer_backend_support(self) -> bool:
         # SiTu is provided by the native TRTLLM-Gen cubin and is not part of
@@ -549,29 +594,19 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                 ("TRTLLMGenFusedMoE BF16 path only supports "
                  f"{[a.name for a in self._BF16_SUPPORTED_ACTIVATIONS]} activations, "
                  f"got {self.activation_type.name}.")
-            assert not self.bias and self.swiglu_alpha is None and self.swiglu_beta is None and self.swiglu_limit is None, \
+            assert not self.bias and self.act_alpha is None and self.act_beta is None and self.act_clamp is None, \
                 "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
 
-        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
+        if self.bias or self.act_alpha is not None or self.act_beta is not None:
             assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, \
-                "TRTLLMGenFusedMoE supports bias/swiglu_alpha/swiglu_beta only for nvfp4 and mxfp4 variants."
-        if self.swiglu_limit is not None or self.swiglu_limit_scalar is not None:
-            # swiglu_limit additionally goes through the DeepSeek FP8
-            # separate-activation path
-            # (DevKernel.cu::activationDeepSeekKernel) when
-            # has_deepseek_fp8_block_scales. The FP8 path consumes the scalar
-            # variant (uniform across experts); NVFP4/MXFP4 fused-activation
-            # cubins consume the per-expert tensor.
+                "TRTLLMGenFusedMoE supports bias and the alpha/beta activation constants only for nvfp4 and mxfp4 variants."
+        if self.act_clamp is not None:
+            # Whether the clamp arrives as a scalar or a per-expert tensor is
+            # settled by ``resolve_activation_support``; which algorithms have a
+            # clamp at all is a quant fact, so it stays here.
             assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 \
                 or self.has_w4a8_mxfp4_mxfp8 or self.has_deepseek_fp8_block_scales, \
-                "TRTLLMGenFusedMoE supports swiglu_limit only for nvfp4, mxfp4, and fp8_block_scale variants."
-            # The FP8 block-scale separate-activation kernel only consumes the
-            # uniform scalar (swiglu_limit_scalar); a per-expert swiglu_limit
-            # tensor would be silently ignored, so reject it explicitly.
-            if self.has_deepseek_fp8_block_scales:
-                assert self.swiglu_limit is None, \
-                    "TRTLLMGenFusedMoE FP8 block-scale path only supports the uniform " \
-                    "swiglu_limit_scalar, not a per-expert swiglu_limit tensor."
+                "TRTLLMGenFusedMoE supports an activation clamp only for nvfp4, mxfp4, and fp8_block_scale variants."
 
         if self.is_situ_activation:
             if not isinstance(self.op_backend, TRTLLMOpBackend):
@@ -588,7 +623,7 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                     f"mode, got {self.scaling_vector_size}.")
             # For SiTu these hold the backend-local activation parameters
             # (populated by create_weights, which runs before this check).
-            for name in ("swiglu_alpha", "swiglu_beta"):
+            for name in ("act_alpha", "act_beta"):
                 value = getattr(self, name)
                 if (value.dtype != torch.float32
                         or value.shape != (self.expert_size_per_partition, )
@@ -603,15 +638,15 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
-                # ``is_situ_activation`` (not ``swiglu_alpha is not None``):
-                # SiTu fills the swiglu_alpha/swiglu_beta slots from
+                # ``is_situ_activation`` (not ``act_alpha is not None``):
+                # SiTu fills the act_alpha/act_beta slots from
                 # create_weights, i.e. after this runs, so keying off the
                 # tensor would make the selected method depend on *when*
                 # _get_quant_method is called. Like the SwiGLU-alpha and
                 # element-wise cases, SiTu needs the padded method's
                 # alignment handling.
                 needs_padded_method = (
-                    self.swiglu_alpha is not None or self.is_situ_activation
+                    self.act_alpha is not None or self.is_situ_activation
                     or self.activation_type
                     in [ActivationType.Relu2, ActivationType.Silu])
                 return (NVFP4TRTLLMGenFusedMoEMethod() if needs_padded_method
@@ -635,6 +670,15 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         if self._weights_created:
             return
 
+        # The final per-layer quant config is in place only now (see
+        # ``_select_op_provider``), so re-resolve the provider before the quant
+        # method is chosen from the same config.
+        self._select_op_provider()
+
+        # The provider may have switched above, and the fused-shared-expert count is
+        # derived from it, so recompute it before it is consumed below.
+        self._resolve_fused_shared_expert()
+
         self.quant_method = self._get_quant_method()
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
         ):
@@ -642,27 +686,13 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         else:
             self.quant_method.create_weights(self)
 
-        # SiTu reuses the swiglu_alpha/swiglu_beta storage: SiTu and SwiGLU are
-        # mutually exclusive (constructor-provided SwiGLU parameters are
-        # rejected by _validate_backend_local_activation) and feed the same
-        # gemm1_alpha/gemm1_beta op slots. Safe with respect to the
-        # `swiglu_alpha is not None` gates: create_moe.py checks the
-        # constructor kwargs (None for SiTu); _get_quant_method's nvfp4 branch
-        # keys off is_situ_activation rather than swiglu_alpha, so it returns
-        # the same method before and after this point; _check_configs runs
-        # after this point and its swiglu gate admits both nvfp4 and
-        # w4a8_mxfp4_mxfp8.
+        # SiTu's two soft-caps ride in the same gemm1_alpha/gemm1_beta op slots
+        # SwiGLU's alpha/beta use -- the kinds are mutually exclusive. They are
+        # backend configuration, not checkpoint weights, so ``cache_derived_state``
+        # refills them if meta-device materialization wipes them.
         if self.is_situ_activation:
-            self.swiglu_alpha = nn.Parameter(torch.full(
-                (self.expert_size_per_partition, ),
-                float(self.trtllm_gen_activation_alpha),
-                dtype=torch.float32),
-                                             requires_grad=False)
-            self.swiglu_beta = nn.Parameter(torch.full(
-                (self.expert_size_per_partition, ),
-                float(self.trtllm_gen_activation_beta),
-                dtype=torch.float32),
-                                            requires_grad=False)
+            self.act_alpha = nn.Parameter(self.act_alpha, requires_grad=False)
+            self.act_beta = nn.Parameter(self.act_beta, requires_grad=False)
 
         self._weights_created = True
         self._check_configs()
@@ -685,12 +715,25 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         super().cache_derived_state()
         if self.is_situ_activation:
             # Reinitialize constants after meta-device materialization. These
-            # are backend configuration, not checkpoint weights.
-            self.swiglu_alpha.data.fill_(float(
-                self.trtllm_gen_activation_alpha))
-            self.swiglu_beta.data.fill_(float(self.trtllm_gen_activation_beta))
+            # are backend configuration, not checkpoint weights, so nothing
+            # else refills them.
+            #
+            # Re-materialized from ``self.activation`` rather than from a
+            # snapshot of the slots taken in create_weights: under meta init
+            # those slots are themselves meta at that point, so the snapshot
+            # would carry no values. ``self.activation`` is the declaration and
+            # is always real.
+            params = materialize_activation_params(
+                self.activation,
+                self.resolve_activation_support(),
+                num_local_experts=self.expert_size_per_partition,
+                device=self.act_alpha.device,
+                owner=type(self).__name__,
+            )
+            self.act_alpha.data.copy_(params.alpha)
+            self.act_beta.data.copy_(params.beta)
 
-    def try_fused_kimi_route_quant(
+    def try_fused_route_quant(
         self,
         x: Union[torch.Tensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
@@ -699,8 +742,11 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
 
         This launch-overhead optimization is deliberately specialized to the
-        K3 decode shape. Returning ``None`` keeps every other model, shape,
-        architecture, and op backend on the existing unfused path.
+        K3 decode shape: the op below hardcodes 896 experts, top-16, hidden
+        3584 and at most 64 tokens. The checks here mirror its ``TORCH_CHECK``s
+        so a miss declines quietly instead of raising. Returning ``None`` keeps
+        every other model, shape, architecture, and op backend on the existing
+        unfused path.
         """
         if (os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1"
                 or isinstance(x, MxFp8QuantizedTensor)):
@@ -971,7 +1017,7 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                 self.routing_method.routing_method_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
-                gemm1_clamp_limit=self.swiglu_limit_scalar,
+                gemm1_clamp_limit=self.act_clamp,
                 output=moe_output,
                 tune_max_num_tokens=self.max_num_tokens,
                 use_dp=self.use_dp,
@@ -988,7 +1034,7 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             # Holds SwiGLU's per-expert alpha/beta, or SiTu's backend-local
             # activation parameters (which reuse this storage; see
             # create_weights).
-            gemm1_alpha, gemm1_beta = self.swiglu_alpha, self.swiglu_beta
+            gemm1_alpha, gemm1_beta = self.act_alpha, self.act_beta
 
             output1_scale_scalar = self._get_data_or_none("fc31_scale_c")
             output1_scale_gate_scalar = self._get_data_or_none("fc31_alpha")
@@ -1004,7 +1050,7 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                 self.w3_w1_bias if self.bias else None,
                 gemm1_alpha,
                 gemm1_beta,
-                self.swiglu_limit,
+                self.act_clamp,
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias if self.bias else None,
@@ -1096,9 +1142,9 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                 self.w3_w1_weight,
                 self.w3_w1_weight_scale,
                 self.w3_w1_bias,
-                self.swiglu_alpha,
-                self.swiglu_beta,
-                self.swiglu_limit,
+                self.act_alpha,
+                self.act_beta,
+                self.act_clamp,
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,

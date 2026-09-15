@@ -20,8 +20,8 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -39,7 +39,11 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekV4SparseAttentionConfig,
+    DraftTargetDecodingConfig,
+    KvCacheConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, KVCacheDesc, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
@@ -1729,17 +1733,7 @@ class TestDeepseekV4CacheManager:
             cache_manager.shutdown()
 
     def test_swa_scratch_reuse_uses_extra_kv_tokens_for_rewind(self):
-        spec_config = SimpleNamespace(
-            max_draft_len=7,
-            max_total_draft_tokens=7,
-            spec_dec_mode=SimpleNamespace(
-                is_eagle3_one_model=lambda: False,
-                is_mtp_eagle_one_model=lambda: False,
-                is_mtp_one_model=lambda: False,
-                is_mtp_vanilla=lambda: False,
-                use_one_engine=lambda: True,
-            ),
-        )
+        spec_config = DraftTargetDecodingConfig(max_draft_len=7, speculative_model="draft")
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,

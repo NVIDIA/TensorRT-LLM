@@ -35,6 +35,12 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType
+from ..activation import (
+    DEFAULT_MOE_ACTIVATION,
+    ActivationParamShape,
+    MoEActivation,
+    MoEActivationSupport,
+)
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
@@ -42,13 +48,15 @@ from ..impl_contract import (
     MoEProblem,
     MoERejectReason,
     MoERunContext,
+    MoEStaticCapability,
 )
 from ..impl_environment import MoEDep
+from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod, _import_deep_gemm
 from ..routing import BaseMoeRoutingMethod
 
-__all__ = ["MegaMoEDeepGemm"]
+__all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
 
 # Process-global DG SymmBuffer cache. The cached object is mutable
 # forward-time activation workspace (input ``x`` / routing slots /
@@ -56,7 +64,122 @@ __all__ = ["MegaMoEDeepGemm"]
 # on the current TRT-LLM execution contract that MegaMoE layers run
 # serially within a forward pass; concurrent MegaMoE forwards sharing
 # a key would race on the same scratch buffers.
-_MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, object] = {}
+#
+# Keyed on buffer geometry only, never on the EP group's identity: a
+# worker process outlives the LLM built in it, so keying on the group
+# would mint a fresh key per LLM and stack a second allocation on top
+# of the first (and ``id()`` is recycled, so it can also alias a dead
+# group). Since the key no longer distinguishes groups, each entry
+# records the ProcessGroup it was allocated over and a hit is
+# re-validated against the caller's live group in
+# ``_take_cached_symm_buffer``. The group is recorded on this side of
+# the DeepGEMM boundary on purpose: relying on ``SymmBuffer.group``
+# would make correctness depend on DeepGEMM storing the passed group
+# verbatim, and a version bump that normalizes it would turn every hit
+# into a false stale -- freeing a buffer another layer already holds.
+# ``release_symm_buffer_cache`` bounds the lifetime.
+_MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, Tuple[object, object]] = {}
+
+
+def _free_symm_buffer(buffered: object) -> int:
+    """Release one DG SymmBuffer's symmetric memory. Returns its size in bytes.
+
+    ``SymmBuffer.destroy`` nulls only ``handle``/``buffer``/``group``/``x``/
+    ``x_sf``, leaving the other tensor views sliced out of the allocation
+    in place -- and any surviving view pins the whole thing. So sweep every
+    remaining tensor attribute too, otherwise this frees nothing whenever the
+    object is held by a reference cycle rather than dropped outright.
+
+    Tolerates an already-destroyed buffer (``buffer`` is ``None``) so a
+    double free degrades to a no-op instead of taking down the teardown path.
+    """
+    buffer = getattr(buffered, "buffer", None)
+    nbytes = buffer.nbytes if buffer is not None else 0
+    buffered.destroy()
+    for name, value in list(vars(buffered).items()):
+        if isinstance(value, torch.Tensor):
+            setattr(buffered, name, None)
+    return nbytes
+
+
+def _take_cached_symm_buffer(key: tuple, ep_pg: object) -> Optional[object]:
+    """Return the cached SymmBuffer for ``key`` if it was allocated over
+    ``ep_pg``; free and drop a geometry-equal entry from another group.
+
+    A geometry-equal entry recorded against a different (already destroyed)
+    EP group means an LLM was torn down without ``release_symm_buffer_cache``,
+    and its buffer's peer mappings are dead. Free it here so the driver can
+    reuse those pages for the caller's allocation -- symmetric memory is
+    outside the caching allocator, so this is the only way to get it back
+    within the process. Evict before freeing so a raising free cannot leave
+    a half-destroyed buffer behind for the next lookup.
+    """
+    entry = _MEGA_MOE_SYMM_BUFFER_CACHE.get(key)
+    if entry is None:
+        return None
+    cached, cached_pg = entry
+    if cached_pg is ep_pg:
+        return cached
+    del _MEGA_MOE_SYMM_BUFFER_CACHE[key]
+    # This runs on the next LLM's init path and the stale buffer was
+    # rendezvoused over an already-destroyed group, so a raising free must
+    # not escape and fail the new LLM -- fall through to a fresh allocation
+    # instead (no worse than the pre-fix behavior, which leaked and
+    # allocated).
+    try:
+        freed = _free_symm_buffer(cached)
+    except Exception as e:
+        logger.error(
+            f"[MegaMoE] failed to release a stale DG SymmBuffer from a "
+            f"previous EP group, allocating fresh: {e}"
+        )
+        return None
+    logger.info(
+        f"[MegaMoE] released stale DG SymmBuffer from a previous EP group: {freed / 2**30:.2f} GiB"
+    )
+    return None
+
+
+def release_symm_buffer_cache() -> None:
+    """Free every cached DG SymmBuffer. Call once per executor teardown.
+
+    The EP group these buffers were rendezvoused over is destroyed on
+    executor shutdown, so nothing may reuse them afterwards. They must be
+    dropped explicitly: the backing symmetric memory sits outside PyTorch's
+    caching allocator, so neither a GC nor ``torch.cuda.empty_cache()``
+    reclaims it, and a reused worker process would otherwise carry a full
+    activation workspace into the next LLM's memory budget.
+
+    Only the MPI worker path (``GenerationExecutorWorker.shutdown``) calls
+    this today. The Ray and RPC worker paths do not: their worker process
+    exits with the LLM, so the driver reclaims the memory at process exit.
+    Any path that starts reusing a worker process across LLMs must call this
+    on its teardown too.
+    """
+    if not _MEGA_MOE_SYMM_BUFFER_CACHE:
+        return
+    # Detach before freeing so a raising free cannot leave a half-destroyed
+    # buffer in the cache for a later lookup to trip over.
+    entries = list(_MEGA_MOE_SYMM_BUFFER_CACHE.values())
+    _MEGA_MOE_SYMM_BUFFER_CACHE.clear()
+    # Free one at a time and keep going on failure: the entries are already
+    # out of the cache, so any buffer skipped by a raising predecessor would
+    # be unreclaimable for the rest of the process lifetime.
+    released = 0
+    total_bytes = 0
+    for buffered, _ in entries:
+        try:
+            total_bytes += _free_symm_buffer(buffered)
+            released += 1
+        except Exception as e:
+            logger.error(
+                f"[MegaMoE] failed to release a DG SymmBuffer during executor "
+                f"teardown, continuing with the remaining buffers: {e}"
+            )
+    logger.info(
+        f"[MegaMoE] released {released}/{len(entries)} DG SymmBuffer(s): "
+        f"{total_bytes / 2**30:.2f} GiB"
+    )
 
 
 # ---- Fused MXFP8 per-token quant backends --------------------------------
@@ -135,14 +258,67 @@ def _assert_num_slots_divisible_by_ep(num_slots: int, ep_size: int) -> None:
         )
 
 
-class MegaMoEDeepGemm(MoEImplBase):
-    """MoE backend wrapping DeepGEMM's fused ``fp8_fp4_mega_moe`` kernel."""
+@register_moe_impl
+class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
+    """``deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8``.
+
+    DeepGEMM fused ``fp8_fp4_mega_moe``: MXFP4 weights, MXFP8 activations,
+    SM100/SM103. One class carries the identity and the whole contract:
+    construction, the MPI/process-group setup, the symmetric-buffer
+    allocation, the weight lifecycle, eligibility, quantization, and
+    ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
+    a backend supports a single quantization format -- an abstract parent
+    would carry no identity, implement nothing, and have one subclass.
+
+    The kernel segment is absent from the name because the ``quant`` segment
+    already separates this one from the grouped-GEMM implementation, with which
+    it shares provider and technique.
+
+    ``MegaMoEDeepGemm`` below is an alias onto this class, so the
+    pre-identity name still resolves for the call sites that use it.
+    """
+
+    descriptor = MoEImplDescriptor(
+        identity=MoEImplId("deepgemm", "cuda", "mega_moe", "w4a8_mxfp4_mxfp8"),
+        # The kernel owns dispatch + GEMM1 + gated activation + GEMM2 + combine
+        # over the NVLink SymmBuffer, so ConfigurableMoE must NOT layer
+        # host-side comm on top.
+        scheduler_kind=MoESchedulerKind.FUSED_COMM,
+        # Static and dynamic EPLB both work: see ``_supports_load_balancer``
+        # below for why slot-id routing and DG-tensor migration are safe here.
+        capabilities=MoEStaticCapability(supports_eplb=True),
+        doc="DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103.",
+    )
+
+    # Taken off the descriptor rather than restated. The scheduler reads these
+    # three attributes and the registry publishes the descriptor; a second
+    # literal would let what is published and what is executed drift apart.
+    # ``input_requirement`` keeps the descriptor default because this backend
+    # prepares its own inputs: ``quantize_input`` emits the FP8 + packed-UE8M0
+    # pair the kernel reads, and ``run_moe`` casts the routing slots itself.
+    scheduler_kind = descriptor.scheduler_kind
+
+    capabilities = descriptor.capabilities
+
+    input_requirement = descriptor.input_requirement
 
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
-    # Kernel owns dispatch + GEMM1 + gated activation + GEMM2 + combine via NVLink
-    # SymmBuffer; ConfigurableMoE must NOT layer host-side comm on top.
-    scheduler_kind = MoESchedulerKind.FUSED_COMM
+    # ActivationType -> the DeepGEMM library's own ``activation`` argument. The
+    # only place that external vocabulary is spoken; keys must cover
+    # ``activation_support``, which ``__init__`` checks.
+    _ACTIVATION_MAP = {
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.SiTu: "situ",
+    }
+
+    # Both SiTU constants and the SwiGLU clamp are baked into the compiled
+    # kernel, so a per-expert tensor is rejected rather than silently reduced.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.SiTu}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+    )
 
     # MegaMoE partitions the global slot table, not just the raw expert count.
     # Let backend-specific num_slots checks handle EPLB/non-divisible layouts.
@@ -192,10 +368,12 @@ class MegaMoEDeepGemm(MoEImplBase):
                 f"(DeepGEMM TMA-aligned packed-UE8M0 SF row); "
                 f"got intermediate_size={p.intermediate_size}",
             )
-        if p.activation_type != ActivationType.Swiglu:
+        if p.activation_type not in cls.activation_support.kinds:
+            supported = ", ".join(sorted(a.name for a in cls.activation_support.kinds))
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                f"MegaMoEDeepGemm only supports ActivationType.Swiglu (got {p.activation})",
+                f"MegaMoEDeepGemm does not support activation {p.activation}; "
+                f"supported: {supported}",
             )
         if d.tp_size != 1:
             return _reject(
@@ -255,15 +433,9 @@ class MegaMoEDeepGemm(MoEImplBase):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        activation_type: ActivationType = ActivationType.Swiglu,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         init_load_balancer: bool = False,
-        # DG tunables. ``activation=None`` infers Kimi K3 SiTU from the
-        # pretrained config and otherwise defaults to SwiGLU.
-        activation: Optional[str] = None,
-        swiglu_limit_scalar: Optional[float] = None,
         fast_math: bool = True,
-        situ_beta: Optional[float] = None,
-        situ_linear_beta: Optional[float] = None,
         **kwargs,
     ) -> None:
         super().__init__(eplb=None)
@@ -279,7 +451,7 @@ class MegaMoEDeepGemm(MoEImplBase):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
-            activation_type=activation_type,
+            activation=activation,
             init_load_balancer=init_load_balancer,
         )
 
@@ -298,20 +470,18 @@ class MegaMoEDeepGemm(MoEImplBase):
         # Also gated in ``can_implement``, but that only covers the resolution
         # path; this catches direct construction.
         _assert_num_slots_divisible_by_ep(self.num_slots, self.ep_size)
-        activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
-            model_config,
-            activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
-        if activation == "situ" and swiglu_limit_scalar is not None:
-            raise ValueError("MegaMoEDeepGemm SiTU does not support activation_clamp.")
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.activation = activation
-        self.swiglu_limit_scalar = swiglu_limit_scalar
+        # Checked here rather than at module scope, where a table drift would
+        # surface as ``import tensorrt_llm`` failing for every model.
+        kind = ActivationType(self.activation.kind)
+        if kind not in self._ACTIVATION_MAP:
+            raise ValueError(
+                f"MegaMoEDeepGemm._ACTIVATION_MAP has no DeepGEMM spelling for "
+                f"{kind.name}, which activation_support declares as executable. Add "
+                f"the spelling, or drop the kind from activation_support."
+            )
+        self.dg_activation = self._ACTIVATION_MAP[kind]
         self.fast_math = fast_math
-        self.situ_beta = situ_beta
-        self.situ_linear_beta = situ_linear_beta
 
         # Buffer sizing. MoE layers execute serially per forward; a single
         # process-level pool sized to worst-case per-rank tokens serves all.
@@ -370,46 +540,6 @@ class MegaMoEDeepGemm(MoEImplBase):
         self.quant_method = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
-
-    @staticmethod
-    def _resolve_activation_config(
-        model_config: ModelConfig,
-        *,
-        activation: Optional[str],
-        situ_beta: Optional[float],
-        situ_linear_beta: Optional[float],
-    ) -> Tuple[str, Optional[float], Optional[float]]:
-        pretrained_config = model_config.pretrained_config
-        text_config = getattr(pretrained_config, "text_config", None)
-        config_situ_beta = getattr(pretrained_config, "activation_situ_beta", None)
-        config_situ_linear_beta = getattr(pretrained_config, "activation_situ_linear_beta", None)
-        if config_situ_beta is None:
-            config_situ_beta = getattr(text_config, "activation_situ_beta", None)
-        if config_situ_linear_beta is None:
-            config_situ_linear_beta = getattr(text_config, "activation_situ_linear_beta", None)
-        if activation is None:
-            activation = "situ" if config_situ_beta is not None else "swiglu"
-        activation = activation.lower()
-        if activation not in ("swiglu", "situ"):
-            raise ValueError(
-                f"MegaMoEDeepGemm activation must be 'swiglu' or 'situ'; got {activation!r}."
-            )
-        if activation == "swiglu":
-            if situ_beta is not None or situ_linear_beta is not None:
-                raise ValueError("SiTU beta parameters require activation='situ'.")
-            return activation, None, None
-
-        situ_beta = config_situ_beta if situ_beta is None else situ_beta
-        situ_linear_beta = config_situ_linear_beta if situ_linear_beta is None else situ_linear_beta
-        if situ_beta is None or situ_linear_beta is None:
-            raise ValueError(
-                "MegaMoEDeepGemm SiTU requires activation_situ_beta and "
-                "activation_situ_linear_beta in the pretrained config, or "
-                "explicit situ_beta and situ_linear_beta arguments."
-            )
-        if situ_beta <= 0 or situ_linear_beta <= 0:
-            raise ValueError("MegaMoEDeepGemm SiTU beta parameters must be positive.")
-        return activation, float(situ_beta), float(situ_linear_beta)
 
     def _supports_load_balancer(self) -> bool:
         # The DeepGEMM mega kernel routes by `topk_idx` interpreted as slot id
@@ -583,7 +713,8 @@ class MegaMoEDeepGemm(MoEImplBase):
         capture would fail on the host-side IPC handle exchange.
 
         Buffers are shared across layers via ``_MEGA_MOE_SYMM_BUFFER_CACHE``
-        keyed on the (EP-PG, slot/expert/topk/shape/activation) tuple.
+        keyed on the (EP-size, slot/expert/topk/shape/activation) tuple; see
+        that cache's definition for why the key carries no group identity.
         Sharing is safe only while MegaMoE layer forwards are issued
         serially within a forward pass; concurrent MegaMoE forwards
         sharing a key would race on the same scratch buffers.
@@ -603,16 +734,16 @@ class MegaMoEDeepGemm(MoEImplBase):
         if self._symm_buffer is not None:
             return
         key = (
-            id(self._ep_pg),
+            self.ep_size,
             self.num_experts,
             self.num_slots,
             self.max_num_tokens,
             self.routing_method.experts_per_token,
             self.hidden_size,
             self.intermediate_size,
-            self.activation,
+            self.dg_activation,
         )
-        cached = _MEGA_MOE_SYMM_BUFFER_CACHE.get(key)
+        cached = _take_cached_symm_buffer(key, self._ep_pg)
         if cached is None:
             cached = self._dg.get_symm_buffer_for_mega_moe(
                 self._ep_pg,
@@ -623,9 +754,9 @@ class MegaMoEDeepGemm(MoEImplBase):
                 self.intermediate_size,
                 num_shared_experts=0,
                 mma_type="fp8xfp4",
-                activation=self.activation,
+                activation=self.dg_activation,
             )
-            _MEGA_MOE_SYMM_BUFFER_CACHE[key] = cached
+            _MEGA_MOE_SYMM_BUFFER_CACHE[key] = (cached, self._ep_pg)
             # Log only on the first layer; deeper layers reuse the cache
             # and would otherwise spam N copies of an identical line.
             log_fn = logger.info if self.layer_idx == 0 else logger.debug
@@ -758,10 +889,20 @@ class MegaMoEDeepGemm(MoEImplBase):
             self._t_l1,
             self._t_l2,
             buf,
-            activation=self.activation,
-            activation_clamp=self.swiglu_limit_scalar,
+            activation=self.dg_activation,
+            # ``situ_beta`` / ``situ_linear_beta`` are the bundled DeepGEMM's own
+            # parameter names: ``_import_deep_gemm`` gates on the installed
+            # signature accepting exactly these, so do not rename them to ours.
+            activation_clamp=self.act_clamp,
             fast_math=self.fast_math,
-            situ_beta=self.situ_beta,
-            situ_linear_beta=self.situ_linear_beta,
+            situ_beta=self.act_alpha,
+            situ_linear_beta=self.act_beta,
         )
         return y.to(output_dtype)
+
+
+# The pre-identity name, kept as an alias rather than a base class: the
+# ``moe_backend="MEGAMOE_DEEPGEMM"`` call sites, the ``issubclass`` dispatch
+# in ``create_moe.py``, and the comments across the MoE tree that still say
+# ``MegaMoEDeepGemm`` all mean the class above.
+MegaMoEDeepGemm = DeepgemmCudaW4a8Mxfp4Mxfp8Impl

@@ -1,0 +1,42 @@
+# Basic disaggregated multi-node tier -- a SUBSET of llm_perf_multinode.txt.
+#
+# Selected by scripts/multinode/lib/select_basic_disagg_cases.py in trtllm-ci.
+# DO NOT hand-edit: re-run the selector, which is also what keeps this honest
+# when a case is added to the full list.
+#
+# Every id below is copied verbatim from llm_perf_multinode.txt and runs at the
+# shape, worker count and concurrency the perf team chose for it. Nothing is
+# shrunk. An earlier attempt built a cheaper tier by forcing num_ctx_servers=1,
+# num_gen_servers=1 and concurrency=1, and that was rejected: those knobs are
+# the disagg topology, so the result no longer exercised KV transfer between
+# workers under load.
+#
+# Coverage is a set cover over the axes on which two disagg cases run different
+# code, keyed per GPU: model, benchmark mode (e2e/ctx_only/gen_only), ISL/OSL
+# class, ctx and gen parallel kind, ctx and gen MoE backend, speculative
+# decoding family, expert-load-balancer presence, multi-ctx-worker and
+# multi-gen-worker topology, concurrency class (low/mid/high), and scenario.
+# The selector asserts that no case here is redundant given the others, and
+# that excluding the stress cases loses no facet.
+#
+# Intended for a DAILY run; llm_perf_multinode.txt stays weekly.
+
+# gb200: 6 case(s), 2643 s of measured compute
+perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb200_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_ctx1_pp4_gen8_pp4_bs2_eplb0_mtp0_con2-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_kimi-k25-thinking-fp4_1k1k_con2048_ctx1_dep4_gen1_dep32_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_wideep_deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_con1024_ccb-NIXL]
+
+# gb300: 10 case(s), 17152 s of measured compute
+perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb300_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-r1-fp4_128k8k_con1_ctx1_pp4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con1229_ctx7_dep4_gen1_dep8_eplb384_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_glm-5-fp4_1k1k_con512_ctx1_dep2_gen1_dep32_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep16_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_minimax-m3-fp4_8k1k_con30_ctx1_tep2_gen2_tp4_eplb0_eagle3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_wideep_deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_con1024_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]

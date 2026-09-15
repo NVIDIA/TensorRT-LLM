@@ -31,6 +31,7 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include <algorithm>
 #include <cassert>
@@ -564,22 +565,12 @@ static kv::EventManager::AttentionDpGatherFn castAttentionDpGather(nb::handle ca
     return [gather = std::move(gather)](std::vector<kv::KVCacheEvent> const& events) { return (*gather)(events); };
 }
 
-static nb::object castStatsDelta(kv::KVCacheStatsDelta const& stats)
-{
-    return nb::cast(stats);
-}
-
-static nb::object castIterationStatsDelta(kv::KVCacheIterationStatsDelta const& stats)
-{
-    return nb::cast(stats);
-}
-
 static nb::dict castIterationStatsByLifeCycle(kv::IterationStatsByLifeCycle const& statsByLifeCycle)
 {
     nb::dict result;
     for (auto const& [lifeCycle, stats] : statsByLifeCycle)
     {
-        result[nb::int_(lifeCycle.value())] = castIterationStatsDelta(stats);
+        result[nb::int_(lifeCycle.value())] = nb::cast(stats);
     }
     return result;
 }
@@ -778,8 +769,33 @@ private:
 static_assert(std::is_move_constructible_v<BlockchainKeyIterator>,
     "BlockchainKeyIterator must be move-constructible (mGen captures mTokens.data())");
 
+namespace
+{
+//! Supplies kv_cache_manager_v2's GIL hooks. Py_IsInitialized() is safe without an interpreter, and
+//! PyGILState_Check() answers the question that matters: does *this* thread hold the GIL right now.
+void* releaseGilIfHeld() noexcept
+{
+    if (Py_IsInitialized() != 0 && PyGILState_Check() != 0)
+    {
+        return PyEval_SaveThread();
+    }
+    return nullptr;
+}
+
+void restoreGil(void* token) noexcept
+{
+    PyEval_RestoreThread(static_cast<PyThreadState*>(token));
+}
+
+// Static storage duration: the core holds this pointer for the lifetime of the process.
+constexpr kv::GilHooks kGilHooks{&releaseGilIfHeld, &restoreGil};
+} // namespace
+
 void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 {
+    // Let the core release the GIL from destructors without depending on the Python C API.
+    kv::setGilHooks(&kGilHooks);
+
     // Export the C++ debug mode as an immutable Python bool snapshot.
     m.attr("NDEBUG") = nb::bool_(!kv::gDebug);
 
@@ -1320,20 +1336,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_stale_range", &kv::SsmLifeCycle::getStaleRange, nb::arg("history_length"), nb::arg("tokens_per_block"))
         .def("__eq__", &kv::SsmLifeCycle::operator==);
 
-    // ---- CUDA event --------------------------------------------------------
-    auto cachedCudaEvent
-        = nb::class_<kv::CachedCudaEvent>(m, "CachedCudaEvent")
-              .def(nb::init<kv::CudaStream>(), nb::arg("stream"))
-              .def("query_complete", &kv::CachedCudaEvent::queryComplete, nb::call_guard<nb::gil_scoped_release>())
-              .def("synchronize", &kv::CachedCudaEvent::synchronize, nb::call_guard<nb::gil_scoped_release>())
-              .def(
-                  "wait_in_stream",
-                  [](kv::CachedCudaEvent const& self, kv::CudaStream stream) { self.waitInStream(stream); },
-                  nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
-              .def("close", &kv::CachedCudaEvent::close)
-              .def("is_closed", &kv::CachedCudaEvent::isClosed);
-    cachedCudaEvent.attr("NULL") = kv::CachedCudaEvent::makeNull();
-
     // ---- ReuseScope --------------------------------------------------------
     nb::class_<kv::ReuseScope>(m, "ReuseScope")
         .def(nb::init<std::optional<kv::LoraTaskIdType>, std::optional<std::uint64_t>>(),
@@ -1613,7 +1615,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "__init__",
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, std::vector<kv::CacheTierConfig> cacheTiers,
-                nb::list layers, float maxUtilForResume, bool enablePartialReuse,
+                nb::list layers, float maxUtilForResume, bool enablePartialReuse, int reuseMatchBackoff,
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
@@ -1632,6 +1634,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 cfg->maxUtilForResume = maxUtilForResume;
                 cfg->enablePartialReuse = enablePartialReuse;
+                cfg->reuseMatchBackoff = reuseMatchBackoff;
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
                 cfg->initialPoolRatio = std::move(initialPoolRatio);
@@ -1645,14 +1648,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("tokens_per_block"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
-            nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
-            nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("swa_scratch_reuse").none() = std::nullopt,
-            nb::arg("commit_min_snapshot") = false, nb::arg("enable_stats") = true, nb::arg("text_only") = false)
+            nb::arg("reuse_match_backoff") = 0, nb::arg("typical_step") = std::nullopt,
+            nb::arg("constraints") = std::vector<kv::BatchDesc>{}, nb::arg("initial_pool_ratio").none() = std::nullopt,
+            nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
+        .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
@@ -1688,8 +1693,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
-        .def("commit_pending_stats", [](kv::KvCache& self) { return castStatsDelta(self.commitPendingStats()); })
-        .def("discard_pending_stats", &kv::KvCache::discardPendingStats)
+        .def("commit_pending_stats", &kv::KvCache::commitPendingStats, nb::call_guard<nb::gil_scoped_release>())
+        .def("discard_pending_stats", &kv::KvCache::discardPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
@@ -1754,33 +1759,38 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
-            [](kv::KvCache& self, bool enable) { self.setEnableSwaScratchReuse(enable); })
-        .def_prop_rw(
-            "text_only", &kv::KvCache::textOnly, [](kv::KvCache& self, bool textOnly) { self.setTextOnly(textOnly); })
+            [](kv::KvCache& self, bool enable)
+            {
+                nb::gil_scoped_release release;
+                self.setEnableSwaScratchReuse(enable);
+            })
+        .def_prop_rw("text_only", &kv::KvCache::textOnly,
+            [](kv::KvCache& self, bool textOnly)
+            {
+                nb::gil_scoped_release release;
+                self.setTextOnly(textOnly);
+            })
         .def("supports_index_mode", &kv::KvCache::supportsIndexMode, nb::arg("mode"))
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
-        .def_prop_ro("finish_event",
-            [](kv::KvCache const& self)
-            {
-                try
-                {
-                    return self.finishEvent();
-                }
-                catch (std::bad_optional_access const&)
-                {
-                    // Python unwrap_optional(None) raises ValueError with this message.
-                    PyErr_SetString(PyExc_ValueError, "Expected non-None value");
-                    throw nb::python_error();
-                }
-            })
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
-        .def("_get_num_tokens_before_hybrid_pruning", &kv::KvCache::numTokensBeforeHybridPruning)
+        .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
+        .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
+        // Both setters reach resize(), which takes the exclusive API lock: release the GIL first.
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
-            [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })
-        .def_prop_rw("capacity", &kv::KvCache::capacity, [](kv::KvCache& self, int cap) { self.setCapacity(cap); })
+            [](kv::KvCache& self, int hist)
+            {
+                nb::gil_scoped_release release;
+                self.setHistoryLength(hist);
+            })
+        .def_prop_rw("capacity", &kv::KvCache::capacity,
+            [](kv::KvCache& self, int cap)
+            {
+                nb::gil_scoped_release release;
+                self.setCapacity(cap);
+            })
         .def_prop_ro("tokens_per_block", &kv::KvCache::tokensPerBlock)
         .def_prop_ro("beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); })
         .def_prop_rw(
@@ -1801,7 +1811,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {
                 return self.getAggregatedPageIndices(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIdx}, validOnly);
             },
-            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0, nb::arg("valid_only") = false)
+            nb::arg("layer_group_id"), nb::arg("beam_idx") = 0, nb::arg("valid_only") = false,
+            // Takes the shared API lock, so it can block on a writer.
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "set_base_page_index_buf",
             [](kv::KvCache& self, int beamIdx, int layerGroupId, nb::object bufObj)
@@ -1846,6 +1858,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("cold_page_bytes_by_layer"));
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
+
+    // CachedCudaEvent is internal: the retirement rules in kv_cache_manager_v2/AGENTS.md are not
+    // something a Python caller can honour, and handing one out would let a copy outlive the
+    // KvCache that recorded it. Exposed here for tests only.
+    auto cachedCudaEvent
+        = nb::class_<kv::CachedCudaEvent>(mIntrospection, "CachedCudaEvent")
+              .def(nb::init<kv::CudaStream>(), nb::arg("stream"))
+              .def("query_complete", &kv::CachedCudaEvent::queryComplete, nb::call_guard<nb::gil_scoped_release>())
+              .def("synchronize", &kv::CachedCudaEvent::synchronize, nb::call_guard<nb::gil_scoped_release>())
+              .def(
+                  "wait_in_stream",
+                  [](kv::CachedCudaEvent const& self, kv::CudaStream stream) { self.waitInStream(stream); },
+                  nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
+              .def("close", &kv::CachedCudaEvent::close)
+              .def("is_closed", &kv::CachedCudaEvent::isClosed);
+    cachedCudaEvent.attr("NULL") = kv::CachedCudaEvent::makeNull();
     mIntrospection.def(
         "make_test_block",
         [](kv::KvCacheManager& manager, nb::object tokenObject, std::vector<int> coveragePerLc, nb::object parentObject,
@@ -2270,7 +2298,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_scale", &kv::KvCacheManager::getPageIndexScale, nb::arg("layer_id"), nb::arg("data_role"))
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),
-            nb::arg("data_role"))
+            nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
             [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)
@@ -2280,26 +2308,66 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "get_quota",
             [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },
-            nb::arg("cache_level"))
-        .def("get_committed_stats",
-            [](kv::KvCacheManager const& self) { return castStatsDelta(self.getCommittedStats()); })
+            nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_committed_stats", &kv::KvCacheManager::getCommittedStats, nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_stats",
-            [](kv::KvCacheManager& self) { return castIterationStatsByLifeCycle(self.getAndResetIterationStats()); })
+            [](kv::KvCacheManager& self)
+            {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetIterationStats();
+                }();
+                return castIterationStatsByLifeCycle(stats);
+            })
         .def("get_and_reset_ssm_snapshot_iteration_stats",
             [](kv::KvCacheManager& self)
-            { return castSsmSnapshotIterationStatsByLifeCycle(self.getAndResetSsmSnapshotIterationStats()); })
+            {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetSsmSnapshotIterationStats();
+                }();
+                return castSsmSnapshotIterationStatsByLifeCycle(stats);
+            })
+        .def("record_request_suspended", &kv::KvCacheManager::recordRequestSuspended,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("record_request_resumed", &kv::KvCacheManager::recordRequestResumed,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_and_reset_iteration_suspend_resume_stats",
+            &kv::KvCacheManager::getAndResetIterationSuspendResumeStats, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_and_reset_iteration_peak_block_stats",
             [](kv::KvCacheManager& self, int cacheLevel)
-            { return castPeakBlockStats(self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel})); },
+            {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel});
+                }();
+                return castPeakBlockStats(stats);
+            },
             nb::arg("cache_level"))
-        .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none())
-        .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none())
+        .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_dirty_stats_kv_cache_ids",
-            [](kv::KvCacheManager const& self) { return castRequestIds(self.getDirtyStatsKvCacheIds()); })
-        .def("mark_stats_excluded", &kv::KvCacheManager::markStatsExcluded, nb::arg("kv_cache_id").none())
-        .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none())
-        .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none())
+            [](kv::KvCacheManager const& self)
+            {
+                auto ids = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getDirtyStatsKvCacheIds();
+                }();
+                return castRequestIds(ids);
+            })
+        .def("mark_stats_excluded", &kv::KvCacheManager::markStatsExcluded, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none(),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
         .def_prop_ro("event_manager",
             [](kv::KvCacheManager const& self)
@@ -2307,7 +2375,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
-        .def_prop_ro("pool_group_descs", [](kv::KvCacheManager const& self) { return self.poolGroupDescs().raw(); })
+        .def_prop_ro("pool_group_descs",
+            [](kv::KvCacheManager const& self)
+            {
+                nb::gil_scoped_release release;
+                return self.poolGroupDescs().raw();
+            })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
@@ -2350,7 +2423,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"))
         .def("adjust", &kv::KvCacheManager::adjust, nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("need_adjustment", &kv::KvCacheManager::needAdjustment);
+        .def_prop_ro("need_adjustment",
+            [](kv::KvCacheManager const& self)
+            {
+                nb::gil_scoped_release release;
+                return self.needAdjustment();
+            });
 
     // ---- PageIndexConverter ------------------------------------------------
     nb::class_<kv::PageIndexConverter>(m, "PageIndexConverter")

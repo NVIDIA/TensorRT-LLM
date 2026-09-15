@@ -24,12 +24,81 @@ from typing import Optional, Tuple
 
 import torch
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
+
+
+def _install_cutlass_dsl_compatibility() -> None:
+    """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
+    import cutlass.cute as cute
+
+    for name in ("ThrCopy", "ThrMma"):
+        if not hasattr(cute.core, name) and hasattr(cute, name):
+            setattr(cute.core, name, getattr(cute, name))
+    if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
+        cute.make_fragment = cute.make_rmem_tensor
+
+
+def _install_flash_attn_tile_scheduler_compatibility() -> None:
+    """Keep FA4's four-axis ``WorkTileInfo`` independent of CUTLASS task scheduling.
+
+    Importing ``cutlass.experimental.task_scheduling`` rewrites the shared
+    ``cutlass.utils.WorkTileInfo`` class in place: its constructor unpacks
+    ``tile_idx`` into exactly three scalars and ``tile_idx`` / ``is_valid_tile``
+    become properties over those scalars. The vendored PrimTS kernels import
+    that package, so once any PrimTS FMHA has been probed or planned in a
+    process, every later FA4 kernel trace fails with ``ValueError: too many
+    values to unpack (expected 3)``: FA4 subclasses the same CUTLASS class with
+    a (block, head, batch, split) coordinate but does not define its own
+    constructor. Installing the upstream tuple semantics directly on the FA4
+    subclass makes it immune to the parent rewrite regardless of import order.
+    The library-level fix is tracked as NVBug 6744731
+    (https://nvbugspro.nvidia.com/bug/6744731, CUTLASS DSL). Remove this shim
+    once the pinned ``nvidia-cutlass-dsl`` release ships that fix, or once FA4
+    defines these members on its own subclass.
+    """
+    try:
+        from flash_attn.cute import tile_scheduler
+    except (ImportError, OSError):
+        return
+    import cutlass.cute as cute
+    from cutlass.cutlass_dsl import Boolean, extract_mlir_values
+
+    work_tile_info = tile_scheduler.WorkTileInfo
+    if "__init__" in vars(work_tile_info):
+        return
+
+    def __init__(self, tile_idx: cute.Coord, is_valid_tile: Boolean) -> None:
+        self._tile_idx = tile_idx
+        self._is_valid_tile = Boolean(is_valid_tile)
+        self._tile_idx_num_values = None
+
+    def __extract_mlir_values__(self) -> list:
+        tile_idx_values = extract_mlir_values(self._tile_idx)
+        valid_values = extract_mlir_values(self._is_valid_tile)
+        self._tile_idx_num_values = len(tile_idx_values)
+        return tile_idx_values + valid_values
+
+    @cute.jit
+    def tile_idx(self) -> cute.Coord:
+        return self._tile_idx
+
+    @cute.jit
+    def is_valid_tile(self) -> Boolean:
+        return self._is_valid_tile
+
+    work_tile_info.__init__ = __init__
+    work_tile_info.__extract_mlir_values__ = __extract_mlir_values__
+    work_tile_info.tile_idx = property(tile_idx)
+    work_tile_info.is_valid_tile = property(is_valid_tile)
+
 
 _flash_attn_fwd_import_error = None
 try:
+    _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import _flash_attn_fwd
+
+    _install_flash_attn_tile_scheduler_compatibility()
 except (ImportError, OSError) as e:
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
