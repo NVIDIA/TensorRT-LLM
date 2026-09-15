@@ -392,17 +392,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
-        if (
-            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
-            and not cls.supports_skip_correction
-        ):
-            logger.debug(
-                "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-correction is "
-                "enabled and unsupported."
-            )
-            return False
-
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False
@@ -537,7 +527,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         return True, ""
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
@@ -770,8 +760,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, f"non-positive tokens_per_block ({tokens_per_block})."
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
-        if tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK:
-            supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
+        # A KV cache manager may allow extra page sizes, e.g. MiniMax-M3 adds 128.
+        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | set(
+            getattr(meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
+        )
+        if tokens_per_block not in supported_tokens_per_block:
+            supported = sorted(supported_tokens_per_block)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
 
         return True, ""

@@ -58,6 +58,11 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
+QWEN38_MTP_MODELS = {
+    "qwen3.8_max_fp4_mtp",
+    "qwen3.8_flash_next_fp8_mtp",
+    "qwen3.8_flash_next_fp4_mtp",
+}
 KIMI_K3_SERVER_ENV = {
     "KIMI_K3_FP8_WEIGHT_READ": "1",
     "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
@@ -65,6 +70,7 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
     "kimi_k3",
     "minimax_m3_fp4",
@@ -104,6 +110,8 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "deepseek_v4_pro_base_fp8",
+    *QWEN38_MTP_MODELS,
     "qwen3_4b_eagle3",
     "qwen3_235b_a22b_fp4_eagle3",
     "gpt_oss_120b_eagle3",
@@ -445,6 +453,7 @@ class PerfTestConfig:
         num_gpus: int = 1,
         # only for torch-backend currently
         extra: bool = False,
+        moe_backend: str | None = None,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-cudagraph",
         extra_runtime: str = "trtllm",
@@ -502,6 +511,7 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Extra flag to enable pytorch_model_config reading for TRT backend
         self.extra = extra
+        self.moe_backend = moe_backend
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
         self.extra_runtime = extra_runtime
@@ -636,6 +646,9 @@ class PerfTestConfig:
         if self.extra:
             entries.append("extra")
 
+        if self.moe_backend is not None:
+            entries.append(f"moe:{self.moe_backend}")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -758,6 +771,10 @@ class PerfTestConfig:
             if self.extra:
                 labels.pop(0)
 
+        self.moe_backend = None
+        if labels and labels[0].startswith("moe:"):
+            self.moe_backend = labels.pop(0).removeprefix("moe:")
+
         assert len(
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
@@ -781,6 +798,11 @@ class PerfTestConfig:
         VALID_RUNTIMES = ["serve", "bench"]
         assert self.runtime in VALID_RUNTIMES, \
             f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
+
+        if self.moe_backend is not None:
+            assert self.moe_backend, "moe backend must not be empty!"
+            assert self.backend == "pytorch", \
+                "moe backend overrides require the pytorch backend!"
 
         # Validate plugin mode.
         VALID_MODES = ["plugin", "ootb", "ootb_except_mha"]
@@ -1023,6 +1045,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def _get_model_yaml_config(self) -> dict:
         config = get_model_yaml_config(self._config.to_string(),
                                        lora_dirs=self.lora_dirs)
+        if self._config.moe_backend is not None:
+            config.setdefault('moe_config',
+                              {})['backend'] = self._config.moe_backend
         uses_pytorch_backend = (self._config.runtime == "serve"
                                 or self._config.backend == "pytorch")
         fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
@@ -1238,6 +1263,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 with open(pytorch_config_path, 'w') as f:
                     yaml.dump(config, f, default_flow_style=False)
                 benchmark_cmd += [f"--config={pytorch_config_path}"]
+                # Throughput initializes the dataset tokenizer before loading YAML.
+                if config.get('custom_tokenizer') is not None:
+                    benchmark_cmd += [
+                        f"--custom_tokenizer={config['custom_tokenizer']}"
+                    ]
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
@@ -1517,11 +1547,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         real_dataset_path=real_dataset_path)
                     client_cmds.append(client_cmd)
             server_env = os.environ.copy()
+            if self._config.model_name.startswith("qwen3.8_flash_next_"):
+                server_env["TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"] = "1"
             if self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             if self._config.model_name in KIMI_K3_MODELS:
                 server_env.update(KIMI_K3_SERVER_ENV)
-            if self._config.model_name in NEMOTRON_SUPER_MODELS:
+            if self._config.model_name in QWEN38_MTP_MODELS:
+                server_timeout = 5400
+            elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400

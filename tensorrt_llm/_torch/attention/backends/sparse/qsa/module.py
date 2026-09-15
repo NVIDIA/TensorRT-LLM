@@ -162,6 +162,7 @@ def qsa_sparse_gqa(
     softmax_scale: float,
     query_positions: torch.Tensor | None = None,
     compress_ratio: int | None = None,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA over V2 paged K/V, using Triton on CUDA by default."""
     if request_indices is None:
@@ -175,7 +176,10 @@ def qsa_sparse_gqa(
         )
     if request_indices.shape != (q.shape[0],):
         raise ValueError("QSA sparse GQA request indices must match query rows")
-    if q.is_cuda and _is_power_of_two(q.shape[-1]):
+    use_fused = q.is_cuda and _is_power_of_two(q.shape[-1])
+    if output_gate is not None and not use_fused:
+        raise ValueError("QSA output-gate fusion requires the fused CUDA sparse path")
+    if use_fused:
         from .kernels import triton_qsa_paged_sparse_gqa
 
         logger.info_once(
@@ -193,6 +197,7 @@ def qsa_sparse_gqa(
             softmax_scale=softmax_scale,
             query_positions=query_positions,
             compress_ratio=compress_ratio,
+            output_gate=output_gate,
         )
     logger.info_once(
         "QSA sparse GQA reference path is active",
@@ -413,6 +418,7 @@ class QSASparseHooks(AttentionSparseHooks):
         relative_attention_bias: Optional[torch.Tensor],
         relative_attention_max_distance: int,
         has_lora: bool,
+        output_gate: Optional[torch.Tensor],
         **kwargs: object,
     ) -> Optional[torch.Tensor]:
         if attention_mask is not PredefinedAttentionMask.CAUSAL:
@@ -456,6 +462,19 @@ class QSASparseHooks(AttentionSparseHooks):
                 f"QSA sparse K/V kernels do not support {kv_cache_dtype}; "
                 "using the regular attention backend",
                 key=f"qsa_dense_fallback_{kv_cache_dtype}",
+            )
+            return None
+
+        from .kernels import qsa_supports_head_dims
+
+        head_dim = attention.head_dim
+        index_head_dim = attention.sparse_params.index_head_dim
+        if not qsa_supports_head_dims(head_dim, index_head_dim):
+            logger.warning_once(
+                f"QSA kernels need power-of-two head dimensions; got head_dim="
+                f"{head_dim} and index_head_dim={index_head_dim}. Using the "
+                "regular attention backend",
+                key="qsa_dense_fallback_head_dim",
             )
             return None
 
@@ -564,6 +583,21 @@ class QSASparseHooks(AttentionSparseHooks):
                 top_k_row_starts=attn_metadata.qsa_topk_row_starts,
                 visible_blocks=attn_metadata.qsa_visible_blocks[:num_tokens],
             )
+            fuse_output_gate = False
+            if output_gate is not None:
+                from .kernels import can_fuse_qsa_splitk_output_gate
+
+                fuse_output_gate = can_fuse_qsa_splitk_output_gate(
+                    q,
+                    k_cache,
+                    selected,
+                    output_gate,
+                )
+                if fuse_output_gate:
+                    logger.info_once(
+                        "QSA split-K merge fuses the attention output gate",
+                        key="qsa_fused_output_gate_active",
+                    )
             output = qsa_sparse_gqa(
                 q=q,
                 k_cache=k_cache,
@@ -572,8 +606,12 @@ class QSASparseHooks(AttentionSparseHooks):
                 request_indices=req_idx,
                 metadata=attn_metadata,
                 softmax_scale=1.0 / (attention.q_scaling * attention.head_dim**0.5),
+                output_gate=output_gate if fuse_output_gate else None,
             )
-            return output.reshape(num_tokens, -1)
+            output = output.reshape(num_tokens, -1)
+            if output_gate is not None and not fuse_output_gate:
+                output = attention.apply_output_gate(output, output_gate)
+            return output
 
         index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
         if index_cache is None:
@@ -612,7 +650,10 @@ class QSASparseHooks(AttentionSparseHooks):
                 query_positions=logical[packed_slice],
                 compress_ratio=params.compress_ratio,
             )
-        return output.reshape(num_tokens, -1)
+        output = output.reshape(num_tokens, -1)
+        if output_gate is not None:
+            output = attention.apply_output_gate(output, output_gate)
+        return output
 
 
 register_attention_sparse_hooks("qsa", QSASparseHooks)
