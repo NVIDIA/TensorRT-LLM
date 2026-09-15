@@ -567,21 +567,11 @@ class NVLinkOneSided(Communication):
         if workspace_state.get("cft_initialized", False):
             # The C++ manager owns a logical endpoint bound to this allocation.
             # Destroy it before dropping the final Python references to the
-            # MNNVL memory, otherwise the LE outlives its backing pages.
-            #
-            # The release op is not registered in every build yet (only
-            # moe_a2a_cft_initialize is). Where it is missing the LE is
-            # reclaimed at process exit, which is the pre-existing behavior;
-            # the ordering below is already correct for when it lands.
-            release_cft_manager = getattr(torch.ops.trtllm, "moe_a2a_cft_release", None)
-            if release_cft_manager is None:
-                tllm_logger.warning_once(
-                    "moe_a2a_cft_release is not available in this build; the CFT "
-                    "logical endpoint will only be reclaimed at process exit.",
-                    key="moe_a2a_cft_release_missing",
-                )
-            else:
-                release_cft_manager(workspace_state["workspace"], workspace_state["ep_rank"])
+            # MNNVL memory, otherwise the endpoint outlives its backing pages
+            # and a recycled virtual address could resolve to it.
+            torch.ops.trtllm.moe_a2a_cft_release(
+                workspace_state["workspace"], workspace_state["ep_rank"]
+            )
 
         cls._WORKSPACES.pop(workspace_key)
         if cls._WORKSPACE is workspace_state:
