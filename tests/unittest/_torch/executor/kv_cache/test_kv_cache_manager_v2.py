@@ -1810,10 +1810,12 @@ def _index_mapper_capacity_for(
 # The overlap rows are the nvbug 6627795 case: the overlap scheduler defers a
 # terminal request's teardown past the point where its replacement is admitted,
 # so both cohorts hold index slots at once and a mapper sized at B+1 silently
-# defers requests one at a time. The overlap half of this predicate is shared
-# with _util.should_enable_overlap_headroom, which gates the *seat* pool, so the
-# two pools are equal on those rows. The is_disagg half is index-local and has no
-# seat-pool counterpart, which is why the startup check requires the index pool to
+# defers requests one at a time. This predicate is deliberately broader than
+# _util.should_enable_overlap_headroom, which gates the *seat* pool and
+# additionally requires attention DP: the index pool widens on every non-PP
+# overlap run, while the seat pool widens only where admission can actually hand
+# the extra seats out. So the two are equal under ADP and the index pool runs
+# ahead elsewhere, which is why the startup check requires the index pool to
 # cover the seat pool rather than to equal it
 # (validate_seq_slot_pool_covers_admission).
 _INDEX_MAPPER_CAPACITY_CASES = [

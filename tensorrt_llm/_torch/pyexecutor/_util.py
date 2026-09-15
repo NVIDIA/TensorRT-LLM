@@ -3126,11 +3126,11 @@ def compute_max_num_sequences(mapping: Mapping,
     """Size the sequence-slot pool (and the sampler state it indexes).
 
     ``enable_overlap_headroom`` is intentionally opt-in, and
-    ``should_enable_overlap_headroom`` is the only thing that should set it: a
-    non-PP overlap-enabled run needs a second slot set because the V2 scheduler
-    can backfill seats before the overlap scheduler releases the previous
-    iteration's terminal slots. Pipeline parallelism already sizes the pool
-    by ``pp_size``.
+    ``should_enable_overlap_headroom`` is the only thing that should set it: an
+    attention-DP, non-PP, overlap-enabled run needs a second slot set because
+    the V2 scheduler plus ``ADPRouter.exclude_retiring_requests`` can backfill
+    seats before the overlap scheduler releases the previous iteration's
+    terminal slots. Pipeline parallelism already sizes the pool by ``pp_size``.
 
     Disaggregation deliberately does **not** appear here. Its ``2x`` is an
     IndexMapper-local concern: a request awaiting its KV transfer holds an
@@ -3212,18 +3212,24 @@ def should_enable_overlap_headroom(mapping: Mapping,
                                    disable_overlap_scheduler: bool,
                                    kv_cache_manager_is_v2: bool,
                                    is_hybrid: bool = False) -> bool:
-    """Gate the extra micro-batch of sequence slots (and its ADP counterpart).
+    """Gate the extra micro-batch of sequence slots.
 
-    The predicate is deliberately the same shape as the one
-    ``KVCacheManagerV2`` uses for its index leases -- non-PP and overlap-on --
-    so the seat pool and the index pool move together instead of the seat pool
-    tracking a narrower condition that has to be re-derived and kept in step.
-    The mechanism it pays for is ``ADPRouter``'s ``exclude_retiring_requests``:
-    it drops ``GENERATION_TO_COMPLETE`` requests from the per-rank active counts
-    that ``_fetch_new_requests`` subtracts from the admission capacity, so a
-    replacement cohort is admitted while the retiring cohort still holds its
-    seats.
+    True only where a retiring request and the replacement that took its place
+    can own a seat at the same time: attention DP, non-PP, overlap-on, V2 and
+    non-hybrid. The mechanism it pays for is ``ADPRouter``'s
+    ``exclude_retiring_requests``: it drops ``GENERATION_TO_COMPLETE`` requests
+    from the per-rank active counts that ``_fetch_new_requests`` subtracts from
+    the admission capacity, so a replacement cohort is admitted while the
+    retiring cohort still holds its seats.
 
+    * ``mapping.enable_attention_dp`` -- that correction is consumed only inside
+      the ``if self.enable_attention_dp:`` branch of ``_fetch_new_requests``.
+      The else-branch subtracts ``len(active_requests)`` with retirees included,
+      so outside attention DP residency never exceeds
+      ``max_batch_size * pp_size`` and the extra seats could not be occupied
+      even in principle -- they would only inflate every seat-keyed allocation
+      (sampler state, the eagerly allocated ``[seats, max_draft_len, vocab]``
+      draft probabilities, the SA pool, the pinned-host block-offset tables).
     * ``not has_pp()`` -- pipeline parallelism already carries ``pp_size``
       micro-batches, and its interaction with the retirement filter is
       unvalidated. Out of scope here.
@@ -3241,20 +3247,22 @@ def should_enable_overlap_headroom(mapping: Mapping,
       slots. (Hybrid state is not ``py_seq_slot``-indexed, so the failure is
       exhaustion rather than an out-of-bounds write -- still a hang.)
 
-    Attention DP is deliberately *not* a condition, even though it is the only
-    deployment where the extra seats are ever occupied: outside attention DP
-    ``_fetch_new_requests`` subtracts ``len(active_requests)`` with retirees
-    included, so residency stays at ``max_batch_size * pp_size`` and the surplus
-    seats sit idle. Including it would make the seat pool narrower than the index
-    pool on the ordinary TP overlap path, which is the asymmetry that has to be
-    tolerated by ``validate_seq_slot_pool_covers_admission`` and re-justified at
-    every reader. Disaggregation is not a condition either, for the opposite
-    reason: its ``2x`` is genuinely index-local, since a transfer-phase request
-    holds a lease and no seat at all.
+    This predicate is deliberately *narrower* than the one ``KVCacheManagerV2``
+    uses for its index leases (``is_disagg or (non-PP and overlap-on)``), so the
+    index pool runs ahead of the seat pool on any non-ADP overlap run and on any
+    disaggregated one. That asymmetry is intended, and it is why
+    ``validate_seq_slot_pool_covers_admission`` requires the index pool to
+    *cover* the seat pool rather than to equal it: surplus index leases cost
+    page-table rows, whereas surplus seats cost sampler and speculative-decoding
+    state. Widening the seat pool to make the two numbers equal would buy
+    allocation and no admission. Disaggregation is not a condition here for the
+    same reason -- its ``2x`` is genuinely index-local, since a transfer-phase
+    request holds a lease and no seat at all.
     """
     if is_hybrid or not kv_cache_manager_is_v2:
         return False
-    return not mapping.has_pp() and not disable_overlap_scheduler
+    return (mapping.enable_attention_dp and not mapping.has_pp()
+            and not disable_overlap_scheduler)
 
 
 def validate_seq_slot_pool_covers_admission(max_num_sequences: int,

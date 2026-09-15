@@ -251,9 +251,14 @@ def _run_create_py_executor(
     llm_args.attn_backend = attn_backend
     llm_args.cache_transceiver_config = cache_transceiver_config
     llm_args.enable_chunked_prefill = enable_chunked_prefill
+    # pp_size/has_pp are required because _DummyModelEngine publishes no
+    # max_num_seq_slots, so executor creation falls back to
+    # compute_max_num_sequences, which branches on mapping.has_pp().
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
+        pp_size=1,
+        has_pp=lambda: False,
         enable_attention_dp=False,
         is_last_pp_rank=lambda: True,
     )
