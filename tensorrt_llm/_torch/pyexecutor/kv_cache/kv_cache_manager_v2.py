@@ -2692,18 +2692,20 @@ class KVCacheManagerV2(BaseResourceManager):
 
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 generation_capacity = self.max_seq_len
-                if type(self) is KVCacheManagerV2 and all(
-                    window is None for window in self.max_attention_window_vec
+                if (
+                    type(self) is KVCacheManagerV2
+                    and self.kv_cache_type == CacheTypeCpp.SELF
+                    and all(window is None for window in self.max_attention_window_vec)
                 ):
-                    # Full attention has one lifecycle, so its pool already receives
+                    # Full self attention has one lifecycle, so its pool receives
                     # the available quota. A max_seq_len floor would silently grow
                     # that quota when the model's context limit cannot fit in memory.
                     # Keep the minimum batch floor; CUDA graph warmup queries the
                     # allocated pool after reserving its short decode requests to
                     # determine how long the remaining request can actually be.
                     generation_capacity = min_decode_capacity
-                # Other layouts need the full-length constraint to distribute
-                # capacity across their distinct attention/recurrent pools.
+                # Preserve the full-length constraint for other cache types and
+                # layouts. Cross attention sizes encoder warmup independently.
                 constraints.append(
                     BatchDesc(
                         [

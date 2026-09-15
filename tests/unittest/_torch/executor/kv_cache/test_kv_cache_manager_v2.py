@@ -774,13 +774,21 @@ def test_default_uses_allocator_fallback() -> None:
 
 
 @pytest.mark.parametrize(
-    "attention_windows,generation_capacity",
-    [([None, None], 3), ([None, 256], 1024)],
-    ids=["full_attention", "mixed_attention"],
+    "kv_cache_type,attention_windows,generation_capacity",
+    [
+        (CacheType.SELF, [None, None], 3),
+        (CacheType.SELF, [None, 256], 1024),
+        (CacheType.CROSS, [None, None], 1024),
+        (CacheType.SELFKONLY, [None, None], 1024),
+    ],
+    ids=["full_attention", "mixed_attention", "cross_attention", "key_only"],
 )
-def test_avg_seq_len_builds_warmup_constraints(attention_windows, generation_capacity) -> None:
+def test_avg_seq_len_builds_warmup_constraints(
+    kv_cache_type, attention_windows, generation_capacity
+) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(use_kv_cache_manager_v2=True, host_cache_size=0, avg_seq_len=1024),
+        kv_cache_type=kv_cache_type,
         max_batch_size=3,
         max_seq_len=1024,
         max_num_tokens=2048,
