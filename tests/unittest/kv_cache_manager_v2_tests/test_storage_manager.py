@@ -890,13 +890,20 @@ class TestStorageManagerLocalized(unittest.TestCase):
 
         evicted = ctrl.evict([1], lambda page: page.locality_domain_id == 1)
 
-        self.assertEqual(evicted[PoolGroupIndex(0)], [page1])
-        self.assertIsNone(page1.node_ref)
-        self.assertIsNotNone(page0.node_ref)
-        self.assertEqual(
-            ctrl.num_evictable_pages(PoolGroupIndex(0), lambda page: page.locality_domain_id == 0),
-            1,
-        )
+        try:
+            self.assertEqual(evicted[PoolGroupIndex(0)], [page1])
+            self.assertIsNone(page1.node_ref)
+            self.assertIsNotNone(page0.node_ref)
+            self.assertEqual(
+                ctrl.num_evictable_pages(
+                    PoolGroupIndex(0), lambda page: page.locality_domain_id == 0
+                ),
+                1,
+            )
+        finally:
+            # Under TLLM_DEBUG_MODE=1 the controller's __del__ terminates the
+            # process if any eviction policy is still holding pages.
+            ctrl.evict([1], lambda page: page.locality_domain_id == 0)
 
 
 if __name__ == "__main__":
