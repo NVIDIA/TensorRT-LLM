@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/attentionWorkspace.h"
+#include "tensorrt_llm/common/attentionOp.h"
 
 #include "tensorrt_llm/common/workspace.h"
 
@@ -56,7 +57,72 @@ void expectNextSlice(char const* name, Slice const& slice, size_t size, size_t& 
     expectedOffset += tc::alignSize(size, kAlignment);
 }
 
+constexpr int32_t kBatchSize = 2;
+constexpr int32_t kInputSequenceLength = 11;
+constexpr int32_t kCrossKvLength = 7;
+constexpr int32_t kPackedTokenCount = 14;
+constexpr int32_t kHeadSize = 8;
+
+void configureUnfusedAttention(tcop::AttentionOp& op, bool crossAttention)
+{
+    op.mNumHeads = 1;
+    op.mNumKVHeads = 1;
+    op.mHeadSize = kHeadSize;
+    op.mNumAttnHeads = 1;
+    op.mNumAttnKVHeads = 1;
+    op.mEnableContextFMHA = false;
+    op.mCrossAttention = crossAttention;
+}
+
+size_t expectedUnfusedContextWorkspace(bool crossAttention)
+{
+    constexpr size_t kElementSize = sizeof(half);
+    size_t const batchSize = kBatchSize;
+    size_t const inputSequenceLength = kInputSequenceLength;
+    size_t const kvSequenceLength = crossAttention ? kCrossKvLength : kInputSequenceLength;
+    size_t const paddedTokenCount = batchSize * inputSequenceLength;
+    size_t const paddedKvTokenCount = batchSize * kvSequenceLength;
+
+    tcop::AttentionContextWorkspaceSizes sizes{};
+    sizes.attentionMask = kElementSize * paddedTokenCount * kvSequenceLength;
+    sizes.cuQSeqlens = sizeof(int) * (batchSize + 1);
+    sizes.cuKvSeqlens = sizes.cuQSeqlens;
+    sizes.cuMaskRows = sizes.cuQSeqlens;
+    sizes.qBuf = kElementSize * paddedTokenCount * kHeadSize;
+    sizes.kBuf = kElementSize * paddedKvTokenCount * kHeadSize;
+    sizes.vBuf = sizes.kBuf;
+    sizes.qkBuf = kElementSize * batchSize * inputSequenceLength * kvSequenceLength;
+    sizes.qkvBuf = kElementSize * paddedTokenCount * kHeadSize;
+    sizes.qkFloatBuf = sizeof(float) * batchSize * inputSequenceLength * kvSequenceLength;
+    sizes.paddingOffset = sizeof(int) * paddedTokenCount;
+    sizes.encoderPaddingOffset = sizeof(int) * paddedKvTokenCount;
+    sizes.tokensInfo = sizeof(int2) * kPackedTokenCount;
+    return tcop::AttentionWorkspaceManager::buildContextLayout(sizes).totalSize;
+}
+
+size_t getUnfusedContextWorkspace(tcop::AttentionOp const& op)
+{
+    return op.getWorkspaceSizeForContext(
+        nvinfer1::DataType::kHALF, kBatchSize, kInputSequenceLength, kCrossKvLength, kPackedTokenCount);
+}
+
 } // namespace
+
+TEST(AttentionWorkspaceManagerTest, RaggedUnfusedSelfAttentionUsesPaddedTokenCounts)
+{
+    tcop::AttentionOp op;
+    configureUnfusedAttention(op, false);
+
+    EXPECT_EQ(getUnfusedContextWorkspace(op), expectedUnfusedContextWorkspace(false));
+}
+
+TEST(AttentionWorkspaceManagerTest, RaggedUnfusedCrossAttentionUsesPaddedTokenCounts)
+{
+    tcop::AttentionOp op;
+    configureUnfusedAttention(op, true);
+
+    EXPECT_EQ(getUnfusedContextWorkspace(op), expectedUnfusedContextWorkspace(true));
+}
 
 TEST(AttentionWorkspaceManagerTest, ContextLayoutMatchesAttentionOpOrdering)
 {

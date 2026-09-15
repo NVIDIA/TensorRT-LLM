@@ -76,6 +76,8 @@ struct MlaRopeGenArgs
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
+    // Per-token KV write slots for speculative verify groups (nullptr otherwise).
+    int32_t const* helix_local_slots_ptr;
     // `kv_norm_weight_ptr` set: `invokeMLAKvNormRopeQuantGeneration` produces the KV
     // half (norm + rope + fp8 + paged write) and the RoPE kernel runs Q-only.
     void const* kv_norm_weight_ptr;
@@ -90,6 +92,7 @@ struct MlaRopeGenArgs
     // `kv_only` launches the KV half, `kv_done_elsewhere` the Q half.
     bool kv_only;
     bool kv_done_elsewhere;
+    bool q_rope_applied;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -133,6 +136,8 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.host_bmm1_scale = args.host_bmm1_scale;
     mla_params.helix_position_offsets = args.helix_position_offsets_ptr;
     mla_params.helix_is_inactive_rank = args.helix_is_inactive_rank_ptr;
+    mla_params.helix_local_slots = args.helix_local_slots_ptr;
+    mla_params.q_rope_applied = args.q_rope_applied;
 
     mla_params.precomputed_cu_seqlens = args.precomputed_cu_seqlens;
     mla_params.precomputed_fmha_scheduler = args.precomputed_fmha_scheduler;
@@ -175,7 +180,7 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append,
     std::optional<torch::Tensor> kv_norm_weight, double const kv_norm_eps, bool const precomputed_cu_seqlens,
     bool const precomputed_fmha_scheduler, bool const kv_only, bool const kv_done_elsewhere,
-    std::optional<torch::Tensor> quant_scale_qkv)
+    std::optional<torch::Tensor> quant_scale_qkv, bool q_rope_applied)
 {
     // `kv_only` runs before q_pe exists, so the Q tensors are absent.
     TORCH_CHECK(kv_only || (fused_q.has_value() && q_pe.has_value()),
@@ -186,10 +191,11 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
     TLLM_CHECK_WITH_INFO(num_kv_heads == 1, "num_kv_heads must = 1");
-    TLLM_CHECK_WITH_INFO(residual_dim == 0 || residual_dim == qk_rope_head_dim,
-        "MLA KV residual_dim must be 0 or qk_rope_head_dim (%ld), got %ld", qk_rope_head_dim, residual_dim);
-    TORCH_CHECK(helix_tensor_params.size() == 2,
-        "Expecting 2 tensors for helix_tensor_params: helix_position_offsets and helix_is_inactive_rank.");
+    TLLM_CHECK_WITH_INFO(residual_dim >= 0 && residual_dim <= qk_rope_head_dim && residual_dim % 16 == 0,
+        "MLA KV residual_dim must be a multiple of 16 in [0, qk_rope_head_dim], got %ld", residual_dim);
+    TORCH_CHECK(helix_tensor_params.size() == 2 || helix_tensor_params.size() == 3,
+        "Expecting 2 or 3 tensors for helix_tensor_params: helix_position_offsets, helix_is_inactive_rank "
+        "and optionally helix_local_slots (per-token KV write slots for speculative verify groups).");
 
     auto stream = at::cuda::getCurrentCUDAStream(latent_cache.get_device());
     auto const kv_cache_quant_mode = tc::QuantMode(uint32_t(quant_mode));
@@ -219,6 +225,14 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         = helix_position_offsets.has_value() ? helix_position_offsets->data_ptr<int32_t>() : nullptr;
     bool const* helix_is_inactive_rank_ptr
         = helix_is_inactive_rank.has_value() ? helix_is_inactive_rank->data_ptr<bool>() : nullptr;
+    int32_t const* helix_local_slots_ptr = nullptr;
+    if (helix_tensor_params.size() == 3 && helix_tensor_params[2].has_value())
+    {
+        helix_local_slots_ptr = helix_tensor_params[2]->data_ptr<int32_t>();
+        TORCH_CHECK(!kv_norm_weight.has_value(),
+            "helix_local_slots (speculative verify groups) is not supported on the fused "
+            "KV-norm RoPE path: its KV append kernel has no per-token helix gate.");
+    }
 
     int* cu_q_seqlens_ptr = reinterpret_cast<int*>(cu_q_seqlens.data_ptr());
     int* cu_kv_seqlens_ptr = reinterpret_cast<int*>(cu_kv_seqlens.data_ptr());
@@ -328,9 +342,9 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         block_ids_per_seq_ptr, cache_type, kv_cache_buffers.kvScaleCacheBuffer, cu_q_seqlens_ptr, cu_kv_seqlens_ptr,
         fmha_tile_counter_ptr, mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_qkv_ptr,
         quant_scale_o_ptr, kv_scale_orig_quant_ptr, kv_scale_quant_orig_ptr, kv_cache_scale_orig_quant_ptr,
-        host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr, kv_norm_weight_ptr,
-        static_cast<float>(kv_norm_eps), latent_row_stride, precomputed_cu_seqlens, precomputed_fmha_scheduler, kv_only,
-        kv_done_elsewhere};
+        host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr, helix_local_slots_ptr,
+        kv_norm_weight_ptr, static_cast<float>(kv_norm_eps), latent_row_stride, precomputed_cu_seqlens,
+        precomputed_fmha_scheduler, kv_only, kv_done_elsewhere, q_rope_applied};
 
     void* q_pe_ptr = kv_only ? nullptr : q_pe->data_ptr();
     void* fused_q_ptr = kv_only ? nullptr : fused_q->data_ptr();
@@ -414,6 +428,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", bool kv_only=False"
         ", bool kv_done_elsewhere=False"
         ", Tensor? quant_scale_qkv=None"
+        ", bool q_rope_applied=False"
         ") -> ()");
 }
 
