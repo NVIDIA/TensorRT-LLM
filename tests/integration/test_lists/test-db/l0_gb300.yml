@@ -26,18 +26,18 @@ l0_gb300:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
-  # Staircase catalog: the certification matrix for each op a staircase target
+  # ModelingV2 catalog: the certification matrix for each op a modeling_v2 target
   # calls, plus the two consistency tests that guard the routing tables against
   # the targets they name. Deliberately NOT a duplicate of the upstream tests
   # for the same ops -- those cover the modules that wrap them, these cover the
-  # op itself cell by cell -- which is why every file is named test_staircase_*.
+  # op itself cell by cell -- which is why every file is named test_modeling_v2_*.
   # These entries are the receipts: the catalog's certification is per GPU
   # architecture, and this list is the sm_103 one. comm/ is excluded here and
   # carried by l0_gb300_multi_gpus.yml, since those two need 4 ranks.
   # TIMEOUT measured, not guessed: the whole entry is 348 cases in 5m34s on one
   # GB300. 30 gives five times that -- enough for a loaded node, short enough
   # that a hung case does not hold this stage for its full budget.
-  - unittest/_torch/staircase --ignore=unittest/_torch/staircase/comm TIMEOUT (30)
-  # Staircase whole-model gate. The op-level entry above certifies the
+  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
+  # ModelingV2 whole-model gate. The op-level entry above certifies the
   # vocabulary; this certifies the assembly that calls it.
-  - accuracy/test_staircase_gpt_oss.py::TestStaircaseGptOss120bSm103Tp1::test_gsm8k
+  - accuracy/test_modeling_v2_gpt_oss.py::TestModelingV2GptOss120bSm103Tp1::test_gsm8k
