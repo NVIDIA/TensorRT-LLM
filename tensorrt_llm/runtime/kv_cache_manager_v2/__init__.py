@@ -99,8 +99,10 @@ if _BACKEND == "python":
     from ._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
+        CountsByLevel,
         KVCacheIterationStatsDelta,
         KVCacheStatsDelta,
+        ReusedBlocksByLevel,
         SsmSnapshotIterationStatsDelta,
     )
     from ._storage import BufferId  # noqa: F401
@@ -257,6 +259,7 @@ else:
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
+    ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
 
@@ -372,6 +375,7 @@ __all__ = [
     "ReuseScope",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",
+    "ReusedBlocksByLevel",
     "KVCacheStatsDelta",
     "SsmSnapshotIterationStatsDelta",
     "SlidingWindowSize",
