@@ -744,14 +744,19 @@ def test_default_uses_allocator_fallback() -> None:
     assert config.constraints == []
 
 
-def test_avg_seq_len_builds_warmup_constraints() -> None:
+@pytest.mark.parametrize(
+    "attention_windows,generation_capacity",
+    [([None, None], 3), ([None, 256], 1024)],
+    ids=["full_attention", "mixed_attention"],
+)
+def test_avg_seq_len_builds_warmup_constraints(attention_windows, generation_capacity) -> None:
     config = _make_cache_config_for_test(
-        KvCacheConfig(host_cache_size=0, avg_seq_len=1024),
+        KvCacheConfig(use_kv_cache_manager_v2=True, host_cache_size=0, avg_seq_len=1024),
         max_batch_size=3,
         max_seq_len=1024,
         max_num_tokens=2048,
         max_draft_len=2,
-        max_attention_window_vec=[None, 256],
+        max_attention_window_vec=attention_windows,
     )
 
     assert config.typical_step == BatchDesc(
@@ -761,7 +766,7 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
     assert config.constraints == [
         BatchDesc(
             [
-                KVCacheDesc(capacity=1024, history_length=1023),
+                KVCacheDesc(capacity=generation_capacity, history_length=generation_capacity - 1),
                 KVCacheDesc(capacity=3, history_length=0),
                 KVCacheDesc(capacity=3, history_length=0),
             ]
@@ -833,7 +838,7 @@ def test_full_attention_warmup_respects_allocated_budget(
     requested_quota = manager.kv_cache_manager_py_config.cache_tiers[0].quota
     allocated_bytes = manager.impl.get_quota(kv_cache_v2_module.GPU_LEVEL)
     # These small quotas round up to a 2 MiB GPU allocation grain. The model's
-    # full context would require 256 MiB, far beyond either configured budget.
+    # full context requires at least 256 MiB, far beyond either configured budget.
     assert 0 < allocated_bytes <= requested_quota + (2 << 20)
     assert manager.max_num_tokens < manager.max_seq_len < 131072
 
