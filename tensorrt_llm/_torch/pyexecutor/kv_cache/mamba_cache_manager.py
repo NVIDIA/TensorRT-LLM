@@ -3512,6 +3512,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_dummy: bool = False,
         enable_request_stats: bool = False,
         expected_prompt_length: Optional[int] = None,
+        locality_domain_id: Optional[int] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -3521,6 +3522,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             is_dummy=is_dummy,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            locality_domain_id=locality_domain_id,
         )
         if (self.mapping.rank == 0 and kv_cache is not None
                 and input_tokens is not None and not is_dummy
