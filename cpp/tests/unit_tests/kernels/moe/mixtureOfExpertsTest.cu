@@ -1530,7 +1530,8 @@ protected:
             linear = std::min(std::max(linear, -mSwigluLimitValue), mSwigluLimitValue);
             if (mSwigluClampAfterSilu)
             {
-                gate = std::min(actfn(gate, 0.0f, ActivationType::Silu), mSwigluLimitValue);
+                gate = std::min(
+                    actfn(gate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue, mSwigluLimitValue);
                 return gate * (linear + mSwigluBetaValue);
             }
             gate = std::min(gate, mSwigluLimitValue);
@@ -1665,7 +1666,8 @@ protected:
             ASSERT_GT(maxGate, mSwigluLimitValue) << "SwigluBias limit values don't change the result";
             if (mSwigluClampAfterSilu)
             {
-                ASSERT_GT(actfn(maxGate, 0.0f, ActivationType::Silu), mSwigluLimitValue)
+                ASSERT_GT(actfn(maxGate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue,
+                    mSwigluLimitValue)
                     << "Post-SiLU clamp order is not observable";
             }
         }
@@ -1986,7 +1988,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluPostSiluClamp)
         GTEST_SKIP() << "W4A8 does not support gated activations";
     }
     this->mActType = ActivationType::SwigluBias;
-    this->mSwigluAlphaValue = 1.0f;
+    this->mSwigluAlphaValue = 0.5f;
     this->mSwigluBetaValue = 0.0f;
     this->mSwigluClampAfterSilu = true;
     this->BasicPermuteTest();
