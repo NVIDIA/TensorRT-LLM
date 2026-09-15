@@ -383,11 +383,14 @@ def atomic_add_u64_gpu(ptr, val):
 SAMPLE_JITTER = True  # stratified self-sample (False: fixed-stride comb, CUDA parity)
 
 
-def _jit_off(t, SS2):
+def _jit_off(t, SS2, on):
     """Stratified jitter of the self-sample: offset in [0, SS2) hashed from the
     sample index (0 for t == 0). Breaks the fixed-stride comb's aliasing with
-    periodic rows; the ladder scalars (SMP/SS2/TGT) are unchanged."""
-    if cutlass.const_expr(not SAMPLE_JITTER):
+    periodic rows; the ladder scalars (SMP/SS2/TGT) are unchanged. Used by the
+    one-shot SPLIT line only: the retrying engines recover a biased line, and
+    the extra live values push the 1024-thread single-CTA form over the
+    64-register wall."""
+    if cutlass.const_expr(not (SAMPLE_JITTER and on)):
         return cutlass.Int32(0)
     h = cutlass.Uint32(t) * cutlass.Uint32(2654435761)
     o = cutlass.Int32((h >> cutlass.Uint32(20)) & cutlass.Uint32(0xFFF))
@@ -1980,7 +1983,7 @@ class GvrMainKernel:
         if tidx < SMP:
             shas = cutlass.Int32(1)
         if shas != cutlass.Int32(0):
-            p4 = (tidx * SS2 + _jit_off(tidx, SS2)) * cutlass.Int32(2)
+            p4 = (tidx * SS2 + _jit_off(tidx, SS2, self.split)) * cutlass.Int32(2)
             C.ld_g_f32x4(atom128, x_addr, p4, fsa)
             C.ld_g_f32x4(atom128, x_addr, p4 + cutlass.Int32(1), fsb)
             if cutlass.const_expr(self.prefill):
@@ -2007,7 +2010,7 @@ class GvrMainKernel:
         fmb_ = cute.make_rmem_tensor((4,), cutlass.Float32)
         j = tidx + cutlass.Int32(BLK)  # strided tail
         while j < SMP:
-            p4 = (j * SS2 + _jit_off(j, SS2)) * cutlass.Int32(2)
+            p4 = (j * SS2 + _jit_off(j, SS2, self.split)) * cutlass.Int32(2)
             C.ld_g_f32x4(atom128, x_addr, p4, fma_)
             C.ld_g_f32x4(atom128, x_addr, p4 + cutlass.Int32(1), fmb_)
             for t in cutlass.range_constexpr(4):
@@ -2113,7 +2116,7 @@ class GvrMainKernel:
                     C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
             j = tidx + cutlass.Int32(BLK)  # tail re-loads
             while j < SMP:
-                p4 = (j * SS2 + _jit_off(j, SS2)) * cutlass.Int32(2)
+                p4 = (j * SS2 + _jit_off(j, SS2, self.split)) * cutlass.Int32(2)
                 C.ld_g_f32x4(atom128, x_addr, p4, fma_)
                 C.ld_g_f32x4(atom128, x_addr, p4 + cutlass.Int32(1), fmb_)
                 for t in cutlass.range_constexpr(4):
@@ -5245,11 +5248,9 @@ class GvrClusKernel:
             if tidx < smp2:
                 shas = cutlass.Int32(1)
             if shas != cutlass.Int32(0):
-                p4 = (tidx * SS2 + _jit_off(tidx, SS2)) * cutlass.Int32(4)
+                p4 = tidx * SS2 * cutlass.Int32(4)
                 if tidx >= SMP:
-                    p4 = ((tidx - SMP) * SS2 + _jit_off(tidx - SMP, SS2)) * cutlass.Int32(
-                        4
-                    ) + cutlass.Int32(2)
+                    p4 = (tidx - SMP) * SS2 * cutlass.Int32(4) + cutlass.Int32(2)
                 C.ld_g_f32x4(atom128, x_addr, p4, fsa)
                 C.ld_g_f32x4(atom128, x_addr, p4 + cutlass.Int32(1), fsb)
 
@@ -5267,11 +5268,9 @@ class GvrClusKernel:
             fmb_ = cute.make_rmem_tensor((4,), cutlass.Float32)
             j = tidx + cutlass.Int32(BLK)  # mop-up
             while j < smp2:
-                p4 = (j * SS2 + _jit_off(j, SS2)) * cutlass.Int32(4)
+                p4 = j * SS2 * cutlass.Int32(4)
                 if j >= SMP:
-                    p4 = ((j - SMP) * SS2 + _jit_off(j - SMP, SS2)) * cutlass.Int32(
-                        4
-                    ) + cutlass.Int32(2)
+                    p4 = (j - SMP) * SS2 * cutlass.Int32(4) + cutlass.Int32(2)
                 C.ld_g_f32x4(atom128, x_addr, p4, fma_)
                 C.ld_g_f32x4(atom128, x_addr, p4 + cutlass.Int32(1), fmb_)
                 for t in cutlass.range_constexpr(4):
@@ -5350,11 +5349,9 @@ class GvrClusKernel:
                         C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
                 j = tidx + cutlass.Int32(BLK)  # mop-up reloads
                 while j < smp2:
-                    p4 = (j * SS2 + _jit_off(j, SS2)) * cutlass.Int32(4)
+                    p4 = j * SS2 * cutlass.Int32(4)
                     if j >= SMP:
-                        p4 = ((j - SMP) * SS2 + _jit_off(j - SMP, SS2)) * cutlass.Int32(
-                            4
-                        ) + cutlass.Int32(2)
+                        p4 = (j - SMP) * SS2 * cutlass.Int32(4) + cutlass.Int32(2)
                     C.ld_g_f32x4(atom128, x_addr, p4, fma_)
                     C.ld_g_f32x4(atom128, x_addr, p4 + cutlass.Int32(1), fmb_)
                     for t in cutlass.range_constexpr(4):
