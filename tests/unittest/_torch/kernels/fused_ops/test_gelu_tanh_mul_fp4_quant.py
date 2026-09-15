@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parity test: fused gelu_tanh+mul+NVFP4-quantize (modules/fused_ops/
+"""Parity test: fused gelu_tanh+mul+NVFP4-quantize (kernels/fused_ops/
 gelu_tanh_mul_fp4_quant) vs the unfused reference chain
 (trtllm::flashinfer_gelu_tanh_and_mul -> trtllm::fp4_quantize).
 
@@ -29,7 +29,7 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.fused_ops.gelu_tanh_mul_fp4_quant import (
+from tensorrt_llm._torch.kernels.fused_ops.gelu_tanh_mul_fp4_quant import (
     gelu_tanh_mul_fp4_quant,
     sf_swizzled_offsets,
 )

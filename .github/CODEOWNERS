@@ -162,7 +162,6 @@
 /cpp/tensorrt_llm/kernels @NVIDIA/trt-llm-kernels-devs
 /cpp/tensorrt_llm/thop @NVIDIA/trt-llm-kernels-devs
 /cpp/tests/unit_tests/kernels @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/cute_dsl_kernels @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/kernels @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/kernels @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/thop @NVIDIA/trt-llm-kernels-devs
@@ -177,7 +176,6 @@
 /tensorrt_llm/_torch/models @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/_torch/modules @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/_torch/modules/dwdp @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/_torch/modules/fused_ops @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/modules/linear.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/quantization @NVIDIA/trt-llm-models-devs
@@ -318,18 +316,18 @@
 /cpp/tests/unit_tests/kernels/ropeTest.cu @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tests/unit_tests/kernels/sparseAttentionKernelsTest.cpp @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/microbenchmarks/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 # Exercises the sliding-block-table op that the sparse cache manager owns,
 # so a change to either side routes to that team as well.
 /tests/unittest/_torch/attention/kernels/test_deepseek_v4_block_table.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-kv-cache-manager-devs
-# Deliberately still under thop/: the top-k kernel this exercises gained a second
-# production consumer outside Attention (KV-cache compression), so the test's final
-# home is settled together with the kernel's, not by this move. Keeping the explicit
-# rule preserves Attention ownership meanwhile. See PR #17968 for the discussion.
-/tests/unittest/_torch/thop/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
+# The kernel-ownership question this test was waiting on is settled: the top-k
+# kernel has two production consumers (Attention and KV-cache compression), so it
+# landed in the architecture-neutral tree at /tensorrt_llm/_torch/kernels/blackwell/
+# top_k (still topk-devs, below), and the test followed it out of thop/. Attention
+# keeps the test because Attention is its primary consumer. See PR #<PR>.
+/tests/unittest/_torch/kernels/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
@@ -353,8 +351,6 @@
 /cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/nanobind/runtime/moe* @NVIDIA/trt-llm-moe-devs
 /cpp/tensorrt_llm/runtime/moeLoadBalancer @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/moe @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe @NVIDIA/trt-llm-moe-devs
@@ -368,7 +364,7 @@
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
 
 # ===== TOP-K =====
-/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k @NVIDIA/trt-llm-topk-devs
+/tensorrt_llm/_torch/kernels/blackwell/top_k @NVIDIA/trt-llm-topk-devs
 /tensorrt_llm/_torch/modules/top_k.py @NVIDIA/trt-llm-topk-devs
 /tests/microbenchmarks/cute_dsl_kernels/top_k @NVIDIA/trt-llm-topk-devs
 /tests/unittest/_torch/attention/sparse/*topk* @NVIDIA/trt-llm-topk-devs

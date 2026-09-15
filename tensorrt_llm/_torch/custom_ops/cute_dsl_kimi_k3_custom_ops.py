@@ -45,15 +45,15 @@ if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.akk_inverse import akk_inv_host as _akk_inv_host
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.fused_k123 import (
+    from ..attention.kernels.blackwell.kimi_k3_kda.akk_inverse import akk_inv_host as _akk_inv_host
+    from ..attention.kernels.blackwell.kimi_k3_kda.fused_k123 import (
         make_host_function as _fused_make_host,
     )
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import (
+    from ..attention.kernels.blackwell.kimi_k3_kda.k4_persistent import (
         BYTES_PER_TENSORMAP as _K4P_BTM,
     )
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import NUM_TENSORMAPS as _K4P_NTM
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.k4_persistent import (
+    from ..attention.kernels.blackwell.kimi_k3_kda.k4_persistent import NUM_TENSORMAPS as _K4P_NTM
+    from ..attention.kernels.blackwell.kimi_k3_kda.k4_persistent import (
         make_host_fn as _k4p_make_host,
     )
     from ..modules.fla.index import prepare_chunk_indices

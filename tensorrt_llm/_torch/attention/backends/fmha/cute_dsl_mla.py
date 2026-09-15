@@ -135,10 +135,10 @@ class CuteDslMlaFmha(PhasedFmha):
         """
         import cutlass
 
-        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import (
+        from tensorrt_llm._torch.attention.kernels.blackwell.mla.mla_decode_fp8 import (
             BlackwellMultiHeadLatentAttentionForwardFP8,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import (
+        from tensorrt_llm._torch.attention.kernels.blackwell.mla.mla_decode_fp16 import (
             BlackwellMultiHeadLatentAttentionForwardFP16,
         )
 

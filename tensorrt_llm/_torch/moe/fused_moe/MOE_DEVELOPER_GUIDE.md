@@ -297,7 +297,7 @@ not `==`.
 | `KERNEL_INTERNALS.html` | Reference for the underlying DeepGEMM kernel layout |
 
 The exported CuteDSL kernel sources for `MegaMoECuteDsl` live under
-`tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/`, preserving the upstream
+`tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/`, preserving the upstream
 package structure and `KernelClass` entry points. The runner constructs
 `ProblemDesc` and `ImplDesc` and dispatches internally; the public backend
 remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase
@@ -643,7 +643,7 @@ When adding new components, use these reference implementations:
 | Task | Reference | Key methods to implement |
 |------|-----------|--------------------------|
 | New `EXTERNAL_COMM` Backend | `fused_moe_cutlass.py` (`CutlassFusedMoE`) | Declare `MoEImplBase`; implement `capabilities`, `activation_support`, `can_implement`, `_get_quant_method`, `quantize_input`, `run_moe`; call `apply_moe_impl_construction_state()` in `__init__` (`create_weights` / `load_weights` come from `MoEWeightOwnerMixin` — override only if allocation needs more); then add the class to `moe_resolution.IMPL_PRIORITY` and `BACKEND_FAMILY`, and add a branch in `create_moe_backend`. Declare the `descriptor` and `@register_moe_impl` on the same class that implements those four methods. Split an abstract parent out of it only when several quantization formats are planned — see the one-class-per-identity note below |
-| New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`), `mega_moe/mega_moe_cute_dsl.py` (`MegaMoECuteDsl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `MegaMoECuteDsl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel imports from `cute_dsl_kernels/cutedsl_megamoe/`, and `quantize_input` that short-circuits zero-token input. |
+| New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`), `mega_moe/mega_moe_cute_dsl.py` (`MegaMoECuteDsl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `MegaMoECuteDsl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel imports from `moe/kernels/cutedsl_megamoe/`, and `quantize_input` that short-circuits zero-token input. |
 | New Quantization Method | `quantization.py` → `FP8QDQFusedMoEMethod` | Subclass `FusedMoEMethod`, implement quant/dequant ops |
 | New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine`; also implement `CheckpointableCommunication` when native workspace mappings must follow executor sleep/wakeup |
 | New Scheduler | `moe_scheduler.py` (`ExternalCommMoEScheduler` / `FusedCommMoEScheduler`) | Subclass `MoEScheduler`, implement `forward`; add new `MoESchedulerKind` value and wire into `create_moe_scheduler` factory |

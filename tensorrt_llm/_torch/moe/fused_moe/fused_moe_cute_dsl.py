@@ -682,7 +682,7 @@ class CuteDslFusedMoE(MoEImplBase):
     input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
 
     # Kinds mirror the kernel's own SUPPORTED_ACTIVATION_TYPES in
-    # cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py.
+    # moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py.
     # The clamp is a kernel-cache-key scalar and the epilogue has no
     # "clamp absent" branch, so an absent clamp is +inf, not None.
     activation_support = MoEActivationSupport(

@@ -147,9 +147,9 @@ l0_b200:
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
-  - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
-  - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
-  - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py
+  - unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py
+  - unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
@@ -286,7 +286,7 @@ l0_b200:
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
-  - unittest/_torch/cute_dsl_kernels/test_nvfp4_conv3d.py
+  - unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
   - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py

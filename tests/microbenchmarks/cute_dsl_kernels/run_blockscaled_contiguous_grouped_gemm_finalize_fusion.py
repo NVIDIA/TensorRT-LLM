@@ -51,12 +51,17 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+    from tensorrt_llm._torch.moe.kernels.blackwell import (
         blockscaled_contiguous_grouped_gemm_finalize_fusion as kernel_module,
     )
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell import blockscaled_contiguous_grouped_gemm_finalize_fusion as kernel_module
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[3])
+    from tensorrt_llm._torch.moe.kernels.blackwell import (
+        blockscaled_contiguous_grouped_gemm_finalize_fusion as kernel_module,
+    )
 
 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel = (
     kernel_module.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel

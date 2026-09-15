@@ -499,28 +499,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
-    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
-        BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
-    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
-        Sm100BlockScaledContiguousGroupedGemmKernel
-    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import \
-        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
-    from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
-        Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
-    from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
-        Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
-    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
-        FilteredTopKKernelVarlenDecode
-    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_prefill_varlen import \
-        FilteredTopKKernelVarlenPrefill
-    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
-        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
-    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
-        SinglePassMultiCTARadixTopKKernel
-    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
-        STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
-    from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
-        SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
@@ -529,7 +507,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledPersistentDenseGemmKernel
     from ..kernels.blackwell.dense_gemm_persistent import \
         PersistentDenseGemmKernel
+    from ..kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
+        FilteredTopKKernelVarlenDecode
+    from ..kernels.blackwell.top_k.filtered_top_k_prefill_varlen import \
+        FilteredTopKKernelVarlenPrefill
+    from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
+        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE
+    from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk import \
+        SinglePassMultiCTARadixTopKKernel
+    from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import \
+        STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
+    from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
+        SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..kernels.blackwell.utils import make_ptr
+    from ..moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
+    from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
+        Sm100BlockScaledContiguousGroupedGemmKernel
+    from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import \
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
+    from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
+        Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
+    from ..moe.kernels.blackwell.moe_as_dense_gemm.fc1 import \
+        Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
 
     @functools.cache
     def _get_full_device_max_active_clusters(device_id: int,
@@ -5403,7 +5403,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return output, output_sf
 
     # Import FC2 kernel
-    from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc2 import \
+    from ..moe.kernels.blackwell.moe_as_dense_gemm.fc2 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmFC2Kernel
 
     class CuteDSLNVFP4DenseGemmFC2Runner(TunableRunner):
@@ -7696,11 +7696,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     #  CuTe DSL GVR Top-K Decode                                         #
     # ------------------------------------------------------------------ #
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import \
+    from ..kernels.blackwell.top_k.gvr_topk_decode import \
         GvrTopKKernel as _GvrTopKKernel
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
+    from ..kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
         is_tiered_topk_supported as _is_tiered_topk_supported
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
+    from ..kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
         tiered_topk as _tiered_topk
 
     class CuteDSLGvrTopKDecodeRunner:
@@ -8352,9 +8352,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     #      long rows ride a cluster (cs=2/4) via DSMEM; short rows go
     #      single-CTA. Both branches share the grid for graph capture.
     # (order_row, counters) are layer-invariant within a decode step.
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
+    from ..kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
         GvrTopKLBKernel as _GvrTopKLBKernel
-    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
+    from ..kernels.blackwell.top_k.gvr_topk_decode_load_balance import \
         GvrTopKLBPrepareKernel as _GvrTopKLBPrepareKernel
 
     # No Runner class for prepare: no tuning knobs, no cluster dispatch.
@@ -8478,7 +8478,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     #  CuTE DSL FP8 Paged MQA Logits (Blackwell SM100)                   #
     # ------------------------------------------------------------------ #
-    from ..cute_dsl_kernels.blackwell.paged_mqa_logits import (
+    from ..attention.kernels.blackwell.paged_mqa_logits import (
         FP4MQALogitsKernel, FP8MQALogitsKernel)
 
     class CuteDSLPagedMQALogitsRunner:
@@ -8738,7 +8738,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     #  CuTe DSL MiniMax-M3 index decode scoring (Blackwell SM100)         #
     # ------------------------------------------------------------------ #
-    from ..cute_dsl_kernels.blackwell.minimax_m3_index_decode_score import \
+    from ..attention.kernels.blackwell.minimax_m3_index_decode_score import \
         IndexDecodeScoreKernel
     from ..kernels.blackwell.cute_ptx_utils import \
         TORCH_TO_CUTE_DTYPE as _M3_TORCH_TO_CUTE_DTYPE
@@ -10959,13 +10959,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     # =========================================================================
     # MLA decode (Blackwell) - wraps the CuTe DSL kernels that live at
-    # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/.
+    # tensorrt_llm/_torch/attention/kernels/blackwell/mla/.
     # Used by the cute_dsl_mla FMHA library (see attention/backends/fmha/cute_dsl_mla.py).
     # =========================================================================
 
-    from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
+    from ..attention.kernels.blackwell.mla.mla_decode_fp8 import \
         BlackwellMultiHeadLatentAttentionForwardFP8
-    from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
+    from ..attention.kernels.blackwell.mla.mla_decode_fp16 import \
         BlackwellMultiHeadLatentAttentionForwardFP16
 
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
@@ -11821,7 +11821,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # BMM, block-scaled (NVFP4 / MXFP8) GEMM, the DSv4 q_b fusion and the
         # FP8 per-tensor GEMM. Every op raises unless get_sm_version() == 107.
 
-        from ..cute_dsl_kernels.rubin.dsv4_qb_fusion.kernel import \
+        from ..attention.kernels.rubin.dsv4_qb_fusion.kernel import \
             compile as compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant
         from ..kernels.rubin.blockwise_gemm import SM107BlockwiseGemmKernel
         from ..kernels.rubin.dense_blockscaled_gemm_persistent import (
@@ -14120,7 +14120,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         #   1. Gather + Grouped GEMM + activation fusion (FC1 layer)
         #   2. Grouped GEMM + Finalize (scatter-add) fusion (FC2 layer)
 
-        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import \
+        from ..moe.kernels.rubin.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import \
             Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel
 
         class Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
@@ -14883,7 +14883,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # ----------------------------------------------------------------
         # Rubin BF16/FP16 Gather + SwiGLU Fusion (FC1 layer)
         # ----------------------------------------------------------------
-        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_gemm_swiglu_fusion import \
+        from ..moe.kernels.rubin.rubin_contiguous_gather_grouped_gemm_swiglu_fusion import \
             Sm107ContiguousGatherGroupedGemmSwigluFusionKernel
 
         class Sm107ContiguousGatherGroupedGemmSwigluFusionRunner(TunableRunner):
@@ -15477,7 +15477,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # ----------------------------------------------------------------
         # Rubin Finalize Fusion (FC2 layer: grouped GEMM + scatter-add)
         # ----------------------------------------------------------------
-        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_blockscaled_gemm_finalize_fusion import \
+        from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_finalize_fusion import \
             Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
 
         class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
@@ -16179,7 +16179,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # ----------------------------------------------------------------
         # Rubin BF16/FP16 Finalize Fusion (FC2 layer: grouped GEMM + scatter-add)
         # ----------------------------------------------------------------
-        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_gemm_finalize_fusion import \
+        from ..moe.kernels.rubin.rubin_contiguous_grouped_gemm_finalize_fusion import \
             Sm107ContiguousGroupedGemmFinalizeFusionKernel
 
         class Sm107ContiguousGroupedGemmFinalizeFusionRunner(TunableRunner):

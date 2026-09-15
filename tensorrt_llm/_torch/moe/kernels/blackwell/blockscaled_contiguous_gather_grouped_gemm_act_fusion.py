@@ -49,7 +49,7 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
     silu_f32,
 )
 
-from ...utils import ActivationType, is_gated_activation
+from ....utils import ActivationType, is_gated_activation
 
 SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
 

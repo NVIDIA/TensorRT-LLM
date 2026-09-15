@@ -34,10 +34,15 @@ import pytest
 import torch
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import GvrTopKKernel
+    from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode import GvrTopKKernel
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[4] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell.top_k.gvr_topk_decode import GvrTopKKernel  # type: ignore[no-redef]
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[4])
+    from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode import (  # type: ignore[no-redef]
+        GvrTopKKernel,
+    )
 
 
 _DTYPE_TORCH_TO_CUTE = {
@@ -1013,12 +1018,16 @@ def gvr_topk_sort_prepare(seq_lens: torch.Tensor) -> torch.Tensor:
 
 # ---- Load-Balance (hybrid multi-CTA + single-CTA) wrappers ------------------
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_load_balance import (
+    from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_load_balance import (
         GvrTopKLBKernel,
         GvrTopKLBPrepareKernel,
     )
 except (ModuleNotFoundError, ImportError):
-    from blackwell.top_k.gvr_topk_decode_load_balance import (  # type: ignore[no-redef]
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[4])
+    from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_load_balance import (  # type: ignore[no-redef]
         GvrTopKLBKernel,
         GvrTopKLBPrepareKernel,
     )

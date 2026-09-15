@@ -307,9 +307,7 @@ def test_metadata_warmup_selfsampling_prefill_leg(
         sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
         num_sms=148,
     )
-    ss_host = (
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
-    )
+    ss_host = "tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
     with (
         patch(
             "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
