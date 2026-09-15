@@ -209,6 +209,7 @@ def _executor_request(**sampling_config_overrides) -> types.SimpleNamespace:
         top_p_min=None,
         top_p_reset_ids=None,
         beam_width=1,
+        beam_width_array=None,
         length_penalty=None,
         beam_search_diversity_rate=None,
         early_stopping=None,
