@@ -405,7 +405,6 @@ class TestStep3p7Helpers(unittest.TestCase):
                 self.assertEqual(activation.clamp_after_silu, moe_lora_enabled)
                 moe.router_bias.router_bias.data.zero_()
                 moe.gate.return_value = torch.zeros(1, text_config.moe_num_experts)
-                moe._clamp_weights_loaded = True
                 python_output = MagicMock(return_value=torch.ones(1, text_config.hidden_size))
                 moe._python_clamped_moe_forward = python_output
 
@@ -417,6 +416,16 @@ class TestStep3p7Helpers(unittest.TestCase):
                 experts.side_effect = separated_experts
                 hidden_states = torch.ones(1, text_config.hidden_size)
                 lora_params = {"active": True} if moe_lora_enabled else None
+                if not moe_lora_enabled:
+                    moe._clamp_weights_loaded = False
+                    with self.assertRaisesRegex(RuntimeError, "requires post-SiLU clamp weights"):
+                        moe(
+                            hidden_states,
+                            types.SimpleNamespace(all_rank_num_tokens=[1]),
+                        )
+                    experts.assert_not_called()
+
+                moe._clamp_weights_loaded = True
                 output = moe(
                     hidden_states,
                     types.SimpleNamespace(all_rank_num_tokens=[1]),
