@@ -58,6 +58,7 @@ class Attention(nn.Module):
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
         separate_qkv_is_self_attention: bool = False,
+        share_qkv_input_quant: bool = False,
     ):
         super().__init__()
 
@@ -149,6 +150,27 @@ class Attention(nn.Module):
             and self.quant_config.layer_quant_mode.has_nvfp4()
             and not self.force_dynamic_quantization
         )
+
+        # Opt-in FP8 analog of the above, for the synchronous get_qkv() path.
+        # Kept opt-in rather than inferred from quant_config so that enabling it
+        # also commits the caller to running post_load_weights(), which checks
+        # the equal-input_scale invariant that makes the sharing sound.
+        self.share_qkv_input_quant = share_qkv_input_quant
+        if share_qkv_input_quant and self.qkv_mode != QKVMode.SEPARATE_QKV:
+            raise ValueError(
+                "Attention: share_qkv_input_quant requires "
+                f"qkv_mode=QKVMode.SEPARATE_QKV ('{QKVMode.SEPARATE_QKV.value}'), "
+                f"got QKVMode.{self.qkv_mode.name} ('{self.qkv_mode.value}'); a "
+                "fused QKV projection already quantizes its input once."
+            )
+        if share_qkv_input_quant and self.force_dynamic_quantization:
+            # A dynamic scale is derived per Linear per call, so there is no
+            # shared calibrated scale to quantize against.
+            raise ValueError(
+                "Attention: share_qkv_input_quant is incompatible with "
+                "force_dynamic_quantization; sharing requires a static "
+                "calibrated input_scale."
+            )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
 
@@ -402,10 +424,82 @@ class Attention(nn.Module):
             kv_source = (
                 encoder_hidden_states if encoder_hidden_states is not None else hidden_states
             )
+            if self._can_share_qkv_quantize(hidden_states, encoder_hidden_states):
+                hidden_states = self._static_quantize_fp8(hidden_states, self.to_q.input_scale)
+                kv_source = hidden_states
             q = self.to_q(hidden_states)
             k = self.to_k(kv_source)
             v = self.to_v(kv_source)
         return q, k, v
+
+    def _shares_qkv_input_quant(self) -> bool:
+        """Config-only half of the condition, so post_load_weights() can reuse it."""
+        if not self.share_qkv_input_quant:
+            return False
+        projections = (self.to_q, self.to_k, self.to_v)
+        return all(
+            p.has_fp8_qdq
+            and p.input_scale is not None
+            and not p.force_dynamic_quantization
+            # A quantization method may run a given call in higher precision
+            # than its checkpoint recipe -- Cosmos3 does this on the outer
+            # denoising steps -- by publishing ``high_precision``. Quantizing
+            # the shared activation here would hand such a call a tensor it
+            # must not receive, so leave it in its input dtype.
+            and not getattr(p.quant_method, "high_precision", False)
+            for p in projections
+        )
+
+    def _can_share_qkv_quantize(self, hidden_states, encoder_hidden_states) -> bool:
+        """Whether q/k/v can consume one quantized activation.
+
+        Reads no tensor values: that would sync the device every forward and make
+        the graph data-dependent. Scale equality is checked at load instead.
+        Cross-attention feeds k/v from a different tensor, so only self-attention
+        has a single activation to share.
+        """
+        return (
+            encoder_hidden_states is None
+            and self._shares_qkv_input_quant()
+            and not isinstance(hidden_states, Fp4QuantizedTensor)
+            and hidden_states.dtype != torch.float8_e4m3fn
+        )
+
+    @staticmethod
+    def _static_quantize_fp8(x: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
+        """Quantize once so each projection can skip its own quantize pass.
+
+        FP8QDQLinearMethod.apply passes a pre-quantized input straight through.
+        The reshapes are views on contiguous activations, not copies.
+        """
+        shape = x.shape
+        x2d = x.reshape(-1, shape[-1]) if x.dim() > 2 else x
+        qx, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x2d, input_scale)
+        return qx.reshape(shape) if x.dim() > 2 else qx
+
+    def post_load_weights(self) -> None:
+        """Check the shared-activation invariant here, never in forward().
+
+        Each Linear applies its *own* input_scale in the GEMM epilogue, so
+        quantizing with to_q's scale is only correct when all three agree.
+        ModelOpt's self-attention calibration makes that an invariant (q/k/v see
+        the same input distribution), but a checkpoint that violates it would
+        otherwise produce silently wrong output.
+        """
+        if not self._shares_qkv_input_quant():
+            return
+        scales = {name: getattr(self, name).input_scale for name in ("to_q", "to_k", "to_v")}
+        mismatched = {
+            name: scale.item()
+            for name, scale in scales.items()
+            if not torch.equal(scale, scales["to_q"])
+        }
+        if mismatched:
+            raise ValueError(
+                "q/k/v share one quantized activation, so they must carry the "
+                f"same calibrated input_scale; got to_q={scales['to_q'].item()} "
+                f"and mismatched {mismatched} at layer_idx={self.layer_idx}"
+            )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
