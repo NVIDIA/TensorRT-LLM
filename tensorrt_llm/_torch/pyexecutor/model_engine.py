@@ -73,6 +73,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..speculative.utils import update_draft_len
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      set_per_request_prefill_cuda_graph_flag,
@@ -1498,13 +1499,6 @@ class PyTorchModelEngine(ModelEngine):
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
 
-        # Capacity profiling runs the scheduler and can leave a shorter dynamic
-        # draft length behind. Generic warmup requests use the maximum buffer
-        # width, so re-establish its logical draft length on every warmup.
-        self.runtime_draft_len = (
-            self.max_total_draft_tokens if self.spec_config is not None
-            and not self.spec_config.is_linear_tree else self.max_draft_len)
-
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
@@ -2818,7 +2812,6 @@ class PyTorchModelEngine(ModelEngine):
                               label: str,
                               force_lora_graph: bool,
                               sample_type: Optional[SampleType] = None) -> None:
-            saved_runtime_draft_len = self.runtime_draft_len
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
             # Pin the sampling tier for this pass. maybe_get_cuda_graph reads
@@ -2862,7 +2855,6 @@ class PyTorchModelEngine(ModelEngine):
                                 self.spec_config.spec_dec_mode.use_one_engine())
                             self._update_draft_inference_state_for_warmup(
                                 batch, draft_len > 0, resource_manager)
-                            self.runtime_draft_len = draft_len
                             if self._is_encoder_decoder_model():
                                 prepare_cross_batch(batch, resource_manager)
                             self.forward(batch,
@@ -2870,10 +2862,6 @@ class PyTorchModelEngine(ModelEngine):
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
-                # Generic warmup creates maximum-width draft buffers. Do not
-                # leave the last graph's shorter logical draft length behind
-                # for the subsequent generic warmup passes.
-                self.runtime_draft_len = saved_runtime_draft_len
                 self._force_lora_graph_for_capture = None
                 self._capture_sample_type = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
@@ -3326,6 +3314,12 @@ class PyTorchModelEngine(ModelEngine):
         result = ScheduledRequests()
         result.reset_context_requests(ctx_requests)
         result.generation_requests = gen_requests
+        update_draft_len(
+            self,
+            result,
+            draft_len=(self.max_draft_len if self.spec_config is None
+                       or self.spec_config.is_linear_tree else
+                       self.max_total_draft_tokens))
         return result
 
     def _create_cuda_graph_warmup_request(
@@ -3521,6 +3515,7 @@ class PyTorchModelEngine(ModelEngine):
             if not self._add_cross_dummy_requests(result.all_requests(),
                                                   resource_manager):
                 return None
+        update_draft_len(self, result, draft_len=draft_len)
         return result
 
     def _get_max_encoder_output_len(self,

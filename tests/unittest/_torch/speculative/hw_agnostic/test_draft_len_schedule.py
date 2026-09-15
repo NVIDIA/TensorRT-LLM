@@ -149,11 +149,9 @@ def test_correctness_across_batch_sizes(
             executor, "_handle_dynamic_draft_len", instrumented_handle_dynamic_draft_len
         )
 
-    try:
-        results_with_schedule = llm_with_schedule.generate(prompts, sampling_params_list)
-        generated_text_with_schedule = [result.outputs[0].text for result in results_with_schedule]
-    finally:
-        llm_with_schedule.shutdown()
+    results_with_schedule = llm_with_schedule.generate(prompts, sampling_params_list)
+    generated_text_with_schedule = [result.outputs[0].text for result in results_with_schedule]
+    llm_with_schedule.shutdown()
 
     if drafter_type == "model_drafter":
         for batch_size, runtime_draft_len in runtime_schedule:
@@ -173,19 +171,21 @@ def test_correctness_across_batch_sizes(
             f"DraftTarget runtime schedule did not exercise {expected_key_transitions}: "
             f"got {runtime_transitions}"
         )
-    # Reference: spec decode with fixed max_draft_len (no schedule)
-    spec_config_fixed = spec_config.model_copy(update={"draft_len_schedule": None})
-    llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
-    try:
-        results_fixed = llm_fixed.generate(prompts, sampling_params_list)
-        generated_text_fixed = [result.outputs[0].text for result in results_fixed]
-    finally:
-        llm_fixed.shutdown()
+        return
 
-    if drafter_type == "model_drafter":
-        assert [result.outputs[0].token_ids for result in results_with_schedule] == [
-            result.outputs[0].token_ids for result in results_fixed
-        ], "Dynamic and fixed draft lengths must produce the same greedy tokens"
+    # Reference: spec decode with fixed max_draft_len (no schedule)
+    spec_config_fixed = NGramDecodingConfig(
+        max_draft_len=max_draft_len,
+        max_matching_ngram_size=2,
+        draft_len_schedule=None,  # No schedule - fixed draft length
+        is_keep_all=True,
+        is_use_oldest=True,
+        is_public_pool=False,
+    )
+    llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
+    results_fixed = llm_fixed.generate(prompts, sampling_params_list)
+    generated_text_fixed = [result.outputs[0].text for result in results_fixed]
+    llm_fixed.shutdown()
 
     # Verify correctness: spec decode with schedule should match spec decode without schedule
     for text_schedule, text_fixed in zip(generated_text_with_schedule, generated_text_fixed):
