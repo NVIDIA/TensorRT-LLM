@@ -9,7 +9,7 @@ BackendKind = Literal["claude-code", "codex"]
 SessionMode = Literal["stateless", "persistent"]
 
 CLAUDE_CODE_DEFAULT_MODEL = os.environ.get("CLAUDE_CODE_DEFAULT_MODEL", "claude-opus-5")
-CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol")
+CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6-astra")
 
 
 @dataclass(frozen=True)
