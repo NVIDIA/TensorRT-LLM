@@ -132,7 +132,8 @@ def test_cuda_graph_padding_dummy_slot_count_tracks_reachable_draft_lengths():
     )
     assert _get_num_cuda_graph_padding_dummy_slots(dynamic, 5) == 2
     assert _get_num_cuda_graph_padding_dummy_slots(dynamic, 32) == 3
-    assert _get_num_cuda_graph_padding_dummy_slots(dynamic, 64) == 4
+    # The implicit tier above the largest key is floored at 1, not 0.
+    assert _get_num_cuda_graph_padding_dummy_slots(dynamic, 64) == 3
 
     repeated = MTPDecodingConfig(
         max_draft_len=4,
@@ -1643,7 +1644,7 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
                 draft_len_schedule={1: 4, 2: 2, 3: 1},
             ),
             True,
-            576,
+            512,
         ),
     ],
 )
@@ -2499,14 +2500,14 @@ def test_v2_hybrid_reserves_every_persistent_dummy_slot():
         enable_attention_dp=True,
     )
     try:
-        runtime_draft_lengths = [4, 2, 1, 0]
+        runtime_draft_lengths = [4, 2, 1]
         cuda_graph_dummy_ids = [
             CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len for draft_len in runtime_draft_lengths
         ]
         request_ids = [101, 102, 103, 104]
 
-        assert mgr._num_reserved_dummy_slots == 5
-        assert mgr.index_mapper.num_free_slots() == len(request_ids) + 5
+        assert mgr._num_reserved_dummy_slots == 4
+        assert mgr.index_mapper.num_free_slots() == len(request_ids) + 4
 
         assert (
             mgr.add_dummy_requests(request_ids, token_nums=[1] * len(request_ids), is_gen=False)
