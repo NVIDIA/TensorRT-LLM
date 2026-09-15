@@ -5,7 +5,7 @@ benchmarks and profiles it with TensorRT-LLM's
 `tensorrt_llm/serve/scripts/benchmark_serving.py`, and writes a report
 whose headline is the **main performance bottleneck**.
 
-All roles run on the **Claude Code** backend:
+By default, all roles run on the **Claude Code** backend:
 
 ```
 benchmarker ──▶ projector ──▶ analyzer ──▶ reporter
@@ -91,6 +91,9 @@ agents:
     projector: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
     analyzer: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
 ```
+
+Set `casebook.enabled: false` for a control run that hides and blocks the
+`perf-optimization-casebook` skill. It is enabled by default.
 
 | Field | Required | Notes |
 | --- | --- | --- |

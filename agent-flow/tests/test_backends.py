@@ -31,6 +31,7 @@ from agent_flow.backends.codex import (
     _extract_final_response,
     _mcp_to_codex_content,
 )
+from agent_flow.config import BackendConfig
 from agent_flow.types import (
     AgentTextEvent,
     CompactBoundaryEvent,
@@ -346,6 +347,14 @@ class TestCreateBackend:
     def test_factory_rejects_unknown_backends(self):
         with pytest.raises(ValueError, match="Unknown backend"):
             create_backend("unknown")
+
+    def test_factory_passes_disabled_skills(self):
+        config = BackendConfig(
+            kind="codex",
+            model="gpt-6-astra",
+            disabled_skills=("perf-optimization-casebook",),
+        )
+        assert create_backend(config)._disabled_skills == ("perf-optimization-casebook",)
 
 
 class TestClaudeBackend:
@@ -1035,6 +1044,15 @@ class TestClaudeBackendCreateClient:
         )
         assert options.effort == "medium"
 
+    async def test_create_client_denies_disabled_skills(self, monkeypatch):
+        options = await self._capture_options(
+            monkeypatch,
+            backend=ClaudeCodeBackend(
+                disabled_skills=("perf-optimization-casebook",),
+            ),
+        )
+        assert options.disallowed_tools == ["Skill(perf-optimization-casebook)"]
+
     async def test_workflow_tool_marks_completion_and_installs_stop_hook(self, monkeypatch):
         completion = ToolCompletion({"append_progress"})
 
@@ -1566,6 +1584,19 @@ class TestCodexBackend:
         assert config.kwargs["codex_bin"] == "/bin/codex"
         assert config.kwargs["experimental_api"] is True
         assert "launch_args_override" not in config.kwargs
+
+    async def test_enter_disables_skills_in_codex_config(self, monkeypatch):
+        _install_codex_sdk_modules()
+        monkeypatch.setattr(codex_mod, "_resolve_codex_bin", lambda: "/bin/codex")
+        monkeypatch.setattr(CodexBackend, "_install_server_request_handler", lambda self: None)
+
+        backend = CodexBackend(disabled_skills=("perf-optimization-casebook",))
+        async with backend:
+            config = backend._codex.config
+
+        assert config.kwargs["config_overrides"] == (
+            'skills.config=[{name="perf-optimization-casebook", enabled=false}]',
+        )
 
     def test_extract_final_response_prefers_final_answer_phase(self):
         sdk = _install_codex_sdk_modules()

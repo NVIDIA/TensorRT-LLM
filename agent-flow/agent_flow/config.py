@@ -19,6 +19,7 @@ class BackendConfig:
     # Provider reasoning tier. ``None`` retains the backend's historical
     # maximum-effort default.
     reasoning_effort: str | None = None
+    disabled_skills: tuple[str, ...] = ()
     tools: list[Any] | None = None
     # Backend-specific hook configuration. Currently only the ``claude-code``
     # backend consumes this — it is forwarded verbatim to the Claude Agent

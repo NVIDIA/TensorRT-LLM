@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import importlib.util
 import inspect
+import json
 import os
 import shlex
 import shutil
@@ -822,6 +823,13 @@ def _codex_stop_hooks(state_path: Path) -> dict[str, Any]:
     }
 
 
+def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
+    if not names:
+        return ()
+    entries = ", ".join(f"{{name={json.dumps(name)}, enabled=false}}" for name in names)
+    return (f"skills.config=[{entries}]",)
+
+
 def _relax_service_tier_on_module(module: Any) -> int:
     """Rewrite ``ServiceTier`` references to ``str`` on every pydantic model in ``module``.
 
@@ -900,10 +908,15 @@ def _patch_codex_sdk_service_tier() -> None:
 
 
 class CodexBackend(Backend):
-    def __init__(self, reasoning_effort: str | None = None) -> None:
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        disabled_skills: tuple[str, ...] = (),
+    ) -> None:
         self._codex = None
         self._default_approval_handler: Callable[..., dict[str, Any]] | None = None
         self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._disabled_skills = disabled_skills
 
     def version(self) -> str:
         return _codex_backend_version()
@@ -922,6 +935,7 @@ class CodexBackend(Backend):
             config=CodexConfig(
                 codex_bin=codex_bin,
                 experimental_api=True,
+                config_overrides=_disabled_skills_override(self._disabled_skills),
             )
         )
         await self._codex.__aenter__()

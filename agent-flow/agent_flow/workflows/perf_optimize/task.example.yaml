@@ -45,6 +45,10 @@ trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
 #   #       url: https://example.test/mcp
 #   #       headers: {X-Environment: staging}
 
+# Optional A/B switch. The optimization casebook is enabled by default.
+# casebook:
+#   enabled: false
+
 # Optional: the benchmark operating point(s) driven by
 # benchmark_serving.py. Every measurement in the campaign (baseline,
 # evaluator, final verification) replays the same point(s).

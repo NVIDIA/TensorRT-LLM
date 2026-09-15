@@ -103,6 +103,14 @@ SOL_OPTIONAL_STR_FIELDS: tuple[str, ...] = ("gpu",)
 SOL_FIELDS: tuple[str, ...] = (SOL_ENABLED_FIELD, *SOL_OPTIONAL_STR_FIELDS)
 SOL_DEFAULTS: dict[str, Any] = {SOL_ENABLED_FIELD: True}
 
+CASEBOOK_FIELD = "casebook"
+CASEBOOK_ENABLED_FIELD = "enabled"
+CASEBOOK_DEFAULTS: dict[str, Any] = {CASEBOOK_ENABLED_FIELD: True}
+CASEBOOK_SKILL_NAMES = (
+    "perf-optimization-casebook",
+    "trtllm-agent-toolkit:perf-optimization-casebook",
+)
+
 # The pre-rename spelling of the ``sol`` block (when the projector still
 # cross-checked a dlsim checkout) — rejected with an actionable error so
 # a stale task.yaml fails loudly instead of having its projector settings
@@ -192,6 +200,7 @@ KNOWN_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "profile",
         SLURM_ENVIRONMENT_FIELD,
         SOL_FIELD,
+        CASEBOOK_FIELD,
         AGENTS_FIELD,
     )
 )
@@ -558,6 +567,14 @@ def load_and_validate_task_yaml(
             errors.append("'profile.nsys_iter_range' must be a non-empty string (e.g. \"100-150\")")
     _validate_profile_ranks(profile, methods, errors)
 
+    casebook = _validate_mapping_block(data, CASEBOOK_FIELD, errors)
+    unknown = set(casebook) - {CASEBOOK_ENABLED_FIELD}
+    if unknown:
+        errors.append(f"'{CASEBOOK_FIELD}' has unknown field(s) {sorted(unknown)}")
+    enabled = casebook.get(CASEBOOK_ENABLED_FIELD)
+    if CASEBOOK_ENABLED_FIELD in casebook and not isinstance(enabled, bool):
+        errors.append(f"'{CASEBOOK_FIELD}.{CASEBOOK_ENABLED_FIELD}' must be a boolean")
+
     if SLURM_ENVIRONMENT_FIELD in data and data[SLURM_ENVIRONMENT_FIELD] is not None:
         slurm_environment = data[SLURM_ENVIRONMENT_FIELD]
         if not isinstance(slurm_environment, dict):
@@ -679,6 +696,7 @@ def load_and_validate_task_yaml(
             benchmark["concurrency"] = sorted(set(benchmark["concurrency"]))
     data["benchmark"] = {**BENCHMARK_DEFAULTS, **benchmark}
     data["profile"] = {**PROFILE_DEFAULTS, **profile}
+    data[CASEBOOK_FIELD] = {**CASEBOOK_DEFAULTS, **casebook}
     # ``sol`` is materialized even when the user never wrote the block —
     # the projector is on by default, so the resolved spec has to state
     # the gate rather than leave it to a reader's assumption.
@@ -758,6 +776,14 @@ def sol_enabled(data: Mapping[str, Any]) -> bool:
     return True
 
 
+def casebook_enabled(data: Mapping[str, Any]) -> bool:
+    """Return whether agents may consult the optimization casebook."""
+    casebook = data.get(CASEBOOK_FIELD)
+    if isinstance(casebook, Mapping):
+        return casebook.get(CASEBOOK_ENABLED_FIELD, True) is not False
+    return True
+
+
 def is_curve_mode(data: Mapping[str, Any]) -> bool:
     """True iff ``benchmark.concurrency`` is a list (Pareto-curve mode).
 
@@ -832,6 +858,10 @@ def dump_task_yaml(data: Mapping[str, Any]) -> str:
 
 __all__ = [
     "BENCHMARK_DEFAULTS",
+    "CASEBOOK_DEFAULTS",
+    "CASEBOOK_ENABLED_FIELD",
+    "CASEBOOK_FIELD",
+    "CASEBOOK_SKILL_NAMES",
     "EXTRA_LLM_API_OPTIONS_FIELD",
     "PROFILE_DEFAULTS",
     "PROFILE_RANKS_FIELD",
@@ -850,6 +880,7 @@ __all__ = [
     "SOL_OPTIONAL_STR_FIELDS",
     "VALID_PROFILE_METHODS",
     "TaskSchemaError",
+    "casebook_enabled",
     "concurrency_points",
     "dump_task_yaml",
     "cluster_ssh",

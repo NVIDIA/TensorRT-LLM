@@ -523,6 +523,17 @@ def test_projector_and_analyzer_can_use_codex(tmp_path):
         workflow.close()
 
 
+def test_casebook_disable_reaches_every_backend(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text("casebook: {enabled: false}\n", encoding="utf-8")
+    try:
+        workflow._configure_agents()
+        for role in ("benchmarker", "projector", "analyzer", "reporter"):
+            assert getattr(workflow, role).config.backend.disabled_skills
+    finally:
+        workflow.close()
+
+
 def test_no_role_wires_an_external_mcp_server(tmp_path):
     """No role ships a hosted endpoint.
 

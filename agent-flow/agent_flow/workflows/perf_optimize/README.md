@@ -219,6 +219,9 @@ agents:
     analyzer: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
 ```
 
+For an A/B run, set `casebook.enabled: false` in the control task. The
+optimization casebook remains enabled when the block is omitted.
+
 Omitting `agents` preserves the historical assignment. On resume, the
 checkpointed workspace's `task.yaml` remains authoritative, so a different
 new `--task` cannot change models midway through a campaign.

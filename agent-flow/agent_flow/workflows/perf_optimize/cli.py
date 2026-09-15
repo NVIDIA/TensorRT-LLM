@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
+from agent_flow.workflows.perf_analyze.task_schema import casebook_enabled
 
 from .disagg import has_disagg
 from .prompts import build_perf_optimize_prompts
@@ -140,6 +141,7 @@ def main(argv: list[str] | None = None) -> None:
         kernel_coverage=kernel_coverage(task_data),
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
+        include_casebook=casebook_enabled(task_data),
     )
     with PerfOptimizeWorkflow(
         workspace=args.workspace,
