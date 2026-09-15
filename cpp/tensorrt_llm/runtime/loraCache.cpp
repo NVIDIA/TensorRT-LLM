@@ -337,6 +337,11 @@ std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
         mCacheMap.erase(taskIdsToEvict.at(i));
     }
     mCachePageManager->releasePages(pageIdsToEvict);
+    if (mEnableStats)
+    {
+        mNumTasksEvicted += taskIdsToEvict.size();
+        mNumPagesEvicted += pageIdsToEvict.size();
+    }
     auto pageIds = mCachePageManager->claimPages(numPages);
     TLLM_CHECK(pageIds.has_value());
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
@@ -490,10 +495,11 @@ SizeType32 LoraCache::determineNumPages(TensorPtr loraConfig) const
 }
 
 LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, BufferManager const& bufferManager)
+    WorldConfig const& worldConfig, BufferManager const& bufferManager, bool enableStats)
     : mPageManagerConfig(pageManagerConfig)
     , mModelConfig(modelConfig)
     , mWorldConfig(worldConfig)
+    , mEnableStats(enableStats)
 {
     mCachePageManager = std::make_unique<LoraCachePageManager>(mPageManagerConfig, bufferManager);
 
@@ -958,6 +964,23 @@ ITensor::SharedConstPtr LoraCache::getPagePtr(size_t pageId) const
 SizeType32 LoraCache::getNumPages() const
 {
     return mPageManagerConfig.getTotalNumPages();
+}
+
+SizeType32 LoraCache::getNumAvailablePages() const
+{
+    std::lock_guard<std::mutex> pageLock(mPagesMutex);
+    return mCachePageManager->numAvailablePages();
+}
+
+std::pair<SizeType32, SizeType32> LoraCache::getNumInProgressAndDoneTasks() const
+{
+    std::lock_guard<std::mutex> cacheLock(mCacheMutex);
+    return {static_cast<SizeType32>(mInProgressTasks.size()), static_cast<SizeType32>(mDoneTasks.size())};
+}
+
+std::pair<std::uint64_t, std::uint64_t> LoraCache::getAndResetEvictionCounters()
+{
+    return {mNumTasksEvicted.exchange(0), mNumPagesEvicted.exchange(0)};
 }
 
 bool LoraCache::fits(TensorPtr config) const

@@ -43,6 +43,7 @@ class ADPIterStatsRecord:
     req_stats: Optional[List[RequestStats]]
     kv_iter_stats: Optional[Dict[int, object]]
     attention_dp_rank: int
+    peft_iter_stats: Optional[object] = None
     # Per-loop CPU wall and GPU forward time captured on rank 0 alongside
     # the IterationStats at queue time. Currently broadcast unchanged to all
     # rank rows during fanout (true per-rank timing would require widening
@@ -74,6 +75,7 @@ class ADPIterStatsBuffer:
         self._rank0_req_stats: Dict[int, Optional[List[RequestStats]]] = {}
         # Rank 0 only: KV iteration stats captured with pending IterationStats.
         self._rank0_kv_iter_stats: Dict[int, Optional[Dict[int, object]]] = {}
+        self._rank0_peft_iter_stats: Dict[int, Optional[object]] = {}
         # Rank 0 only: per-loop CPU and GPU timings captured with the
         # IterationStats. Broadcast to all rank rows at fanout (see
         # _make_rank_iter_stats / finalize).
@@ -108,6 +110,7 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
+        peft_iter_stats: Optional[object] = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
@@ -126,6 +129,7 @@ class ADPIterStatsBuffer:
             self._rank0_iter_stats[iter_id] = stats
             self._rank0_req_stats[iter_id] = req_stats
             self._rank0_kv_iter_stats[iter_id] = kv_iter_stats
+            self._rank0_peft_iter_stats[iter_id] = peft_iter_stats
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
             self._rank0_prev_device_step_time_ms[iter_id] = prev_device_step_time_ms
             self._rank0_gpu_forward_time_ms[iter_id] = gpu_forward_time_ms
@@ -160,6 +164,7 @@ class ADPIterStatsBuffer:
         self._rank0_iter_stats.pop(iter_id, None)
         self._rank0_req_stats.pop(iter_id, None)
         self._rank0_kv_iter_stats.pop(iter_id, None)
+        self._rank0_peft_iter_stats.pop(iter_id, None)
         self._rank0_host_step_time_ms.pop(iter_id, None)
         self._rank0_prev_device_step_time_ms.pop(iter_id, None)
         self._rank0_gpu_forward_time_ms.pop(iter_id, None)
@@ -291,6 +296,7 @@ class ADPIterStatsBuffer:
 
             req_stats = self._rank0_req_stats.get(iter_stats_iter)
             kv_iter_stats = self._rank0_kv_iter_stats.get(iter_stats_iter)
+            peft_iter_stats = self._rank0_peft_iter_stats.get(iter_stats_iter)
             host_step_time_ms = self._rank0_host_step_time_ms.get(iter_stats_iter)
             prev_device_step_time_ms = self._rank0_prev_device_step_time_ms.get(iter_stats_iter)
             gpu_forward_time_ms = self._rank0_gpu_forward_time_ms.get(iter_stats_iter)
@@ -302,6 +308,7 @@ class ADPIterStatsBuffer:
                         stats=self._make_rank_iter_stats(rank0_stats, rank_state),
                         req_stats=req_stats if rank == 0 else None,
                         kv_iter_stats=kv_iter_stats if rank == 0 else None,
+                        peft_iter_stats=peft_iter_stats if rank == 0 else None,
                         attention_dp_rank=rank,
                         host_step_time_ms=host_step_time_ms,
                         prev_device_step_time_ms=prev_device_step_time_ms,
