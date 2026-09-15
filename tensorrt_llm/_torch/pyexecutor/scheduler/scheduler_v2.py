@@ -15,7 +15,7 @@
 
 import enum
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
@@ -249,6 +249,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+
+        # Set on the disaggregated path only; see set_in_transmission_predicate.
+        self._is_in_transmission: Optional[Callable[[LlmRequest], bool]] = None
+
+    def set_in_transmission_predicate(
+        self, predicate: Optional[Callable[[LlmRequest], bool]]
+    ) -> None:
+        """Register the predicate that reports disagg transfer ownership.
+
+        Disaggregated KV transfer addresses a peer's pages by GPU pool slot id,
+        which stays valid only while the owning cache is active. It is consulted
+        when picking an eviction or recompute-pause victim, and nowhere else, so
+        registering it does not change which requests are scheduled.
+        """
+        self._is_in_transmission = predicate
 
     @property
     def scheduling_state_range(
@@ -1329,6 +1344,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.free_resources(req)
 
+    def _is_transfer_pinned(self, req: LlmRequest) -> bool:
+        """True while the disagg fabric may still read or write this request's KV.
+
+        Suspending unlocks the pages, which makes them free to migrate to
+        another cache tier, and recompute pause frees them outright. Either one
+        invalidates the slot ids the peer is addressing.
+        """
+        return self._is_in_transmission is not None and self._is_in_transmission(req)
+
     def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
         """A started request whose KV cache is still active on GPU.
 
@@ -1339,12 +1363,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         if not self._is_started_request(req):
             return False
+        if self._is_transfer_pinned(req):
+            return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
     def _is_recompute_pause_candidate(
         self, req: LlmRequest, inflight_request_ids: set[int]
     ) -> bool:
         if req.request_id in inflight_request_ids:
+            return False
+        if self._is_transfer_pinned(req):
             return False
         # is_generation_in_progress_state also includes GENERATION_TO_COMPLETE,
         # which is outside the schedulable range and may still be finalizing.
