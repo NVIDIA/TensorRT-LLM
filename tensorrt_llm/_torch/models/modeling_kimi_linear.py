@@ -974,6 +974,11 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
 _K3_ROUTED_EXPERT_KEY_PREFIXES = ("language_model.model.", "model.", "")
 _K3_ROUTED_EXPERT_KEY_SUFFIXES = ("block_sparse_moe.experts", "mlp.experts")
 
+# The subset of the above that can be a real module path. ``exclude_modules``
+# matches with wildcards and walks ancestor prefixes, so an empty prefix would
+# widen what matches instead of just missing, as it does in the dict lookup.
+_K3_ROUTED_EXPERT_MODULE_PREFIXES = ("language_model.model.", "model.")
+
 # Routed-expert quantization used when the checkpoint declares nothing per
 # layer. The original ``moonshotai/Kimi-K3`` ships a compressed-tensors
 # ``mxfp4-pack-quantized`` config with no ModelOpt per-layer entries, and that
@@ -1246,7 +1251,28 @@ class KimiK3MoERuntime(nn.Module):
         declares nothing per layer and keeps the historical
         ``W4A8_MXFP4_MXFP8`` default. Reading the checkpoint instead of
         hardcoding is what lets one code path serve both.
+
+        An exclusion outranks the per-layer entry and the default below:
+        ``create_weights`` treats an override as authoritative over anything
+        ``__post_init__`` wrote, so this return value stands in for both
+        quantization passes and exclusion is the one that runs second. It is
+        matched as a pattern, so it is asked only about real module names.
         """
+        quant_config = model_config.quant_config
+        if quant_config is not None and any(
+            quant_config.is_module_excluded_from_quantization(
+                f"{prefix}layers.{layer_idx}.{suffix}"
+            )
+            for prefix in _K3_ROUTED_EXPERT_MODULE_PREFIXES
+            for suffix in _K3_ROUTED_EXPERT_KEY_SUFFIXES
+        ):
+            logger.debug(
+                "Kimi K3 layer %d routed experts: excluded from quantization, "
+                "keeping them unquantized",
+                layer_idx,
+            )
+            return QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+
         per_layer = getattr(model_config, "quant_config_dict", None)
         if per_layer:
             for prefix in _K3_ROUTED_EXPERT_KEY_PREFIXES:

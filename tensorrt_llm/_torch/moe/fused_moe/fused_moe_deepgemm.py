@@ -756,19 +756,12 @@ def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
 class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
     """``deepgemm.cuda.grouped_gemm.fp8_block_scales``.
 
-    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103. One
-    class carries the identity and the whole contract: construction, the
-    pooled memory buffers, workspace sizing, eligibility, quantization, and
-    ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
-    a backend supports a single quantization format -- an abstract parent
-    would carry no identity, implement nothing, and have one subclass.
+    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103. One class
+    carries the identity and the whole contract, which is the shape
+    ``MOE_DEVELOPER_GUIDE.md`` asks for while a backend serves a single
+    quantization format.
 
-    The kernel segment is absent from the name because the ``quant`` segment
-    already separates this one from the MegaMoE implementation, with which it
-    shares provider and technique.
-
-    ``DeepGemmFusedMoE`` below is an alias onto this class, so the
-    pre-identity name still resolves for the call sites that use it.
+    ``DeepGemmFusedMoE`` below is an alias onto this class.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -794,9 +787,9 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
         doc="DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103.",
     )
 
-    # Taken off the descriptor rather than restated. The scheduler reads these
-    # three attributes and the registry publishes the descriptor; a second
-    # literal would let what is published and what is executed drift apart.
+    # Taken off the descriptor, not restated: the scheduler reads these three
+    # attributes and the registry publishes the descriptor, so a second literal
+    # would let the two drift apart.
     scheduler_kind = descriptor.scheduler_kind
     capabilities = descriptor.capabilities
     input_requirement = descriptor.input_requirement
@@ -1199,8 +1192,5 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
         return final_hidden_states
 
 
-# The pre-identity name, kept as an alias rather than a base class: the
-# ``moe_backend="DEEPGEMM"`` call sites, the ``issubclass`` dispatch in
-# ``create_moe.py``, and the comments across the MoE tree that still say
-# ``DeepGemmFusedMoE`` all mean the class above.
+# An alias, not a base class, so there is no second class to keep in step.
 DeepGemmFusedMoE = DeepgemmCudaFp8BlockScalesImpl
