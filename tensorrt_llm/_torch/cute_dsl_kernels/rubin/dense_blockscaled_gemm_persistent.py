@@ -3209,6 +3209,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
             self.fallback_cluster_shape_mn,
             preferred_max_active_clusters,
             fallback_max_active_clusters,
+            self.swizzle_size,
+            self.raster_order == "m",
         )
 
         self.buffer_align_bytes = 1024

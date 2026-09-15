@@ -30,7 +30,8 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import module as 
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     project_sparse_attn_output,
 )
-from tensorrt_llm._torch.attention.mla import MLA
+from tensorrt_llm._torch.attention.mla import MLA, _is_cute_dsl_fp8_bmm_available
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
 from tensorrt_llm._utils import get_sm_version
@@ -66,6 +67,7 @@ def calculate_reference_deepseek_v4_o_proj(
     qk_rope_head_dim,
     device,
     is_fp8: bool = False,
+    quantize_o_a_input: bool = False,
 ):
     """
     Reference implementation for DeepSeek-V4 output projection based on ref/model.py.
@@ -80,6 +82,7 @@ def calculate_reference_deepseek_v4_o_proj(
         qk_rope_head_dim: Dimension of positional part
         device: Device to run on
         is_fp8: Whether test fp8 or bf16
+        quantize_o_a_input: Whether o_a_proj consumes block-scaled FP8 input
 
     Returns:
         output: [num_tokens, hidden_size] projected output
@@ -92,7 +95,7 @@ def calculate_reference_deepseek_v4_o_proj(
 
     # Reshape for grouped projection
     attn_out_grouped = attn_out_latent.view(num_tokens, n_local_groups, -1)
-    if is_fp8:
+    if quantize_o_a_input:
         attn_out_grouped = _per_token_fp8_quant_dequant(
             attn_out_grouped.transpose(0, 1).contiguous()
         ).transpose(0, 1)
@@ -124,6 +127,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
+    sm_version = get_sm_version()
 
     # Model configuration matching the reference model
     num_heads = 64
@@ -184,7 +188,10 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         pretrained_config=pretrained_config,
         sparse_attention_config=sparse_config,
         quant_config=quant_config,
-        use_cute_dsl_blockscaling_mm=dtype_str == "fp8",
+        use_cute_dsl_blockscaling_mm=(
+            dtype_str == "fp8"
+            and (sm_version in (100, 103) or (sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE))
+        ),
     )
 
     # Setup positional embedding params
@@ -219,6 +226,12 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     assert not hasattr(mla, "v_b_proj")
     assert not hasattr(mla, "o_proj")
 
+    has_native_fp8_o_proj = _is_cute_dsl_fp8_bmm_available(sm_version)
+    if dtype_str == "fp8" and has_native_fp8_o_proj:
+        assert mla.o_a_proj.dtype == torch.float8_e4m3fn
+        assert mla.o_a_proj_dequant is None
+        assert not mla.use_cute_dsl_blockscaling_bmm
+
     # Initialize weights
     nn_init_std = 0.02
     with torch.no_grad():
@@ -245,12 +258,8 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             fp8_a_weight = fp8_a_weight.reshape(n_local_groups, o_lora_rank, dim)
             mla.o_a_proj.data = fp8_a_weight
             mla.o_a_proj_scale.data = fp8_a_scale
-            # mla.o_a_proj_dequant is None for DSv4 on SM100: PR #14254
-            # decouples the FP8-native o_a_proj path from
-            # use_cute_dsl_blockscaling_bmm, so DSv4 unconditionally uses the
-            # fused inv-RoPE + FP8 quant + cute-dsl BMM chain and never needs
-            # the bf16-dequant fallback buffer. The reference path below uses
-            # o_a_proj_bf16 directly.
+            if not has_native_fp8_o_proj:
+                mla.o_a_proj_dequant.data = o_a_proj_bf16
 
         # Initialize o_b_proj weights
         if dtype_str == "bf16":
@@ -289,16 +298,19 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         o_a_proj_ref = mla.o_a_proj.data
         o_b_proj_weight_ref = mla.o_b_proj.weight.data
     else:
-        # Match the FP8-native o_a_proj path: the runtime BMM consumes
-        # quantized o_a_proj plus block scales, not the original BF16 weight.
-        o_a_proj_ref = (
-            weight_dequant(
-                fp8_a_weight.reshape(-1, dim).contiguous(),
-                fp8_a_scale.contiguous(),
+        if has_native_fp8_o_proj:
+            # Match the native path, which consumes the quantized weight and
+            # its block scales rather than the original BF16 values.
+            o_a_proj_ref = (
+                weight_dequant(
+                    fp8_a_weight.reshape(-1, dim).contiguous(),
+                    fp8_a_scale.contiguous(),
+                )
+                .bfloat16()
+                .reshape(o_a_proj_bf16.shape)
             )
-            .bfloat16()
-            .reshape(o_a_proj_bf16.shape)
-        )
+        else:
+            o_a_proj_ref = o_a_proj_bf16
         o_b_proj_weight_ref = fp8_b_weight_dequant
 
     freqs_cis = precompute_freqs_cis(
@@ -321,6 +333,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         qk_rope_head_dim=qk_rope_head_dim,
         device=device,
         is_fp8=dtype_str == "fp8",
+        quantize_o_a_input=dtype_str == "fp8" and has_native_fp8_o_proj,
     )
 
     # Validate output shapes

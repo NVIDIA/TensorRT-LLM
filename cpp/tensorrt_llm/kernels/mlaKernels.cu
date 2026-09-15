@@ -406,15 +406,16 @@ inline __device__ void dequantCopy(
 
 // `kOutputFp8Q`: when true, write the rotated Q rope segment directly to
 // `quant_q_buf` as FP8 (scaled by `*quant_scale_qkv`) and skip the bf16 STG to
-// `q_ptr`. Companion: `deepseek_v4_q_norm_fused_fp8` pre-fills the nope segment
-// of `quant_q_buf`, so the standalone quantizeCopyInputToFp8Kernel can be
-// dropped. `quant_q_buf`/`quant_scale_qkv`/bmm_scale outputs are unused when
-// `kOutputFp8Q == false`.
+// `q_ptr`. `deepseek_v4_q_norm_fused_fp8` can pre-fill the nope segment for
+// this kernel to append RoPE, while the q_b fusion can pre-fill the complete
+// rotated Q and set `q_rope_applied` to preserve it. Both paths drop the
+// standalone quantizeCopyInputToFp8Kernel. `quant_q_buf`/`quant_scale_qkv` and
+// bmm-scale outputs are unused when `kOutputFp8Q == false`.
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer, bool kOutputFp8Q = false>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
     KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
     int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode,
+    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode, bool q_rope_applied,
     __nv_fp8_e4m3* quant_q_buf = nullptr, float const* quant_scale_qkv = nullptr, float* bmm1_scale_out = nullptr,
     float* bmm2_scale_out = nullptr, float const* dequant_scale_q = nullptr, float const* dequant_scale_kv = nullptr,
     float const* quant_scale_o = nullptr, float host_bmm1_scale = 1.0f)
@@ -501,19 +502,24 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
             float2 const* rotary_coef_cache_buffer
                 = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
-            VecT q, k;
+            // When q_rope_applied is true, Q is already complete in the FP8
+            // output buffer. Zero-initialize the unused Q fragment so the
+            // shared GPT-J helper can still rotate K without reading q_pe.
+            VecT q{}, k;
             auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
-            auto src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
-                + (head_size + ROPE_DIM) * head_idx + head_size;
-            // In the absorption mode, we load pe from q_pe instead of q_ptr.
-            T* q_pe_input = q_ptr;
-            if (absorption_mode)
+            if (!q_rope_applied)
             {
-                q_pe_input = q_pe;
-                src_q_global_offset = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
+                auto src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
+                    + (head_size + ROPE_DIM) * head_idx + head_size;
+                // In absorption mode, load the positional segment from q_pe.
+                T* q_pe_input = q_ptr;
+                if (absorption_mode)
+                {
+                    q_pe_input = q_pe;
+                    src_q_global_offset = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
+                }
+                q = *reinterpret_cast<VecT const*>(&q_pe_input[src_q_global_offset + head_dim_idx]);
             }
-
-            q = *reinterpret_cast<VecT const*>(&q_pe_input[src_q_global_offset + head_dim_idx]);
             k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
             // Pack two elements into one for gptj rotary embedding.
@@ -548,14 +554,17 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
                     + head_idx * (nope_head_size_q + ROPE_DIM) + nope_head_size_q + head_dim_idx;
                 auto const dst_k_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                     + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
-                if constexpr (kOutputFp8Q)
+                if (!q_rope_applied)
                 {
-                    quantCopy<T, ELTS_PER_VEC>(
-                        quant_q_buf + dst_q_idx, reinterpret_cast<T const*>(&q), quant_scale_qkv_val);
-                }
-                else
-                {
-                    reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
+                    if constexpr (kOutputFp8Q)
+                    {
+                        quantCopy<T, ELTS_PER_VEC>(
+                            quant_q_buf + dst_q_idx, reinterpret_cast<T const*>(&q), quant_scale_qkv_val);
+                    }
+                    else
+                    {
+                        reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
+                    }
                 }
                 // Only write to k_pe to k_buf in the non-absorption mode.
                 if (!absorption_mode)
@@ -626,7 +635,8 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int* seqKVOffsets, int q_pe_ld, int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale,
     float const* quant_scale_o, float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
-    bool const* helix_is_inactive_rank, bool precomputed_cu_seqlens = false, bool precomputed_fmha_scheduler = false)
+    bool const* helix_is_inactive_rank, int32_t const* helix_local_slots = nullptr, bool precomputed_cu_seqlens = false,
+    bool precomputed_fmha_scheduler = false, bool q_rope_applied = false)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -645,7 +655,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     constexpr auto TOTAL_VEC_PER_HEAD = VECS_PER_HEAD + K_VECS_PER_HEAD;
 
     // Block/Head idx.
-    size_t const head_idx = blockIdx.y;
+    // Remap a compact pre-rotated-Q launch directly onto the K-RoPE and
+    // KV-copy work, skipping the Q-RoPE and Q-nope quantization blocks.
+    size_t const head_idx = q_rope_applied ? blockIdx.y + head_num : blockIdx.y;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
@@ -743,10 +755,18 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             {
                 if (head_idx == head_num)
                 {
-                    // If helix parallelism is being used, only write to KV cache if current rank is active.
-                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
+                    // If helix parallelism is being used, only write to KV cache if this rank
+                    // owns the token's position. With speculative verify groups the per-token
+                    // slot table decides (a group can straddle a page boundary onto two ranks);
+                    // otherwise the per-sequence flag does.
+                    bool const helix_write = helix_local_slots != nullptr
+                        ? helix_local_slots[global_token_idx] >= 0
+                        : (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]);
+                    if (helix_write)
                     {
-                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                        auto const token_kv_idx = helix_local_slots != nullptr
+                            ? helix_local_slots[global_token_idx]
+                            : kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
                         {
                             auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
@@ -806,7 +826,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     }
     else if (head_idx <= head_num + 8)
     {
-        int block_dim = gridDim.y - head_num - 1;
+        constexpr int block_dim = 8;
         int block_id = head_idx - head_num - 1;
         size_t const head_dim_vec_idx = (threadIdx.x % K_VECS_PER_HEAD);
         size_t const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
@@ -834,10 +854,17 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     }
                 }
 
-                // If helix parallelism is being used, only write to KV cache if current rank is active.
-                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
+                // If helix parallelism is being used, only write to KV cache if this rank
+                // owns the token's position (per-token slots for speculative verify
+                // groups, per-sequence flag otherwise; see the Q/K branch above).
+                bool const helix_write = helix_local_slots != nullptr
+                    ? helix_local_slots[global_token_idx] >= 0
+                    : (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx]);
+                if (helix_write)
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                    auto const token_kv_idx = helix_local_slots != nullptr
+                        ? helix_local_slots[global_token_idx]
+                        : kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
                     auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
                     {
@@ -1720,13 +1747,13 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
     {
         if (useFusedFp8Q)
         {
-            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer, true>
-                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
-                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
-                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
-                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
-                    params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
-                    params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer, true><<<grid, 256, 0, stream>>>(
+                params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
+                params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
+                params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode, params.q_rope_applied,
+                quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.dequant_scale_q,
+                params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
         }
         else
         {
@@ -1734,7 +1761,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
                 params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
                 params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
                 params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
-                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode);
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode, params.q_rope_applied);
         }
     }
     else
@@ -1781,13 +1808,13 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 
         if (useFusedFp8Q)
         {
-            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, true>
-                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
-                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
-                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
-                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
-                    params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
-                    params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, true><<<grid, 256, 0, stream>>>(
+                params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
+                params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
+                params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode, params.q_rope_applied,
+                quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.dequant_scale_q,
+                params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
         }
         else
         {
@@ -1795,7 +1822,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
                 params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
                 params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
                 params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
-                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode);
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode, params.q_rope_applied);
         }
     }
 }
@@ -1906,8 +1933,11 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     bool const useFusedFp8Q = params.fuse_q_fp8_in_rope && params.cache_type == KvCacheDataType::FP8
         && params.quant_q_buf != nullptr && params.quant_scale_qkv != nullptr;
 
-    dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
-    if ((params.cache_type == KvCacheDataType::FP8 && !useFusedFp8Q) || params.cache_type == KvCacheDataType::NVFP4)
+    dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)),
+        params.q_rope_applied ? 1 + 8 : params.head_num + 1 + 8);
+    if (!params.q_rope_applied
+        && ((params.cache_type == KvCacheDataType::FP8 && !useFusedFp8Q)
+            || params.cache_type == KvCacheDataType::NVFP4))
         grid.y += params.head_num * 8;
     TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
         "MLA can only support input sequences with the same sequence length.");
@@ -1946,7 +1976,8 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld, params.q_pe_stride, params.cache_type,
         params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, quant_scale_q_eff, params.quant_scale_kv,
         params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale, params.helix_position_offsets,
-        params.helix_is_inactive_rank, params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler);
+        params.helix_is_inactive_rank, params.helix_local_slots, params.precomputed_cu_seqlens,
+        params.precomputed_fmha_scheduler, params.q_rope_applied);
 }
 
 template <typename T, typename KVCacheBuffer>

@@ -142,13 +142,14 @@ statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
 output allocation. DeepSeek-V4's fused epilogue instead uses the optional
-output-preparation hook to create one token-major O-LoRA output tensor. Its
-context- and generation-phase helpers allocate the private FP8 attention and
-scale buffers, then write the O-LoRA result into the corresponding token range.
-The shared MLA custom-op contract exposes exactly one mutable output tensor;
-`_create_outputs()` keeps that tensor in a single-entry list through forward
-and output projection. Phase-specific scratch buffers remain inside the
-DeepSeek-V4 algorithm module and do not widen the generic hook facade.
+output-preparation hook to create one token-major O-LoRA-sized output tensor.
+Its context- and generation-phase helpers allocate the private FP8 attention
+and scale buffers, run both O-LoRA projections, and write the final hidden
+states into the leading columns of that tensor. The shared MLA custom-op
+contract exposes exactly one mutable output tensor; `_create_outputs()` keeps
+that tensor in a single-entry list through forward and output projection.
+Phase-specific scratch buffers remain inside the DeepSeek-V4 algorithm module
+and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
