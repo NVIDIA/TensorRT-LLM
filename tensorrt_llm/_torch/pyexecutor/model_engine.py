@@ -3431,18 +3431,35 @@ class PyTorchModelEngine(ModelEngine):
         # Use max_draft_loop_tokens for capacity estimation to account
         # for the actual KV reservation per request.
         _kv_draft = self.max_draft_loop_tokens
-        available_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=max_seq_len,
-            batch_size=batch_size,
-            max_num_draft_tokens=_kv_draft)
+
+        def get_available_tokens(manager):
+            capacity_batch_size = batch_size
+            if type(manager) is KVCacheManagerV2 and all(
+                    window is None
+                    for window in manager.max_attention_window_vec):
+                # The capacity query reserves one page for each other sequence.
+                # Full attention has one lifecycle, so use the actual occupied
+                # pages, including multi-page draft dummies and the guard page.
+                capacity_batch_size = 1 + sum(
+                    int(cache.num_blocks)
+                    for cache in manager.kv_cache_map.values())
+            return manager.get_num_available_tokens(
+                token_num_upper_bound=max_seq_len,
+                batch_size=capacity_batch_size,
+                max_num_draft_tokens=_kv_draft)
+
+        available_tokens = get_available_tokens(kv_cache_manager)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
-            draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
-                batch_size=batch_size,
-                token_num_upper_bound=max_seq_len,
-                max_num_draft_tokens=_kv_draft)
+            draft_available_tokens = get_available_tokens(
+                draft_kv_cache_manager)
             available_tokens = min(available_tokens, draft_available_tokens)
+
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
+            # V2's generation dummy reserves one more token after allocating
+            # its input. Leave room for that token in both target and draft KV.
+            available_tokens -= 1
 
         token_num = max(
             ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
