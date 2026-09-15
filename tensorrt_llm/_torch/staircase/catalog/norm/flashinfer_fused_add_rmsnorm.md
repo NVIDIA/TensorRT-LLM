@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 5}
+  sm_103: {status: passed, tests: 5}
 ---
 
 # flashinfer_fused_add_rmsnorm
@@ -61,7 +60,7 @@ None. Stateless.
   would read `M = shape[0]`), but the guard is **loud, not silent**: the
   CuTe compiled-kernel argument check raises `ValueError: Mismatched
   Tensor on argument #0 ... expected ndim=2` before launch. Nothing is
-  silently skipped (measured 2026-07-28); the precondition stands, its
+  silently skipped; the precondition stands, its
   earlier justification did not.
 - `weight.shape == (hidden,)`, `weight.dtype == x.dtype`, contiguous.
 - Dtype is one of fp16, bf16, fp32. `float64`, `int8`, `uint8` and
@@ -85,8 +84,7 @@ None. Stateless.
 ## Notes
 
 - The op is registered only when flashinfer is importable
-  (`IS_FLASHINFER_AVAILABLE`); this pinned install ships
-  flashinfer-python 0.6.14, which routes to the CuTe DSL kernel
+  (`IS_FLASHINFER_AVAILABLE`), and routes to the CuTe DSL kernel
   (`fused_add_rmsnorm_cute`); a CUDA JIT fallback exists behind
   `FLASHINFER_USE_CUDA_NORM=1` but is not what these receipts certify.
 - Programmatic dependent launch (PDL) is controlled by the env var

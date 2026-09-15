@@ -647,3 +647,45 @@ def test_wrapper_guards_silent_domains() -> None:
     out = torch.ops.trtllm.nvfp4_gemm(a_data, b_data, a_sf, b_sf, fat_alpha, torch.bfloat16)
     torch.testing.assert_close(out, ref.to(torch.bfloat16))
     guarded(lambda: nvfp4_gemm(a_data, b_data, a_sf, b_sf, fat_alpha, torch.bfloat16))
+
+
+def test_a_short_scale_buffer_is_rejected_before_dispatch() -> None:
+    """A contiguous but undersized scale buffer reads past its end.
+
+    The swizzle addresses the *padded* rectangle, so the length the kernel
+    indexes is `pad_up(rows,128) * pad_up(K/16,4)` whatever the real shape is.
+    Contiguity says nothing about that, and the op does not check it: a short
+    buffer is read out of bounds, which is either a wrong result or a dead
+    worker depending on what follows it in the allocation.
+
+    M and N pad independently, so both operands are exercised, and both are
+    sized so that the padding is not a no-op: 200 and 160 each pad to 256.
+    Picking a row count already on the 128 boundary would make the "unpadded
+    length" case below identical to the correct one and assert nothing.
+    """
+    m, n, k = 200, 160, 512
+    a_data, _, a_sf, a_values = _operand(m, k, seed=61)
+    b_data, _, b_sf, b_values = _operand(n, k, seed=62)
+    alpha = _alpha(ALPHA)
+
+    # The full-length buffers are accepted and correct, so the rejection below
+    # is about length alone and not about these operands.
+    ref = _reference(a_values, b_values, ALPHA)
+    out = nvfp4_gemm(a_data, b_data, a_sf, b_sf, alpha, torch.bfloat16)
+    torch.testing.assert_close(out, ref.to(torch.bfloat16))
+    assert a_sf.numel() == _pad_up(m, 128) * _pad_up(k // VEC, 4)
+    assert b_sf.numel() == _pad_up(n, 128) * _pad_up(k // VEC, 4)
+
+    def rejected(*args) -> None:
+        try:
+            nvfp4_gemm(*args, alpha, torch.bfloat16)
+        except AssertionError:
+            return
+        raise AssertionError("expected the wrapper to reject a short scale buffer")
+
+    # One byte short, and the un-padded length -- the two ways to get it wrong:
+    # truncation, and sizing the buffer from the real rectangle.
+    rejected(a_data, b_data, a_sf[:-1].contiguous(), b_sf)
+    rejected(a_data, b_data, a_sf[: m * (k // VEC)].contiguous(), b_sf)
+    rejected(a_data, b_data, a_sf, b_sf[:-1].contiguous())
+    rejected(a_data, b_data, a_sf, b_sf[: n * (k // VEC)].contiguous())

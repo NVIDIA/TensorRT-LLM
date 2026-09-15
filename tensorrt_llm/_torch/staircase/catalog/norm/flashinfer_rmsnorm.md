@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 6}
+  sm_103: {status: passed, tests: 6}
 ---
 
 # flashinfer_rmsnorm
@@ -64,8 +63,7 @@ None. Stateless.
 ## Notes
 
 - The op is registered only when flashinfer is importable
-  (`IS_FLASHINFER_AVAILABLE`); this pinned install ships
-  flashinfer-python 0.6.14.
+  (`IS_FLASHINFER_AVAILABLE`).
 - Programmatic dependent launch (PDL) is controlled by the env var
   `TRTLLM_ENABLE_PDL` (default enabled) inside the trtllm custom op;
   it affects scheduling only, not results.

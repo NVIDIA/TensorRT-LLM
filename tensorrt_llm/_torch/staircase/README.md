@@ -79,8 +79,8 @@ A quantity may be a routing criterion only if it is known when
 `_resolve_class` runs **and** constant for the engine's life — and only if it
 changes the *structure of the forward*. Config shape, SM version, parallel
 topology qualify. `max_num_tokens` and `cuda_graph_config.max_batch_size` pass
-the first test and fail the second: they are tuning knobs and belong in a
-target's `configs/` variant. Batch composition and `num_contexts` fail the
+the first test and fail the second: they are tuning knobs — LLM API arguments,
+not identity. Batch composition and `num_contexts` fail the
 first outright — those move every step, and a target chosen from them would
 be chosen once and then be wrong. Per-step specialization is a separate
 mechanism (dispatch inside a target's `forward`), not a routing dimension.
@@ -91,8 +91,8 @@ Routing recognizes a checkpoint by `(num_hidden_layers, hidden_size, ...)`,
 the same sniffing idiom as `is_mla` / `is_nemotron_hybrid` upstream. It cannot
 tell a fine-tune from the original. That is a deliberate trade, and it changes
 what a gate record means: not "this target passed" but "this modeling code
-passed **on the checkpoint whose digests TARGET.md records**". Running it on
-any other checkpoint of the same shape is ungated. Each `TARGET.md` says so.
+passed **on the checkpoint the accuracy gate names**". Running it on any other
+checkpoint of the same shape is ungated.
 
 ## Layout
 
@@ -102,11 +102,12 @@ explain.py          why a configuration routed where it did
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
   targets/<checkpoint>/<gpu arch>/<parallel>/
-                    modeling.py  weights.py  TARGET.md  [configs/]
+                    modeling.py  weights.py
 catalog/            the kernel vocabulary: contract .md + wrapper .py
-references/         accuracy anchors, keyed by HF repo name
-docs/               cross-target mechanism and runtime notes
 ```
+
+Accuracy anchors are not kept here. They live where every other model's do,
+`tests/integration/defs/accuracy/references/`, read by the gates CI runs.
 
 The third piece of a catalog entry, its GPU test, lives in the tests tree:
 
@@ -115,6 +116,8 @@ tests/unittest/_torch/staircase/
   test_staircase_claims.py     routing tables vs the targets they name (no GPU)
   test_staircase_routing.py    what staircase_resolve does (no GPU)
   <category>/test_staircase_<entry>.py
+  comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
+  comm/_rank_job.py            starts one of those and asserts on its exit code
 ```
 
 That split is not a preference; it is where this repo's CI collects from, and
@@ -122,13 +125,13 @@ an in-package test is on no list. It costs one thing worth stating: a receipt
 is valid only if it post-dates the last write to *every* file of its entry, so
 that check now has to look in both trees.
 
-The two collective entries keep their rank bodies in `catalog/comm/`
-(`_allgather_op_matrix.py`, `_reducescatter_op_matrix.py`) because the launcher
-re-execs them as `python -m` and the ranks need the package context; only the
-collected shells moved. Neither those file names nor their `check_*` bodies
-match pytest's collection patterns: a package tree is no place for a
-collectable test, and each of those two is one fixed 4-rank sequence that
-cannot run as independent cases anyway.
+The two collectives' rank bodies sit in the tests tree with everything else
+that only tests run. Both halves are started by file path -- the launcher must
+not import `tensorrt_llm`, because that calls `MPI_Init` and an
+MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
+by absolute import -- so neither needs a package to live in. Neither those
+file names nor their `check_*` bodies match pytest's collection patterns:
+each is one fixed 4-rank sequence that cannot run as independent cases.
 
 Identity is the path. `targets/` keeps all three segments rather than
 flattening them, and the class name carries the same triple;
@@ -154,12 +157,12 @@ checkpoints", which is the opposite of what this package is for.
 1. **Boot** — minutes, binary. `examples/llm-api/quickstart_advanced.py` with
    the target's topology flags and `TRTLLM_STAIRCASE=require` exported. Engine
    cold start, weight-manifest coverage, a handful of greedy continuations.
-   Catches catastrophes, not accuracy. A target whose `configs/` holds a
-   variant that changes the forward has its own file there, so that path gets
-   a minutes-scale gate too.
+   Catches catastrophes, not accuracy. A variant that changes the forward gets
+   its own minutes-scale gate on the same footing.
 2. **Accuracy** — the release criterion. `trtllm-eval` with the protocol from
-   `references/accuracy.yaml` and `TRTLLM_STAIRCASE=require` exported. One-sided: measured >= reference − tol.
-   This is the gate CI runs, as `accuracy/test_staircase.py`.
+   `tests/integration/defs/accuracy/references/` and `TRTLLM_STAIRCASE=require`
+   exported. One-sided: measured >= reference − tol. This is the gate CI runs,
+   in the accuracy suite's staircase files.
 3. **Acceptance** — required whenever a variant is distribution-preserving by
    construction, speculative decoding above all. Rejection sampling holds the
    emitted distribution to the target model's, so a *miscomputed* draft path
@@ -183,13 +186,16 @@ never executed.**
 Two things voided every receipt in the move: each catalog test file was
 rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where
 certification is per architecture. The whole catalog was therefore re-run on
-GB300 under 1.3.0rc26 -- **19 of 19 entries pass, 312 certified cells**, plus
-both 4-rank collective matrices.
+GB300 -- **19 of 19 entries pass, 312 certified cells**, plus both 4-rank
+collective matrices. The sm_100 receipts were dropped rather than carried:
+they predate every file of the entries they sat in, and no sm_100 machine is
+in CI to re-take them on. A missing arch key reads as unknown, which is the
+honest state.
 
 Getting there surfaced four real differences. None was resolved by widening a
 tolerance, and each is written up in its own contract:
 
-* **Op schema drift rc21 -> rc26** (`thop_attention`, `mla_rope_generation`,
+* **Op schema drift** (`thop_attention`, `mla_rope_generation`,
   `mla_rope_append_paged_kv_assign_q`). Parameters were renamed and added. The
   wrappers now mirror their schemas argument for argument, so the next drift
   fails loudly rather than shifting a positional list silently.
@@ -201,10 +207,8 @@ tolerance, and each is written up in its own contract:
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted
   by the op, not certified here).
 
-**gpt-oss-120b / sm_103 / tp1 is gated on GB300.** Its checkpoint was
-downloaded and every digest re-verified against `TARGET.md`, so the new records
-and the old sm_100 ones were measured on byte-identical weights. Both gates
-pass with `TRTLLM_STAIRCASE=require` in force, which is what rules out the built-in
+**gpt-oss-120b / sm_103 / tp1 is gated on GB300.** Both gates pass with
+`TRTLLM_STAIRCASE=require` in force, which is what rules out the built-in
 implementation having been measured instead:
 
 | Gate | Result |
@@ -219,40 +223,42 @@ implementation having been measured instead:
 |---|---|
 | boot, 10 greedy continuations | **10/10** |
 | gsm8k, full 1319 | **95.0720** vs threshold 89.9962 -- pass by 5.08 |
-| boot, `configs/mtp3.yaml` | **10/10**, with the layer-61 MTP module loaded |
+| boot, mtp3 | **10/10**, with the layer-61 MTP module loaded |
 | gsm8k, identity vs mtp3 **paired in one session** | delta **-0.3791** against a `\|delta\| < 1.2` criterion -- 0.63 sigma |
 | acceptance vs stock | `acceptance_length` **3.3514** vs **3.2752**, ratio **1.023** |
 
 That last row is the one that matters for a speculative variant: rejection
 sampling makes a miscomputed draft layer *slower*, not wrong, so boot and
 accuracy are blind to it and only the acceptance rate against a reference can
-see it. `configs/mtp{1,2}.yaml` remain ungated -- they are the dominated end of
+see it. Draft lengths 1 and 2 remain ungated -- they are the dominated end of
 the measured draft-length axis.
-
-Measured statements throughout the contracts are left exactly as written.
-They are true records of what was observed on sm_100, and rewriting them would
-manufacture GB300 evidence that does not exist.
 
 ### What replaced the version pin
 
-Out of tree each target hard-asserted `tensorrt_llm == 1.3.0rc21` at import,
-because a target reads private engine surface and a drifting engine silently
-voids its records. In tree that assert is meaningless — the target moves with
-the trunk — so it is gone, replaced by an SM assert, which is the part of the
-identity that does *not* move.
+Out of tree each target hard-asserted a pinned `tensorrt_llm` version at
+import, because a target reads private engine surface and a drifting engine
+silently voids its records. In tree that assert is meaningless — the target
+moves with the trunk — so it is gone, replaced by an SM assert, which is the
+part of the identity that does *not* move.
 
-The pin was earning its keep, though, and the migration paid the bill
-immediately: between rc21 and rc26 the attention backends moved from
+The same reasoning retires the version from the records themselves. A receipt
+is keyed by GPU architecture and nothing else: there is no external pin left to
+drift against, and a version written into a contract is a number that is wrong
+the next day with nothing to notice. What a receipt is still fresh against is
+its own entry's files, and that CI re-proves on every commit.
+
+The pin was earning its keep out of tree, though, and the migration paid the
+bill immediately: the attention backends moved from
 `_torch/attention_backend/{interface,trtllm}.py` to
 `_torch/attention/backends/`. The compatibility shim left behind re-exports
 the names but not the submodule paths, so all five files importing them
 failed at import. They now use the canonical path.
 
 The lesson generalizes: with no pin, a target's contact with private engine
-surface is checked only by running it. The import-time
-`_check_static_contract` op-existence loop and the first-forward metadata
-field check are what turn that from a wrong answer into a loud failure, which
-is why both survived the move.
+surface is checked only by running it. Each target declares that surface as
+`REQUIRED_TRTLLM_OPS`, `test_staircase_target_contract.py` asserts every name
+in it exists, and the first-forward metadata field check catches the rest --
+which turns a drifting engine from a wrong answer into a loud failure.
 
 ## Two facts this migration surfaced about upstream
 

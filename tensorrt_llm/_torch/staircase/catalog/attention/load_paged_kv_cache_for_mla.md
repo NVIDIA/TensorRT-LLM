@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 18}
+  sm_103: {status: passed, tests: 18}
 ---
 
 # load_paged_kv_cache_for_mla

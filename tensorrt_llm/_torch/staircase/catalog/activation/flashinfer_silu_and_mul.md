@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 4}
+  sm_103: {status: passed, tests: 4}
 ---
 
 # flashinfer_silu_and_mul
@@ -67,8 +66,7 @@ None. Stateless.
 ## Notes
 
 - The op is registered only when flashinfer is importable
-  (`IS_FLASHINFER_AVAILABLE`); this pinned install ships
-  flashinfer-python 0.6.14.
+  (`IS_FLASHINFER_AVAILABLE`).
 - Alignment trap: the op's Python-side check only validates
   `x.shape[-1] * itemsize % 16 == 0` (raising `ValueError`), but the
   vectorized load of the up half starts at element offset `d`, so `d`

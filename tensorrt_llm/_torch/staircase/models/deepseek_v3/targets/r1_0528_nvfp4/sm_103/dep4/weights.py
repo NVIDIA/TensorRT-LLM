@@ -34,7 +34,7 @@ module at layer index `num_hidden_layers` — its own 256 experts,
 
 * Under the target's identity config all 790 are an expected non-load, listed
   rather than swept under a relaxed assert.
-* Under a `configs/mtp*.yaml` variant the module is loaded, and this table
+* Under an MTP variant (`speculative_config` set) the module is loaded, and this table
   gains its rows: **212 keys per rank** are consumed (the whole front end and
   attention block, the router, the shared expert, and this rank's 64-expert
   window), leaving 578 — the 192 off-window experts' 576 weight tensors, which

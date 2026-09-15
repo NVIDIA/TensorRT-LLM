@@ -130,37 +130,59 @@ def test_checkpoint_fingerprints_are_distinct(arch):
     )
 
 
+# Context fields a routing tree may not branch on yet, and what has to happen
+# before it can. Both would otherwise decide silently on a value that is not
+# the deployment's -- the failure ``require`` exists to prevent. Delete a row
+# once its prerequisite is met.
+_UNREADABLE_CONTEXT_FIELDS = {
+    "is_disagg": (
+        "no caller sets it, so it reads False in every deployment, "
+        "disaggregated or not; plumb it onto ModelConfig first"
+    ),
+    "spec_config": (
+        "explain.py has no flag for a speculative config, so it would report "
+        "the wrong target for every drafting configuration; give explain a "
+        "way to name one first"
+    ),
+}
+
+
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_no_routing_module_reads_an_unplumbed_dimension(arch):
-    """``ctx.is_disagg`` is declared but nothing sets it, so it is always
-    False. A branch on it would take the wrong side in a disaggregated
-    deployment and say nothing -- exactly the silent-wrong-system failure
-    ``require`` exists to prevent. Delete this test when it is plumbed.
+@pytest.mark.parametrize("field", sorted(_UNREADABLE_CONTEXT_FIELDS))
+def test_no_routing_module_reads_an_unplumbed_dimension(arch, field):
+    """A routing tree may only read what both the engine and explain can fill.
+
+    ``explain`` replays the same tree to answer "why did I not get the target
+    I expected". A criterion it cannot evaluate makes that answer wrong on
+    exactly the configurations someone would ask about -- so the set of
+    readable fields is bounded by the weaker of the two callers, not the
+    engine alone.
     """
     source = _module_path(STAIRCASE_ROUTERS[arch]).read_text()
-    assert "is_disagg" not in source, (
-        f"{arch}: routing reads ctx.is_disagg, which no caller sets yet; "
-        f"plumb it onto ModelConfig first"
+    assert field not in source, (
+        f"{arch}: routing reads ctx.{field}, but {_UNREADABLE_CONTEXT_FIELDS[field]}"
     )
 
 
-def test_every_target_ships_the_three_products():
-    """modeling.py, weights.py and TARGET.md travel together.
+def test_every_target_ships_both_products():
+    """modeling.py and weights.py travel together.
 
-    The forward, the weights it expects, and the record of what that pair was
-    measured to do. A target missing the third is one nobody can check.
+    The forward and the weights it expects. A target missing either is not a
+    target.
 
-    There used to be a fourth, a per-target ``smoke.py``. In-tree there is no
-    reason to carry a bespoke keyword-assert CLI: the same boot-and-generate
-    check is ``examples/llm-api/quickstart_advanced.py``, and the accuracy
-    gates are ``trtllm-eval`` and ``accuracy/test_staircase.py`` -- which,
-    unlike a module that nothing ever ran, CI actually runs.
+    Two products, not the four the out-of-tree tree carried. The per-target
+    ``smoke.py`` and ``configs/`` went with the move: the boot-and-generate
+    check is ``examples/llm-api/quickstart_advanced.py``, the knob variants are
+    LLM API arguments the accuracy gates pass directly, and what a target was
+    measured to do is recorded where every other model records it --
+    ``tests/integration/defs/accuracy/references/``, read by the gates CI runs
+    rather than by a reader.
     """
     for arch in _ARCHS:
         routing = routing_module(arch)
         for name, dotted in routing.TARGET_MODULES.items():
             target_dir = _module_path(dotted).parent
-            for product in ("modeling.py", "weights.py", "TARGET.md"):
+            for product in ("modeling.py", "weights.py"):
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
 

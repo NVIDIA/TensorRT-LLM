@@ -25,7 +25,7 @@ def mla_rope_append_paged_kv_assign_q(
     host_kv_cache_pool_pointers: torch.Tensor,
     host_kv_cache_pool_mapping: torch.Tensor,
     kv_scale_orig_quant: Optional[torch.Tensor],
-    # ``residual_dim`` (rc26; absent in rc21) must be 0 or ``rope_size``,
+    # ``residual_dim`` must be 0 or ``rope_size``,
     # and the op rejects non-zero unless the KV pool is FP4. Every caller
     # here runs a bf16 or fp8-e4m3 pool, so 0 is the only legal value.
     residual_dim: int,

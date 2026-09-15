@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 13}
+  sm_103: {status: passed, tests: 13}
 ---
 
 # mxfp8_quantize

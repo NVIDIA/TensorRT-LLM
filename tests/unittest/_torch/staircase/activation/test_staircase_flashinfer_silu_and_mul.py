@@ -56,3 +56,33 @@ def test_fp16_2d() -> None:
     for num_tokens, two_d in [(2, 8192), (1024, 4096)]:
         x = torch.randn(num_tokens, two_d, dtype=torch.float16, device="cuda")
         _check(x)
+
+
+def test_a_misaligned_half_is_rejected_before_dispatch() -> None:
+    """A final dim of 24 passes the op's own check and faults the kernel.
+
+    The op validates the *row* (`shape[-1] * itemsize % 16 == 0`, which 24
+    satisfies at 48 bytes), but the kernel vectorizes over each half
+    separately, and at 24 the second half starts 24 bytes in -- mid-vector.
+    The launch then dies with `CUDA misaligned address`, which poisons the
+    context for everything after it rather than raising something a caller
+    could catch. The wrapper's precondition is what keeps that off the device,
+    so this asserts it raises *without* calling the op.
+    """
+    for width in (24, 40, 56):  # d * 2 bytes = 24, 40, 56 -- none a multiple of 16
+        x = torch.randn(4, width, dtype=torch.bfloat16, device="cuda")
+        try:
+            flashinfer_silu_and_mul(x)
+        except AssertionError:
+            continue
+        raise AssertionError(f"shape[-1]={width} should have been rejected before dispatch")
+
+
+def test_an_odd_width_is_rejected() -> None:
+    """There is no half to split at an odd width; the op would truncate."""
+    x = torch.randn(4, 33, dtype=torch.bfloat16, device="cuda")
+    try:
+        flashinfer_silu_and_mul(x)
+    except AssertionError:
+        return
+    raise AssertionError("an odd shape[-1] should have been rejected")

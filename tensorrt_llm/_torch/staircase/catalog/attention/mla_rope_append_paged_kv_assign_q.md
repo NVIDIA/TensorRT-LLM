@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 13}
+  sm_103: {status: passed, tests: 13}
 ---
 
 # mla_rope_append_paged_kv_assign_q
@@ -177,7 +176,7 @@ above:
 | `host_kv_cache_pool_pointers` | `[num_pools, 2]`: (primary ptr, secondary ptr=0) | int64 | contiguous | CPU |
 | `host_kv_cache_pool_mapping` | `[num_layers, 2]`: (pool index, layer-within-pool) row per layer | int32 | contiguous | CPU |
 | `kv_scale_orig_quant` | `quant_mode=0`: `None`. `quant_mode=128`: `[1]` holding the **write-side** factor `w` — everything this call quantizes is multiplied by it. `None` = 1.0, which is what the engine's own MLA call site passes. Only element `[0]` is read (a longer tensor is accepted) | fp32 (fp16 rejected, see *Notes*) | contiguous | CUDA |
-| `residual_dim` | — | `int` | **rc26 addition.** Must be `0` or `rope_size`; the op rejects non-zero unless the KV pool is FP4. `0` on every path this entry certifies (bf16 and fp8-e4m3 pools), which is also what the in-tree caller passes | — |
+| `residual_dim` | — | `int` | Must be `0` or `rope_size`; the op rejects non-zero unless the KV pool is FP4. `0` on every path this entry certifies (bf16 and fp8-e4m3 pools), which is also what the in-tree caller passes | — |
 | `layer_idx` | row into `host_kv_cache_pool_mapping` | Python int | — | — |
 | `tokens_per_block` | pool page size; 32 and 64 certified on the matching-dtype pool, 32 on the fp8 pool (32 is what a default `KvCacheConfig` produces) | Python int | — | — |
 | `attention_window_size` | `>= max(kv_s)`; production passes the manager's `max_seq_len` (smaller values imply cyclic-cache addressing, not certified) | Python int | — | — |
@@ -365,11 +364,9 @@ arguments. The length/addressing tensors are exactly what a
   *content* is not an axis this op's gate exercises).
 
 
-## rc26 change to the accepted KV-cache formats
+## Accepted KV-cache formats
 
-The op accepted only an fp8-e4m3 latent pool in 1.3.0rc21 and now also
-accepts NVFP4; its rejection message changed accordingly from
-`Only FP8 KV cache is supported for now` to `Only FP8 and NVFP4 KV
-caches are supported for now`. An int8 pool (`quant_mode=64`) is still
-rejected. **NVFP4 is accepted by the op but not certified here** — no
-cell in this entry's test drives it, so it stays outside the envelope.
+The op takes an fp8-e4m3 latent pool and an NVFP4 one; an int8 pool
+(`quant_mode=64`) is rejected with `Only FP8 and NVFP4 KV caches are
+supported for now`. **NVFP4 is accepted by the op but not certified here** —
+no cell in this entry's test drives it, so it stays outside the envelope.

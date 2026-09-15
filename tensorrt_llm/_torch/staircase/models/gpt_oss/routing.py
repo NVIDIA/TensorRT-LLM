@@ -21,8 +21,8 @@ _SM = (10, 3)
 # Config-shape fingerprint -> checkpoint identity. Sniffing the shape is the
 # upstream idiom (``is_mla``, ``is_nemotron_hybrid`` do the same). It buys
 # automatic routing at a stated cost: a *fine-tune* of this checkpoint has the
-# same shape and is routed here silently. See TARGET.md -- the gate record is
-# what pins the identity, and it says which checkpoint it was measured on.
+# same shape and is routed here silently. The accuracy gate is what pins the
+# identity: it names the checkpoint this target was measured on.
 #
 # (num_hidden_layers, hidden_size, num_local_experts). Layer count alone
 # separates 120b from 20b, but the expert count is what makes the MoE operand

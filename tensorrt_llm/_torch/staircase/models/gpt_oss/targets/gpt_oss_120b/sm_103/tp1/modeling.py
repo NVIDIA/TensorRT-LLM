@@ -74,23 +74,19 @@ from . import weights as _weights
 _SM = (10, 3)
 
 
-def _check_static_contract() -> None:
-    """Import-time fail-fast: op symbol existence."""
-    for op in (
-        "fused_qk_norm_rope",
-        "flashinfer_rmsnorm",
-        "flashinfer_fused_add_rmsnorm",
-        "cublas_mm",
-        "mxfp8_quantize",
-        "mxe4m3_mxe2m1_block_scale_moe_runner",
-    ):
-        assert hasattr(torch.ops.trtllm, op), f"missing op trtllm::{op}"
-    from tensorrt_llm.bindings.internal import thop
-
-    assert hasattr(thop, "attention"), "missing pybind thop.attention"
-
-
-_check_static_contract()
+#: Every trtllm op this target reaches for, in its forward and in the weight
+#: load. Declared here, asserted in tests/unittest/_torch/staircase: a symbol
+#: that does not exist is a fact of the build, and the place to find that out
+#: is a machine with the extension built rather than every import of this
+#: module.
+REQUIRED_TRTLLM_OPS = (
+    "fused_qk_norm_rope",
+    "flashinfer_rmsnorm",
+    "flashinfer_fused_add_rmsnorm",
+    "cublas_mm",
+    "mxfp8_quantize",
+    "mxe4m3_mxe2m1_block_scale_moe_runner",
+)
 
 # Metadata fields consumed each step (sourcing mirrors the in-tree
 # FallbackFmha for this trtllm version; existence checked at first forward).
@@ -131,9 +127,8 @@ _STEP_FIELDS = (
     "num_sparse_topk",
     "flash_mla_tile_scheduler_metadata",
     "flash_mla_num_splits",
-    # Added between 1.3.0rc21 and 1.3.0rc26. Both are engine-prepared
-    # per-instance constants (max_num_sequences defaults to
-    # max_num_requests; the tree-mask flag is set from
+    # Both are engine-prepared per-instance constants (max_num_sequences
+    # defaults to max_num_requests; the tree-mask flag is set from
     # is_spec_dec_dynamic_tree), so they project like the rest.
     "max_num_sequences",
     "force_prepare_spec_dec_tree_mask",
@@ -248,9 +243,8 @@ _CALL_CONSTANTS = dict(
     cross_kv=None,
     relative_attention_bias=None,
     relative_attention_max_distance=0,
-    # Added between 1.3.0rc21 and 1.3.0rc26; held at the values the op had
-    # before they existed. All three are MLA-only surface that this target
-    # does not use -- skip_correction is forced to 0.0 for a non-MLA layer by
+    # Held at the op's defaults. All three are MLA-only surface that this
+    # target does not use -- skip_correction is forced to 0.0 for a non-MLA layer by
     # the engine's own resolver, and kv_norm_* folds an MLA kv_a_layernorm
     # that does not exist here.
     kv_norm_weight=None,

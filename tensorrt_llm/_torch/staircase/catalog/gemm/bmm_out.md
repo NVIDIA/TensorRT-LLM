@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 5}
+  sm_103: {status: passed, tests: 5}
 ---
 
 # bmm_out
@@ -66,19 +65,19 @@ None. Stateless.
 - `out.shape == (B, M, N)` exactly. **The op does not validate this**: a
   wrong-shaped `out` is silently resized (with only a deprecation
   warning). The hazard is real but is **shape/stride corruption, not a
-  lost write**: measured 2026-07-28, an aliased view with room to grow
-  keeps its `data_ptr` and the result *does* land in the caller's buffer,
-  now under a silently rewritten shape; a genuine reallocation moves the
-  shared storage, so sibling views follow it rather than being detached.
-  The wrapper asserts the shape.
+  lost write**: an aliased view with room to grow keeps its `data_ptr` and
+  the result *does* land in the caller's buffer, now under a silently
+  rewritten shape; a genuine reallocation moves the shared storage, so
+  sibling views follow it rather than being detached. The wrapper asserts
+  the shape.
 - One dtype across `a`, `b`, `out`. **Mixed input dtypes always raise** —
   there is no promotion path and no silent hazard here. The meta check
   demands `out` in `b.dtype` while the kernel demands `a.dtype`, so when
   `a.dtype != b.dtype` the two can never both be satisfied: all six
   combinations over {bf16, fp16, fp32} raise, including the bf16-`a` /
   fp32-`b` / fp32-`out` case an earlier revision of this bullet described
-  as working (measured 2026-07-28). The wrapper's single-dtype assert is
-  therefore redundant rather than load-bearing.
+  as working. The wrapper's single-dtype assert is therefore redundant
+  rather than load-bearing.
 - `out.dtype` must equal the input dtype; a mismatch raises
   (`Expected out tensor to have dtype ...`).
 - Dtypes verified: bf16, fp16, fp32. float8_e4m3fn raises
@@ -97,5 +96,5 @@ None. Stateless.
 - Not arch-gated; TRT-LLM uses it as the bf16 batched-gemm path in MLA
   weight-absorption and output projections, with the batch dim carrying
   head groups.
-- Behavior above was established empirically under trtllm 1.3.0rc21 /
-  torch 2.11.0 on sm_100.
+- Behavior above was established empirically, not read off the op's
+  documentation; this entry's test is what holds it.

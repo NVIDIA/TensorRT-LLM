@@ -7,17 +7,16 @@ duplicate of it: that file covers the *fusion patterns* through the
 ``AllReduce`` module, while this covers the op itself cell by cell. The names
 are kept apart so review does not read one as a copy of the other.
 
-The matrix lives in ``catalog/comm/_reducescatter_op_matrix.py``, which is its
+The matrix is ``_reducescatter_op_matrix.py`` beside this file, which is its
 own launcher and runs two jobs: the ordered check sequence, then a separately
 capped job that certifies the one call-order divergence that wedges instead of
 lying (it cannot be a normal check, because the job that runs it never
 reports).
 """
 
+import _rank_job
 import pytest
 import torch
-
-from tensorrt_llm._torch.staircase.catalog.comm import _rank_job
 
 assert torch.cuda.is_available(), "reducescatter requires CUDA devices"
 

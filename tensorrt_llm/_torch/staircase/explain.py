@@ -58,9 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
 
-    from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+    from tensorrt_llm._torch.model_config import ModelConfig
 
-    pretrained_config = load_pretrained_config(args.model)
     world_size = args.tp * args.pp
     mapping = Mapping(
         world_size=world_size,
@@ -71,14 +70,17 @@ def main(argv: Optional[list] = None) -> int:
         enable_attention_dp=args.attention_dp,
     )
 
-    ctx = StaircaseContext(
-        pretrained_config=pretrained_config,
+    # The engine's own loader, not a second reading of the checkpoint. It is
+    # what fills `quant_config` from hf_quant_config.json, so a tree that gates
+    # on quantization is explained against the same value the engine will route
+    # on. It touches no CUDA, which is what keeps `--sm` usable off-GPU.
+    model_config = ModelConfig.from_pretrained(
+        args.model,
         mapping=mapping,
-        sm=_sm(args.sm),
-        quant_config=None,
-        spec_config=None,
-        is_disagg=False,
+        moe_backend="AUTO",
     )
+    ctx = StaircaseContext.from_model_config(model_config, sm=_sm(args.sm))
+    pretrained_config = model_config.pretrained_config
 
     arch = (pretrained_config.architectures or ["(none)"])[0]
     routing = routing_module(arch)
