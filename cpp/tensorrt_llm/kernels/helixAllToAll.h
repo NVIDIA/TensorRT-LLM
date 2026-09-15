@@ -36,6 +36,13 @@ struct HelixFieldInfo
     int stride;       // Stride between rows in bytes
 };
 
+//! Arguments for one Helix CP all-to-all: what to send, where to receive, and
+//! which peers participate.
+//!
+//! Two fields per direction, matching the pair the Helix combine needs: field 0
+//! is the partial attention output, field 1 the per-row (max, sum) softmax
+//! stats. An "entry" is one unit of exchange per peer rank, so a rank sends
+//! entryCount entries to each of the cpSize peers.
 struct HelixAllToAllParams
 {
     HelixFieldInfo sendFields[2];
@@ -47,6 +54,14 @@ struct HelixAllToAllParams
     int cpSize;
     int channelCount; // use 0 to auto-compute
     int maxChannelCount;
+
+    // Rows this rank owns no KV for. The sender replaces them in shared memory
+    // with a no-op contribution for the combine: field 0 zeros, field 1
+    // (max, sum) = (-inf, 0). nullptr when the caller already sanitized.
+    uint8_t const* zeroKvMask;
+    // entryCount / zeroKvMask length: 1 when an entry is a token (fifo v2),
+    // num_heads when it is a (token, head) pair (fifo v1).
+    int zeroKvMaskDivisor;
 };
 
 // ============================================================================
