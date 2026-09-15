@@ -46,12 +46,15 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_no_mxfp4_swizzle, skip_no_sm120,
                         skip_post_blackwell, skip_post_hopper, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2, assert_acceptance_length,
-                            assert_acceptance_length_for_llm,
-                            assert_guided_decoding_regex,
-                            compute_acceptance_length)
+
+# isort: off
+from .accuracy_core import (
+    GSM8K, MMLU, CnnDailymail, GPQADiamond, GSM8KInferenceX, JsonModeEval,
+    LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2,
+    assert_acceptance_length, assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex, compute_acceptance_length)
+
+# isort: on
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -7340,21 +7343,23 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("eval_mode", ["default", "inferencex"])
     @parametrize_with_ids("overlap_scheduler", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler):
+                          overlap_scheduler, eval_mode):
         # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
-        # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K plus
-        # a chat-GSM8K acceptance probe, since accuracy alone does not notice a
-        # corrupted drafter KV.
+        # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K, or
+        # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy
+        # alone does not notice a corrupted drafter KV.
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
             msa_package_available
         if not msa_package_available():
             pytest.skip("MSA kernels (fmha_sm100) not available")
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        inferencex = eval_mode == "inferencex"
         max_draft_len = 3
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
@@ -7364,6 +7369,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
                                         dtype="fp8")
+        # InferenceX mode: 16k context for thinking output, batch 64 (the
+        # InferenceX default). Otherwise fmha_sm100 caps total_q x heads at
+        # 65536; with 4 verify tokens per row that is 512 (256 unsharded).
+        if inferencex:
+            max_seq_len, max_batch_size = 16384, 64
+        else:
+            max_seq_len = 4096
+            max_batch_size = 256 if attention_dp else 512
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
@@ -7372,14 +7385,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
                     implementation="msa", indexer_kv_dtype="fp8"),
                 moe_config=MoeConfig(backend="CUTLASS"),
-                max_seq_len=4096,
-                # fmha_sm100 caps total_q x heads at 65536; with 4 verify
-                # tokens per row that is 512 (256 with unsharded heads).
-                max_batch_size=256 if attention_dp else 512,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
                 speculative_config=spec_config,
                 cuda_graph_config=CudaGraphConfig(
                     enable_padding=True,
-                    max_batch_size=64 if attention_dp else 128,
+                    max_batch_size=64 if (inferencex or attention_dp) else 128,
                 ),
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
@@ -7400,10 +7411,20 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                     steps += sd.get("numRequestsWithDraftTokens", 0)
                 return drafted, accepted, steps
 
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
+            if inferencex:
+                # InferenceX serves M3 with thinking forced on.
+                task = GSM8KInferenceX(model_name)
+                task.evaluate(llm,
+                              extra_evaluator_kwargs={
+                                  "chat_template_kwargs": {
+                                      "thinking_mode": "enabled"
+                                  }
+                              })
+            else:
+                task = MMLU(model_name)
+                task.evaluate(llm)
+                task = GSM8K(model_name)
+                task.evaluate(llm)
 
             # Acceptance probe: 200 chat-format GSM8K questions, greedy, 512 tokens.
             questions = [
