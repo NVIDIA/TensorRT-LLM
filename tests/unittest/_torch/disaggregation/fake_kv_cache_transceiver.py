@@ -196,8 +196,9 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
 
     def prepare_context_requests(self, requests: List[LlmRequest]) -> None:
         # Mirror BindKvCacheTransceiver: a no-op placeholder so the executor
-        # can invoke it unconditionally.
-        ...
+        # can invoke it unconditionally. Logged so tests can pin that it is
+        # entered every iteration, with or without requests.
+        self.call_log.append(f"prepare_context_requests:{[req.py_request_id for req in requests]}")
 
     def get_disaggregated_params(self) -> Dict[str, object]:
         return {}
