@@ -23,7 +23,12 @@ backend gating, and the opt-in config flags.
 import pytest
 import torch
 
-from tensorrt_llm._torch.route_capture import RouteCapture, assert_capturable
+from tensorrt_llm._torch.route_capture import (
+    ROUTE_CAPTURE_ATTR,
+    RouteCapture,
+    assert_capturable,
+    get_active_route_capture,
+)
 
 pytestmark = pytest.mark.cpu_only
 _L, _K = 4, 2  # small MoE-layer count / top-k for tests
@@ -88,6 +93,50 @@ def test_prefix_store_and_readback_roundtrip():
     for p in range(len(toks)):
         assert hashes_sib[p] in rc._shared
         assert torch.equal(rc._shared[hashes_sib[p]], _row(p))
+
+
+def test_create_gating_and_fail_closed():
+    common = dict(rank=0, model_engine=None)
+    # Feature off -> no capturer at all.
+    assert (
+        RouteCapture.create(
+            **common, enabled=False, pp_size=1, is_spec_decode=False, is_draft_model=False
+        )
+        is None
+    )
+    # Draft engines never capture, even with the feature on.
+    assert (
+        RouteCapture.create(
+            **common, enabled=True, pp_size=1, is_spec_decode=False, is_draft_model=True
+        )
+        is None
+    )
+    # Supported path -> a capturer instance.
+    rc = RouteCapture.create(
+        **common, enabled=True, pp_size=1, is_spec_decode=False, is_draft_model=False
+    )
+    assert isinstance(rc, RouteCapture)
+    # Unsupported paths fail closed instead of returning wrong routes.
+    with pytest.raises(RuntimeError):
+        RouteCapture.create(
+            **common, enabled=True, pp_size=2, is_spec_decode=False, is_draft_model=False
+        )
+    with pytest.raises(RuntimeError):
+        RouteCapture.create(
+            **common, enabled=True, pp_size=1, is_spec_decode=True, is_draft_model=False
+        )
+
+
+def test_active_capturer_is_looked_up_per_engine_forward():
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    rc = RouteCapture(rank=0)
+    assert get_active_route_capture() is None  # outside any forward
+    with model_extra_attrs({ROUTE_CAPTURE_ATTR: rc}):  # this engine's forward
+        assert get_active_route_capture() is rc
+    with model_extra_attrs({}):  # an engine without Router Replay
+        assert get_active_route_capture() is None
+    assert get_active_route_capture() is None
 
 
 def test_assert_capturable_gates_on_separated_routing():

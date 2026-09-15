@@ -51,17 +51,17 @@ prefix caching, and the overlap scheduler all ON. CUTLASS / DeepGemm separated
 routing only; fused backends fail closed (``assert_capturable``).
 """
 
-import builtins
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
-# NeMo-RL contract: -1 => genuinely missing route (fail-closed). Final/padding
-# positions get an arange(top_k) dummy in the downstream shared pad_and_align.
+# Consumer contract (trainer-side replay): -1 => genuinely missing route
+# (fail-closed). Final/padding positions are filled by the consumer's own
+# pad-and-align step; this module never emits a dummy expert id for them.
 _MISSING = -1
 
 # FNV-1a cumulative rolling hash for prefix-cache keys (position-granular): the
@@ -71,21 +71,23 @@ _FNV_OFF = 1469598103934665603
 _FNV_PRIME = 1099511628211
 _MASK64 = (1 << 64) - 1
 
-# The capture singleton lives on ``builtins`` — a single object shared across the
-# whole process — so that even if this module is imported under two different
-# sys.modules identities (absolute ``tensorrt_llm._torch.route_capture`` vs a
-# relative ``..route_capture`` import can yield two distinct classes in the Ray
-# per-worker venv), the MoE capture hook and the py_executor prepare/attach hooks
-# all read/write the SAME store.
-_R3_SINGLETON_KEY = "_R3_ROUTE_CAPTURE_SINGLETON"
+# Key under which the owning model engine registers its capturer in the
+# per-forward model extra attrs (the same channel that carries ``moe_layers``),
+# so the MoE routing hook reaches the capturer of the engine whose forward is
+# running -- no process-wide state, so several engines/models can coexist.
+ROUTE_CAPTURE_ATTR = "route_capture"
 
 
-def _get_singleton() -> Optional["RouteCapture"]:
-    return getattr(builtins, _R3_SINGLETON_KEY, None)
+def get_active_route_capture() -> Optional["RouteCapture"]:
+    """The capturer of the model engine whose forward is currently running.
 
-
-def _set_singleton(inst: Optional["RouteCapture"]) -> None:
-    setattr(builtins, _R3_SINGLETON_KEY, inst)
+    Reads the per-forward model extra attrs set by ``PyTorchModelEngine.forward``;
+    ``None`` outside a forward or when Router Replay is disabled for that engine.
+    """
+    attrs = get_model_extra_attrs()
+    if not attrs:
+        return None
+    return attrs.get(ROUTE_CAPTURE_ATTR)
 
 
 class RouteCopier:
@@ -104,46 +106,61 @@ class RouteCopier:
         self._ring = [
             torch.empty(shape, dtype=torch.int32, pin_memory=prefer_pinned()) for _ in range(ring)
         ]
-        self._done: List[Optional[torch.cuda.Event]] = [None] * ring  # per-slot D2H event
-        self._pending: List[Tuple[int, list, int, torch.cuda.Event]] = []
+        # Per-slot events, re-recorded each time the slot is used (no per-step
+        # Event allocation on the hot path).
+        self._fwd_done: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(ring)]
+        self._d2h: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(ring)]
+        # (slot, layout, n): staged copies whose rows are not yet committed.
+        self._pending: List[Tuple[int, list, int]] = []
         self._slot = 0
         self._last_d2h: Optional[torch.cuda.Event] = None
 
-    def stage(self, buf: torch.Tensor, n: int, layout: list) -> None:
+    def _slot_pending(self, slot: int) -> bool:
+        return any(p[0] == slot for p in self._pending)
+
+    def stage(self, buf: torch.Tensor, n: int, layout: list, commit_cb) -> None:
+        """Copy this step's ``n`` valid rows of ``buf`` into the next host slot.
+
+        A slot is never overwritten while a staged copy of it is still pending:
+        landed copies are committed first (event-gated, no host sync), and the
+        rare still-in-flight case is synchronized and committed before reuse.
+        Otherwise a later ``drain`` would commit the new rows under the old
+        layout.
+        """
         if n <= 0:
             return
-        cur = torch.cuda.current_stream(self._device)
-        fwd_done = torch.cuda.Event()
-        fwd_done.record(cur)  # forward finished writing buf
+        self.drain(commit_cb)
         slot = self._slot
-        prev = self._done[slot]
-        if prev is not None and not prev.query():  # ring slot still in flight — rare safety sync
-            prev.synchronize()
+        if self._slot_pending(slot):  # ring wrapped onto an unfinished copy -- rare
+            self._d2h[slot].synchronize()
+            self.drain(commit_cb)
+        fwd_done = self._fwd_done[slot]
+        fwd_done.record(torch.cuda.current_stream(self._device))  # forward finished writing buf
         self._stream.wait_event(fwd_done)  # side stream waits for the forward
+        d2h = self._d2h[slot]
         with torch.cuda.stream(self._stream):
             self._ring[slot][:n].copy_(buf[:n], non_blocking=True)
-            d2h = torch.cuda.Event()
             d2h.record(self._stream)
-        self._done[slot] = d2h
         self._last_d2h = d2h
-        self._pending.append((slot, list(layout), n, d2h))
+        self._pending.append((slot, list(layout), n))
         self._slot = (slot + 1) % len(self._ring)
 
     def wait_before_overwrite(self) -> None:
         # The single device buffer is about to be overwritten by the next
-        # forward — serialize AFTER the last D2H read it (GPU-side, no host sync).
+        # forward -- serialize AFTER the last D2H read it (GPU-side, no host sync).
         if self._last_d2h is not None:
             torch.cuda.current_stream(self._device).wait_event(self._last_d2h)
 
     def drain(self, commit_cb, force: bool = False) -> None:
         still = []
-        for slot, layout, n, ev in self._pending:
+        for slot, layout, n in self._pending:
+            ev = self._d2h[slot]
             if force or ev.query():
                 if force and not ev.query():
                     ev.synchronize()
                 commit_cb(self._ring[slot][:n], layout)
             else:
-                still.append((slot, layout, n, ev))
+                still.append((slot, layout, n))
         self._pending = still
 
 
@@ -151,60 +168,62 @@ class RouteCapture:
     """Per-request store of pre-EPLB logical top-k, keyed by absolute position.
 
     Write-once per (request, position): a re-prefill / recompute must never
-    overwrite an already-committed position — KV is a recomputable cache, the
+    overwrite an already-committed position -- KV is a recomputable cache, the
     store is immutable history. Each committed position holds the full [L, K]
     (all MoE layers for that token, filled in one forward).
+
+    One instance per ``PyTorchModelEngine`` (``model_engine.route_capture``),
+    built by ``RouteCapture.create``; the engine exposes it to the MoE routing
+    hook through its model extra attrs (see ``get_active_route_capture``).
     """
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        rank: int,
+        model_engine,
+        enabled: bool,
+        pp_size: int,
+        is_spec_decode: bool,
+        is_draft_model: bool,
+    ) -> Optional["RouteCapture"]:
+        """Build the engine's capturer, or ``None`` when Router Replay is off.
+
+        Draft engines never capture: their MoE layers are not target routing.
+        Fails closed on paths this capture cannot attribute correctly: pipeline
+        parallelism (routes live on the last PP stage only) and speculative
+        decoding / MTP (accepted-token remap not handled). All flags are passed
+        explicitly so this does not depend on engine attribute initialization
+        order.
+        """
+        if not enabled or is_draft_model:
+            return None
+        if pp_size > 1 or is_spec_decode:
+            raise RuntimeError(
+                "[R3] enable_return_routed_experts is not supported with "
+                f"pipeline parallelism (pp_size={pp_size}) or speculative decoding "
+                f"(is_spec_decode={is_spec_decode}); disable one of them or the feature."
+            )
+        return cls(rank=rank, model_engine=model_engine)
+
     # ------------------------------------------------------------------ #
-    #  Static facade — MoE forward + py_executor call these
+    #  Per-forward hooks -- the MoE forward and py_executor call these
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def get() -> Optional["RouteCapture"]:
-        return _get_singleton()
+    def set_iter(self, iter_id: int) -> None:
+        self._iter_id = iter_id
 
-    @staticmethod
-    def create(*, rank: int, model_engine=None, enabled: Optional[bool] = None) -> None:
-        if enabled is None:
-            # Engine-level opt-in: LlmArgs.enable_return_routed_experts. The
-            # R3_CAPTURE env var is a dev/test fallback only.
-            enabled = False
-            la = getattr(model_engine, "llm_args", None) if model_engine is not None else None
-            if la is not None:
-                enabled = bool(getattr(la, "enable_return_routed_experts", False))
-            if not enabled:
-                enabled = os.environ.get("R3_CAPTURE") == "1"
-        if enabled and model_engine is not None:
-            # Fail closed on paths this capture cannot attribute correctly:
-            # pipeline parallelism (routes live on the last PP stage only) and
-            # speculative decoding / MTP (accepted-token remap not handled).
-            pp = int(getattr(getattr(model_engine, "mapping", None), "pp_size", 1) or 1)
-            spec = bool(getattr(model_engine, "is_spec_decode", False))
-            if pp > 1 or spec:
-                raise RuntimeError(
-                    "[R3] enable_return_routed_experts is not supported with "
-                    f"pipeline parallelism (pp_size={pp}) or speculative decoding "
-                    f"(is_spec_decode={spec}); disable one of them or the feature."
-                )
-        if _get_singleton() is not None:
-            return  # idempotent: a second create() (draft + main model_engine)
-            #          must not drop the store the capture hook is writing to.
-        _set_singleton(RouteCapture(rank=rank, model_engine=model_engine) if enabled else None)
-
-    @staticmethod
-    def set_iter(iter_id: int) -> None:
-        m = _get_singleton()
-        if m is not None:
-            m._iter_id = iter_id
-
-    @staticmethod
-    def capture(layer_id: int, token_selected_experts: torch.Tensor) -> None:
+    def capture(
+        self, layer_id: int, token_selected_experts: torch.Tensor, row_offset: int = 0
+    ) -> None:
         """Hook from moe_scheduler after ``routing_method.apply()`` (separated,
         pre-EPLB). ``token_selected_experts`` is [num_rows, top_k] int32 in
-        scheduler token order == the current-forward layout order. Runs inside
-        the CUDA graph — a pure device write, no sync, no ``.cpu()``.
-        ``layer_id`` is ``moe.layer_idx`` (a Python int, constant at capture
-        time), so the slice write is baked into the captured graph.
+        scheduler token order == the current-forward layout order; ``row_offset``
+        is the first forward row of this MoE chunk (a multi-chunk MoE forward
+        calls the hook once per chunk with chunk-local rows). Runs inside the
+        CUDA graph -- a pure device write, no sync, no ``.cpu()``. ``layer_id``
+        (``moe.layer_idx``) and ``row_offset`` are Python ints, constant at
+        capture time, so the slice write is baked into the captured graph.
 
         NOT gated on ``_layout``: the buffer write must be *recorded into the
         CUDA graph during capture* (graph capture runs in model_engine warmup,
@@ -213,44 +232,32 @@ class RouteCapture:
         would never write the buffer -> graphed decode routes lost. The write is
         layout-independent (it just dumps router output in forward row order);
         ``_layout`` only gates the later per-row commit."""
-        m = _get_singleton()
-        if m is not None:
-            m._capture(int(layer_id), token_selected_experts)
+        self._capture(int(layer_id), token_selected_experts, int(row_offset))
 
-    @staticmethod
-    def prepare(scheduled_batch, tokens_per_block: int = 0) -> None:
-        m = _get_singleton()
-        if m is not None:
-            if tokens_per_block and tokens_per_block > 0:
-                m._tpb = int(tokens_per_block)
-            if not getattr(m, "_tpb_warned", False):
-                m._tpb_warned = True
-                logger.debug(f"[R3][pfx] prepare tpb={m._tpb}")
-            # _prepare first (records per-request prompt tokens/hashes), then
-            # readback (uses them to fill hit prefixes from the cache).
-            m._prepare(scheduled_batch)
-            m._readback_prefix(scheduled_batch)
+    def prepare(self, scheduled_batch, tokens_per_block: int = 0) -> None:
+        if tokens_per_block and tokens_per_block > 0:
+            self._tpb = int(tokens_per_block)
+        if not getattr(self, "_tpb_warned", False):
+            self._tpb_warned = True
+            logger.debug(f"[R3][pfx] prepare tpb={self._tpb}")
+        # _prepare first (records per-request prompt tokens/hashes), then
+        # readback (uses them to fill hit prefixes from the cache).
+        self._prepare(scheduled_batch)
+        self._readback_prefix(scheduled_batch)
 
-    @staticmethod
-    def clear_shared() -> None:
+    def clear_shared(self) -> None:
         """Hook from py_executor.reset_prefix_cache: route validity == KV
         validity, so when the KV reuse state is reset the cached routes must be
         dropped too."""
-        m = _get_singleton()
-        if m is not None:
-            m._shared.clear()
-            m._readback_done.clear()
-            m._prefix_populated.clear()
-            m._pop_cursor.clear()
+        self._shared.clear()
+        self._readback_done.clear()
+        self._prefix_populated.clear()
+        self._pop_cursor.clear()
 
-    @staticmethod
-    def finish_forward() -> None:
-        m = _get_singleton()
-        if m is not None:
-            m._finish_forward()
+    def finish_forward(self) -> None:
+        self._finish_forward()
 
-    @staticmethod
-    def attach_routes(request) -> None:
+    def attach_routes(self, request) -> None:
         """Called from py_executor._handle_responses when a request finishes:
         assemble its routes and append them so they surface on
         ``CompletionOutput.routed_experts`` (backed by
@@ -262,13 +269,12 @@ class RouteCapture:
         attach_routes can fire MULTIPLE times for the same finished request
         (_handle_responses revisits it). Attach + free EXACTLY ONCE, and only
         once assemble succeeds: on an incomplete store (assemble None / gap) do
-        NOT free — retry on a later call. Freeing eagerly corrupts the store."""
-        m = _get_singleton()
-        if m is None or request.py_request_id in m._attached:
+        NOT free -- retry on a later call. Freeing eagerly corrupts the store."""
+        if request.py_request_id in self._attached:
             return
-        if m._copier is not None:
+        if self._copier is not None:
             try:
-                m._copier.drain(m.commit, force=True)
+                self._copier.drain(self.commit, force=True)
             except Exception:
                 pass
         try:
@@ -276,15 +282,15 @@ class RouteCapture:
             if pyr is None:
                 return
             rid = request.py_request_id
-            routes = m.assemble(rid)
+            routes = self.assemble(rid)
             if routes is not None:
                 if pyr._additional_generation_outputs is None:
                     pyr._additional_generation_outputs = {}
                 pyr._additional_generation_outputs.setdefault("routed_experts", [])
                 pyr.append_additional_generation_outputs("routed_experts", routes)
-                m._attached.add(rid)
-                m._populate_prefix(request, rid)  # store this req's blocks for reuse
-                m.free(rid)  # bound memory once safely attached
+                self._attached.add(rid)
+                self._populate_prefix(request, rid)  # store this req's blocks for reuse
+                self.free(rid)  # bound memory once safely attached
         except Exception:
             pass
 
@@ -302,7 +308,7 @@ class RouteCapture:
         # PR2 prefix-cache: SharedRouteCache — routes keyed by a self-computed
         # hash of the prefix token ids at block boundaries, so a prefix-cache hit
         # (whose tokens are NOT recomputed -> no capture) can copy the routes back
-        # into its store. Lives on this singleton (which persists across
+        # into its store. Lives on this capturer (which persists across
         # requests); cleared on reset_prefix_cache. key = hash(tuple(tokens[:end]))
         # -> int16 [tokens_per_block, L, K].
         self._shared: Dict[int, torch.Tensor] = {}
@@ -334,20 +340,16 @@ class RouteCapture:
         if self._buf is not None:
             return
         if torch.cuda.is_current_stream_capturing():
-            # Cannot cudaMalloc during graph capture. This branch means the very
+            # Cannot cudaMalloc during graph capture. Reaching here means the very
             # first MoE capture happened INSIDE a graph capture with no preceding
-            # eager warmup forward — the write for this graph key is then NOT
-            # recorded and its routes would be silently lost. Warn once so it is
-            # visible rather than a silent gap (expected never to fire: TRT-LLM
-            # runs an eager warmup before graph capture).
-            if not getattr(self, "_warned_capture_alloc", False):
-                self._warned_capture_alloc = True
-                logger.warning(
-                    "[R3] first MoE capture during graph capture with "
-                    "no buffer — routes for this graph key will be missing. "
-                    "Expected an eager warmup forward first."
-                )
-            return  # warmup eager allocates first
+            # eager warmup forward: the write for this graph key would not be
+            # recorded and its routes silently lost. TRT-LLM always runs an eager
+            # warmup before graph capture, so fail loudly rather than degrade.
+            raise RuntimeError(
+                "[R3] first MoE capture happened during CUDA graph capture, before "
+                "the route buffer was allocated by an eager warmup forward; routes "
+                "for this graph would be missing."
+            )
         # Read the MoE-layer registry via the CANONICAL context-local accessor
         # ``get_model_extra_attrs()`` — the exact source the MoE forward itself
         # uses (interface.py: extract_extra_attrs). It is set during forward, so
@@ -387,7 +389,7 @@ class RouteCapture:
             f"[R3] route buffer allocated: L={self._L} K={self._K} max_num_tokens={max_tok}"
         )
 
-    # ---- driven by py_executor, once per forward (via the static facade) ----
+    # ---- driven by py_executor, once per forward (via the hooks above) ----
     def _prepare(self, scheduled_batch) -> None:
         # Next forward is about to overwrite the single device buffer — make it
         # wait on the last D2H (GPU-side, no host sync).
@@ -459,20 +461,21 @@ class RouteCapture:
         # whatever prior D2Hs have already landed. Never syncs the forward path.
         if self._copier is not None and self._buf is not None and self._layout is not None:
             try:
-                self._copier.stage(self._buf, len(self._layout), self._layout)
+                self._copier.stage(self._buf, len(self._layout), self._layout, self.commit)
                 # On a prefill step, force-drain so THIS step's prompt routes land
                 # in the store now (prefill is not the graphed decode hot loop, so
-                # the sync is cheap) — then incremental populate can push them to
+                # the sync is cheap) -- then incremental populate can push them to
                 # the SharedRouteCache this same step, ahead of a sibling's hit.
                 self._copier.drain(self.commit, force=self._had_context)
                 self._incremental_populate()
-            except Exception as e:
-                if not getattr(self, "_warned_stage", False):
-                    self._warned_stage = True
-                    logger.warning(f"[R3] stage/commit failed (routes will be missing): {e}")
-        self._layout = None  # disarm between forwards (excludes stray/warmup calls)
+            finally:
+                # Disarm between forwards (excludes stray/warmup calls) even if
+                # staging raised; a failure here must surface, not be logged away.
+                self._layout = None
+        else:
+            self._layout = None
 
-    def _capture(self, layer_id: int, tse: torch.Tensor) -> None:
+    def _capture(self, layer_id: int, tse: torch.Tensor, row_offset: int = 0) -> None:
         # Device-buffer write, inside the CUDA graph. Allocate lazily on the
         # first eager capture (warmup), then reuse the fixed-address buffer.
         if self._buf is None:
@@ -482,11 +485,13 @@ class RouteCapture:
         pos = self._layer_pos.get(layer_id)
         if pos is None:
             return
-        n = tse.shape[0]
-        if n > self._buf.shape[0]:
-            n = self._buf.shape[0]
-        # tse is [n, K] int32 (moe_scheduler cast it); buf is [max_tok, L, K].
-        self._buf[:n, pos, :] = tse[:n]
+        # tse is [n, K] int32 (moe_scheduler cast it) holding forward rows
+        # [row_offset, row_offset + n) of this MoE call; buf is [max_tok, L, K].
+        begin = max(int(row_offset), 0)
+        end = min(begin + tse.shape[0], self._buf.shape[0])
+        if end <= begin:
+            return
+        self._buf[begin:end, pos, :] = tse[: end - begin]
 
     # ---- commit staged host rows into the per-request store (write-once) ----
     def commit(self, host_rows: torch.Tensor, layout: list) -> None:
