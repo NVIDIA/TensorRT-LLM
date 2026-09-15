@@ -575,9 +575,12 @@ class TestKVCacheManagerLocalizedQueries(unittest.TestCase):
 
         self.manager = _make_localized_manager()
 
+        unpatched = self.manager.get_page_index_upper_bound(LayerId(0), DataRole("key"))
         with patch.object(type(self.manager), "get_page_stride", lambda _self, _layer_id, _role: 3):
             upper_bound = self.manager.get_page_index_upper_bound(LayerId(0), DataRole("key"))
-            self.assertGreater(upper_bound, 0)
+            self.assertEqual(
+                upper_bound, unpatched, "upper bound must not depend on page_stride"
+            )
 
 
 class TestKVCacheSaltedReuse(unittest.TestCase):
