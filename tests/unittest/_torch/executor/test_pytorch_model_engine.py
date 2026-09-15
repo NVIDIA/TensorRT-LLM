@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -97,18 +98,6 @@ class DummyModel(torch.nn.Module):
         self.recorded_position_ids = kwargs["position_ids"]
         batch_size = input_ids.size(0)
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
-
-
-class DummyMultimodalIndexModel(torch.nn.Module):
-
-    class Config:
-        vocab_size = 100
-
-    config = Config()
-
-    @property
-    def multimodal_token_ids(self) -> torch.Tensor:
-        return torch.tensor([90, 91], dtype=torch.int32)
 
 
 class DummyLegacyMultimodalIndexModel(MultimodalModelMixin, torch.nn.Module):
@@ -260,6 +249,7 @@ def _make_forward_only_engine(
     engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
+    engine._runner = None
     engine.cuda_graph_lora_manager = None
     engine._force_lora_graph_for_capture = None
 
@@ -357,6 +347,33 @@ def create_model_engine_and_kvcache(
     )
 
     return model_engine, kv_cache_manager
+
+
+def test_cleanup_releases_runner_model_before_release_gc() -> None:
+
+    class Model:
+        pass
+
+    engine = object.__new__(PyTorchModelEngine)
+    model = Model()
+    model_ref = weakref.ref(model)
+    engine._cleanup_done = False
+    engine.model_loader = None
+    engine._runner = SimpleNamespace(_model=model)
+    engine._mm_item_scheduler = None
+    engine.model = model
+    engine._release_cuda_graphs = Mock()
+    engine.input_processor = None
+    del model
+
+    def assert_model_released() -> None:
+        assert model_ref() is None
+
+    with patch("tensorrt_llm._torch.pyexecutor.model_engine.release_gc",
+               side_effect=assert_model_released) as release_gc:
+        engine.cleanup()
+
+    release_gc.assert_called_once_with()
 
 
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
@@ -1188,8 +1205,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "speculative_draft_model",
             "beam",
             "encoder_decoder",
-            "encode_only",
-            "mm_encoder_only",
             "ple_recurrent_state",
             "nested_ple_recurrent_state",
             "context_parallel",
@@ -1211,10 +1226,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine.max_beam_width = 2
                 elif case == "encoder_decoder":
                     engine._is_encoder_decoder_model.return_value = True
-                elif case == "encode_only":
-                    engine._is_encode_only = True
-                elif case == "mm_encoder_only":
-                    engine.llm_args.mm_encoder_only = True
                 elif case == "ple_recurrent_state":
                     engine.model.has_ple = True
                 elif case == "nested_ple_recurrent_state":
@@ -1615,26 +1626,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(engine.is_multimodal)
         engine._validate_breakable_cuda_graph_compatibility()
 
-    def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
-
-    def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
-            [1, 90, 2, 91, 3])
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
-
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
         request = LlmRequest(
@@ -1699,7 +1690,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         new_tokens[0, 0, 0] = 999
         new_tokens[0, 1, 0] = 777
         overlap_state = SimpleNamespace(new_tokens=new_tokens)
-        model_engine._can_use_incremental_update = Mock(return_value=True)
         model_engine._can_use_steady_gen_fast_prepare = Mock(return_value=True)
 
         inputs, _ = model_engine._prepare_tp_inputs(
@@ -1716,7 +1706,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(
             attn_metadata.kv_cache_params.num_cached_tokens_per_seq, [2, 5])
         self.assertEqual(context.cached_tokens, 3)
-        model_engine._can_use_incremental_update.assert_not_called()
         model_engine._can_use_steady_gen_fast_prepare.assert_not_called()
         self.assertEqual(
             model_engine.previous_batch_indices_cuda[:1].cpu().tolist(), [1])

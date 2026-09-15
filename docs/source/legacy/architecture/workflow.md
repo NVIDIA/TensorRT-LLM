@@ -1,3 +1,8 @@
+---
+orphan: true
+---
+
+(workflow)=
 # TensorRT-LLM Build Workflow
 
 ```{caution}
@@ -57,7 +62,7 @@ class LLaMAForCausalLM (DecoderModelForCausalLM):
 
 
 Then, in the convert_checkpoint.py script in the
-[`examples/models/core/llama/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama/) directory of the GitHub repo,
+[`examples/models/core/llama/`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.0/examples/models/core/llama/) directory of the GitHub repo,
 the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the `from_hugging_face` API will keep the same, thus the existing workflow using this interface will not be affected.
 
 
@@ -110,7 +115,7 @@ TensorRT-LLM relies on NVIDIA Modelopt toolkit to support some of the quantizati
 In TensorRT-LLM 0.8 version:
 
 * For Modelopt-supported quantization algorithms, a standalone script,
-  [example/quantization/quantize.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/quantization/quantize.py)
+  [example/quantization/quantize.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/quantization/quantize.py)
   can export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.
 
 * For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.

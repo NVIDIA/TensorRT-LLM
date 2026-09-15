@@ -34,6 +34,10 @@ from mpi4py import MPI as _MPI
 from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_catalog import \
+    build_safetensors_checkpoint_catalog
 from tensorrt_llm._torch.models.checkpoints.hf.rank_striped_read_ahead import (
     RankStripedReadAheadSession, build_local_plan, close_node_communicator,
     coordinate_error, effective_available_host_memory, memory_admission)
@@ -173,11 +177,13 @@ class HfWeightLoader(BaseWeightLoader):
 
     def _log_checkpoint_io_status(self) -> None:
         status = self._last_checkpoint_io_status
+        fallback_reason = (status.fallback_reason
+                           or "none").replace("\r", "\\r").replace("\n", "\\n")
         logger.info(
             f"Checkpoint I/O policy: requested={status.requested}, "
             f"selected={status.selected}, activated={status.activated}, "
             f"effective={status.effective}, fallback_reason="
-            f"{status.fallback_reason or 'none'}.")
+            f"{fallback_reason}.")
 
     @staticmethod
     def _is_weight_cache_enabled() -> bool:
@@ -427,19 +433,24 @@ class HfWeightLoader(BaseWeightLoader):
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
-        """Load synchronously for callers without a materialization session."""
-        if self._checkpoint_io_policy == _NATIVE_IO_POLICY:
-            self._reset_checkpoint_io_status()
-            weights = self._load_weights_native(checkpoint_dir, mapping,
-                                                use_consolidated, **kwargs)
-            self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
-            self._log_checkpoint_io_status()
-            return weights
-        with self.open_weight_session(checkpoint_dir,
-                                      mapping=mapping,
-                                      use_consolidated=use_consolidated,
-                                      **kwargs) as weights:
-            return weights
+        """Load synchronously without activating session-scoped read-ahead."""
+        self._reset_checkpoint_io_status()
+        if self._checkpoint_io_policy != _NATIVE_IO_POLICY:
+            status = self._last_checkpoint_io_status
+            status.selected = _NATIVE_IO_POLICY
+            status.fallback_reason = (
+                "rank-striped read-ahead requires open_weight_session() to "
+                "overlap I/O with model materialization")
+            message = (
+                "Checkpoint I/O policy is falling back for a sessionless "
+                f"load: requested={status.requested}, "
+                f"selected={status.selected}, reason={status.fallback_reason}.")
+            logger.info(message)
+        weights = self._load_weights_native(checkpoint_dir, mapping,
+                                            use_consolidated, **kwargs)
+        self._last_checkpoint_io_status.effective = _NATIVE_IO_POLICY
+        self._log_checkpoint_io_status()
+        return weights
 
     @contextmanager
     def open_weight_session(self,
@@ -568,6 +579,22 @@ class HfWeightLoader(BaseWeightLoader):
             if ("consolidated" in os.path.split(path)[1]) == use_consolidated
         ]
         return filtered_weight_files or weight_files
+
+    def build_checkpoint_catalog(
+            self,
+            checkpoint_dir: str,
+            use_consolidated: bool = False) -> CheckpointCatalog | None:
+        """Inspect the selected eager SafeTensors files without reading payloads."""
+        if self._requires_lazy_safetensors(checkpoint_dir):
+            return None
+        if (self._partial_model_loading
+                or int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0")) != 0):
+            return None
+        weight_files = self._selected_safetensors_files(checkpoint_dir,
+                                                        use_consolidated)
+        if not weight_files:
+            return None
+        return build_safetensors_checkpoint_catalog(weight_files)
 
     def _close_unactivated_session(
             self,
