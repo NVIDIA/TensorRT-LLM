@@ -612,6 +612,23 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             self.sf_vec_size,
             self.num_ab_stage,
         )
+        # The FC2 TMA store picks its gmem tile with
+        # ``cumulative_data_physical_row // _EpilogueTokenTileSize`` (64), but
+        # that cumulative row is only rounded up to ``token_padding_block``.
+        # A block that is not itself a multiple of 64 therefore lets the
+        # floor-division drop a partial tile and land the 64-row store on the
+        # wrong rows. Nothing else constrains the two: the scheduler only
+        # requires a positive block, and the kernel only requires
+        # ``cluster_tile_tokens`` to be divisible by it.
+        epi_token_tile = SwapABSwigluFp4Epilogue._EpilogueTokenTileSize
+        if (self.epilogue.fc2_use_tma
+                and self.token_padding_block % epi_token_tile != 0):
+            raise ValueError(
+                f"FC2 TMA store requires token_padding_block "
+                f"({self.token_padding_block}) to be a multiple of the "
+                f"epilogue token tile ({epi_token_tile}); otherwise pool row "
+                f"offsets do not align with the TMA tile index.")
+
         # Read epilogue's autonomous decisions.
         self.overlapping_accum = self.epilogue.overlapping_accum
         self.num_acc_pipeline_stages = self.epilogue.num_acc_pipeline_stages
@@ -1947,19 +1964,28 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             sfa_full_mcast_mask = None
             if cutlass.const_expr(self.is_a_mcast or use_2cta_instrs):
                 if cutlass.const_expr(self.is_mixed_cga):
+                    # The "a"/"sfa" pattern is
+                    # ``sum(1 << (n_idx * cluster_m) for n_idx in
+                    # range(cluster_n))``, so it varies with the cluster shape
+                    # just as "b"/"sfb" does. Passing None here pinned it to
+                    # the preferred shape, and on a fallback cluster that
+                    # pattern can name CTA ranks the cluster does not contain.
+                    # Resolve it the same way the B/SFB path does below.
+                    is_preferred_cluster = (
+                        is_fallback_cluster == cutlass.Boolean(False))
                     a_full_mcast_mask = tma_multicast_mask(
                         self.cluster_shape_mn,
-                        None,
+                        self.resolved_fallback_cluster_shape_mn,
                         cta_coord_in_cluster,
-                        None,
+                        is_preferred_cluster,
                         use_2cta_instrs,
                         "a",
                     )
                     sfa_full_mcast_mask = tma_multicast_mask(
                         self.cluster_shape_mn,
-                        None,
+                        self.resolved_fallback_cluster_shape_mn,
                         cta_coord_in_cluster,
-                        None,
+                        is_preferred_cluster,
                         use_2cta_instrs,
                         "sfa",
                     )
