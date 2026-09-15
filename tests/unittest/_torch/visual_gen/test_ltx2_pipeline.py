@@ -1405,8 +1405,8 @@ class TestLTX2TwoStageLoRAHelpers:
         assert dense_replay_key == dense_key
         assert captured_keys == [dense_key, sparse_key]
 
-    def test_ltx2_threads_raw_modality_timestep_for_sol_phase(self):
-        """SOL phase preparation must not use the AdaLN-transformed timestep."""
+    def test_ltx2_threads_raw_modality_timestep_to_attention(self):
+        """Attention must schedule on the denoising timestep, not the AdaLN modulation."""
         from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import (
             graph_phase_for_timestep,
         )
@@ -1449,22 +1449,8 @@ class TestLTX2TwoStageLoRAHelpers:
         observed_phases = []
 
         class Block:
-            def __call__(
-                self,
-                *,
-                video,
-                audio,
-                video_sol_timestep=None,
-                audio_sol_timestep=None,
-                **kwargs,
-            ):
+            def __call__(self, *, video, audio, video_timestep, audio_timestep, **kwargs):
                 del kwargs
-                video_timestep = (
-                    video.timesteps if video_sol_timestep is None else video_sol_timestep
-                )
-                audio_timestep = (
-                    audio.timesteps if audio_sol_timestep is None else audio_sol_timestep
-                )
                 observed_phases.append(
                     (
                         graph_phase_for_timestep(
