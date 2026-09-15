@@ -7,6 +7,11 @@ Set ``TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS=1`` before process startup for a
 targeted diagnostic run. Standard and performance runs leave it unset, making
 each instrumented edge a module-attribute check with no clock read, request
 inspection, serialization, or log emission.
+
+For cross-process correlation, set
+``TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID`` to the same UUID for all CTX and
+GEN workers in one diagnostic launch. Use a new UUID for each launch. An unset
+or invalid value limits analysis to individual process lifetimes.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import queue
 import socket
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator, Optional, TypeAlias
 
@@ -26,6 +32,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
 _DIAGNOSTICS_ENV = "TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS"
+_DIAGNOSTICS_RUN_ID_ENV = "TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID"
 DIAGNOSTICS_LOG_PREFIX = "[DISAGG_TRANSFER_DIAG] "
 DIAGNOSTICS_SCHEMA_VERSION = 1
 _DIAGNOSTIC_QUEUE_CAPACITY = 32_768
@@ -77,6 +84,19 @@ class _AsyncDiagnosticSink:
 
     def __init__(self, pid: int) -> None:
         self.pid = pid
+        self._identity: DiagnosticRecord = {
+            "process_uuid": str(uuid.uuid4()),
+            "run_uuid": None,
+            "run_uuid_status": "unset",
+        }
+        run_id = os.getenv(_DIAGNOSTICS_RUN_ID_ENV)
+        if run_id is not None:
+            try:
+                self._identity["run_uuid"] = str(uuid.UUID(run_id))
+            except ValueError:
+                self._identity["run_uuid_status"] = "invalid"
+            else:
+                self._identity["run_uuid_status"] = "shared"
         self._queue: queue.Queue[DiagnosticRecord] = queue.Queue(maxsize=_DIAGNOSTIC_QUEUE_CAPACITY)
         self._stop_requested = threading.Event()
         self._submit_lock = threading.Lock()
@@ -134,20 +154,26 @@ class _AsyncDiagnosticSink:
                 raise OSError("diagnostic stdout write made no progress")
             offset += written
 
+    def _write_identified_record(self, record: DiagnosticRecord) -> None:
+        # Attach cached identities on the writer thread, overriding caller
+        # details so no event can impersonate a different process lifetime.
+        record.update(self._identity)
+        record["host"] = _host_identity()
+        record["pid"] = self.pid
+        self._write(record)
+
     def _write_drop_record(self) -> None:
         dropped = self._take_dropped()
         if dropped == 0:
             return
         try:
-            self._write(
+            self._write_identified_record(
                 {
                     "schema_version": DIAGNOSTICS_SCHEMA_VERSION,
                     "event": "diagnostics_events_dropped",
                     "side": "runtime",
                     "request_id": None,
                     "local_request_id": None,
-                    "host": _host_identity(),
-                    "pid": self.pid,
                     "monotonic_ns": time.monotonic_ns(),
                     "wall_ns": time.time_ns(),
                     "dropped_events": dropped,
@@ -176,8 +202,7 @@ class _AsyncDiagnosticSink:
             except Exception:
                 pass
             try:
-                record["host"] = _host_identity()
-                self._write(record)
+                self._write_identified_record(record)
             except Exception:
                 # Diagnostics are best-effort and must never affect request
                 # progress. Account for transient failures so a later healthy
