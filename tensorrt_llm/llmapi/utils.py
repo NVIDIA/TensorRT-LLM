@@ -17,6 +17,7 @@ import traceback
 import warnings
 import weakref
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from queue import Empty, Queue
@@ -708,6 +709,138 @@ def _reapply_current_thread_affinity_to_all_threads() -> tuple[int, int]:
             f"starting executor threads: {e}.")
         return 0, 0
     return _set_affinity_all_threads(cpus)
+
+
+@dataclass
+class _CpuAffinityLeaseState:
+    pid: int
+    original_masks: dict[int, frozenset[int]]
+    default_mask: frozenset[int]
+    owned_masks: set[frozenset[int]] = field(default_factory=set)
+    leases: set[int] = field(default_factory=set)
+
+
+_cpu_affinity_lease_state: _CpuAffinityLeaseState | None = None
+_cpu_affinity_lease_lock = threading.Lock()
+_next_cpu_affinity_lease = 0
+
+
+def _read_thread_affinities() -> dict[int, frozenset[int]]:
+    """Return the affinity mask of every live thread that can be inspected."""
+    if not hasattr(os,
+                   "sched_getaffinity") or not os.path.isdir("/proc/self/task"):
+        return {os.getpid(): frozenset(psutil.Process().cpu_affinity())}
+
+    try:
+        tids = os.listdir("/proc/self/task")
+    except OSError as e:
+        logger.warning(f"Could not snapshot /proc/self/task CPU affinity: {e}.")
+        return {}
+
+    affinities = {}
+    for tid_text in tids:
+        tid = int(tid_text)
+        try:
+            affinities[tid] = frozenset(os.sched_getaffinity(tid))
+        except ProcessLookupError:
+            continue
+        except OSError as e:
+            logger.warning(
+                f"Could not read CPU affinity for thread {tid}: {e}.")
+    return affinities
+
+
+def acquire_cpu_affinity(device_id: int) -> int | None:
+    """Configure worker affinity and return a lease that restores it on release.
+
+    Concurrent workers in one process share the saved pre-worker state. The
+    final release restores only masks still owned by this affinity manager, so
+    an external affinity change made while a worker is alive is preserved.
+    """
+    global _cpu_affinity_lease_state, _next_cpu_affinity_lease
+    with _cpu_affinity_lease_lock:
+        pid = os.getpid()
+        state = _cpu_affinity_lease_state
+        if state is None or state.pid != pid:
+            original_masks = _read_thread_affinities()
+            if not original_masks:
+                configure_cpu_affinity(device_id)
+                return None
+            try:
+                default_mask = frozenset(os.sched_getaffinity(0))
+            except (AttributeError, OSError):
+                default_mask = frozenset(psutil.Process(pid).cpu_affinity())
+            state = _CpuAffinityLeaseState(pid, original_masks, default_mask)
+            before = _read_thread_affinities()
+            configure_cpu_affinity(device_id)
+            after = _read_thread_affinities()
+            state.owned_masks.update(mask for tid, mask in after.items()
+                                     if before.get(tid) != mask)
+            if not state.owned_masks:
+                return None
+
+        _next_cpu_affinity_lease += 1
+        lease = _next_cpu_affinity_lease
+        state.leases.add(lease)
+        _cpu_affinity_lease_state = state
+        return lease
+
+
+def release_cpu_affinity(lease: int | None) -> None:
+    """Release an affinity lease and restore pre-worker masks when it is last."""
+    global _cpu_affinity_lease_state
+    if lease is None:
+        return
+
+    with _cpu_affinity_lease_lock:
+        state = _cpu_affinity_lease_state
+        if state is None or state.pid != os.getpid(
+        ) or lease not in state.leases:
+            return
+        state.leases.remove(lease)
+        if state.leases:
+            return
+
+        current_masks = _read_thread_affinities()
+        if not hasattr(os, "sched_setaffinity"):
+            process = psutil.Process(state.pid)
+            current_mask = frozenset(process.cpu_affinity())
+            if current_mask in state.owned_masks:
+                try:
+                    process.cpu_affinity(list(state.default_mask))
+                except (OSError, psutil.Error) as e:
+                    logger.warning(f"Could not restore CPU affinity: {e}.")
+            else:
+                logger.info("Preserved externally changed CPU affinity.")
+            _cpu_affinity_lease_state = None
+            return
+        failures = collections.Counter()
+        restored = 0
+        skipped = 0
+        for tid, current_mask in current_masks.items():
+            if current_mask not in state.owned_masks:
+                skipped += 1
+                continue
+            original_mask = state.original_masks.get(tid, state.default_mask)
+            try:
+                os.sched_setaffinity(tid, original_mask)
+            except ProcessLookupError:
+                continue
+            except OSError as e:
+                failures[errno.errorcode.get(e.errno, e.errno)] += 1
+            else:
+                restored += 1
+
+        if failures:
+            logger.warning(
+                f"Could not restore the CPU affinity of {sum(failures.values())} "
+                f"threads ({dict(failures)}).")
+        if skipped:
+            logger.info(
+                f"Preserved externally changed CPU affinity on {skipped} threads."
+            )
+        logger.info(f"Restored pre-worker CPU affinity on {restored} threads.")
+        _cpu_affinity_lease_state = None
 
 
 def configure_cpu_affinity(device_id: int) -> None:
