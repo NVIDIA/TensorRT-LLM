@@ -24,20 +24,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
-        Attention2DAttention,
-        RingAttention,
-        UlyssesAttention,
-    )
-    from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
-    from tensorrt_llm.visual_gen.args import ParallelConfig
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    Attention2DAttention,
+    RingAttention,
+    UlyssesAttention,
+)
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
+from tensorrt_llm.visual_gen.args import ParallelConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
@@ -85,8 +80,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
 
 
 def _run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs) -> None:
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     from ._visual_gen_dist_utils import spawn_with_retry

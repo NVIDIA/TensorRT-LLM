@@ -15,7 +15,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse
 class ExecutorEffects(Protocol):
     """Executor-owned side effects the coordinator may trigger.
 
-    These three are the complete set; adding one is a design decision, not
+    These four are the complete set; adding one is a design decision, not
     a convenience.
     """
 
@@ -45,6 +45,14 @@ class ExecutorEffects(Protocol):
         charge_budget: bool,
     ) -> None:
         """Fail requests through the executor's error path."""
+        ...
+
+    def fail_fatal(self, error_msg: str) -> None:
+        """Mark the executor fatal and fail every active request.
+
+        Called only after a world-wide collective agreed on the failure, so
+        the executor takes its collective-aligned fatal path on every rank.
+        """
         ...
 
 

@@ -20,10 +20,6 @@ the cached step counts to confirm the user override is respected.
 
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan13b_teacache_coefficients.py -v -s
-
-Override checkpoint:
-    DIFFUSION_MODEL_PATH_WAN21_1_3B=/path/to/weights \\
-        pytest tests/unittest/_torch/visual_gen/test_wan13b_teacache_coefficients.py -v -s
 """
 
 import gc
@@ -31,10 +27,9 @@ import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
-from pathlib import Path
-
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TeaCacheConfig, VisualGenArgs
@@ -55,23 +50,7 @@ def _cleanup_gpu():
     torch.cuda.empty_cache()
 
 
-def _llm_models_root() -> Path:
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    else:
-        root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return root
-
-
-WAN21_1_3B_PATH = os.environ.get(
-    "DIFFUSION_MODEL_PATH_WAN21_1_3B",
-    str(_llm_models_root() / "Wan2.1-T2V-1.3B-Diffusers"),
-)
+WAN21_1_3B_SUBDIR = "Wan2.1-T2V-1.3B-Diffusers"
 
 PROMPT = "a cat sitting on a windowsill"
 HEIGHT, WIDTH = 480, 832
@@ -98,11 +77,8 @@ COEFFICIENTS_IDENTITY_LINEAR = [
 
 def _run_forward(coefficients: list, thresh: float, label: str) -> dict:
     """Load the pipeline with the given user-supplied coefficients, run one forward pass."""
-    if not os.path.exists(WAN21_1_3B_PATH):
-        pytest.skip(f"Checkpoint not found: {WAN21_1_3B_PATH}")
-
     args = VisualGenArgs(
-        model=WAN21_1_3B_PATH,
+        model=get_checkpoint(WAN21_1_3B_SUBDIR),
         cache_config=TeaCacheConfig(
             teacache_thresh=thresh,
             coefficients=coefficients,
