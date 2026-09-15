@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM configuration, loading and vision ownership regressions without checkpoint files."""
 
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import MethodType, SimpleNamespace
+from unittest.mock import Mock, create_autospec, patch
 
 import pytest
 import torch
@@ -16,9 +16,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper import (
     audit_glm5_next_checkpoint,
 )
 from tensorrt_llm._torch.models.modeling_glm5_next import (
-    Glm5NextForCausalLM,
+    SPARSE_MLP,
+    Glm5NextDecoderLayer,
     Glm5NextLinearAttention,
+    Glm5NextRuntimeContext,
     Glm5NextSparseAttention,
+    glm5_next_tp_reduces,
 )
 from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVisionModelBase
 from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_masks
@@ -143,7 +146,7 @@ def test_cache_manager_routing_guards(route, monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("fp8_kv_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
-def test_fp8_kv_cache_rejected_before_manager_construction(fp8_kv_cache):
+def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache):
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextCacheManager
     from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
     from tensorrt_llm.bindings import DataType
@@ -163,9 +166,7 @@ def test_fp8_kv_cache_rejected_before_manager_construction(fp8_kv_cache):
         pass
 
     with patch.object(Glm5NextCacheManager, "__new__", side_effect=AllocationReached) as allocate:
-        expected = ValueError if fp8_kv_cache else AllocationReached
-        message = "glm5_next does not support FP8 KV cache" if fp8_kv_cache else None
-        with pytest.raises(expected, match=message):
+        with pytest.raises(AllocationReached):
             _create_kv_cache_manager(
                 model_engine=None,
                 kv_cache_manager_cls=Glm5NextCacheManager,
@@ -185,11 +186,10 @@ def test_fp8_kv_cache_rejected_before_manager_construction(fp8_kv_cache):
                 dtype=torch.bfloat16,
                 is_draft=False,
             )
-        if fp8_kv_cache:
-            allocate.assert_not_called()
-        else:
-            allocate.assert_called_once()
-            assert allocate.call_args.kwargs["dtype"] == DataType.BF16
+        allocate.assert_called_once()
+        assert allocate.call_args.kwargs["dtype"] == (
+            DataType.FP8 if fp8_kv_cache else DataType.BF16
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -211,23 +211,6 @@ def test_encoder_only_factory_materializes_attention_weights(deferred):
         for projection in (block.attn.qkv_proj, block.attn.o_proj, block.mlp.down_proj):
             assert projection._weights_created
             assert projection.weight is not None
-
-
-@pytest.mark.cpu_only
-def test_attention_dp_speculation_rejected_before_model_construction():
-    config = SimpleNamespace(
-        pretrained_config=_config(),
-        mapping=Mapping(world_size=4, tp_size=4, enable_attention_dp=True),
-        spec_config=object(),
-    )
-    with (
-        patch(
-            "tensorrt_llm._torch.models.modeling_glm5_next.Glm5NextModel",
-            side_effect=AssertionError("must reject before constructing layers"),
-        ),
-        pytest.raises(ValueError, match="does not support attention DP"),
-    ):
-        Glm5NextForCausalLM(config)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -380,3 +363,133 @@ def test_sparse_prefill_continuation_preserves_partial_pools():
     broken, _, _ = run([5, 8], discard_prefix=True)
     broken_l2 = (broken.float() - reference.float()).norm() / reference.float().norm()
     assert broken_l2 > 0.03
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens_per_request", [1, 4], ids=["decode", "verify"])
+def test_attention_dp_mixed_batches_keep_one_full_batch_moe_call(tokens_per_request: int) -> None:
+    # Rank-local phase mixes differ under ADP. Exercise the real decoder
+    # dispatch and FFN wrapper with lightweight math stubs.
+    batches = [(3, 1), (3, 0), (0, 1), (2, 1)]
+    counts = [
+        context_tokens + generations * tokens_per_request for context_tokens, generations in batches
+    ]
+    for rank, (context_tokens, generations) in enumerate(batches):
+        mapping = Mapping(
+            world_size=4, tp_size=4, moe_ep_size=4, rank=rank, enable_attention_dp=True
+        )
+        contexts = int(context_tokens > 0)
+        metadata = SimpleNamespace(all_rank_num_tokens=counts)
+        context = Glm5NextRuntimeContext(
+            manager=object(),
+            num_contexts=contexts,
+            num_ctx_tokens=context_tokens,
+            num_generations=generations,
+            ctx_cu_seqlens=[0, context_tokens] if contexts else [0],
+            cached_lens=[0] * contexts + [1] * generations,
+            state_indices=torch.arange(contexts + generations),
+            kv_lens=torch.tensor(
+                ([context_tokens] if contexts else [])
+                + ([1 + tokens_per_request] if generations else [])
+            ),
+            metadata=metadata,
+            gen_tokens_per_request=tokens_per_request,
+        )
+        hidden = torch.arange(counts[rank] * 4 * 8, dtype=torch.float32).view(-1, 4, 8)
+        reduction = Mock(side_effect=lambda value: value)
+        attention = SimpleNamespace(
+            tp_all_reduce=reduction if glm5_next_tp_reduces(mapping) else None
+        )
+        for phase in ("prefill", "decode", "verify"):
+            implementation = MethodType(
+                getattr(Glm5NextSparseAttention, f"forward_{phase}"), attention
+            )
+            setattr(
+                attention,
+                f"forward_{phase}",
+                create_autospec(implementation, side_effect=lambda x, *args, **kwargs: x),
+            )
+        attention.forward_mixed = MethodType(Glm5NextSparseAttention.forward_mixed, attention)
+        connection = SimpleNamespace(
+            pre_mapping=lambda streams: (None, None, streams.mean(dim=1)),
+            post_mapping=lambda output, residual, post, comb: residual + output.unsqueeze(1),
+        )
+        layer = SimpleNamespace(
+            attention_type="deepseek_sparse_attention",
+            layer_idx=1,
+            mlp_type=SPARSE_MLP,
+            self_attn=attention,
+            hc_attn=connection,
+            hc_ffn=connection,
+            input_layernorm=torch.nn.Identity(),
+            post_attention_layernorm=torch.nn.Identity(),
+            mlp=Mock(side_effect=lambda x, all_rank_num_tokens: x),
+        )
+        layer.forward_direct = MethodType(Glm5NextDecoderLayer.forward_direct, layer)
+        layer.run_mlp = MethodType(Glm5NextDecoderLayer.run_mlp, layer)
+        result = Glm5NextDecoderLayer.forward(layer, hidden_states=hidden, runtime_ctx=context)
+        assert result.shape == hidden.shape
+        reduction.assert_not_called()
+        layer.mlp.assert_called_once()
+        mlp_tokens, all_rank_num_tokens = layer.mlp.call_args.args
+        assert mlp_tokens.shape[0] == counts[rank]
+        assert all_rank_num_tokens is counts
+        if contexts:
+            attention.forward_prefill.assert_called_once()
+            torch.testing.assert_close(
+                attention.forward_prefill.call_args.args[0], hidden.mean(dim=1)[:context_tokens]
+            )
+        else:
+            attention.forward_prefill.assert_not_called()
+        generation = getattr(attention, f"forward_{context.gen_phase}")
+        if generations:
+            generation.assert_called_once()
+            assert generation.call_args.kwargs["metadata"] is metadata
+            torch.testing.assert_close(
+                generation.call_args.args[0], hidden.mean(dim=1)[context_tokens:]
+            )
+            if contexts:
+                assert generation.call_args.kwargs["reduce"] is False
+            if tokens_per_request > 1:
+                assert generation.call_args.kwargs["tokens_per_request"] == tokens_per_request
+        else:
+            generation.assert_not_called()
+        other = attention.forward_decode if tokens_per_request > 1 else attention.forward_verify
+        other.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("generation_phase", ["decode", "verify"])
+@pytest.mark.parametrize("reduce_output", [False, True], ids=["attention-dp", "tp"])
+def test_mixed_attention_splits_only_attention_and_reduces_once(generation_phase, reduce_output):
+    gen_tokens = 4 if generation_phase == "verify" else 1
+    hidden = torch.randn(3 + gen_tokens, 8)
+    ctx = torch.zeros(3, 8)
+    gen = torch.ones(gen_tokens, 8)
+    reduction = Mock(side_effect=lambda value: value + 10) if reduce_output else None
+    attention = SimpleNamespace(
+        forward_prefill=Mock(return_value=ctx),
+        forward_decode=Mock(return_value=gen),
+        forward_verify=Mock(return_value=gen),
+        tp_all_reduce=reduction,
+    )
+    result = Glm5NextSparseAttention.forward_mixed(
+        attention,
+        hidden,
+        num_ctx_tokens=3,
+        prefill={"marker": "context"},
+        generation={"marker": "generation"},
+        generation_phase=generation_phase,
+    )
+    expected = torch.cat([ctx, gen]) + (10 if reduce_output else 0)
+    torch.testing.assert_close(result, expected)
+    attention.forward_prefill.assert_called_once()
+    assert attention.forward_prefill.call_args.kwargs["reduce"] is False
+    selected = getattr(attention, "forward_" + generation_phase)
+    selected.assert_called_once()
+    assert selected.call_args.kwargs["reduce"] is False
+    torch.testing.assert_close(selected.call_args.args[0], hidden[3:])
+    other = attention.forward_decode if generation_phase == "verify" else attention.forward_verify
+    other.assert_not_called()
+    if reduction is not None:
+        reduction.assert_called_once()

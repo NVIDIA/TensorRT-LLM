@@ -22,8 +22,16 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     kpool_score,
     kpool_update,
 )
+from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+try:
+    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
+
+    HAS_FLASH_MLA = flash_mla_sparse_fwd is not None
+except ImportError:
+    HAS_FLASH_MLA = False
 
 HD = 128
 KPOOL = 4
@@ -265,3 +273,89 @@ def test_pool_expansion_graph_replay_tracks_request_tables_and_tails():
     tables.copy_(tables.flip(0))
     graph.replay()
     assert torch.equal(output, reference())
+
+
+@pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
+@pytest.mark.skipif(get_sm_version() < 90, reason="FlashMLA requires SM90 (Hopper) or later")
+@pytest.mark.parametrize("heads", [16, 64])
+def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
+    """Exercise the selected-row core used by production prefill, decode and verify."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
+        GlmKpoolSparseAttention,
+        latent_pool_rows,
+    )
+
+    backend = object.__new__(GlmKpoolSparseAttention)
+    backend.kv_lora_rank = 512
+    backend.softmax_scale = 256**-0.5
+    backend.kv_scale_quant_orig = torch.tensor([0.5], device="cuda")
+    backend._FP8_QUERY_CHUNK_SIZE = 2  # Exercise multiple chunks and a short final chunk.
+    generator = torch.Generator(device="cuda").manual_seed(71)
+    storage = torch.randn(12, 4, 512, device="cuda", generator=generator).to(torch.float8_e4m3fn)
+    pool = storage[1::3]  # Nonzero offset and coalesced page stride.
+    rows, base, stride = latent_pool_rows(pool)
+    q = torch.randn(5, heads, 512, device="cuda", generator=generator).to(torch.bfloat16)
+    positions = torch.randint(0, 16, (5, 67), device="cuda", generator=generator)
+    indices = (base + positions // 4 * stride + positions % 4).int()
+    indices[:, -2] = -1
+    indices[:, -1] = rows.shape[0]  # Preserve FlashMLA's out-of-range sentinel semantics.
+
+    def reference():
+        decoded = (rows.float() * backend.kv_scale_quant_orig).to(q.dtype)
+        return backend._dispatch_sparse_core(q, decoded, indices)
+
+    expected = reference()
+    actual = backend._dispatch_sparse_core(q, rows, indices)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        backend._dispatch_sparse_core(q, rows, indices)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = backend._dispatch_sparse_core(q, rows, indices)
+    storage.copy_((storage.float() * 0.5).to(storage.dtype))
+    graph.replay()
+    torch.testing.assert_close(captured, reference(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("context", [False, True])
+def test_fp8_cache_storage_helpers_preserve_coalesced_pages(context):
+    """Check cache-write and compatibility prefix-gather helpers.
+
+    The production model supplies topk_rows and does not call gather_paged_prefix;
+    its FP8 attention core is covered by the sparse-core test above.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import GlmKpoolSparseAttention
+
+    backend = object.__new__(GlmKpoolSparseAttention)
+    backend.kv_scale_orig_quant = torch.tensor([2.0], device="cuda")
+    backend.kv_scale_quant_orig = torch.tensor([0.5], device="cuda")
+    backend.sparse_params = SimpleNamespace(packed_state_dim=4)
+    storage = torch.zeros(9, 4, 8, device="cuda", dtype=torch.float8_e4m3fn)
+    latent_pool = storage[1::3]
+    index_pool = torch.zeros(9, 4, 6, device="cuda", dtype=torch.bfloat16)[2::3]
+    state = SimpleNamespace(
+        latent_pool=latent_pool,
+        index_pool=index_pool,
+        tokens_per_block=4,
+        num_contexts=1 if context else 0,
+        block_tables=torch.tensor([[2, 0]], device="cuda"),
+    )
+    backend._cache_state = Mock(return_value=state)
+    latent = torch.tensor([[0.0, 0.125, -0.4, 1.1, 5.0, -5.0, 500.0, -500.0]], device="cuda")
+    packed = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device="cuda")
+    positions = torch.tensor([0] if context else [[0]], device="cuda")
+    backend.append_paged_state(
+        latent, packed, positions, object(), request_index=0 if context else None
+    )
+    decoded, actual_packed = backend.gather_paged_prefix(1, object(), request_index=0)
+    expected = (latent * 2).clamp(-448, 448).to(torch.float8_e4m3fn).float() * 0.5
+    torch.testing.assert_close(decoded.float(), expected)
+    torch.testing.assert_close(actual_packed.float(), packed)
+    assert torch.count_nonzero(storage.float()[[0, 2, 3, 5, 6, 8]]) == 0
+    assert torch.count_nonzero(index_pool[:, :, 4:]) == 0
