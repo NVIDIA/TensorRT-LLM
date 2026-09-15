@@ -143,6 +143,7 @@ class TestSplitGpuBudgetForDraft:
         )
         draft_model_config = SimpleNamespace(
             quant_config=None,
+            sparse_attention_config=None,
             pretrained_config=SimpleNamespace(
                 num_hidden_layers=1,
                 hidden_size=2880,
