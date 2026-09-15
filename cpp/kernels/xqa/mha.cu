@@ -1630,15 +1630,11 @@ CUBIN_EXPORT __global__
         init(&smem.ctaRowMaxBwdBarriers[0][0] + ctaThrdId, warp_size);
     }
 #endif
-#if CTA_ROW_MAX_BACKWARD_METHOD == 1 || CTA_ROW_MAX_BACKWARD_METHOD == 2 || CTA_ROW_MAX_BACKWARD_METHOD == 3
-    if (warpIdx.z == 0)
+#if CTA_ROW_MAX_BACKWARD_METHOD != 0
+    static_assert(ctaSize >= sizeof(smem.ctaRowMax) / sizeof(float));
+    if (ctaThrdId < sizeof(smem.ctaRowMax) / sizeof(float))
     {
-        smem.ctaRowMax[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, initialRowMax);
-    }
-#elif CTA_ROW_MAX_BACKWARD_METHOD == 4
-    if (warpIdx.z == 0 && warpIdx.x == 0)
-    {
-        smem.ctaRowMax[warpIdx.y].storeFromReg<false>(warp, initialRowMax);
+        reinterpret_cast<float*>(&smem.ctaRowMax[0])[ctaThrdId] = safeInitRowMax;
     }
 #endif
 #if GRP_LOAD_V
@@ -1936,7 +1932,8 @@ CUBIN_EXPORT __global__
             assertWarpConverged();
         }
 #if CTA_ROW_MAX_BACKWARD_METHOD == 2
-        ThrdRegRowMax initRowMax = initialRowMax;
+        ThrdRegRowMax initRowMax;
+        initRowMax.fill(safeInitRowMax);
 #endif
         for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters)
         {
@@ -2023,7 +2020,8 @@ CUBIN_EXPORT __global__
             // apply qkScale
             rescaleAcc(warp, acc, qkScale);
 #if CTA_ROW_MAX_BACKWARD_METHOD == 0
-            QuadRegRowMax initRowMaxQuad = replicateForQuad(warp, initialRowMax);
+            QuadRegRowMax initRowMaxQuad;
+            initRowMaxQuad.fill(safeInitRowMax);
 #elif CTA_ROW_MAX_BACKWARD_METHOD == 1
             // load hint
             xBar.consumed.wait_parity(getAndFlip(xBarConsumedParityNext));
@@ -2038,6 +2036,7 @@ CUBIN_EXPORT __global__
             // load hint
             QuadRegRowMax initRowMaxQuad = smem.ctaRowMax[warpIdx.y].loadToRegForQuad<true>(warp);
 #endif
+            initRowMaxQuad = fmaxf(initRowMaxQuad, replicateForQuad(warp, initialRowMax));
             // masking
             uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if SPEC_DEC
