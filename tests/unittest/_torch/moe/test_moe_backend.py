@@ -1172,8 +1172,8 @@ def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(
     module = _DummyModule()
     module.tp_size = tp_size
 
-    # The 64-row constraint applies to the PER-SHARD row count, which is what
-    # the loader passes: _validate_alignment(w2_weight_shard.shape[-1], ...).
+    # The 64-row constraint applies to the PER-SHARD row count, which is the
+    # first count the loader passes to _validate_alignment.
     num_rows = intermediate_size // tp_size
 
     # Precondition: these really are the unaligned cases, so the test is not
@@ -1181,7 +1181,7 @@ def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(
     assert num_rows % 64 != 0
 
     with pytest.raises(ValueError) as excinfo:
-        W4A16WoqPerChannelFusedMoEMethod._validate_alignment(num_rows, "w2_weight", module)
+        W4A16WoqPerChannelFusedMoEMethod._validate_alignment(num_rows, 64, "w2_weight", module)
 
     message = str(excinfo.value)
     # The diagnostic must identify the tensor, the offending count and the
@@ -1208,8 +1208,38 @@ def test_cutlass_w4a16_aligned_rows_accepted(num_rows: int) -> None:
     module.tp_size = 1
 
     assert num_rows % 64 == 0
-    # Must not raise.
-    W4A16WoqPerChannelFusedMoEMethod._validate_alignment(num_rows, "w2_weight", module)
+    # Must not raise. 64 columns is a multiple of 8, so only the row check is
+    # under test here.
+    W4A16WoqPerChannelFusedMoEMethod._validate_alignment(num_rows, 64, "w2_weight", module)
+
+
+@pytest.mark.parametrize("num_cols", [4, 12, 457, 914])
+def test_cutlass_w4a16_unaligned_cols_raise_diagnostic(num_cols: int) -> None:
+    """A packed column count that is not a multiple of 8 must fail clearly.
+
+    ``preprocess_weights_for_mixed_gemm`` also bare-asserts
+    ``num_cols % MMA_SHAPE_N == 0`` with MMA_SHAPE_N == 8, unconditionally.
+    ``num_cols`` counts packed bytes, so this is reachable whenever the logical
+    width is not a multiple of 16: intermediate_size 1828 at tp=2 gives 914
+    logical and 457 packed, and a hidden size of 1828 does the same for
+    w3_w1_weight.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
+
+    class _DummyModule:
+        pass
+
+    module = _DummyModule()
+    module.tp_size = 2
+
+    # 64 rows is aligned, so the column check is what must fire.
+    with pytest.raises(ValueError) as excinfo:
+        W4A16WoqPerChannelFusedMoEMethod._validate_alignment(64, num_cols, "w3_w1_weight", module)
+
+    message = str(excinfo.value)
+    assert "w3_w1_weight" in message
+    assert str(num_cols) in message
+    assert "tp_size=2" in message
 
 
 def run_backend_moe(

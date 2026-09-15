@@ -1681,17 +1681,26 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         )
 
     @staticmethod
-    def _validate_alignment(num_rows: int, name: str,
+    def _validate_alignment(num_rows: int, num_cols: int, name: str,
                             module: torch.nn.Module) -> None:
         """Fail with a diagnostic before preprocess_weights_for_mixed_gemm's bare asserts.
 
-        ``preprocess_weights_for_mixed_gemm`` asserts
-        ``num_rows % rows_per_tile == 0`` with
-        ``rows_per_tile = 128 * 8 // BITS_PER_ELT_A``. That is activation-driven,
-        so it is 64 for INT4 exactly as for INT8: W4A16 inherits W8A16's TP
-        restriction, no worse. Raised here so the message names the offending
-        tensor and tp_size instead of surfacing as an opaque AssertionError
-        inside the preprocessor.
+        Both counts are as the preprocessor sees them, i.e. after the loader's
+        transpose: ``num_rows`` is the shard's pre-transpose last dim and
+        ``num_cols`` its pre-transpose first dim, the packed one.
+
+        Rows must be a multiple of 64. ``rows_per_tile = 128 * 8 //
+        BITS_PER_ELT_A`` is activation-driven, so it is 64 for INT4 exactly as
+        for INT8, and it subsumes the weaker ``B_ROWS_PER_MMA`` (32) and
+        ``elts_in_int32`` (8) row asserts.
+
+        Columns must be a multiple of ``MMA_SHAPE_N`` (8). That assert is
+        unconditional, and because ``num_cols`` counts packed bytes it is
+        reachable whenever the logical width is not a multiple of 16.
+
+        Both are raised here so the message names the offending tensor, the
+        count and tp_size, instead of surfacing as an opaque AssertionError
+        several frames below the loader.
         """
         if num_rows % 64 != 0:
             raise ValueError(
@@ -1701,6 +1710,14 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                 "For w2_weight this dimension is the per-partition intermediate "
                 "size, so a tensor-parallel size that keeps it 64-aligned is "
                 "required; for w3_w1_weight it is the hidden size.")
+        if num_cols % 8 != 0:
+            raise ValueError(
+                f"W4A16 MoE requires the packed column count of {name} to be a "
+                f"multiple of 8, got {num_cols} (tp_size={module.tp_size}). "
+                "Two INT4 values share one byte, so this is half the logical "
+                "width: w3_w1_weight needs the per-partition expanded "
+                "intermediate size to be a multiple of 16, and w2_weight needs "
+                "the hidden size to be a multiple of 16.")
 
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
@@ -1726,9 +1743,10 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                 "activation dtype should be float16 or bfloat16, got "
                 f"{module.dtype}")
 
-        # shape[-1] is the pre-transpose column count == num_rows the
-        # preprocessor sees after .T (it reads shape[1] of the 3-D view).
-        self._validate_alignment(w31_weight_shard.shape[-1], "w3_w1_weight",
+        # After .T the preprocessor reads shape[1] and shape[2] of the 3-D
+        # view, which are this shard's last and first dims respectively.
+        self._validate_alignment(w31_weight_shard.shape[-1],
+                                 w31_weight_shard.shape[0], "w3_w1_weight",
                                  module)
 
         # Checkpoint entries are already packed two INT4 per byte along the
@@ -1756,7 +1774,8 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
 
-        self._validate_alignment(w2_weight_shard.shape[-1], "w2_weight", module)
+        self._validate_alignment(w2_weight_shard.shape[-1],
+                                 w2_weight_shard.shape[0], "w2_weight", module)
 
         w2_weight_shard = module.preprocessor(w2_weight_shard.T.contiguous(),
                                               torch.quint4x2, module.dtype,
