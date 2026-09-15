@@ -22,6 +22,67 @@ import torch
 import triton
 import triton.language as tl
 
+
+@triton.jit
+def _gather_fp8_kv_rows_kernel(
+    rows,
+    indices,
+    scale,
+    output,
+    local_indices,
+    row_stride,
+    index_stride,
+    column_stride,
+    NUM_ROWS: tl.constexpr,
+    DIM: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    index = tl.load(indices + (token // TOPK) * index_stride + (token % TOPK) * column_stride)
+    valid = (index >= 0) & (index < NUM_ROWS)
+    dim = tl.arange(0, BLOCK)
+    values = tl.load(
+        rows + index.to(tl.int64) * row_stride + dim,
+        mask=valid & (dim < DIM),
+        other=0.0,
+    ).to(tl.float32)
+    values *= tl.load(scale)
+    tl.store(output + token.to(tl.int64) * DIM + dim, values, mask=dim < DIM)
+    tl.store(local_indices + token, tl.where(valid, token, -1))
+
+
+def gather_fp8_kv_rows(
+    rows: torch.Tensor, indices: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather selected FP8 rows as BF16 and remap sparse indices in one pass.
+
+    ``rows`` is ``[N, 1, D]`` with contiguous features, ``indices`` is
+    ``[queries, topk]`` and ``scale`` is a device FP32 scalar. Invalid indices
+    remain -1; no unselected cache payload is read or dequantized.
+    """
+    selected = torch.empty(
+        (indices.numel(), 1, rows.shape[-1]), dtype=torch.bfloat16, device=rows.device
+    )
+    local_indices = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
+    if indices.numel():
+        _gather_fp8_kv_rows_kernel[(indices.numel(),)](
+            rows,
+            indices,
+            scale,
+            selected,
+            local_indices,
+            rows.stride(0),
+            indices.stride(0),
+            indices.stride(1),
+            NUM_ROWS=rows.shape[0],
+            DIM=rows.shape[-1],
+            TOPK=indices.shape[1],
+            BLOCK=triton.next_power_of_2(rows.shape[-1]),
+        )
+    return selected, local_indices
+
+
 _FP32_MIN = torch.finfo(torch.float32).min
 
 

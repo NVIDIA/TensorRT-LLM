@@ -401,14 +401,15 @@ class Glm5NextRuntimeContext:
 
         The attention module splits the packed tokens at ``num_ctx_tokens``
         and runs its context rows through the prefill kernels and its
-        generation rows through the decode kernels; everything outside
+        generation rows through the decode or verify kernels; everything outside
         attention runs once over the whole batch (the vLLM layout). The KDA
         layers do this split inside the shared mixer from the metadata.
         """
         return {
             "num_ctx_tokens": self.num_ctx_tokens,
             "prefill": self.sparse_kwargs(layer_idx, "prefill"),
-            "decode": self.sparse_kwargs(layer_idx, "decode"),
+            "generation": self.sparse_kwargs(layer_idx, self.gen_phase),
+            "generation_phase": self.gen_phase,
         }
 
     def sparse_kwargs(self, layer_idx: int, phase: str) -> dict[str, Any]:
@@ -603,11 +604,6 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         text_config = get_glm5_next_text_config(model_config.pretrained_config)
-        if model_config.mapping.enable_attention_dp and model_config.spec_config is not None:
-            raise ValueError(
-                "glm5_next does not support attention DP with speculative decoding; "
-                "set enable_attention_dp=False when enabling MTP."
-            )
         # tie_word_embeddings is false on this checkpoint, so lm_head is a real
         # weight rather than a view of the embedding; it is asserted, not assumed.
         if bool(getattr(text_config, "tie_word_embeddings", False)):
@@ -1702,12 +1698,15 @@ class Glm5NextSparseAttention(nn.Module):
         *,
         num_ctx_tokens: int,
         prefill: dict[str, Any],
-        decode: dict[str, Any],
+        generation: dict[str, Any],
+        generation_phase: str = "decode",
     ) -> torch.Tensor:
-        """Context rows through the prefill path, generation rows through the
-        fused decode path, one TP reduction over the concatenated output."""
+        """Split attention by phase and reduce the concatenated output once."""
+        if generation_phase not in ("decode", "verify"):
+            raise ValueError(f"Unsupported generation phase: {generation_phase}")
         ctx = self.forward_prefill(hidden_states[:num_ctx_tokens], reduce=False, **prefill)
-        gen = self.forward_decode(hidden_states[num_ctx_tokens:], reduce=False, **decode)
+        generation_forward = getattr(self, f"forward_{generation_phase}")
+        gen = generation_forward(hidden_states[num_ctx_tokens:], reduce=False, **generation)
         out = torch.cat([ctx, gen], dim=0)
         return out if self.tp_all_reduce is None else self.tp_all_reduce(out)
 
@@ -1717,6 +1716,7 @@ class Glm5NextSparseAttention(nn.Module):
         kv_lens: torch.Tensor,
         metadata: AttentionMetadata,
         tokens_per_request: int,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Generation phase with ``tokens_per_request`` tokens per request.
 
@@ -1739,7 +1739,7 @@ class Glm5NextSparseAttention(nn.Module):
         """
         tokens_per_request = int(tokens_per_request)
         if tokens_per_request <= 1:
-            return self.forward_decode(hidden_states, kv_lens, metadata)
+            return self.forward_decode(hidden_states, kv_lens, metadata, reduce=reduce)
         num_tokens = hidden_states.shape[0]
         batch = num_tokens // tokens_per_request
         if batch * tokens_per_request != num_tokens or kv_lens.shape[0] != batch:
@@ -1773,6 +1773,7 @@ class Glm5NextSparseAttention(nn.Module):
             metadata,
             AttentionInputType.generation_only,
             rows_per_request=tokens_per_request,
+            reduce=reduce,
         )
 
 
@@ -2116,8 +2117,8 @@ class Glm5NextDecoderLayer(DecoderLayer):
         """Runtime entry: derive this layer's cache arguments from metadata.
 
         The executor packs context requests first, then generation requests;
-        the two phases run through :meth:`forward_direct` separately, which is
-        exact because every non-attention operation here is token-local.
+        attention handles the two phases separately, while the remaining
+        operations run once over the packed batch to preserve DP collectives.
         ``position_ids`` is unused: the text path is fully NoPE and the
         indexer derives its positions from the cached lengths.
         """
@@ -2134,36 +2135,15 @@ class Glm5NextDecoderLayer(DecoderLayer):
             )
         derive = runtime_ctx.sparse_kwargs
         if runtime_ctx.num_contexts > 0 and runtime_ctx.num_generations > 0:
-            if runtime_ctx.gen_phase == "decode":
-                # Mixed context+generation batch: one pass over all tokens
-                # (hyper-connections, norms, MoE, the o_proj reduction), with
-                # the attention module splitting the rows internally between
-                # its prefill and decode kernels -- the vLLM layout. A second
-                # small-batch pass per layer would cost a whole decode step
-                # per mixed iteration.
-                return self.forward_direct(
-                    hidden_states,
-                    phase="mixed",
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    **runtime_ctx.mixed_kwargs(self.layer_idx),
-                )
-            # Speculative verification rows run the replay verify kernel; they
-            # keep the split path (prefill rows, then verify rows).
-            parts = [
-                self.forward_direct(
-                    hidden_states[: runtime_ctx.num_ctx_tokens],
-                    phase="prefill",
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    **derive(self.layer_idx, "prefill"),
-                ),
-                self.forward_direct(
-                    hidden_states[runtime_ctx.num_ctx_tokens :],
-                    phase="verify",
-                    all_rank_num_tokens=all_rank_num_tokens,
-                    **derive(self.layer_idx, "verify"),
-                ),
-            ]
-            return torch.cat(parts, dim=0)
+            # Only attention is phase-specific. MoE must see the complete
+            # packed batch exactly once: DP ranks can have different phase
+            # mixes, but must issue the same collective sequence and counts.
+            return self.forward_direct(
+                hidden_states,
+                phase="mixed",
+                all_rank_num_tokens=all_rank_num_tokens,
+                **runtime_ctx.mixed_kwargs(self.layer_idx),
+            )
         if runtime_ctx.num_contexts > 0:
             return self.forward_direct(
                 hidden_states,

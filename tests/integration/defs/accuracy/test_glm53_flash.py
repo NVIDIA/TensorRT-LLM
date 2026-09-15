@@ -283,6 +283,39 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
             assert_acceptance_length_for_llm("TestGLM53FlashFP8::test_mtp", llm)
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.parametrize(
+        "attention_dp,draft_len,cache_dtype",
+        [(True, 3, "auto"), (False, 0, "fp8"), (True, 3, "fp8")],
+        ids=["adp-mtp3", "tp-fp8-kv", "adp-mtp3-fp8-kv"],
+    )
+    def test_attention_dp_mtp_and_fp8_kv(self, attention_dp, draft_len, cache_dtype):
+        """Manual regressions for the supported attention-DP, MTP and KV-cache combinations."""
+        kwargs = self._llm_kwargs(4, 4)
+        kwargs.update(
+            enable_attention_dp=attention_dp,
+            enable_chunked_prefill=True,
+            max_num_tokens=4096 if attention_dp else 16384,
+            kv_cache_config=KvCacheConfig(
+                dtype=cache_dtype, free_gpu_memory_fraction=0.5, enable_block_reuse=False
+            ),
+        )
+        if draft_len:
+            kwargs.update(
+                speculative_config=MTPDecodingConfig(max_draft_len=draft_len),
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
+            )
+        with LLM(self.MODEL_PATH, **kwargs) as llm:
+            self._assert_glm5_next_stack(llm)
+            assert llm.args.enable_attention_dp == attention_dp
+            if cache_dtype == "fp8":
+                assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            GSM8K(self.MODEL_NAME).evaluate(llm)
+            if draft_len:
+                assert_acceptance_length_for_llm("TestGLM53FlashFP8::test_mtp", llm)
+
+    @skip_pre_blackwell
     @pytest.mark.timeout(900)
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.threadleak(enabled=False)

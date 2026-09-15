@@ -82,7 +82,7 @@ from ...interface import (
     merge_attention_forward_args,
 )
 from ...trtllm import TrtllmAttention, TrtllmAttentionMetadata
-from .kernels import kpool_expand, kpool_score, kpool_update
+from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update
 from .params import INDEX_SENTINEL, GlmKpoolSparseParams
 
 
@@ -242,6 +242,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     #: way). Attention is per-head, so zero query lanes cannot perturb real
     #: lanes; their outputs are discarded by the slice.
     _KERNEL_HEAD_COUNTS = (64, 128)
+
+    # Bound selected-KV staging independently of the configured context length.
+    # At the published 2112-entry selection this uses 132 MiB of BF16 rows.
+    _FP8_QUERY_CHUNK_SIZE = 64
 
     def __init__(
         self,
@@ -472,7 +476,15 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             else:
                 table = state.block_tables[request_index]
             page, offset = paged_slot_indices(table, positions, state.tokens_per_block)
-        state.latent_pool[page, offset] = latent.to(state.latent_pool.dtype)
+        if state.latent_pool.dtype == torch.float8_e4m3fn:
+            quantized = (latent.float() * self.kv_scale_orig_quant).clamp(-448, 448)
+            # PyTorch advanced indexing does not implement FP8 payloads. Index
+            # their byte views, preserving the manager's coalesced page strides.
+            state.latent_pool.view(torch.uint8)[page, offset] = quantized.to(
+                torch.float8_e4m3fn
+            ).view(torch.uint8)
+        else:
+            state.latent_pool[page, offset] = latent.to(state.latent_pool.dtype)
         # Only the [k | gate] columns; the pool-key slice is maintained by
         # update_pool_keys.
         packed_dim = self.sparse_params.packed_state_dim
@@ -493,7 +505,12 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             state.block_tables[request_index], positions, state.tokens_per_block
         )
         packed = state.index_pool[page, offset][..., : self.sparse_params.packed_state_dim]
-        return state.latent_pool[page, offset], packed
+        if state.latent_pool.dtype == torch.float8_e4m3fn:
+            latent = state.latent_pool.view(torch.uint8)[page, offset].view(torch.float8_e4m3fn)
+            latent = (latent.float() * self.kv_scale_quant_orig).to(torch.bfloat16)
+        else:
+            latent = state.latent_pool[page, offset]
+        return latent, packed
 
     def _rows(
         self,
@@ -687,6 +704,21 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         output ``[T, H, kv_lora]``; :meth:`_finalize_output` flattens it to the
         base-contract shape at the ``forward`` boundary.
         """
+        if kv_rows.dtype == torch.float8_e4m3fn:
+            # Like DeepSeek-V4's BF16 context adapter, dequantize only selected
+            # rows and reuse FlashMLA. Chunk query rows so prefill never stages
+            # the full cache or a [max_num_tokens, topk, latent_dim] allocation.
+            output = torch.empty_like(q_latent)
+            for start in range(0, q_latent.shape[0], self._FP8_QUERY_CHUNK_SIZE):
+                stop = min(start + self._FP8_QUERY_CHUNK_SIZE, q_latent.shape[0])
+                indices = topk_rows[start:stop]
+                selected, local_indices = gather_fp8_kv_rows(
+                    kv_rows, indices, self.kv_scale_quant_orig
+                )
+                output[start:stop] = self._dispatch_sparse_core(
+                    q_latent[start:stop], selected, local_indices
+                )
+            return output
         pad = (-topk_rows.shape[-1]) % self._KERNEL_TOPK_ALIGN
         if pad:
             topk_rows = torch.nn.functional.pad(topk_rows, (0, pad), value=INDEX_SENTINEL)

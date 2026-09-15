@@ -78,7 +78,9 @@ LB = -5.0
 
 
 @torch.no_grad()
-def _make_runtime(seed, aux_stream=None, checkpoint_fp8=False, *, num_heads=H, use_full_rank_gate=True):
+def _make_runtime(
+    seed, aux_stream=None, checkpoint_fp8=False, *, num_heads=H, use_full_rank_gate=True
+):
     # A real KimiLinearConfig (not a SimpleNamespace) so the runtime sees the
     # same config surface it does in production. ``linear_attn_config`` carries
     # the per-layer KDA params the runtime reads plus the (unused here)
@@ -201,23 +203,36 @@ def _rep(name, a, b):
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("num_heads", "use_full_rank_gate", "checkpoint_fp8"),
-    [(H, True, False), (H, True, True), (16, False, False), (64, False, False)],
-    ids=["full-rank-bf16", "full-rank-fp8", "low-rank-h16", "low-rank-h64"],
+    ("num_heads", "use_full_rank_gate", "checkpoint_fp8", "large_state_stride"),
+    [
+        (H, True, False, False),
+        (H, True, True, False),
+        (16, False, False, False),
+        (64, False, False, False),
+        (64, False, False, True),
+    ],
+    ids=["full-rank-bf16", "full-rank-fp8", "low-rank-h16", "low-rank-h64", "large-state-stride"],
 )
-def test_fused_vs_sequential_two_rounds(num_heads, use_full_rank_gate, checkpoint_fp8):
+def test_fused_vs_sequential_two_rounds(
+    num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride
+):
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     torch.manual_seed(0)
     B = 4
     T = M + 1
     rt_seq = _make_runtime(
-        seed=1, checkpoint_fp8=checkpoint_fp8, num_heads=num_heads,
+        seed=1,
+        checkpoint_fp8=checkpoint_fp8,
+        num_heads=num_heads,
         use_full_rank_gate=use_full_rank_gate,
     )
     rt_fused = _make_runtime(
-        seed=1, aux_stream=torch.cuda.Stream(), checkpoint_fp8=checkpoint_fp8,
-        num_heads=num_heads, use_full_rank_gate=use_full_rank_gate,
+        seed=1,
+        aux_stream=torch.cuda.Stream(),
+        checkpoint_fp8=checkpoint_fp8,
+        num_heads=num_heads,
+        use_full_rank_gate=use_full_rank_gate,
     )
     rt_fused.finalize_decode_weights()
     if checkpoint_fp8:
@@ -236,7 +251,19 @@ def test_fused_vs_sequential_two_rounds(num_heads, use_full_rank_gate, checkpoin
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2, num_heads=num_heads)
     conv_pool_fused = conv_pool_seq.clone()
-    ssm_pool_fused = ssm_pool_seq.clone()
+    if large_state_stride:
+        # Only four small states are populated. The gaps reproduce V2's
+        # coalesced layer layout, with the last slot beyond INT32_MAX elements.
+        state_stride = ((2**31 // (B - 1)) // (K * K) + 1) * K * K
+        storage_size = (B - 1) * state_stride + num_heads * K * K
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if free_bytes < storage_size * ssm_pool_seq.element_size() + 2**30:
+            pytest.skip("large-stride regression needs 9 GiB of free GPU memory")
+        storage = torch.empty(storage_size, dtype=ssm_pool_seq.dtype, device="cuda")
+        ssm_pool_fused = storage.as_strided(ssm_pool_seq.shape, (state_stride, K * K, K, 1))
+        ssm_pool_fused.copy_(ssm_pool_seq)
+    else:
+        ssm_pool_fused = ssm_pool_seq.clone()
     cache_seq = _make_seq_layer_cache(B, num_heads=num_heads)
     cache_fused = _make_fused_layer_cache(B, conv_pool_fused, num_heads=num_heads)
 

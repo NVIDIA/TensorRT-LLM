@@ -14,7 +14,8 @@ The following features have been tested on B200 with four GPUs per worker. Disag
 * Overlap scheduler
 * Chunked prefill
 * Multi-Token Prediction (MTP)
-* Attention data parallelism (see [`enable_attention_dp`](#enable_attention_dp))
+* Attention data parallelism, including MTP (see [`enable_attention_dp`](#enable_attention_dp))
+* FP8 KV cache
 * Disaggregated serving
 * Disaggregated serving with MTP
 * KV cache block reuse (with periodic Mamba state snapshots, see [`kv_cache_config`](#kv_cache_config))
@@ -22,8 +23,6 @@ The following features have been tested on B200 with four GPUs per worker. Disag
 
 ### Limitations
 
-* Attention data parallelism cannot currently be combined with MTP. Support for this combination is planned for a future update. Use tensor parallelism when enabling MTP.
-* FP8 KV cache is not supported. Leave `kv_cache_config.dtype` at `auto` to use BF16.
 * KV cache block reuse requires a periodic Mamba snapshot policy; see [`kv_cache_config`](#kv_cache_config).
 
 See the [Model-Feature Support Matrix](../models/supported-models.md#model-feature-support-matrix-key-models) for the current support status.
@@ -131,7 +130,7 @@ EOF
 
 #### B200 FP8 Config with Attention Data Parallelism
 
-Attention data parallelism distributes requests across ranks while keeping the routed experts expert-parallel. Set `enable_attention_dp: true` and reduce `--max_num_tokens` to `4096` in the launch command below. This configuration cannot be combined with MTP.
+Attention data parallelism distributes requests across ranks while keeping the routed experts expert-parallel. Set `enable_attention_dp: true` and reduce `--max_num_tokens` to `4096` in the launch command below. To enable MTP as well, add the `speculative_config` section from the MTP example above.
 
 ```bash
 cat > /tmp/config.yml <<EOF
@@ -145,6 +144,8 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.5
 EOF
 ```
+
+To use FP8 KV cache with any of these aggregated-serving configurations, add `dtype: fp8` under `kv_cache_config`. This halves latent KV storage; indexer and KDA state precision are unchanged. Selected KV rows are dequantized in bounded query chunks before attention. For large prefills, repeated staging and attention calls can increase time to first token and reduce prefill throughput, in addition to decode overhead. Leave `dtype: auto` (BF16) when prioritizing latency or prefill throughput. The performance curves below use BF16 KV cache.
 
 ### Launch the TensorRT LLM Server
 
@@ -210,7 +211,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 * **Options**:
   * `enable_block_reuse`: Enables prefix reuse. Requires `mamba_state_config.periodic_snapshot_interval` (for example `256`); without this policy, reuse is disabled.
   * `free_gpu_memory_fraction`: Fraction of free GPU memory reserved for caches after loading the model. **Recommendation**: `0.5`; reduce it if you encounter OOM errors.
-  * `dtype`: Attention KV-cache data type. **Default**: `auto` (BF16). FP8 KV cache is not supported.
+  * `dtype`: Attention KV-cache data type. **Default**: `auto` (BF16). Set to `fp8` to reduce latent KV storage; this also works with MTP and attention data parallelism.
 
 #### `cuda_graph_config`
 
@@ -238,7 +239,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 #### `enable_attention_dp`
 
-* **Description**: Enables attention data parallelism with expert-parallel MoE. **Default**: `false`. When enabled, use `--max_num_tokens 4096` for the configuration above and leave MTP disabled.
+* **Description**: Enables attention data parallelism with expert-parallel MoE. **Default**: `false`. When enabled, use `--max_num_tokens 4096` for the configuration above. MTP can be enabled with the same `speculative_config` as tensor parallelism.
 
 See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the YAML configuration file.
 
@@ -433,12 +434,12 @@ $$
 
 ## Performance
 
-The chart shows output-token throughput per GPU versus per-user output speed on 4x B200 with FP8 weights and a BF16 KV cache. Measurements use the `benchmark_serving` client above, ISL 1024 / OSL 1024, random token IDs, seed 0, and greedy decoding. Each point is one run of `5 * concurrency` requests; labels show concurrency.
+The chart compares TP4 / EP4 and attention DP4 / EP4, each with and without MTP3, on 4x B200 with FP8 weights and a BF16 KV cache. Measurements use the `benchmark_serving` client above, ISL 1024 / OSL 1024, random token IDs, seed 0, and greedy decoding. Each run sends `5 * concurrency` requests. Points combine all matching runs; faint dots show individual runs and bars show their minimum and maximum, not confidence intervals.
 
-To reproduce the curve, use the serving configurations above with `--max_batch_size 128`, `--max_seq_len 8192`, and `cuda_graph_config.max_batch_size: 128`. Keep CUDA graph padding, chunked prefill, and the overlap scheduler enabled; use a cache memory fraction of 0.5 and disable block reuse. Set `--max_num_tokens 16384` for TP4 / EP4 and MTP3, or `4096` for attention DP4 / EP4.
+To reproduce the curve, use the serving configurations above with `--max_batch_size 128`, `--max_seq_len 8192`, and `cuda_graph_config.max_batch_size: 128`. Keep CUDA graph padding, chunked prefill, and the overlap scheduler enabled; use a cache memory fraction of 0.5 and disable block reuse. Set `--max_num_tokens 16384` for TP4 / EP4 or `4096` for attention DP4 / EP4, with or without MTP3.
 
-The horizontal axis is `1000 / mean_tpot_ms`, excluding TTFT. The vertical axis is aggregate output-token throughput divided by four GPUs, excluding input-token throughput.
+The horizontal axis is `1000 / mean_tpot_ms`, excluding TTFT. The vertical axis is aggregate output-token throughput divided by four GPUs, excluding input-token throughput. For repeated runs, throughput is total output tokens divided by total measured duration, and mean TPOT is weighted by request count.
 
 ![GLM-5.3-Flash FP8 performance on 4x B200](../media/glm_5_3_flash_fp8_perf.png)
 
-MTP3 improves single-user decode speed from 154.7 to 397.6 tok/s/user. At concurrency 128, all three configurations deliver approximately 5.9K–6.0K output tok/s in aggregate. MTP uses natural acceptance; random-token workloads can have different acceptance rates from real conversations. This sweep covers the plotted concurrency range, not peak throughput or maximum-context validation.
+With TP4 / EP4, MTP3 improves single-user decode speed from approximately 153 to 372 tok/s/user. At concurrency 128, the four configurations deliver approximately 5.9K–6.3K output tok/s in aggregate. Attention DP4 / EP4 was also repeated in ascending and descending concurrency order; earlier TTFT spikes at concurrency 8 and 32 did not consistently recur, and all matching samples remain included. MTP uses natural acceptance; random-token workloads can have different acceptance rates from real conversations. This sweep covers the plotted concurrency range, not peak throughput or maximum-context validation.
