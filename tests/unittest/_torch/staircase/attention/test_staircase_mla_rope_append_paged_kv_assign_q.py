@@ -946,9 +946,9 @@ def test_fp8_kv_rejects_int8_kv_cache_quant_mode() -> None:
             torch.cuda.synchronize()
         except RuntimeError as exc:
             raised = str(exc)
-        # rc26 added NVFP4 latent pools, so the rejection message now
-        # enumerates two accepted formats. int8 is still rejected --
-        # what this test certifies -- only the wording widened.
+        # The op accepts fp8 and NVFP4 latent pools, so the rejection
+        # message enumerates two formats. int8 is rejected -- that is what
+        # this test certifies.
         assert "Only FP8 and NVFP4 KV caches are supported for now" in raised, (
             f"quant_mode={QUANT_MODE_INT8_KV_CACHE} was not rejected as expected; got: {raised!r}"
         )

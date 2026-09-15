@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21, world_size: 4}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, world_size: 4}
+  sm_103: {status: passed, world_size: 4}
 ---
 
 # reducescatter

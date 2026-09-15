@@ -15,23 +15,20 @@ Fresh interpreter is required, not tidiness: the launcher must not have
 initialized MPI, and a pytest process that has imported ``tensorrt_llm``
 already has.
 
-For the same reason the launcher is started **by file path, not by
-``-m``**. ``-m`` on a module inside this package imports every parent
-package on the way to it, ``tensorrt_llm`` included, and that import calls
-``MPI_Init``; the launcher would then fail to start ``mpirun`` at all
-(measured: it exits 1 with no output from any rank). Run by path the file
-has no package context and imports nothing but torch, which is all its
-launcher half needs -- the entry keeps its relative imports inside
-``_run_one_rank``, and the ranks it spawns *are* started with ``-m`` so
-they get one.
+Everything here is started **by file path**. The launcher must not import
+``tensorrt_llm`` -- that calls ``MPI_Init``, and an MPI-initialized process
+cannot start ``mpirun`` at all (measured: it exits 1 with no output from any
+rank) -- and the ranks it spawns reach the catalog by absolute import, so
+neither half needs a package context. This tree does not have one to give:
+it is tests/, not a package.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
-from importlib import import_module
 from pathlib import Path
 
 WORLD_SIZE = 4
@@ -56,22 +53,40 @@ def _devices() -> str:
     return ",".join(devices[:WORLD_SIZE])
 
 
+def _load_launcher_constants(launcher: Path):
+    """Read the entry's module-level budget without importing it by name.
+
+    There is no dotted name to import it by -- this directory is not a
+    package -- and only its constants are wanted. Executing the file at module
+    scope is cheap and pulls in nothing but torch; the entry keeps its
+    tensorrt_llm imports inside the rank body for exactly that reason.
+    """
+    spec = importlib.util.spec_from_file_location(launcher.stem, launcher)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def run(entry: str) -> None:
     """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices."""
-    module = f"{__package__}._{entry}_op_matrix"
-    launcher = Path(__file__).with_name(f"_{entry}_op_matrix.py")
+    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
-    # The launcher re-execs itself per rank and needs this package importable
-    # from the ranks; by path it has no package context of its own to inherit.
+
+    # The ranks import tensorrt_llm absolutely, and a source checkout is not
+    # necessarily installed. tests/unittest/_torch/staircase/comm -> repo root.
     repo_root = Path(__file__).resolve().parents[5]
+    assert (repo_root / "tensorrt_llm").is_dir(), (
+        f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
+        f"this file moved without its parents[] index following"
+    )
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p)
 
     # Read the budget off the entry rather than restating it: an entry that
     # raises its own deadline would otherwise be killed by this one first,
     # and the message a reader needs ("wedged") would be lost. reducescatter
     # runs a second, separately capped job after the main one.
-    entry_module = import_module(module)
-    timeout = entry_module.DEADLINE_S + getattr(entry_module, "WEDGE_CAP_S", 0) + _LAUNCHER_GRACE_S
+    constants = _load_launcher_constants(launcher)
+    timeout = constants.DEADLINE_S + getattr(constants, "WEDGE_CAP_S", 0) + _LAUNCHER_GRACE_S
 
     completed = subprocess.run(
         [sys.executable, str(launcher)],

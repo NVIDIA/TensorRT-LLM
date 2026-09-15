@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 7}
+  sm_103: {status: passed, tests: 7}
 ---
 
 # cublas_mm
@@ -105,7 +104,7 @@ a plain allocation). The enum is importable as
   single-pass cluster-mode kernels for small-M (decode) gemms there; the
   op itself is not gated on arch.
 - All silently-wrong-result behaviors listed under Preconditions were
-  observed under trtllm 1.3.0rc21 on sm_100.
+  observed directly, not inferred from the op's documentation.
 
 
 ## The fp32 cell needs its reference pinned, not its tolerance widened

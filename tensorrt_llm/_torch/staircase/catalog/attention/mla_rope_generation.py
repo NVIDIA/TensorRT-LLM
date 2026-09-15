@@ -29,8 +29,8 @@ def mla_rope_generation(
     host_kv_cache_pool_mapping: Optional[torch.Tensor],
     kv_scale_orig_quant: Optional[torch.Tensor],
     kv_scale_quant_orig: Optional[torch.Tensor],
-    # rc26: when None the op falls back to kv_scale_orig_quant, which is what
-    # it did before this parameter existed (dsv3RopeOp.cpp:280).
+    # When None the op falls back to kv_scale_orig_quant
+    # (dsv3RopeOp.cpp:280).
     kv_cache_scale_orig_quant: Optional[torch.Tensor],
     out_scale: Optional[torch.Tensor],
     block_ids_per_seq: Optional[torch.Tensor],
@@ -40,7 +40,7 @@ def mla_rope_generation(
     num_heads: int,
     num_kv_heads: int,
     head_size: int,
-    # rc26: 0 or rope_size, and non-zero requires an FP4 KV pool.
+    # 0 or rope_size, and non-zero requires an FP4 KV pool.
     residual_dim: int,
     tokens_per_block: int,
     attention_window_size: int,
@@ -53,8 +53,8 @@ def mla_rope_generation(
     qk_rope_head_dim: int,
     v_head_dim: int,
     rope_append: bool,
-    # Added in rc26; every default below reproduces the op's pre-rc26
-    # behaviour. kv_norm_weight non-None would fold the kv_a_layernorm into
+    # Every default below leaves the op on its default behaviour.
+    # kv_norm_weight non-None would fold the kv_a_layernorm into
     # this kernel, which then reads latent_cache RAW -- a caller that already
     # normalized would be normalizing twice.
     kv_norm_weight: Optional[torch.Tensor] = None,

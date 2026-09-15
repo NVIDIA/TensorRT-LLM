@@ -12,25 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the staircase targets.
+"""Whole-model gates for the deepseek-v3 staircase targets.
 
-Separate file rather than entries in test_llm_api_pytorch.py, for the same
-reason the targets are separate codebases: these gate a parallel
-implementation, and reading them next to the built-in model's tests would
-invite treating one as a variant of the other.
+One file per model family, beside the other accuracy suites rather than inside
+test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
+next to the built-in model's tests would invite treating one as a variant of
+the other.
 
 Every test here needs ``TRTLLM_STAIRCASE=require``. Under ``"auto"`` a
 configuration that missed a target's criteria would quietly fall back to the
 built-in implementation, pass, and report the built-in's numbers as the
 target's -- which is the one failure this whole system exists to prevent. The
-one exception is the stock leg of the acceptance gate, which asks for
-``"off"`` on purpose.
+one exception is the stock leg of the acceptance gate, which asks for ``"off"``
+on purpose.
 
 The switch is an environment variable, and worker ranks read it as it stood
-when they started. At world size 1 that is this process. Above it the ranks
-are already running by the time a test body executes, so a multi-rank case
-cannot choose its own mode -- it can only assert that the environment it was
-given is the one it needs, which is what ``_require_mode`` does.
+when they started. These targets are multi-rank, so the ranks are already
+running by the time a test body executes: a case cannot choose its own mode, it
+can only assert that the environment it was given is the one it needs, which is
+what ``_require_mode`` does.
 """
 
 import os
@@ -56,6 +56,12 @@ skip_not_sm103 = pytest.mark.skipif(
     get_sm_version() != 103, reason="staircase targets in this batch are certified on sm_103 only"
 )
 
+# The filter the staircase anchors were measured on. Unset, the evaluator
+# averages every metric GSM8K reports, which means the mean of strict-match and
+# flexible-extract -- two numbers measuring different things on a checkpoint
+# that does not answer purely in the strict "#### N" form.
+_SCORES_FILTER = {"scores_filter": "exact_match,flexible-extract"}
+
 
 def _require_mode(expected: str) -> None:
     """Skip unless the ranks were started with the mode this case needs.
@@ -70,56 +76,6 @@ def _require_mode(expected: str) -> None:
         pytest.skip(f"{STAIRCASE_ENV}={actual!r}, this case needs {expected!r}")
 
 
-class _StaircaseGSM8K(GSM8K):
-    """GSM8K reading the filter the staircase anchors were measured on.
-
-    Unset, the evaluator averages every metric the task reports, which for
-    GSM8K means the mean of ``strict-match`` and ``flexible-extract``. Those
-    measure different things here: neither of these checkpoints answers purely
-    in the strict ``#### N`` form, so the average is a number no reference was
-    ever taken at -- gpt-oss scores ~90 flexible, ~25 strict, and the mean of
-    56 reads as a catastrophic failure of a model that is answering correctly.
-    """
-
-    EVALUATE_KWARGS = {"scores_filter": "exact_match,flexible-extract"}
-
-
-class _GSM8KWithRoomToReason(_StaircaseGSM8K):
-    """The above, with the output budget a reasoning model needs.
-
-    The stock 256 tokens truncate this checkpoint mid-chain-of-thought, before
-    it ever reaches an answer, and the gate then reads as an assembly defect
-    rather than as the protocol being wrong for the model.
-    """
-
-    MAX_OUTPUT_LEN = 8192
-
-
-class TestStaircaseGptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
-    """gpt-oss-120b / sm_103 / tp1."""
-
-    # The registry key upstream uses for this checkpoint; it carries the
-    # W4A8_MXFP4_MXFP8 entry the engine resolves from its quantization_config.
-    MODEL_NAME = "GPT-OSS/120B-MXFP4"
-    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
-
-    # This checkpoint is gated as a reasoning model: its answer never arrives
-    # in the strict "#### N" form, so the protocol applies the chat template
-    # and gives the model room to reason. Matches the protocol recorded in
-    # _torch/staircase/references/accuracy.yaml.
-    extra_evaluator_kwargs = {
-        "apply_chat_template": True,
-        "fewshot_as_multiturn": True,
-    }
-
-    @skip_not_sm103
-    def test_gsm8k(self):
-        _require_mode("require")
-        with LLM(self.MODEL_PATH) as llm:
-            task = _GSM8KWithRoomToReason(self.MODEL_NAME)
-            task.evaluate(llm, extra_evaluator_kwargs=self.extra_evaluator_kwargs)
-
-
 class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
     """deepseek-r1-0528-nvfp4 / sm_103 / dep4, identity and the mtp3 variant."""
 
@@ -131,9 +87,9 @@ class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
     # against the mapping the engine actually built.
     DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
 
-    # configs/mtp3.yaml. The kv-cache fraction is a boot requirement of the
-    # variant rather than a tuning choice: the drafting forward's post-pool
-    # transient does not fit what the default 0.9 leaves.
+    # The kv-cache fraction is a boot requirement of the variant rather than a
+    # tuning choice: the drafting forward's post-pool transient does not fit
+    # what the default 0.9 leaves.
     MTP3 = MTPDecodingConfig(max_draft_len=3)
     MTP3_KV = KvCacheConfig(free_gpu_memory_fraction=0.75)
 
@@ -150,7 +106,7 @@ class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
-    def test_gsm8k_identity_vs_mtp3(self):
+    def test_gsm8k_identity_vs_mtp3(self, mocker):
         """The identity accuracy gate, and the gate on MTP not moving it.
 
         Turning MTP on must not move the answers.
@@ -168,7 +124,8 @@ class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         recorded in some earlier session carries that session's variance into
         the judgement. Paired, the variance is common to both and cancels.
         """
-        task = _StaircaseGSM8K(self.MODEL_NAME)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        task = GSM8K(self.MODEL_NAME)
 
         _require_mode("require")
         with LLM(self.MODEL_PATH, **self.DEP4) as llm:
@@ -194,7 +151,7 @@ class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("mode", ["require", "off"], ids=["staircase", "stock"])
-    def test_mtp3_acceptance(self, mode):
+    def test_mtp3_acceptance(self, mode, mocker):
         """The only gate that can see a miscomputed draft layer.
 
         Rejection sampling makes a wrong draft path *slower*, not wrong: every
@@ -210,8 +167,7 @@ class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
                                            rather than blaming the target
 
         The anchor is populated from the **stock** leg. Populating it from the
-        target's own number would make the gate self-referential, which is the
-        same rule references/accuracy.yaml states for accuracy anchors.
+        target's own number would make the gate self-referential.
         """
         _require_mode(mode)
         if mode == "off":
@@ -228,6 +184,8 @@ class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
                 "it stock cannot boot this checkpoint at dep4 with MTP"
             )
 
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+
         with LLM(
             self.MODEL_PATH,
             speculative_config=self.MTP3,
@@ -236,25 +194,8 @@ class TestStaircaseDeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             enable_iter_perf_stats=True,
             **self.DEP4,
         ) as llm:
-            task = _StaircaseGSM8K(self.MODEL_NAME)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] {mode} acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)
-
-
-def test_staircase_off_is_the_default(monkeypatch):
-    """Unset means off, on the code path the engine actually takes.
-
-    Cheap, GPU-free, and the thing most worth never regressing: everything in
-    this file rests on staircase being opt-in.
-    """
-    from tensorrt_llm._torch.staircase import StaircaseMode
-
-    monkeypatch.delenv(STAIRCASE_ENV, raising=False)
-    assert StaircaseMode.from_env() is StaircaseMode.OFF
-    assert os.environ.get("STAIRCASE_TARGET") is None, (
-        "STAIRCASE_TARGET was retired with the move in-tree; it named a "
-        "target, where TRTLLM_STAIRCASE names only a mode and lets routing "
-        "pick the target from the configuration"
-    )

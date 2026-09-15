@@ -39,6 +39,15 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         # Returns None unless `staircase` is on and a target claims this exact
         # (checkpoint, GPU arch, parallel topology), so the default path is
         # byte-for-byte unchanged.
+        #
+        # Precedence, since this runs last and would override the rewrite
+        # above: staircase wins. It reads the *un-rewritten* architectures[0],
+        # so it decides on the checkpoint rather than on what that rewrite made
+        # of it, and a target that claims a configuration carries that
+        # configuration's draft path itself. Not reachable today -- Eagle3
+        # needs draft_vocab_size, and no draft checkpoint matches a target's
+        # shape fingerprint -- so this note is the contract, not a description
+        # of observed behaviour.
         if (staircase_arch := staircase_resolve(config)) is not None:
             model_arch = staircase_arch
 

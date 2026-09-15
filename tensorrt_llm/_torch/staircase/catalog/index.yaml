@@ -30,20 +30,28 @@
 #
 # ── RECEIPT STATUS: all 19 entries certified on sm_103 ────────────────────
 #
-# A receipt says this entry's test passed, on a stated GPU architecture, over
-# files no newer than the run. Both anchors moved at once here -- the
-# migration rewrote every test file, and the targets moved from sm_100 (B200)
-# to sm_103 (GB300) -- so every sm_100 receipt was voided and the whole set
-# was re-run on GB300 under 1.3.0rc26. **All 19 pass**; per-entry counts are
-# in each contract's `receipts:` frontmatter.
+# A receipt says this entry's test passed on a stated GPU architecture. The
+# architecture is the whole key: it is a real axis -- see the
+# mxe4m3_mxe2m1_block_scale_moe_runner note below, where two architectures
+# compute bit-different results -- and CI cannot stand in for it unless CI
+# runs on every one. Staying current with the trunk is not a receipt's job:
+# there is no external pin left to drift against, and the catalog tests run
+# in pre-merge, so the trunk proves itself on every commit.
+#
+# The migration rewrote every test file and moved the targets from sm_100
+# (B200) to sm_103 (GB300), so the whole set was re-run on GB300. **All 19
+# pass**; per-entry counts are in each contract's `receipts:` frontmatter.
+# The sm_100 receipts were dropped rather than carried -- they predate every
+# file of the entries they sat in, and no sm_100 machine is in CI to re-take
+# them on. A missing arch key reads as unknown, which is the honest state.
 #
 # Getting there surfaced four real differences, none of which was fixed by
 # widening a tolerance:
 #
 #   * thop_attention, mla_rope_generation, mla_rope_append_paged_kv_assign_q
-#     -- op schema drift rc21 -> rc26 (renamed and added parameters). The
-#     wrappers now mirror their schemas argument for argument, so the next
-#     drift fails loudly instead of shifting a positional list.
+#     -- op schema drift (renamed and added parameters). The wrappers now
+#     mirror their schemas argument for argument, so the next drift fails
+#     loudly instead of shifting a positional list.
 #
 #   * mxe4m3_mxe2m1_block_scale_moe_runner -- the FC1 epilogue's MXFP8 block
 #     scale is `floor(log2(amax))-8` on sm_100 and `ceil(log2(amax/448))` on

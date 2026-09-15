@@ -385,6 +385,19 @@
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
 
+# ===== STAIRCASE =====
+# Overrides the /tensorrt_llm/_torch runtime-devs rule above for this subtree.
+# Individual handles rather than a team, like SCAFFOLDING: this is one bounded
+# experiment with named owners, not a standing domain.
+/tensorrt_llm/_torch/staircase @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+/tests/unittest/_torch/staircase @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+/tests/integration/defs/accuracy/test_staircase_deepseek_v3.py @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+/tests/integration/defs/accuracy/test_staircase_gpt_oss.py @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+# The two catalog categories whose contracts state kernel behaviour the
+# attention and MoE owners are the authority on; co-owned rather than reassigned.
+/tensorrt_llm/_torch/staircase/catalog/attention @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
+/tensorrt_llm/_torch/staircase/catalog/moe @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
+
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers

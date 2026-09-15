@@ -14,113 +14,24 @@ MoE with 256 routed experts at top-8 plus one shared expert (intermediate
 are bf16 and only the MLP path is NVFP4 — **and the KV cache is fp8-e4m3**
 (`hf_quant_config.json`: `kv_cache_quant_algo: FP8`).
 
-Against the `deepseek-v3-lite-nvfp4/dep4` sibling (not in this batch) — same architecture
-family, same topology, same quantization shape — five things differ, and each
-is re-derived here rather than inherited:
-
-* **the query path is a LoRA pair.** `q_lora_rank: 1536`, so the query is
-  `q_b_proj(q_a_layernorm(q_a_proj(x)))` — two GEMMs and a norm — where the
-  lite checkpoint's `q_lora_rank: null` projects directly. Nothing downstream
-  changes: `q_b_proj` produces the same `[T, H*(nope+rope)]` rows;
-* **routing is group-limited.** `n_group 8`, `topk_group 4`: `noaux_tc_op`
-  scores 8 contiguous groups of 32 experts by their two best bias-corrected
-  scores, keeps the best 4 groups, and takes top-8 inside them. The lite
-  sibling runs the ungrouped case. The MoE runner's own `n_group`/`topk_group`
-  stay inert — routing is done before the call, on either checkpoint;
-* **the rope table is YaRN-scaled** (factor 40 over an original 4096-position
-  window, `beta_fast` 32, `beta_slow` 1), and the model's YaRN attention
-  temperature `mscale = 0.1*ln(40) + 1` rides in **`q_scaling = 1/mscale^2`**
-  rather than in the table: the table's own amplitude is
-  `m(mscale)/m(mscale_all_dim)` = exactly 1.0 because this config sets both to
-  1.0. The op reads the table's *content* and `q_scaling`; the seven scalar
-  rope arguments beside them are inert (measured — see thop_attention.md);
-* **the latent KV pool is fp8-e4m3**, which changes what every one of the five
-  MLA-family calls a layer issues does — see below;
-* **scale.** 128 query heads (attention DP replicates them, so every rank runs
-  all 128), 64 routed experts per rank, and a 163840-position rope table.
+The query path is a LoRA pair (`q_lora_rank: 1536`), routing is group-limited
+(`n_group 8`, `topk_group 4`), and the rope table is YaRN-scaled with the
+attention temperature carried in `q_scaling` rather than in the table.
 
 **Layer 61 — the checkpoint's bf16 MTP module — is a second forward path this
-file also carries, and it exists only when a `configs/` variant turns it on.**
-Under the target's identity config (`llm_args.yaml`, no `speculative_config`)
-nothing below MTP is declared, layer 61's 790 keys stay a predicted non-load in
-the weight manifest, and the shell's forward is a plain call to the inherited
-base — bit-identical to the assembly the accuracy gate was measured on. With
-`configs/mtp{1,2,3}.yaml` the engine resolves a `spec_config` onto the model
-config before the model is built, the core declares the module's parameters,
-and the shell builds a draft-model container plus the runtime's spec worker.
-`MTPLayer` below is the module's forward; `docs/models/multi-token-prediction.md`
-is its semantics (the checkpoint ships no reference implementation of it and
-neither does transformers), and `docs/references/trtllm-runtime-integration.md`
-§13 is the runtime binding. Two consequences the rest of this file carries:
-`predicted_tokens_per_seq` is per call site rather than inert, because a
-generation request under MTP arrives carrying its whole draft chain; and the
-`spec_decoding_*` group stays inert, because on a trtllm-gen arch a
-linear-tree draft has
-its mask machinery forced off and drafting reaches the attention ops through
-`predicted_tokens_per_seq` alone.
+file also carries, and it exists only when `speculative_config` turns it on.**
+Under the target's identity config nothing below MTP is declared, layer 61's
+790 keys stay a predicted non-load in the weight manifest, and the shell's
+forward is a plain call to the inherited base. `MTPLayer` below is the
+module's forward; the checkpoint ships no reference implementation of it and
+neither does transformers, so what it computes is stated where it is built.
 
-**The fp8 latent pool, and the four things it moves.** Nothing validates the
-fp8 round trip at any layer: the write scale, the read scale and the two
-folded FMHA scales are independent roles with no relation checked anywhere, so
-a mistake here is silently mis-scaled output rather than an error.
-
-* **the context append and the cache gather** take the KV scaling factor `s`
-  as a write-side `1/s` and a read-side `s`. This checkpoint's 122 per-layer
-  `k_scale`/`v_scale` tensors are all exactly 1.0 (loaded and asserted in
-  `derive_after_load`), and `s = 1.0` is the **only** correct value on the fp8
-  MLA context path — both context flavors quantize q/k/v at 1.0 while applying
-  `s^2`/`s` as if they had not, so any other `s` is silently wrong. Both scale
-  arguments are therefore passed as `None`, which the ops read as exactly 1.0
-  and which is what the engine's own call sites pass;
-* **the context FMHA quantizes its own q/k/v to e4m3**, in both flavors. So
-  prefill accuracy *is* affected by cache quantization, and a cached-prefix
-  context call pays fp8 twice — the gather dequantizes the cached latent rows
-  off the pool and the FMHA quantizes the up-projected result straight back;
-* **the decode producers are ordered, not concurrent.** `mla_rope_generation`
-  does not write `fused_q` here — it **reads** `fused_q[..., :C]` to build
-  `quant_q_buffer`, the query the decode FMHA actually consumes. The absorbed-q
-  BMM must have finished before it. This forward issues both on the ambient
-  stream in that order, which is what makes it safe; the bf16 reading (the two
-  producers write disjoint halves and may overlap) is a silent race here;
-* **the decode FMHA reads neither kv scale tensor.** Its query comes from
-  `quant_q_buffer` and its two scales from `mla_bmm1_scale[1]` and
-  `mla_bmm2_scale[0]`, both written by `mla_rope_generation` from `q_scaling`,
-  the MLA dims and the read-side factor. The caller owns the dequantization
-  entirely.
-
-**The parallel segment.** `dep4` is `tensor_parallel_size: 4` plus
-`moe_expert_parallel_size: 4` plus `enable_attention_dp: true`: the requests
-are split, not the heads.
-
-* **attention, the q-LoRA pair, both dense MLP shapes, the shared expert, the
-  router, the embedding, the norms and the residual stream are replicated**,
-  and each rank runs them over its own tokens only — 128 query heads per rank.
-  A rank's `o_proj` output is complete, so there is no attention-side
-  collective at all;
-* **the MoE stays expert-parallel** (`moe_tp_size == 1`): rank `r` holds
-  experts `[64r, 64r+64)` whole. Every token must reach every window, so the
-  rank's tokens are **gathered** before the router and the four windows'
-  partials are **reduce-scattered** back — one `comm/allgather` and one
-  `comm/reducescatter` per MoE layer, 116 per forward, none in layers 0-2;
-* **the gather goes before the router GEMM, and that placement is
-  load-bearing.** Expert parallelism rests on the four windows tiling the
-  routing space exactly once, which needs every rank to select the same experts
-  for the same token. Ranks hold different tokens here, so the invariant is
-  restored by routing on the gathered full token set: identical bytes in,
-  replicated deterministic router GEMM and `noaux_tc_op`, identical top-8 out.
-  Routing locally and gathering afterwards would break it with no error;
-* **the reduce-scatter is crossed in bf16**: the op sums, and it sums
-  `float8_e4m3fn` as raw bytes rather than as floats, so a post-quantization
-  return trip is silently wrong (the gather is a byte move and would survive
-  it — the asymmetry is the trap);
-* **`lm_head` is replicated** — the shell builds the whole `[vocab, hidden]` on
-  every rank under attention DP, because a rank's logits rows are its own
-  tokens' and no other rank computed them.
-
-The expert call is **chunked** to `_MOE_MAX_T` rows: the gathered token set
-reaches `4 * max_num_tokens` = 32768 and both `fp4_block_scale_moe_runner` and
-`noaux_tc_op` are certified to 8192. That bound is a certification boundary,
-not a tuning knob.
+`dep4` is `tensor_parallel_size: 4` plus `moe_expert_parallel_size: 4` plus
+`enable_attention_dp: true`: the requests are split, not the heads. Everything
+but the MoE is replicated and runs over a rank's own tokens, so there is no
+attention-side collective; the MoE stays expert-parallel, rank `r` holding
+experts `[64r, 64r+64)` whole, which costs one `comm/allgather` and one
+`comm/reducescatter` per MoE layer.
 
 Weights are target-owned: a flat ParameterDict declared here (HF [out, in]
 storage so checkpoint rows copy in unchanged, plus the kernel-ready expert
@@ -130,7 +41,11 @@ derived once after load. The registration shell inherits
 DecoderModelForCausalLM for lm_head, packed-batch logits gathering, and the
 meta-init/load/post-load hooks.
 
-The import-time and first-forward contract checks below fail fast on drift.
+Everything this forward relies on that is not visible in the call itself is
+stated at the call: which scales are read and which are inert, why the two
+decode producers are ordered rather than concurrent, why the gather precedes
+the router GEMM, why the reduce-scatter is crossed in bf16, and which bounds
+are certification boundaries rather than tuning knobs.
 """
 
 import math
@@ -196,35 +111,31 @@ from . import weights as _weights
 _SM = (10, 3)
 
 
-def _check_static_contract() -> None:
-    """Import-time fail-fast: op symbol existence. The list is the forward's
-    trtllm call set plus `block_scale_interleave`, which the load-time
-    expert/scale relayout in weights.py depends on."""
-    for op in (
-        "cublas_mm",
-        "bmm_out",
-        "nvfp4_gemm",
-        "flashinfer_rmsnorm",
-        "flashinfer_fused_add_rmsnorm",
-        "flashinfer_silu_and_mul",
-        "fp4_quantize",
-        "noaux_tc_op",
-        "fp4_block_scale_moe_runner",
-        "fused_moe",
-        "mla_rope_generation",
-        "mla_rope_append_paged_kv_assign_q",
-        "load_paged_kv_cache_for_mla",
-        "allgather",
-        "reducescatter",
-        "block_scale_interleave",
-    ):
-        assert hasattr(torch.ops.trtllm, op), f"missing op trtllm::{op}"
-    from tensorrt_llm.bindings.internal import thop
-
-    assert hasattr(thop, "attention"), "missing pybind thop.attention"
-
-
-_check_static_contract()
+#: Every trtllm op this target reaches for, in its forward and in the weight
+#: load. Declared here, asserted in tests/unittest/_torch/staircase: a symbol
+#: that does not exist is a fact of the build, and the place to find that out
+#: is a machine with the extension built rather than every import of this
+#: module.
+REQUIRED_TRTLLM_OPS = (
+    "cublas_mm",
+    "bmm_out",
+    "nvfp4_gemm",
+    "flashinfer_rmsnorm",
+    "flashinfer_fused_add_rmsnorm",
+    "flashinfer_silu_and_mul",
+    "fp4_quantize",
+    "noaux_tc_op",
+    "fp4_block_scale_moe_runner",
+    "fused_moe",
+    "mla_rope_generation",
+    "mla_rope_append_paged_kv_assign_q",
+    "load_paged_kv_cache_for_mla",
+    "allgather",
+    "reducescatter",
+    # Not a forward call: the load-time expert/scale relayout in weights.py
+    # depends on it, so it belongs to the same contract.
+    "block_scale_interleave",
+)
 
 # Metadata fields consumed each step (sourcing mirrors the in-tree
 # FallbackFmha for this trtllm version; existence checked at first forward).
@@ -259,10 +170,10 @@ _STEP_FIELDS = (
     "use_spec_decoding",
     "flash_mla_tile_scheduler_metadata",
     "flash_mla_num_splits",
-    # Added between 1.3.0rc21 and 1.3.0rc26. Both are engine-prepared
-    # per-instance constants (max_num_sequences defaults to max_num_requests;
-    # the tree-mask flag is set from is_spec_dec_dynamic_tree, and this
-    # target's MTP is a linear tree), so they project like the rest.
+    # Both are engine-prepared per-instance constants (max_num_sequences
+    # defaults to max_num_requests; the tree-mask flag is set from
+    # is_spec_dec_dynamic_tree, and this target's MTP is a linear tree), so
+    # they project like the rest.
     "max_num_sequences",
     "force_prepare_spec_dec_tree_mask",
 )
@@ -392,14 +303,13 @@ _CALL_INERT = dict(
     num_sparse_topk=None,
     flash_mla_tile_scheduler_metadata=None,
     flash_mla_num_splits=None,
-    # Added between 1.3.0rc21 and 1.3.0rc26; held at the values the op had
-    # before they existed, which are also what the in-tree caller passes on
-    # this path. kv_norm_weight is not merely a default: non-None would fold
+    # Held at the op's defaults, which are also what the in-tree caller passes
+    # on this path. kv_norm_weight is not merely a default: non-None would fold
     # the kv_a_layernorm into the KV kernel and make it read latent_cache
     # RAW, and this target normalizes that itself -- passing the weight would
     # normalize twice. skip_correction is a lossy trtllm-gen MLA option
-    # (SM100/SM103, off by default upstream); enabling it is a configs/
-    # variant's business, not the identity assembly's.
+    # (SM100/SM103, off by default upstream); enabling it is a caller's
+    # business, not the identity assembly's.
     kv_norm_weight=None,
     kv_norm_eps=1e-6,
     skip_correction_threshold=0.0,
@@ -444,7 +354,7 @@ _FUSED_MOE_ACT_SWIGLU = 5
 # The MTP layer's `eh_proj` operand order, at one place so flipping it is a
 # one-line experiment. True = `concat(enorm(e), hnorm(h))`, the embedding block
 # first — measured on this checkpoint's own weights by two independent
-# statistics (docs/models/multi-token-prediction.md), which contradicts the
+# statistics, which contradicts the
 # DeepSeek-V3 report's `M_k[RMSNorm(h); RMSNorm(e)]` notation and agrees with
 # the parameter's name. Nothing in the checkpoint's metadata pins it and
 # nothing downstream detects a flip: the drafts are simply rejected, so the
@@ -562,7 +472,7 @@ class StaircaseCore(DecoderModel):
         self.mtp_layers = int(getattr(cfg, "num_nextn_predict_layers", 0) or 0)
         # Whether this engine drafts. The checkpoint decides the *mode*
         # (`num_nextn_predict_layers: 1` -> MTP-Eagle one-model, one layer
-        # replayed `max_draft_len` times); a `configs/` variant's
+        # replayed `max_draft_len` times); the caller's
         # `speculative_config` decides whether it runs at all, and the engine
         # has already resolved that onto `model_config.spec_config` by the time
         # the model is built. With it absent — the target's identity config —
@@ -666,19 +576,18 @@ class StaircaseCore(DecoderModel):
         self.shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
         self.dense_inter = cfg.intermediate_size
         assert 0 < self.topk < self.num_experts, "MoE top-k bound"
-        # noaux_tc_op is the whole gate: in-kernel sigmoid, bias correction
-        # for selection only, group-limited selection, renormalization and the
-        # routed_scaling_factor multiply. A checkpoint with norm_topk_prob
-        # false cannot use it.
+        # noaux_tc_op does the whole gate in-kernel and is not configurable:
+        # sigmoid, bias correction for selection only, renormalization, the
+        # routed_scaling_factor multiply. A checkpoint that wants any of those
+        # differently cannot use it.
         assert cfg.topk_method == "noaux_tc", cfg.topk_method
         assert cfg.scoring_func == "sigmoid", cfg.scoring_func
         assert cfg.norm_topk_prob, "noaux_tc_op always renormalizes"
         self.n_group = cfg.n_group
         self.topk_group = cfg.topk_group
-        # Group-limited routing, which this checkpoint uses and the lite
-        # sibling does not. noaux_tc_op's grouped configuration carries four
-        # hard limits of its own; each is checked here because the op reports
-        # a violation as one opaque "unsupported configuration".
+        # Four hard limits of the op's grouped path, each checked here because
+        # the op reports any violation as one opaque "unsupported
+        # configuration".
         assert self.n_group > 1 and 1 <= self.topk_group <= self.n_group, (
             f"grouped routing needs 1 <= topk_group <= n_group, got "
             f"{self.topk_group} / {self.n_group}"
@@ -792,7 +701,7 @@ class StaircaseCore(DecoderModel):
         w["final_norm"] = P(self.hidden)
         w["embed"] = P(self.vocab, self.hidden)
         # The MTP module at layer index `num_hidden_layers`, declared only when
-        # a configs/ variant turned drafting on. Its attention block is
+        # `speculative_config` turned drafting on. Its attention block is
         # byte-identical in geometry to a trunk layer's; its MLP path is the
         # same structure at a different **dtype** — `hf_quant_config.json`
         # carries `model.layers.61*` as one wildcard entry in its
@@ -2109,7 +2018,7 @@ class StaircaseDeepseekR10528Nvfp4Sm103Dep4(
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
         )
-        # The speculative branch, built only when a configs/ variant asked for
+        # The speculative branch, built only when `speculative_config` asked for
         # it. `spec_config` is already resolved on the model config by the time
         # the model is built, and the checkpoint — not the target — picked the
         # mode: `num_nextn_predict_layers: 1` gives MTP-Eagle one-model, where

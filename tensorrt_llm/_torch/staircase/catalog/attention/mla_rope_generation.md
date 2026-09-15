@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 22}
+  sm_103: {status: passed, tests: 22}
 ---
 
 # mla_rope_generation
@@ -410,11 +409,10 @@ arguments. The length/addressing tensors are exactly what a prepared
   other than bf16.
 
 
-## rc26 additions
+## Parameters this entry pins to their defaults
 
-Parameters that did not exist in 1.3.0rc21. Every value this entry certifies
-reproduces the op's pre-rc26 behaviour, and matches what the in-tree caller
-passes on the same path.
+Every value certified below leaves the op on its default behaviour, and
+matches what the in-tree caller passes on the same path.
 
 | Parameter | Certified value | Why |
 |---|---|---|
