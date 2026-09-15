@@ -3,7 +3,6 @@
 
 import contextlib
 import functools
-import math
 import os
 import threading
 from collections.abc import Callable

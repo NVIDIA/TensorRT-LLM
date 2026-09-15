@@ -1251,8 +1251,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 if _fp8_block_scales_uses_cute_dsl_sm107(module):
                     # transform_weights() re-laid weight_scale out as UE8M0
                     # K32 R128c4; quantize the activation to match.
-                    act_input_fp8, act_input_sf = \
-                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+                    act_input_fp8, act_input_sf = (
+                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+                            input))
                     output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
                         act_input_fp8, module.weight, act_input_sf,
                         module.weight_scale)
