@@ -324,6 +324,22 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     // exists to avoid). knownNoDigest=false lets makeKey's update() scan for digests
     // itself — correct regardless of content, so no separate scan is needed here.
     TLLM_CHECK_DEBUG(k == Block::makeKey(prevNode->key, tokens.data(), tokens.size(), /*knownNoDigest=*/false));
+
+    if (eventSink != nullptr && eventSink->needsTokenDigestContext())
+    {
+        if (prevNode->type() == Type::kBLOCK)
+        {
+            mLastTokenDigest = static_cast<Block const*>(prevNode)->getLastTokenDigest();
+        }
+        for (auto iter = tokens.rbegin(); iter != tokens.rend(); ++iter)
+        {
+            if (iter->isDigest())
+            {
+                mLastTokenDigest = std::make_shared<Digest const>(iter->digest());
+                break;
+            }
+        }
+    }
 }
 
 // Delegates to the tree, mirroring Python's RootBlock.num_life_cycles. Defined
