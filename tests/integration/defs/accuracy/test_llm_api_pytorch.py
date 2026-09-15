@@ -5986,7 +5986,8 @@ class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(14400)
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        use_kv_cache_manager_v2=True)
         chat_template_kwargs = dict(thinking_budget=-1)
 
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
