@@ -4484,10 +4484,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             f"Question: what was the code word? Answer in one word."
             for n in needles
         ]
-        # Long generation so each suspend/resume round trip spans many decode
-        # steps and the suspended requests are held across a long active run of
-        # the request that owns the pool
-        sampling = SamplingParams(max_tokens=128, temperature=0.0)
+        # Keep every request resident for the full decode length. An early EOS
+        # can release enough pages to avoid the suspend/resume path. GPT-OSS
+        # has multiple EOS IDs, so min_tokens alone does not prevent early stops.
+        sampling = SamplingParams(max_tokens=128,
+                                  ignore_eos=True,
+                                  temperature=0.0)
 
         def _drain_stats() -> tuple[int, int, int, int, int]:
             # Single drain: llm.get_stats() consumes the per-iteration records,
@@ -4553,11 +4555,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             # Checked against the *measured* pool, never against max_tokens --
             # the manager inflates that knob by 1 / max_util_for_resume, so a
             # config-derived bound is wrong by ~1.43x (see the sizing note on
-            # kv_cache_config). Under VSWA the pool holds far more tokens per
-            # byte than a full-attention model, so it takes twelve requests to
-            # overflow it: observed on B200 at concurrent_peak ~4764 vs
-            # pool_tokens ~3328, a ~1.4x margin that reliably suspends/resumes a
-            # couple of in-flight requests. Failing here means the workload
+            # kv_cache_config). The allocated pool also depends on page-aligned
+            # window retention. Failing here means the workload
             # stopped being contended, NOT that the KV path broke.
             assert concurrent_peak > pool_tokens, (
                 f"workload precondition failed: the pool ({pool_tokens} tokens) "
@@ -4588,6 +4587,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
               f"common_prefix_tokens={prefixes}")
         for i in range(len(prompts)):
             print(f"[I-10 out {i}] needle={needles[i]} "
+                  f"ref_tokens={len(ref_ids[i])} con_tokens={len(con_ids[i])} "
                   f"ref_recall={needles[i] in ref_txt[i].upper()} "
                   f"con_recall={needles[i] in con_txt[i].upper()} "
                   f"ref={ref_txt[i]!r} con={con_txt[i]!r}")
@@ -4599,6 +4599,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         assert all(len(ids) > 0 for ids in con_ids), (
             "a request produced no tokens under suspend/resume contention "
             "(possible V2 scheduler deadlock or illegal-memory-access crash)")
+        assert all(len(ids) == sampling.max_tokens for ids in con_ids), (
+            "fixed-length contention workload ended early: "
+            f"expected {sampling.max_tokens} tokens per request, "
+            f"got {[len(ids) for ids in con_ids]}")
         # (2) The ACTIVE<->SUSPENDED state machine genuinely fired (not mere
         # queuing): an in-flight request was suspended under pressure and later
         # recovered. These per-iteration manager counters are the direct signal;
@@ -6361,11 +6365,16 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    check_acceptance_length: bool,
                    moe_expert_parallel_size: int = 1,
                    enable_attention_dp: bool = False,
-                   cover_guided_decoding: bool = False) -> LLM:
+                   cover_guided_decoding: bool = False,
+                   enable_block_reuse: bool = False) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
-                                        enable_block_reuse=False,
+                                        enable_block_reuse=enable_block_reuse,
                                         mamba_ssm_cache_dtype="bfloat16")
+        if enable_block_reuse:
+            # Attention pages alone cannot restore GDN or PLE state, so the
+            # runtime turns reuse back off without a snapshot policy.
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         cuda_graph_config = CudaGraphConfig(max_batch_size=self.MAX_BATCH_SIZE,
                                             enable_padding=True)
         mtp_config = (None if max_draft_len is None else MTPDecodingConfig(
@@ -6400,7 +6409,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    mocker,
                    moe_expert_parallel_size: int = 1,
                    enable_attention_dp: bool = False,
-                   cover_guided_decoding: bool = False) -> None:
+                   cover_guided_decoding: bool = False,
+                   enable_block_reuse: bool = False) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
@@ -6410,16 +6420,16 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             and tensor_parallel_size == 4 and moe_backend == "TRTLLM"
             and max_draft_len == 3 and moe_expert_parallel_size == 4
-            and enable_attention_dp)
-        with self._build_llm(
-                model_path,
-                tensor_parallel_size,
-                moe_backend,
-                max_draft_len,
-                check_acceptance_length,
-                moe_expert_parallel_size=moe_expert_parallel_size,
-                enable_attention_dp=enable_attention_dp,
-                cover_guided_decoding=cover_guided_decoding) as llm:
+            and enable_attention_dp and not enable_block_reuse)
+        with self._build_llm(model_path,
+                             tensor_parallel_size,
+                             moe_backend,
+                             max_draft_len,
+                             check_acceptance_length,
+                             moe_expert_parallel_size=moe_expert_parallel_size,
+                             enable_attention_dp=enable_attention_dp,
+                             cover_guided_decoding=cover_guided_decoding,
+                             enable_block_reuse=enable_block_reuse) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if cover_guided_decoding:
                 assert_guided_decoding_regex(llm)
@@ -6472,6 +6482,29 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         mocker=mocker,
                         moe_expert_parallel_size=4,
                         enable_attention_dp=True)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(82000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_fp8_adp4_mtp3_prefix_cache(self, monkeypatch: pytest.MonkeyPatch,
+                                        mocker) -> None:
+        """test_fp8_adp4_mtp3_trtllm_ple_offload with block reuse enabled.
+
+        A reused prefix restores the Gated DeltaNet and PLE state from a
+        recurrent-state snapshot instead of recomputing it, so accuracy holds
+        only if the snapshot carries every role in the recurrent page.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True,
+                        enable_block_reuse=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -7874,3 +7907,104 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(model_name)
             task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("overlap_scheduler", [False, True])
+    @parametrize_with_ids("attention_dp", [False, True])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
+                          overlap_scheduler):
+        # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
+        # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K plus
+        # a chat-GSM8K acceptance probe, since accuracy alone does not notice a
+        # corrupted drafter KV.
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import \
+            msa_package_available
+        if not msa_package_available():
+            pytest.skip("MSA kernels (fmha_sm100) not available")
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        max_draft_len = 3
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+        )
+        # The MSA path runs an FP8 KV cache, as in test_nvfp4.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False,
+                                        dtype="fp8")
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                    implementation="msa", indexer_kv_dtype="fp8"),
+                moe_config=MoeConfig(backend="CUTLASS"),
+                max_seq_len=4096,
+                # fmha_sm100 caps total_q x heads at 65536; with 4 verify
+                # tokens per row that is 512 (256 with unsharded heads).
+                max_batch_size=256 if attention_dp else 512,
+                speculative_config=spec_config,
+                cuda_graph_config=CudaGraphConfig(
+                    enable_padding=True,
+                    max_batch_size=64 if attention_dp else 128,
+                ),
+                disable_overlap_scheduler=not overlap_scheduler,
+                enable_attention_dp=attention_dp,
+                enable_iter_perf_stats=True,
+                # Keep the whole acceptance probe: the default buffer holds
+                # only the latest 1000 iterations.
+                max_stats_len=5000,
+                trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+
+            def drain_spec_stats(llm):
+                drafted = accepted = steps = 0
+                for s in llm.get_stats(timeout=2):
+                    s = json.loads(s) if isinstance(s, str) else s
+                    sd = s.get("specDecodingStats") or {}
+                    drafted += sd.get("numDraftTokens", 0)
+                    accepted += sd.get("numAcceptedTokens", 0)
+                    steps += sd.get("numRequestsWithDraftTokens", 0)
+                return drafted, accepted, steps
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+            # Acceptance probe: 200 chat-format GSM8K questions, greedy, 512 tokens.
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            drain_spec_stats(llm)
+            llm.generate(chat_prompts,
+                         SamplingParams(max_tokens=512, temperature=0))
+            drafted, accepted, steps = drain_spec_stats(llm)
+            assert steps > 0, "no speculative iterations recorded"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            # Reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
+            # reports 0.839 / 3.518; the GQA head measures 0.838 / 3.515 here.
+            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.80, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
+                f"(threshold 0.80, reference 0.839 from the drafter card)"
+            assert chat_length > 3.4, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
+                f"the drafter card)"

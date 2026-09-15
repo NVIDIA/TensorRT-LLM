@@ -166,6 +166,8 @@ speculative_config = DFlashDecodingConfig(
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
 
+[DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.

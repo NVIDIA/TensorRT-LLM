@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import array
 import os
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
@@ -41,9 +42,11 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheT
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
+    DFlashDecodingConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
+    PARDDecodingConfig,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -1349,6 +1352,77 @@ class _ContextRequest:
         self.context_current_position = length
 
 
+@pytest.mark.parametrize("config_cls", [DFlashDecodingConfig, PARDDecodingConfig])
+def test_external_draft_estimated_quota_supports_allocation_and_resume(
+    config_cls: type[DFlashDecodingConfig] | type[PARDDecodingConfig],
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    spec = config_cls(max_draft_len=4, speculative_model="draft")
+    model_config = SimpleNamespace(
+        quant_config=None,
+        pretrained_config=SimpleNamespace(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            layer_types=["full_attention"],
+        ),
+        get_num_attention_layers=lambda: 1,
+    )
+    batch_size, context_tokens, window = 64, 512, 504
+    config = KvCacheConfig(enable_block_reuse=False, max_attention_window=[window])
+    slope, fixed = KVCacheManagerV2.get_cache_size_per_token(
+        model_config,
+        Mapping(),
+        tokens_per_block=32,
+        max_seq_len=4096,
+        max_batch_size=batch_size,
+        max_num_tokens=context_tokens,
+        kv_cache_config=config,
+        spec_config=spec,
+        is_draft=True,
+    )
+    config.max_gpu_total_bytes = slope * context_tokens + fixed
+    manager = KVCacheManagerV2(
+        config,
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        tokens_per_block=32,
+        max_seq_len=4096,
+        max_batch_size=batch_size,
+        max_num_tokens=context_tokens,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=spec,
+        is_draft=True,
+    )
+    caches = []
+    stream = torch.cuda.current_stream().cuda_stream
+    try:
+        for _ in range(batch_size):
+            cache = manager.impl.create_kv_cache()
+            caches.append(cache)
+            assert cache.resume(stream)
+        # One context request runs alongside a full generation batch minus one.
+        assert caches[0].resize(context_tokens + spec.max_draft_len - 1)
+        # Sweep a complete page so the workload exercises unaligned retention.
+        for history in range(1024, 1056):
+            capacity = history + spec.max_draft_len - 1 + spec.tokens_per_gen_step
+            for cache in caches[1:]:
+                assert cache.resize(capacity, history)
+        # A quota that admits allocation must also allow requests to resume.
+        for cache in caches:
+            cache.suspend()
+            assert cache.resume(stream)
+    finally:
+        for cache in caches:
+            cache.close()
+        manager.shutdown()
+
+
 @pytest.fixture
 def max_num_turns() -> int:
     return 1
@@ -2286,3 +2360,174 @@ def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) ->
     assert torch.isnan(buffer[guard_page]).all()  # sentinel survives the scrub
     assert torch.equal(buffer[0], torch.zeros(2))  # everything else is zeroed
     assert torch.equal(buffer[5], torch.zeros(2))
+
+
+class _FakeLogger:
+    """Stand-in for tensorrt_llm.logger with a settable level and captured messages."""
+
+    def __init__(self, level: str = "debug") -> None:
+        self.level = level
+        self.messages: list[str] = []
+
+    def is_debug_enabled(self) -> bool:
+        return self.level in ("trace", "debug", "verbose")
+
+    def debug(self, *msg) -> None:
+        self.messages.append(" ".join(str(m) for m in msg))
+
+
+class _FakeWindowedKVCache:
+    """Matches the production contract: get_base_page_indices() is padded to
+    max_blocks_per_seq with BAD_PAGE_INDEX, and num_blocks bounds the entries
+    that belong to the sequence."""
+
+    _MAX_BLOCKS_PER_SEQ = 256
+
+    def __init__(self, page_indices: dict[int, list[int]]) -> None:
+        self._page_indices = page_indices
+
+    @property
+    def num_blocks(self) -> int:
+        return max(len(indices) for indices in self._page_indices.values())
+
+    def get_base_page_indices(self, layer_group_id, beam_id=DEFAULT_BEAM_INDEX):
+        indices = self._page_indices[int(layer_group_id)]
+        return array.array(
+            "i", indices + [BAD_PAGE_INDEX] * (self._MAX_BLOCKS_PER_SEQ - len(indices))
+        )
+
+
+def _make_window_crossing_manager() -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = 4096
+    manager.tokens_per_block = 64
+    # Group 0 is windowed at 2048; group 1 spans the whole sequence, so it is
+    # not windowed and must never produce a crossing line.
+    manager._windowed_layer_group_sizes = {0: 2048}
+    return manager
+
+
+def test_window_crossing_logs_once_with_capacity_and_blocks(monkeypatch) -> None:
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    kv_cache = _FakeWindowedKVCache({0: [7, 8, 9]})
+    request = SimpleNamespace(py_request_id=42)
+
+    manager._log_window_crossing(request, kv_cache, 2047, 2049, "generation")
+
+    assert len(fake_logger.messages) == 1
+    message = fake_logger.messages[0]
+    assert "request 42" in message
+    assert "generation" in message
+    assert "layer_group_id=0" in message
+    assert "window=2048" in message
+    assert "capacity 2047 -> 2049 tokens" in message
+    assert "num_blocks=3" in message
+    assert "block_range=[7, 9]" in message
+
+    # A further growth on the same request stays quiet: the window was already
+    # crossed, so the once-per-sequence-per-pool contract holds without state.
+    manager._log_window_crossing(request, kv_cache, 2049, 2050, "generation")
+    assert len(fake_logger.messages) == 1
+
+
+@pytest.mark.parametrize(
+    "pre_capacity,new_capacity",
+    [
+        (100, 2048),  # grows up to the window but does not cross it
+        (2048, 2048),  # no growth at all
+        (2049, 3000),  # already past the window
+    ],
+)
+def test_window_crossing_is_silent_without_a_crossing(
+    monkeypatch, pre_capacity: int, new_capacity: int
+) -> None:
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1),
+        _FakeWindowedKVCache({0: [1]}),
+        pre_capacity,
+        new_capacity,
+        "context",
+    )
+
+    assert fake_logger.messages == []
+
+
+@pytest.mark.parametrize(
+    "level,expected",
+    [("trace", 1), ("debug", 1), ("verbose", 1), ("info", 0), ("warning", 0), ("error", 0)],
+)
+def test_window_crossing_follows_the_logger_severity_order(monkeypatch, level, expected) -> None:
+    """Every level at least as verbose as debug logs; the rest stay quiet.
+
+    ``verbose`` and ``trace`` are valid ways to ask for debug output, so a
+    guard that compares the level to the literal ``"debug"`` suppresses the
+    line for users who did enable it.
+    """
+    fake_logger = _FakeLogger(level=level)
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1), _FakeWindowedKVCache({0: [1]}), 2047, 2049, "context"
+    )
+
+    assert len(fake_logger.messages) == expected
+
+
+@pytest.mark.parametrize(
+    "global_level,module_level,expected",
+    [
+        # A module raised to debug logs even though the global level is info.
+        ("info", 10, 1),
+        # A module pinned to info stays quiet even though the global level is debug.
+        ("debug", 20, 0),
+    ],
+)
+def test_window_crossing_honours_per_module_log_levels(
+    monkeypatch, global_level: str, module_level: int, expected: int
+) -> None:
+    """The real logger, not a stand-in: the gate must resolve this module.
+
+    ``TLLM_LOG_LEVEL_BY_MODULE=debug:_torch`` is how a user turns this
+    diagnostic on without drowning in every other subsystem's debug output,
+    and the manager's own module (``_torch``) is what the override names.
+    """
+    from tensorrt_llm.logger import logger as real_logger
+
+    assert kv_cache_v2_module.logger is real_logger, "the manager must log through the real logger"
+    recorded: list[str] = []
+    monkeypatch.setattr(real_logger, "_min_severity", global_level)
+    monkeypatch.setattr(real_logger, "_module_levels", {"_torch": module_level})
+    monkeypatch.setattr(real_logger, "debug", lambda *msg: recorded.append(" ".join(map(str, msg))))
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1), _FakeWindowedKVCache({0: [1]}), 2047, 2049, "context"
+    )
+
+    assert len(recorded) == expected
+
+
+def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
+    """Diagnostics must never turn a working run into a failing one."""
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    class _BrokenKVCache:
+        def get_base_page_indices(self, layer_group_id, beam_id=DEFAULT_BEAM_INDEX):
+            raise KeyError("no base buffer")
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1), _BrokenKVCache(), 2047, 2049, "context"
+    )
+
+    assert len(fake_logger.messages) == 1
+    assert "unavailable" in fake_logger.messages[0]

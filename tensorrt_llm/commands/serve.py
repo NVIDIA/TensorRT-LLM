@@ -247,7 +247,6 @@ def get_llm_args(
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
-        fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
         enable_attention_dp: bool = False,
@@ -331,8 +330,6 @@ def get_llm_args(
         reasoning_parser,
         "otlp_traces_endpoint":
         otlp_traces_endpoint,
-        "fail_fast_on_attention_window_too_large":
-        fail_fast_on_attention_window_too_large,
         "multimodal_config":
         MultimodalConfig(video_pruning_rate=video_pruning_rate)
         if video_pruning_rate is not None else None,
@@ -1177,15 +1174,6 @@ def launch_visual_gen_server(
     "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
     "Required when using service registry.",
     status="prototype")
-@stability_option(
-    "--fail_fast_on_attention_window_too_large",
-    is_flag=True,
-    default=True,
-    help=
-    "[Deprecated] Exit with runtime error when attention window is too large "
-    "to fit even a single sequence in the KV cache. Now defaults to True. "
-    "This flag only affects the TRT backend and will be removed in a future release.",
-    status="deprecated")
 @stability_option("--otlp_traces_endpoint",
                   type=str,
                   default=None,
@@ -1305,35 +1293,62 @@ def launch_visual_gen_server(
     "launcher read the kernel-assigned port back instead of reserving one up "
     "front.",
     status="prototype")
-def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-          post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, generation_config: str,
-          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
-          max_seq_len: int, tensor_parallel_size: int,
-          pipeline_parallel_size: int, context_parallel_size: int,
-          moe_expert_parallel_size: Optional[int],
-          moe_cluster_parallel_size: Optional[int],
-          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
-          kv_cache_dtype: str, num_postprocess_workers: int,
-          num_serve_frontends: int, num_input_processor_workers: int,
-          num_media_load_workers: int, trust_remote_code: bool,
-          revision: Optional[str], extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str], tool_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
-          server_role: Optional[str],
-          fail_fast_on_attention_window_too_large: bool,
-          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-          media_io_kwargs: Optional[str], agent_percentage: float,
-          agent_types: Optional[str], video_pruning_rate: Optional[float],
-          telemetry: bool, custom_module_dirs: list[Path],
-          chat_template: Optional[str], allow_request_chat_template: bool,
-          middleware: tuple[str, ...], grpc: bool, grpc_protocol: str,
-          enable_visual_gen: bool, served_model_name: Optional[str],
-          visual_gen_args: Optional[str], report_addr: Optional[str]) -> None:
+def serve(
+    model: str,
+    tokenizer: Optional[str],
+    custom_tokenizer: Optional[str],
+    post_processor_hook: Optional[str],
+    host: str,
+    port: int,
+    log_level: str,
+    backend: str,
+    generation_config: str,
+    max_beam_width: int,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_seq_len: int,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    context_parallel_size: int,
+    moe_expert_parallel_size: Optional[int],
+    moe_cluster_parallel_size: Optional[int],
+    gpus_per_node: Optional[int],
+    free_gpu_memory_fraction: float,
+    kv_cache_dtype: str,
+    num_postprocess_workers: int,
+    num_serve_frontends: int,
+    num_input_processor_workers: int,
+    num_media_load_workers: int,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    extra_llm_api_options: Optional[str],
+    reasoning_parser: Optional[str],
+    tool_parser: Optional[str],
+    metadata_server_config_file: Optional[str],
+    server_role: Optional[str],
+    otlp_traces_endpoint: Optional[str],
+    enable_chunked_prefill: bool,
+    enable_attention_dp: bool,
+    disagg_cluster_uri: Optional[str],
+    media_io_kwargs: Optional[str],
+    agent_percentage: float,
+    agent_types: Optional[str],
+    video_pruning_rate: Optional[float],
+    telemetry: bool,
+    custom_module_dirs: list[Path],
+    chat_template: Optional[str],
+    allow_request_chat_template: bool,
+    middleware: tuple[str, ...],
+    grpc: bool,
+    grpc_protocol: str,
+    enable_visual_gen: bool,
+    served_model_name: Optional[str],
+    visual_gen_args: Optional[str],
+    report_addr: Optional[str],
+) -> None:
     """Running an OpenAI API compatible server
 
-    MODEL: model name | HF checkpoint path | TensorRT engine path
+    MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
 
@@ -1352,12 +1367,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
             "no longer supported. This option will be removed in a future release."
         )
-
-    if "--fail_fast_on_attention_window_too_large" in sys.argv:
-        logger.warning(
-            "--fail_fast_on_attention_window_too_large is deprecated. "
-            "It now defaults to True and will be removed in a future release. "
-            "This flag only affects the TRT backend.")
 
     if tool_parser == "auto":
         resolved = resolve_auto_tool_parser(model)
@@ -1427,8 +1436,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             trust_remote_code=trust_remote_code,
             revision=revision,
             reasoning_parser=reasoning_parser,
-            fail_fast_on_attention_window_too_large=
-            fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
@@ -1694,16 +1701,26 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     default=True,
     help="Enable or disable anonymous usage telemetry collection.",
     status="beta")
-def serve_encoder(model: str, host: str, port: int, log_level: str,
-                  max_batch_size: int, max_num_tokens: int,
-                  gpus_per_node: Optional[int], trust_remote_code: bool,
-                  extra_encoder_options: Optional[str], revision: Optional[str],
-                  free_gpu_memory_fraction: float, tensor_parallel_size: int,
-                  metadata_server_config_file: Optional[str],
-                  allow_request_chat_template: bool, telemetry: bool):
+def serve_encoder(
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    gpus_per_node: Optional[int],
+    trust_remote_code: bool,
+    extra_encoder_options: Optional[str],
+    revision: Optional[str],
+    free_gpu_memory_fraction: float,
+    tensor_parallel_size: int,
+    metadata_server_config_file: Optional[str],
+    allow_request_chat_template: bool,
+    telemetry: bool,
+):
     """Running an OpenAI API compatible server
 
-    MODEL: model name | HF checkpoint path | TensorRT engine path
+    MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
 
@@ -1820,11 +1837,20 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
 def serve_embedding(
-        model: str, host: str, port: int, log_level: str, max_batch_size: int,
-        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
-        trust_remote_code: bool, extra_llm_api_options: Optional[str],
-        revision: Optional[str], metadata_server_config_file: Optional[str],
-        telemetry: bool):
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_queue_delay: float,
+    max_queue_size: int,
+    trust_remote_code: bool,
+    extra_llm_api_options: Optional[str],
+    revision: Optional[str],
+    metadata_server_config_file: Optional[str],
+    telemetry: bool,
+):
     """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
 
     Coalesces concurrent requests with a dynamic batcher and serves them through
