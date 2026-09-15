@@ -563,7 +563,17 @@ def apply_model_defaults_to_llm_args(
 
     new_args = llm_args.__class__(**merged_state)
 
+    # `model_dump()` omits `exclude=True` fields, so they are absent from
+    # merged_state and come back at their default on `new_args`. Copying that
+    # over would silently drop launcher-injected state (`mpi_session`,
+    # `disagg_worker_role`) that no model default can legitimately set.
+    excluded = {
+        name
+        for name, field in type(llm_args).model_fields.items() if field.exclude
+    }
     for field_name in type(llm_args).model_fields:
+        if field_name in excluded:
+            continue
         setattr(llm_args, field_name, getattr(new_args, field_name))
 
     def _compute_applied(defaults: Dict[str, Any],

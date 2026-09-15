@@ -349,6 +349,15 @@ class PreprocessedInputs:
     encoder_input_token_ids: Optional[List[int]] = None
 
 
+# Keys accepted by the LLM constructor that are not `LlmArgs` field names:
+# `backend` selects the args class itself, and the underscore-prefixed ones are
+# launcher-injected fields carried by their alias (see `mpi_session` and
+# `disagg_worker_role` in llm_args.py). Both the generic kwargs check and the
+# PyTorch-backend validator read this, so a new alias only has to be added once.
+_NON_FIELD_LLM_KWARGS = frozenset(
+    {'backend', '_mpi_session', '_disagg_worker_role'})
+
+
 class BaseLLM:
     """The base class for all LLM classes.
     """
@@ -402,8 +411,7 @@ class BaseLLM:
 
             # check the kwargs and raise ValueError directly
             valid_keys = set(
-                list(llm_args_cls.model_fields.keys()) +
-                ['_mpi_session', 'backend'])
+                llm_args_cls.model_fields.keys()) | _NON_FIELD_LLM_KWARGS
             if issubclass(llm_args_cls, TorchLlmArgs):
                 # Values are vetted by TorchLlmArgs._drop_removed_args.
                 valid_keys |= TORCH_LLMARGS_REMOVED_ARGS
@@ -2065,7 +2073,7 @@ class _TorchLLM(BaseLLM):
         # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
         accepted_keys = (set(TorchLlmArgs.model_fields.keys())
                          | TORCH_LLMARGS_REMOVED_ARGS
-                         | {'_mpi_session', 'backend'})
+                         | _NON_FIELD_LLM_KWARGS)
 
         # Check if any arguments not supported by the PyTorch backend are passed.
         unsupported_args = [key for key in kwargs if key not in accepted_keys]
