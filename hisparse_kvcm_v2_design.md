@@ -1,21 +1,6 @@
-<!--
-SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: Apache-2.0
--->
 
-# HiSparse KV offload on KVCacheManagerV2
 
-Status: use SGLang's HiSparse kernel directly. KVCM integration and safety rules need owner review.
-Updated 2026-09-15.
-
-Targets: GLM5.2, DeepSeek-V4, and MiniMax M3. Support local prefill/decode and prefix reuse;
-disaggregated serving is optional. MTP is out of scope for now.
-
-Build from current `main` and the local residency changes. Use each model's existing GPU-only
-sparse path as the correctness baseline. [HiSparse.md](HiSparse.md) lists the implementation tasks.
-
-Sections 2 and 3 separate existing behavior from the proposed changes. Owner-review notes mark
-remaining API and safety questions; section 6 summarizes the eight agreed choices.
+# DSA KV offload on KVCacheManagerV2
 
 ## 1. Goal and terms
 
@@ -28,36 +13,40 @@ The GPU cache may retain recently used KV as well as the current selection. Pres
 selections and results. Indexer history, dense KV, metadata, temporary buffers, and prefill have
 separate memory costs; the sparse GPU-cache budget does not bound those costs.
 
-Use SGLang's `load_cache_to_device_buffer_kernel` from [hisparse.cuh][hisparse-kernel]
+Port SGLang's `load_cache_to_device_buffer_kernel` from [hisparse.cuh](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/kvcacheio/hisparse.cuh)
 for GPU lookup, LRU replacement, refetch, and attention indices. Integrate the kernel source
 with KVCM V2 through a small wrapper. The existing local Triton cache is a correctness reference
 for this integration.
 
 ### Key terms
 
-| Term | Meaning |
-| --- | --- |
-| Layer buffer | One kind of saved data from one layer, such as layer 0's K or V. |
-| Block | A fixed group of token positions. With 64 tokens per block, block 0 covers tokens 0–63. |
-| Layer group | A set of layer buffers that KVCM manages together under the same rules for keeping and releasing data. One group can include several layers. |
-| Page | Cached data managed together: held, locked, moved, or dropped as one unit. An attention page contains one block's data for one layer group. |
-| Slot | A fixed-size piece of memory that can hold several buffers. |
-| Pool | A collection of slots. Every slot in that pool has the same byte size. |
-| GPU cache entry | One token's KV, or one compressed entry, from one layer, kept in the small GPU cache. |
-| Metadata | Records of which tokens and layers the KV belongs to, and where it is stored. |
+
+| Term            | Meaning                                                                                                                                      |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Layer buffer    | One kind of saved data from one layer, such as layer 0's K or V.                                                                             |
+| Block           | A fixed group of token positions. With 64 tokens per block, block 0 covers tokens 0–63.                                                      |
+| Layer group     | A set of layer buffers that KVCM manages together under the same rules for keeping and releasing data. One group can include several layers. |
+| Page            | Cached data managed together: held, locked, moved, or dropped as one unit. An attention page contains one block's data for one layer group.  |
+| Slot            | A fixed-size piece of memory that can hold several buffers.                                                                                  |
+| Pool            | A collection of slots. Every slot in that pool has the same byte size.                                                                       |
+| GPU cache entry | One token's KV, or one compressed entry, from one layer, kept in the small GPU cache.                                                        |
+| Metadata        | Records of which tokens and layers the KV belongs to, and where it is stored.                                                                |
+
 
 For example, four 4 KiB buffers can share one 16 KiB slot. Every slot in that pool is 16 KiB;
-a different pool can use a different slot size. See [slot layout][slot-layout] and
-[fixed slot size][slot-size].
+a different pool can use a different slot size. See [slot layout](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/config.h#L101) and
+[fixed slot size](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h#L172).
 
 An attention page includes the group's configured buffers for that block, which may include
 indexer data as well as K/V. Its buffers can occupy one slot in each of several pools, so a page
-need not be one continuous piece of memory. See [Page][page-type] and [pages within a block][block-pages].
+need not be one continuous piece of memory. See [Page](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.h#L43) and [pages within a block](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h#L72).
 
 HiSparse can copy one selected token's KV from a page into the GPU cache while keeping the full
 page on host. A **host copy** means KV data kept in host memory.
 
 ## 2. What exists today
+
+
 
 ### 2.1 Sparse model storage
 
@@ -70,25 +59,27 @@ may place them in different pools, but they share the same rules for keeping and
 DeepSeek-V4 separates sliding-window attention (SWA) from other state, while its sparse compressed
 KV and compressed indexer K still share those rules.
 
-Sources: [DSA buffers][dsa-cache], [MiniMax buffers][minimax-cache], and [DeepSeek-V4 groups][dsv4-cache].
+Sources: [DSA buffers](tensorrt_llm/_torch/attention/backends/sparse/dsa/cache_manager.py#L538), [MiniMax buffers](tensorrt_llm/_torch/attention/backends/sparse/minimax_m3/cache_manager.py#L235), and [DeepSeek-V4 groups](tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py#L928).
 
 ### 2.2 Page storage and protection
 
 V2 defaults to C++; Python is a reference backend. Existing components provide:
 
-| Component | What it does |
-| --- | --- |
-| `StorageManager` | Allocates GPU, host, and disk storage. Moving a whole page to another level releases its source slot. |
-| `LRUEvictionPolicy` | Uses CPU-managed page queues ordered by priority and least-recently-used order (LRU). |
-| `BlockRadixTree` | Shares pages for prefix reuse. |
-| `IKvCacheColdPageCodec` | Converts and copies whole pages between GPU and host/disk formats. |
-| `kv_cache_config.host_cache_size` | Sets the host-memory budget. |
+
+| Component                         | What it does                                                                                          |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `StorageManager`                  | Allocates GPU, host, and disk storage. Moving a whole page to another level releases its source slot. |
+| `LRUEvictionPolicy`               | Uses CPU-managed page queues ordered by priority and least-recently-used order (LRU).                 |
+| `BlockRadixTree`                  | Shares pages for prefix reuse.                                                                        |
+| `IKvCacheColdPageCodec`           | Converts and copies whole pages between GPU and host/disk formats.                                    |
+| `kv_cache_config.host_cache_size` | Sets the host-memory budget.                                                                          |
+
 
 A page's protection controls what storage management may do:
 
 - **HELD:** keep the data; it may move to another storage level.
 - **LOCKED:** keep the data on GPU. Completion events also prevent reuse before earlier GPU work
-  finishes.
+finishes.
 
 The local `residencyGroup` change lets otherwise-identical layer configurations have separate
 page lifetimes. `setResidencyWindow()` lets a full-history request keep GPU locks for sinks,
@@ -99,8 +90,8 @@ This window API chooses protection from token ranges. Sparse top-K can select sc
 anywhere in history, so it needs a separate operation to find and fetch those selections. That
 operation is proposed in section 3.4.
 
-Sources: [KvCache][cache], [residency rules][residency], [page locks][pages],
-[storage management][storage], and [the codec][codec].
+Sources: [KvCache](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.cpp), [residency rules](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md#internal-sparse-residency), [page locks](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.cpp),
+[storage management](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.cpp), and [the codec](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCodec.h).
 
 ### 2.3 What the existing GPU page table means
 
@@ -109,14 +100,16 @@ lock immediately changes its entry to `-1`. This does not immediately move the b
 
 For example, an old page leaves the residency window and is neither a sink nor writable:
 
-| Stage | Where the bytes are | This request's table entry |
-| --- | --- | --- |
-| Request locks the page | GPU slot 7 | `7` |
-| Request releases the lock and keeps a hold | Still GPU slot 7 | `-1` |
-| Storage later moves the page to host | Host | `-1` |
+
+| Stage                                      | Where the bytes are | This request's table entry |
+| ------------------------------------------ | ------------------- | -------------------------- |
+| Request locks the page                     | GPU slot 7          | `7`                        |
+| Request releases the lock and keeps a hold | Still GPU slot 7    | `-1`                       |
+| Storage later moves the page to host       | Host                | `-1`                       |
+
 
 In this example, `-1` records the released GPU lock; it does not mean the bytes have left GPU.
-The [lock-release code][release-index] writes this value. HiSparse needs a separate mapping for
+The [lock-release code](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.cpp#L397) writes this value. HiSparse needs a separate mapping for
 selected GPU entries, described in section 3.4.
 
 ### 2.4 Local implementation progress
@@ -129,14 +122,18 @@ miss plans. The earlier Triton path remains available for comparison. See step 5
 
 ## 3. Proposed changes
 
+
+
 ### 3.1 Use `residencyGroup` to separate data with different GPU needs
 
 For HiSparse, use this split:
 
-| `residencyGroup` | Data | Where it stays |
-| --- | --- | --- |
-| `0` | Indexer/scoring data and required dense-attention KV | GPU while needed |
-| `1` | Sparse-attention KV, including its scales | Full history on host, with a small GPU cache |
+
+| `residencyGroup` | Data                                                 | Where it stays                               |
+| ---------------- | ---------------------------------------------------- | -------------------------------------------- |
+| `0`              | Indexer/scoring data and required dense-attention KV | GPU while needed                             |
+| `1`              | Sparse-attention KV, including its scales            | Full history on host, with a small GPU cache |
+
 
 **Sparse KV still has a full history.** The difference is where that history is stored.
 Full-history lookup tables stay on GPU.
@@ -145,7 +142,7 @@ Two implementation steps are required:
 
 1. Put indexer data and sparse KV into **separate KVCM layer entries**, each with a unique ID.
 2. Give those entries different `residencyGroup` values so V2 cannot combine them into one page,
-   even when their window and sink settings match.
+  even when their window and sink settings match.
 
 The field applies to every buffer in a layer entry. **It only separates pages.** It does not copy
 data or create a GPU cache; the new storage/cache code does that.
@@ -153,7 +150,7 @@ data or create a GPU cache; the new storage/cache code does that.
 > **KVCM and attention owner review:** confirm each model's split and entry mappings. Check that
 > releasing sparse GPU locks leaves required indexer/dense KV locked.
 
-Sources: [`AttentionLayerConfig`][residency-config] and [the grouping rule][residency-key].
+Sources: `AttentionLayerConfig` and [the grouping rule](cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/lifeCycleRegistry.h#L39).
 
 ### 3.2 Fetch only the selected data
 
@@ -171,6 +168,8 @@ support these small reads.
 
 > **KVCM and attention owner review:** confirm selection IDs, offsets, compressed entries/scales,
 > valid lengths, and shared-prefix mappings.
+
+
 
 ### 3.3 Keep host copies and protect unfinished work
 
@@ -195,9 +194,11 @@ cannot read disk.
 > **KVCM owner review:** confirm copy validity, safe reuse, fixed host addresses, partial pages,
 > shared data, and host/disk exhaustion.
 
+
+
 ### 3.4 Find GPU hits, fetch misses, and give attention its indices
 
-**Use `load_cache_to_device_buffer_kernel` directly behind `ensure_resident`.** It combines these
+**Use** `load_cache_to_device_buffer_kernel` **directly behind** `ensure_resident`**.** It combines these
 operations in one GPU kernel for each layer:
 
 1. Keep selected entries already on GPU.
@@ -218,26 +219,30 @@ CPU page LRU and `batchedLockToGpu()` handle whole pages. They do not implement 
 > **KVCM, attention, and executor owner review:** confirm lookup, replacement, copy ordering,
 > indices, error reporting, and progress when the cache is full.
 
+
+
 ### 3.5 Reuse V2 code and connect the models
 
-**Keep one `KvCache` per request, with separate host-storage and GPU-cache allocators.** Track
+**Keep one** `KvCache` **per request, with separate host-storage and GPU-cache allocators.** Track
 host copies and GPU entries separately; `Page::cacheLevel` alone cannot describe both.
 
 - Reuse V2 allocation, pinned host memory, events, and whole-page backup code.
 - Integrate the HiSparse kernel source and required helpers. Record the upstream revision and
-  preserve its license. Limit changes to the KVCM binding, layouts, and required lifetime checks.
+preserve its license. Limit changes to the KVCM binding, layouts, and required lifetime checks.
 - Keep selection/layout interfaces and KVCM ownership separate from kernel execution.
-  HiSparse handles LRU and transfer together through `ensure_resident`. Eviction and transfer
-  interfaces remain extension points for experiments; they do not require separate GPU launches.
-  This follows the [generalization principle](hisparse_design_principle.md).
+HiSparse handles LRU and transfer together through `ensure_resident`. Eviction and transfer
+interfaces remain extension points for experiments; they do not require separate GPU launches.
+This follows the [generalization principle](hisparse_design_principle.md).
 - Connect `DSACacheManagerV2`, `DeepseekV4CacheManager`, and `MiniMaxM3KVCacheManagerV2` through
-  `sparse/registry.py`, using each model's layout and selection format.
+`sparse/registry.py`, using each model's layout and selection format.
 
 Use the local Triton implementation for correctness comparisons. Measure the integrated HiSparse
 path and tune its launch settings with the same KV format, usable capacity, and protection rules.
 
 > **KVCM, transfer, and attention owner review:** confirm ownership, copy addresses,
 > index-buffer lifetimes, ordering, and the kernel binding.
+
+
 
 ## 4. One decode step
 
@@ -251,7 +256,7 @@ Each layer runs these steps on GPU:
 1. **Write** new KV and scoring data. Wait for prior uses before overwriting a slot.
 2. **Select** the KV to read. IndexShare layers can share a selection but need their own KV.
 3. **Fetch** missing KV with the HiSparse kernel through `ensure_resident`. New KV can use its
-   protected GPU copy while backup is pending.
+  protected GPU copy while backup is pending.
 4. **Run attention** using the returned indices, after the required copies finish.
 
 Copy newly completed KV to host after its writes. This may overlap attention when both read the
@@ -270,9 +275,11 @@ GPU-entry reuse needs stream/event ordering without CPU lock calls per token.
 > **KVCM, attention, and executor owner review:** confirm writes, copies, attention, and reuse
 > stay correctly ordered, including full capacity and side-stream prefetch.
 
-Sources: [DSA selection][dsa] and [page-index conversion][indices].
+Sources: [DSA selection](tensorrt_llm/_torch/attention/backends/sparse/dsa/backend.py) and [page-index conversion](cpp/tensorrt_llm/kernels/convertReqIndexToGlobal.cu).
 
 ## 5. Request lifecycle and memory limits
+
+
 
 ### Prefill and transition to decode
 
@@ -288,14 +295,18 @@ separate prefill work.
 > **KVCM and attention owner review:** confirm prefill capacity, copy completion, and actual
 > release of full-history sparse GPU storage.
 
+
+
 ### Capacity and failure
 
 **Reserve GPU and host memory before admitting a request.**
 
-| Memory | Include in the budget |
-| --- | --- |
-| GPU | Selected cache, HiSparse's extra newest-token storage, indexer/dense KV, sinks/window, writes, mappings, prefill, and temporary copy/prefetch buffers. |
-| Host | History already present and the admitted generation budget. |
+
+| Memory | Include in the budget                                                                                                                                  |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| GPU    | Selected cache, HiSparse's extra newest-token storage, indexer/dense KV, sinks/window, writes, mappings, prefill, and temporary copy/prefetch buffers. |
+| Host   | History already present and the admitted generation budget.                                                                                            |
+
 
 Check further reservations before a step starts. Count each shared allocation once and each
 request-local copy separately. Include pending work; measure allocated memory, not just locked pages.
@@ -307,27 +318,33 @@ executed forward; safe retry needs separate work.
 > **KVCM and scheduler owner review:** confirm reservations, history growth, and cleanup after
 > partial writes or failed copies.
 
+
+
 ### Prefix reuse, suspension, and close
 
 **Requests can share pages while choosing different KV for their GPU caches.** Each request keeps
 its own mapping; selections must not change shared token IDs or committed values.
 
-| Action | Required behavior |
-| --- | --- |
-| Commit | Keep values read-only and preserve pending-copy events. Do not recreate dropped data. |
-| Suspend | Keep references to pages the request still needs. |
-| Close | Release this request's references; other requests or transfers may still need those pages. |
-| Reuse a request slot | Clear its old GPU-cache mappings first. |
+
+| Action               | Required behavior                                                                          |
+| -------------------- | ------------------------------------------------------------------------------------------ |
+| Commit               | Keep values read-only and preserve pending-copy events. Do not recreate dropped data.      |
+| Suspend              | Keep references to pages the request still needs.                                          |
+| Close                | Release this request's references; other requests or transfers may still need those pages. |
+| Reuse a request slot | Clear its old GPU-cache mappings first.                                                    |
+
 
 Memory reuse must wait for pending reads/copies. Full-history sparse KV must remain available
 when unselected; native SWA follows its own window rules.
 
 > **KVCM owner review:** confirm shared-page identity, commit rules, and page/GPU-copy lifetimes.
 
+
+
 ### Optional disaggregated serving
 
 **Exchange all history the destination needs, including unselected sparse KV.** Extend the
-[disaggregation adapter][disagg] to support host addresses:
+[disaggregation adapter](tensorrt_llm/_torch/disaggregation/resource/cache_reuse.py) to support host addresses:
 
 1. Send or receive sparse history in host memory; put required indexer/dense data on GPU.
 2. If a transport needs staging, transfer chunks through a fixed-size temporary buffer.
@@ -339,9 +356,11 @@ Validate NIXL/UCX/MPI support and limits. Local prefill/decode must also work wi
 > **KVCM and disaggregation owner review:** confirm addresses, memory registration, completion
 > tracking, and staging limits for each supported transport.
 
+
+
 ### Configuration and defaults
 
-**Reuse `host_cache_size` and the model's selection settings.** Add feature enablement and a
+**Reuse** `host_cache_size` **and the model's selection settings.** Add feature enablement and a
 GPU-cache budget if existing settings do not cover them.
 
 Define the budget's units, whether it is per request or shared, and space for writes and other
@@ -355,19 +374,21 @@ unless a user setting is needed. New public settings need the review listed in s
 The eight directions below, including direct use of the HiSparse kernel, are agreed. Exact APIs,
 model layouts, budget scope, and integration review remain open.
 
-| # | Decision | Agreed direction | Remaining review and checks |
-| --- | --- | --- | --- |
-| 1 | Residency groups | Keep indexer/required dense KV and lookup tables on GPU; use a separate bounded GPU cache for sparse KV. | Model buffer split, sinks/window, and writable data. |
-| 2 | Transfer size | Fetch selected tokens or compressed entries; allocate pages where useful. | Offsets/scales and bytes copied for scattered selections. |
-| 3 | Host copies | Keep host copies; replace GPU copies only when host data is valid and protected uses finish. | Copy validity, writes, stable addresses, uncommitted KV, and host exhaustion. |
-| 4 | Execution and graphs | Run model selection on GPU, then the HiSparse fused lookup/LRU/refetch kernel with preallocated buffers. | Changed selections, full capacity, ordering, and no per-layer CPU allocation/sync. |
-| 5 | Lifecycle API | Keep `KvCache`, separate host/GPU-cache components, and policy extension points; call HiSparse through `ensure_resident`. | Resume, suspend, commit, close, ownership, and fused execution. |
-| 6 | Capacity and failures | Reserve GPU/host space before admitting work; clean up safely on unexpected failure. | All memory costs and partial-write failures; retry needs separate work. |
-| 7 | Disaggregation | Prefer direct host transfers; use bounded staging as needed. Keep it optional. | Supported transports, address lifetimes, large histories, and local prefill/decode. |
-| 8 | Configuration and kernels | Use `load_cache_to_device_buffer_kernel` directly. Reuse host/top-K settings; add enablement and GPU budget as needed. | KVCM bindings/layouts, newest-token space, model support, and launch tuning. |
 
-SGLang's [HiSparse kernel][hisparse-kernel] is the chosen GPU implementation. Its
-[coordinator][hisparse-coordinator] is the integration reference for retained host copies,
+| #   | Decision                  | Agreed direction                                                                                                          | Remaining review and checks                                                         |
+| --- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| 1   | Residency groups          | Keep indexer/required dense KV and lookup tables on GPU; use a separate bounded GPU cache for sparse KV.                  | Model buffer split, sinks/window, and writable data.                                |
+| 2   | Transfer size             | Fetch selected tokens or compressed entries; allocate pages where useful.                                                 | Offsets/scales and bytes copied for scattered selections.                           |
+| 3   | Host copies               | Keep host copies; replace GPU copies only when host data is valid and protected uses finish.                              | Copy validity, writes, stable addresses, uncommitted KV, and host exhaustion.       |
+| 4   | Execution and graphs      | Run model selection on GPU, then the HiSparse fused lookup/LRU/refetch kernel with preallocated buffers.                  | Changed selections, full capacity, ordering, and no per-layer CPU allocation/sync.  |
+| 5   | Lifecycle API             | Keep `KvCache`, separate host/GPU-cache components, and policy extension points; call HiSparse through `ensure_resident`. | Resume, suspend, commit, close, ownership, and fused execution.                     |
+| 6   | Capacity and failures     | Reserve GPU/host space before admitting work; clean up safely on unexpected failure.                                      | All memory costs and partial-write failures; retry needs separate work.             |
+| 7   | Disaggregation            | Prefer direct host transfers; use bounded staging as needed. Keep it optional.                                            | Supported transports, address lifetimes, large histories, and local prefill/decode. |
+| 8   | Configuration and kernels | Use `load_cache_to_device_buffer_kernel` directly. Reuse host/top-K settings; add enablement and GPU budget as needed.    | KVCM bindings/layouts, newest-token space, model support, and launch tuning.        |
+
+
+SGLang's [HiSparse kernel](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/kvcacheio/hisparse.cuh) is the chosen GPU implementation. Its
+[coordinator](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/hisparse_coordinator.py) is the integration reference for retained host copies,
 the small GPU cache, and graph execution. See also the [HiSparse paper](https://arxiv.org/abs/2608.07009).
 Its [documented deployment](https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/hisparse_guide.mdx)
 uses a disaggregated decode instance with radix caching disabled. Our prefix reuse and local
@@ -379,41 +400,22 @@ telemetry/privacy CODEOWNER review. Leave room for future speculative steps; MTP
 
 ## 7. Validation and deliverables
 
-| Area | Required checks |
-| --- | --- |
-| Correctness | Match each GPU-only sparse baseline's selections and output tolerance. Physical indices may differ. |
-| Kernel integration | Test the actual HiSparse kernel with KVCM host handles, model layouts/scales, short-sequence initialization, newest-token storage, and required protection/error checks. |
-| Transfers | Page boundaries, compressed entries/scales, duplicate/invalid/empty selections, partial entries, and extra bytes from scattered top-K. |
-| Host copies | Pending copies, writes, uncommitted KV, repeated fetches, and GPU replacement without another GPU-to-host copy. |
-| Full capacity | All hits/misses, overlap, and completely different selections with protected writes, sinks/window, prefetch, and delayed work. |
-| CUDA graphs | Changed selections/request IDs across same-shape replays, padding, stable buffers/host addresses, side streams, shared-plan validity, and the `nvbugs/6018172` mapping case. |
-| Lifetimes and sharing | Commit, suspend/resume, close, prefix reuse on/off, different selections over shared pages, reused request slots, and cleanup. |
-| Prefill | Host-copy readiness, actual release/shrink of full-history GPU storage, and the separate prefill peak. |
-| Disaggregation | Full required history larger than decode sparse-cache capacity, bounded staging, concurrent transfers, prefix reuse, and destination readiness. |
-| Failures | GPU/host exhaustion, supported disk-restore errors, rejected copy submissions, partial writes, shared-data protection, and cleanup. |
-| Memory/performance | Measure integrated HiSparse latency, throughput, and transfer bytes across batch sizes and miss rates. Count all GPU/host storage, including newest-token space and metadata. Compare with reference timings and check for leaks. |
+
+| Area                  | Required checks                                                                                                                                                                                                                   |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Correctness           | Match each GPU-only sparse baseline's selections and output tolerance. Physical indices may differ.                                                                                                                               |
+| Kernel integration    | Test the actual HiSparse kernel with KVCM host handles, model layouts/scales, short-sequence initialization, newest-token storage, and required protection/error checks.                                                          |
+| Transfers             | Page boundaries, compressed entries/scales, duplicate/invalid/empty selections, partial entries, and extra bytes from scattered top-K.                                                                                            |
+| Host copies           | Pending copies, writes, uncommitted KV, repeated fetches, and GPU replacement without another GPU-to-host copy.                                                                                                                   |
+| Full capacity         | All hits/misses, overlap, and completely different selections with protected writes, sinks/window, prefetch, and delayed work.                                                                                                    |
+| CUDA graphs           | Changed selections/request IDs across same-shape replays, padding, stable buffers/host addresses, side streams, shared-plan validity, and the `nvbugs/6018172` mapping case.                                                      |
+| Lifetimes and sharing | Commit, suspend/resume, close, prefix reuse on/off, different selections over shared pages, reused request slots, and cleanup.                                                                                                    |
+| Prefill               | Host-copy readiness, actual release/shrink of full-history GPU storage, and the separate prefill peak.                                                                                                                            |
+| Disaggregation        | Full required history larger than decode sparse-cache capacity, bounded staging, concurrent transfers, prefix reuse, and destination readiness.                                                                                   |
+| Failures              | GPU/host exhaustion, supported disk-restore errors, rejected copy submissions, partial writes, shared-data protection, and cleanup.                                                                                               |
+| Memory/performance    | Measure integrated HiSparse latency, throughput, and transfer bytes across batch sizes and miss rates. Count all GPU/host storage, including newest-token space and metadata. Compare with reference timings and check for leaks. |
+
 
 Deliver reviewed ownership and lifecycle rules, selection/transfer APIs, reservations and cleanup,
 model layouts, and graph/performance results. Document codec changes and supported combinations.
 Keep [HiSparse.md](HiSparse.md) aligned with those results.
-
-[cache]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.cpp
-[pages]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.cpp
-[storage]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.cpp
-[codec]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCodec.h
-[residency]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md#internal-sparse-residency
-[dsa-cache]: tensorrt_llm/_torch/attention/backends/sparse/dsa/cache_manager.py#L538
-[minimax-cache]: tensorrt_llm/_torch/attention/backends/sparse/minimax_m3/cache_manager.py#L235
-[dsv4-cache]: tensorrt_llm/_torch/attention/backends/sparse/deepseek_v4/cache_manager.py#L928
-[disagg]: tensorrt_llm/_torch/disaggregation/resource/cache_reuse.py
-[dsa]: tensorrt_llm/_torch/attention/backends/sparse/dsa/backend.py
-[indices]: cpp/tensorrt_llm/kernels/convertReqIndexToGlobal.cu
-[release-index]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.cpp#L397
-[slot-layout]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/config.h#L101
-[slot-size]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h#L172
-[page-type]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/page.h#L43
-[block-pages]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h#L72
-[residency-config]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h#L139
-[residency-key]: cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/lifeCycleRegistry.h#L39
-[hisparse-kernel]: https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/kvcacheio/hisparse.cuh
-[hisparse-coordinator]: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/hisparse_coordinator.py
