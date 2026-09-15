@@ -125,6 +125,7 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
         self.metadata.workspace.resize_(16384)
         self.report_forward(4096)
         self.metadata.is_cuda_graph = True
+        self.metadata.cuda_graph_workspace = torch.empty(4096, dtype=torch.uint8)
         graph_tensor = self.metadata.cuda_graph_workspace
         with self.reclaimer.forward(self.metadata):
             self.assertEqual(self.metadata.workspace.numel(), 4096)

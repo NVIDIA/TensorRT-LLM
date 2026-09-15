@@ -36,8 +36,10 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.reclaimer_class = reclaimer_patch.start()
         self.addCleanup(reclaimer_patch.stop)
 
-    def freeze(self) -> None:
-        with patch.object(self.engine, "_is_encoder_decoder_model", return_value=False):
+    def freeze(self, *, is_encoder_decoder: bool = False) -> None:
+        with patch.object(
+            self.engine, "_is_encoder_decoder_model", return_value=is_encoder_decoder
+        ):
             self.engine._freeze_eager_workspace_floor()
 
     def call(self) -> int:
@@ -72,6 +74,9 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
+        self.freeze(is_encoder_decoder=True)
+        self.assertIsNone(self.engine._eager_workspace_reclaimer)
+        self.reclaimer_class.assert_not_called()
         for name, value in [
             ("is_spec_decode", True),
             ("_torch_compile_backend", object()),
