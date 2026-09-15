@@ -122,6 +122,8 @@ def _make_cache_config_for_test(
     num_extra_kv_tokens: int = 0,
     max_attention_window_vec: list[int | None] | None = None,
     pp_layers: list[int] | None = None,
+    dtype: DataType = DataType.HALF,
+    kv_cache_type: CacheType = CacheType.SELFKONLY,
 ) -> KVCacheManagerConfig:
     if max_attention_window_vec is None:
         max_attention_window_vec = [None]
@@ -130,8 +132,8 @@ def _make_cache_config_for_test(
     assert len(max_attention_window_vec) == len(pp_layers)
 
     cache_manager = object.__new__(KVCacheManagerV2)
-    cache_manager.kv_cache_type = CacheType.SELFKONLY
-    cache_manager.dtype = DataType.HALF
+    cache_manager.kv_cache_type = kv_cache_type
+    cache_manager.dtype = dtype
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
@@ -293,6 +295,33 @@ def test_base_config_uses_local_attention_window_order() -> None:
         128,
         None,
     ]
+
+
+@pytest.mark.parametrize("kv_cache_type", [CacheType.SELF, CacheType.SELFKONLY])
+@pytest.mark.parametrize(
+    "kv_cache_dtype,dtype,has_block_scales",
+    [
+        pytest.param("auto", DataType.NVFP4, True, id="checkpoint-nvfp4"),
+        pytest.param("nvfp4", DataType.NVFP4, True, id="explicit-nvfp4"),
+        pytest.param("auto", DataType.HALF, False, id="unquantized"),
+        pytest.param("nvfp4", DataType.FP8, False, id="fp8-fallback"),
+    ],
+)
+def test_base_config_scale_buffers_follow_resolved_dtype(
+    kv_cache_dtype: str, dtype: DataType, has_block_scales: bool, kv_cache_type: CacheType
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(dtype=kv_cache_dtype), dtype=dtype, kv_cache_type=kv_cache_type
+    )
+
+    expected_roles = {Role.KEY}
+    if has_block_scales:
+        expected_roles.add(Role.KEY_BLOCK_SCALE)
+    if kv_cache_type == CacheType.SELF:
+        expected_roles.add(Role.VALUE)
+        if has_block_scales:
+            expected_roles.add(Role.VALUE_BLOCK_SCALE)
+    assert {buffer.role for buffer in config.layers[0].buffers} == expected_roles
 
 
 @pytest.mark.parametrize(
