@@ -506,6 +506,49 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     return stats;
 }
 
+TypedVec<PoolGroupIndex, StorageStatistics> KvCacheManager::getStorageStatistics(CacheLevel cacheLevel) const
+{
+    auto const apiLock = lockShared();
+    TypedVec<PoolGroupIndex, StorageStatistics> result;
+    PoolGroupIndex const numPoolGroups = mStorage->numPoolGroups(cacheLevel);
+    result.reserve(numPoolGroups);
+    for (PoolGroupIndex poolGroup{0}; poolGroup < numPoolGroups; ++poolGroup)
+    {
+        result.push_back(mStorage->getStatistics(cacheLevel, poolGroup));
+    }
+    return result;
+}
+
+TypedVec<LifeCycleId, PoolGroupIndex> KvCacheManager::getLifeCyclePoolGroupIndices(CacheLevel cacheLevel) const
+{
+    TypedVec<LifeCycleId, PoolGroupIndex> result;
+    result.reserve(mLifeCycles.size());
+    for (LifeCycleId lifeCycle{0}; lifeCycle < mLifeCycles.size(); ++lifeCycle)
+    {
+        result.push_back(mStorage->getPoolGroupIndex(cacheLevel, lifeCycle));
+    }
+    return result;
+}
+
+void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, byLevel] : byLifeCycle)
+    {
+        if (!byLevel.empty())
+        {
+            mIterReusedBlocksByLevel[lifeCycle].add(byLevel);
+        }
+    }
+}
+
+ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksByLevel()
+{
+    auto const apiLock = lockExclusive();
+    ReusedBlocksByLevelByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterReusedBlocksByLevel);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     auto const apiLock = lockExclusive();
@@ -524,6 +567,42 @@ void KvCacheManager::recordRequestResumed()
         return;
     }
     ++mIterResumedRequests;
+}
+
+void KvCacheManager::recordDiskPrefetchBlocks(int64_t numBlocks)
+{
+    TLLM_CHECK_DEBUG(numBlocks >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterDiskPrefetchBlocks += numBlocks;
+}
+
+int64_t KvCacheManager::getAndResetIterationDiskPrefetchBlocks()
+{
+    auto const apiLock = lockExclusive();
+    auto const numBlocks = mIterDiskPrefetchBlocks;
+    mIterDiskPrefetchBlocks = 0;
+    return numBlocks;
+}
+
+void KvCacheManager::commitCachedTokensByLevel(CountsByLevel const& counts)
+{
+    TLLM_CHECK_DEBUG(std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count >= 0; }));
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    addCountsByLevel(mIterCachedTokensByLevel, counts);
+}
+
+CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
+{
+    auto const apiLock = lockExclusive();
+    CountsByLevel counts;
+    std::swap(counts, mIterCachedTokensByLevel);
+    return counts;
 }
 
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
@@ -595,6 +674,15 @@ PeakBlockStatsByPoolGroup KvCacheManager::getAndResetIterationPeakBlockStats(Cac
     _updateIterationPeakNumBlocks();
     PeakBlockStatsByPoolGroup peak = mIterationPeakNumBlocksByCacheLevel.at(cacheLevel);
     _resetIterationPeakNumBlocks(cacheLevel);
+    return peak;
+}
+
+PeakBlockStatsByCacheLevel KvCacheManager::getAndResetIterationPeakBlockStatsByLevel()
+{
+    auto const apiLock = lockExclusive();
+    _updateIterationPeakNumBlocks();
+    PeakBlockStatsByCacheLevel peak = mIterationPeakNumBlocksByCacheLevel;
+    _resetIterationPeakNumBlocks();
     return peak;
 }
 

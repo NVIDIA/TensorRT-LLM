@@ -121,6 +121,23 @@ def close_test_block(block: Any) -> None:
     block.close()
 
 
+def set_test_block_page_cache_level(block: Any, life_cycle_id: int, cache_level: int) -> None:
+    """Set synthetic page residency for attribution tests."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        cpp_introspection.set_test_block_page_cache_level(block, life_cycle_id, cache_level)
+        return
+
+    from ._common import CacheLevel
+
+    page = next((page for page in block.pages if page.life_cycle == life_cycle_id), None)
+    if page is None:
+        raise ValueError(f"test block has no page for life cycle {life_cycle_id}")
+    if page.scheduled_for_eviction:
+        page.manager.exclude_from_eviction(page)
+    page.cache_level = CacheLevel(cache_level)
+
+
 def test_block_key(block: Any) -> bytes:
     """Return a test block real radix-tree key."""
     cpp_introspection = _cpp_introspection_module()
@@ -279,14 +296,6 @@ def force_rebalance_precondition(manager: Any, skew: float = 2.0) -> None:
     set_target_ratio_list_gpu(manager, [x / total for x in skewed])
 
 
-def storage_statistics(manager: Any, cache_level: int = 0) -> list[Any]:
-    """Return storage statistics by pool group for a cache level."""
-    cpp_introspection = _cpp_introspection_module()
-    if cpp_introspection is not None:
-        return list(cpp_introspection.storage_statistics(manager, cache_level))
-    return list(manager._storage.get_statistics(cache_level))
-
-
 def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     """Return storage utilization by pool group for a cache level."""
     cpp_introspection = _cpp_introspection_module()
@@ -435,30 +444,6 @@ def reuse_match_planned_drop_counts(
         page = block.get_page(lc_id)
         counts.append(None if page is None else page.planned_drop_count)
     return match.num_tokens, counts
-
-
-def pool_group_index(manager: Any, lc_id: int, cache_level: int = 0) -> int:
-    """Return a lifecycle storage pool-group index at ``cache_level``."""
-    cpp_introspection = _cpp_introspection_module()
-    if cpp_introspection is not None:
-        return cpp_introspection.pool_group_index(manager, lc_id, cache_level)
-    # The Python backend currently uses the hot lifecycle grouping at every level.
-    return manager._storage.get_pool_group_index(lc_id)
-
-
-def life_cycle_pool_group_indices(manager: Any, cache_level: int = 0) -> list[int]:
-    """Return the pool-group index of every lifecycle at ``cache_level``, indexed by lifecycle ID.
-
-    Cold levels group lifecycles by encoded cold-page size, so their pool-group indices and counts are
-    unrelated to the hot ones. Callers that aggregate level-specific data must translate through this
-    mapping rather than reusing hot pool-group indices.
-    """
-    cpp_introspection = _cpp_introspection_module()
-    if cpp_introspection is not None:
-        return list(cpp_introspection.life_cycle_pool_group_indices(manager, cache_level))
-    # The Python backend currently uses the hot lifecycle grouping at every level.
-    storage = manager._storage
-    return [storage.get_pool_group_index(lc_id) for lc_id in range(storage.num_life_cycles)]
 
 
 def compute_slots_for_batch(

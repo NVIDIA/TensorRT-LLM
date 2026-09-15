@@ -94,13 +94,16 @@ if _BACKEND == "python":
     from ._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
+        CountsByLevel,
         KVCacheIterationStatsDelta,
         KVCacheStatsDelta,
+        ReusedBlocksByLevel,
         SsmSnapshotIterationStatsDelta,
     )
     from ._storage import BufferId  # noqa: F401
     from ._storage._config import CoalescedBuffer, SlotDesc, SlotDescVariant  # noqa: F401
     from ._storage._core import PoolGroupIndex, PoolIndex  # noqa: F401
+    from ._storage_manager import StorageStatistics  # noqa: F401
     from ._utils import HalfOpenRange, exact_div, typed_range  # noqa: F401
 
     _cpp_introspection = None
@@ -219,6 +222,7 @@ else:
     SlotDesc = _cpp.SlotDesc
     SlotDescVariant = _cpp.SlotDescVariant
     SsmLayerConfig = _cpp.SsmLayerConfig
+    StorageStatistics = _cpp.StorageStatistics
     _KVCache = _cpp._KVCache
     _cpp_introspection = getattr(_cpp, "_introspection", None)
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
@@ -233,6 +237,7 @@ else:
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
+    ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
     UniqueToken = _cpp.UniqueToken
 
@@ -348,6 +353,7 @@ __all__ = [
     "ReuseScope",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",
+    "ReusedBlocksByLevel",
     "KVCacheStatsDelta",
     "SsmSnapshotIterationStatsDelta",
     "SlidingWindowSize",
