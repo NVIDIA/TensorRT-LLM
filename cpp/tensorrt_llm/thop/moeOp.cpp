@@ -373,12 +373,12 @@ public:
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
         torch::optional<torch::Tensor> const& input_sf, bool const swizzled_input_sf,
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
-        torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu, int64_t const tp_size,
-        int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
-        int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids, torch::optional<int64_t> const& activation_type,
-        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
-        torch::optional<torch::Tensor> const& out_tensor, bool use_dynamic_fc2_scale = false,
+        torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
+        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
+        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor,
+        bool use_dynamic_fc2_scale = false,
         // Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
         // Each *_ranks   : CPU int32  [num_seqs]
         // Each *_weights : CPU int64  [num_seqs, 3], holding (A_ptr, B_ptr, DoRA_ptr); DoRA unused.
@@ -402,7 +402,8 @@ public:
         torch::optional<torch::Tensor> const& fc2_slot_lora_weight_ptrs = torch::nullopt,
         torch::optional<torch::Tensor> const& gated_slot_lora_ranks = torch::nullopt,
         torch::optional<torch::Tensor> const& gated_slot_lora_weight_ptrs = torch::nullopt,
-        torch::optional<torch::Tensor> const& token_to_slot = torch::nullopt)
+        torch::optional<torch::Tensor> const& token_to_slot = torch::nullopt,
+        bool const swiglu_clamp_after_silu = false)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -731,12 +732,12 @@ public:
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
         torch::optional<torch::Tensor> const& input_sf, bool const swizzled_input_sf,
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
-        torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu, int64_t const tp_size,
-        int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
-        int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids, torch::optional<int64_t> const& activation_type,
-        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
-        torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
+        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
+        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor,
+        bool const swiglu_clamp_after_silu = false)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 

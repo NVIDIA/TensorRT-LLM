@@ -793,7 +793,11 @@ class Step3p7MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             activation=SwigluActivation(
                 clamp=self._routed_swiglu_limit,
-                clamp_after_silu=self._routed_swiglu_limit is not None,
+                # Clamp-active layers use the Python reference path unless
+                # routed-expert LoRA requires the fused CUTLASS path. Only the
+                # latter backend execution needs to advertise this mode to the
+                # resolver; the Python path applies the same order directly.
+                clamp_after_silu=(self._routed_swiglu_limit is not None and self._moe_lora_enabled),
             ),
         )
 
