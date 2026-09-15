@@ -1250,6 +1250,7 @@ def test_kv_cache_manager_v2_pair_rolls_back_both_pools_on_draft_failure() -> No
 def test_prepare_draft_generation_does_not_resize_after_joint_admission() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
     kv_cache = Mock(is_active=True)
     manager.kv_cache_map = {17: kv_cache}
     request = SimpleNamespace(
@@ -1269,6 +1270,7 @@ def test_prepare_draft_generation_does_not_resize_after_joint_admission() -> Non
 def test_prepare_draft_generation_resizes_deferred_disagg_first_pass() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.is_draft = True
+    manager.enable_joint_kv_cache_reuse = False
     kv_cache = Mock(is_active=True, capacity=128)
     kv_cache.resize.return_value = True
     manager.kv_cache_map = {19: kv_cache}
