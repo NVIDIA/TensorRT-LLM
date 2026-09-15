@@ -868,6 +868,17 @@ def update_spec_config_from_model_config(spec_config,
     if not spec_config.use_dynamic_tree:
         spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
+    # Vanilla MTP opts out of dynamic draft length (support_dynamic_draft_len):
+    # running only mtp_layers[:runtime_draft_len] would leave the other modules'
+    # KV cache stale. The mode is only known once the checkpoint resolved it.
+    if is_vanilla and spec_config.max_draft_len > 1 and (
+            spec_config.draft_len_schedule is not None
+            or spec_config.max_concurrency is not None):
+        logger.warning(
+            "MTP: draft_len_schedule / max_concurrency are ignored for vanilla "
+            f"MTP with {spec_config.max_draft_len} MTP modules; speculation "
+            "stays at max_draft_len. Use MTP-Eagle for dynamic draft lengths.")
+
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:
     """Populate spec config fields from loaded target and draft model configs."""
@@ -894,7 +905,9 @@ class SpecDecodingTensor:
 
 
 def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
-                                 batch_size: int, max_draft_len: int) -> int:
+                                 batch_size: int,
+                                 max_draft_len: int,
+                                 min_draft_len: int = 0) -> int:
     """
     Get the appropriate draft length for the given batch size using binary search.
 
@@ -910,9 +923,11 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
                             - batch size 1-4:   use draft_len=4 (up to key 4)
                             - batch size 5-8:   use draft_len=2 (up to key 8)
                             - batch size 9-32:  use draft_len=1 (up to key 32)
-                            - batch size 33+:   use draft_len=0 (speculation disabled, implicit)
+                            - batch size 33+:   use draft_len=0 (implicit)
         batch_size: Current batch size.
         max_draft_len: Maximum draft length to use if no schedule is provided.
+        min_draft_len: Floor for the resolved draft length, the implicit tier
+                       included (DecodingBaseConfig.min_runtime_draft_len).
 
     Returns:
         The draft length to use for this batch size.
@@ -929,7 +944,7 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     idx = bisect_left(schedule_batch_sizes, batch_size)
 
     if idx < len(schedule_batch_sizes):
-        return draft_len_schedule[schedule_batch_sizes[idx]]
+        return max(draft_len_schedule[schedule_batch_sizes[idx]], min_draft_len)
 
-    # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
-    return 0
+    # batch_size > all batch sizes in draft_len_schedule: implicit 0, floored
+    return min_draft_len

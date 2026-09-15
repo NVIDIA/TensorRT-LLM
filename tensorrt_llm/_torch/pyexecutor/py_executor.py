@@ -583,6 +583,8 @@ class PyExecutor:
         # disable.
         self.speculation_permanently_disabled = False
         self.speculation_gate = None
+        # Draft length resolved by the previous _handle_dynamic_draft_len call.
+        self._last_runtime_draft_len = 0
         spec_config = getattr(self.model_engine, 'spec_config', None)
         if spec_config is not None:
             window = getattr(spec_config, 'acceptance_rate_window_size', None)
@@ -3382,20 +3384,26 @@ class PyExecutor:
             # 1. Resolve runtime draft length from schedule
             runtime_draft_len = get_draft_len_for_batch_size(
                 self.model_engine.spec_config.draft_len_schedule,
-                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+                scheduled_batch.batch_size, self.model_engine.max_draft_len,
+                self.model_engine.spec_config.min_runtime_draft_len)
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             rejection_on = getattr(self.model_engine.spec_config,
                                    "use_rejection_sampling", False)
+            # One-model rejection: the drafter scattered draft_probs rows
+            # [0, K_prev) last iteration, so when K rises the rows [K_prev, K)
+            # are stale and _prepare_tp_inputs one-hots them. K_prev is the
+            # previous resolution, not len(py_draft_tokens), which lags one
+            # iteration under the overlap scheduler.
+            onehot_start = min(self._last_runtime_draft_len, runtime_draft_len)
             for request in scheduled_batch.generation_requests:
                 current_num_draft_tokens = len(request.py_draft_tokens)
-                # One-model rejection: a gen request entering with 0 real draft
-                # tokens produced no draft-prob scatter for its slot last iter,
-                # so next iter's rejection kernel would read a stale draft_probs
-                # row. Mark it (pre-pad signal) so _prepare_tp_inputs writes a
-                # one-hot placeholder row after spec_metadata.prepare().
-                request.py_needs_onehot_draft_probs |= (
-                    rejection_on and current_num_draft_tokens == 0)
+                if request.py_needs_onehot_draft_probs:
+                    # Whole row: flagged by _prepare_and_schedule_batch.
+                    request.py_onehot_draft_probs_start = 0
+                elif rejection_on and onehot_start < runtime_draft_len:
+                    request.py_needs_onehot_draft_probs = True
+                    request.py_onehot_draft_probs_start = onehot_start
                 if spec_dec_mode.is_pard():
                     # special case: PARD carries 2K-1 draft tokens per request
                     runtime_draft_token_buffer_width = (
@@ -3424,6 +3432,7 @@ class PyExecutor:
                                                                           runtime_draft_len]
 
             self.model_engine.runtime_draft_len = runtime_draft_len
+            self._last_runtime_draft_len = runtime_draft_len
         else:
             # Linear-tree modes (incl. PARD) use logical K; tree decoding
             # (e.g. EAGLE3 dynamic tree) uses total tree tokens. Same

@@ -1968,9 +1968,11 @@ class DecodingBaseConfig(StrictBaseModel):
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
-        "When specified (>0), speculation will be disabled at batch sizes above this value. Otherwise, "
-        "speculation will always be on. PyTorch backend only. "
-        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly supports max concurrency control."
+        "When specified (>0), speculation is reduced at batch sizes above this value to the shortest "
+        "draft length the algorithm sustains (min_runtime_draft_len: 1 for one-model speculation, whose "
+        "drafter state would go stale otherwise, else 0). Otherwise, speculation will always be on. "
+        "PyTorch backend only. "
+        "Mutually exclusive with draft_len_schedule since draft_len_schedule implicitly supports max concurrency control."
     )
 
     draft_len_schedule: Optional[dict[int, int]] = Field(
@@ -1982,7 +1984,8 @@ class DecodingBaseConfig(StrictBaseModel):
         " - Batch sizes 1-4:   use draft_len=4"
         " - Batch sizes 5-8:   use draft_len=2"
         " - Batch sizes 9-32:  use draft_len=1"
-        " - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). "
+        " - Batch sizes 33+:   use draft_len=0 (implicit). "
+        "Resolved draft lengths are floored at min_runtime_draft_len (1 for one-model speculation). "
         "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
     )
 
@@ -2200,6 +2203,19 @@ class DecodingBaseConfig(StrictBaseModel):
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
+
+    @property
+    def min_runtime_draft_len(self) -> int:
+        """Floor for draft lengths resolved from ``draft_len_schedule``.
+
+        A one-engine drafter's state (draft KV cache, hidden-state pools) is
+        only written by the draft forward; at draft length 0 it goes stale while
+        the target keeps committing tokens, so it never drops below 1. Stateless
+        drafters (NGram, user-provided) and a drafter attending over the target's
+        own KV cache need no floor.
+        """
+        one_engine = self.spec_dec_mode.use_one_engine()
+        return 1 if one_engine and not self._use_shared_kv_cache else 0
 
     @functools.cached_property
     def is_linear_tree(self) -> bool:
