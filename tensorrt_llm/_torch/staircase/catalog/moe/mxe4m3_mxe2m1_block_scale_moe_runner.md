@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 19}
+  sm_103: {status: passed, tests: 19}
 ---
 
 # mxe4m3_mxe2m1_block_scale_moe_runner

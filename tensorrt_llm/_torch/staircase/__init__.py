@@ -29,17 +29,21 @@ in the built-in static index would fail its staleness assertion.
 """
 
 from ._router_index import (
+    ROUTING_BACKENDS,
     STAIRCASE_ENV,
     STAIRCASE_ROUTERS,
     StaircaseContext,
     StaircaseMode,
+    assert_backend_can_route,
     staircase_resolve,
 )
 
 __all__ = [
+    "ROUTING_BACKENDS",
     "STAIRCASE_ENV",
     "STAIRCASE_ROUTERS",
     "StaircaseContext",
     "StaircaseMode",
+    "assert_backend_can_route",
     "staircase_resolve",
 ]

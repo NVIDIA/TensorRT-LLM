@@ -209,10 +209,19 @@ def test_an_unrouted_architecture_raises_under_require(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "raw,expected", [("off", "off"), ("AUTO", "auto"), (" require ", "require"), ("", "off")]
+    "raw,expected",
+    [(None, "off"), ("off", "off"), ("AUTO", "auto"), (" require ", "require"), ("", "off")],
 )
 def test_the_env_var_is_read_leniently(monkeypatch, raw, expected):
-    monkeypatch.setenv(STAIRCASE_ENV, raw)
+    """``None`` is the unset case, and it is the one that must never drift.
+
+    Everything in the accuracy suite rests on staircase being opt-in: unset has
+    to read as off on the code path the engine actually takes.
+    """
+    if raw is None:
+        monkeypatch.delenv(STAIRCASE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(STAIRCASE_ENV, raw)
     assert StaircaseMode.from_env().value == expected
 
 

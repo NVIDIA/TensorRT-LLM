@@ -59,6 +59,13 @@ STAIRCASE_ROUTERS = {
     "DeepseekV3ForCausalLM": "models.deepseek_v3.routing",
 }
 
+#: Backends whose model construction reaches ``staircase_resolve``. The
+#: resolver is called from ``AutoModelForCausalLM._resolve_class``, so a
+#: backend that builds its model some other way never consults it -- AutoDeploy
+#: goes through ``ADEngine.build_from_config`` and nothing under
+#: ``_torch/auto_deploy/`` mentions staircase at all.
+ROUTING_BACKENDS = frozenset({"pytorch"})
+
 
 class StaircaseMode(str, enum.Enum):
     """What to do when a config reaches the staircase resolver."""
@@ -90,6 +97,32 @@ class StaircaseMode(str, enum.Enum):
             ) from None
 
 
+def assert_backend_can_route(backend: str) -> None:
+    """Refuse ``require`` on a backend that never reaches the resolver.
+
+    ``require`` is a promise that the run measured a staircase target. A
+    backend outside ``ROUTING_BACKENDS`` cannot keep it: nothing raises,
+    nothing routes, and the run reports another implementation's numbers as
+    the target's. That is the same misattribution ``from_env`` already refuses
+    for a typo'd value, arriving by a different door.
+
+    ``auto`` is left alone on purpose -- it licenses the non-staircase path by
+    definition, so taking it is the documented outcome rather than a silent
+    one.
+    """
+    if StaircaseMode.from_env() is not StaircaseMode.REQUIRE:
+        return
+    if backend in ROUTING_BACKENDS:
+        return
+    raise ValueError(
+        f"{STAIRCASE_ENV}=require, but the {backend!r} backend never reaches "
+        f"the staircase resolver, so no target can be selected and nothing "
+        f"would report that. Backends that route: "
+        f"{', '.join(sorted(ROUTING_BACKENDS))}. Use one of those, or unset "
+        f"{STAIRCASE_ENV}."
+    )
+
+
 @dataclass(frozen=True)
 class StaircaseContext:
     """Everything a routing decision is allowed to depend on.
@@ -104,8 +137,8 @@ class StaircaseContext:
 
     That is a necessary condition, not a sufficient one. ``max_num_tokens``
     and ``cuda_graph_config.max_batch_size`` are per-instance constants too,
-    but they are tuning knobs: they belong in a ``configs/`` variant. Only an
-    instance constant that changes the *structure of the forward* earns a
+    but they are tuning knobs: they are LLM API arguments, not identity. Only
+    an instance constant that changes the *structure of the forward* earns a
     target of its own.
 
     ``is_disagg`` is declared but **not yet plumbed**: nothing sets it on
@@ -127,17 +160,29 @@ class StaircaseContext:
     is_disagg: bool
 
     @classmethod
-    def from_model_config(cls, config: "ModelConfig") -> "StaircaseContext":
-        import torch
+    def from_model_config(
+        cls, config: "ModelConfig", sm: Optional[Tuple[int, int]] = None
+    ) -> "StaircaseContext":
+        """Build the context the resolver routes on.
 
-        assert torch.cuda.is_available(), (
-            "staircase routes on the SM version of the device it will run on; "
-            "no CUDA device is visible"
-        )
+        ``sm`` defaults to the device this process will run on, which is what
+        the engine wants. ``explain`` passes it explicitly so a configuration
+        can be explained from a host with no GPU -- every other field it reads
+        off the same ``ModelConfig`` the engine built, rather than restating
+        one, so the two cannot disagree about what a checkpoint is.
+        """
+        if sm is None:
+            import torch
+
+            assert torch.cuda.is_available(), (
+                "staircase routes on the SM version of the device it will run on; "
+                "no CUDA device is visible"
+            )
+            sm = torch.cuda.get_device_capability()
         return cls(
             pretrained_config=config.pretrained_config,
             mapping=config.mapping,
-            sm=torch.cuda.get_device_capability(),
+            sm=sm,
             quant_config=config.quant_config,
             spec_config=config.spec_config,
             is_disagg=getattr(config, "is_disagg", False),

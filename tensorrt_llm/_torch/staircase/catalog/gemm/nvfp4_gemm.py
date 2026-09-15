@@ -7,6 +7,19 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 
 
+def _pad_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def _swizzled_scale_numel(rows: int, k: int) -> int:
+    """Bytes a 128x4 swizzled block-scale buffer holds for `rows` x `k`.
+
+    The swizzle addresses the padded rectangle, not the real one, so the
+    buffer is this size whatever `rows` and `k` are -- see nvfp4_gemm.md.
+    """
+    return _pad_up(rows, 128) * _pad_up(k // 16, 4)
+
+
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -37,6 +50,30 @@ def nvfp4_gemm(
         "alpha must hold exactly one element; extra elements are silently "
         "ignored (this build has no per-token alpha)"
     )
+    # Contiguity above says nothing about length, and a short scale buffer is
+    # read past its end rather than rejected: the kernel indexes the *padded*
+    # rectangle. Both operands are checked because M and N pad independently.
+    #
+    # Only for 2-D operands, and only for *under*-length. Anything else about
+    # the shapes -- wrong rank, zero rows, K disagreement -- the op rejects
+    # itself and loudly, and pre-empting that here would swap its RuntimeError
+    # for an AssertionError that says less. Over-length is not the hazard
+    # either: the kernel never reads past what the swizzle addresses, and the
+    # contract already says the padding bytes may hold anything.
+    if act_fp4.dim() == 2 and weight.dim() == 2:
+        k = act_fp4.shape[1] * 2  # act_fp4 packs two 4-bit values per byte
+        floor_act_sf = _swizzled_scale_numel(act_fp4.shape[0], k)
+        floor_weight_scale = _swizzled_scale_numel(weight.shape[0], k)
+        assert act_sf.numel() >= floor_act_sf, (
+            f"act_sf must hold at least pad_up(M,128) * pad_up(K/16,4) = "
+            f"{floor_act_sf} bytes for M={act_fp4.shape[0]}, K={k}; got "
+            f"{act_sf.numel()} -- the kernel would read past its end"
+        )
+        assert weight_scale.numel() >= floor_weight_scale, (
+            f"weight_scale must hold at least pad_up(N,128) * pad_up(K/16,4) = "
+            f"{floor_weight_scale} bytes for N={weight.shape[0]}, K={k}; got "
+            f"{weight_scale.numel()} -- the kernel would read past its end"
+        )
     return torch.ops.trtllm.nvfp4_gemm(
         act_fp4,
         weight,

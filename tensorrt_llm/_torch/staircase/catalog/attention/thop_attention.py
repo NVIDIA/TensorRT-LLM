@@ -127,8 +127,7 @@ def thop_attention(
     quant_scale_qkv: Optional[torch.Tensor] = None,
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None,
     enable_dsv4_epilogue_fusion: bool = False,
-    # Added between 1.3.0rc21 and 1.3.0rc26. Defaults reproduce the behaviour
-    # the op had before they existed, and match what the in-tree caller
+    # Defaults match what the in-tree caller
     # (attention/backends/fmha/fallback.py) passes on a dense, non-sparse,
     # non-folded path -- which is the path both migrated targets are on.
     max_num_sequences: Optional[int] = None,

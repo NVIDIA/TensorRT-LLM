@@ -15,7 +15,7 @@ file covers what a serving engine adds: the engine's own attention-DP
 synchronisation interleaved with the op, the engine's stream switching, and
 what disagreeing on call order actually does.
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python catalog/comm/_allgather_op_matrix.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python _allgather_op_matrix.py
 
 Not a pytest module, despite the `check_*` bodies. They are one fixed
 sequence inside a single 4-rank job rather than independent cases: each reads
@@ -27,9 +27,10 @@ keeps it uncollectable however pytest is pointed at this tree.
 
 The collected entry point is
 `tests/unittest/_torch/staircase/comm/test_staircase_allgather_op_matrix.py`:
-it starts this job and turns its exit code into an assertion. This half stays
-in the package because the launcher re-execs it as `python -m`, and the ranks
-need the package context for their relative imports.
+it starts this job and turns its exit code into an assertion. Both halves are
+started by file path: the launcher must not import `tensorrt_llm` (that calls
+`MPI_Init`, and an MPI-initialized process cannot start `mpirun`), and the
+ranks reach the catalog by absolute import, so neither needs a package.
 """
 
 import os
@@ -37,6 +38,7 @@ import random
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -915,9 +917,8 @@ def _run_one_rank() -> int:
     from mpi4py import MPI as _MPI
 
     from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.staircase.catalog.comm import allgather as entry
     from tensorrt_llm.mapping import Mapping
-
-    from . import allgather as entry
 
     allgather = entry.allgather
     MPI = _MPI
@@ -979,8 +980,7 @@ def _spawn_ranks() -> None:
         "-n",
         str(world_size),
         sys.executable,
-        "-m",
-        "tensorrt_llm._torch.staircase.catalog.comm._allgather_op_matrix",
+        str(Path(__file__).resolve()),
         _WORKER_FLAG,
     ]
     print(f"[launcher] {' '.join(command)}", flush=True)

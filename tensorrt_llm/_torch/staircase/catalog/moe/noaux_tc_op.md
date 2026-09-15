@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 16}
+  sm_103: {status: passed, tests: 16}
 ---
 
 # noaux_tc_op
@@ -191,7 +190,7 @@ A caller violating none of the above gets the result described under
 
 ## Notes
 
-- **Certified surface.** Passing on sm_100 / trtllm 1.3.0rc21: `num_tokens`
+- **Certified surface.** Passing: `num_tokens`
   in `{0, 1, 2, 4, 7, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192}`;
   `num_experts` in `{1, 2, 7, 8, 16, 32, 64, 72, 100, 128, 256, 257, 512,
   1024}`; `topk` in `{0, 1, 2, 3, 4, 6, 8, 16, 31, 32}`; all eight accepted

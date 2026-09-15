@@ -10,7 +10,7 @@ rather than raising — and this op wedges rather than raising when the ranks
 disagree about the split — so the deadline is what keeps a broken kernel
 from taking the calling run down with it.
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python catalog/comm/_reducescatter_op_matrix.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python _reducescatter_op_matrix.py
 
 That runs two jobs, in this order. The first is the matrix proper: every
 `CHECKS` entry on `world_size` ranks, and it must exit 0. The second is a
@@ -33,9 +33,10 @@ keeps it uncollectable however pytest is pointed at this tree.
 
 The collected entry point is
 `tests/unittest/_torch/staircase/comm/test_staircase_reducescatter_op_matrix.py`:
-it starts this job and turns its exit code into an assertion. This half stays
-in the package because the launcher re-execs it as `python -m`, and the ranks
-need the package context for their relative imports.
+it starts this job and turns its exit code into an assertion. Both halves are
+started by file path: the launcher must not import `tensorrt_llm` (that calls
+`MPI_Init`, and an MPI-initialized process cannot start `mpirun`), and the
+ranks reach the catalog by absolute import, so neither needs a package.
 """
 
 import os
@@ -46,6 +47,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -1428,7 +1430,7 @@ def _run_one_rank() -> int:
     global COMM, RANK, WORLD, GROUP, reducescatter
     from mpi4py import MPI
 
-    from . import reducescatter as entry
+    from tensorrt_llm._torch.staircase.catalog.comm import reducescatter as entry
 
     reducescatter = entry.reducescatter
     COMM = MPI.COMM_WORLD
@@ -1495,7 +1497,7 @@ def _run_wedge_rank() -> int:
     global COMM, RANK, WORLD, GROUP, reducescatter
     from mpi4py import MPI
 
-    from . import reducescatter as entry
+    from tensorrt_llm._torch.staircase.catalog.comm import reducescatter as entry
 
     reducescatter = entry.reducescatter
     COMM = MPI.COMM_WORLD
@@ -1542,8 +1544,7 @@ def _mpirun(world_size: int, flag: str, env: Optional[Dict[str, str]] = None) ->
         "-n",
         str(world_size),
         sys.executable,
-        "-m",
-        "tensorrt_llm._torch.staircase.catalog.comm._reducescatter_op_matrix",
+        str(Path(__file__).resolve()),
         flag,
     ]
     print(f"[launcher] {' '.join(command)}", flush=True)

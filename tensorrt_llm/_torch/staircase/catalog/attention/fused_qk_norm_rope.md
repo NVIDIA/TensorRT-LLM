@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 9}
+  sm_103: {status: passed, tests: 9}
 ---
 
 # fused_qk_norm_rope
@@ -46,8 +45,7 @@ then irrelevant). `attention_factor` scales cos/sin — but **not at
 `factor == 1.0` exactly**, where any `attention_factor != 1.0` raises
 `Assertion failed: attention_factor == 1.0f`
 (`fusedQKNormRopeKernel.cu:322`). `factor = 1.0000001` accepts it.
-Measured 2026-07-28; the gate is on `factor` alone and is not otherwise
-documented.
+The gate is on `factor` alone and is not otherwise documented.
 
 Interleaved mRoPE (`use_mrope=True`) takes 3 position rows
 (temporal/height/width) per token. Frequency index `j` reads its position

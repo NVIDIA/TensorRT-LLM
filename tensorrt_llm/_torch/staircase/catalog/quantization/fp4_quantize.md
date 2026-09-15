@@ -1,7 +1,6 @@
 ---
 receipts:
-  sm_100: {status: passed, trtllm: 1.3.0rc21}
-  sm_103: {status: passed, trtllm: 1.3.0rc26, tests: 21}
+  sm_103: {status: passed, tests: 21}
 ---
 
 # fp4_quantize
@@ -202,7 +201,7 @@ None. Stateless — no runtime, attention metadata, or workspace.
     `5 * 448 / g` then clip to `+-6`; the rest quantize normally against
     the collapsed scale and still dequantize close to their true value —
     at 1.17x overshoot a hand-built block came back
-    `[6, 4, 2, 1, 0.5, 0, 0, 0]`, not all-`+-6` (measured 2026-07-28).
+    `[6, 4, 2, 1, 0.5, 0, 0, 0]`, not all-`+-6`.
     **Do not look for an all-`+-6`, signs-only block as the signature**:
     a mis-calibrated block looks ordinary, and only ~100x overshoot
     produces the saturated form.
