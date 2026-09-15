@@ -363,6 +363,7 @@ def _build_transceiver_for_kv_slice(
     cached_tokens: int = 0,
     is_generation_only: bool = False,
     beam_width: int = 1,
+    num_draft_tokens: int = 0,
 ):
     """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
 
@@ -376,7 +377,13 @@ def _build_transceiver_for_kv_slice(
         kv_head_num_per_rank=1,
         sliding_window_size=sliding_window_size,
     )
-    total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
+    total_blocks = (
+        prompt_len
+        + (num_draft_tokens if is_generation_only else 0)
+        + num_extra_kv_tokens
+        + tokens_per_block
+        - 1
+    ) // tokens_per_block
     if block_ids is None:
         block_ids = np.arange(total_blocks, dtype=np.int64)
     else:
@@ -536,6 +543,37 @@ class TestCreateKvSliceBlockSpan:
         )
         transceiver, req = _build_transceiver_for_kv_slice(
             num_extra_kv_tokens=5,
+            prompt_len=prompt_len,
+            tokens_per_block=tokens_per_block,
+            block_ids=block_ids,
+            sliding_window_size=sliding_window_size,
+            is_generation_only=True,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        np.testing.assert_array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            block_ids[:-1],
+        )
+
+    def test_dspark_gen_init_draft_reserve_is_removed_before_swa_trim(self):
+        """Remove gen-init draft reserve before selecting the valid SWA suffix."""
+        prompt_len = 1144
+        tokens_per_block = 128
+        num_extra_kv_tokens = 4
+        num_draft_tokens = 5
+        total_prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
+        sliding_window_size = 133
+        stale_end = max(
+            0,
+            (prompt_len + 1 - sliding_window_size) // tokens_per_block,
+        )
+        valid_prompt_blocks = total_prompt_blocks - stale_end
+        block_ids = np.arange(200, 200 + valid_prompt_blocks + 1, dtype=np.int64)
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=num_extra_kv_tokens,
+            num_draft_tokens=num_draft_tokens,
             prompt_len=prompt_len,
             tokens_per_block=tokens_per_block,
             block_ids=block_ids,
