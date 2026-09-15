@@ -1586,6 +1586,21 @@ CUBIN_EXPORT __global__
     assert(warpIdx.x < ctaShapeInWarps.x && warpIdx.y < ctaShapeInWarps.y && warpIdx.z < ctaShapeInWarps.z);
     uint32_t const flatWarpIdPerRow = warpIdx.z * ctaShapeInWarps.x + warpIdx.x; // per ctaShapeInWarps.y value
 
+    // Include the sink in both GEMMs' initial maxima before computing softmax weights.
+    auto initialRowMax = ThrdRegRowMax::filled(safeInitRowMax);
+    if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
+    {
+        for (uint32_t i = 0; i < initialRowMax.size; i++)
+        {
+            uint32_t const rowOffset = warp_size * i + laneId();
+            if (rowOffset < (SPEC_DEC ? warpTile.y : headGrpSize))
+            {
+                uint32_t const srcOffset = SPEC_DEC ? rowOffset % headGrpSize : rowOffset;
+                initialRowMax[i] = fmaxf(initialRowMax[i], attentionSinks[headGrpSize * idxHeadGrp + srcOffset]);
+            }
+        }
+    }
+
     // initialize shared memory
     static_assert(persistentQ && ctaShapeInWarps.y == 1);
     if (ctaThrdId < ctaShapeInWarps.y)
@@ -1615,11 +1630,15 @@ CUBIN_EXPORT __global__
         init(&smem.ctaRowMaxBwdBarriers[0][0] + ctaThrdId, warp_size);
     }
 #endif
-#if CTA_ROW_MAX_BACKWARD_METHOD != 0
-    static_assert(ctaSize >= sizeof(smem.ctaRowMax) / sizeof(float));
-    if (ctaThrdId < sizeof(smem.ctaRowMax) / sizeof(float))
+#if CTA_ROW_MAX_BACKWARD_METHOD == 1 || CTA_ROW_MAX_BACKWARD_METHOD == 2 || CTA_ROW_MAX_BACKWARD_METHOD == 3
+    if (warpIdx.z == 0)
     {
-        reinterpret_cast<float*>(&smem.ctaRowMax[0])[ctaThrdId] = safeInitRowMax;
+        smem.ctaRowMax[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, initialRowMax);
+    }
+#elif CTA_ROW_MAX_BACKWARD_METHOD == 4
+    if (warpIdx.z == 0 && warpIdx.x == 0)
+    {
+        smem.ctaRowMax[warpIdx.y].storeFromReg<false>(warp, initialRowMax);
     }
 #endif
 #if GRP_LOAD_V
@@ -1917,8 +1936,7 @@ CUBIN_EXPORT __global__
             assertWarpConverged();
         }
 #if CTA_ROW_MAX_BACKWARD_METHOD == 2
-        ThrdRegRowMax initRowMax;
-        initRowMax.fill(safeInitRowMax);
+        ThrdRegRowMax initRowMax = initialRowMax;
 #endif
         for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters)
         {
@@ -2005,8 +2023,7 @@ CUBIN_EXPORT __global__
             // apply qkScale
             rescaleAcc(warp, acc, qkScale);
 #if CTA_ROW_MAX_BACKWARD_METHOD == 0
-            QuadRegRowMax initRowMaxQuad;
-            initRowMaxQuad.fill(safeInitRowMax);
+            QuadRegRowMax initRowMaxQuad = replicateForQuad(warp, initialRowMax);
 #elif CTA_ROW_MAX_BACKWARD_METHOD == 1
             // load hint
             xBar.consumed.wait_parity(getAndFlip(xBarConsumedParityNext));
@@ -2319,8 +2336,7 @@ CUBIN_EXPORT __global__
         ParityOrNone<grpLoadV> vBarParity{};
         // @fixme: do prefetch for next iter tile if last part
 
-        ThrdRegRowMax globalRowMax;
-        globalRowMax.fill(safeInitRowMax);
+        ThrdRegRowMax globalRowMax = initialRowMax;
         ThrdRegRowMax globalRowSum;
         globalRowSum.fill(0);
         // the accumulator
