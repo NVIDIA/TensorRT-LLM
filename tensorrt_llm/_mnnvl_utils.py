@@ -958,7 +958,7 @@ class MnnvlMemory:
                     is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
                     if is_active:
                         active_links += 1
-            except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
+            except pynvml.NVMLError_NotSupported:
                 continue
             except pynvml.NVMLError_InvalidArgument:
                 # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures;
