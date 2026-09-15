@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Pin v1 KVCM and the C++ transceiver for v1 timing metrics and CSV output.
 hostname: localhost
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 free_gpu_memory_fraction: 0.25
@@ -13,10 +17,10 @@ context_servers:
   return_perf_metrics: True
   perf_metrics_max_requests: 1000
   kv_cache_config:
-    use_kv_cache_manager_v2: auto
+    use_kv_cache_manager_v2: false
   cache_transceiver_config:
     backend: DEFAULT
-    transceiver_runtime: auto
+    transceiver_runtime: CPP
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -24,7 +28,7 @@ generation_servers:
   return_perf_metrics: True
   perf_metrics_max_requests: 1000
   kv_cache_config:
-    use_kv_cache_manager_v2: auto
+    use_kv_cache_manager_v2: false
   cache_transceiver_config:
     backend: DEFAULT
-    transceiver_runtime: auto
+    transceiver_runtime: CPP
