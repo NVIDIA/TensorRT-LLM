@@ -1550,11 +1550,6 @@
       "path": "speculative_config.eagle3_model_arch"
     },
     {
-      "capture_policy": "list[list[int]]|none",
-      "kind": "value",
-      "path": "speculative_config.eagle_choices"
-    },
-    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "speculative_config.enable_global_pool"
