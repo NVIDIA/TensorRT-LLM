@@ -408,3 +408,4 @@ class SkipSoftmaxParams(SparseParams):
 
     algorithm: Literal["skip_softmax"] = field(init=False, default="skip_softmax")
     scheduler: SkipSoftmaxScheduler = field(default_factory=SkipSoftmaxScheduler)
+    uses_spcompress: bool = False
