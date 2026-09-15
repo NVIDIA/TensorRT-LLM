@@ -32,7 +32,10 @@
 // APPLY_PROFILES (default on) re-BOLTs that tarball in the same run
 // ("consume immediately after generating"); PROMOTE (set by the postmerge launch,
 // opt-in elsewhere) publishes the packaged bundle to the branch-keyed Artifactory
-// path so premerge can pull `latest` (apply_latest.sh).
+// path so premerge can pull `latest` (apply_latest.sh). PUBLISH_BOLTED_CANONICAL
+// (also set by the postmerge launch) repushes that re-BOLTed tarball to the input
+// artifactPath under the canonical name, so consumers of the postmerge build --
+// its own test stages included -- get BOLT transparently.
 // =============================================================================
 
 import groovy.transform.Field
@@ -89,8 +92,9 @@ APPLY_PROFILES = (params.applyProfiles ?: "true").toString()
 // downstream consumers of that build get BOLT transparently, preserving the
 // original as unbolted-<tarball>. Requires APPLY_PROFILES=true (the bolted tarball
 // is produced by the merge job's BOLT_APPLY=1 step) and PROMOTE=true (only the
-// postmerge producer repushes a canonical). Default OFF -- the rollout is flipped
-// on in a follow-up change -- so this is inert until then. Resolution mirrors the
+// postmerge producer repushes a canonical). Set true by the postmerge launch in
+// L0_MergeRequest.groovy, alongside the other two; default OFF, so an on-demand or
+// premerge run still publishes nothing unless it asks. Resolution mirrors the
 // other toggles: param, then env.
 PUBLISH_BOLTED_CANONICAL = (params.boltPublishCanonical ?: env.boltPublishCanonical ?: "false").toString() == "true"
 // Multiply each workload's client `iterations` (num_requests = concurrency *
@@ -536,7 +540,7 @@ def submitProfileGen(pipeline)
         // Runs BEFORE that sweep. Coupled to PROMOTE so only the postmerge producer
         // (which promotes the bundle) repushes a canonical -- a premerge
         // generate-and-consume run (promote=false) never does, even with the toggle
-        // on. Gated off by default (PUBLISH_BOLTED_CANONICAL).
+        // on. PUBLISH_BOLTED_CANONICAL is set by the postmerge launch; off elsewhere.
         if (PUBLISH_BOLTED_CANONICAL && APPLY_PROFILES == "true" && PROMOTE == "true") {
             stage("Publish BOLTed build as canonical") {
                 publishBoltedCanonical(pipeline, remote,
@@ -546,6 +550,12 @@ def submitProfileGen(pipeline)
             }
         } else if (!PUBLISH_BOLTED_CANONICAL) {
             pipeline.echo("PUBLISH_BOLTED_CANONICAL=false: not repushing a BOLTed canonical tarball.")
+        } else {
+            // Asked for, but a precondition is unmet. Worth reporting now that the
+            // postmerge launch sets the toggle: name the offending input instead of
+            // skipping silently and leaving an un-BOLTed canonical unexplained.
+            pipeline.echo("PUBLISH_BOLTED_CANONICAL=true but applyProfiles=${APPLY_PROFILES}, promote=${PROMOTE} " +
+                          "(both must be true): no BOLTed tarball to publish; canonical left un-BOLTed.")
         }
 
         // Retention: best-effort purge of workspaces older than 7 days so scratch
@@ -901,7 +911,7 @@ pipeline {
         choice(
             name: "boltPublishCanonical",
             choices: ["false", "true"],
-            description: "After merge (requires applyProfiles=true), push the BOLTed build back to the input artifactPath under the canonical name (original preserved as unbolted-<tarball>). Default false; the rollout is turned on in a follow-up change."
+            description: "After merge (requires applyProfiles=true and promote=true), push the BOLTed build back to the input artifactPath under the canonical name (original preserved as unbolted-<tarball>). Default false; the postmerge pipeline passes true."
         )
         string(
             name: "slurmPlatform",
