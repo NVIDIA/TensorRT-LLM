@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 import os
 import tempfile
@@ -30,6 +31,35 @@ from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 
 from ..conftest import llm_models_root
+
+
+@pytest.fixture
+def recording_connector(monkeypatch: pytest.MonkeyPatch,
+                        tmp_path: Path) -> KvCacheConnectorConfig:
+    """Expose the recording backend to both local and spawned workers."""
+    examples_dir = Path(__file__).resolve().parents[4] / "examples/llm-api"
+    paths = [str(examples_dir), str(Path(__file__).resolve().parent)]
+    for path in paths:
+        monkeypatch.syspath_prepend(path)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(paths + [os.environ.get("PYTHONPATH", "")]))
+    monkeypatch.setenv("CONNECTOR_TEST_RECORDS",
+                       str(tmp_path / "producer-loads"))
+    monkeypatch.delenv("CONNECTOR_TEST_ASYNC", raising=False)
+    return KvCacheConnectorConfig(
+        connector_module="connector_test_backend",
+        connector_scheduler_class="RecordingConnectorScheduler",
+        connector_worker_class="RecordingConnectorWorker",
+    )
+
+
+def _connector_event_count(folder: Path, rank: int, event: str) -> int:
+    path = folder / f"rank-{rank}.jsonl"
+    if not path.exists():
+        return 0
+    return sum(record["count"] for line in path.read_text().splitlines()
+               if (record := json.loads(line))["event"] == event)
 
 
 @pytest.fixture(scope="function")
@@ -592,39 +622,27 @@ def test_connector_e2e_persistent_cache(
     enforce_single_worker: None,
     monkeypatch: pytest.MonkeyPatch,
     enable_attention_dp: bool,
+    recording_connector: KvCacheConnectorConfig,
+    tmp_path: Path,
 ) -> None:
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 
     Runs generation twice with separate LLM instances sharing a disk-based
-    connector cache, verifying that outputs are identical (proving cache
-    save/load works end-to-end).
+    connector cache, requiring completed consumer loads and identical output.
     """
-    # sys.path, not __extra_import_path__: the connector module is imported by
-    # name from inside tensorrt_llm, not by this file. monkeypatch restores the
-    # entry at teardown so a failure cannot leak it into later tests.
-    examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..",
-                                "..", "examples", "llm-api")
-    examples_dir = os.path.abspath(examples_dir)
-    monkeypatch.syspath_prepend(examples_dir)
-
     cache_dir = tempfile.mkdtemp()
     os.environ["CONNECTOR_CACHE_FOLDER"] = cache_dir
 
     try:
-        kv_connector_config = KvCacheConnectorConfig(
-            connector_module="llm_kv_cache_connector",
-            connector_scheduler_class="PersistentKvCacheConnectorLeader",
-            connector_worker_class="PersistentKvCacheConnectorWorker",
-        )
-
         llm_kwargs = dict(
             model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
             backend="pytorch",
-            kv_connector_config=kv_connector_config,
+            kv_connector_config=recording_connector,
             cuda_graph_config=None,
             disable_overlap_scheduler=True,
             enable_attention_dp=enable_attention_dp,
             enable_chunked_prefill=False,
+            max_seq_len=1024,
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
         )
 
@@ -641,18 +659,19 @@ def test_connector_e2e_persistent_cache(
                                          ignore_eos=True,
                                          temperature=0)
 
-        llm1 = LLM(**llm_kwargs)
-        output1 = llm1.generate([prompt], sampling_params)
-        expected_tokens = output1[0].outputs[0].token_ids
-        del llm1
+        with LLM(**llm_kwargs) as producer:
+            output1 = producer.generate([prompt], sampling_params)
+            expected_tokens = output1[0].outputs[0].token_ids
 
         cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".pt")]
         assert len(cache_files) > 0, "No cache files written by connector"
 
-        llm2 = LLM(**llm_kwargs)
-        output2 = llm2.generate([prompt], sampling_params)
-        assert output2[0].outputs[0].token_ids == expected_tokens
-        del llm2
+        consumer_records = tmp_path / "consumer-loads"
+        monkeypatch.setenv("CONNECTOR_TEST_RECORDS", str(consumer_records))
+        with LLM(**llm_kwargs) as consumer:
+            output2 = consumer.generate([prompt], sampling_params)
+            assert output2[0].outputs[0].token_ids == expected_tokens
+        assert _connector_event_count(consumer_records, 0, "loaded_blocks") > 0
     finally:
         os.environ.pop("CONNECTOR_CACHE_FOLDER", None)
 
@@ -662,9 +681,10 @@ def test_connector_e2e_persistent_cache(
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
-def test_connector_adp_persistent_pool(monkeypatch: pytest.MonkeyPatch,
-                                       tmp_path: Path,
-                                       disable_overlap_scheduler: bool) -> None:
+def test_connector_adp_persistent_pool(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        disable_overlap_scheduler: bool,
+        recording_connector: KvCacheConnectorConfig) -> None:
     """Two ADP owners share persisted KV across executor restarts.
 
     A single request exercises an idle owner; four equal requests exercise
@@ -673,25 +693,13 @@ def test_connector_adp_persistent_pool(monkeypatch: pytest.MonkeyPatch,
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two GPUs")
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
-    examples_dir = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../../../examples/llm-api"))
-    monkeypatch.syspath_prepend(examples_dir)
-    monkeypatch.setenv(
-        "PYTHONPATH",
-        os.pathsep.join([examples_dir,
-                         os.environ.get("PYTHONPATH", "")]))
     monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
-    config = KvCacheConnectorConfig(
-        connector_module="llm_kv_cache_connector",
-        connector_scheduler_class="PersistentKvCacheConnectorLeader",
-        connector_worker_class="PersistentKvCacheConnectorWorker",
-    )
     kwargs = dict(
         model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         backend="pytorch",
         tensor_parallel_size=2,
         enable_attention_dp=True,
-        kv_connector_config=config,
+        kv_connector_config=recording_connector,
         enable_chunked_prefill=False,
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=None,
@@ -710,8 +718,62 @@ def test_connector_adp_persistent_pool(monkeypatch: pytest.MonkeyPatch,
             expected.append([output.outputs[0].token_ids for output in outputs])
     assert list(
         tmp_path.glob("*.pt")), "The first executor must publish cache blocks"
+    consumer_records = tmp_path / "consumer-loads"
+    monkeypatch.setenv("CONNECTOR_TEST_RECORDS", str(consumer_records))
     with LLM(**kwargs) as consumer:
         for prompts, token_ids in zip(workloads, expected):
             outputs = consumer.generate(prompts, params)
             assert [output.outputs[0].token_ids
                     for output in outputs] == token_ids
+    for rank in (0, 1):
+        assert _connector_event_count(consumer_records, rank,
+                                      "loaded_blocks") > 0
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_connector_adp_async_without_dummy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    disable_overlap_scheduler: bool,
+    recording_connector: KvCacheConnectorConfig,
+) -> None:
+    """An async owner at its slot cap must preserve its peer's prepared V1 batch."""
+    assert torch.cuda.device_count() >= 2, "This regression requires two GPUs"
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path / "cache"))
+    kwargs = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        kv_connector_config=recording_connector,
+        max_batch_size=1,
+        max_seq_len=1024,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                      use_kv_cache_manager_v2=False),
+    )
+    prompt = "Explain how a computer stores information. " * 16
+    params = SamplingParams(max_tokens=8, ignore_eos=True, temperature=0)
+    with LLM(**kwargs) as producer:
+        expected = [
+            out.outputs[0].token_ids
+            for out in producer.generate([prompt] * 2, params)
+        ]
+    assert list((tmp_path / "cache").glob("*.pt"))
+
+    consumer_records = tmp_path / "consumer-loads"
+    monkeypatch.setenv("CONNECTOR_TEST_RECORDS", str(consumer_records))
+    monkeypatch.setenv("CONNECTOR_TEST_ASYNC", "1")
+    with LLM(**kwargs) as consumer:
+        outputs = consumer.generate([prompt] * 2, params)
+        assert [out.outputs[0].token_ids for out in outputs] == expected
+    assert _connector_event_count(consumer_records, 0, "loaded_blocks") > 0
+    assert _connector_event_count(consumer_records, 0, "async_finished") > 0
+    assert _connector_event_count(consumer_records, 1, "loaded_blocks") == 0
+    for rank in (0, 1):
+        assert _connector_event_count(consumer_records, rank,
+                                      "allocated_requests") == 1

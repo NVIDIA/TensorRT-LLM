@@ -108,7 +108,9 @@ The capability flag commits an implementation to these requirements:
 Async loading may remove every real request from an owner's scheduled batch.
 The executor attempts to add a compute dummy so other owners can advance while
 the transfer proceeds. If the owner has no dummy capacity or sequence slot,
-the existing ADP forward gate still defers the batch.
+it polls local transfer completion until at least one request is ready, then
+runs the already-prepared batch. Peers wait at the normal forward gate during
+this fallback; their V1 allocations and connector plans are preserved.
 
 This support uses the existing single-primary-pool connector interface with
 `KVCacheManagerV1` and guaranteed-no-evict scheduling. PP=1, CP=1 and beam width

@@ -3941,6 +3941,10 @@ class PyExecutor:
     def _kv_connector_start_batch(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         if self.kv_connector_manager:
+            loading_context = (
+                scheduled_batch.context_requests if self.enable_attention_dp
+                and self.kv_connector_manager.new_async_requests.loading else
+                [])
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
             if self.enable_attention_dp and scheduled_batch.batch_size == 0:
@@ -3954,6 +3958,28 @@ class PyExecutor:
             self.kv_connector_manager.handle_metadata()
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
+
+            if loading_context and scheduled_batch.batch_size == 0:
+                # No dummy fits. Every owner has already prepared resources,
+                # so vetoing this forward would repeat V1 allocation on retry.
+                # Drain enough local loads to run this prepared batch instead.
+                # Other owners wait at the normal post-connector queue vote.
+                while scheduled_batch.batch_size == 0:
+                    self._kv_connector_terminate_requests()
+                    scheduled_batch.reset_context_requests([
+                        req for req in loading_context
+                        if req.state == LlmRequestState.CONTEXT_INIT
+                    ])
+                    if scheduled_batch.batch_size == 0:
+                        time.sleep(0.001)
+
+                # The initial async-load plan omitted these requests. Publish
+                # their first compute metadata now, without allocating again.
+                self.kv_connector_manager.build_scheduler_output(
+                    scheduled_batch, self.kv_cache_manager)
+                self.kv_connector_manager.handle_metadata()
+                self.kv_connector_manager.worker.start_load_kv(
+                    torch.cuda.current_stream())
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:

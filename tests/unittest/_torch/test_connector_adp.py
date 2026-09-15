@@ -242,3 +242,64 @@ def test_cancel_waits_for_connector_dma(forbid_connector_collectives: None) -> N
     manager.worker.get_finished.return_value = ([], [8])
     manager.get_finished()
     assert executor._try_cancel_request(req)
+
+
+@pytest.mark.parametrize("padding_failure", ["slot_cap", "kv_capacity"])
+def test_async_without_dummy_keeps_prepared_batch(
+    forbid_connector_collectives: None, padding_failure: str
+) -> None:
+    """Resume the first completed load without reallocation or waiting for all loads."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    manager = _manager()
+    ready, pending = _request(10), _request(11)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [ready, pending]
+    cache = MagicMock()
+    cache.get_cache_indices.return_value = [5, 6]
+    cache.commit_and_get_block_hashes.return_value = [123]
+    for req in batch.context_requests:
+        manager.get_num_new_matched_tokens(req, 0)
+        req.context_current_position = 4
+        req.context_remaining_length = 4
+        req.context_chunk_size = 4
+        manager.update_state_after_alloc(req, [5, 6])
+
+    # Mirror the executor's already-prepared batch and initial load plan.
+    manager.build_scheduler_output(batch, cache)
+    manager.handle_metadata()
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = manager
+    executor.kv_cache_manager = cache
+    executor.kv_cache_transceiver = None
+    executor.enable_attention_dp = True
+    executor.active_requests = [ready, pending]
+    executor.expected_num_active_requests = 2
+    executor.max_num_active_requests = 2 if padding_failure == "slot_cap" else 3
+    executor._count_schedulable_active_requests = MagicMock(return_value=0)
+    executor._should_skip_dummy_for_benchmark_disagg = MagicMock(return_value=False)
+    executor._has_adp_dummy_kv_capacity = MagicMock(return_value=False)
+    executor.resource_manager = MagicMock()
+    executor.resource_manager.prepare_resources.side_effect = AssertionError("double allocation")
+    manager.worker.get_finished.side_effect = [([], []), ([], [10])]
+
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep") as sleep,
+    ):
+        executor._kv_connector_start_batch(batch)
+
+    assert batch.context_requests == [ready]
+    assert not batch.generation_requests
+    assert ready.state == LlmRequestState.CONTEXT_INIT
+    assert pending.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert manager.has_pending_transfers(11)
+    assert not manager.should_add_sequence(ready)
+    executor.resource_manager.prepare_resources.assert_not_called()
+    cache.add_dummy_requests.assert_not_called()
+    sleep.assert_called_once_with(0.001)
+    compute_plan = manager.scheduler.build_connector_meta.call_args.args[0]
+    assert [req.request_id for req in compute_plan.new_requests] == [10]
+    assert compute_plan.new_requests[0].computed_position == 4
+    assert compute_plan.new_requests[0].new_block_ids == [5, 6]
+    assert manager.worker.start_load_kv.call_count == 2
