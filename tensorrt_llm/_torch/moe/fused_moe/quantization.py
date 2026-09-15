@@ -1459,197 +1459,96 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                                                 module.rebuild_tensor_metadata)
 
 
-class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
-    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
+class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
+    """Shared implementation of the per-channel weight-only MoE methods.
 
-    def create_weights(self, module: torch.nn.Module):
-        module.sm_version = get_sm_version()
-        module.sm_version = 80 if module.sm_version >= 90 else module.sm_version
-        module.preprocessor = preprocess_weights_for_mixed_gemm
-
-        weight_dtype = torch.int8
-        if not module.quant_config.layer_quant_mode.is_int8_weight_only():
-            raise NotImplementedError(
-                f"Weight Only Quantization currently only supports INT8. Got: {module.quant_config.layer_quant_mode}."
-            )
-
-        # notice the weight shape for int8 weight-only is different from the original shape,
-        # since the quantized weights have their own layout
-        w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.hidden_size,
-                              module.expand_intermediate_size_per_partition)
-        w2_weight_shape = (module.expert_size_per_partition,
-                           module.intermediate_size_per_partition,
-                           module.hidden_size)
-
-        fc31_weight_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition,
-            module.expand_intermediate_size_per_partition,
-            dtype=module.dtype),
-                                         requires_grad=False)
-        module.register_parameter("fc31_weight_scale", fc31_weight_scale)
-
-        fc2_weight_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition,
-            module.hidden_size,
-            dtype=module.dtype),
-                                        requires_grad=False)
-        module.register_parameter("fc2_weight_scale", fc2_weight_scale)
-
-        super().create_weights(module, weight_dtype, w3_w1_weight_shape,
-                               w2_weight_shape)
-
-        self._online_eplb_not_supported(module)
-
-        self.setup_quant_scales(module)
-
-    def setup_quant_scales(self, module: torch.nn.Module):
-        module.quant_scales = FusedMoEQuantScalesINT8WoqPerChannel(
-            fc31_weight_scale=module.fc31_weight_scale,
-            fc2_weight_scale=module.fc2_weight_scale,
-        )
-
-    def load_expert_w3_w1_weight(self, module: torch.nn.Module,
-                                 w1_weight: torch.Tensor,
-                                 w3_weight: torch.Tensor,
-                                 dst_w3_w1_weight: torch.Tensor):
-        """
-        Load w1 and w3 weights for each expert.
-        """
-        w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN)
-
-        # w3_weight (gate_proj) is empty for non-gated MoE (e.g. Nemotron-H squared-ReLU).
-        # Only concatenate the gate projection when present; otherwise the single
-        # up-projection fills the (non-doubled) intermediate buffer. The unquantized
-        # fused-MoE path handles non-gated experts the same way.
-        if w3_weight is not None and w3_weight.numel() > 0:
-            w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
-                                                module.tp_rank,
-                                                TensorParallelMode.COLUMN)
-            w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
-                                         dim=0)
-        else:
-            w31_weight_shard = w1_weight_shard
-
-        weight_dtype = torch.int8
-
-        assert module.dtype in [torch.float16, torch.bfloat16], \
-            f"activation dtype should be float16 or bfloat16, got {module.dtype}"
-        if not module.quant_config.layer_quant_mode.is_int8_weight_only():
-            raise NotImplementedError(
-                f"weight dtype should be INT8. Got: {module.quant_config.layer_quant_mode}."
-            )
-        # preprocess the weights for mixed gemm
-        w31_weight_shard = module.preprocessor(w31_weight_shard.T.contiguous(),
-                                               weight_dtype, module.dtype,
-                                               module.sm_version).contiguous()
-        dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
-                               non_blocking=True)
-
-    def load_expert_w2_weight(self, module: torch.nn.Module,
-                              w2_weight: torch.Tensor,
-                              dst_w2_weight: torch.Tensor):
-        """
-        Load w2 weight for each expert.
-        """
-        w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW)
-
-        weight_dtype = torch.int8
-        if not module.quant_config.layer_quant_mode.is_int8_weight_only():
-            raise NotImplementedError(
-                f"Weight Only Quantization currently only supports INT8. Got: {module.quant_config.layer_quant_mode}."
-            )
-
-        # preprocess the weights for mixed gemm
-        w2_weight_shard = module.preprocessor(w2_weight_shard.T.contiguous(),
-                                              weight_dtype, module.dtype,
-                                              module.sm_version).contiguous()
-        dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
-                            non_blocking=True)
-
-    def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
-        # fc31 scales. w1 (up_proj) is always present; w3 (gate_proj) is absent
-        # for non-gated MoE (e.g. Nemotron-H squared-ReLU). Only concatenate the
-        # gate-projection scales when the gate weights are present; otherwise the
-        # up-projection scales alone fill the (non-doubled) fc31 scale buffer.
-        all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
-            for expert_id in module.initial_local_expert_ids
-        ]
-        has_w3_scales = all(f"{expert_id}.w3.weight_scale" in weights
-                            for expert_id in module.initial_local_expert_ids)
-        if module.is_gated_activation and has_w3_scales:
-            all_w3_scales = [
-                load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
-                                  module.tp_size, module.tp_rank,
-                                  TensorParallelMode.COLUMN)
-                for expert_id in module.initial_local_expert_ids
-            ]
-            w3_w1_scales = torch.cat(
-                [torch.stack(all_w3_scales),
-                 torch.stack(all_w1_scales)],
-                dim=-1)
-        else:
-            w3_w1_scales = torch.stack(all_w1_scales)
-        w3_w1_scales = w3_w1_scales.to(module.dtype)
-        module.fc31_weight_scale.data.copy_(w3_w1_scales.contiguous())
-        # fc2 scales
-        all_w2_scales = [
-            load_weight_shard(weights[f"{expert_id}.w2.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.ROW)
-            for expert_id in module.initial_local_expert_ids
-        ]
-        w2_scales = torch.stack(all_w2_scales).to(module.dtype)
-        module.fc2_weight_scale.data.copy_(w2_scales.contiguous())
-
-
-class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
-    """Plain W4A16: INT4 weights, per-channel scales, 16-bit activations.
-
-    Storage mirrors ``INT8WoqPerChannelFusedMoEMethod`` (the dim-swapped,
-    post-transpose layout the per-channel weight-only runner expects) with the
-    trailing output dimension halved, because two INT4 values are packed into
-    one int8 byte. That matches the dense W4A16 convention, where
-    ``WeightOnlyQuantLinearMethod.create_weights`` allocates
-    ``(in_features, out_features // 2)``, and the C++ ``FusedMoeRunner``
-    constructor sets ``mInnerDimMultiplier = 2`` for INT4 weights.
+    INT8 and INT4 differ only in the dtype the mixed-GEMM preprocessor is told
+    to interpret the weights as, in how many values share one int8 storage byte,
+    and in the quant-mode predicate. The dim-swapped storage layout, the
+    full-width per-channel scale parameters, the gated and non-gated w3
+    handling, the tensor-parallel sharding and the alignment diagnostics are
+    identical, so subclasses override three attributes and one hook.
     """
 
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
-    # 2 INT4 values per int8 byte, matching mInnerDimMultiplier in FusedMoeRunner.
-    PACKED_ELEMENTS_PER_BYTE = 2
+    # dtype passed to preprocess_weights_for_mixed_gemm, which is not the same
+    # as the storage dtype: packed INT4 is stored in an int8 container.
+    preprocessor_weight_dtype = torch.int8
+    # Logical values packed into one int8 storage byte.
+    packed_elements_per_byte = 1
+    # Used in the alignment diagnostics.
+    quant_name = "weight-only per-channel"
+
+    @staticmethod
+    def _check_quant_mode(module: torch.nn.Module) -> None:
+        """Reject a quant config the subclass does not implement."""
+        raise NotImplementedError
+
+    @classmethod
+    def _validate_alignment(cls, num_rows: int, num_cols: int, name: str,
+                            module: torch.nn.Module) -> None:
+        """Fail with a diagnostic before preprocess_weights_for_mixed_gemm's bare asserts.
+
+        Both counts are as the preprocessor sees them, i.e. after the loader's
+        transpose: ``num_rows`` is the shard's pre-transpose last dim and
+        ``num_cols`` its pre-transpose first dim, the packed one.
+
+        Rows must be a multiple of 64. ``rows_per_tile = 128 * 8 //
+        BITS_PER_ELT_A`` is activation-driven, so it is 64 for INT4 exactly as
+        for INT8, and it subsumes the weaker ``B_ROWS_PER_MMA`` and
+        ``elts_in_int32`` row asserts.
+
+        Columns must be a multiple of ``MMA_SHAPE_N`` (8). That assert is
+        unconditional, and where ``num_cols`` counts packed bytes it is
+        reachable whenever the logical width is not a multiple of 16.
+
+        Both are raised here so the message names the offending tensor, the
+        count and tp_size, instead of surfacing as an opaque AssertionError
+        several frames below the loader.
+        """
+        if num_rows % 64 != 0:
+            raise ValueError(
+                f"{cls.quant_name} MoE requires the pre-transpose row count of "
+                f"{name} to be a multiple of 64, got {num_rows} "
+                f"(tp_size={module.tp_size}). "
+                "preprocess_weights_for_mixed_gemm interleaves 64-row tiles. "
+                "For w2_weight this dimension is the per-partition intermediate "
+                "size, so a tensor-parallel size that keeps it 64-aligned is "
+                "required; for w3_w1_weight it is the hidden size.")
+        if num_cols % 8 != 0:
+            pack = cls.packed_elements_per_byte
+            raise ValueError(
+                f"{cls.quant_name} MoE requires the column count of {name} to "
+                f"be a multiple of 8, got {num_cols} "
+                f"(tp_size={module.tp_size}). "
+                f"This count is in storage bytes holding {pack} value(s) each, "
+                f"so the logical width must be a multiple of {8 * pack}: "
+                "w3_w1_weight is sized by the per-partition expanded "
+                "intermediate size and w2_weight by the hidden size.")
 
     def create_weights(self, module: torch.nn.Module) -> None:
-        """Allocate packed INT4 expert weights and full-width per-channel scales."""
+        """Allocate the expert weights and full-width per-channel scales."""
         module.sm_version = get_sm_version()
         module.sm_version = 80 if module.sm_version >= 90 else module.sm_version
         module.preprocessor = preprocess_weights_for_mixed_gemm
 
-        if not module.quant_config.layer_quant_mode.is_int4_weight_only():
-            raise NotImplementedError(
-                f"W4A16 MoE requires INT4 weight-only quantization. Got: {module.quant_config.layer_quant_mode}."
-            )
+        self._check_quant_mode(module)
 
-        # Storage container is int8; each byte holds two INT4 values. The
-        # logical widths are unpacked, so only the trailing (output) dim is
-        # halved. Sized from module.expand_intermediate_size_per_partition
-        # (twice the per-partition intermediate size for gated activations, once
-        # otherwise) so gated and non-gated both work without a hardcoded 2.
+        # The weight shape for per-channel weight-only differs from the original
+        # shape, since the quantized weights have their own layout. The storage
+        # container is int8; for INT4 each byte holds two values, so only the
+        # trailing (output) dim is halved. Sizing from
+        # expand_intermediate_size_per_partition (twice the per-partition
+        # intermediate size for gated activations, once otherwise) keeps gated
+        # and non-gated working without a hardcoded factor.
+        pack = self.packed_elements_per_byte
         expand_inter = module.expand_intermediate_size_per_partition
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.hidden_size,
-                              expand_inter // self.PACKED_ELEMENTS_PER_BYTE)
+                              module.hidden_size, expand_inter // pack)
         w2_weight_shape = (module.expert_size_per_partition,
                            module.intermediate_size_per_partition,
-                           module.hidden_size // self.PACKED_ELEMENTS_PER_BYTE)
+                           module.hidden_size // pack)
 
         # Scales stay at full logical width: one scale per output channel.
         fc31_weight_scale = nn.Parameter(torch.empty(
@@ -1673,51 +1572,12 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
     def setup_quant_scales(self, module: torch.nn.Module) -> None:
         """Publish the 2-element per-channel scale tuple the runner expects."""
-        # Reuses the per-channel 2-scale tuple; FusedMoeRunner's quant-scale
-        # handling turns this into QuantParams::Int(fc1_scale, fc2_scale).
+        # FusedMoeRunner's quant-scale handling turns this into
+        # QuantParams::Int(fc1_scale, fc2_scale).
         module.quant_scales = FusedMoEQuantScalesINT8WoqPerChannel(
             fc31_weight_scale=module.fc31_weight_scale,
             fc2_weight_scale=module.fc2_weight_scale,
         )
-
-    @staticmethod
-    def _validate_alignment(num_rows: int, num_cols: int, name: str,
-                            module: torch.nn.Module) -> None:
-        """Fail with a diagnostic before preprocess_weights_for_mixed_gemm's bare asserts.
-
-        Both counts are as the preprocessor sees them, i.e. after the loader's
-        transpose: ``num_rows`` is the shard's pre-transpose last dim and
-        ``num_cols`` its pre-transpose first dim, the packed one.
-
-        Rows must be a multiple of 64. ``rows_per_tile = 128 * 8 //
-        BITS_PER_ELT_A`` is activation-driven, so it is 64 for INT4 exactly as
-        for INT8, and it subsumes the weaker ``B_ROWS_PER_MMA`` (32) and
-        ``elts_in_int32`` (8) row asserts.
-
-        Columns must be a multiple of ``MMA_SHAPE_N`` (8). That assert is
-        unconditional, and because ``num_cols`` counts packed bytes it is
-        reachable whenever the logical width is not a multiple of 16.
-
-        Both are raised here so the message names the offending tensor, the
-        count and tp_size, instead of surfacing as an opaque AssertionError
-        several frames below the loader.
-        """
-        if num_rows % 64 != 0:
-            raise ValueError(
-                f"W4A16 MoE requires the pre-transpose row count of {name} to be a "
-                f"multiple of 64, got {num_rows} (tp_size={module.tp_size}). "
-                "preprocess_weights_for_mixed_gemm interleaves 64-row tiles. "
-                "For w2_weight this dimension is the per-partition intermediate "
-                "size, so a tensor-parallel size that keeps it 64-aligned is "
-                "required; for w3_w1_weight it is the hidden size.")
-        if num_cols % 8 != 0:
-            raise ValueError(
-                f"W4A16 MoE requires the packed column count of {name} to be a "
-                f"multiple of 8, got {num_cols} (tp_size={module.tp_size}). "
-                "Two INT4 values share one byte, so this is half the logical "
-                "width: w3_w1_weight needs the per-partition expanded "
-                "intermediate size to be a multiple of 16, and w2_weight needs "
-                "the hidden size to be a multiple of 16.")
 
     def load_expert_w3_w1_weight(self, module: torch.nn.Module,
                                  w1_weight: torch.Tensor,
@@ -1727,21 +1587,24 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
+
+        # w3 (gate_proj) is absent for non-gated MoE, e.g. Nemotron-H squared
+        # ReLU. Only concatenate it when present; otherwise the single
+        # up-projection fills the non-doubled intermediate buffer.
         if w3_weight is not None and w3_weight.numel() > 0:
             w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
                                                 module.tp_rank,
                                                 TensorParallelMode.COLUMN)
-            # Gated: w3 first, matching the fc31 scale concatenation order.
             w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
                                          dim=0)
         else:
-            # Non-gated activations (e.g. Nemotron-H squared-ReLU) have no w3.
             w31_weight_shard = w1_weight_shard
 
         if module.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
                 "activation dtype should be float16 or bfloat16, got "
                 f"{module.dtype}")
+        self._check_quant_mode(module)
 
         # After .T the preprocessor reads shape[1] and shape[2] of the 3-D
         # view, which are this shard's last and first dims respectively.
@@ -1749,17 +1612,17 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                                  w31_weight_shard.shape[0], "w3_w1_weight",
                                  module)
 
-        # Checkpoint entries are already packed two INT4 per byte along the
-        # OUTPUT dim, i.e. w1/w3 arrive as (inter/2, hidden), so the COLUMN
+        # For INT4, checkpoint entries arrive already packed two values per byte
+        # along the OUTPUT dim, i.e. w1/w3 are (inter/2, hidden), so the COLUMN
         # shard and the dim-0 concat both operate in packed coordinates. The
-        # transpose then yields (hidden, expand_inter/2), which is exactly the
-        # destination parameter. preprocess_weights_for_mixed_gemm consumes and
-        # returns packed bytes -- it preserves the byte count and only permutes
-        # (its subbyte_transpose step) -- so no dimension is
-        # halved here. Packing along the output dim is required because a packed
-        # tensor cannot be transposed to move the packing axis.
+        # transpose then yields exactly the destination parameter.
+        # preprocess_weights_for_mixed_gemm preserves the byte count and only
+        # permutes, so no dimension is halved here. Packing along the output dim
+        # is required because a packed tensor cannot be transposed to move the
+        # packing axis.
         w31_weight_shard = module.preprocessor(w31_weight_shard.T.contiguous(),
-                                               torch.quint4x2, module.dtype,
+                                               self.preprocessor_weight_dtype,
+                                               module.dtype,
                                                module.sm_version).contiguous()
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
@@ -1774,11 +1637,14 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
 
+        self._check_quant_mode(module)
+
         self._validate_alignment(w2_weight_shard.shape[-1],
                                  w2_weight_shard.shape[0], "w2_weight", module)
 
         w2_weight_shard = module.preprocessor(w2_weight_shard.T.contiguous(),
-                                              torch.quint4x2, module.dtype,
+                                              self.preprocessor_weight_dtype,
+                                              module.dtype,
                                               module.sm_version).contiguous()
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
@@ -1791,8 +1657,9 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         if (module.weight_loading_mode ==
                 MoEWeightLoadingMode.FUSED_GATE_UP_PROJ):
             raise ValueError(
-                "W4A16 per-channel MoE does not support loading scales from "
-                "MoEWeightLoadingMode.FUSED_GATE_UP_PROJ checkpoints.")
+                f"{self.quant_name} per-channel MoE does not support loading "
+                "scales from MoEWeightLoadingMode.FUSED_GATE_UP_PROJ "
+                "checkpoints.")
         all_w1_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
                               module.tp_size, module.tp_rank,
@@ -1825,6 +1692,49 @@ class W4A16WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         ]
         w2_scales = torch.stack(all_w2_scales).to(module.dtype)
         module.fc2_weight_scale.data.copy_(w2_scales.contiguous())
+
+
+class INT8WoqPerChannelFusedMoEMethod(WoqPerChannelFusedMoEMethodBase):
+    """W8A16: INT8 weights, per-channel scales, 16-bit activations."""
+
+    preprocessor_weight_dtype = torch.int8
+    packed_elements_per_byte = 1
+    quant_name = "W8A16"
+
+    @staticmethod
+    def _check_quant_mode(module: torch.nn.Module) -> None:
+        """Reject anything but INT8 weight-only."""
+        if not module.quant_config.layer_quant_mode.is_int8_weight_only():
+            raise NotImplementedError(
+                "Weight Only Quantization currently only supports INT8. Got: "
+                f"{module.quant_config.layer_quant_mode}.")
+
+
+class W4A16WoqPerChannelFusedMoEMethod(WoqPerChannelFusedMoEMethodBase):
+    """Plain W4A16: INT4 weights, per-channel scales, 16-bit activations.
+
+    Storage mirrors the INT8 sibling (the dim-swapped, post-transpose layout the
+    per-channel weight-only runner expects) with the trailing output dimension
+    halved, because two INT4 values are packed into one int8 byte. That matches
+    the dense W4A16 convention, where
+    ``WeightOnlyQuantLinearMethod.create_weights`` allocates
+    ``(in_features, out_features // 2)``, and the C++ ``FusedMoeRunner``
+    constructor sets ``mInnerDimMultiplier = 2`` for INT4 weights.
+    """
+
+    preprocessor_weight_dtype = torch.quint4x2
+    # 2 INT4 values per int8 byte, matching mInnerDimMultiplier in
+    # FusedMoeRunner.
+    packed_elements_per_byte = 2
+    quant_name = "W4A16"
+
+    @staticmethod
+    def _check_quant_mode(module: torch.nn.Module) -> None:
+        """Reject anything but INT4 weight-only."""
+        if not module.quant_config.layer_quant_mode.is_int4_weight_only():
+            raise NotImplementedError(
+                "W4A16 MoE requires INT4 weight-only quantization. Got: "
+                f"{module.quant_config.layer_quant_mode}.")
 
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
