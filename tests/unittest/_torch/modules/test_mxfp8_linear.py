@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -89,6 +90,7 @@ def _mock_mxfp8_ops(monkeypatch):
         ops=SimpleNamespace(trtllm=fake_trtllm_ops),
         ones=torch.ones,
         float32=torch.float32,
+        compiler=SimpleNamespace(is_compiling=lambda: False),
     )
     monkeypatch.setattr(linear_module, "torch", fake_torch)
     return (
@@ -181,6 +183,51 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
+
+
+def test_mxfp8_auto_stays_native_while_compiling(monkeypatch):
+    """https://nvbugs/6714109: the auto gate must not read ContextVars under Dynamo.
+
+    FlashInfer's mm_mxfp8 cannot be traced inside a torch.compile region, so a
+    compiled forward has to resolve to the native op even while the
+    autotune/decode-capture scopes are active.
+    """
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+
+    mm_mxfp8 = Mock(return_value=torch.empty((2, 3), dtype=torch.bfloat16))
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=contextlib.nullcontext),
+    )
+    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+    method.mark_flashinfer_autotuned()
+
+    # A ContextVar read would raise under a real Dynamo trace; assert the
+    # is_compiling() check short-circuits before either scope is consulted.
+    linear_module.torch.compiler.is_compiling = lambda: True
+    with flashinfer_mxfp8_autotune():
+        assert method.apply(module, activation, bias=None) is native_output
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is native_output
+    mm_mxfp8.assert_not_called()
+    assert native_gemm.call_count == 2
+
+    # Eager execution keeps the tuned FlashInfer path.
+    linear_module.torch.compiler.is_compiling = lambda: False
+    with flashinfer_mxfp8_decode_graph_capture():
+        method.apply(module, activation, bias=None)
+    mm_mxfp8.assert_called_once()
 
 
 def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):
