@@ -899,6 +899,11 @@ def _validate_qwen_ulysses_attention_backend(model_config: DiffusionModelConfig)
     attention_backend = model_config.attention.backend
     ulysses_size = getattr(model_config.visual_gen_mapping, "ulysses_size", 1)
     if ulysses_size > 1 and attention_backend != "VANILLA":
+        # Qwen-Image Ulysses pads text and image token streams before sharding.
+        # The attention backend must consume key_padding_mask to ignore padded
+        # tokens; today only the VANILLA Qwen-Image implementation supports
+        # that mask path. Non-VANILLA backends remain valid when ulysses_size
+        # is 1.
         raise ValueError(
             "Qwen-Image Ulysses parallelism requires "
             "attention_config.backend='VANILLA'. "
