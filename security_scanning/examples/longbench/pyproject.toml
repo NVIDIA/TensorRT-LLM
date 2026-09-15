@@ -8,7 +8,6 @@ authors = [
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "jieba (>=0.42.1,<0.43.0)",
-    "rapidfuzz (>=3.14.5,<4.0.0)",
     "rouge (>=1.0.1,<2.0.0)"
 ]
 

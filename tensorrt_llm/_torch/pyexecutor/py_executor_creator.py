@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import functools
 import gc
 import importlib
 import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,8 +23,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
-                                          LoadFormat, SpeculativeConfig,
-                                          TorchLlmArgs)
+                                          SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -31,7 +32,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -40,16 +41,17 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           resolve_cache_transceiver_config,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .dwdp import DwdpManager
+from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
-_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
-_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
@@ -206,19 +208,6 @@ def _get_mapping(_mapping: Mapping) -> Mapping:
     return mapping
 
 
-def update_sampler_max_seq_len(max_seq_len, sampler):
-    # Originally, TRTLLMSampler is constructed with executor_config, but
-    # _create_kv_cache_manager (via build_managers) may later overwrite executor_config.max_seq_len.
-    # Because TRTLLMSampler.sample_async still needs the updated limit and executor_config is
-    # deprecated inside TRTLLMSampler, keep TRTLLMSampler.max_seq_len updated with
-    # with executor_config.max_seq_len.
-    from .sampler import TRTLLMSampler
-
-    if isinstance(sampler, TRTLLMSampler):
-        assert hasattr(sampler, "max_seq_len")
-        sampler.max_seq_len = max_seq_len
-
-
 def _extend_full_attention_windows_for_spec_decode(
     kv_cache_config: KvCacheConfig,
     spec_config: Optional[SpeculativeConfig],
@@ -271,7 +260,9 @@ def _load_config_and_create_checkpoint_loader(
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
-        mx_model_name=llm_args.model,
+        checkpoint_io_policy=llm_args.checkpoint_io_policy,
+        load_format=llm_args.load_format,
+        partial_model_loading=llm_args.is_partial_model_loading,
     )
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
@@ -333,7 +324,7 @@ def log_memory_usage(stage: str):
     )
 
 
-def create_py_executor(
+def _create_py_executor_impl(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
@@ -381,8 +372,6 @@ def create_py_executor(
         # Disable KV cache reuse for deterministic mode
         kv_cache_config.enable_block_reuse = False
         kv_cache_config.enable_partial_reuse = False
-
-    decoding_config = llm_args.decoding_config
 
     # The tokenizer is stripped from MPI kwargs in proxy.py to avoid pickle
     # failures with trust_remote_code models.  Reload it from the checkpoint
@@ -493,10 +482,8 @@ def create_py_executor(
 
     cache_transceiver_config = llm_args.cache_transceiver_config
 
-    has_draft_model_engine = False
     has_spec_drafter = False
     if spec_config is not None:
-        has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
         # Eagle3DecodingConfig._max_batch_size is internally managed: the
@@ -507,17 +494,35 @@ def create_py_executor(
         if hasattr(spec_config, '_max_batch_size'):
             spec_config._max_batch_size = max_batch_size
 
-        # WAR for https://nvbugs/5807902
-        # Disable separate draft KV cache in disaggregated mode
-        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        if cache_transceiver_config is not None:
+        # WAR for https://nvbugs/5807902 (Eagle3 disagg RMSNorm crash, closed
+        # will-not-fix). Keep the blanket disable; carve out only the standalone
+        # drafters, which it stranded on their private max_seq_len-dense arena.
+        is_standalone_drafter = (spec_config.spec_dec_mode.is_dflash()
+                                 or spec_config.spec_dec_mode.is_dspark())
+        # MiniMax-M3 supports one-model Eagle3 only; its drafter shares the
+        # target KV cache.
+        is_m3_eagle3 = (is_minimax_m3(m3_sparse_config)
+                        and spec_config.spec_dec_mode.is_eagle3_one_model())
+        if ((cache_transceiver_config is not None and not is_standalone_drafter)
+                or is_m3_eagle3):
             spec_config._allow_separate_draft_kv_cache = False
+        # The triton reference backend runs multi-token verify through its
+        # prefill builder, which cannot be CUDA-graph captured.
+        if (is_m3_eagle3 and m3_sparse_config.implementation != "msa"
+                and llm_args.cuda_graph_config is not None):
+            raise ValueError(
+                "MiniMax-M3 Eagle3 on the triton reference backend does not "
+                "support CUDA graphs; use implementation='msa' or set "
+                "cuda_graph_config=None.")
+        if is_m3_eagle3 and not spec_config.is_linear_tree:
+            raise ValueError(
+                "MiniMax-M3 Eagle3 supports the linear draft chain only.")
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
         cache_reuse=kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
+        has_speculative_draft_tokens=has_spec_drafter,
         chunk_size=max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
@@ -590,7 +595,7 @@ def create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
-    validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
+    validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
@@ -601,46 +606,7 @@ def create_py_executor(
                     dist=dist)
     model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
-    if has_draft_model_engine:
-        with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
-            draft_spec_config = copy.copy(spec_config)
-
-            draft_llm_args = copy.copy(llm_args)
-            if spec_config.load_format == "dummy":
-                draft_llm_args.load_format = LoadFormat.DUMMY
-
-            model_weights_memory_tag = None
-            model_weights_restore_mode = None
-            if enable_sleep:
-                model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_DRAFT
-                model_weights_restore_mode = sleep_config.restore_modes[
-                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT]
-
-            draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model,
-                llm_args=draft_llm_args,
-                mapping=mapping,
-                attn_runtime_features=attn_runtime_features,
-                dist=dist,
-                spec_config=draft_spec_config,
-                is_draft_model=True,
-                model_weights_memory_tag=model_weights_memory_tag,
-                model_weights_restore_mode=model_weights_restore_mode,
-            )
-            # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
-            if spec_config.spec_dec_mode.is_mtp_eagle():
-                draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
-            draft_model_engine.load_weights_from_target_model(
-                model_engine.model)
-    else:
-        draft_model_engine = None
-
-    # TODO: Overlap scheduler is not supported for two-model speculative decoding.
-    if has_draft_model_engine:
-        logger.warning(
-            "Overlap scheduler is not supported for two-model speculative decoding."
-        )
-        llm_args.disable_overlap_scheduler = True
+    draft_model_engine = None
 
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
@@ -659,14 +625,12 @@ def create_py_executor(
         model_engine_max_seq_len=model_engine_max_seq_len,
     )
 
-    if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
-        logger.warning(
-            "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
-        )
-
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
+
+    # Resolve this before cache reuse and cache manager selection consume it.
+    resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
@@ -700,11 +664,16 @@ def create_py_executor(
                                            False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
+        nvfp4_dsa_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
+                                 and getattr(sparse_attention_config,
+                                             "algorithm", None) == "dsa")
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
-                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
+                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
+                or nvfp4_dsa_cache_reuse):
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
+                f"KV cache reuse for MLA can only be enabled without KV cache quantization, with FP8 quantization, "
+                f"or with NVFP4 quantization on the DSA sparse path, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
@@ -800,11 +769,8 @@ def create_py_executor(
             mapping,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
-            max_seq_len=max_seq_len,
             mm_encoder_only=mm_encoder_only,
             speculative_config=spec_config,
-            decoding_config=decoding_config,
-            kv_cache_config=kv_cache_config,
             max_num_sequences=max_num_seq_slots,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
@@ -933,10 +899,6 @@ def create_py_executor(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
     # weight manager + MoE backend fixup (single entry point).
@@ -1032,10 +994,6 @@ def create_py_executor(
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
             kv_cache_creator.build_managers(resources, False)
-            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
-            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
-            max_seq_len = kv_cache_creator._max_seq_len
-            update_sampler_max_seq_len(max_seq_len, sampler)
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
@@ -1078,3 +1036,34 @@ def create_py_executor(
     py_executor.start_worker()
 
     return py_executor
+
+
+@functools.wraps(_create_py_executor_impl)
+def create_py_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
+) -> PyExecutor:
+    """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
+    previous_dwdp_manager = get_global_dwdp_manager()
+    try:
+        return _create_py_executor_impl(
+            llm_args=llm_args,
+            checkpoint_dir=checkpoint_dir,
+            tokenizer=tokenizer,
+            profiling_stage_data=profiling_stage_data,
+            resource_governor_queue=resource_governor_queue,
+        )
+    except BaseException:
+        current_dwdp_manager = get_global_dwdp_manager()
+        if (current_dwdp_manager is not None
+                and current_dwdp_manager is not previous_dwdp_manager):
+            try:
+                current_dwdp_manager.__exit__(None, None, None)
+            except BaseException:
+                logger.error(
+                    "Failed to roll back DWDP after PyExecutor construction error\n"
+                    f"{traceback.format_exc()}")
+        raise

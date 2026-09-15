@@ -15,8 +15,11 @@ class SchedulingParams:
         agent_hierarchy (AgentHierarchy): Path of (agent_type, node_id) tuples
             identifying this request's position in an agent execution tree.
             Used by the batch scheduler for hierarchy-aware scheduling.
+        subagent_affinity_id (str): Parent-session routing key supplied by the
+            chat-completions server for conversation-aware attention-DP affinity.
     """
 
     attention_dp_rank: Optional[int] = None
     attention_dp_relax: bool = True
     agent_hierarchy: Optional[AgentHierarchy] = None
+    subagent_affinity_id: Optional[str] = None

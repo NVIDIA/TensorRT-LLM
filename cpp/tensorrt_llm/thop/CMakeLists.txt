@@ -31,6 +31,13 @@ endif()
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+# Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
+# OptionalArrayRef in the reverse order, relying on C++20's automatic generation
+# of the reversed comparison operator. th_utils/th_common only contain host .cpp
+# sources, so scope the bump to these targets instead of the repo-wide C++17
+# standard.
+set_target_properties(th_utils PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                          ON)
 # Declare the dependency on the main shared library explicitly so consumers
 # (e.g. thUtilsTest) place it after th_utils on the link line; this was
 # previously satisfied transitively via the removed TensorRT plugin target.
@@ -47,7 +54,6 @@ add_library(
   asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
-  convertSpecDecodingMaskToPackedMaskOp.cpp
   cuteDslMoeUtilsOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
@@ -57,7 +63,6 @@ add_library(
   marlinNvfp4MoeMM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
-  dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp8PerTensorScalingTrtllmGenGemm.cpp
@@ -90,7 +95,6 @@ add_library(
   fusedGatedRMSNormQuant.cpp
   rmsNormFp4Quant.cpp
   fusedTopkSoftmax.cpp
-  gatherTreeOp.cpp
   groupRmsNormOp.cpp
   helixPostProcessOp.cpp
   llama4MinLatency.cpp
@@ -123,7 +127,6 @@ add_library(
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
-  redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
@@ -144,11 +147,14 @@ add_library(
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
+  nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
+                                                           ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)

@@ -26,7 +26,7 @@ from defs.conftest import get_sm_version
 from tensorrt_llm.logger import logger
 
 
-def get_ucx_tls():
+def get_ucx_tls() -> str:
     """Get UCX_TLS value based on GPU architecture.
 
     Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
@@ -38,22 +38,8 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
-    if sm == 90:
-        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
-        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
-        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
-        return "^gdr_copy"
     return "^ib,gdr_copy"
 
-
-# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
-# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
-# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
-# address handles to cross-rail peers and time out, hanging the workers.
-# Drop it at import time so worker environments (copied from os.environ)
-# fall back to standard GID-based address resolution; no-op when absent.
-if get_sm_version() == 90:
-    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 # Configuration file paths
 EXAMPLES_DIR = "examples/disaggregated"
@@ -69,7 +55,9 @@ PROMPTS_FILE = f"{CLIENTS_DIR}/prompts.json"
 def kill_automated_disaggregated_processes():
     """Kill any existing automated disaggregated processes."""
     try:
-        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'], check=False)
+        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'],
+                       check=False,
+                       timeout=30)
     except Exception:
         pass
 
@@ -189,7 +177,8 @@ def run_client_test(config, env=None) -> bool:
                             env=env,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True)
+                            text=True,
+                            timeout=600)
 
     if result.returncode == 0:
         logger.info("Client test succeeded")
@@ -207,7 +196,10 @@ def kill_server_by_port(port: int) -> bool:
     try:
         # Find PID using port
         cmd = ["lsof", "-t", f"-i:{port}"]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        result = subprocess.run(cmd,
+                                stdout=subprocess.PIPE,
+                                text=True,
+                                timeout=30)
 
         if result.stdout.strip():
             pid = int(result.stdout.strip())
@@ -264,7 +256,8 @@ def cleanup_etcd_data(env=None):
                             env=env,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True)
+                            text=True,
+                            timeout=30)
 
     if result.returncode == 0:
         logger.info("Successfully cleaned etcd data")

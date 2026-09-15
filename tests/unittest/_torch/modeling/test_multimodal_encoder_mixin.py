@@ -82,7 +82,7 @@ def test_setup_attn_metadata_accepts_processor_capacity():
 
 def test_setup_attn_metadata_is_idempotent_per_call():
     """Subsequent calls overwrite the previous AttentionMetadata, which
-    matches how the engine drives `_set_up_multimodal_encoder_attn_metadata` (called
+    matches how the engine drives `setup_mm_encoder_attn_metadata` (called
     once at engine init; tests that multiple calls don't crash and that the
     last sizes win)."""
     encoder = _DummyEncoder()

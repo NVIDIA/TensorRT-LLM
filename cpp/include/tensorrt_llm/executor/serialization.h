@@ -66,11 +66,6 @@ public:
     static void serialize(AdditionalModelOutput const& additionalModelOutput, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(AdditionalModelOutput const& additionalModelOutput);
 
-    // ExternalDraftTokensConfig
-    [[nodiscard]] static ExternalDraftTokensConfig deserializeExternalDraftTokensConfig(std::istream& is);
-    static void serialize(ExternalDraftTokensConfig const& config, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(ExternalDraftTokensConfig const& config);
-
     // PromptTuningConfig
     [[nodiscard]] static PromptTuningConfig deserializePromptTuningConfig(std::istream& is);
     static void serialize(PromptTuningConfig const& config, std::ostream& os);
@@ -177,20 +172,10 @@ public:
     static void serialize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::ostream& os);
     static size_t serializedSize(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
 
-    // ParallelConfig
-    static ParallelConfig deserializeParallelConfig(std::istream& is);
-    static void serialize(ParallelConfig const& parallelConfig, std::ostream& os);
-    static size_t serializedSize(ParallelConfig const& parallelConfig);
-
     // PeftCacheConfig
     static PeftCacheConfig deserializePeftCacheConfig(std::istream& is);
     static void serialize(PeftCacheConfig const& peftCacheConfig, std::ostream& os);
     static size_t serializedSize(PeftCacheConfig const& peftCacheConfig);
-
-    // OrchestratorConfig
-    static OrchestratorConfig deserializeOrchestratorConfig(std::istream& is);
-    static void serialize(OrchestratorConfig const& orchestratorConfig, std::ostream& os);
-    static size_t serializedSize(OrchestratorConfig const& orchestratorConfig);
 
     // DecodingMode
     static DecodingMode deserializeDecodingMode(std::istream& is);
@@ -201,16 +186,6 @@ public:
     static LookaheadDecodingConfig deserializeLookaheadDecodingConfig(std::istream& is);
     static void serialize(LookaheadDecodingConfig const& lookaheadDecodingConfig, std::ostream& os);
     static size_t serializedSize(LookaheadDecodingConfig const& lookaheadDecodingConfig);
-
-    // EagleConfig
-    static EagleConfig deserializeEagleConfig(std::istream& is);
-    static void serialize(EagleConfig const& eagleConfig, std::ostream& os);
-    static size_t serializedSize(EagleConfig const& eagleConfig);
-
-    // SpeculativeDecodingConfig
-    static SpeculativeDecodingConfig deserializeSpeculativeDecodingConfig(std::istream& is);
-    static void serialize(SpeculativeDecodingConfig const& specDecConfig, std::ostream& os);
-    static size_t serializedSize(SpeculativeDecodingConfig const& specDecConfig);
 
     // GuidedDecodingConfig
     static GuidedDecodingConfig deserializeGuidedDecodingConfig(std::istream& is);
@@ -238,20 +213,10 @@ public:
     static void serialize(DecodingConfig const& decodingConfig, std::ostream& os);
     static size_t serializedSize(DecodingConfig const& decodingConfig);
 
-    // DebugConfig
-    static DebugConfig deserializeDebugConfig(std::istream& is);
-    static void serialize(DebugConfig const& debugConfig, std::ostream& os);
-    static size_t serializedSize(DebugConfig const& debugConfig);
-
     // CacheTransceiverConfig
     static CacheTransceiverConfig deserializeCacheTransceiverConfig(std::istream& is);
     static void serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os);
     static size_t serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig);
-
-    // ExecutorConfig
-    static ExecutorConfig deserializeExecutorConfig(std::istream& is);
-    static void serialize(ExecutorConfig const& executorConfig, std::ostream& os);
-    static size_t serializedSize(ExecutorConfig const& executorConfig);
 
     // KvCacheStats
     static KvCacheStats deserializeKvCacheStats(std::istream& is);

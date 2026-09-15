@@ -24,6 +24,7 @@ Supported:
   - safe_gate mode (sigmoid + lower_bound) and softplus mode
   - dt_bias
   - use_gate_in_kernel=True with A_log
+  - optional in-kernel beta sigmoid
   - chunk_size=64
 
 The ``trtllm::kda_prefill`` operator updates selected recurrent-state pool rows
@@ -374,7 +375,7 @@ def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta,
 
 
 def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=False):
-    """All beta fusion lives in akk_inv kernel epilogue (post-inv column-scale)."""
+    """Return cached intermediate tensors for the KDA prefill pipeline."""
     key = (dev.index or 0, B, T, H, K_dim, V_dim, NT, N_seqs, varlen)
     if key not in _buf_cache:
         bf16 = cutlass.BFloat16
@@ -401,6 +402,7 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         k_scaled = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)  # raw, no beta
         kg = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)
         q_scaled = _with_slack(torch.empty, B, T_alloc, H, K_dim, dtype=dtype_k)
+        beta_activated = _with_slack(torch.empty, B, T_alloc, H, dtype=torch.bfloat16)
         gk_last_exp = torch.empty(B, NT, H, K_dim, device=dev, dtype=torch.float32)
         A_qk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
         A_kk = _with_slack(torch.zeros, B, T_alloc, H, BT, dtype=dtype_k)
@@ -474,6 +476,7 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
             k_scaled,
             kg,
             q_scaled,
+            beta_activated,
             gk_last_exp,
             A_qk,
             A_kk,
@@ -625,6 +628,7 @@ def _launch_fused_k123_inv(
     g,
     A_log,
     beta,
+    beta_activated,
     scale,
     k_scaled,
     kg,
@@ -636,9 +640,11 @@ def _launch_fused_k123_inv(
     chunk_indices,
     is_varlen,
     NT,
+    valid_tokens,
     dt_bias=None,
     safe_gate=False,
     lower_bound=None,
+    use_beta_sigmoid_in_kernel=True,
     akk_in_view=None,
     akk_out_view=None,
     cute_wrappers=None,
@@ -705,6 +711,8 @@ def _launch_fused_k123_inv(
         varlen_pure,
         cu_ci_dtypes,
         eqlen_t_key,
+        use_beta_sigmoid_in_kernel,
+        beta.dtype,
     )
 
     # Inputs are guaranteed contiguous by upstream linear projections.
@@ -716,7 +724,14 @@ def _launch_fused_k123_inv(
     k_ct = _ct(k, cutlass.BFloat16)
     g_ct = _ct(g, cutlass.BFloat16)
     alog_ct = _ct(A_log if A_log.dtype == torch.float32 else A_log.float(), cutlass.Float32)
-    beta_ct = _ct(beta, cutlass.BFloat16)
+    if beta.dtype == torch.float32:
+        beta_etype = cutlass.Float32
+    elif beta.dtype == torch.bfloat16:
+        beta_etype = cutlass.BFloat16
+    else:
+        raise ValueError(f"Kimi K3 KDA prefill beta must be float32 or bfloat16, got {beta.dtype}")
+    beta_ct = _ct(beta, beta_etype)
+    beta_activated_ct = _ct_cached(beta_activated, cutlass.BFloat16)
 
     ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
     kg_ct = _ct_cached(kg, cutlass.BFloat16)
@@ -746,6 +761,7 @@ def _launch_fused_k123_inv(
         g_ct,
         alog_ct,
         beta_ct,
+        beta_activated_ct,
         scale,
         ks_ct,
         kg_ct,
@@ -761,6 +777,7 @@ def _launch_fused_k123_inv(
         NT,
         B,
         B * (T_padded if is_varlen else NT * BT),
+        valid_tokens,
         stream,
     )
 
@@ -773,6 +790,7 @@ def _launch_fused_k123_inv(
             T_padded=T_padded,
             has_bias=has_bias,
             use_safe_gate=safe_gate,
+            use_beta_sigmoid=use_beta_sigmoid_in_kernel,
             varlen_pure=varlen_pure,
         )
         _fused_k123_cache[cache_key] = cute.compile(host_fn, *ct_args)
@@ -800,17 +818,28 @@ def _launch_fused_k123_inv(
         is_varlen_int = 0
         T_val = NT * BT
 
+    beta_for_akk = beta_activated if use_beta_sigmoid_in_kernel else beta
+    if beta_for_akk.dtype == torch.float32:
+        akk_beta_etype = cutlass.Float32
+    else:
+        akk_beta_etype = cutlass.BFloat16
+    akk_beta_ct = (
+        _ct_cached(beta_for_akk, akk_beta_etype)
+        if use_beta_sigmoid_in_kernel
+        else _ct(beta_for_akk, akk_beta_etype)
+    )
+
     # B/NT/T_val remain runtime args of akk_inv_host. Eqlen T is still part of
-    # the cache key because the raw mBeta wrapper bakes its batch stride.
+    # the cache key because the beta wrapper bakes its batch stride.
     # cu/ci dtype is a specializer for the same reason as in the K123 key above
     # (element type baked into the compiled reader).
-    akk_cache_key = (H, is_varlen, dev, cu_ci_dtypes, eqlen_t_key)
+    akk_cache_key = (H, is_varlen, dev, cu_ci_dtypes, eqlen_t_key, beta_for_akk.dtype)
     if akk_cache_key not in _akk_inv_cache:
         _akk_inv_cache[akk_cache_key] = cute.compile(
             _akk_inv_host,
             akk_in_view,
             akk_out_view,
-            beta_ct,
+            akk_beta_ct,
             B,
             NT,
             H,
@@ -821,7 +850,7 @@ def _launch_fused_k123_inv(
             stream,
         )
     akk_fn = _akk_inv_cache[akk_cache_key]
-    akk_args = (akk_in_view, akk_out_view, beta_ct, B, NT, akk_cu_ct, akk_ci_ct, T_val, stream)
+    akk_args = (akk_in_view, akk_out_view, akk_beta_ct, B, NT, akk_cu_ct, akk_ci_ct, T_val, stream)
     akk_fn(*akk_args)
 
 
@@ -840,6 +869,7 @@ def _chunk_kda_fwd(
     safe_gate: bool = False,
     lower_bound: float | None = None,
     use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = True,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     varlen_is_aligned: bool | None = None,
@@ -991,6 +1021,7 @@ def _chunk_kda_fwd(
         k_scaled,
         kg,
         q_scaled,
+        beta_activated,
         gk_last_exp,
         A_qk,
         A_kk,
@@ -1008,6 +1039,7 @@ def _chunk_kda_fwd(
         g,
         A_log,
         beta,
+        beta_activated,
         scale,
         k_scaled,
         kg,
@@ -1019,9 +1051,11 @@ def _chunk_kda_fwd(
         chunk_indices,
         is_varlen,
         NT,
+        real_T,
         dt_bias=dt_bias,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         akk_in_view=cute_wrappers["akk_in_view"],
         akk_out_view=cute_wrappers["akk_out_view"],
         cute_wrappers=cute_wrappers,
@@ -1076,6 +1110,7 @@ class KdaPrefillRunner:
         safe_gate: bool = False,
         lower_bound: Optional[float] = None,
         use_gate_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         varlen_is_aligned: Optional[bool] = None,
@@ -1104,6 +1139,7 @@ class KdaPrefillRunner:
             safe_gate=safe_gate,
             lower_bound=lower_bound,
             use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             A_log=A_log,
             dt_bias=dt_bias,
             varlen_is_aligned=varlen_is_aligned,
@@ -1182,6 +1218,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         safe_gate: bool = False,
         lower_bound: Optional[float] = None,
         use_gate_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         varlen_is_aligned: Optional[bool] = None,
@@ -1212,6 +1249,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             safe_gate=safe_gate,
             lower_bound=lower_bound,
             use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             varlen_is_aligned=varlen_is_aligned,
             single_sequence_length=single_sequence_length,
         )
@@ -1232,6 +1270,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         safe_gate: bool = False,
         lower_bound: Optional[float] = None,
         use_gate_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         varlen_is_aligned: Optional[bool] = None,
@@ -1239,6 +1278,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> torch.Tensor:
         del q, k, g, beta, state_pool, state_indices
         del scale, cu_seqlens, chunk_indices, chunk_size, safe_gate
-        del lower_bound, use_gate_in_kernel, A_log, dt_bias
+        del lower_bound, use_gate_in_kernel, use_beta_sigmoid_in_kernel, A_log, dt_bias
         del varlen_is_aligned, single_sequence_length
         return v.new_empty(v.shape)

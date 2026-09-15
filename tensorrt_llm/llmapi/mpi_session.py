@@ -32,63 +32,88 @@ if ENABLE_MULTI_DEVICE:
 T = TypeVar("T")
 
 _FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
+_FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
+_FLASHINFER_WORKSPACE_MANAGED_ENV = "TRTLLM_FLASHINFER_WORKSPACE_MANAGED"
 _FLASHINFER_WORKER_BOOTSTRAP = """
 import fcntl
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from mpi4py import MPI
 
 workspace_lock = None
+temporary_workspace = None
 rank = "unknown"
-if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
-    try:
-        workspace_root = Path(sys.argv[1]).expanduser()
-        rank = MPI.COMM_WORLD.Get_rank()
-        slot = rank
-        slot_stride = MPI.COMM_WORLD.Get_size()
-        # Reuse the rank's cache when possible. Concurrent pools with the same
-        # rank skip locked slots in world-size strides, keeping every worker apart.
-        while True:
-            workspace = workspace_root / f"rank-{slot}"
-            workspace.mkdir(parents=True, exist_ok=True)
-            workspace_lock = (workspace / ".lock").open("a")
-            try:
-                fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                workspace_lock.close()
-                workspace_lock = None
-                slot += slot_stride
+# ``MPIPoolExecutor(env=...)`` overlays the inherited environment; omitting a
+# variable does not unset it. This bootstrap is selected only when automatic
+# isolation is required, so replace any launcher-managed parent workspace.
+os.environ.pop("FLASHINFER_WORKSPACE_BASE", None)
+try:
+    rank = MPI.COMM_WORLD.Get_rank()
+    workspace_root = Path(sys.argv[1]).expanduser()
+    slot = rank
+    slot_stride = MPI.COMM_WORLD.Get_size()
+    # Reuse the rank's cache when possible. Concurrent pools with the same
+    # rank skip locked slots in world-size strides, keeping every worker apart.
+    # Slots intentionally persist for JIT cache reuse, so the workspace root
+    # can grow to the high-water mark of concurrent pools.
+    while True:
+        workspace = workspace_root / f"rank-{slot}"
+        workspace.mkdir(parents=True, exist_ok=True)
+        workspace_lock = (workspace / ".lock").open("a")
+        try:
+            fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            workspace_lock.close()
+            workspace_lock = None
+            slot += slot_stride
 
-        # Preserve FlashInfer's default cubin cache before changing its workspace
-        # base. Importing flashinfer.jit.env here would initialize all of its
-        # workspace constants before the isolated base is configured.
-        os.environ.setdefault(
-            "FLASHINFER_CUBIN_DIR",
-            str(Path.home() / ".cache" / "flashinfer" / "cubins"),
+    os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
+except Exception as error:  # noqa: BLE001
+    if workspace_lock is not None:
+        try:
+            workspace_lock.close()
+        except Exception as close_error:  # noqa: BLE001
+            print(
+                f"[trtllm] rank {rank} could not close a failed FlashInfer "
+                f"workspace lock ({close_error})",
+                file=sys.stderr,
+            )
+    workspace_lock = None
+
+    try:
+        temporary_workspace = tempfile.TemporaryDirectory(
+            prefix=f"trtllm-flashinfer-rank-{rank}-"
         )
-        os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
-    # This isolation is only a cache optimization. Any setup failure must fall
-    # back to FlashInfer's shared defaults rather than prevent the MPI worker
-    # from starting.
-    except Exception as error:  # noqa: BLE001
-        if workspace_lock is not None:
-            try:
-                workspace_lock.close()
-            except Exception as close_error:  # noqa: BLE001
-                print(
-                    f"[trtllm] rank {rank} could not close a failed FlashInfer "
-                    f"workspace lock ({close_error})",
-                    file=sys.stderr,
-                )
-        workspace_lock = None
-        print(
-            f"[trtllm] rank {rank} could not isolate its FlashInfer workspace "
-            f"({error}); falling back to FlashInfer's shared defaults",
-            file=sys.stderr,
-        )
+    except Exception as temporary_error:  # noqa: BLE001
+        raise RuntimeError(
+            f"rank {rank} could not create an isolated FlashInfer workspace; "
+            f"persistent setup failed with {error} and temporary setup "
+            f"failed with {temporary_error}. Configure "
+            f"FLASHINFER_WORKSPACE_BASE to a writable process-unique path, "
+            f"or set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 to disable "
+            f"automatic isolation if the shared-workspace risk is acceptable"
+        ) from temporary_error
+    os.environ["FLASHINFER_WORKSPACE_BASE"] = temporary_workspace.name
+    print(
+        f"[trtllm] rank {rank} could not use a persistent FlashInfer "
+        f"workspace ({error}); using temporary workspace "
+        f"{temporary_workspace.name}",
+        file=sys.stderr,
+    )
+
+os.environ["TRTLLM_FLASHINFER_WORKSPACE_MANAGED"] = "1"
+
+# Preserve FlashInfer's default cubin cache without importing
+# flashinfer.jit.env. The environment must be fully configured before that
+# module initializes its workspace constants.
+if "FLASHINFER_CUBIN_DIR" not in os.environ and os.environ.get("HOME"):
+    os.environ["FLASHINFER_CUBIN_DIR"] = str(
+        Path(os.environ["HOME"]) / ".cache" / "flashinfer" / "cubins"
+    )
 
 from mpi4py.futures.server import main
 
@@ -112,6 +137,15 @@ finally:
             print(
                 f"[trtllm] rank {rank} could not close the FlashInfer "
                 f"workspace lock ({error})",
+                file=sys.stderr,
+            )
+    if temporary_workspace is not None:
+        try:
+            temporary_workspace.cleanup()
+        except OSError as error:
+            print(
+                f"[trtllm] rank {rank} could not remove the temporary "
+                f"FlashInfer workspace ({error})",
                 file=sys.stderr,
             )
 """
@@ -522,10 +556,20 @@ class MpiPoolSession(MpiSession):
             if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
                 "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
         }
+        workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)
-        isolate_workspace = (self.n_workers > 1 and env.get(
-            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "0") == "1"
-                             and "FLASHINFER_WORKSPACE_BASE" not in env)
+        explicit_workspace_override = (_FLASHINFER_WORKSPACE_ENV
+                                       in self._env_overrides)
+        isolate_workspace = (
+            (self.n_workers > 1 or workspace_managed)
+            and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+            and (_FLASHINFER_WORKSPACE_ENV not in env or
+                 (workspace_managed and not explicit_workspace_override)))
+        if isolate_workspace:
+            env.pop(_FLASHINFER_WORKSPACE_ENV, None)
+        elif explicit_workspace_override:
+            # The override is user-owned, including in any further nested pool.
+            env.pop(_FLASHINFER_WORKSPACE_MANAGED_ENV, None)
         python_args = ([
             "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
         ] if isolate_workspace else None)

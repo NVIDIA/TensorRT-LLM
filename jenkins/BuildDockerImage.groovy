@@ -700,12 +700,18 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        (stageNames.ciImageSBSAUbuntu): [
-            arch: "arm64",
-            target: "ubuntu24",
-            args: "PYTHON_VERSION=3.12.3",
-            postTag: "-py312",
-        ],
+        // TODO(dlfw-26.08): re-enable once a CUDA 13.4 base image exists. This one builds on
+        // nvcr.io/nvidia/cuda:13.3.1-devel-ubuntu24.04 and, unlike rockylinux8, never reinstalls
+        // the toolkit (install_cuda_toolkit.sh only handles Rocky), so its nvcc would stay at
+        // 13.3.1 while the libraries move to 13.4. nvcr.io/nvidia/cuda tops out at 13.3.1 today.
+        // Disabled by commenting out the build config rather than the stage name, so the name
+        // stays valid where it is referenced below.
+        // (stageNames.ciImageSBSAUbuntu): [
+        //     arch: "arm64",
+        //     target: "ubuntu24",
+        //     args: "PYTHON_VERSION=3.12.3",
+        //     postTag: "-py312",
+        // ],
         (stageNames.ngcReleaseX86): [
             target: "ngc-release",
             action: release_action,
@@ -758,7 +764,9 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
     if (buildCiImage) {
-        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+        // TODO(dlfw-26.08): restore ciImageSBSAUbuntu here when its build config above is
+        // uncommented.
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312]
     }
     if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
@@ -876,6 +884,10 @@ pipeline {
     environment {
         CCACHE_DIR="${CCACHE_DIR}"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        // Picked up by docker/Makefile and handed to `docker buildx build` as a
+        // BuildKit secret, which authenticates the github.com clones inside the
+        // image build (docker/common/github_auth.sh).
+        GITHUB_CLONE_TOKEN = credentials('github_read_public_only_token')
     }
     stages {
         stage("Setup Environment") {
@@ -1021,7 +1033,7 @@ pipeline {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
-                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
                             def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {

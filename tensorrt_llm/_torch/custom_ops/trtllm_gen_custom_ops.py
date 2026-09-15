@@ -238,7 +238,7 @@ def prepare_dummy_topk_and_hook(
     def make_routing_method():
 
         # Lazy import to avoid circular import: fused_moe imports from this module.
-        from tensorrt_llm._torch.modules.fused_moe.routing import (
+        from tensorrt_llm._torch.moe.fused_moe.routing import (
             ROUTING_METHOD_TYPE_TO_CLASS, RoutingMethodType)
 
         # Get routing method

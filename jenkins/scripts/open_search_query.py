@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,8 +18,8 @@
 #
 # This module provides functions to query the OpenSearch database for passed
 # test results from previous pipeline runs. It retrieves test names that have
-# passed for a given commit ID and stage name, which can be reused to skip
-# redundant test execution in subsequent runs.
+# passed for a given commit ID and stage-name patterns, which can be reused to
+# skip redundant test execution in subsequent runs.
 #
 # Main functionality:
 # - queryJobEvents: Queries OpenSearch for job events with pagination support
@@ -36,12 +36,12 @@ import sys
 from open_search_db import OpenSearchDB
 
 
-def queryJobEvents(commitID="", stageName="", onlySuccess=True):
+def queryJobEvents(commitID="", stageNamePattern="", onlySuccess=True):
     """Query OpenSearch database for job events with pagination.
 
     Args:
         commitID: Git commit SHA to filter by (optional)
-        stageName: Stage name to filter by (optional)
+        stageNamePattern: Non-empty regular-expression stage-name pattern to filter by
         onlySuccess: If True, only return PASSED tests (default: True)
 
     Returns:
@@ -50,8 +50,9 @@ def queryJobEvents(commitID="", stageName="", onlySuccess=True):
     mustConditions = []
     if commitID:
         mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
-    if stageName:
-        mustConditions.append({"term": {"s_stage_name": stageName}})
+    if not stageNamePattern:
+        raise ValueError("stageNamePattern cannot be empty")
+    mustConditions.append({"regexp": {"s_stage_name": stageNamePattern}})
     if onlySuccess:
         mustConditions.append({"term": {"s_status": "PASSED"}})
 
@@ -103,8 +104,12 @@ def writeTestListToFile(testList, fileName):
             f.write(test + "\n")
 
 
-def getPassedTestList(commitID, stageName, outputFile):
-    hits = queryJobEvents(commitID=commitID, stageName=stageName, onlySuccess=True)
+def getPassedTestList(commitID, stageNamePattern, outputFile):
+    hits = queryJobEvents(
+        commitID=commitID,
+        stageNamePattern=stageNamePattern,
+        onlySuccess=True,
+    )
     # Use set to automatically remove duplicates
     testSet = set()
     for hit in hits:
@@ -114,11 +119,19 @@ def getPassedTestList(commitID, stageName, outputFile):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--commit-id", required=True, help="Commit ID")
-    parser.add_argument("--stage-name", required=True, help="Stage Name")
+    parser.add_argument(
+        "--stage-name-pattern",
+        required=True,
+        help="Regular-expression stage-name pattern to query",
+    )
     parser.add_argument("--output-file", required=True, help="Output File")
     args = parser.parse_args(sys.argv[1:])
+    if not args.stage_name_pattern:
+        parser.error("--stage-name-pattern cannot be empty")
     getPassedTestList(
-        commitID=args.commit_id, stageName=args.stage_name, outputFile=args.output_file
+        commitID=args.commit_id,
+        stageNamePattern=args.stage_name_pattern,
+        outputFile=args.output_file,
     )

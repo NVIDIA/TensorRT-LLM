@@ -129,9 +129,9 @@ static bool isSupportedFhcHiddenRuntime(int hidden_size)
 }
 
 // Validate the tcgen05 MMA fused-HC compile-time shape contract. Hidden must
-// be divisible into BLOCK_K tiles, kNumSplits must evenly divide those tiles,
-// and the hidden dimension must be a multiple of BF16_VEC_LI (per-thread vector
-// load granularity in the Phase 4 layer_input loop). The (Hidden % team-stride)
+// be divisible into BLOCK_K tiles, and the hidden dimension must be a multiple
+// of BF16_VEC_LI (per-thread vector load granularity in the Phase 4
+// layer_input loop). The (Hidden % team-stride)
 // alignment is no longer required: the layer_input loop has a scalar-vec tail
 // that handles the residue after the vectorized main loop. Keep this in sync
 // with the Python tactic filter (_fused_hc_mma_ks_supported in mhc_cuda.py).
@@ -144,7 +144,13 @@ static constexpr bool isSupportedFhcMmaKS()
     constexpr uint32_t hTilesPerHc = Hidden / FHC_BLOCK_K;
     constexpr uint32_t bf16VecLi = 8;
 
-    return Hidden % FHC_BLOCK_K == 0 && hTilesPerHc % KS == 0 && Hidden % bf16VecLi == 0;
+    // The kernels distribute remainder tiles over their first splits, so KS need
+    // not divide hTilesPerHc. Keep the uneven surface to the two measured H=7168
+    // shapes rather than instantiating every split count.
+    constexpr bool evenSplit = hTilesPerHc % KS == 0;
+    constexpr bool singleWaveSplit = Hidden == FHC_HIDDEN_PRO && (KS == 53 || KS == 106);
+
+    return Hidden % FHC_BLOCK_K == 0 && KS <= hTilesPerHc && (evenSplit || singleWaveSplit) && Hidden % bf16VecLi == 0;
 }
 
 static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gmemInner, uint64_t gmemOuter,
@@ -335,8 +341,10 @@ static FusedRoutFn pickFhc(uint32_t ks)
     case 16: return fhcInstanceIfSupported<Hidden, 16>();
     case 28: return fhcInstanceIfSupported<Hidden, 28>();
     case 32: return fhcInstanceIfSupported<Hidden, 32>();
+    case 53: return fhcInstanceIfSupported<Hidden, 53>();
     case 56: return fhcInstanceIfSupported<Hidden, 56>();
     case 64: return fhcInstanceIfSupported<Hidden, 64>();
+    case 106: return fhcInstanceIfSupported<Hidden, 106>();
     case 112: return fhcInstanceIfSupported<Hidden, 112>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
@@ -619,8 +627,10 @@ static FusedAllInOneFn pickFhcAllInOne(uint32_t ks)
     case 16: return fhcAllInOneInstanceIfSupported<Hidden, 16, kFuseNorm>();
     case 28: return fhcAllInOneInstanceIfSupported<Hidden, 28, kFuseNorm>();
     case 32: return fhcAllInOneInstanceIfSupported<Hidden, 32, kFuseNorm>();
+    case 53: return fhcAllInOneInstanceIfSupported<Hidden, 53, kFuseNorm>();
     case 56: return fhcAllInOneInstanceIfSupported<Hidden, 56, kFuseNorm>();
     case 64: return fhcAllInOneInstanceIfSupported<Hidden, 64, kFuseNorm>();
+    case 106: return fhcAllInOneInstanceIfSupported<Hidden, 106, kFuseNorm>();
     case 112: return fhcAllInOneInstanceIfSupported<Hidden, 112, kFuseNorm>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }

@@ -27,20 +27,11 @@ import types
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import precheck_config as pcfg
+import run_precheck as rp
 
-import precheck_config as pcfg  # noqa: E402
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+_PRECHECK_DIR = os.path.dirname(os.path.abspath(pcfg.__file__))
 
 
 def _disagg_yaml(ctx_extra=None, gen_extra=None, **overrides):
@@ -541,7 +532,7 @@ def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
     )
 
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     commands = result.stdout.splitlines()
 
@@ -582,7 +573,7 @@ def test_precheck_commands_split_pytest_common_vars(monkeypatch):
     )
 
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     tokens = shlex.split(result.stdout.splitlines()[0])
 
@@ -633,6 +624,7 @@ def test_precheck_commands_export_model_root_safely(model_root, monkeypatch):
         text=True,
         capture_output=True,
         check=True,
+        timeout=60,
     )
     assert result.stdout == model_root
 
@@ -785,7 +777,9 @@ pytestCommandCTXPrecheck=ctx-command
 precheckRunScript=/unused
 run_cache_transceiver_precheck
 """
-    subprocess.run(["bash"], input=shell_script, capture_output=True, check=True, text=True)
+    subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
+    )
 
     status_dir = tmp_path / "output" / "cache_transceiver_precheck" / "status"
     for name in ("gen_0", "ctx_0"):
@@ -847,7 +841,7 @@ run_cache_transceiver_precheck
 printf '%s\n%s\n' "$DISAGG_SERVING_TYPE" "$pytestCommand"
 """
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     assert result.stdout.splitlines()[-2:] == ["REAL_PERF_PARENT", "real-perf-command"]
 
@@ -922,7 +916,6 @@ class TestMultiPeerOrchestration:
         fail_ctx=False,
         wave_delay_s=0,
     ):
-        import sys
         import types
 
         # PrecheckRunner.__init__ imports mpi4py only to ensure MPI init.
@@ -1240,7 +1233,6 @@ def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
     delivered via bcast the rank must raise; with a clean (None) broadcast it
     must return normally.
     """
-    import sys
     import types
 
     monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))

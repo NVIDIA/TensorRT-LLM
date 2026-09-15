@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
@@ -64,7 +65,9 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mHistoryLength(0)
     , mExpectedPromptLength(
           expectedPromptLength.has_value() ? std::optional<int>{std::max(*expectedPromptLength, 0)} : std::nullopt)
-    , mNumTokensBeforeHybridPruning(reuseMatch.has_value() ? reuseMatch->numTokensBeforeHybridPruning : 0)
+    , mNumReusableTokensBeforeHybridPruning(
+          reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforeHybridPruning : 0)
+    , mNumReusableTokensBeforePruning(reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforePruning : 0)
     , mEnableRequestStats(enableRequestStats)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
@@ -110,6 +113,10 @@ KvCache::~KvCache()
 {
     try
     {
+        // close() takes the exclusive API lock. When Python drops the last reference nanobind runs
+        // this from tp_dealloc with the GIL held, which deadlocks against a lock holder waiting on
+        // the GIL to run a Python callback. Drop the GIL first if we happen to hold it.
+        OptionalGilRelease const gilRelease;
         close();
     }
     catch (...)
@@ -256,15 +263,17 @@ void KvCache::activate()
 
 bool KvCache::resume(std::optional<CUstream> stream)
 {
-    TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
+    TLLM_CHECK(mStatus == Status::SUSPENDED);
 
     // Set stream first (mirrors Python: self.cuda_stream = cuda_stream).
     if (stream.has_value())
     {
         setCudaStream(*stream);
     }
-    TLLM_CHECK_DEBUG_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
+    TLLM_CHECK_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
+
+    auto const apiLock = mManager->lockExclusive();
 
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kHotLevel);
@@ -476,13 +485,23 @@ bool KvCache::resume(std::optional<CUstream> stream)
             mBlocks[lastOrdinal].treeBlock = nullptr;
     }
 
+    // A freshly-created cache starts SUSPENDED and is activated by this same
+    // resume() call, so gate the counter on mNeverResumed: only a cache that was
+    // previously ACTIVE and got suspended counts as a preemption recovery.
+    // Without this, the counter would track request admissions, not preemption.
+    bool const firstActivation = mNeverResumed;
     mNeverResumed = false;
     mStatus = Status::ACTIVE;
+    if (!firstActivation && _shouldRecordStats())
+    {
+        mManager->recordRequestResumed();
+    }
     return true;
 }
 
 bool KvCache::prefetch(CacheLevel target)
 {
+    auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
     CacheLevel const numTiers = storageMgr.numCacheLevels();
@@ -520,6 +539,7 @@ bool KvCache::prefetch(CacheLevel target)
 
 void KvCache::suspend()
 {
+    auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(_checkSanity());
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
@@ -552,10 +572,15 @@ void KvCache::suspend()
         _freeScratchSlots();
     }
     mStatus = Status::SUSPENDED;
+    if (_shouldRecordStats())
+    {
+        mManager->recordRequestSuspended();
+    }
 }
 
 void KvCache::close()
 {
+    auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(_checkSanity());
     if (mStatus == Status::CLOSED)
         return;
@@ -595,6 +620,7 @@ void KvCache::close()
 
 KVCacheStatsDelta KvCache::commitPendingStats()
 {
+    auto const apiLock = mManager->lockExclusive();
     if (!_shouldRecordStats())
     {
         discardPendingStats();
@@ -615,6 +641,7 @@ KVCacheStatsDelta KvCache::commitPendingStats()
 
 void KvCache::discardPendingStats()
 {
+    auto const apiLock = mManager->lockExclusive();
     mPendingStats.clear();
     mManager->clearStatsDirty(id);
 }
@@ -671,17 +698,26 @@ void KvCache::_recordMigratedSlots(
         return;
     }
     TLLM_CHECK_DEBUG(pages.size() == slots.size());
+
+    // One migration batch moves every page between the same pair of cache levels and does not
+    // mutate the storage while we record, so the per-page contributions differ only by life
+    // cycle. Aggregate them and commit once: commitStats() re-samples the peak block statistics
+    // on every call, which is O(cache levels x pool groups), so committing per page turns a
+    // long-sequence eviction into thousands of redundant full scans.
+    KVCacheStatsDelta stats{};
+    IterationStatsByLifeCycle iterationStatsByLifeCycle{};
+    bool recorded = false;
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
         bool const isAttention = std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle));
 
-        KVCacheStatsDelta stats;
-        KVCacheIterationStatsDelta iterationStats;
         if (srcLevel == kHotLevel && dstLevel > kHotLevel)
         {
-            iterationStats.iterOffloadBlocks = 1;
-            iterationStats.iterOffloadBytes = sumSlotBytes(mManager->storage(), dstLevel, lifeCycle);
+            auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
+            iterationStats.iterOffloadBlocks += 1;
+            iterationStats.iterOffloadBytes += sumSlotBytes(mManager->storage(), dstLevel, lifeCycle);
+            recorded = true;
         }
         else if (dstLevel == kHotLevel)
         {
@@ -689,46 +725,48 @@ void KvCache::_recordMigratedSlots(
             // reported by lifecycle/pool-group iteration statistics instead.
             if (isAttention)
             {
-                stats.allocTotalBlocks = 1;
-                stats.allocNewBlocks = 1;
+                stats.allocTotalBlocks += 1;
+                stats.allocNewBlocks += 1;
             }
-            iterationStats.iterAllocTotalBlocks = 1;
-            iterationStats.iterAllocNewBlocks = 1;
+            auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
+            iterationStats.iterAllocTotalBlocks += 1;
+            iterationStats.iterAllocNewBlocks += 1;
             if (srcLevel > kHotLevel)
             {
-                iterationStats.iterOnboardBlocks = 1;
-                iterationStats.iterOnboardBytes = sumSlotBytes(mManager->storage(), srcLevel, lifeCycle);
+                iterationStats.iterOnboardBlocks += 1;
+                iterationStats.iterOnboardBytes += sumSlotBytes(mManager->storage(), srcLevel, lifeCycle);
             }
             else if (srcLevel == kHotLevel)
             {
-                iterationStats.iterIntraDeviceCopyBlocks = 1;
-                iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(mManager->storage(), kHotLevel, lifeCycle);
+                iterationStats.iterIntraDeviceCopyBlocks += 1;
+                iterationStats.iterIntraDeviceCopyBytes += sumSlotBytes(mManager->storage(), kHotLevel, lifeCycle);
             }
+            recorded = true;
         }
+    }
 
-        if (!stats.empty() || !iterationStats.empty())
-        {
-            IterationStatsByLifeCycle iterationStatsByLifeCycle;
-            iterationStatsByLifeCycle.emplace(lifeCycle, iterationStats);
-            mManager->commitStats(stats, iterationStatsByLifeCycle);
-        }
+    if (recorded)
+    {
+        mManager->commitStats(stats, iterationStatsByLifeCycle);
     }
 }
 
 void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
 {
-    if (!_shouldRecordManagerStats())
+    if (!_shouldRecordManagerStats() || pages.empty())
     {
         return;
     }
+    // Aggregate per life cycle and commit once — see _recordMigratedSlots for why.
+    IterationStatsByLifeCycle iterationStatsByLifeCycle;
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        KVCacheIterationStatsDelta iterationStats;
-        iterationStats.iterHostDroppedBlocks = 1;
-        iterationStats.iterHostDroppedBytes = sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle);
-        _recordDirectIterationStats(lifeCycle, iterationStats);
+        auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
+        iterationStats.iterHostDroppedBlocks += 1;
+        iterationStats.iterHostDroppedBytes += sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle);
     }
+    mManager->commitStats({}, iterationStatsByLifeCycle);
 }
 
 void KvCache::_recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdinal blockEnd,
@@ -1023,6 +1061,7 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
 
 bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLength)
 {
+    auto const lock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(mBlocks.size() == BlockOrdinal{divUp(mCapacity, mTokensPerBlock)});
 
@@ -1362,6 +1401,10 @@ void KvCache::_refreshGenerationAllocReady()
     }
 }
 
+// ---------------------------------------------------------------------------
+// Capacity management
+// ---------------------------------------------------------------------------
+
 void KvCache::_decreaseCapacity(BlockOrdinal newNumBlocks)
 {
     while (mBlocks.size() > newNumBlocks)
@@ -1384,6 +1427,7 @@ void KvCache::setBeamWidth(BeamIndex beamWidth)
         return;
     if (mStatus == Status::CLOSED)
         throw LogicError("Cannot change beam_width after close()");
+    auto const apiLock = mManager->lockExclusive();
     if (mManager->enablePartialCommit())
         throw AssertionError("beam_width changes are not supported with partial commit");
 
@@ -1884,7 +1928,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 
 void KvCache::commit(TokenSpan tokens, bool isEnd)
 {
-    TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
+    TLLM_CHECK(isActive());
+    auto const apiLock = mManager->lockExclusive();
     if (tokens.size() == 0)
     {
         if (isEnd)
@@ -1962,6 +2007,7 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
 
 void KvCache::stopCommitting()
 {
+    auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus != Status::CLOSED);
     if (mCommitState == CommitState::USER_STOP)
         return;
@@ -1996,8 +2042,12 @@ void KvCache::stopCommitting()
 // PlannedDropHandle — mirrors Python's PlannedDropHandle.
 // ---------------------------------------------------------------------------
 
-PlannedDropHandle::PlannedDropHandle(std::vector<CommittedPage*> const& pages)
+PlannedDropHandle::PlannedDropHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages)
+    : mManager(manager.shared_from_this())
 {
+    // Exclusive: mutates pages reachable from the radix tree and copies non-atomic refcounts.
+    auto const apiLock = mManager->lockExclusive();
+
     // Deduplicate by identity (mirrors Python's {id(page): page} dict).
     std::vector<CommittedPage*> unique;
     std::unordered_set<CommittedPage*> seen;
@@ -2020,8 +2070,11 @@ PlannedDropHandle::PlannedDropHandle(std::vector<CommittedPage*> const& pages)
 
 void PlannedDropHandle::drop()
 {
-    if (!mPageRefs.has_value())
-        throw std::invalid_argument("Planned drop handle has already been dropped");
+    // Exclusive: touches non-atomic refcounts and the shared eviction list. Reachable from any
+    // thread -- the binding releases the GIL, and the destructor fires wherever CPython collects.
+    auto const apiLock = mManager->lockExclusive();
+
+    TLLM_CHECK_WITH_INFO(mPageRefs.has_value(), "Planned drop handle has already been dropped");
 
     std::vector<SharedPtr<CommittedPage>> pages;
     for (auto const& ref : *mPageRefs)
@@ -2029,8 +2082,7 @@ void PlannedDropHandle::drop()
         auto page = ref.lock();
         if (page)
         {
-            if (page->plannedDropCount <= 0)
-                throw std::invalid_argument("Committed page has no planned drop");
+            TLLM_CHECK_WITH_INFO(page->plannedDropCount > 0, "Committed page has no planned drop");
             pages.push_back(std::move(page));
         }
     }
@@ -2054,6 +2106,9 @@ PlannedDropHandle::~PlannedDropHandle()
         // Destructors must not throw; swallow any error.
         try
         {
+            // drop() takes the exclusive API lock. The explicit drop() binding releases the GIL,
+            // but this path runs from tp_dealloc/GC with the GIL held, so release it here too.
+            OptionalGilRelease const gilRelease;
             drop();
         }
         catch (...)
@@ -2064,6 +2119,7 @@ PlannedDropHandle::~PlannedDropHandle()
 
 std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
 {
+    auto const apiLock = mManager->lockExclusive();
     if (mCommitState != CommitState::USER_STOP)
         throw LogicError("plan_committed_block_drop() requires stop_committing()");
 
@@ -2071,7 +2127,8 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
     if (numCommittedTokens() == 0)
         return nullptr;
 
-    auto const match = mManager->matchReuse(mReuseScope, toSpan(mCommittedTokens), textOnly());
+    auto const match = mManager->radixTree().match(
+        mReuseScope, toSpan(mCommittedTokens), textOnly(), mManager->enablePartialMatch());
     if (match.numTokens != numCommittedTokens() || match.blocks.empty())
         return nullptr;
 
@@ -2103,7 +2160,7 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
             pagesToDrop.push_back(page);
         }
     }
-    return std::make_unique<PlannedDropHandle>(pagesToDrop);
+    return std::make_unique<PlannedDropHandle>(*mManager, pagesToDrop);
 }
 
 // ---------------------------------------------------------------------------
@@ -2533,6 +2590,8 @@ Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx
 
 std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex beamIdx, bool validOnly) const
 {
+    // Shared: reads each Page's slot id, which a concurrent migration reassigns. Returns by value.
+    auto const apiLock = mManager->lockShared();
     std::vector<int> result;
     result.reserve(mBlocks.stdSize());
     for (auto const& sb : mBlocks)
@@ -2599,6 +2658,8 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
 
 int KvCache::getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx) const
 {
+    // Lock-free: an ACTIVE cache holds its SSM page locked, so eviction cannot reassign the slot.
+    TLLM_CHECK_WITH_INFO(isActive(), "getSsmBlockBaseIndex() requires an ACTIVE KvCache");
     auto const& bp = mSsmBlocks.at(beamIdx).at(lgId);
     if (blockPageIsNull(bp))
         return kBadPageIndex.value();
@@ -2662,6 +2723,9 @@ int KvCache::_swaScratchMaxRewindLen() const
 
 std::optional<ScratchDesc> KvCache::getScratchDesc(LayerGroupId lgId) const
 {
+    // Lock-free: scratch slots are exclusively owned by this KvCache and defrag-cased page movement
+    // happens only when all KvCache instances are suspended, which means mScratchSlots is empty.
+    TLLM_CHECK_WITH_INFO(isActive(), "getScratchDesc() requires an ACTIVE KvCache");
     auto const& lc = mManager->lifeCycles().getLifeCycle(lgId);
     auto sr = _getScratchRange(lc);
     if (!sr)
@@ -2675,6 +2739,7 @@ std::optional<ScratchDesc> KvCache::getScratchDesc(LayerGroupId lgId) const
 
 void KvCache::setEnableSwaScratchReuse(bool enable)
 {
+    auto const apiLock = mManager->lockExclusive();
     if (enable == mEnableSwaScratchReuse)
         return;
     if (enable)
@@ -2701,6 +2766,7 @@ bool KvCache::textOnly() const noexcept
 
 void KvCache::setTextOnly(bool textOnly)
 {
+    auto const apiLock = mManager->lockExclusive();
     // A text-only deployment is a hard guarantee: a request may not opt out.
     if (!textOnly && mManager->textOnly())
     {
