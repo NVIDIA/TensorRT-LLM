@@ -106,15 +106,20 @@ import cutlass.torch as cutlass_torch
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch.utils import ActivationType
-
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+    from tensorrt_llm._torch.kernels.blackwell import (
         dense_blockscaled_gemm_act_fusion as kernel_module,
     )
+    from tensorrt_llm._torch.utils import ActivationType
 except (ModuleNotFoundError, ImportError):
-    sys.path.insert(0, str(Path(__file__).parents[3] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell import dense_blockscaled_gemm_act_fusion as kernel_module
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[3])
+    from tensorrt_llm._torch.kernels.blackwell import (
+        dense_blockscaled_gemm_act_fusion as kernel_module,
+    )
+    from tensorrt_llm._torch.utils import ActivationType
 
 Sm100BlockScaledPersistentDenseGemmActFusionKernel = (
     kernel_module.Sm100BlockScaledPersistentDenseGemmActFusionKernel

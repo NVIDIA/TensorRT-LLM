@@ -586,7 +586,7 @@ def test_cute_dsl_blockscaled_rubin_runner_hierarchy():
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
         CuteDSLBlockScaledRubinLinear, CuteDSLMXFP8RubinLinear,
         CuteDSLNVFP4RubinLinear)
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.dense_blockscaled_gemm_persistent import \
+    from tensorrt_llm._torch.kernels.rubin.dense_blockscaled_gemm_persistent import \
         Sm107BlockScaledPersistentDenseGemmMixedClustersKernel
 
     assert CuteDSLNVFP4RubinLinear.__bases__ == (

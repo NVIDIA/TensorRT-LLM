@@ -507,14 +507,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel
     from ..cute_dsl_kernels.blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import \
         Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel
-    from ..cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import \
-        Sm100BlockwiseGemmKernel
-    from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
-        Sm100BlockScaledPersistentDenseGemmActFusionKernel
-    from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
-        Sm100BlockScaledPersistentDenseGemmKernel
-    from ..cute_dsl_kernels.blackwell.dense_gemm_persistent import \
-        PersistentDenseGemmKernel
     from ..cute_dsl_kernels.blackwell.moe_as_dense_gemm.fc1 import \
         Sm100BlockScaledPersistentDenseGemmKernel as DenseGemmSwigluKernel
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
@@ -529,7 +521,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..cute_dsl_kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
-    from ..cute_dsl_kernels.blackwell.utils import make_ptr
+    from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
+        Sm100BlockwiseGemmKernel
+    from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
+        Sm100BlockScaledPersistentDenseGemmActFusionKernel
+    from ..kernels.blackwell.dense_blockscaled_gemm_persistent import \
+        Sm100BlockScaledPersistentDenseGemmKernel
+    from ..kernels.blackwell.dense_gemm_persistent import \
+        PersistentDenseGemmKernel
+    from ..kernels.blackwell.utils import make_ptr
 
     @functools.cache
     def _get_full_device_max_active_clusters(device_id: int,
@@ -8738,10 +8738,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     #  CuTe DSL MiniMax-M3 index decode scoring (Blackwell SM100)         #
     # ------------------------------------------------------------------ #
-    from ..cute_dsl_kernels.blackwell.cute_ptx_utils import \
-        TORCH_TO_CUTE_DTYPE as _M3_TORCH_TO_CUTE_DTYPE
     from ..cute_dsl_kernels.blackwell.minimax_m3_index_decode_score import \
         IndexDecodeScoreKernel
+    from ..kernels.blackwell.cute_ptx_utils import \
+        TORCH_TO_CUTE_DTYPE as _M3_TORCH_TO_CUTE_DTYPE
 
     class CuteDSLMiniMaxM3IndexDecodeScoreRunner:
         """Runner for the MiniMax-M3 indexer decode block-scoring kernel.
@@ -9566,9 +9566,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # provides the SM107 helpers (IS_CUTLASS_DSL_RUBIN_AVAILABLE).
 
     if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
-        from ..cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import \
+        from ..kernels.rubin.dense_bf16_gemm_persistent import \
             PersistentDenseGemmKernel as Sm107Bf16PersistentDenseGemmKernel
-        from ..cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import \
+        from ..kernels.rubin.dense_bf16_gemm_persistent import \
             PersistentDenseGemmKernelPreferredCluster as \
             Sm107Bf16PersistentDenseGemmKernelPreferredCluster
     else:
@@ -11821,15 +11821,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # BMM, block-scaled (NVFP4 / MXFP8) GEMM, the DSv4 q_b fusion and the
         # FP8 per-tensor GEMM. Every op raises unless get_sm_version() == 107.
 
-        from ..cute_dsl_kernels.rubin.blockwise_gemm import \
-            SM107BlockwiseGemmKernel
-        from ..cute_dsl_kernels.rubin.dense_blockscaled_gemm_persistent import (
-            Sm107BlockScaledPersistentDenseGemmKernel,
-            Sm107BlockScaledPersistentDenseGemmMixedClustersKernel)
-        from ..cute_dsl_kernels.rubin.dense_gemm_persistent import \
-            SM107PersistentDenseGemmKernel
         from ..cute_dsl_kernels.rubin.dsv4_qb_fusion.kernel import \
             compile as compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant
+        from ..kernels.rubin.blockwise_gemm import SM107BlockwiseGemmKernel
+        from ..kernels.rubin.dense_blockscaled_gemm_persistent import (
+            Sm107BlockScaledPersistentDenseGemmKernel,
+            Sm107BlockScaledPersistentDenseGemmMixedClustersKernel)
+        from ..kernels.rubin.dense_gemm_persistent import \
+            SM107PersistentDenseGemmKernel
 
         # SM107 FP8 blockwise GEMM
         # ====================================================================

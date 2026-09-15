@@ -33,8 +33,17 @@ from cutlass import Float8E4M3FN, Float16, Float32, Int64, Uint32, cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from .cute_ptx_utils import EVICT_FIRST, fp8x4_to_fp16x4, mma_sync, simple_tma_copy
-from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
+    EVICT_FIRST,
+    fp8x4_to_fp16x4,
+    mma_sync,
+    simple_tma_copy,
+)
+from tensorrt_llm._torch.kernels.blackwell.utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
 
 __all__ = ["IndexDecodeScoreKernel"]
 

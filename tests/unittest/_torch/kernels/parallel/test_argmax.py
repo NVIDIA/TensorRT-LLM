@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -10,8 +10,14 @@ Only float32 uses the CuTE kernel; float16/bfloat16 use torch.max fallback.
 
 import pytest
 import torch
+from utils.util import getSMVersion
 
-from tensorrt_llm._torch.cute_dsl_kernels.argmax import argmax
+from tensorrt_llm._torch.kernels.argmax import argmax
+
+pytestmark = pytest.mark.skipif(
+    getSMVersion() < 90,
+    reason="the CuTe DSL argmax kernel is only supported on SM90+",
+)
 
 # Increase dynamo cache for parameterized tests
 torch._dynamo.config.cache_size_limit = 1024

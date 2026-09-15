@@ -162,8 +162,9 @@
 /cpp/tensorrt_llm/kernels @NVIDIA/trt-llm-kernels-devs
 /cpp/tensorrt_llm/thop @NVIDIA/trt-llm-kernels-devs
 /cpp/tests/unit_tests/kernels @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/cuda_tile_kernels @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/cute_dsl_kernels @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/kernels @NVIDIA/trt-llm-kernels-devs
+/tests/unittest/_torch/kernels @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/thop @NVIDIA/trt-llm-kernels-devs
 
 # ===== MODELS =====

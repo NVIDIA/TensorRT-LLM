@@ -24,7 +24,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import fmin, silu_f32
+from tensorrt_llm._torch.kernels.blackwell.utils import fmin, silu_f32
 
 """
 This example provides an experimental implementation of the SM100 batched dense blockscaled

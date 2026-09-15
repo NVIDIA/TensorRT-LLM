@@ -21,7 +21,12 @@ import cutlass.utils as utils
 import torch
 from cutlass.torch import dtype as torch_dtype
 
-from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+from tensorrt_llm._torch.kernels.blackwell.utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
+
 from .filtered_top_k_varlen_util import (
     FilteredTopKKernelVarlen,
     compare_top_k_results,

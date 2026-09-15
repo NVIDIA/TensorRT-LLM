@@ -139,9 +139,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp16.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp8.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
@@ -172,6 +169,9 @@ common-files: &common_files |
         tensorrt_llm/_torch/distributed/pg_utils.py |
         tensorrt_llm/_torch/flashinfer_utils.py |
         tensorrt_llm/_torch/hostfunc.py |
+        tensorrt_llm/_torch/kernels/blackwell/custom_pipeline.py |
+        tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py |
+        tensorrt_llm/_torch/kernels/blackwell/utils.py |
         tensorrt_llm/_torch/llm.py |
         tensorrt_llm/_torch/memory_buffer_utils.py |
         tensorrt_llm/_torch/metadata.py |
@@ -897,9 +897,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp16.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_decode_fp8.py |
         tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/mla_helpers.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py |
-        tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/__init__.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/blocked_scale.py |
         tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4/contract.py |
@@ -930,6 +927,9 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/distributed/pg_utils.py |
         tensorrt_llm/_torch/flashinfer_utils.py |
         tensorrt_llm/_torch/hostfunc.py |
+        tensorrt_llm/_torch/kernels/blackwell/custom_pipeline.py |
+        tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py |
+        tensorrt_llm/_torch/kernels/blackwell/utils.py |
         tensorrt_llm/_torch/llm.py |
         tensorrt_llm/_torch/memory_buffer_utils.py |
         tensorrt_llm/_torch/metadata.py |

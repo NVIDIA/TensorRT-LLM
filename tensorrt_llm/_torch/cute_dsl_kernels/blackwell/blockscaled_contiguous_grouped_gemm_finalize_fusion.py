@@ -37,7 +37,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .utils import (
+from tensorrt_llm._torch.kernels.blackwell.utils import (
     TRTLLM_ENABLE_PDL,
     blk_reduce_bf16,
     blk_reduce_fp16,

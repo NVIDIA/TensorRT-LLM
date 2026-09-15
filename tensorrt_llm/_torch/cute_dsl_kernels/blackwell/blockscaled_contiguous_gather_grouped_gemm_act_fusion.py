@@ -38,9 +38,8 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from ...utils import ActivationType, is_gated_activation
-from .custom_pipeline import PipelineCpAsyncUmma
-from .utils import (
+from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineCpAsyncUmma
+from tensorrt_llm._torch.kernels.blackwell.utils import (
     TRTLLM_ENABLE_PDL,
     fclip_xorsign,
     fmin,
@@ -49,6 +48,8 @@ from .utils import (
     is_power_of_2,
     silu_f32,
 )
+
+from ...utils import ActivationType, is_gated_activation
 
 SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
 

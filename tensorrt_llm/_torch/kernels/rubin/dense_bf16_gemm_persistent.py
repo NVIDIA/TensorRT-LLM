@@ -42,7 +42,7 @@ from cuda.bindings.driver import CUstream
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.dense_gemm_persistent import (
+from tensorrt_llm._torch.kernels.blackwell.dense_gemm_persistent import (
     PersistentDenseGemmKernel as BlackwellPersistentDenseGemmKernel,
 )
 

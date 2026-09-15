@@ -12,22 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Blackwell blockwise GEMM kernels.
 
-from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
-
-if IS_CUDA_TILE_AVAILABLE:
-    from .rms_norm import rms_norm_kernel, rms_norm_kernel_gather, rms_norm_kernel_static_persistent
-    from .rms_norm_fuse_residual import (
-        rms_norm_fuse_residual_kernel,
-        rms_norm_fuse_residual_kernel_gather,
-        rms_norm_fuse_residual_kernel_static_persistent,
-    )
-
-    __all__ = [
-        "rms_norm_kernel",
-        "rms_norm_kernel_gather",
-        "rms_norm_kernel_static_persistent",
-        "rms_norm_fuse_residual_kernel",
-        "rms_norm_fuse_residual_kernel_gather",
-        "rms_norm_fuse_residual_kernel_static_persistent",
-    ]
+Nothing is re-exported from this file on purpose: importing one kernel must
+not drag in the others, several of which are arch-gated.
+"""
