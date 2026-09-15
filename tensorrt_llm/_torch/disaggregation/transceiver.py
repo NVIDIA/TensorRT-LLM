@@ -50,7 +50,10 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     create_cache_reuse_adapter,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_pool_view_num_layers,
+)
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -485,9 +488,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for pv in lg.pool_views:
                 pool = get_physical_pool(pt, lg_id, pv.pool_idx)
                 if lg.kind == CacheKind.STATE:
-                    # STATE: n=1 (one slot), but transfer covers all layers.
-                    num_layers = len(lg.local_layers)
-                    total += num_layers * pool.slot_bytes
+                    # STATE: n=1 (one slot), but transfer covers all layers of
+                    # the view. The physical slot may hold several roles, so
+                    # size by the view's per-layer bytes, not the pool's slot.
+                    num_layers = get_pool_view_num_layers(pv)
+                    total += num_layers * pv.bytes_per_layer
                 else:
                     # Attention: n blocks, each slot covers all layers.
                     total += n * pool.slot_bytes

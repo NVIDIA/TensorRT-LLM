@@ -16,6 +16,13 @@ from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
                                  KvCacheConfig, MpiCommSession)
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
 
+# Skip every test in this module: the MPI publish/lookup control channel these
+# tests rely on does not work with the Open MPI 5 shipped by the DLFW 26.08 base
+# image. See https://nvbugs/6770878.
+pytestmark = pytest.mark.skip(
+    reason="Disaggregated single-GPU tests are broken on Open MPI 5, "
+    "see https://nvbugs/6770878")
+
 
 def get_ucx_tls():
     """Get UCX_TLS value based on GPU architecture.

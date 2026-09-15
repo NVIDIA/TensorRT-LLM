@@ -73,6 +73,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
   - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
+  - unittest/_torch/visual_gen/test_utils.py
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
@@ -108,6 +109,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
+  - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   # test_request_metrics.py as a whole is not registered on any list, so only the
   # two cases added with the KV-transfer fix are selected here. Registering the
@@ -154,4 +156,5 @@ l0_cpu:
   - unittest/usage
   - unittest/utils/test_logger.py
   - unittest/utils/test_confidential_compute.py
+  - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
