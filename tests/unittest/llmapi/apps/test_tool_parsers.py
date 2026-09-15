@@ -1226,6 +1226,35 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert parser._buf == ""
         assert parser._in_tool_call is False
 
+    def test_streaming_zero_arg_tool(self, parser):
+        """A call without parameter blocks streams "{}" as its arguments."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        text = ("<tool_call>\n"
+                "<function=get_time>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.parse_streaming_increment(text, tools)
+
+        names = [c.name for c in result.calls if c.name]
+        assert names == ["get_time"]
+        params = "".join(c.parameters for c in result.calls)
+        assert params == "{}", f"Expected '{{}}', got {params!r}"
+        assert params == self.make_parser().detect_and_parse(
+            text, tools).calls[0].parameters
+
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):
         """Test streaming parser handles multiple tool calls."""
