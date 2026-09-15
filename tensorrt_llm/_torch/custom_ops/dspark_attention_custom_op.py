@@ -21,7 +21,7 @@ from cutlass.cute.typing import Numeric, Pointer, Type
 from ..._utils import get_sm_version
 from ...logger import logger
 from ..cute_dsl_kernels.blackwell.dspark.attention import DSparkAttention
-from ..cute_dsl_kernels.blackwell.utils import make_ptr
+from ..kernels.blackwell.utils import make_ptr
 from .dspark_rmsnorm_rope_custom_op import (
     _get_dspark_arch_str,
     cute_dsl_dspark_rmsnorm_rope_cache_write,

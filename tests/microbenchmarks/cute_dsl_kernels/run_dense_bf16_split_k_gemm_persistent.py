@@ -33,9 +33,7 @@ Example::
 """
 
 import argparse
-import importlib.util
 import sys
-import types
 from pathlib import Path
 from typing import Tuple
 
@@ -48,55 +46,24 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 def _load_rubin_bf16_kernel():
     """Import the Rubin BF16 kernel without triggering heavy package init.
 
-    The ``tensorrt_llm`` package ``__init__`` needs transformers etc.
-
-    The kernel modules use relative imports within ``cute_dsl_kernels``; the
-    rubin module's only absolute import is
-    ``tensorrt_llm._torch.cute_dsl_kernels.blackwell.dense_gemm_persistent``.
-    We register stub namespace packages with correct ``__path__`` so that
-    absolute import resolves to the source files directly.
+    The ``tensorrt_llm`` package ``__init__`` needs transformers etc., so
+    when this script runs outside an install the shared offline loader
+    seeds the checkout into ``tensorrt_llm.__path__`` and ordinary import
+    machinery resolves the kernel modules from the source tree.
     """
     try:
-        from tensorrt_llm._torch.cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import (
+        from tensorrt_llm._torch.kernels.rubin.dense_bf16_gemm_persistent import (
             PersistentDenseGemmKernel as K,
         )
-
-        return K
     except (ModuleNotFoundError, ImportError):
-        pass
+        sys.path.insert(0, str(Path(__file__).parent))
+        from _offline_loader import install as _install_offline_imports
 
-    repo = Path(__file__).parents[3]
-    chain = {
-        "tensorrt_llm": repo / "tensorrt_llm",
-        "tensorrt_llm._torch": repo / "tensorrt_llm/_torch",
-        "tensorrt_llm._torch.cute_dsl_kernels": repo / "tensorrt_llm/_torch/cute_dsl_kernels",
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell": repo
-        / "tensorrt_llm/_torch/cute_dsl_kernels/blackwell",
-        "tensorrt_llm._torch.cute_dsl_kernels.rubin": repo
-        / "tensorrt_llm/_torch/cute_dsl_kernels/rubin",
-    }
-    for name, path in chain.items():
-        if name not in sys.modules:
-            mod = types.ModuleType(name)
-            mod.__path__ = [str(path)]
-            sys.modules[name] = mod
-
-    def _load(modname, file):
-        spec = importlib.util.spec_from_file_location(modname, file)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[modname] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
-    bw = "tensorrt_llm._torch.cute_dsl_kernels.blackwell"
-    rb = "tensorrt_llm._torch.cute_dsl_kernels.rubin"
-    bw_dir = chain[bw]
-    rb_dir = chain[rb]
-    _load(f"{bw}.utils", bw_dir / "utils.py")
-    _load(f"{bw}.custom_pipeline", bw_dir / "custom_pipeline.py")
-    _load(f"{bw}.dense_gemm_persistent", bw_dir / "dense_gemm_persistent.py")
-    rubin_mod = _load(f"{rb}.dense_bf16_gemm_persistent", rb_dir / "dense_bf16_gemm_persistent.py")
-    return rubin_mod.PersistentDenseGemmKernel
+        _install_offline_imports(Path(__file__).parents[3])
+        from tensorrt_llm._torch.kernels.rubin.dense_bf16_gemm_persistent import (
+            PersistentDenseGemmKernel as K,
+        )
+    return K
 
 
 RubinBf16PersistentDenseGemmKernel = _load_rubin_bf16_kernel()
