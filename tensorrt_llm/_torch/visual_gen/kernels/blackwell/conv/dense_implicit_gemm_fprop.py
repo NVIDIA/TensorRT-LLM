@@ -66,7 +66,7 @@ To run this example:
 
 .. code-block:: bash
 
-    python -m tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_implicit_gemm_fprop \
+    python -m tensorrt_llm._torch.visual_gen.kernels.blackwell.conv.dense_implicit_gemm_fprop \
       --ncdhw 1,128,32,32,32 --ktrs 256,3,3,3                         \
       --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32        \
       --use_2cta_instrs --mma_tiler_mn 256,128                        \
@@ -78,7 +78,7 @@ To collect performance with NCU profiler:
 
 .. code-block:: bash
 
-    ncu python -m tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_implicit_gemm_fprop \
+    ncu python -m tensorrt_llm._torch.visual_gen.kernels.blackwell.conv.dense_implicit_gemm_fprop \
       --ncdhw 1,128,32,32,32 --ktrs 256,3,3,3                         \
       --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32        \
       --use_2cta_instrs --mma_tiler_mn 256,128                        \

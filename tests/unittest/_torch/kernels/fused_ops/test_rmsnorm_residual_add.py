@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parity tests: fused post-norm residual kernels (modules/fused_ops/
+"""Parity tests: fused post-norm residual kernels (kernels/fused_ops/
 rmsnorm_residual_add) vs the unfused chains.
 
 Covers the three variants served by the shared kernel body:
@@ -33,7 +33,7 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.fused_ops.rmsnorm_residual_add import (
+from tensorrt_llm._torch.kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
     rmsnorm_residual_add_scale,
 )

@@ -29,10 +29,13 @@ import torch
 from cutlass.utils.smem_allocator import SmemAllocator
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.paged_mqa_logits import FP4MQALogitsKernel
+    from tensorrt_llm._torch.attention.kernels.blackwell.paged_mqa_logits import FP4MQALogitsKernel
 except ImportError:
-    sys.path.insert(0, str(Path(__file__).parents[4] / "tensorrt_llm/_torch/cute_dsl_kernels"))
-    from blackwell.paged_mqa_logits import FP4MQALogitsKernel
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from _offline_loader import install as _install_offline_imports
+
+    _install_offline_imports(Path(__file__).parents[4])
+    from tensorrt_llm._torch.attention.kernels.blackwell.paged_mqa_logits import FP4MQALogitsKernel
 
 
 # ---- FP4 quant helpers (verbatim from DeepGEMM/deep_gemm/utils/math.py) -----

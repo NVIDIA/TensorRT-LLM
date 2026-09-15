@@ -19,7 +19,7 @@ import cutlass
 import pytest
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop import (
+from tensorrt_llm._torch.visual_gen.kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop import (
     run,
 )
 
