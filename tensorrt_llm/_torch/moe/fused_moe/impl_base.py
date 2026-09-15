@@ -240,6 +240,13 @@ class MoEImplBase(
         self, x: "torch.Tensor | Fp4QuantizedTensor", **kwargs: object
     ) -> "tuple[torch.Tensor, torch.Tensor | None] | dict": ...
 
+    def get_deep_ep_nvfp4_dispatch_input_scale(
+        self, x: "torch.Tensor | Fp4QuantizedTensor"
+    ) -> "torch.Tensor | None":
+        """Return no fused-dispatch scale unless a backend opts in."""
+        del x
+        return None
+
     # Narrower than ``MoE.run_moe``, which also takes a keyword-only
     # ``workspace``. Not a drift: the impl already allocates that scratch
     # itself, through ``get_workspaces`` below. What the scheduler still owns is
