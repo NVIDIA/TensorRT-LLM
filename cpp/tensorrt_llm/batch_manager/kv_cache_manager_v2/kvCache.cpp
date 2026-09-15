@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/hostPageCopy.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -73,6 +74,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mTokensPerBlock(manager.tokensPerBlock())
 {
     LifeCycleId numLc = manager.storage().numLifeCycles();
+    mResidencyWindows.resize(numLc);
 
     // Initialise page index buffers: [beamIdx][lcId] = empty vector
     mBasePageIndices.resize(mBeamWidth);
@@ -208,6 +210,131 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
     return blockPageGetPage(blockPage);
 }
 
+bool KvCache::_requiresGpuLock(BlockOrdinal ordinal, LifeCycleId lifeCycle, int historyLength) const
+{
+    auto const& window = mResidencyWindows.at(lifeCycle);
+    return !window || !window->getStaleRange(historyLength, mTokensPerBlock).contains(ordinal);
+}
+
+SharedPtr<Page> const& KvCache::hostCopyPage(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam) const
+{
+    if (mStatus != Status::ACTIVE)
+        throw LogicError("Host-copy operations require an active request");
+    if (group < LifeCycleId{0} || group >= storageManager()->numLifeCycles()
+        || !std::holds_alternative<AttnLifeCycle>(storageManager()->getLifeCycle(group)))
+        throw std::invalid_argument("Host copies require an attention lifecycle");
+    if (ordinal < BlockOrdinal{0} || ordinal >= mBlocks.size() || beam < BeamIndex{0}
+        || beam >= mBlocks[ordinal].pages.size())
+        throw std::out_of_range("Host-copy page is outside the request");
+    auto const& page = blockPageGetPage(mBlocks[ordinal].pages[beam][group]);
+    if (!page)
+        throw LogicError("The request does not hold this page");
+    return page;
+}
+
+int KvCache::writtenTokensInPage(Page const& page, BlockOrdinal ordinal) const
+{
+    int const written = std::clamp(mHistoryLength - ordinal.value() * mTokensPerBlock, 0, mTokensPerBlock);
+    return page.isCommitted() ? std::min(written, static_cast<CommittedPage const&>(page).numTokensInBlock) : written;
+}
+
+void KvCache::backupToHost(
+    LayerGroupId group, BlockOrdinal ordinal, int validTokens, CacheLevel hostLevel, BeamIndex beam)
+{
+    auto page = hostCopyPage(group, ordinal, beam);
+    if (hostLevel <= kHotLevel || hostLevel >= storageManager()->numCacheLevels()
+        || storageManager()->cacheTier(hostLevel) != CacheTier::HOST_MEM)
+        throw std::invalid_argument("Host backup requires a configured host-memory level");
+    if (validTokens <= 0 || validTokens > writtenTokensInPage(*page, ordinal))
+        throw std::invalid_argument("Host backup exceeds the page's written token prefix");
+    if (page->hostCopy() && page->hostCopy()->level() == hostLevel && page->hostCopy()->validTokens() >= validTokens)
+        return;
+    // A cold codec may need GPU decoding. Restore one page at a time before
+    // producing a retained copy in the host codec layout.
+    if (page->cacheLevel != kHotLevel)
+    {
+        auto locks = batchedLockToGpu(*this, {BatchedLockTarget{page, beam, ordinal, group}});
+        // Record the lock's finish after the backup has been submitted.
+        auto unlock = FuncGuard(
+            [&]()
+            {
+                auto scope = recordEventScope();
+                locks.clear();
+            });
+        storageManager()->backupPageToHost(*page, hostLevel, validTokens, cudaStream());
+    }
+    else
+    {
+        storageManager()->backupPageToHost(*page, hostLevel, validTokens, cudaStream());
+    }
+    // Count the actual backup once. Switching the primary slot in offloadToHost
+    // does not transfer bytes, and repeated backup calls return above.
+    KVCacheIterationStatsDelta stats;
+    stats.iterOffloadBlocks = 1;
+    stats.iterOffloadBytes = page->hostCopy()->pageBytes();
+    _recordDirectIterationStats(group, stats);
+}
+
+void KvCache::invalidateHostCopy(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam)
+{
+    auto const& page = hostCopyPage(group, ordinal, beam);
+    if (page->isCommitted() || !std::holds_alternative<SharedPageLock>(mBlocks[ordinal].pages[beam][group]))
+        throw LogicError("Invalidate only a writable, GPU-locked request page");
+    if (page->hostCopy())
+        page->hostCopy()->invalidate();
+}
+
+void KvCache::offloadToHost(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam)
+{
+    auto const& page = hostCopyPage(group, ordinal, beam);
+    storageManager()->offloadPageToHost(*page, writtenTokensInPage(*page, ordinal));
+}
+
+std::unique_ptr<HostPageRead> KvCache::acquireHostCopy(LayerGroupId group, BlockOrdinal ordinal, BeamIndex beam)
+{
+    return std::make_unique<HostPageRead>(mManager, hostCopyPage(group, ordinal, beam)->hostCopy(), cudaStream());
+}
+
+void KvCache::setResidencyWindow(LayerGroupId group, std::optional<int> windowSize, int numSinkTokens)
+{
+    if (mStatus == Status::CLOSED)
+        throw LogicError("Cannot change residency of a closed cache");
+    auto const* attention = std::get_if<AttnLifeCycle>(&mManager->lifeCycles().getLifeCycle(group));
+    if (!attention || attention->windowSize)
+        throw std::invalid_argument("Residency windows require a full-history attention lifecycle");
+    if ((windowSize && *windowSize <= 0) || numSinkTokens < 0 || (!windowSize && numSinkTokens != 0))
+        throw std::invalid_argument("Invalid residency window or sink token count");
+
+    std::optional<AttnLifeCycle> window;
+    if (windowSize)
+        window = AttnLifeCycle::make(windowSize, numSinkTokens, mTokensPerBlock);
+
+    if (isActive())
+    {
+        std::vector<BatchedLockTarget> targets;
+        for (BlockOrdinal ordinal{0}; ordinal < mBlocks.size(); ++ordinal)
+        {
+            if (window && window->getStaleRange(mHistoryLength, mTokensPerBlock).contains(ordinal))
+                continue;
+            for (BeamIndex beam{0}; beam < mBeamWidth; ++beam)
+            {
+                auto const& page = mBlocks[ordinal].pages[beam][group];
+                if (auto const* holder = std::get_if<SharedPtr<PageHolder>>(&page))
+                    targets.push_back({(*holder)->page, beam, ordinal, group});
+            }
+        }
+        // Acquisition is transactional: do not change requirements or release
+        // existing locks until every newly required page has been acquired.
+        auto locks = batchedLockToGpu(*this, targets);
+        for (size_t i = 0; i < targets.size(); ++i)
+            mBlocks[targets[i].ordinal].pages[targets[i].beamIndex][group] = std::move(locks[i]);
+    }
+    mResidencyWindows.at(group) = window;
+    if (isActive())
+        _unlockColdBlocks(mHistoryLength);
+    TLLM_CHECK_DEBUG(_checkSanity());
+}
+
 void KvCache::activate()
 {
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
@@ -215,13 +342,15 @@ void KvCache::activate()
 
     mFinishEvent.reset();
 
-    // Lock only active (non-stale) pages to GPU — mirrors Python's _active_pages().
+    // Lock required non-stale pages; cold history retains its PageHolder.
     auto activePages = _activePages();
     std::vector<BatchedLockTarget> targets;
     targets.reserve(activePages.size());
 
     for (auto const& ap : activePages)
     {
+        if (!_requiresGpuLock(ap.ordinal, ap.lcId, mHistoryLength))
+            continue;
         BlockPage* bp = nullptr;
         if (ap.ordinal == kBadBlockOrdinal)
         {
@@ -553,10 +682,11 @@ void KvCache::suspend()
         {
             auto& bp = (ap.lcId != ssmLcId) ? mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId]
                                             : mSsmBlocks[ap.beamIdx][ap.lcId];
-            // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
-            auto& lock = std::get<SharedPageLock>(bp);
-            auto holder = lock.page()->hold();
-            bp = std::move(holder); // ~SharedPageLock calls unlock() → notifyFinish(finishEvent())
+            if (auto* lock = std::get_if<SharedPageLock>(&bp))
+            {
+                auto holder = lock->page()->hold();
+                bp = std::move(holder); // unlock records finishEvent(); already-held pages stay held.
+            }
         }
         // Free scratch slots inside scope — unlock() needs finishEvent().
         // Mirrors Python: _free_scratch_slots() inside `with self._record_event()`.
@@ -1091,6 +1221,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     auto backupHolders = _unlockStaleBlocks(newHist);
+    auto coldHolders = _unlockColdBlocks(newHist);
+    backupHolders.insert(backupHolders.end(), coldHolders.begin(), coldHolders.end());
 
     if (newNumBlocks < oldNumBlocks)
     {
@@ -1167,6 +1299,12 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 _recoverExcessScratchSlots(excessScratchSlots);
                 _lockHeldBlocks(backupHolders);
                 return false;
+            }
+            catch (...)
+            {
+                _recoverExcessScratchSlots(excessScratchSlots);
+                _lockHeldBlocks(backupHolders);
+                throw;
             }
         }
         else
@@ -1301,6 +1439,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     mHistoryLength = newHist;
     _refreshGenerationAllocReady();
     _evictOutOfWindowBlocks(newHist);
+    _unlockColdBlocks(newHist);
     TLLM_CHECK_DEBUG(_checkSanity());
     return true;
 }
@@ -1339,9 +1478,14 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
 {
     if (newHist == mHistoryLength)
         return true;
-    // Check if stale range changes for any lifecycle.
+    // Both logical staleness and residency boundaries can require lock changes.
     for (auto [lcId, lc] : mManager->lifeCycles())
     {
+        auto const& window = mResidencyWindows[lcId];
+        if (window
+            && window->getStaleRange(newHist, mTokensPerBlock)
+                != window->getStaleRange(mHistoryLength, mTokensPerBlock))
+            return false;
         bool changed = std::visit(
             [&](auto const& v) -> bool
             {
@@ -1386,8 +1530,15 @@ void KvCache::_decreaseCapacity(BlockOrdinal newNumBlocks)
     {
         auto& sb = mBlocks.back();
         for (auto& beamPages : sb.pages)
+        {
             for (auto& bp : beamPages)
+            {
+                // Page destruction inspects this entry. Keep the page alive until
+                // the variant has finished releasing its lock/holder and is empty.
+                auto page = blockPageGetPage(bp);
                 bp = std::monostate{};
+            }
+        }
         sb.treeBlock.reset();
         mBlocks.pop_back();
     }
@@ -1450,6 +1601,36 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
         }
     }
     return ret;
+}
+
+std::vector<KvCache::StaleBackup> KvCache::_unlockColdBlocks(int historyLength)
+{
+    std::vector<StaleBackup> backup;
+    if (std::none_of(
+            mResidencyWindows.begin(), mResidencyWindows.end(), [](auto const& window) { return bool(window); }))
+        return backup;
+    auto scope = recordEventScope();
+    for (LifeCycleId lc{0}; lc < mResidencyWindows.size(); ++lc)
+    {
+        auto const& window = mResidencyWindows[lc];
+        if (!window)
+            continue;
+        auto const cold = window->getStaleRange(historyLength, mTokensPerBlock);
+        for (BlockOrdinal ordinal = cold.beg; ordinal < std::min(cold.end, mBlocks.size()); ++ordinal)
+        {
+            for (BeamIndex beam{0}; beam < mBeamWidth; ++beam)
+            {
+                auto& page = mBlocks[ordinal].pages[beam][lc];
+                if (auto* lock = std::get_if<SharedPageLock>(&page))
+                {
+                    auto holder = lock->page()->hold();
+                    backup.push_back({ordinal, beam, lc, holder});
+                    page = std::move(holder);
+                }
+            }
+        }
+    }
+    return backup;
 }
 
 void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
@@ -1647,8 +1828,11 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                     auto holder = blockPageGetPage(bp)->hold();
                     bp = std::move(holder);
                 }
-                reuseTasks.push_back(
-                    {existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc});
+                if (isLocked || !mResidencyWindows[lc])
+                    reuseTasks.push_back(
+                        {existingPage->sharedFromThis(), kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc});
+                else
+                    bp = existingPage->hold();
             }
         }
         if (!reuseTasks.empty())
@@ -2238,10 +2422,13 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    // The page must be present, and locked exactly when the cache is
-                    // active; a suspended cache holds it instead.
-                    TLLM_CHECK_DEBUG(!std::holds_alternative<std::monostate>(bp)
-                        && ((mStatus == Status::ACTIVE) == std::holds_alternative<SharedPageLock>(bp)));
+                    // Cold history remains present even while the request is active.
+                    TLLM_CHECK_DEBUG(!blockPageIsNull(bp));
+                    bool const locked = std::holds_alternative<SharedPageLock>(bp);
+                    if (mStatus == Status::ACTIVE)
+                        TLLM_CHECK_DEBUG(locked || !_requiresGpuLock(ordinal, lc, mHistoryLength));
+                    else
+                        TLLM_CHECK_DEBUG(!locked);
                 }
 
                 if (!blockPageIsNull(bp))
@@ -2270,7 +2457,7 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
+                    TLLM_CHECK_DEBUG((mStatus == Status::ACTIVE) == std::holds_alternative<SharedPageLock>(bp));
                     auto page = blockPageGetPage(bp);
                     TLLM_CHECK_DEBUG(dynamicPointerCast<UncommittedPage>(page) != nullptr);
                 }
@@ -2377,6 +2564,14 @@ Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx
     {
         auto ref = getAggregatedPageIndices(lgId, beamIdx);
         auto len = static_cast<size_t>(std::min(result.len, static_cast<int32_t>(ref.size())));
+        for (size_t i = 0; i < len; ++i)
+        {
+            // Aggregated indices describe storage in any tier. Only this request's
+            // locked pages may appear in its GPU page table.
+            if (!std::holds_alternative<SharedPageLock>(
+                    mBlocks[BlockOrdinal{static_cast<int>(i)}].pages[beamIdx][lgId]))
+                ref[i] = kBadPageIndex.value();
+        }
         TLLM_CHECK(std::equal(result.data(), result.data() + len, ref.begin()));
     }
     return result;

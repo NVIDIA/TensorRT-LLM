@@ -29,6 +29,16 @@ add_gtest(kvCacheManagerV2DefaultColdPageCodecTest
 target_include_directories(
   kvCacheManagerV2DefaultColdPageCodecTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2HostCopyTest kvCacheManagerV2HostCopyTest.cpp)
+target_include_directories(
+  kvCacheManagerV2HostCopyTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(kvCacheManagerV2ResidencyTest kvCacheManagerV2ResidencyTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ResidencyTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 add_gtest(kvCacheManagerV2ColdPageTest kvCacheManagerV2ColdPageTest.cpp)
 target_include_directories(
   kvCacheManagerV2ColdPageTest

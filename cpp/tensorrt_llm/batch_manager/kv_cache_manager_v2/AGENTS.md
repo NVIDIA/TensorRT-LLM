@@ -103,6 +103,43 @@ live pages may be moved into the radix tree rather than copied.
 doing so would append the same tokens twice. It also releases stale held SWA
 pages and performs final commit-state bookkeeping.
 
+### Internal sparse residency
+
+- `AttentionLayerConfig::residencyGroup` separates otherwise-identical attention
+  lifecycles. Independently managed data must use separate layer descriptors with
+  unique layer IDs; buffers within one descriptor still share one page lifecycle.
+- `KvCache::setResidencyWindow()` opts a full-history attention group into mixed
+  residency. Sinks, the local window, and writable pages stay locked; older pages
+  remain held, including uncommitted generated history. Logical stale ranges and
+  prefix retention are unchanged. SWA and SSM retain their existing residency rules.
+- Advancing `historyLength` means the corresponding writes have been submitted on
+  the request stream. Release records completion events before slots can be reused.
+  Commit must preserve any migration completion event attached to a held page.
+- `nullopt` restores full GPU residency. Acquisition failure leaves the previous
+  residency requirements in effect. The Python binding exposes this C++ capability
+  through `_residency_group` and `_set_residency_window`; the reference backend does
+  not implement the opt-in.
+- This primitive does not acquire arbitrary top-K selections. Attention integration
+  must acquire the selected historical data before using it; held pages have invalid
+  GPU page-table entries even when their storage has not yet moved off GPU.
+
+### Retained host copies
+
+- `KvCache::backupToHost()` retains a host-tier slot using the configured cold-page
+  codec. `HostPageCopy` owns that slot; `Page` may alias it as its primary slot.
+  Never release the alias through the ordinary page allocator a second time.
+- `offloadToHost()` requires a held page and enough backed-up tokens. It reuses
+  the retained slot and protects the released GPU source with completion events.
+  Full-page GPU restoration keeps the host copy.
+- Call `invalidateHostCopy()` before writing backed-up, uncommitted GPU data.
+  Open `HostPageRead` handles block invalidation. Closed reads still protect the
+  slot until their CUDA work finishes. Publish only completed host coverage.
+- Retained copies pin host addresses. Pool resize/defrag must reject live pins
+  and wait for retired copies' events. A reader also keeps `KvCacheManager` alive.
+- Active retained pages use explicit offload. Last-request cleanup releases extra
+  copies of cached GPU pages; inactive host pages remain normally evictable.
+- See [host-copy usage and layout](../../../../docs/source/developer-guide/kv-cache-host-copies.md).
+
 ### Page status
 
 - `LOCKED`: required on GPU; neither eviction nor dropping is permitted.

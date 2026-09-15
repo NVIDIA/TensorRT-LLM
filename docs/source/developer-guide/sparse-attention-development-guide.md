@@ -23,6 +23,7 @@ rationale and high-level architecture diagrams, see the
   - [2. Prediction module](#2-prediction-module)
   - [3. Auxiliary memory](#3-auxiliary-memory)
   - [4. Registration and dispatch](#4-registration-and-dispatch)
+- [Selected KV interfaces](#selected-kv-interfaces)
 - [Kernel-level sparse attention](#kernel-level-sparse-attention)
 - [Roadmap](#roadmap)
 
@@ -370,6 +371,68 @@ If the algorithm needs extra tensors beyond the main KV cache:
 - If your algorithm exposes new C++ parameters, plumb them through
   `cpp/tensorrt_llm/thop/attentionOp.cpp` and
   `cpp/tensorrt_llm/kernels/sparseAttentionKernels.h`.
+
+## Selected KV interfaces
+
+The internal interfaces in `backends/sparse/selection.py` and `kv_layout.py`
+describe selected KV before host offload is connected to models. They keep one
+existing `KvCache` per request. Host storage and the small GPU cache supply
+separate views; these views do not own or move pages.
+
+| Type | What it carries |
+| --- | --- |
+| `SelectionPolicy` | Adapts model selections to logical entries. |
+| `SelectionContext` | Request IDs, query-to-request rows, KVCM layer/lifecycle IDs, and per-query valid lengths. |
+| `SelectedEntries` | Logical positions and an optional validity mask, in attention order. |
+| `EntryLayout` | Entries per page and byte spans for KV, scales, or other entry data. |
+| `HostStorageView` | Host slot IDs, completed entry counts, and pool sizes. |
+| `GpuCacheView` | Logical entry to ready GPU entry mapping. |
+| `ResolvedEntries` | Logical validity, host availability/offsets, and GPU hits or misses. |
+
+`DSATrtllmAttention.select_kv()` exposes DSA top-K before the ordinary GPU
+page-table conversion. It also supports shared indexer output. The caller
+supplies `SelectionContext` for the layer whose KV will be read. The existing
+`sparse_attn_predict()` path still returns ordinary physical indices; call one
+entry point per query.
+
+Positions count tokens, or native compressed entries. For example, compression
+by four gives four entries in a 16-token page. The model adapter supplies the
+number of completed entries each query may read, including its causal limit.
+The resolver does not divide positions by the compression ratio again.
+Duplicates keep their columns. Negative positions, positions outside the valid
+length, and masked entries are invalid.
+
+Build the layout from the **host** pool/slot sizes and buffer offsets, plus the model's
+entry format. The default cold-page codec joins GPU pools into one host pool;
+see [retained host copies](kv-cache-host-copies.md#host-layout-and-disk-restore). Do not infer entry stride from total buffer size. A component
+names one byte span per entry: its pool, offset in the slot, byte stride, and
+byte count. Use separate components for separate scale regions or heads when
+needed. For component `c`, the host byte offset is:
+
+```text
+page = position // entries_per_page
+entry = position % entries_per_page
+offset = host_slot[request, page] * pool_slot_bytes[c.pool_index]
+         + c.offset + entry * c.stride
+```
+
+Allocate CUDA tables and `ResolvedEntries` outputs before graph capture, then
+call `resolve_entries(selection, host_view, gpu_view, outputs)`. It reads current
+GPU values and writes the outputs without allocating tensors, copying KV, or
+changing page residency. Request IDs in both storage views must match the
+selection's IDs. Update these tensors before replay when requests change.
+
+A valid selection stays valid on a GPU miss. Host offsets remain available
+when the selected data is only on host. A missing or unfinished host copy has
+`host_valid = False` and offset `-1`; the caller must fetch or report failure,
+not discard that selection. One GPU entry hit says nothing about neighbouring
+entries or whole-page residency.
+
+The storage/cache owners must keep addresses stable and protect reads and
+copies. KVCM V2 now provides [retained host copies and read handles](kv-cache-host-copies.md).
+The views above still do not own memory. Selected-entry fetch, replacement, and
+model integration are later HiSparse steps. Prefix commit status does not
+determine whether a completed host entry may be read.
 
 ## Kernel-level sparse attention
 

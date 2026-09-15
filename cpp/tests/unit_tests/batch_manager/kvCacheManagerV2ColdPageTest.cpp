@@ -440,6 +440,46 @@ TEST(KvCacheManagerV2ColdPageTest, AsyncEncodeRejectionFencesRecycledColdSlotAnd
     storage.releaseSlot(lifeCycle, kHotLevel, std::move(hotBlocker));
 }
 
+TEST(KvCacheManagerV2ColdPageTest, RetainedBackupRejectionProtectsSourceAndRecyclesHostAllocation)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto codec = std::make_unique<AsyncRejectingColdPageCodec>(AsyncRejectingColdPageCodec::Operation::kEncode);
+    auto* codecPtr = codec.get();
+    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig(), nullptr, std::move(codec));
+    auto cache = manager->createKvCache();
+    auto cleanup = FuncGuard(
+        [&]()
+        {
+            codecPtr->release();
+            cache->close();
+            cudaStreamDestroy(stream);
+        });
+    ASSERT_TRUE(cache->resume(stream));
+    ASSERT_TRUE(cache->resize(4, 4));
+    LifeCycleId const group{0};
+    auto source = blockPageGetPage(cache->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][group]);
+    auto const sourceSlot = source->slotId();
+    auto& storage = manager->storage();
+    CacheLevel const host{1};
+    auto const pool = storage.getPoolGroupIndex(host, group);
+    auto const freeBefore = storage.getStatistics(host, pool).free;
+    EXPECT_THROW(cache->backupToHost(group, BlockOrdinal{0}, 4), TllmException);
+    EXPECT_TRUE(codecPtr->launched());
+    EXPECT_FALSE(source->hostCopy());
+    EXPECT_EQ(source->slotId(), sourceSlot);
+    EXPECT_EQ(source->cacheLevel, kHotLevel);
+    EXPECT_FALSE(source->queryReady());
+    EXPECT_EQ(storage.getStatistics(host, pool).free, freeBefore);
+    auto slots = storage.newSlotsForPoolGroup(host, pool, freeBefore);
+    EXPECT_TRUE(std::any_of(slots.begin(), slots.end(), [](Slot& slot) { return !slot.queryReady(); }));
+    for (auto& slot : slots)
+        storage.releaseSlot(group, host, std::move(slot));
+    codecPtr->release();
+    source->readyEvent.synchronize();
+}
+
 TEST(KvCacheManagerV2ColdPageTest, ForceEvictFailureReschedulesFallenPage)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
