@@ -23,8 +23,9 @@ import sys
 
 from ._bootstrap import _init, _prepare_environment
 
-# Phase 1: DLL search path, Python-library preload and vendored triton_kernels
-# precedence. Must run before torch and before any TensorRT-LLM shared object.
+# Phase 1: cache environment, DLL search path, Python-library preload and
+# vendored triton_kernels precedence. Must run before torch and before any
+# TensorRT-LLM shared object.
 _prepare_environment()
 
 # The package's public surface is loaded lazily (PEP 562): importing
