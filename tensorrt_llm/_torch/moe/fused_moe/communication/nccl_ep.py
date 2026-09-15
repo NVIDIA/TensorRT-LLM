@@ -14,8 +14,8 @@
 # limitations under the License.
 """NCCL EP (Expert Parallelism) Communication Strategy for MoE -- LL rank-major.
 
-Targets the ``nccl.ep`` Python package shipped in the nccl4py wheel (built
-against an NCCL master tree containing ``contrib/nccl_ep``). The dispatch
+Targets the embedded ``nccl.ep`` Python package built from pinned
+NCCL-Extensions source. The dispatch
 returns rank-major LL outputs:
 
   * ``recv_x``            : 3D ``[ep_size, max_tokens_per_rank, hidden]`` bf16,
@@ -34,12 +34,14 @@ subsequent dispatches call ``handle.update(topk_idx, ...)`` to rebind routing.
 CUDA-graph capture is supported once the handle exists.
 """
 
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .base import Communication
 
@@ -57,6 +59,8 @@ class NcclEP(Communication):
         max_num_tokens: int = 1024,
         moe_max_num_tokens: Optional[int] = None,
         top_k: int = 8,
+        quant_config: Optional[QuantConfig] = None,
+        use_low_precision_combine: bool = False,
     ):
         super().__init__(mapping)
 
@@ -65,36 +69,30 @@ class NcclEP(Communication):
         if not is_nccl_ep_installed():
             raise RuntimeError("nccl-ep is not installed.")
 
-        if self.ep_size <= 0:
-            raise ValueError(f"NcclEP requires moe_ep_size > 0, got {self.ep_size}")
-        if not 0 <= self.ep_rank < self.ep_size:
-            raise ValueError(
-                f"NcclEP requires 0 <= moe_ep_rank < moe_ep_size, "
-                f"got {self.ep_rank=}, {self.ep_size=}"
-            )
-        if num_slots <= 0:
-            raise ValueError(f"NcclEP requires num_slots > 0, got {num_slots}")
-        if num_slots % self.ep_size != 0:
-            raise ValueError(
-                f"NcclEP requires num_slots divisible by moe_ep_size, "
-                f"got {num_slots=}, {self.ep_size=}"
-            )
-        if hidden_size <= 0:
-            raise ValueError(f"NcclEP requires hidden_size > 0, got {hidden_size}")
-        if top_k <= 0 or top_k > num_slots:
-            raise ValueError(f"NcclEP requires 0 < top_k <= num_slots, got {top_k=}, {num_slots=}")
-        if max_num_tokens <= 0:
-            raise ValueError(f"NcclEP requires max_num_tokens > 0, got {max_num_tokens}")
-        if moe_max_num_tokens is not None and moe_max_num_tokens <= 0:
-            raise ValueError(
-                f"NcclEP requires moe_max_num_tokens > 0 when provided, got {moe_max_num_tokens}"
-            )
-
         self.num_slots = num_slots
         self.num_experts = num_slots
         self.hidden_size = hidden_size
         self.num_local_experts = num_slots // self.ep_size
         self.max_top_k = top_k
+        self.quant_config = quant_config
+        self.use_fp8 = self._has_deepseek_fp8_block_scales()
+        self.use_external_fp8 = self._has_fp8_qdq()
+        self.use_external_nvfp4 = self._has_nvfp4()
+        if self.use_fp8 or self.use_external_fp8 or self.use_external_nvfp4:
+            from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import nccl_ep_supports_version
+
+            if not nccl_ep_supports_version("0.2"):
+                raise RuntimeError("NCCL-EP quantized dispatch requires libnccl_ep >= 0.2.")
+
+        if self.use_external_nvfp4 and hidden_size % 256 != 0:
+            raise RuntimeError(
+                "NCCL-EP NVFP4 dispatch requires hidden_size divisible by 256 "
+                "for 16-byte token and scale rows."
+            )
+
+        self.use_low_precision_combine = (
+            use_low_precision_combine and self.supports_low_precision_combine()
+        )
 
         self.max_tokens_per_rank = (
             max_num_tokens
@@ -129,6 +127,28 @@ class NcclEP(Communication):
             return False
         return True
 
+    def supports_post_quant_dispatch(self) -> bool:
+        return self.use_external_fp8 or self.use_external_nvfp4
+
+    def uses_internal_dispatch_quantization(self) -> bool:
+        return self.use_fp8
+
+    def supports_low_precision_combine(self) -> bool:
+        """Return whether the experimental LL NVFP4 combine path is available."""
+        return self.use_external_nvfp4 and self.hidden_size % 512 == 0
+
+    def _has_deepseek_fp8_block_scales(self) -> bool:
+        return (
+            self.quant_config is not None
+            and self.quant_config.layer_quant_mode.has_fp8_block_scales()
+        )
+
+    def _has_fp8_qdq(self) -> bool:
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_qdq()
+
+    def _has_nvfp4(self) -> bool:
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4()
+
     def _get_context(self):
         if self._ctx is None:
             if torch.cuda.is_current_stream_capturing():
@@ -146,7 +166,10 @@ class NcclEP(Communication):
                 self.max_tokens_per_rank,
                 self.hidden_size,
                 self.max_top_k,
+                self.use_fp8,
                 Layout.RANK_MAJOR,
+                external_fp8=self.use_external_fp8,
+                external_nvfp4=self.use_external_nvfp4,
             )
         return self._ctx
 
@@ -191,7 +214,9 @@ class NcclEP(Communication):
         ``recv_rank_counter[r]`` for source rank r have recv_slots = -1
         (sentinel), naturally skipped by the MoE backend.
         """
-        from nccl.ep import DispatchConfig, DispatchInputs, DispatchOutputs, LayoutInfo, Tensor
+        from nccl.ep import DispatchInputs, DispatchOutputs, Tensor
+
+        from tensorrt_llm.bindings.internal.thop import BufferKind
 
         ctx = self._get_context()
 
@@ -214,53 +239,109 @@ class NcclEP(Communication):
 
         stream = ctx.get_stream()
 
-        # TODO(NCCL): topk_weights still requires float32; once bf16/native
-        # weights are accepted upstream, drop this conversion too.
-        weights_f32 = (
-            token_final_scales
-            if token_final_scales.dtype == torch.float32
-            else token_final_scales.to(torch.float32)
-        )
-        hidden_states_c = hidden_states.contiguous()
-        weights_f32_c = weights_f32.contiguous()
+        # NCCL-EP takes FP32 top-k weights. Router outputs are commonly
+        # BF16/FP16, so convert them at the binding boundary.
+        if not hidden_states.is_contiguous() or not token_final_scales.is_contiguous():
+            raise ValueError("NCCL-EP dispatch requires contiguous token and routing tensors.")
+        hidden_states_c = hidden_states
+        weights_f32_c = token_final_scales.float()
 
         input_tokens_nd = Tensor(hidden_states_c)
         input_topk_weights_nd = Tensor(weights_f32_c)
+        input_scales_nd = None
+        if self.use_external_fp8:
+            if hidden_states.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "NCCL-EP external FP8 dispatch requires float8_e4m3fn tokens, "
+                    f"got {hidden_states.dtype}."
+                )
+            # TODO(NCCL-EP): accept raw FP8 descriptors under NONE so this
+            # byte-preserving compatibility view is unnecessary.
+            # NONE accepts BF16 but not FP8 descriptors. Mirror DeepEP LL by
+            # transporting the FP8 payload as a BF16 byte view, then restoring
+            # the FP8 view on the receive buffer below.
+            hidden_states_c = hidden_states.view(torch.bfloat16)
+            input_tokens_nd = Tensor(hidden_states_c)
+        elif self.use_external_nvfp4:
+            expected_token_shape = (num_tokens, self.hidden_size // 2)
+            expected_scale_shape = (num_tokens, self.hidden_size // 16)
+            if hidden_states.dtype != torch.uint8 or hidden_states.shape != expected_token_shape:
+                raise ValueError(
+                    "NCCL-EP NVFP4 dispatch requires uint8 tokens with shape "
+                    f"{expected_token_shape}, got dtype={hidden_states.dtype}, "
+                    f"shape={tuple(hidden_states.shape)}."
+                )
+            if (
+                hidden_states_sf is None
+                or hidden_states_sf.dtype != torch.uint8
+                or hidden_states_sf.shape != expected_scale_shape
+            ):
+                got_dtype = None if hidden_states_sf is None else hidden_states_sf.dtype
+                got_shape = None if hidden_states_sf is None else tuple(hidden_states_sf.shape)
+                raise ValueError(
+                    "NCCL-EP NVFP4 dispatch requires uint8 scales with shape "
+                    f"{expected_scale_shape}, got dtype={got_dtype}, shape={got_shape}."
+                )
+            scales_c = (
+                hidden_states_sf
+                if hidden_states_sf.is_contiguous()
+                else hidden_states_sf.contiguous()
+            )
+            # nccl4py does not expose ncclFloat4x2. Transport the packed FP4
+            # bytes through a BF16 view; FWD preserves the physical row bytes.
+            hidden_states_c = hidden_states.view(torch.bfloat16)
+            input_tokens_nd = Tensor(hidden_states_c)
+            input_scales_nd = Tensor(scales_c)
 
-        # Mark padding rows with the -1 sentinel so fused_moe skips them.
-        # The dispatch kernel only writes recv_topk_idx for slots that
-        # received tokens; rows beyond `recv_rank_counter[r]` keep stale
-        # data from prior dispatches. recv_rank_counter is written fresh
-        # by the dispatch kernel (low_latency.cu:877) so it does not need
-        # pre-zeroing, and recv_topk_weights on -1 rows is don't-care
-        # (fused_moe ignores the weight when the expert id is -1).
-        ctx.recv_topk_idx_buf.fill_(-1)
+        # NCCL-EP 0.2 resets inactive rank-major recv_topk_idx rows in the
+        # dispatch kernel. Retain the v0.1 pre-dispatch fallback.
+        if not ctx.kernel_resets_recv_topk_idx:
+            ctx.recv_topk_idx_buf.fill_(-1)
 
-        outputs = DispatchOutputs(
-            tokens=ctx.output_tokens_nd,
-            topk_weights=ctx.recv_topk_weights_nd,
-            topk_idx=ctx.recv_topk_idx_nd,
-            scales=None,
+        topk_idx_dev = (
+            token_selected_slots
+            if token_selected_slots.dtype == ctx.topk_idx_dtype
+            and token_selected_slots.is_contiguous()
+            else token_selected_slots.to(ctx.topk_idx_dtype).contiguous()
         )
-        layout_info = LayoutInfo(src_rank_counters=ctx.recv_rank_counter_nd)
-        # The v0.2-gated capability path asks the kernel to emit global
-        # expert ids directly; v0.1 retains the default local-id contract
-        # and uses the translation below.
-        if ctx._expert_id_kind_global is not None:
-            layout_info._lowpp.recv_topk_idx_kind = ctx._expert_id_kind_global
-
-        topk_idx_dev = token_selected_slots.to(ctx.topk_idx_dtype).contiguous()
         topk_nd = Tensor(topk_idx_dev)
+        dispatch_outputs = ctx.dispatch_outputs
+        window_tokens = None
+        # CUDA graph capture requires stable context-owned output addresses.
+        # Eager dispatch keeps the operation-scoped NCCL-window allocation.
+        if ctx.zerocopy_enabled and not torch.cuda.is_current_stream_capturing():
+            window_tokens, actual_kind, window_handle = (
+                torch.ops.trtllm.allocate_output_with_nccl_window(
+                    ctx.output_tokens_buf,
+                    int(BufferKind.NCCL_WINDOW),
+                    self.mapping.moe_ep_group,
+                )
+            )
+            if actual_kind == int(BufferKind.NCCL_WINDOW) and window_handle:
+                # The TRT-LLM pool owns this already-registered raw ncclWindow_t.
+                window = SimpleNamespace(handle=window_handle)
+                dispatch_outputs = DispatchOutputs(
+                    tokens=Tensor(window_tokens, window=window, window_offset=0),
+                    topk_weights=ctx.recv_topk_weights_nd,
+                    topk_idx=ctx.recv_topk_idx_nd,
+                    scales=ctx.scales_nd,
+                )
+            else:
+                # The allocator returned a distinct ordinary tensor. Dispatch
+                # still targets the persistent descriptor, so return it below.
+                window_tokens = None
+
         handle = self._setup_handle(ctx, topk_nd, stream)
         inputs = DispatchInputs(
             tokens=input_tokens_nd,
             topk_weights=input_topk_weights_nd,
+            scales=input_scales_nd,
         )
         handle.dispatch(
             inputs,
-            outputs,
-            layout_info=layout_info,
-            config=DispatchConfig(round_scales=0),
+            dispatch_outputs,
+            layout_info=ctx.dispatch_layout_info,
+            config=ctx.dispatch_config,
             stream=stream,
         )
 
@@ -270,6 +351,7 @@ class NcclEP(Communication):
             "num_tokens": num_tokens,
             "topk_nd": topk_nd,
             "topk_idx_dev": topk_idx_dev,
+            "window_tokens": window_tokens,
         }
 
         # Match NVLinkOneSided's contract: token_selected_slots in
@@ -294,9 +376,24 @@ class NcclEP(Communication):
         # Output buffers are 3D [ep_size, max_tokens_per_rank, ...] per the
         # LL rank-major contract; downstream MoE pipeline expects 2D --
         # flatten via view.
+        output_tokens = window_tokens if window_tokens is not None else ctx.output_tokens_buf
+        if self.use_external_fp8:
+            output_tokens = output_tokens.view(torch.float8_e4m3fn)
+        elif self.use_external_nvfp4:
+            output_tokens = output_tokens.view(torch.uint8)
         return (
-            ctx.output_tokens_buf.view(self.max_recv_tokens, self.hidden_size),
-            None,
+            output_tokens.view(
+                self.max_recv_tokens,
+                self.hidden_size // 2 if self.use_external_nvfp4 else self.hidden_size,
+            ),
+            (
+                ctx.scales_buf.view(
+                    self.max_recv_tokens,
+                    self.hidden_size // 128 if self.use_fp8 else self.hidden_size // 16,
+                )
+                if (self.use_fp8 or self.use_external_nvfp4)
+                else None
+            ),
             recv_slots_global,
             ctx.recv_topk_weights_buf.view(self.max_recv_tokens, self.max_top_k),
         )
@@ -315,7 +412,13 @@ class NcclEP(Communication):
         Input: [max_recv_tokens, hidden] -- already weighted per-row by fused_moe.
         Output: [num_tokens, hidden] -- combined to original token order.
         """
-        from nccl.ep import CombineInputs, CombineOutputs, Tensor
+        from nccl.ep import (
+            CombineConfig,
+            CombineInputs,
+            CombineOutputs,
+            CombineQuantizationRecipe,
+            Tensor,
+        )
 
         ctx = self._ctx
         if ctx is None:
@@ -325,33 +428,21 @@ class NcclEP(Communication):
 
         num_tokens = state["num_tokens"]
 
-        # NCCL-EP LL combine consumes rank-major tokens with shape
-        # [ep_size, max_tokens_per_rank, hidden]. The scheduler normally
-        # provides the equivalent 2D [max_recv_tokens, hidden] view.
+        # Combine input for LL rank-major must be 3D
+        # [ep_size, max_tokens_per_rank, hidden] -- reshape if caller passed
+        # 2D [max_recv, H] or a per-expert [E, max_recv, H] layout.
+        if final_hidden_states.dim() == 3 and final_hidden_states.shape[0] != self.ep_size:
+            final_hidden_states = final_hidden_states.reshape(-1, self.hidden_size)
         if final_hidden_states.dim() == 2:
-            expected_shape = (self.max_recv_tokens, self.hidden_size)
-            if tuple(final_hidden_states.shape) != expected_shape:
+            if final_hidden_states.shape[0] != self.max_recv_tokens:
                 raise ValueError(
-                    f"combine input shape={tuple(final_hidden_states.shape)} "
-                    f"expected={expected_shape}"
+                    f"combine input rows={final_hidden_states.shape[0]} "
+                    f"expected={self.max_recv_tokens}"
                 )
             final_hidden_states = final_hidden_states.view(
                 self.ep_size,
                 self.max_tokens_per_rank,
                 self.hidden_size,
-            )
-        elif final_hidden_states.dim() == 3:
-            expected_shape = (self.ep_size, self.max_tokens_per_rank, self.hidden_size)
-            if tuple(final_hidden_states.shape) != expected_shape:
-                raise ValueError(
-                    f"combine input shape={tuple(final_hidden_states.shape)} "
-                    f"expected={expected_shape}"
-                )
-        else:
-            raise ValueError(
-                "NcclEP combine input must be 2D [max_recv_tokens, hidden] or "
-                "3D [ep_size, max_tokens_per_rank, hidden], got "
-                f"shape={tuple(final_hidden_states.shape)}"
             )
 
         combine_input_c = final_hidden_states.contiguous()
@@ -365,13 +456,42 @@ class NcclEP(Communication):
         combine_input_nd = Tensor(combine_input_c)
         combine_output_nd = Tensor(combine_output)
 
-        # Rank-major combine: no layout_info, no config required (send_only=0
-        # is the default; defaults round-trip fine).
-        self._handle.combine(
-            CombineInputs(tokens=combine_input_nd),
-            CombineOutputs(tokens=combine_output_nd),
-            stream=stream,
-        )
+        if self.use_low_precision_combine:
+            # Match DeepEP LL's NVFP4 contract.  The rank-major leading
+            # dimension is the source rank, so recv_rank_counter_buf supplies
+            # the valid rows for each scale-kernel group.
+            combine_scales = torch.ops.trtllm.calculate_nvfp4_global_scale(
+                combine_input_c,
+                ctx.recv_rank_counter_buf,
+            )
+            expected_scale_shape = (*combine_input_c.shape[:-1], 1)
+            if (
+                combine_scales.dtype != torch.float32
+                or tuple(combine_scales.shape) != expected_scale_shape
+            ):
+                raise RuntimeError(
+                    "calculate_nvfp4_global_scale must return FP32 scales with shape "
+                    f"{expected_scale_shape}, got dtype={combine_scales.dtype}, "
+                    f"shape={tuple(combine_scales.shape)}"
+                )
+            self._handle.combine(
+                CombineInputs(
+                    tokens=combine_input_nd,
+                    scales=Tensor(combine_scales.contiguous()),
+                ),
+                CombineOutputs(tokens=combine_output_nd),
+                config=CombineConfig(
+                    quantization_recipe=CombineQuantizationRecipe.NVFP4,
+                ),
+                stream=stream,
+            )
+        else:
+            # Rank-major combine: no layout_info or config required.
+            self._handle.combine(
+                CombineInputs(tokens=combine_input_nd),
+                CombineOutputs(tokens=combine_output_nd),
+                stream=stream,
+            )
 
         self._dispatch_state = {}
         return combine_output

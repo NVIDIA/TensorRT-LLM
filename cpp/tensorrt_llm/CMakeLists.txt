@@ -300,6 +300,10 @@ if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
 endif()
 
+if(BUILD_NCCL_EXTENSIONS)
+  add_subdirectory(nccl_extensions)
+endif()
+
 if(BUILD_DEEP_GEMM)
   add_subdirectory(deep_gemm)
 endif()
