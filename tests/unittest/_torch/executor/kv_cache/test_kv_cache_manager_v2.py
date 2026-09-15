@@ -2406,3 +2406,57 @@ def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
 
     assert len(fake_logger.messages) == 1
     assert "unavailable" in fake_logger.messages[0]
+
+
+class _DualCursorRequest:
+    """Stand-in for LlmRequest's two context cursors (llmRequest.h).
+
+    The draft cursor's chunk size stays at the full prompt: only the target one
+    is advanced during chunked prefill.
+    """
+
+    def __init__(self, request_id: int, prompt_len: int, position: int, chunk: int) -> None:
+        self.py_request_id = request_id
+        self.prompt_len = prompt_len
+        self.use_draft_model = False
+        self.is_last_context_chunk = False
+        self._position = position
+        self._chunk = chunk
+
+    @property
+    def context_current_position(self) -> int:
+        return 0 if self.use_draft_model else self._position
+
+    @property
+    def context_chunk_size(self) -> int:
+        return self.prompt_len if self.use_draft_model else self._chunk
+
+
+def test_draft_mirror_sizes_from_the_target_context_cursor() -> None:
+    """The mirror reserves this iteration's chunk, not the whole prompt."""
+    request = _DualCursorRequest(request_id=11, prompt_len=500_000, position=8192, chunk=8192)
+    requested = []
+    kv_cache = Mock(capacity=0)
+
+    def resize(capacity, history_length=None):
+        del history_length
+        requested.append(capacity)
+        return True
+
+    kv_cache.resize.side_effect = resize
+
+    manager = object.__new__(KVCacheManagerV2)
+    # The configuration that took the draft-cursor branch before this fix.
+    manager.enable_joint_kv_cache_reuse = False
+    manager.num_extra_kv_tokens = 2
+    manager._allocated_draft_lens = {}
+    manager._mirror_draft_kv_cache = lambda req: kv_cache
+    manager._resume_and_restore = lambda request_id, cache: True
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.append_context_request(request)
+
+    manager._prepare_draft_resources(scheduled_batch)
+
+    assert requested == [8192 + 8192 + 2]
+    assert not request.use_draft_model

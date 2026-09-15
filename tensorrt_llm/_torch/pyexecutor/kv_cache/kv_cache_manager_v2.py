@@ -112,7 +112,6 @@ from ..resource_manager import (
     _populate_dummy_mrope_config,
     _project_max_attention_window_vec,
     get_pp_layers,
-    request_context,
 )
 from ..scheduler import ScheduledRequests
 
@@ -3682,58 +3681,59 @@ class KVCacheManagerV2(BaseResourceManager):
         IndexMapper contains the correct request IDs. With block reuse, the
         scheduler pre-creates context caches to coordinate the reusable prefix.
         """
-        # Joint V2 reuse deliberately shares the target request progress. A
-        # separate draft engine still uses the legacy draft request view.
-        with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
-            for req in scheduled_batch.context_requests:
-                kv_cache = self._mirror_draft_kv_cache(req)
-                if kv_cache is None:
-                    # Retryable here, unlike the generation loop below: a
-                    # context request has not drafted yet, so the next
-                    # iteration can mirror it once slots free up.
-                    logger.warning(
-                        f"Draft KV cache mirror has no free IndexMapper slot for "
-                        f"context request {req.py_request_id}; retrying next iteration."
-                    )
-                    continue
-                if not self._resume_and_restore(req.py_request_id, kv_cache):
-                    raise RuntimeError(
-                        f"Failed to resume draft KV cache for request {req.py_request_id}"
-                    )
-                draft_len = get_draft_token_length(req) if req.is_last_context_chunk else 0
-                capacity = (
-                    req.context_current_position
-                    + req.context_chunk_size
-                    + draft_len
-                    + self.num_extra_kv_tokens
+        # Sized from the target's context cursor. The draft cursor's chunk size
+        # stays at the full prompt because chunked prefill only advances the
+        # target one, and it does not apply here anyway: this manager is built
+        # only for one-model speculation.
+        for req in scheduled_batch.context_requests:
+            kv_cache = self._mirror_draft_kv_cache(req)
+            if kv_cache is None:
+                # Retryable here, unlike the generation loop below: a
+                # context request has not drafted yet, so the next
+                # iteration can mirror it once slots free up.
+                logger.warning(
+                    f"Draft KV cache mirror has no free IndexMapper slot for "
+                    f"context request {req.py_request_id}; retrying next iteration."
                 )
-                if not kv_cache.resize(capacity):
-                    raise RuntimeError(
-                        f"Draft KV cache context resize failed for request "
-                        f"{req.py_request_id}: could not resize to {capacity} tokens"
-                    )
+                continue
+            if not self._resume_and_restore(req.py_request_id, kv_cache):
+                raise RuntimeError(
+                    f"Failed to resume draft KV cache for request {req.py_request_id}"
+                )
+            draft_len = get_draft_token_length(req) if req.is_last_context_chunk else 0
+            capacity = (
+                req.context_current_position
+                + req.context_chunk_size
+                + draft_len
+                + self.num_extra_kv_tokens
+            )
+            if not kv_cache.resize(capacity):
+                raise RuntimeError(
+                    f"Draft KV cache context resize failed for request "
+                    f"{req.py_request_id}: could not resize to {capacity} tokens"
+                )
 
-            for req in scheduled_batch.generation_requests:
-                kv_cache = self._mirror_draft_kv_cache(req)
-                if kv_cache is None:
-                    raise RuntimeError(
-                        f"Draft KV cache mirror exhausted its IndexMapper on "
-                        f"generation request {req.py_request_id}"
-                    )
-                if not self._resume_and_restore(req.py_request_id, kv_cache):
-                    raise RuntimeError(
-                        f"Failed to resume draft KV cache for request {req.py_request_id}"
-                    )
-                # A paired scheduler already grew both pools atomically; the
-                # recorded width says so, so do not charge this step twice.
-                if req.py_request_id in self._allocated_draft_lens:
-                    continue
-                new_cap = self._required_gen_capacity(req, kv_cache.capacity)
-                if not kv_cache.resize(new_cap):
-                    raise RuntimeError(
-                        f"Draft KV cache generation resize failed for request "
-                        f"{req.py_request_id}: could not resize to {new_cap} tokens"
-                    )
+        for req in scheduled_batch.generation_requests:
+            kv_cache = self._mirror_draft_kv_cache(req)
+            if kv_cache is None:
+                raise RuntimeError(
+                    f"Draft KV cache mirror exhausted its IndexMapper on "
+                    f"generation request {req.py_request_id}"
+                )
+            if not self._resume_and_restore(req.py_request_id, kv_cache):
+                raise RuntimeError(
+                    f"Failed to resume draft KV cache for request {req.py_request_id}"
+                )
+            # A paired scheduler already grew both pools atomically; the
+            # recorded width says so, so do not charge this step twice.
+            if req.py_request_id in self._allocated_draft_lens:
+                continue
+            new_cap = self._required_gen_capacity(req, kv_cache.capacity)
+            if not kv_cache.resize(new_cap):
+                raise RuntimeError(
+                    f"Draft KV cache generation resize failed for request "
+                    f"{req.py_request_id}: could not resize to {new_cap} tokens"
+                )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
         """Beam-0 tokens for block reuse, in the form the active backend consumes.
