@@ -139,9 +139,9 @@ __global__ void llama4_moe_fc13_swiglu_fp8_kernel(int num_tokens,
 #pragma unroll
         for (int i = 0; i < VEC_SIZE / 4; i++)
         {
-            float4 a_val = float4(a_vec.data[i]);
-            float4 b_val_linear = float4(b_vec_linear.data[i]);
-            float4 b_val_gate = float4(b_vec_gate.data[i]);
+            float4 a_val = static_cast<float4>(a_vec.data[i]);
+            float4 b_val_linear = static_cast<float4>(b_vec_linear.data[i]);
+            float4 b_val_gate = static_cast<float4>(b_vec_gate.data[i]);
 
             thread_sum_linear
                 = ffma2(make_float2(a_val.x, a_val.y), make_float2(b_val_linear.x, b_val_linear.y), thread_sum_linear);
@@ -273,8 +273,8 @@ __global__ void llama4_moe_fc2_fp8_kernel(int num_tokens,
 #pragma unroll
         for (int i = 0; i < VEC_SIZE / 4; i++)
         {
-            float4 a_val = float4(a_vec.data[i]);
-            float4 b_val = float4(b_vec[tile_row_idx].data[i]);
+            float4 a_val = static_cast<float4>(a_vec.data[i]);
+            float4 b_val = static_cast<float4>(b_vec[tile_row_idx].data[i]);
             thread_sum = ffma2(make_float2(a_val.x, a_val.y), make_float2(b_val.x, b_val.y), thread_sum);
             thread_sum = ffma2(make_float2(a_val.z, a_val.w), make_float2(b_val.z, b_val.w), thread_sum);
         }

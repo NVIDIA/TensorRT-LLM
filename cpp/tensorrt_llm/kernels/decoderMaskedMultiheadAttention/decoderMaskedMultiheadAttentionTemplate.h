@@ -702,7 +702,7 @@ __inline__ __device__ __nv_fp8_e4m3 vec_conversion<__nv_fp8_e4m3, float>(float c
 template <>
 __inline__ __device__ float2 vec_conversion<float2, fp8_2_t>(fp8_2_t const& a)
 {
-    return float2(a);
+    return static_cast<float2>(a);
 }
 
 template <>
@@ -715,7 +715,7 @@ __inline__ __device__ fp8_2_t vec_conversion<fp8_2_t, float2>(float2 const& a)
 template <>
 __inline__ __device__ float4 vec_conversion<float4, fp8_4_t>(fp8_4_t const& a)
 {
-    return float4(a);
+    return static_cast<float4>(a);
 }
 
 template <>

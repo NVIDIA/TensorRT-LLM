@@ -1207,8 +1207,8 @@ inline __device__ float4 fma(float4 a, fp8_4_t b, float4 fc)
     };
 
     fp8_4 = b;
-    float2 fb0 = float2(fp8_2[0]);
-    float2 fb1 = float2(fp8_2[1]);
+    float2 fb0 = static_cast<float2>(fp8_2[0]);
+    float2 fb1 = static_cast<float2>(fp8_2[1]);
 
     fd.x = fma(a.x, fb0.x, fc.x);
     fd.y = fma(a.y, fb0.y, fc.y);
@@ -1230,8 +1230,8 @@ inline __device__ float4 fma(float a, fp8_4_t b, float4 fc)
     };
 
     fp8_4 = b;
-    float2 fb0 = float2(fp8_2[0]);
-    float2 fb1 = float2(fp8_2[1]);
+    float2 fb0 = static_cast<float2>(fp8_2[0]);
+    float2 fb1 = static_cast<float2>(fp8_2[1]);
 
     fd.x = fma(a, fb0.x, fc.x);
     fd.y = fma(a, fb0.y, fc.y);
@@ -1264,10 +1264,10 @@ inline __device__ Float8_ fma(uint4 a, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(a.x, float2(fp8_2[0]), fc.x);
-    fd.y = fma(a.y, float2(fp8_2[1]), fc.y);
-    fd.z = fma(a.z, float2(fp8_2[2]), fc.z);
-    fd.w = fma(a.w, float2(fp8_2[3]), fc.w);
+    fd.x = fma(a.x, static_cast<float2>(fp8_2[0]), fc.x);
+    fd.y = fma(a.y, static_cast<float2>(fp8_2[1]), fc.y);
+    fd.z = fma(a.z, static_cast<float2>(fp8_2[2]), fc.z);
+    fd.w = fma(a.w, static_cast<float2>(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -1286,10 +1286,10 @@ inline __device__ Float8_ fma(Float8_ fa, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(fa.x, float2(fp8_2[0]), fc.x);
-    fd.y = fma(fa.y, float2(fp8_2[1]), fc.y);
-    fd.z = fma(fa.z, float2(fp8_2[2]), fc.z);
-    fd.w = fma(fa.w, float2(fp8_2[3]), fc.w);
+    fd.x = fma(fa.x, static_cast<float2>(fp8_2[0]), fc.x);
+    fd.y = fma(fa.y, static_cast<float2>(fp8_2[1]), fc.y);
+    fd.z = fma(fa.z, static_cast<float2>(fp8_2[2]), fc.z);
+    fd.w = fma(fa.w, static_cast<float2>(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -1308,10 +1308,10 @@ inline __device__ Float8_ fma(float a, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(a, float2(fp8_2[0]), fc.x);
-    fd.y = fma(a, float2(fp8_2[1]), fc.y);
-    fd.z = fma(a, float2(fp8_2[2]), fc.z);
-    fd.w = fma(a, float2(fp8_2[3]), fc.w);
+    fd.x = fma(a, static_cast<float2>(fp8_2[0]), fc.x);
+    fd.y = fma(a, static_cast<float2>(fp8_2[1]), fc.y);
+    fd.z = fma(a, static_cast<float2>(fp8_2[2]), fc.z);
+    fd.w = fma(a, static_cast<float2>(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -1337,10 +1337,10 @@ inline __device__ Float8_ fma(bf16_8_t a, fp8_8_t b, Float8_ fc)
 
     fp8_8 = b;
 
-    fd.x = fma(a.x, float2(fp8_2[0]), fc.x);
-    fd.y = fma(a.y, float2(fp8_2[1]), fc.y);
-    fd.z = fma(a.z, float2(fp8_2[2]), fc.z);
-    fd.w = fma(a.w, float2(fp8_2[3]), fc.w);
+    fd.x = fma(a.x, static_cast<float2>(fp8_2[0]), fc.x);
+    fd.y = fma(a.y, static_cast<float2>(fp8_2[1]), fc.y);
+    fd.z = fma(a.z, static_cast<float2>(fp8_2[2]), fc.z);
+    fd.w = fma(a.w, static_cast<float2>(fp8_2[3]), fc.w);
 
     return fd;
 }
@@ -2137,10 +2137,10 @@ inline __device__ Float8_ mul(uint4 a, fp8_8_t b)
 
     fp8_8 = b;
 
-    fc.x = mul<float2, uint32_t, float2>(a.x, float2(fp8_2[0]));
-    fc.y = mul<float2, uint32_t, float2>(a.y, float2(fp8_2[1]));
-    fc.z = mul<float2, uint32_t, float2>(a.z, float2(fp8_2[2]));
-    fc.w = mul<float2, uint32_t, float2>(a.w, float2(fp8_2[3]));
+    fc.x = mul<float2, uint32_t, float2>(a.x, static_cast<float2>(fp8_2[0]));
+    fc.y = mul<float2, uint32_t, float2>(a.y, static_cast<float2>(fp8_2[1]));
+    fc.z = mul<float2, uint32_t, float2>(a.z, static_cast<float2>(fp8_2[2]));
+    fc.w = mul<float2, uint32_t, float2>(a.w, static_cast<float2>(fp8_2[3]));
 
     return fc;
 }
@@ -2160,10 +2160,10 @@ inline __device__ Float8_ mul(Float8_ fa, fp8_8_t b)
 
     fp8_8 = b;
 
-    fc.x = mul<float2, float2, float2>(fa.x, float2(fp8_2[0]));
-    fc.y = mul<float2, float2, float2>(fa.y, float2(fp8_2[1]));
-    fc.z = mul<float2, float2, float2>(fa.z, float2(fp8_2[2]));
-    fc.w = mul<float2, float2, float2>(fa.w, float2(fp8_2[3]));
+    fc.x = mul<float2, float2, float2>(fa.x, static_cast<float2>(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa.y, static_cast<float2>(fp8_2[1]));
+    fc.z = mul<float2, float2, float2>(fa.z, static_cast<float2>(fp8_2[2]));
+    fc.w = mul<float2, float2, float2>(fa.w, static_cast<float2>(fp8_2[3]));
 
     return fc;
 }
@@ -2184,8 +2184,8 @@ inline __device__ Float4_ mul(float fa, fp8_4_t b)
     fp8_4 = b;
     float2 fa2 = make_float2(fa, fa);
 
-    fc.x = mul<float2, float2, float2>(fa2, float2(fp8_2[0]));
-    fc.y = mul<float2, float2, float2>(fa2, float2(fp8_2[1]));
+    fc.x = mul<float2, float2, float2>(fa2, static_cast<float2>(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa2, static_cast<float2>(fp8_2[1]));
 
     return fc;
 }
@@ -2215,10 +2215,10 @@ inline __device__ Float8_ mul(float fa, fp8_8_t b)
     fp8_8 = b;
     float2 fa2 = make_float2(fa, fa);
 
-    fc.x = mul<float2, float2, float2>(fa2, float2(fp8_2[0]));
-    fc.y = mul<float2, float2, float2>(fa2, float2(fp8_2[1]));
-    fc.z = mul<float2, float2, float2>(fa2, float2(fp8_2[2]));
-    fc.w = mul<float2, float2, float2>(fa2, float2(fp8_2[3]));
+    fc.x = mul<float2, float2, float2>(fa2, static_cast<float2>(fp8_2[0]));
+    fc.y = mul<float2, float2, float2>(fa2, static_cast<float2>(fp8_2[1]));
+    fc.z = mul<float2, float2, float2>(fa2, static_cast<float2>(fp8_2[2]));
+    fc.w = mul<float2, float2, float2>(fa2, static_cast<float2>(fp8_2[3]));
 
     return fc;
 }
@@ -2238,10 +2238,10 @@ inline __device__ Float8_ mul(bf16_8_t a, fp8_8_t b)
 
     fp8_8 = b;
 
-    fc.x = mul<float2, __nv_bfloat162, float2>(a.x, float2(fp8_2[0]));
-    fc.y = mul<float2, __nv_bfloat162, float2>(a.y, float2(fp8_2[1]));
-    fc.z = mul<float2, __nv_bfloat162, float2>(a.z, float2(fp8_2[2]));
-    fc.w = mul<float2, __nv_bfloat162, float2>(a.w, float2(fp8_2[3]));
+    fc.x = mul<float2, __nv_bfloat162, float2>(a.x, static_cast<float2>(fp8_2[0]));
+    fc.y = mul<float2, __nv_bfloat162, float2>(a.y, static_cast<float2>(fp8_2[1]));
+    fc.z = mul<float2, __nv_bfloat162, float2>(a.z, static_cast<float2>(fp8_2[2]));
+    fc.w = mul<float2, __nv_bfloat162, float2>(a.w, static_cast<float2>(fp8_2[3]));
     return fc;
 }
 
@@ -2260,8 +2260,8 @@ inline __device__ float4 mul(float4 fa, fp8_4_t b)
 
     fp8_4 = b;
 
-    float2 fb0 = float2(fp8_2[0]);
-    float2 fb1 = float2(fp8_2[1]);
+    float2 fb0 = static_cast<float2>(fp8_2[0]);
+    float2 fb1 = static_cast<float2>(fp8_2[1]);
 
     fc.x = fa.x * fb0.x;
     fc.y = fa.y * fb0.y;
@@ -3358,7 +3358,7 @@ inline __device__ void convert_from_fp8(uint16_t* v, const __nv_fp8_e4m3 u)
 
 inline __device__ void convert_from_fp8(uint32_t* v, const fp8_2_t u)
 {
-    half2 h = half2(u);
+    half2 h = static_cast<half2>(u);
     v[0] = reinterpret_cast<uint32_t&>(h);
 }
 
@@ -3441,24 +3441,24 @@ inline __device__ void convert_from_fp8(float* v, const __nv_fp8_e4m3 u)
 
 inline __device__ void convert_from_fp8(float2* v, const fp8_2_t u)
 {
-    v[0] = float2(u);
+    v[0] = static_cast<float2>(u);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void convert_from_fp8(float4* v, const fp8_4_t u)
 {
-    v[0] = float4(u);
+    v[0] = static_cast<float4>(u);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ void convert_from_fp8(Float8_* v, const fp8_8_t u)
 {
-    v[0].x = float2(u.x);
-    v[0].y = float2(u.y);
-    v[0].z = float2(u.z);
-    v[0].w = float2(u.w);
+    v[0].x = static_cast<float2>(u.x);
+    v[0].y = static_cast<float2>(u.y);
+    v[0].z = static_cast<float2>(u.z);
+    v[0].w = static_cast<float2>(u.w);
 }
 #endif // ENALBE_FP8
 
