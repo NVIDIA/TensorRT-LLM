@@ -93,6 +93,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     override_moe_environment,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     build_moe_deployment,
@@ -789,10 +790,19 @@ def _marlin_environment(sm: int = 90) -> MoEEnvironment:
     return MoEEnvironment(sm=sm)
 
 
-def test_marlin_is_selected_for_nvfp4():
+@pytest.mark.parametrize(
+    "quant_algo, expected_leaf",
+    [
+        pytest.param(QuantAlgo.NVFP4, MarlinCudaNvfp4Impl, id="nvfp4"),
+        pytest.param(QuantAlgo.W4A16_NVFP4, MarlinCudaW4a16Nvfp4Impl, id="w4a16_nvfp4"),
+    ],
+)
+def test_marlin_selects_the_leaf_that_publishes_the_format(quant_algo, expected_leaf):
+    """``moe_backend: MARLIN`` names the family; the quant picks which leaf."""
     with override_moe_environment(_marlin_environment()):
-        report = resolve_moe_impl(_marlin_model_config())
-    assert impl_class_for(report) is MarlinFusedMoE
+        report = resolve_moe_impl(_marlin_model_config(quant_algo))
+    assert impl_class_for(report) is expected_leaf
+    assert issubclass(impl_class_for(report), MarlinFusedMoE)
     assert report.selected_by == "pinned"
     assert not report.degraded
 
