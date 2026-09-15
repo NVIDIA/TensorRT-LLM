@@ -674,14 +674,17 @@ def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endp
     assert "path" in body["message"] and "disabled" in body["message"]
 
 
-def test_the_default_media_storage_path_is_timestamped(monkeypatch):
+def test_the_default_media_storage_path_is_timestamped(tmp_path, monkeypatch):
     """Without ``TRTLLM_MEDIA_STORAGE_PATH`` each server gets its own
-    timestamped directory, so servers running side by side do not write their
-    media into a shared one."""
+    timestamped directory under the working directory, so servers running side
+    by side do not write their media into a shared one."""
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    # The default is relative to the working directory, so move off the
+    # checkout rather than leaving a directory in it on every run.
+    monkeypatch.chdir(tmp_path)
     with patch(
         "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
         return_value=True,
@@ -694,9 +697,24 @@ def test_the_default_media_storage_path_is_timestamped(monkeypatch):
             metadata_server_cfg=None,
         )
 
-    assert server.media_storage_path.parent == Path("/tmp/trtllm_generated")
+    assert server.media_storage_path.parent == Path.cwd() / "trtllm_generated"
     # Raises if the directory name is not a yymmdd-hhmmss stamp.
     datetime.strptime(server.media_storage_path.name, "%y%m%d-%H%M%S")
+
+
+def test_servers_starting_in_the_same_second_get_separate_directories(tmp_path):
+    """The stamp has one-second resolution, so two servers that start together
+    would otherwise share a directory and interleave their media."""
+    from tensorrt_llm.serve.openai_server import _new_media_dir
+
+    with patch("tensorrt_llm.serve.openai_server.datetime") as clock:
+        clock.now.return_value = datetime(2026, 9, 15, 7, 12, 38)
+        first = _new_media_dir(tmp_path)
+        second = _new_media_dir(tmp_path)
+
+    assert first.name == "260915-071238"
+    assert second.name == "260915-071238-2"
+    assert first.is_dir() and second.is_dir()
 
 
 # =========================================================================
