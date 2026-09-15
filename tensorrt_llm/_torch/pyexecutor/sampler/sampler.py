@@ -2715,7 +2715,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # Handle embedding bias
         apply_embedding_bias(
-            logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
+            logits_cuda,
+            sampling_requests,
+            sampling_requests_metadata.req_num_steps,
+            request_beams=sampling_requests_metadata.req_num_beams,
         )
 
         # Apply repetition/presence/frequency penalties in place, before the greedy fast
