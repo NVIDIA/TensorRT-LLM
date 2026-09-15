@@ -273,15 +273,17 @@ def _merge_mtp_fields_from_speculative_model(spec_config,
             )
 
     # HF NemotronHConfig: mtp_hybrid_override_pattern is a read-only property
-    # derived from mtp_layers_block_type. Convert the pattern when the draft
-    # checkpoint only provides the legacy string form.
+    # derived from mtp_layers_block_type. Expand the pattern when the draft
+    # checkpoint provides only the packed string form.
     if (draft_cfg.get("mtp_layers_block_type") is None
             and draft_cfg.get("mtp_hybrid_override_pattern") is not None):
         _set_pretrained_config_attr(
             model_config,
             "mtp_layers_block_type",
-            _pattern_to_mtp_layers_block_type(
-                draft_cfg["mtp_hybrid_override_pattern"]),
+            match_nemotron_h_layer_types(
+                model_config,
+                _pattern_to_mtp_layers_block_type(
+                    draft_cfg["mtp_hybrid_override_pattern"])),
         )
 
     if draft_nextn is not None:

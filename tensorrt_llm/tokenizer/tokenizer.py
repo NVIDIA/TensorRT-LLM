@@ -299,10 +299,10 @@ class TransformersTokenizer(TokenizerBase):
             tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                       **kwargs)
         except Exception as e:
-            # Two transformers 5.x regressions for model_types not registered
-            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
-            # tokenizer.json directly and skips AutoConfig, so it sidesteps
-            # both:
+            # Three transformers 5.x regressions for model_types not
+            # registered in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps all
+            # three:
             #  - deepseek_v32: bare PreTrainedConfig fallback hits
             #    modeling_rope_utils → self.max_position_embeddings →
             #    AttributeError (PreTrainedConfig is now a dataclass with

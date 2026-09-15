@@ -992,15 +992,25 @@ def load_pretrained_config(model_name_or_path: str,
         try:
             model_config = transformers.AutoConfig.from_pretrained(
                 model_name_or_path, trust_remote_code=trust_remote_code)
-        except Exception:
+        except Exception as exc:
             # Retried only on failure, so a transformers that parses the
-            # checkpoint itself never reaches this.
+            # checkpoint itself never reaches this. Broad by necessity: the
+            # vocabulary mismatch surfaces as a strict-dataclass validation
+            # error from the built-in config, or as an AssertionError raised
+            # by a checkpoint's own remote code.
             renamed = nemotron_h_legacy_layer_types(config_dict)
             if renamed is None:
                 raise
             from transformers.models.auto.configuration_auto import \
                 CONFIG_MAPPING
-            model_config = CONFIG_MAPPING[model_type].from_dict(renamed)
+            model_config = CONFIG_MAPPING[model_type].from_dict(
+                renamed, **kwargs)
+            cause = (str(exc).splitlines() or [""])[0]
+            logger.warning(
+                f"{model_name_or_path} uses the transformers>=5.13 Nemotron-H "
+                f"layer vocabulary; rebuilt it with the legacy names after "
+                f"{type(exc).__name__}: {cause} -- hybrid_override_pattern="
+                f"{getattr(model_config, 'hybrid_override_pattern', None)!r}")
 
     # Transformers 5.x sets rope_scaling to {"rope_type": "default"} instead
     # of None for models with standard RoPE (no scaling).  Clear it so that

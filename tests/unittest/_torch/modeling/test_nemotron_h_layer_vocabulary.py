@@ -43,7 +43,7 @@ class TestLoader(unittest.TestCase):
         self.assertEqual(_load(layers_block_type=_LEGACY).hybrid_override_pattern, _PATTERN)
 
     def test_failure_the_rename_cannot_explain_propagates(self):
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(Exception, "not_a_layer_type"):
             _load(layers_block_type=["not_a_layer_type"])
 
 
