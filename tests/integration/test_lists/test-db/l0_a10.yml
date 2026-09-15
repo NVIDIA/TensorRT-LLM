@@ -41,6 +41,9 @@ l0_a10:
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_kv_cache_layout.py
   - unittest/_torch/executor/test_kv_connector_v2_prefix_real_manager.py
+  - unittest/_torch/executor/test_mooncake_store_common.py
+  - unittest/_torch/executor/test_mooncake_store_donor.py
+  - unittest/_torch/executor/test_mooncake_store_master.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/executor/test_resource_manager.py
   - unittest/_torch/executor/test_seq_slot_sizing.py
