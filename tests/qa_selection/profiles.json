@@ -1,0 +1,44 @@
+{
+  "H100": {
+    "sm": 90,
+    "device_name": "H100 80GB HBM3",
+    "device_memory_mib": 81559,
+    "max_gpu_per_node": 8,
+    "cpu_arch": "x86_64"
+  },
+  "B200": {
+    "sm": 100,
+    "device_name": "B200",
+    "device_memory_mib": 183359,
+    "max_gpu_per_node": 8,
+    "cpu_arch": "x86_64"
+  },
+  "B300": {
+    "sm": 103,
+    "device_name": "B300 SXM6 AC",
+    "device_memory_mib": 275040,
+    "max_gpu_per_node": 8,
+    "cpu_arch": "x86_64"
+  },
+  "GB200": {
+    "sm": 100,
+    "device_name": "GB200",
+    "device_memory_mib": 189471,
+    "max_gpu_per_node": 4,
+    "cpu_arch": "aarch64"
+  },
+  "GB300": {
+    "sm": 103,
+    "device_name": "GB300",
+    "device_memory_mib": 284208,
+    "max_gpu_per_node": 4,
+    "cpu_arch": "aarch64"
+  },
+  "VR200": {
+    "sm": 107,
+    "device_name": "VR NVL72 ES",
+    "device_memory_mib": 168896,
+    "max_gpu_per_node": 4,
+    "cpu_arch": "aarch64"
+  }
+}
