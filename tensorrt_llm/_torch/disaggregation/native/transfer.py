@@ -37,6 +37,7 @@ except ImportError:
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.base import Chunk
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -46,7 +47,6 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferRequest,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
-    KVSlice,
     ReceiverBase,
     RxSessionBase,
     SenderBase,
@@ -364,6 +364,15 @@ class _ReceiveOperationOwner:
             self._local_completion_pending = False
 
     @property
+    def all_writers_reported(self) -> bool:
+        """Whether every writer of the sealed cohort has reported a terminal result."""
+        with self._lock:
+            return (
+                self._expected_writers is not None
+                and len(self._writer_results) == self._expected_writers
+            )
+
+    @property
     def resources_drained(self) -> bool:
         with self._lock:
             writers_drained = self._expected_writers is not None and (
@@ -612,7 +621,7 @@ class AuxSendTask(SendTaskBase):
 class KVSendTask(SendTaskBase):
     def __init__(
         self,
-        kv_slice: KVSlice,
+        chunk: Chunk,
         params: DisaggregatedParams,
         slice_id: int,
         prompt_len: Optional[int] = None,
@@ -620,8 +629,18 @@ class KVSendTask(SendTaskBase):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
-        self._slice = kv_slice
+        self.expected_transfers = 0
+        self._chunk = chunk
         self._prompt_len = prompt_len
+
+    @property
+    def reports_outstanding(self) -> bool:
+        """Whether any of this piece's writes has still to finish.
+
+        One peer failing ends the task while the writes to its siblings run on, so the task's own
+        status cannot answer this. Zero expected means nothing was ever submitted.
+        """
+        return self.transferred_count < self.expected_transfers
 
 
 class Sender(SenderBase):
@@ -651,7 +670,10 @@ class Sender(SenderBase):
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
-        self._pre_cancelled_rids: set[int] = set()
+        # unique_rid -> whether the peer asked, for cancels that arrive before the session exists.
+        # Who asked is not recoverable from the id alone, and the two differ: a peer's cancel is a
+        # transfer error, our own side's is an ordinary end.
+        self._pre_cancelled_rids: dict[int, bool] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -737,19 +759,20 @@ class Sender(SenderBase):
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
         pre_cancel = False
+        cancelled_by_peer = False
         with self._sessions_lock:
             if self._shutdown_requested:
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
-                self._pre_cancelled_rids.discard(unique_rid)
+                cancelled_by_peer = self._pre_cancelled_rids.pop(unique_rid)
             if not (pre_cancel and self._enforce_physical_ownership):
                 self._sessions[unique_rid] = (
                     tx_session if self._enforce_physical_ownership else weakref.ref(tx_session)
                 )
         if pre_cancel:
             if self._enforce_physical_ownership:
-                tx_session.cancel_local()
+                tx_session.cancel_local(by_peer=cancelled_by_peer)
                 # Make the cancelled session visible only after its terminal
                 # state and the previously saved requests are captured. This
                 # prevents the listener from reporting the same first
@@ -757,7 +780,7 @@ class Sender(SenderBase):
                 with self._sessions_lock:
                     if self._shutdown_requested:
                         raise RuntimeError("cannot create a TxSession after Sender shutdown")
-                    self._pre_cancelled_rids.discard(unique_rid)
+                    self._pre_cancelled_rids.pop(unique_rid, None)
                     with self._peer_requests_lock:
                         req_infos = list(self._peer_requests.get(unique_rid, {}).values())
                     self._sessions[unique_rid] = tx_session
@@ -768,7 +791,7 @@ class Sender(SenderBase):
                         defer_to_worker=True,
                     )
             else:
-                tx_session.cancel()
+                tx_session.cancel(by_peer=cancelled_by_peer)
             return
 
         req_info = self._get_first_req_info(unique_rid)
@@ -1304,7 +1327,7 @@ class Sender(SenderBase):
         instead would shift every block one position early.
 
         Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
-        _create_kv_slice, so there dst must not exceed src. A smaller dst
+        _create_chunk, so there dst must not exceed src. A smaller dst
         (generation prefix-cache reuse) is handled via dst_start.
         """
         block_diff = dst_block_ids.size - src_block_ids.size
@@ -1321,8 +1344,11 @@ class Sender(SenderBase):
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         self_ri = self._registrar.self_rank_info
-        token_range = task._slice.token_range
-        if token_range is not None and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
+        token_range = task._chunk.token_range
+        # Only a piece short of the whole prompt runs the chunk projection below, and that is the
+        # part with no answer under CP; a sole piece covering everything takes the untouched path.
+        is_partial = token_range.start > 0 or token_range.end < task._prompt_len
+        if is_partial and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
             raise ValueError(
                 "enable_pipelined_transfer is not supported with context parallelism "
                 f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
@@ -1332,6 +1358,9 @@ class Sender(SenderBase):
             timer.record_prepare_args_start(peer_ri.instance_rank)
         targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
         expected_transfers = len(targets.ranks)
+        # Recorded on the task as well: the count on the write meta settles the task, while the
+        # handle has to answer how many writes are still out after one of them has already failed.
+        task.expected_transfers = expected_transfers
 
         # Aggregate fragment pointers from all matching pool pairs.
         # Each pool pair produces one or more region pairs (rp), each containing
@@ -1350,7 +1379,7 @@ class Sender(SenderBase):
         )
         pool_mapping = self._registrar.get_pool_mapping(peer_ri)
         dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
-        src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
+        src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
 
         # Aggregate fragments from all matching pools using numpy concatenation.
         # Send ownership is per pool: replicated pools elect one fan-in
@@ -1384,7 +1413,7 @@ class Sender(SenderBase):
 
                 # Block lists are the suffix of [..., slice_end); cached prefix
                 # is implicit in their size. token_start = (total_blocks - n) * tpb.
-                slice_end = token_range.end if token_range is not None else task._prompt_len
+                slice_end = token_range.end
                 total_blocks = (slice_end + tpb - 1) // tpb
 
                 # Project the peer's whole-prompt list only for partial chunks.
@@ -1392,10 +1421,8 @@ class Sender(SenderBase):
                 # only the last context chunk, so its peer list must remain whole.
                 prompt_blocks = (task._prompt_len + tpb - 1) // tpb
                 is_windowed = window_size is not None and window_size < task._prompt_len
-                if (
-                    token_range is not None
-                    and (token_range.start > 0 or total_blocks < prompt_blocks)
-                    and not (is_windowed and task._slice.is_last_slice)
+                if (token_range.start > 0 or total_blocks < prompt_blocks) and not (
+                    is_windowed and task._chunk.is_last
                 ):
                     dst_block_ids = project_blocks_to_global_chunk(
                         dst_block_ids,
@@ -1481,7 +1508,7 @@ class Sender(SenderBase):
             unique_rid=task._unique_rid,
             slice_id=task.slice_id,
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
-            is_last_slice=task._slice.is_last_slice,
+            is_last_slice=task._chunk.is_last,
             bounce_dst_base=req_info.bounce_dst_base,
         )
 
@@ -1639,12 +1666,14 @@ class Sender(SenderBase):
         with self._sessions_lock:
             session = self._get_session(unique_rid)
             if session is None:
-                self._pre_cancelled_rids.add(unique_rid)
+                # Parked with the peer as who asked: the session built afterwards reads its
+                # cancellation from here, and an id on its own would read as a local cancel.
+                self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
             if self._enforce_physical_ownership:
-                session.cancel_local()
+                session.cancel_local(by_peer=True)
             else:
-                session.cancel()
+                session.cancel(by_peer=True)
 
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
@@ -1899,6 +1928,9 @@ class Sender(SenderBase):
 
 
 class TxSession(TxSessionBase):
+    cancelled_by_peer: bool = False
+    """Only meaningful once the session is CANCELLED."""
+
     def __init__(
         self,
         request_id: int,
@@ -1929,6 +1961,7 @@ class TxSession(TxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
+        self._cancel_exception: Optional[Exception] = None
         self.transfer_start_time = None
         self.transfer_end_time = None
         # Must be last: makes session visible to listener thread,
@@ -1959,15 +1992,18 @@ class TxSession(TxSessionBase):
             and bool(self.kv_tasks)
             and all(t.status == TaskStatus.TRANSFERRED for t in self.kv_tasks)
         )
-        if kv_all_transferred:
-            if self.aux_task is not None and self.aux_task.status == TaskStatus.TRANSFERRED:
-                return SessionStatus.FULLY_TRANSFERRED
-            return SessionStatus.KV_TRANSFERRED
-        if self.kv_tasks and any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks):
+        aux_done = not self._need_aux or (
+            self.aux_task is not None and self.aux_task.status == TaskStatus.TRANSFERRED
+        )
+        if kv_all_transferred and aux_done:
+            return SessionStatus.TRANSFERRED
+        if kv_all_transferred or (
+            self.kv_tasks and any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks)
+        ):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
-    def send(self, slice: KVSlice) -> None:
+    def send(self, chunk: Chunk) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
@@ -1979,14 +2015,14 @@ class TxSession(TxSessionBase):
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
-                slice,
+                chunk,
                 params,
                 slice_id,
                 prompt_len=self._base_args.prompt_len,
             )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
-            self._has_last_slice |= slice.is_last_slice
+            self._has_last_slice |= chunk.is_last
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)
 
@@ -2067,15 +2103,7 @@ class TxSession(TxSessionBase):
 
     def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?"""
-        status = self.status
-        if self._need_aux:
-            logically_completed = status == SessionStatus.FULLY_TRANSFERRED
-        else:
-            logically_completed = status in (
-                SessionStatus.KV_TRANSFERRED,
-                SessionStatus.FULLY_TRANSFERRED,
-            )
-        return logically_completed and (
+        return self.status is SessionStatus.TRANSFERRED and (
             not getattr(self, "_enforce_physical_ownership", False) or self.resources_drained()
         )
 
@@ -2100,25 +2128,35 @@ class TxSession(TxSessionBase):
             else WaitResult.FAILED
         )
 
-    def cancel(self) -> None:
-        """Cancel the session and notify the remote receiver.
+    def cancel(self, by_peer: bool = False) -> bool:
+        """Cancel the session and notify the remote receiver. ``True`` if the ask went out.
 
         Safe to call multiple times. TRANSFERRING tasks keep running (mid-write).
         Only INIT tasks have their events signalled immediately.
         The lock serializes with _deliver_kv_to_agent() so has_transferring_tasks()
         is accurate the moment this returns.
         """
-        if not self.cancel_local():
-            return
+        if not self.cancel_local(by_peer=by_peer):
+            return False
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
+        return True
 
-    def cancel_local(self) -> bool:
+    def cancel_local(self, by_peer: bool = False) -> bool:
         aux_failures: list[RecvReqInfo] = []
         with self.lock:
+            # Only an earlier cancel refuses: a failed session may still have peers touching memory,
+            # and they are told to stop here. Which ending a piece reports is latched by its handle,
+            # so it does not depend on this.
             if self._terminal_status == SessionStatus.CANCELLED:
                 return False
             self._terminal_status = SessionStatus.CANCELLED
+            # Who asked is not recoverable later, and the two differ: the peer asking is a transfer
+            # error, our own side asking is an ordinary end.
+            self.cancelled_by_peer = by_peer
             exc = RuntimeError(f"TxSession {self.disagg_request_id} cancelled")
+            # Kept so a task failed by the line below is recognisable as cancelled rather than
+            # broken; its own status cannot say which, since both end it the same way.
+            self._cancel_exception = exc
             for task in self.kv_tasks:
                 if task.status == TaskStatus.INIT:
                     task.fail(exc)
@@ -2294,7 +2332,7 @@ class KVRecvTask:
     def __init__(
         self,
         unique_rid: Optional[int],
-        kv_slice: KVSlice,
+        chunk: Chunk,
         slice_id: int,
         params: DisaggregatedParams,
         aux_slot: Optional[int],
@@ -2303,10 +2341,11 @@ class KVRecvTask:
         self.slice_id = slice_id
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
-        self.last_slice_count = 0
+        # One terminal result per writer rank, keyed by the rank the result frame carries.
+        self._writer_reports: dict[int, bool] = {}
 
         self._unique_rid = unique_rid
-        self._kv_slice = kv_slice
+        self._chunk = chunk
         self._params = params
         self._exception: Optional[Exception] = None
         self._aux_slot = aux_slot
@@ -2343,6 +2382,40 @@ class KVRecvTask:
     @property
     def is_done(self) -> bool:
         return self._event.is_set()
+
+    def note_writer_report(self, peer_rank: int, succeeded: bool) -> tuple[bool, bool]:
+        """Record one writer's terminal word: whether this rank had yet to speak, and whether every
+        expected writer has now succeeded.
+
+        The first answer is an edge, not a level. A rank keeps the first result it reports, and a
+        repeat is refused outright, so the caller settles the piece once rather than once per frame.
+        Callers hold ``RxSession.lock``, which serializes the writes.
+        """
+        # TODO: a report from a rank outside the authorized writer set is counted, not rejected.
+        if peer_rank in self._writer_reports:
+            previous = self._writer_reports[peer_rank]
+            if previous != succeeded:
+                logger.warning(
+                    f"KV writer {peer_rank} reported success={succeeded} for slice {self.slice_id} "
+                    f"after reporting success={previous}; the first result stands"
+                )
+            return False, False
+        self._writer_reports[peer_rank] = succeeded
+        all_succeeded = len(self._writer_reports) == self.expected_transfers and all(
+            self._writer_reports.values()
+        )
+        return True, all_succeeded
+
+    @property
+    def reports_outstanding(self) -> bool:
+        """Whether a writer's terminal word about this task is still missing.
+
+        A logical outcome is not an answer to this: one writer's failure settles the task while
+        its siblings write on. The ownership owner tracks its own cohort and answers for itself.
+        """
+        if self._physical_owner is not None:
+            return not self._physical_owner.all_writers_reported
+        return len(self._writer_reports) < self.expected_transfers
 
     def begin_publication(self) -> None:
         if self._physical_owner is None:
@@ -2428,7 +2501,10 @@ class Receiver(ReceiverBase):
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
-        self._pre_cancelled_rids: set[int] = set()
+        # unique_rid -> whether the peer asked, for cancels that arrive before the session exists.
+        # Who asked is not recoverable from the id alone, and the two differ: a peer's cancel is a
+        # transfer error, our own side's is an ordinary end.
+        self._pre_cancelled_rids: dict[int, bool] = {}
         self._shutdown = False
         self._ownership_admission_lock = threading.Lock()
         self._ownership_poisoned: Optional[Exception] = None
@@ -2484,6 +2560,7 @@ class Receiver(ReceiverBase):
         if getattr(rx_session, "_enforce_physical_ownership", False):
             release_admission = self._acquire_ownership_admission()
         pre_cancel = False
+        cancelled_by_peer = False
         try:
             with self._sessions_lock:
                 if self._shutdown:
@@ -2494,15 +2571,15 @@ class Receiver(ReceiverBase):
                     self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
                 if rx_session.disagg_request_id in self._pre_cancelled_rids:
                     pre_cancel = True
-                    self._pre_cancelled_rids.discard(rx_session.disagg_request_id)
+                    cancelled_by_peer = self._pre_cancelled_rids.pop(rx_session.disagg_request_id)
         finally:
             if release_admission is not None:
                 release_admission()
         if pre_cancel:
             if getattr(rx_session, "_enforce_physical_ownership", False):
-                rx_session.cancel_local()
+                rx_session.cancel_local(by_peer=cancelled_by_peer)
             else:
-                rx_session.cancel()
+                rx_session.cancel(by_peer=cancelled_by_peer)
 
     def _get_session(self, unique_rid: Optional[int]) -> Optional["RxSession"]:
         with self._sessions_lock:
@@ -2544,7 +2621,7 @@ class Receiver(ReceiverBase):
             sender_req_id=sender_req_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
-            block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
+            block_ids_per_layer_groups=task._chunk.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
             dst_start_token=None,
             aux_slot=task._aux_slot,
@@ -2888,12 +2965,14 @@ class Receiver(ReceiverBase):
             session_entry = self._sessions.get(unique_rid)
             session = self._resolve_session_entry(unique_rid, session_entry)
             if session is None:
-                self._pre_cancelled_rids.add(unique_rid)
+                # Parked with the peer as who asked: the session built afterwards reads its
+                # cancellation from here, and an id on its own would read as a local cancel.
+                self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
             if self._enforce_physical_ownership:
-                session.cancel_local()
+                session.cancel_local(by_peer=True)
             else:
-                session.cancel()
+                session.cancel(by_peer=True)
 
     def _process_kv_agent_result(self, _send_id: bytes, message: list[bytes]):
         if message[0] != MessageType.KV_AGENT_RESULT:
@@ -2956,6 +3035,9 @@ class Receiver(ReceiverBase):
 
 
 class RxSession(RxSessionBase):
+    cancelled_by_peer: bool = False
+    """Only meaningful once the session is CANCELLED."""
+
     def __init__(
         self,
         request_id: int,
@@ -2976,6 +3058,7 @@ class RxSession(RxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
+        self._cancel_exception: Optional[Exception] = None
         self.transfer_start_time = None
         self.transfer_end_time = None
         self.kv_cache_size_bytes: int = 0
@@ -3052,11 +3135,12 @@ class RxSession(RxSessionBase):
             return SessionStatus.ERROR
         if self._kv_tasks:
             kv_all_transferred = all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks)
-            if kv_all_transferred and self._aux_status == TaskStatus.TRANSFERRED:
-                return SessionStatus.FULLY_TRANSFERRED
-            if kv_all_transferred:
-                return SessionStatus.KV_TRANSFERRED
-            if any(t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks):
+            aux_done = not self._need_aux or self._aux_status == TaskStatus.TRANSFERRED
+            if kv_all_transferred and aux_done:
+                return SessionStatus.TRANSFERRED
+            if kv_all_transferred or any(
+                t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks
+            ):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
@@ -3121,11 +3205,11 @@ class RxSession(RxSessionBase):
                 f"RxSession {self.disagg_request_id} became terminal before publication"
             )
 
-    def receive(self, slice: KVSlice) -> None:
+    def receive(self, chunk: Chunk) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         if self._enforce_physical_ownership:
-            task = self.prepare_receive(slice)
+            task = self.prepare_receive(chunk)
             if task is not None:
                 self.dispatch_prepared_receive(task)
             return
@@ -3133,7 +3217,7 @@ class RxSession(RxSessionBase):
         slice_id = len(self._kv_tasks)
         task = KVRecvTask(
             self.disagg_request_id,
-            slice,
+            chunk,
             slice_id,
             params,
             aux_slot=self.aux_slot,
@@ -3141,7 +3225,7 @@ class RxSession(RxSessionBase):
         self._kv_tasks.append(task)
         self._receiver.dispatch_task(task)
 
-    def prepare_receive(self, slice: KVSlice) -> Optional[KVRecvTask]:
+    def prepare_receive(self, chunk: Chunk) -> Optional[KVRecvTask]:
         """Create an unpublished task under the cancellation linearization lock."""
         with self.lock:
             if self._closed or self._terminal_status is not None:
@@ -3149,7 +3233,7 @@ class RxSession(RxSessionBase):
             params = self._base_args.params
             task = KVRecvTask(
                 self.disagg_request_id,
-                slice,
+                chunk,
                 len(self._kv_tasks),
                 params,
                 aux_slot=self.aux_slot,
@@ -3254,9 +3338,13 @@ class RxSession(RxSessionBase):
                     all_succeeded = False
             else:
                 all_succeeded = False
-                if status == AgentResult.SUCCESS and is_last_slice:
-                    task.last_slice_count += 1
-                    all_succeeded = task.last_slice_count == task.expected_transfers
+                # A failure and a last-slice success are both one writer's terminal word.
+                if status == AgentResult.FAILED or is_last_slice:
+                    accepted, all_succeeded = task.note_writer_report(
+                        peer_rank, status == AgentResult.SUCCESS
+                    )
+                    if not accepted:
+                        return
             self.kv_cache_size_bytes += transfer_size
             if status == AgentResult.SUCCESS:
                 from .bounce import scatter_write_result
@@ -3435,16 +3523,13 @@ class RxSession(RxSessionBase):
             }
 
     def is_completed(self) -> bool:
-        """Non-blocking check: has the transfer completed successfully?"""
-        status = self.status
-        if self._need_aux:
-            logically_completed = status == SessionStatus.FULLY_TRANSFERRED
-        else:
-            logically_completed = status in (
-                SessionStatus.KV_TRANSFERRED,
-                SessionStatus.FULLY_TRANSFERRED,
-            )
-        return logically_completed and (
+        """Non-blocking check: has the transfer completed successfully?
+
+        One read of ``status`` answers both halves at one instant. Asking the KV handles and the
+        auxiliary handle separately would compose two instants, and retirement feeds a cross-rank
+        consensus that must not see a combination which never held.
+        """
+        return self.status is SessionStatus.TRANSFERRED and (
             not self._enforce_physical_ownership or self.resources_drained()
         )
 
@@ -3459,13 +3544,22 @@ class RxSession(RxSessionBase):
         aux_drained = self._aux_physical_owner is None or self._aux_physical_owner.resources_drained
         return kv_drained and aux_drained
 
-    def cancel_local(self) -> bool:
+    def cancel_local(self, by_peer: bool = False) -> bool:
         """Commit cancellation under the same lock used for publication."""
         with self.lock:
+            # Only an earlier cancel refuses: a failed session may still have peers touching memory,
+            # and they are told to stop here. Which ending a piece reports is latched by its handle,
+            # so it does not depend on this.
             if self._terminal_status == SessionStatus.CANCELLED:
                 return False
             self._terminal_status = SessionStatus.CANCELLED
+            # Who asked is not recoverable later, and the two differ: the peer asking is a transfer
+            # error, our own side asking is an ordinary end.
+            self.cancelled_by_peer = by_peer
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
+            # Kept so a task failed by the loop below is recognisable as cancelled rather than
+            # broken; its own status cannot say which, since both end it the same way.
+            self._cancel_exception = exc
             for task in self._kv_tasks:
                 rid_slice = (self.disagg_request_id, task.slice_id)
                 if task.status == TaskStatus.INIT:
@@ -3495,10 +3589,15 @@ class RxSession(RxSessionBase):
         with self._publication_lock:
             self._receiver.send_cancel_to_senders(self.disagg_request_id, sender_endpoints)
 
-    def cancel(self) -> None:
-        """Cancel locally, then notify every writer without holding the lock."""
-        if self.cancel_local():
-            self.notify_cancel()
+    def cancel(self, by_peer: bool = False) -> bool:
+        """Cancel locally, then notify every writer without holding the lock.
+
+        ``True`` if the ask went out; ``False`` means the session had already ended.
+        """
+        if not self.cancel_local(by_peer=by_peer):
+            return False
+        self.notify_cancel()
+        return True
 
     def has_transferring_tasks(self) -> bool:
         """True while a destination accessor may remain active.
@@ -3545,7 +3644,7 @@ class RxSession(RxSessionBase):
         if self._need_aux:
             while True:
                 status = self.status
-                if status == SessionStatus.FULLY_TRANSFERRED:
+                if status == SessionStatus.TRANSFERRED:
                     return WaitResult.COMPLETED
                 elif status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
                     return self._failed_wait_result()
