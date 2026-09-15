@@ -497,8 +497,14 @@ def write_weight_manifest(manifest: WeightManifest, path: Path) -> None:
         raise FileExistsError(f"Weight manifest already exists: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(serialize_weight_manifest(manifest), encoding="utf-8")
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(serialize_weight_manifest(manifest), encoding="utf-8")
+        os.replace(temporary, path)
+    except BaseException:
+        # A failed write must not leave the .tmp behind: nothing cleans it up
+        # later, and it reads as a manifest mid-write to any directory scan.
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def load_weight_manifest(path: Path) -> WeightManifest:

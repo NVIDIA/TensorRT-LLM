@@ -541,6 +541,26 @@ def test_write_load_roundtrip_is_atomic_and_refuses_overwrite(tmp_path: Path):
         write_weight_manifest(manifest, path)
 
 
+@pytest.mark.cpu_only
+def test_failed_write_leaves_no_tmp_file(monkeypatch, tmp_path: Path):
+    """A write that fails mid-way must remove its .tmp: nothing cleans it up
+    later, and it reads as a manifest mid-write to any directory scan."""
+    manifest = build_weight_manifest(_TiedModule(tied=True), context={"boundary": "unit"})
+    path = tmp_path / manifest_file_name("final", "baseline", 0)
+
+    # Fail at the rename, after the .tmp has been written: this is the point
+    # where a leftover would otherwise survive.
+    def _boom(_src, _dst):
+        raise OSError("rename failure")
+
+    monkeypatch.setattr(weight_manifest_mod.os, "replace", _boom)
+    with pytest.raises(OSError, match="rename failure"):
+        write_weight_manifest(manifest, path)
+
+    assert not path.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 # --------------------------------------------------------------------------- #
 # Env-gated writer
 # --------------------------------------------------------------------------- #
