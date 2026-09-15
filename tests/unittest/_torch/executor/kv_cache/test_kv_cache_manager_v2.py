@@ -51,6 +51,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
+    GPU_LEVEL,
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
@@ -788,6 +789,97 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
             KvCacheConfig(avg_seq_len=2048),
             max_seq_len=1024,
         )
+
+
+@pytest.mark.parametrize("is_estimating", [False, True])
+@pytest.mark.parametrize("layout", ["full_attention", "windowed", "ssm"])
+def test_estimation_preserves_heterogeneous_warmup_constraints(
+    is_estimating: bool, layout: str
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(use_kv_cache_manager_v2=True, avg_seq_len=1024),
+        max_attention_window_vec=[None, 128 if layout == "windowed" else None],
+        max_batch_size=3,
+        max_num_tokens=2048,
+    )
+    if layout == "ssm":
+        config = replace(
+            config,
+            commit_min_snapshot=True,
+            layers=[
+                config.layers[0],
+                SsmLayerConfig(layer_id=LayerId(1), buffers=config.layers[1].buffers),
+            ],
+        )
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_estimating_kv_cache = is_estimating
+
+    result = manager._build_cache_config(config)
+
+    assert result.typical_step == config.typical_step
+    assert config.constraints
+    if is_estimating and layout == "full_attention":
+        assert result.constraints == []
+    else:
+        assert result.constraints == config.constraints
+
+
+@pytest.mark.parametrize("max_batch_size", [1, 64])
+@pytest.mark.parametrize("max_seq_len", [512, 262144])
+@pytest.mark.parametrize("limit", ["bytes", "tokens"])
+def test_full_attention_estimation_respects_memory_budget(
+    max_batch_size: int, max_seq_len: int, limit: str
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    # Two FP16 K/V layers with two 64-element heads cost 1024 bytes/token.
+    # The long model context needs 256 MiB, while either budget allows 4 MiB.
+    config = KvCacheConfig(
+        use_kv_cache_manager_v2=True,
+        enable_block_reuse=False,
+        host_cache_size=0,
+        avg_seq_len=max_seq_len,
+        max_gpu_total_bytes=(4 if limit == "bytes" else 8) << 20,
+        max_tokens=262144 if limit == "bytes" else 4096,
+        max_util_for_resume=1.0,
+    )
+    manager = KVCacheManagerV2(
+        config,
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=256,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        is_estimating_kv_cache=True,
+    )
+    caches = []
+    try:
+        assert 0 < manager.impl.get_quota(GPU_LEVEL) <= 4 << 20
+        assert isinstance(manager.max_seq_len, int)
+        if max_seq_len == 512:
+            assert manager.max_seq_len == max_seq_len
+        else:
+            assert 0 < manager.max_seq_len < max_seq_len
+        capacity = manager.get_num_available_tokens(
+            token_num_upper_bound=max_seq_len, batch_size=max_batch_size
+        )
+        assert capacity > 0
+        for _ in range(max_batch_size):
+            cache = manager.impl.create_kv_cache()
+            caches.append(cache)
+            assert cache.resume(torch.cuda.current_stream().cuda_stream)
+            assert cache.resize(1)
+        assert caches[0].resize(capacity)
+    finally:
+        for cache in caches:
+            cache.close()
+        manager.shutdown()
 
 
 def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:

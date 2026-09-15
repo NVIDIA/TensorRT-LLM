@@ -2793,6 +2793,20 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
+        if (
+            self.is_estimating_kv_cache
+            and config.layers
+            and all(
+                isinstance(layer, AttentionLayerConfig) and layer.sliding_window_size is None
+                for layer in config.layers
+            )
+        ):
+            # Full attention has one lifecycle, so warmup constraints cannot
+            # improve the pool split. They can instead force allocation of the
+            # model's entire context beyond the profiling memory budget, before
+            # the manager and warmup can clamp sequence lengths to GPU capacity.
+            # Specialized managers retain control of their constraints via this hook.
+            return replace(config, constraints=[])
         return config
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
