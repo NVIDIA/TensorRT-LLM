@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Integration tests for per-iteration KV cache statistics (kvCacheIterationStats).
+"""Integration tests for KV cache manager V2 per-iteration statistics.
 
-Tests verify that the 18 stat fields are correctly populated across
+Tests verify that window, hot-pool and cold-pool fields are correctly populated across
 different inference scenarios: cold start, block reuse (partial/full),
 shared prefix, batch generation, long context, and rapid-fire.
 
@@ -43,16 +43,13 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..conftest import llm_models_root
 
 MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+HOST_CACHE_SIZE = 64 << 20
 
-ALL_FIELDS = [
+WINDOW_FIELDS = {
     # Instantaneous gauges — primary (GPU) pool
     "primaryMaxNumBlocks",
     "primaryFreeNumBlocks",
     "primaryUsedNumBlocks",
-    # Instantaneous gauges — secondary (host) pool
-    "secondaryMaxNumBlocks",
-    "secondaryFreeNumBlocks",
-    "secondaryUsedNumBlocks",
     # Per-iteration deltas — context phase
     "iterAllocTotalBlocks",
     "iterAllocNewBlocks",
@@ -71,14 +68,22 @@ ALL_FIELDS = [
     # Intra-device (GPU → GPU) block copies
     "iterIntraDeviceCopyBlocks",
     "iterIntraDeviceCopyBytes",
-]
+}
+
+# Reuse counters describe logical cache lifecycles, not physical hot pools.
+HOT_POOL_FIELDS = WINDOW_FIELDS - {
+    "iterReusedBlocks",
+    "iterFullReusedBlocks",
+    "iterPartialReusedBlocks",
+    "iterMissedBlocks",
+    "iterCacheHitRate",
+}
 
 SECONDARY_FIELDS = {
     "secondaryMaxNumBlocks",
     "secondaryFreeNumBlocks",
     "secondaryUsedNumBlocks",
 }
-NON_SECONDARY_FIELDS = set(ALL_FIELDS) - SECONDARY_FIELDS
 
 TEST_NAMES = {
     1: "Cold start",
@@ -103,21 +108,23 @@ def _is_verbose(request):
 
 
 def print_kv_stats(label, stats_list):
-    """Print all 18 fields for every stats entry."""
+    """Print the fields reported in each V2 stats view."""
     print(f"\n{'=' * 60}")
     print(f" {label}: {len(stats_list)} stats entries")
     print(f"{'=' * 60}")
     found = False
     for i, s in enumerate(stats_list):
-        ki = s.get("kvCacheIterationStats")
-        if ki:
-            found = True
-            for ws, v in ki.items():
-                print(f"\n  --- entry[{i}] window_size={ws} ---")
-                for field in ALL_FIELDS:
-                    val = v.get(field, "<MISSING>")
-                    print(f"    {field:30s} = {val}")
-        else:
+        for view in (
+            "kvCacheIterationStats",
+            "kvCacheIterationStatsByPoolGroup",
+            "kvCacheIterationStatsByColdPoolGroup",
+        ):
+            for group, fields in s.get(view, {}).items():
+                found = True
+                print(f"\n  --- entry[{i}] {view}[{group}] ---")
+                for field, value in fields.items():
+                    print(f"    {field:30s} = {value}")
+        if not s.get("kvCacheIterationStats"):
             keys = list(s.keys())[:8]
             print(f"  entry[{i}]: no kvCacheIterationStats (keys: {keys})")
     if not found:
@@ -150,7 +157,12 @@ def llm_instance():
     """Create a shared LLM instance for all tests in this module."""
     llm = LLM(
         model=MODEL,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=True, iteration_stats_interval=1),
+        kv_cache_config=KvCacheConfig(
+            version=2,
+            enable_block_reuse=True,
+            iteration_stats_interval=1,
+            host_cache_size=HOST_CACHE_SIZE,
+        ),
         enable_iter_perf_stats=True,
         return_perf_metrics=True,
     )
@@ -390,7 +402,7 @@ class TestKvCacheIterationStats:
         assert total_alloc > 0, "iterAllocTotalBlocks = 0 across all entries"
 
     def test_field_completeness(self, llm_instance, all_collected, request):
-        """Field completeness — verify fields in their V2 window and cold-pool views."""
+        """Verify fields in the V2 window, hot-pool and cold-pool views."""
         # If running standalone (no prior tests), generate some traffic
         if not all_collected:
             llm_instance.generate(["Hello world"], SamplingParams(max_tokens=16))
@@ -401,19 +413,33 @@ class TestKvCacheIterationStats:
             ki = s.get("kvCacheIterationStats")
             if ki:
                 entries_with_kv += 1
+                assert s.get("kvCacheIterationStatsByPoolGroup"), "missing V2 hot-pool stats"
+                # The explicit host tier ensures cold-field coverage is not vacuous.
+                assert s.get("kvCacheIterationStatsByColdPoolGroup"), "missing V2 cold-pool stats"
                 # V2 reports secondary gauges by cold pool group, not by window.
-                for ws, v in ki.items():
-                    missing_fields = NON_SECONDARY_FIELDS - v.keys()
-                    assert not missing_fields, (
-                        f"Missing kvCacheIterationStats fields for window {ws}: "
-                        f"{sorted(missing_fields)}"
-                    )
+                for view, expected_fields in (
+                    ("kvCacheIterationStats", WINDOW_FIELDS),
+                    ("kvCacheIterationStatsByPoolGroup", HOT_POOL_FIELDS),
+                ):
+                    for group, v in s[view].items():
+                        missing_fields = expected_fields - v.keys()
+                        assert not missing_fields, (
+                            f"Missing {view} fields for group {group}: {sorted(missing_fields)}"
+                        )
+                        assert not any(field.startswith("secondary") for field in v), (
+                            f"Unexpected secondary fields in {view} for group {group}"
+                        )
 
                 for group, v in s.get("kvCacheIterationStatsByColdPoolGroup", {}).items():
                     missing_fields = SECONDARY_FIELDS - v.keys()
                     assert not missing_fields, (
                         f"Missing kvCacheIterationStatsByColdPoolGroup fields for group {group}: "
                         f"{sorted(missing_fields)}"
+                    )
+                    assert v["secondaryMaxNumBlocks"] > 0
+                    assert (
+                        v["secondaryFreeNumBlocks"] + v["secondaryUsedNumBlocks"]
+                        == v["secondaryMaxNumBlocks"]
                     )
 
         print(f"  Entries with kvCacheIterationStats: {entries_with_kv}/{len(all_collected)}")
@@ -444,7 +470,7 @@ def main():
         "--verbose",
         "-v",
         action="store_true",
-        help="Dump all 18 KV cache stat fields for every stats entry",
+        help="Dump the window, hot-pool and cold-pool KV cache stat fields",
     )
     parser.add_argument(
         "--test",
@@ -478,10 +504,15 @@ def main():
 
     fake_request = FakeRequest()
 
-    print("Starting LLM with block_reuse + iteration_stats_interval=1")
+    print("Starting LLM with KV cache V2 + block_reuse + iteration_stats_interval=1")
     llm = LLM(
         model=MODEL,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=True, iteration_stats_interval=1),
+        kv_cache_config=KvCacheConfig(
+            version=2,
+            enable_block_reuse=True,
+            iteration_stats_interval=1,
+            host_cache_size=HOST_CACHE_SIZE,
+        ),
         enable_iter_perf_stats=True,
         return_perf_metrics=True,
     )
