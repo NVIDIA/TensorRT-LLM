@@ -1073,7 +1073,13 @@ def _cbtsCoverageAudit(pipeline)
         def readyJson = ""
         def prAuthor = ""
         def pilotEligible = false
-        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'),
+            string(credentialsId: 'default-llm-repo', variable: 'CBTS_COVERAGE_GIT_REPO'),
+        ]) {
             prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
@@ -1097,6 +1103,7 @@ def _cbtsCoverageAudit(pipeline)
             return null
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        pipeline.echo("CBTS audit: PR diff applies cleanly to the latest coverage DB")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
         return ready
     } catch (InterruptedException e) {
