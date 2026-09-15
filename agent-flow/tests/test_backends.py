@@ -742,6 +742,9 @@ _RECURSIVE_NODE_SCHEMA = {
 
 
 class TestClaudeBackendCreateClient:
+    def test_reasoning_effort_override(self):
+        assert ClaudeCodeBackend(reasoning_effort="medium").reasoning_effort() == "medium"
+
     async def test_framework_tools_keep_annotations_and_independent_handlers(self):
         from agent_flow.tools import tool
 

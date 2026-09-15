@@ -81,6 +81,17 @@ Copy [`task.example.yaml`](./task.example.yaml) and fill it in.
 
 ## `task.yaml`
 
+An optional `agents` block selects the backend, model, reasoning effort,
+and external MCP servers per role. Unspecified roles retain the historical
+Claude defaults:
+
+```yaml
+agents:
+  roles:
+    projector: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+    analyzer: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+```
+
 | Field | Required | Notes |
 | --- | --- | --- |
 | `checkpoint_path` | ✅ | Model checkpoint dir to serve. Remote when `cluster_ssh` is set; otherwise local. |

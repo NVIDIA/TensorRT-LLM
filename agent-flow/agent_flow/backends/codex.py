@@ -142,14 +142,15 @@ _REASONING_EFFORT = "max"
 
 
 class CodexBackend(Backend):
-    def __init__(self) -> None:
+    def __init__(self, reasoning_effort: str | None = None) -> None:
         self._transport: CodexTransport | None = None
+        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
 
     def version(self) -> str:
         return _codex_backend_version()
 
     def reasoning_effort(self) -> str:
-        return _REASONING_EFFORT
+        return self._reasoning_effort
 
     async def __aenter__(self) -> "CodexBackend":
         self._transport = CodexTransport(
@@ -222,7 +223,10 @@ class CodexBackend(Backend):
                 server["disabled_tools"] = list(
                     dict.fromkeys([*inherited, *server["disabled_tools"]])
                 )
-        config.update(model_reasoning_effort=_REASONING_EFFORT, model_context_window=1000000)
+        config.update(
+            model_reasoning_effort=self._reasoning_effort,
+            model_context_window=1000000,
+        )
         params = ThreadStartParams(
             model=model,
             developer_instructions=system_prompt or None,

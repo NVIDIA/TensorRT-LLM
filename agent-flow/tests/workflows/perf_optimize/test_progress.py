@@ -353,7 +353,7 @@ def test_read_latest_progress_tool_filters_by_agent(tmp_path):
     # The optimizer fetches the evaluator's REJECT feedback on a retry.
     read = _tool(tools, "optimizer", "read_latest_progress")
     out = _call(read.handler, {"agent": "evaluator"})
-    rendered = yaml.safe_load(out["content"][0]["text"])
+    rendered = yaml.safe_load(out)
     assert rendered == [
         {
             "step": 2,
@@ -370,4 +370,4 @@ def test_read_latest_progress_tool_filters_by_agent(tmp_path):
     ctx2 = progress_module.ProgressContext(path=empty)
     read2 = _tool(progress_module.build_progress_tools(ctx2), "qa", "read_latest_progress")
     out = _call(read2.handler, {})
-    assert "No optimization entries yet" in out["content"][0]["text"]
+    assert "No optimization entries yet" in out

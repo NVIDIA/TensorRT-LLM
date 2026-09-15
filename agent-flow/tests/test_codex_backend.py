@@ -130,6 +130,10 @@ async def test_session_options_use_developer_instructions_and_preserve_native_de
     assert ("thread/unsubscribe", {"threadId": "thread-1"}) in transport.requests
 
 
+def test_reasoning_effort_override():
+    assert CodexBackend(reasoning_effort="ultra").reasoning_effort() == "ultra"
+
+
 async def test_empty_prompt_does_not_replace_runtime_instructions(backend, tmp_path):
     async with backend.create_client("", "gpt-5.4", cwd=tmp_path):
         payload = next(

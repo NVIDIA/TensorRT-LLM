@@ -13,13 +13,8 @@ from typing import Any
 import yaml
 from rich.markup import escape
 
-from agent_flow import (
-    CLAUDE_CODE_DEFAULT_MODEL,
-    AgentLayer,
-    AgentLayerConfig,
-    BackendConfig,
-    SessionConfig,
-)
+from agent_flow import AgentLayer, AgentLayerConfig, BackendConfig, SessionConfig
+from agent_flow.agent_runtime import AgentConfig, resolve_agent_config
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
@@ -45,6 +40,7 @@ from .progress import (
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
 from .roadmap_schema import RoadmapError
+from .roles import ROLES
 from .state import (
     ROUND_STAGES,
     STAGE_ANALYZER,
@@ -97,10 +93,9 @@ def _progress_has_entries(path: Path) -> bool:
 def _make_agent(
     name: str,
     system_prompt: str,
+    agent_config: AgentConfig,
     tools: list | None = None,
     required_tools: list[str] | None = None,
-    backend_kind: str = "claude-code",
-    model: str = CLAUDE_CODE_DEFAULT_MODEL,
     session_mode: str = "persistent",
     cwd: Path | None = None,
 ) -> AgentLayer:
@@ -109,10 +104,12 @@ def _make_agent(
             name=name,
             system_prompt=system_prompt,
             backend=BackendConfig(
-                kind=backend_kind,
-                model=model,
+                kind=agent_config.backend,
+                model=agent_config.model,
+                reasoning_effort=agent_config.reasoning_effort,
                 tools=tools,
                 cwd=cwd,
+                extra_mcp_servers=agent_config.extra_mcp_servers,
             ),
             session=SessionConfig(mode=session_mode),
             required_tools=tuple(required_tools or ()),
@@ -120,16 +117,7 @@ def _make_agent(
     )
 
 
-_ROLES = (
-    "benchmarker",
-    "projector",
-    "analyzer",
-    "optimizer",
-    "evaluator",
-    "integrator",
-    "qa",
-    "reporter",
-)
+_ROLES = ROLES
 
 
 class PerfOptimizeWorkflow:
@@ -344,26 +332,10 @@ class PerfOptimizeWorkflow:
         )
         progress_tools = build_progress_tools(self._progress_ctx)
 
-        for role in _ROLES:
-            setattr(
-                self,
-                role,
-                _make_agent(
-                    role,
-                    getattr(self.prompts, role),
-                    progress_tools[role],
-                    required_tools=[f"append_{role}_progress"],
-                    # Sessions are scoped to each role's unit of work: the
-                    # judges (evaluator, qa) are stateless so every verdict
-                    # gets fresh eyes, uninfluenced by earlier attempts' /
-                    # rounds' conclusions; the analyzer keeps campaign-long
-                    # memory of the roadmap it authored.
-                    session_mode=(
-                        "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
-                    ),
-                ),
-            )
         self._progress_tools = progress_tools
+        self._agent_configs: dict[str, AgentConfig] = {}
+        for role in _ROLES:
+            setattr(self, role, None)
 
     def __enter__(self) -> "PerfOptimizeWorkflow":
         return self
@@ -377,6 +349,35 @@ class PerfOptimizeWorkflow:
             if hasattr(layer, "__exit__"):
                 layer.__exit__(None, None, None)
 
+    def _configure_agents(self) -> None:
+        task_data = self._task_data()
+        self._agent_configs = {
+            role: resolve_agent_config(
+                task_data,
+                role,
+            )
+            for role in _ROLES
+        }
+        for role in _ROLES:
+            if getattr(self, role) is not None:
+                continue
+            setattr(
+                self,
+                role,
+                _make_agent(
+                    role,
+                    getattr(self.prompts, role),
+                    self._agent_configs[role],
+                    self._progress_tools[role],
+                    required_tools=[f"append_{role}_progress"],
+                    # Judges are stateless; other roles retain their existing
+                    # unit-of-work session scope.
+                    session_mode=(
+                        "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
+                    ),
+                ),
+            )
+
     # ------------------------------------------------------------- orchestration
 
     def run(self, task: str) -> None:
@@ -385,6 +386,7 @@ class PerfOptimizeWorkflow:
         state = self._init_state(task, log)
         if state is None:
             return
+        self._configure_agents()
 
         try:
             self._ensure_optimization_branch(state, log)
@@ -1066,6 +1068,7 @@ class PerfOptimizeWorkflow:
         optimizer = _make_agent(
             f"optimizer-{item_id}",
             self.prompts.optimizer,
+            self._agent_configs["optimizer"],
             tools["optimizer"],
             required_tools=["append_optimizer_progress"],
             cwd=Path(item_state.item_worktree_path),
@@ -1073,6 +1076,7 @@ class PerfOptimizeWorkflow:
         evaluator = _make_agent(
             f"evaluator-{item_id}",
             self.prompts.evaluator,
+            self._agent_configs["evaluator"],
             tools["evaluator"],
             required_tools=["append_evaluator_progress"],
             session_mode="stateless",

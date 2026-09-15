@@ -12,6 +12,13 @@ checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>  # remote when usin
 trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
 # extra_llm_api_options: /local/path/to/extra_llm_api_options.yaml
 
+# Optional per-role backend routing. Roles omitted here keep the historical
+# Claude backend and model.
+# agents:
+#   roles:
+#     projector: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+#     analyzer: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
+
 # Optional: the benchmark operating point(s) driven by
 # benchmark_serving.py.
 benchmark:
