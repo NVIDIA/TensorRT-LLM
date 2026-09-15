@@ -559,19 +559,28 @@ class NVLinkOneSided(Communication):
         if workspace_state is None:
             return
 
-        if workspace_state.get("cft_initialized", False):
-            # The C++ manager owns a logical endpoint bound to this allocation.
-            # Destroy it before dropping the final Python references to the
-            # MNNVL memory, otherwise the endpoint outlives its backing pages
-            # and a recycled virtual address could resolve to it.
-            torch.ops.trtllm.moe_a2a_cft_release(
-                workspace_state["workspace"], workspace_state["ep_rank"]
-            )
-
-        cls._WORKSPACES.pop(workspace_key)
-        if cls._WORKSPACE is workspace_state:
-            cls._WORKSPACE = None
-        workspace_state.clear()
+        try:
+            if workspace_state.get("cft_initialized", False):
+                # The C++ manager owns a logical endpoint bound to this
+                # allocation. Destroy it before dropping the final Python
+                # references to the MNNVL memory, otherwise the endpoint
+                # outlives its backing pages and a recycled virtual address
+                # could resolve to it.
+                torch.ops.trtllm.moe_a2a_cft_release(
+                    workspace_state["workspace"], workspace_state["ep_rank"]
+                )
+        finally:
+            # Drop the workspace whether or not the release succeeded. By the
+            # time we get here ``destroy`` has already decremented the refcount
+            # and unregistered the lifecycle, so nothing will call this again:
+            # leaving the entry behind would hand a later communicator an
+            # allocation whose endpoint state is unknown. The exception still
+            # propagates -- the caller learns the release failed, but not by
+            # inheriting a reusable half-released workspace.
+            cls._WORKSPACES.pop(workspace_key, None)
+            if cls._WORKSPACE is workspace_state:
+                cls._WORKSPACE = None
+            workspace_state.clear()
 
     def destroy(self):
         """Release shared state during explicit, rank-coordinated teardown."""

@@ -606,13 +606,19 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         # A disaggregated launcher may export its outer context/generation
         # world into each server's independent model MPI world.
         launcher_env_matches_mpi = False
+        launcher_port = None
         if all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
             try:
+                # Parse the port here too: accepting the launcher env on
+                # RANK/WORLD_SIZE alone and only converting MASTER_PORT later
+                # turns a non-numeric port into an uncaught ValueError instead
+                # of falling back to the MPI rendezvous.
+                launcher_port = int(os.environ["MASTER_PORT"])
                 launcher_env_matches_mpi = (
                     int(os.environ["RANK"]) == rank and int(os.environ["WORLD_SIZE"]) == world_size
                 )
             except ValueError:
-                pass
+                launcher_env_matches_mpi = False
 
         if not launcher_env_matches_mpi:
             host, port = comm.bcast(_pick_rendezvous(), root=0)
@@ -622,7 +628,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
             os.environ["WORLD_SIZE"] = str(world_size)
         else:
             host = os.environ["MASTER_ADDR"]
-            port = int(os.environ["MASTER_PORT"])
+            port = launcher_port
 
         device_id = None
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
