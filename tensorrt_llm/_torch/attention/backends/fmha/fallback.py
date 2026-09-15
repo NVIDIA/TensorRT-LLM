@@ -210,6 +210,7 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
+            locality_domain_id=forward_args.locality_domain_id,
             skip_softmax_stat=attn.skip_softmax_stat,
             skip_correction_threshold=attn.skip_correction_threshold,
             # --- Sparse runtime parameters ---

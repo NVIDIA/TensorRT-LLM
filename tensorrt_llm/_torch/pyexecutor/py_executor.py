@@ -5951,6 +5951,12 @@ class PyExecutor:
 
             new_requests = new_requests_cur_rank
 
+        if self._is_kv_manager_v2:
+            for req_item in new_requests:
+                if req_item.is_normal_request:
+                    req_item.locality_domain_id = (
+                        self.kv_cache_manager.pick_locality_domain(req_item.id))
+
         # 7. Merge requests
         return merge_requests(new_requests,
                               cp_config=self.dist.cp_config,

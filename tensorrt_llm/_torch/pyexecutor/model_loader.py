@@ -41,6 +41,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
+from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -886,6 +887,12 @@ class ModelLoader:
         load_format = self.llm_args.load_format
         self._startup_metadata = _checkpoint_startup_metadata(
             checkpoint_loader, load_format)
+        if load_format == LoadFormat.GMS and config.locality_domain_policy.enabled:
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with locality domain localized weights. "
+                "GMS shares registered parameters, while locality domain execution "
+                "releases those parameters after creating partition-local weight shards."
+            )
 
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
@@ -1546,6 +1553,9 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
+        if model.model_config.locality_domain_policy.enabled:
+            enabled_features.add(
+                PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1837,6 +1847,8 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            locality_domain_policy=LocalityDomainPolicy(
+                enabled=self.llm_args.enable_locality_domains),
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -1877,7 +1889,6 @@ class ModelLoader:
                 f"Could not read allreduce pre-allocation config from "
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
-
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
