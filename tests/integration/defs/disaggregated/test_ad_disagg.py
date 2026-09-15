@@ -91,7 +91,7 @@ LLAMA_EAGLE3_EXPECTED_TOKEN_IDS = [
 MODEL_PATHS = {
     "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
-    "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
     "DeepSeek-V3-Lite": "DeepSeek-V3-Lite/bf16",
 }
 
@@ -468,7 +468,7 @@ def reduced_model_config(model, extra_config=None):
 def reduced_model_cases():
     return [
         pytest.param(
-            "TinyLlama-1.1B-Chat-v1.0",
+            "Qwen3-0.6B",
             id="tinyllama",
         ),
         pytest.param(
@@ -589,7 +589,7 @@ def test_tinyllama_batch_handoff_semantic_slots():
         "seed": AUTODEPLOY_DISAGG_SEED,
     }
     outputs = run_sequential_batch_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         generation_overlap=True,
         prompts=prompts,
         sampling_params_kwargs=sampling_params_kwargs,
@@ -951,13 +951,13 @@ def run_context_then_generation_handoff(
 @pytest.mark.timeout(600)
 def test_async_generation_matches_aggregate():
     aggregate_output = run_aggregate_generation(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         world_size=1,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
     outputs = run_context_then_generation_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         worker_world_sizes=(1, 1),
         generation_overlap=True,
         prompt="What is the capital of Germany?",
@@ -989,13 +989,13 @@ def test_async_generation_no_overlap_matches_aggregate():
     """
     sampling_params_kwargs = {"max_tokens": 10, "ignore_eos": True}
     aggregate_output = run_aggregate_generation(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         world_size=1,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs=sampling_params_kwargs,
     )
     outputs = run_context_then_generation_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         worker_world_sizes=(1, 1),
         generation_overlap=False,
         prompt="What is the capital of Germany?",
@@ -1014,13 +1014,13 @@ def test_async_generation_no_overlap_matches_aggregate():
 @pytest.mark.timeout(900)
 def test_async_sharded_generation_handoff():
     aggregate_output = run_aggregate_generation(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         world_size=2,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
     outputs = run_context_then_generation_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         worker_world_sizes=(2, 2),
         generation_overlap=True,
         prompt="What is the capital of Germany?",

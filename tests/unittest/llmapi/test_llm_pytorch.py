@@ -235,7 +235,7 @@ def test_llm_perf_metrics():
 @pytest.mark.part3
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 def test_llm_prefix_cache_reuse(attn_backend):
-    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = get_model_path("Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0,
                                      max_tokens=5,

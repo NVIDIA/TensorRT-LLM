@@ -34,7 +34,7 @@ from tensorrt_llm.usage import schemas
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 

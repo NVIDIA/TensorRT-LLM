@@ -191,7 +191,7 @@ def test_result_completes_within_timeout():
 
 def test_DetokenizedGenerationResultBase():
     sampling_params = SamplingParams(max_tokens=4)
-    model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = llm_models_root() / "Qwen3/Qwen3-0.6B"
     tokenizer = TransformersTokenizer.from_pretrained(model_path)
     result = DetokenizedGenerationResultBase(
         id=2,
@@ -405,10 +405,9 @@ def test_ResponsePostprocessWorker():
 
     pool = ProcessPoolExecutor(max_workers=1)
     print("submit task")
-    fut = pool.submit(
-        ResponsePostprocessWorker_worker_task, input_pipe.address,
-        out_pipe.address,
-        str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"))
+    fut = pool.submit(ResponsePostprocessWorker_worker_task, input_pipe.address,
+                      out_pipe.address,
+                      str(llm_models_root() / "Qwen3/Qwen3-0.6B"))
 
     inputs = [
         Input(rsp=create_rsp(123),
@@ -500,10 +499,9 @@ def test_PostprocWorker_disaggregated_params():
     out_pipe = ZeroMqQueue(is_server=True, socket_type=zmq.PULL)
 
     pool = ProcessPoolExecutor(max_workers=1)
-    fut = pool.submit(
-        ResponsePostprocessWorker_worker_task, input_pipe.address,
-        out_pipe.address,
-        str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"))
+    fut = pool.submit(ResponsePostprocessWorker_worker_task, input_pipe.address,
+                      out_pipe.address,
+                      str(llm_models_root() / "Qwen3/Qwen3-0.6B"))
 
     disagg_params = DisaggregatedParams(
         request_type="generation_only",

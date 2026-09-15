@@ -55,7 +55,7 @@ MPI_STARTED = MPI_TAG + 4
 
 MODEL_PATHS = {
     "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
-    "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
     "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
     "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
@@ -625,7 +625,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logprobs(model, generation_overlap):
     """Verify that logprobs propagate correctly from prefill to decode.
@@ -732,7 +732,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
                 future.result()
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 def test_disaggregated_cancel_gen_requests(model):
     # Test that cancelling generation requests on a saturated generation
     # worker completes without hangs or resource leaks.
@@ -839,7 +839,7 @@ def test_disaggregated_cancel_gen_requests(model):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logits(model, generation_overlap):
     """Verify that generation logits propagate from prefill to decode in disagg."""
@@ -974,7 +974,7 @@ def test_disaggregated_logits(model, generation_overlap):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False])
 def test_arbitrary_kv_cache_transfer(model, generation_overlap):
     """Test KV cache transfer from the reuse tree.
@@ -1125,7 +1125,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False])
 def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
     """Test that missing-block transfers fail.

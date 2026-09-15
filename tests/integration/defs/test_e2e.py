@@ -241,10 +241,9 @@ class BenchRunner:
         return result
 
 
-@pytest.mark.parametrize(
-    "model_name, llama_model_root",
-    [pytest.param("TinyLlama-1.1B-Chat-v1.0", "TinyLlama-1.1B-Chat-v1.0")],
-    indirect=["llama_model_root"])
+@pytest.mark.parametrize("model_name, llama_model_root",
+                         [pytest.param("Qwen3-0.6B", "Qwen3-0.6B")],
+                         indirect=["llama_model_root"])
 def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
                                             llama_model_root):
     # Prepare dataset with invalid tokens

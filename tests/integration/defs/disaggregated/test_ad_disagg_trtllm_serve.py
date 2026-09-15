@@ -48,13 +48,13 @@ SERVER_START_TIMEOUT_S = 300
 SERVER_READY_REQUEST_TIMEOUT_S = 5
 OPENAI_REQUEST_TIMEOUT_S = 60
 PROXY_PORT_MAX_RETRIES = 5
-TINYLLAMA_MODEL_DIR = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+QWEN3_MODEL_DIR = "Qwen3/Qwen3-0.6B"
 AUTODEPLOY_BACKEND = "_autodeploy"
 EXPECTED_COMPLETION_SUBSTRING = "Berlin"
 
 
-def tinyllama_model_path():
-    return str(Path(llm_models_root()) / TINYLLAMA_MODEL_DIR)
+def qwen3_model_path():
+    return str(Path(llm_models_root()) / QWEN3_MODEL_DIR)
 
 
 def worker_cuda_devices(num_workers):
@@ -175,7 +175,7 @@ async def test_openai_completion(work_dir):
     verifies the trtllm-serve deployment shape: context worker, generation
     worker, disaggregated proxy, and an OpenAI-compatible completion request.
     """
-    model = tinyllama_model_path()
+    model = qwen3_model_path()
     ctx_device, gen_device = worker_cuda_devices(2)
 
     last_port_conflict = None

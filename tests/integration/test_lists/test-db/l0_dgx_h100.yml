@@ -113,17 +113,17 @@ l0_dgx_h100:
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first_sync"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"
-  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_genbs1[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-Qwen3-0.6B]
   - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_ctx_pp_gen_tp_asymmetric
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_kv_cache_v1
@@ -217,7 +217,7 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
-  - disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_workers.py::test_workers_conversation_router[Qwen3-0.6B]
 - condition:
     ranges:
       system_gpu_count:

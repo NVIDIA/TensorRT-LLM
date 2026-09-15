@@ -8,7 +8,7 @@ from .test_llm import llama_model_path
 
 prompts = ["A B C"]
 
-model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+model_name = "Qwen/Qwen3-0.6B"
 
 
 def test_llm_with_model_downloaded():

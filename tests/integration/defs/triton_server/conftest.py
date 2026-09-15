@@ -332,11 +332,32 @@ def gpt_2b_lora_model_root():
 
 
 @pytest.fixture(scope="session")
+def tiny_llama_lora_base_model_root():
+    """Base model for the TinyLlama-1.1B-Chat-v1.0 LoRA adapter.
+
+    Kept separate from `tiny_llama_model_root` because the LoRA adapter
+    returned by `tiny_llama_lora_model_root` is fine-tuned specifically
+    for TinyLlama-1.1B-Chat-v1.0 and has no Qwen3-0.6B equivalent.
+    """
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    tiny_llama_lora_base_model_root = os.path.join(models_root,
+                                                   "llama-models-v2",
+                                                   "TinyLlama-1.1B-Chat-v1.0")
+
+    assert os.path.exists(
+        tiny_llama_lora_base_model_root
+    ), f"{tiny_llama_lora_base_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    return tiny_llama_lora_base_model_root
+
+
+@pytest.fixture(scope="session")
 def tiny_llama_lora_model_root():
     """HF-format LoRA adapter for TinyLlama-1.1B-Chat-v1.0.
 
     Used by the llmapi triton backend's E2E LoRA test
-    (`test_llmapi_lora`). Same base model as `tiny_llama_model_root`.
+    (`test_llmapi_lora`). Same base model as
+    `tiny_llama_lora_base_model_root`.
     """
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -466,8 +487,7 @@ def whisper_large_model_root():
 def tiny_llama_model_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    tiny_llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                         "TinyLlama-1.1B-Chat-v1.0")
+    tiny_llama_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
 
     assert os.path.exists(
         tiny_llama_model_root

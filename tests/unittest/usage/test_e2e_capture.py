@@ -48,7 +48,7 @@ import pytest
 # Model path resolution (same pattern as test_llm_telemetry.py)
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 
 
 def _get_model_path():

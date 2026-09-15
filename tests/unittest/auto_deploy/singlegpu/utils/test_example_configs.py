@@ -41,7 +41,7 @@ _EXCLUDED_FILES = {
 }
 
 # Dummy model name used during validation (model path is not resolved during construction)
-_DUMMY_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+_DUMMY_MODEL = "Qwen3/Qwen3-0.6B"
 
 
 def _find_config_yamls():

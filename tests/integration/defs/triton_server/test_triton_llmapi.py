@@ -185,7 +185,7 @@ def test_llmapi_lora(
     TENSOR_PARALLEL_SIZE,
     llm_backend_inflight_batcher_llm_root,
     llm_backend_venv,
-    tiny_llama_model_root,
+    tiny_llama_lora_base_model_root,
     tiny_llama_lora_model_root,
 ):
     """E2E LoRA test for the new llmapi triton backend.
@@ -213,7 +213,7 @@ def test_llmapi_lora(
     model_config["triton_config"]["max_batch_size"] = 0
     model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
     model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
-    model_config["model"] = tiny_llama_model_root
+    model_config["model"] = tiny_llama_lora_base_model_root
     model_config["lora_config"] = {
         "lora_dir": [tiny_llama_lora_model_root],
         "max_lora_rank": 64,

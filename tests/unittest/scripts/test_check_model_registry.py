@@ -88,7 +88,7 @@ def test_validate_models_rejects_duplicate_explicit_config_id(mod):
 def test_validate_models_rejects_empty_config_id(mod):
     models = [
         {
-            "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "name": "Qwen3/Qwen3-0.6B",
             "config_id": "   ",
             "yaml_extra": ["world_size_1.yaml"],
         }

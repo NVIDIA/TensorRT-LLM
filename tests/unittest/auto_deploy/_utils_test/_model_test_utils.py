@@ -519,7 +519,7 @@ _SMALL_MODEL_CONFIGS = {
             "ssm_state_size": 32,
         },
     },
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": {
+    "Qwen3/Qwen3-0.6B": {
         "model_kwargs": {
             "num_hidden_layers": 2,
         },

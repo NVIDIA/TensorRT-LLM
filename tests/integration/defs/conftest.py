@@ -677,9 +677,8 @@ def llama_v2_tokenizer_model_root():
 def llama_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "TinyLlama-1.1B-Chat-v1.0":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "TinyLlama-1.1B-Chat-v1.0")
+    if request.param == "Qwen3-0.6B":
+        llama_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
     elif request.param == "llama-3.1-8b":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Meta-Llama-3.1-8B")

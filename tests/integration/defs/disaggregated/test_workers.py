@@ -231,7 +231,7 @@ class ConditionalWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs, internal_request_auth_key)
@@ -285,7 +285,7 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs, internal_request_auth_key)
@@ -406,7 +406,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  tokens_per_block: int = 32,
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
@@ -555,7 +555,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
 def prepare_llama_model(llama_model_root: str, llm_venv):
     src_dst_dict = {
         llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
@@ -677,8 +677,7 @@ def background_workers(llm_venv, config_file: str):
 
 
 @pytest.mark.skip(reason="https://nvbugs/5372970")
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
+@pytest.mark.parametrize("llama_model_root", ['Qwen3-0.6B'], indirect=True)
 def test_workers_conditional_disaggregation(disaggregated_test_root,
                                             disaggregated_example_root,
                                             llm_venv, llama_model_root):
@@ -725,8 +724,7 @@ def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
+@pytest.mark.parametrize("llama_model_root", ['Qwen3-0.6B'], indirect=True)
 def test_workers_kv_cache_events(disaggregated_test_root,
                                  disaggregated_example_root, llm_venv,
                                  llama_model_root):
@@ -745,8 +743,7 @@ def test_workers_kv_cache_events(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts, 6))
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
+@pytest.mark.parametrize("llama_model_root", ['Qwen3-0.6B'], indirect=True)
 def test_workers_kv_cache_aware_router(disaggregated_test_root,
                                        disaggregated_example_root, llm_venv,
                                        llama_model_root):
@@ -797,8 +794,7 @@ def test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16(
         asyncio.run(tester.test_multi_round_request(prompts, 8, 4))
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
+@pytest.mark.parametrize("llama_model_root", ['Qwen3-0.6B'], indirect=True)
 def test_workers_kv_cache_aware_router_eviction(disaggregated_test_root,
                                                 disaggregated_example_root,
                                                 llm_venv, llama_model_root):
@@ -825,7 +821,7 @@ class ConversationRouterTester(BasicWorkerTester):
                  gen_servers: List[str],
                  req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
                  server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
-                 model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                 model_name: str = "Qwen3/Qwen3-0.6B",
                  internal_request_auth_key: str | None = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs, internal_request_auth_key)
@@ -1003,8 +999,7 @@ class ConversationRouterTester(BasicWorkerTester):
 
 @skip_no_hopper
 @pytest.mark.skip_less_device(3)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
+@pytest.mark.parametrize("llama_model_root", ['Qwen3-0.6B'], indirect=True)
 def test_workers_conversation_router(disaggregated_test_root,
                                      disaggregated_example_root, llm_venv,
                                      llama_model_root):
