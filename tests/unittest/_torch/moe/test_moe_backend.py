@@ -1164,7 +1164,7 @@ def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(
     and INT8; INT4's other row constraints there are weaker divisors of 64
     (B_ROWS_PER_MMA = 32, elts_in_int32 = 8).
     """
-    from tensorrt_llm._torch.modules.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
+    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
 
     class _DummyModule:
         pass
@@ -1199,7 +1199,7 @@ def test_cutlass_w4a16_aligned_rows_accepted(num_rows: int) -> None:
     Counterpart to the rejection test: pinning only the failure would leave the
     validator free to reject every shape, so the accepted side is pinned too.
     """
-    from tensorrt_llm._torch.modules.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
+    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A16WoqPerChannelFusedMoEMethod
 
     class _DummyModule:
         pass
