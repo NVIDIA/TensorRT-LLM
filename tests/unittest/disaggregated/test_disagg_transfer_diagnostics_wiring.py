@@ -49,7 +49,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Sched
 pytestmark = pytest.mark.cpu_only
 
 
-def _disagg_request(local_id: int, canonical_id: int, prompt_len: int = 65):
+def _disagg_request(local_id: int, canonical_id: int, prompt_len: int = 65) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=local_id,
         request_id=local_id,
@@ -500,15 +500,13 @@ def test_ctx_send_continues_when_diagnostic_preparation_fails(
     )
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    monkeypatch.setattr(
-        diagnostics,
-        "emit_event",
-        Mock(side_effect=RuntimeError("diagnostics failed")),
-    )
+    failing_emit = Mock(side_effect=RuntimeError("diagnostics failed"))
+    monkeypatch.setattr(diagnostics, "emit_event", failing_emit)
     monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: 12.5)
 
     coordinator.send_completed_context([request])
 
+    assert failing_emit.call_count > 0
     assert [operation[0] for operation in operations] == ["start_transfer", "respond"]
     assert request.py_kv_transfer_start_time == 12.5
 
@@ -923,7 +921,7 @@ def test_diagnostic_preparation_failure_does_not_change_bypassed_admission(
 ) -> None:
     class _BrokenLegacyResult:
         @property
-        def admitted_requests(self):
+        def admitted_requests(self) -> list:
             raise RuntimeError("diagnostic counterfactual inspection failed")
 
     candidate = _disagg_request(21, 2021)
@@ -1109,7 +1107,7 @@ def test_ctx_settlement_continues_when_diagnostic_session_snapshot_is_stale(
     transceiver._ctx_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
 
-    def retire_before_diagnostic_snapshot(*_args):
+    def retire_before_diagnostic_snapshot(*_args) -> tuple[list, list, list, list]:
         transceiver._send_sessions.pop(request_id)
         return [], [], [request_id], [request_id]
 
@@ -1231,6 +1229,10 @@ def test_backend_wait_continues_when_submission_diagnostic_callback_fails(
         task.begin_backend_submission.assert_called_once_with(7, request)
         task.record_backend_submission.assert_called_once_with(7, status)
         task.retire_backend_done_physical_operation.assert_called_once_with(7)
+    else:
+        task.begin_backend_submission.assert_not_called()
+        task.record_backend_submission.assert_not_called()
+        task.retire_backend_done_physical_operation.assert_not_called()
 
 
 def test_request_cleanup_continues_when_diagnostic_emission_fails(
@@ -1251,14 +1253,12 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
     executor.global_rank = 4
     executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=0)
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    monkeypatch.setattr(
-        diagnostics,
-        "emit_event",
-        Mock(side_effect=RuntimeError("diagnostics failed")),
-    )
+    failing_emit = Mock(side_effect=RuntimeError("diagnostics failed"))
+    monkeypatch.setattr(diagnostics, "emit_event", failing_emit)
 
     executor._free_request_resources(request)
 
+    failing_emit.assert_called_once()
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert request.py_request_id not in executor._prefetched_request_ids
     executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
@@ -1270,9 +1270,11 @@ def test_source_unpin_continues_when_diagnostic_inspection_fails(
     class _KVCacheManager:
         def __init__(self) -> None:
             self.unpin_blocks_by_id = Mock()
+            self.mapping_accessed = False
 
         @property
-        def mapping(self):
+        def mapping(self) -> SimpleNamespace:
+            self.mapping_accessed = True
             raise RuntimeError("diagnostic mapping inspection failed")
 
     request = SimpleNamespace(
@@ -1293,6 +1295,7 @@ def test_source_unpin_continues_when_diagnostic_inspection_fails(
     should_terminate = manager.end_transfer(request)
 
     assert should_terminate is True
+    assert manager.kv_cache_manager.mapping_accessed
     manager.kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(block_ids)
     assert request.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
     assert manager._requests_in_transfer == {}
