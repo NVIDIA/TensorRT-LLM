@@ -20,6 +20,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import KVCacheManager
+from . import diagnostics as disagg_diagnostics
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -173,6 +174,7 @@ def create_kv_cache_transceiver(
             "kv_cache_config.use_kv_cache_manager_v2=False for a model "
             "that supports V1.")
 
+    transceiver: KvCacheTransceiver
     if use_python_transceiver:
         if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
             raise ValueError(
@@ -207,13 +209,27 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        transceiver = KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                           cache_transceiver_config)
+    else:
+        # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
+        transceiver = BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
+                                             attention_type,
+                                             cache_transceiver_config,
+                                             mamba_cache_manager)
 
-    # Explicit legacy runtime: transceiver_runtime is None or "CPP".
-    return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
-                                  attention_type, cache_transceiver_config,
-                                  mamba_cache_manager)
+    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            disagg_diagnostics.emit_event(
+                "diagnostic_capabilities",
+                side="runtime",
+                request_id=None,
+                rank=mapping.rank,
+                capability_schema_version=1,
+                transceiver_runtime="PYTHON"
+                if use_python_transceiver else "CPP",
+                python_transfer_events=use_python_transceiver)
+    return transceiver
 
 
 class CtxTransferStatus(NamedTuple):

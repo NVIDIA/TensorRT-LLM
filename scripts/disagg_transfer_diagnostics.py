@@ -4,9 +4,15 @@
 """Summarize opt-in disaggregated KV-transfer diagnostic events.
 
 The runtime writes compact JSON objects after ``[DISAGG_TRANSFER_DIAG]``. This
-tool tolerates unrelated and malformed log lines, groups valid events by their
-canonical request ID, and derives durations only when both boundaries share a
-``(host, pid)`` monotonic-clock domain.
+tool tolerates unrelated and malformed log lines. Requests are correlated across
+processes only with a shared run UUID; otherwise analysis stays process-local.
+Durations require matching run/process UUIDs, host, and PID. Legacy records
+without a process UUID remain readable but cannot establish safe timing.
+
+Startup ``diagnostic_capabilities`` records describe which event groups each
+executor/transceiver can emit. Unsupported boundaries are not missing events;
+logs without this metadata retain identity-safe measured pairs but have
+unassessed expectations.
 """
 
 from __future__ import annotations
@@ -22,10 +28,12 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+from uuid import UUID
 
 DIAGNOSTICS_LOG_PREFIX = "[DISAGG_TRANSFER_DIAG] "
 _SUPPORTED_SCHEMA_VERSION = 1
 _GEN_KV_ADMISSION_EVENT = "gen_kv_admission_result"
+_CAPABILITY_FIELDS = ("executor_events", "scheduler_kv_admission_events", "python_transfer_events")
 _TIMELINE_FIELDS = (
     "event",
     "side",
@@ -33,6 +41,9 @@ _TIMELINE_FIELDS = (
     "monotonic_ns",
     "host",
     "pid",
+    "run_uuid",
+    "process_uuid",
+    "run_uuid_status",
     "instance",
     "rank",
     "tp_rank",
@@ -65,6 +76,7 @@ _TIMELINE_FIELDS = (
     "transfer_bytes",
     "expected_receivers",
     "expected_writers",
+    "writer_cohort_known",
     "prompt_tokens",
     "tokens_per_block",
     "cache_present",
@@ -91,11 +103,15 @@ _TIMELINE_FIELDS = (
     "kv_pool_used_blocks",
     "index_free_slots",
     "dropped_events",
+    "capability_schema_version",
+    "transceiver_runtime",
+    *_CAPABILITY_FIELDS,
 )
 
 Event = dict[str, object]
-ClockDomain = tuple[str, int]
-Participant = tuple[str | None, str | None, int | None, int | None]
+ClockDomain = tuple[str, int, str, str | None]
+Participant = tuple[str | None, str | None, int | None, int | None, str | None, str | None]
+CapabilityScope = tuple[str, int, str, str | None, int | None]
 
 _STRING_FIELDS = frozenset(
     {
@@ -171,6 +187,7 @@ _BOOLEAN_FIELDS = frozenset(
         "source_kv_request_owned",
         "source_kv_reuse_pinned",
         "timeout_expected",
+        "writer_cohort_known",
     }
 )
 _MAX_TIMESTAMP_NS = (1 << 63) - 1
@@ -365,6 +382,142 @@ _PHASES = (
     ),
 )
 
+_EVENT_CAPABILITIES = {
+    event: "python_transfer_events"
+    for phase in _PHASES
+    for event in (phase.start_event, phase.end_event)
+}
+_EVENT_CAPABILITIES.update(
+    dict.fromkeys(
+        (
+            "gen_ingress",
+            "gen_transfer_window_result",
+            "gen_decode_ready",
+            "ctx_send_ready",
+            "ctx_source_kv_released",
+            "ctx_source_unpinned",
+            "transfer_timeout_started",
+            "transfer_timeout_observed",
+        ),
+        "executor_events",
+    )
+)
+_EVENT_CAPABILITIES.update(
+    dict.fromkeys(
+        (_GEN_KV_ADMISSION_EVENT, "gen_kv_pool_snapshot"), "scheduler_kv_admission_events"
+    )
+)
+
+
+@dataclass(frozen=True)
+class _Capabilities:
+    groups: dict[str, bool | None]
+    runtime: str | None = None
+    issues: tuple[str, ...] = ()
+
+    def supports(self, event: str) -> bool | None:
+        return self.groups[_EVENT_CAPABILITIES[event]]
+
+    def to_json(self) -> dict[str, object]:
+        known = sum(value is not None for value in self.groups.values())
+        return {
+            "status": "known"
+            if known == len(_CAPABILITY_FIELDS)
+            else "partial"
+            if known
+            else "unknown",
+            "transceiver_runtime": self.runtime,
+            **self.groups,
+            "issues": list(self.issues),
+        }
+
+
+def _capability_scope(record: Event) -> CapabilityScope | None:
+    domain = _clock_domain(record)
+    return (*domain, _participant(record)[3]) if domain is not None else None
+
+
+def _known_capability_version(record: Event) -> bool:
+    return (
+        type(record.get("capability_schema_version")) is int
+        and record["capability_schema_version"] == 1
+    )
+
+
+def _capability_index(events: list[_ParsedEvent]) -> dict[CapabilityScope, _Capabilities]:
+    declarations: dict[CapabilityScope, list[Event]] = defaultdict(list)
+    for event in events:
+        if event.record["event"] == "diagnostic_capabilities":
+            scope = _capability_scope(event.record)
+            if scope is not None:
+                declarations[scope].append(event.record)
+    result = {}
+    for scope, records in declarations.items():
+        issues = set()
+        groups: dict[str, bool | None] = {}
+        if not all(_known_capability_version(record) for record in records):
+            issues.add("invalid_capability_schema_version")
+        for field in _CAPABILITY_FIELDS:
+            field_records = [record for record in records if field in record]
+            values = [record[field] for record in field_records]
+            if any(type(value) is not bool for value in values) or not all(
+                _known_capability_version(record) for record in field_records
+            ):
+                issues.add(f"invalid_{field}")
+                groups[field] = None
+            elif len(set(values)) > 1:
+                issues.add(f"conflicting_{field}")
+                groups[field] = None
+            else:
+                groups[field] = values[0] is True if values else None
+        runtimes = {
+            record["transceiver_runtime"] for record in records if "transceiver_runtime" in record
+        }
+        runtime = next(iter(runtimes)) if len(runtimes) == 1 else None
+        if runtimes and (
+            len(runtimes) != 1
+            or runtime not in ("CPP", "PYTHON")
+            or any(
+                not _known_capability_version(record)
+                for record in records
+                if "transceiver_runtime" in record
+            )
+        ):
+            issues.add("invalid_or_conflicting_transceiver_runtime")
+            groups["python_transfer_events"] = None
+            runtime = None
+        elif runtime is not None and groups["python_transfer_events"] not in (
+            None,
+            runtime == "PYTHON",
+        ):
+            issues.add("runtime_capability_mismatch")
+            groups["python_transfer_events"] = None
+        result[scope] = _Capabilities(
+            groups, runtime if isinstance(runtime, str) else None, tuple(sorted(issues))
+        )
+    return result
+
+
+def _participant_capabilities(
+    events: list[_ParsedEvent], index: dict[CapabilityScope, _Capabilities]
+) -> _Capabilities:
+    scope = _capability_scope(events[0].record)
+    profile = index.get(scope) if scope is not None else None
+    if profile is None:
+        return _Capabilities(
+            dict.fromkeys(_CAPABILITY_FIELDS), issues=("missing_capability_metadata",)
+        )
+    # Contradictory records must not turn an observed Python path into a false
+    # C++ exemption. Keep actual measurements, but mark the declaration unknown.
+    groups = profile.groups.copy()
+    issues = set(profile.issues)
+    for event in events:
+        field = _EVENT_CAPABILITIES.get(str(event.record["event"]))
+        if field is not None and groups[field] is False:
+            groups[field] = None
+            issues.add(f"observed_unsupported_{field}")
+    return _Capabilities(groups, profile.runtime, tuple(sorted(issues)))
+
 
 def parse_lines(lines: Iterable[str]) -> ParseResult:
     """Extract valid diagnostic JSON objects from mixed log lines."""
@@ -403,12 +556,35 @@ def parse_lines(lines: Iterable[str]) -> ParseResult:
     )
 
 
+def _uuid_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return None
+
+
+def _identity_issues(record: Event) -> list[str]:
+    issues = []
+    for field in ("run_uuid", "process_uuid"):
+        if _uuid_value(record.get(field)) is None:
+            invalid = record.get(field) is not None or (
+                field == "run_uuid" and record.get("run_uuid_status") == "invalid"
+            )
+            issues.append(f"{'invalid' if invalid else 'missing'}_{field}")
+    return issues
+
+
 def _clock_domain(record: Event) -> ClockDomain | None:
     host = record.get("host")
     pid = record.get("pid")
     if not isinstance(host, str) or not host or not isinstance(pid, int) or isinstance(pid, bool):
         return None
-    return host, pid
+    process_uuid = _uuid_value(record.get("process_uuid"))
+    if process_uuid is None:
+        return None
+    return host, pid, process_uuid, _uuid_value(record.get("run_uuid"))
 
 
 def _monotonic_ns(record: Event) -> int | None:
@@ -441,7 +617,12 @@ def _correlation(record: Event, fields: tuple[str, ...]) -> tuple[object, ...]:
 
 
 def _domain_json(domain: ClockDomain) -> dict[str, object]:
-    return {"host": domain[0], "pid": domain[1]}
+    return {
+        "host": domain[0],
+        "pid": domain[1],
+        "process_uuid": domain[2],
+        "run_uuid": domain[3],
+    }
 
 
 def _participant(record: Event) -> Participant:
@@ -454,12 +635,21 @@ def _participant(record: Event) -> Participant:
         host if isinstance(host, str) else None,
         pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
         rank if isinstance(rank, int) and not isinstance(rank, bool) else None,
+        _uuid_value(record.get("process_uuid")),
+        _uuid_value(record.get("run_uuid")),
     )
 
 
 def _participant_json(participant: Participant) -> dict[str, object]:
-    side, host, pid, rank = participant
-    return {"side": side, "host": host, "pid": pid, "rank": rank}
+    side, host, pid, rank, process_uuid, run_uuid = participant
+    return {
+        "side": side,
+        "host": host,
+        "pid": pid,
+        "rank": rank,
+        "process_uuid": process_uuid,
+        "run_uuid": run_uuid,
+    }
 
 
 def _timeline(events: list[_ParsedEvent]) -> list[dict[str, object]]:
@@ -478,8 +668,73 @@ def _timeline_sort_key(event: _ParsedEvent) -> tuple[int, int, int]:
     return 1, 0, event.line_number
 
 
+def _broadcast_writer_expectations(
+    starts: list[_ParsedEvent], ends: list[_ParsedEvent]
+) -> tuple[set[tuple[ClockDomain, Participant, object]], list[dict[str, object]]]:
+    """Do not require every candidate in a GEN-first ADP broadcast to respond."""
+    cohorts: dict[tuple[ClockDomain, Participant, object], list[Event]] = defaultdict(list)
+    responders: dict[tuple[ClockDomain, Participant, object], set[object]] = defaultdict(set)
+    for boundaries, is_start in ((starts, True), (ends, False)):
+        for event in boundaries:
+            record = event.record
+            domain = _clock_domain(record)
+            if (
+                domain is None
+                or _monotonic_ns(record) is None
+                or record.get("slice_id") is None
+                or record.get("peer_rank") is None
+            ):
+                continue
+            key = domain, _participant(record), record["slice_id"]
+            if is_start:
+                cohorts[key].append(record)
+            elif record.get("session_found") is not False:
+                responders[key].add(record["peer_rank"])
+
+    relaxed = set()
+    gaps = []
+    for (domain, participant, slice_id), records in cohorts.items():
+        flags = {record.get("writer_cohort_known") for record in records}
+        if flags == {True}:
+            continue
+        key = domain, participant, slice_id
+        relaxed.add(key)
+        observed = len(responders[key])
+        counts = {record.get("expected_writers") for record in records}
+        expected = next(iter(counts)) if len(counts) == 1 else None
+        issue = None
+        if flags != {False}:
+            # Older or partial logs cannot prove that every published peer was
+            # selected. Still retain all observed per-peer timing below.
+            issue = "missing_or_conflicting_writer_cohort"
+        elif expected is None or not isinstance(expected, int) or expected <= 0:
+            issue = "missing_invalid_or_conflicting_expected_writers"
+        if issue is None and observed == expected:
+            continue
+        gap: dict[str, object] = {
+            "phase": "gen_writer_first_response",
+            "clock_domain": _domain_json(domain),
+            "correlation": {"slice_id": slice_id},
+            "observed_writers": observed,
+        }
+        if participant[3] is not None:
+            gap["rank"] = participant[3]
+        if issue is not None:
+            gap.update(reason="unknown_writer_cohort", detail=issue)
+        else:
+            gap.update(
+                reason="missing_writer_responses"
+                if observed < expected
+                else "unexpected_writer_responses",
+                expected_writers=expected,
+                count=abs(expected - observed),
+            )
+        gaps.append(gap)
+    return relaxed, gaps
+
+
 def _derive_phase(
-    events: list[_ParsedEvent], phase: _Phase
+    events: list[_ParsedEvent], phase: _Phase, profiles: dict[Participant, _Capabilities]
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     starts = [
         event
@@ -506,13 +761,17 @@ def _derive_phase(
     if not phase.report_unmatched and (not starts or not ends):
         return [], []
 
-    Boundary = tuple[ClockDomain, tuple[object, ...], int]
+    Boundary = tuple[ClockDomain, Participant, tuple[object, ...], int]
 
-    def timed(boundaries: list[_ParsedEvent]) -> tuple[list[Boundary], int, int]:
+    def timed(boundaries: list[_ParsedEvent]) -> tuple[list[Boundary], int, int, int]:
         result = []
         invalid_clock_count = 0
         missing_correlation_count = 0
+        unverified_identity_count = 0
         for event in boundaries:
+            if _uuid_value(event.record.get("process_uuid")) is None:
+                unverified_identity_count += 1
+                continue
             domain = _clock_domain(event.record)
             timestamp = _monotonic_ns(event.record)
             if domain is None or timestamp is None:
@@ -522,24 +781,34 @@ def _derive_phase(
             if any(value is None for value in correlation):
                 missing_correlation_count += 1
                 continue
-            result.append((domain, correlation, timestamp))
-        return result, invalid_clock_count, missing_correlation_count
+            result.append((domain, _participant(event.record), correlation, timestamp))
+        return result, invalid_clock_count, missing_correlation_count, unverified_identity_count
 
-    timed_starts, invalid_clock_starts, missing_correlation_starts = timed(starts)
-    timed_ends, invalid_clock_ends, missing_correlation_ends = timed(ends)
-    grouped_starts: dict[tuple[ClockDomain, tuple[object, ...]], list[int]] = defaultdict(list)
-    grouped_ends: dict[tuple[ClockDomain, tuple[object, ...]], list[int]] = defaultdict(list)
-    for domain, correlation, timestamp in timed_starts:
-        grouped_starts[(domain, correlation)].append(timestamp)
-    for domain, correlation, timestamp in timed_ends:
-        grouped_ends[(domain, correlation)].append(timestamp)
+    timed_starts, invalid_clock_starts, missing_correlation_starts, unverified_starts = timed(
+        starts
+    )
+    timed_ends, invalid_clock_ends, missing_correlation_ends, unverified_ends = timed(ends)
+    grouped_starts: dict[tuple[ClockDomain, Participant, tuple[object, ...]], list[int]] = (
+        defaultdict(list)
+    )
+    grouped_ends: dict[tuple[ClockDomain, Participant, tuple[object, ...]], list[int]] = (
+        defaultdict(list)
+    )
+    for domain, participant, correlation, timestamp in timed_starts:
+        grouped_starts[(domain, participant, correlation)].append(timestamp)
+    for domain, participant, correlation, timestamp in timed_ends:
+        grouped_ends[(domain, participant, correlation)].append(timestamp)
 
     durations: list[dict[str, object]] = []
-    unmeasured: list[dict[str, object]] = []
+    relaxed_writer_cohorts, unmeasured = (
+        _broadcast_writer_expectations(starts, ends)
+        if phase.name == "gen_writer_first_response"
+        else (set(), [])
+    )
     all_keys = sorted(grouped_starts.keys() | grouped_ends.keys(), key=lambda key: repr(key))
-    for domain, correlation in all_keys:
-        domain_starts = sorted(grouped_starts.get((domain, correlation), []))
-        domain_ends = sorted(grouped_ends.get((domain, correlation), []))
+    for domain, participant, correlation in all_keys:
+        domain_starts = sorted(grouped_starts.get((domain, participant, correlation), []))
+        domain_ends = sorted(grouped_ends.get((domain, participant, correlation), []))
         used_end_indexes: set[int] = set()
         unmatched_starts = 0
 
@@ -564,6 +833,8 @@ def _derive_phase(
                 "phase": phase.name,
                 "clock_domain": _domain_json(domain),
             }
+            if participant[3] is not None:
+                result["rank"] = participant[3]
             if phase.signed_offset:
                 result.update(
                     {
@@ -590,6 +861,12 @@ def _derive_phase(
         else:
             missing_end_count = unmatched_starts
             missing_start_count = len(domain_ends) - len(used_end_indexes)
+        if (
+            relaxed_writer_cohorts
+            and not domain_ends
+            and (domain, participant, correlation[0]) in relaxed_writer_cohorts
+        ):
+            missing_end_count = 0
         if phase.report_unmatched and (missing_end_count or missing_start_count):
             for reason, count in (
                 ("missing_end", missing_end_count),
@@ -599,15 +876,20 @@ def _derive_phase(
                     continue
                 gap: dict[str, object] = {
                     "phase": phase.name,
-                    "reason": reason,
+                    "reason": _phase_gap_reason(profiles[participant], phase, reason),
                     "count": count,
                     "clock_domain": _domain_json(domain),
                 }
+                if participant[3] is not None:
+                    gap["rank"] = participant[3]
+                if gap["reason"] != reason:
+                    gap["missing_boundary"] = reason.removeprefix("missing_")
                 if phase.correlation_fields:
                     gap["correlation"] = dict(zip(phase.correlation_fields, correlation))
                 unmeasured.append(gap)
 
     for reason, start_count, end_count in (
+        ("unverified_process_identity", unverified_starts, unverified_ends),
         ("invalid_clock_metadata", invalid_clock_starts, invalid_clock_ends),
         (
             "missing_correlation_fields",
@@ -633,7 +915,9 @@ def _derive_phase(
             unmeasured.append({"phase": phase.name, "reason": "clock_domain_mismatch"})
         return [], unmeasured
     if not starts or not ends:
-        reason = "missing_start" if not starts else "missing_end"
+        # Participant-specific gaps above already describe capability support;
+        # do not add a second, unconditional missing-boundary summary.
+        return [], unmeasured
     elif len(timed_starts) != len(starts) or len(timed_ends) != len(ends):
         return [], unmeasured
     elif start_domains.isdisjoint(end_domains):
@@ -663,7 +947,18 @@ def _has_event(
     )
 
 
-def _missing_boundaries(events: list[_ParsedEvent]) -> list[str]:
+def _phase_gap_reason(profile: _Capabilities, phase: _Phase, reason: str) -> str:
+    support = (profile.supports(phase.start_event), profile.supports(phase.end_event))
+    if False in support:
+        return "unsupported_capability"
+    if None in support:
+        return "unknown_capability"
+    return reason
+
+
+def _boundary_expectations(
+    events: list[_ParsedEvent], profile: _Capabilities
+) -> dict[str, list[str]]:
     expected: set[str] = set()
     observed = {event.record.get("event") for event in events}
 
@@ -711,18 +1006,46 @@ def _missing_boundaries(events: list[_ParsedEvent]) -> list[str]:
     if _has_event(events, "ctx_backend_submitted"):
         expected.add("ctx_backend_complete")
 
-    return sorted(event for event in expected if event not in observed)
+    result: dict[str, list[str]] = {
+        "missing_boundaries": [],
+        "unsupported_boundaries": [],
+        "unassessed_boundaries": [],
+    }
+    for event in sorted(expected - observed):
+        support = profile.supports(event)
+        key = (
+            "missing_boundaries"
+            if support is True
+            else "unsupported_boundaries"
+            if support is False
+            else "unassessed_boundaries"
+        )
+        result[key].append(event)
+    return result
 
 
 def _request_sort_key(request_id: object) -> tuple[str, str]:
     return type(request_id).__name__, str(request_id)
 
 
-def _participant_summaries(events: list[_ParsedEvent]) -> list[dict[str, object]]:
-    grouped: dict[Participant, list[_ParsedEvent]] = defaultdict(list)
-    for event in events:
-        grouped[_participant(event.record)].append(event)
+def _request_group_key(event: _ParsedEvent) -> tuple[str, str, str, str]:
+    record = event.record
+    process_uuid = _uuid_value(record.get("process_uuid"))
+    run_uuid = _uuid_value(record.get("run_uuid"))
+    if process_uuid is None:
+        # Even records from one input file can span restarts. Keep unidentified
+        # records separate instead of manufacturing a request from reused IDs.
+        scope, identity = "unverified", str(event.line_number)
+    elif run_uuid is not None:
+        scope, identity = "run", run_uuid
+    else:
+        scope, identity = "process", repr((process_uuid, record.get("host"), record.get("pid")))
+    return scope, identity, *_request_sort_key(record["request_id"])
 
+
+def _participant_summaries(
+    grouped: dict[Participant, list[_ParsedEvent]], profiles: dict[Participant, _Capabilities]
+) -> list[dict[str, object]]:
     summaries = []
     for participant, participant_events in sorted(grouped.items(), key=lambda item: repr(item[0])):
         event_counts = Counter(str(event.record["event"]) for event in participant_events)
@@ -731,14 +1054,19 @@ def _participant_summaries(events: list[_ParsedEvent]) -> list[dict[str, object]
             {
                 "event_count": len(participant_events),
                 "event_counts": dict(sorted(event_counts.items())),
-                "missing_boundaries": _missing_boundaries(participant_events),
+                "capabilities": profiles[participant].to_json(),
+                **_boundary_expectations(participant_events, profiles[participant]),
             }
         )
         summaries.append(summary)
     return summaries
 
 
-def _summarize_request(request_id: object, events: list[_ParsedEvent]) -> dict[str, object]:
+def _summarize_request(
+    request_id: object,
+    events: list[_ParsedEvent],
+    capability_index: dict[CapabilityScope, _Capabilities],
+) -> dict[str, object]:
     event_counts = Counter(str(event.record["event"]) for event in events)
     sides = sorted(
         {side for event in events if isinstance((side := event.record.get("side")), str)}
@@ -748,19 +1076,37 @@ def _summarize_request(request_id: object, events: list[_ParsedEvent]) -> dict[s
     )
     durations: list[dict[str, object]] = []
     unmeasured: list[dict[str, object]] = []
+    grouped: dict[Participant, list[_ParsedEvent]] = defaultdict(list)
+    for event in events:
+        grouped[_participant(event.record)].append(event)
+    profiles = {
+        participant: _participant_capabilities(participant_events, capability_index)
+        for participant, participant_events in grouped.items()
+    }
+    participants = _participant_summaries(grouped, profiles)
     for phase in _PHASES:
-        phase_durations, phase_unmeasured = _derive_phase(events, phase)
+        phase_durations, phase_unmeasured = _derive_phase(events, phase, profiles)
         durations.extend(phase_durations)
         unmeasured.extend(phase_unmeasured)
 
     return {
         "request_id": request_id,
+        "run_uuid": _uuid_value(events[0].record.get("run_uuid")),
+        "correlation_scope": _request_group_key(events[0])[0],
+        "identity_issues": sorted(
+            {issue for event in events for issue in _identity_issues(event.record)}
+        ),
         "event_count": len(events),
         "event_counts": dict(sorted(event_counts.items())),
         "sides": sides,
         "clock_domains": [_domain_json(domain) for domain in domains],
-        "missing_boundaries": _missing_boundaries(events),
-        "participants": _participant_summaries(events),
+        **{
+            field: sorted(
+                {boundary for participant in participants for boundary in participant[field]}
+            )
+            for field in ("missing_boundaries", "unsupported_boundaries", "unassessed_boundaries")
+        },
+        "participants": participants,
         "durations": durations,
         "unmeasured_phases": unmeasured,
         "timeline": _timeline(events),
@@ -894,7 +1240,7 @@ def _transfer_settled_to_next_decision(events: list[_ParsedEvent]) -> list[dict[
 
 def analyze(parse_result: ParseResult) -> dict[str, object]:
     """Group parsed events and produce request- and phase-level summaries."""
-    grouped: dict[tuple[str, str], tuple[object, list[_ParsedEvent]]] = {}
+    grouped: dict[tuple[str, str, str, str], tuple[object, list[_ParsedEvent]]] = {}
     ungrouped_events: list[_ParsedEvent] = []
     ungrouped_event_counts: Counter[str] = Counter()
     event_counts: Counter[str] = Counter()
@@ -910,18 +1256,60 @@ def analyze(parse_result: ParseResult) -> dict[str, object]:
             ungrouped_events.append(event)
             ungrouped_event_counts[event_name] += 1
             continue
-        key = _request_sort_key(request_id)
+        key = _request_group_key(event)
         if key not in grouped:
             grouped[key] = (request_id, [])
         grouped[key][1].append(event)
 
+    capabilities = _capability_index(parse_result.events)
     requests = [
-        _summarize_request(request_id, events)
+        _summarize_request(request_id, events, capabilities)
         for _, (request_id, events) in sorted(grouped.items())
     ]
     return {
+        "identity_semantics": {
+            "requests": "Join across processes only by a shared run_uuid and request_id.",
+            "process_local": (
+                "Without a valid run_uuid, correlate only within one process_uuid, host and PID."
+            ),
+            "unverified": (
+                "Without a valid process_uuid, retain individual records "
+                "without joining or deriving timing."
+            ),
+            "configuration": (
+                "Set TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID to the same fresh UUID "
+                "on CTX and GEN for each launch."
+            ),
+        },
+        "identity_issues": dict(
+            sorted(
+                Counter(
+                    issue
+                    for event in parse_result.events
+                    for issue in _identity_issues(event.record)
+                ).items()
+            )
+        ),
+        "capability_semantics": {
+            "scope": (
+                "Startup declarations are matched by run/process UUIDs, host, pid and rank, "
+                "then applied per participant."
+            ),
+            "missing_boundaries": "Expected events supported by this participant but not observed.",
+            "unsupported_boundaries": "Events not instrumented by this participant's implementation.",
+            "unassessed_boundaries": (
+                "Expected events whose capability metadata is absent or ambiguous; "
+                "not a healthy result."
+            ),
+            "durations": (
+                "Observed matching pairs remain measurable without capability metadata; "
+                "unsupported or unknown gaps are labeled separately."
+            ),
+        },
         "clock_semantics": {
-            "durations": "Derived only from monotonic_ns within the same (host, pid).",
+            "durations": (
+                "Derived only from monotonic_ns within matching run/process UUIDs, host and PID."
+            ),
             "timeline": (
                 "wall_ns is preserved for manual cross-process correlation; cross-host ordering "
                 "is clock-sync-sensitive and no wall-clock deltas are derived."
