@@ -93,6 +93,7 @@ def _git(repo: Path, *args: str) -> str:
         check=True,
         stdout=subprocess.PIPE,
         text=True,
+        timeout=120,
     ).stdout.strip()
 
 
