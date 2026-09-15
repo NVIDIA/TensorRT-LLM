@@ -54,6 +54,12 @@ from .sparse.params import BlockSparseForwardInputs, SparseParams
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
+# Set to 0 to run the locality domains one at a time instead of concurrently.
+# Each domain still uses its own stream, workspace and metadata, so only the
+# overlap is lost -- useful for telling a partitioning bug apart from a race.
+_LOCALITY_DOMAIN_TWO_STREAM = os.environ.get(
+    "TRTLLM_LOCALITY_DOMAIN_TWO_STREAM_ATTN", "1") == "1"
+
 
 def _resolve_skip_correction_threshold(threshold: float,
                                        sm_version: int,
@@ -1881,7 +1887,10 @@ def _build_locality_domain_slices(metadata: TrtllmAttentionMetadata,
 
 def _locality_domain_attention_enabled(attn, metadata, forward_args) -> bool:
     """Whether this call should be split across locality domains."""
-    if forward_args.output is None or forward_args.output_sf is not None:
+    # output_sf is deliberately not checked here: an NVFP4 output quantization
+    # request that reaches this path is asserted on rather than silently run
+    # unpartitioned.
+    if forward_args.output is None:
         return False
     # MLA chunked-prefill context gathers k/v by per-request KV length, and a
     # domain can hold a mix of chunk lengths including zero, which FMHA rejects.
@@ -2747,6 +2756,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             yield q, k, v, forward_args
             return
 
+        assert forward_args.output_sf is None, (
+            "NVFP4 output quantization is not supported with locality domain "
+            "fork-join attention.")
+
         num_locality_domains = metadata.kv_cache_manager.num_locality_domains
         # MLA context with pre-gathered k/v lays those rows out by per-request
         # KV length, not by Q length, so the k/v slice differs from q's.
@@ -2852,30 +2865,42 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                      num_ctx_tokens=num_ctx_tokens,
                      num_gen_tokens=num_gen_tokens))
 
-        runtime.fork()
+        two_stream = _LOCALITY_DOMAIN_TWO_STREAM
+        if two_stream:
+            runtime.fork()
         try:
             for prep in prepared:
                 locality_domain_id = prep["locality_domain_id"]
                 ld_slice = prep["ld_slice"]
-                with _locality_domain_metadata(metadata, ld_slice,
-                                               locality_domain_id):
-                    with runtime.partition_context(locality_domain_id):
-                        yield prep["q"], prep["k"], prep["v"], prep["ld_args"]
-                        if prep["scatter_back"]:
-                            n_ctx = prep["num_ctx_tokens"]
-                            if n_ctx > 0:
-                                output[ld_slice["ctx_token_start"]:
-                                       ld_slice["ctx_token_end"]] = (
-                                           prep["ld_output"][:n_ctx])
-                            if prep["num_gen_tokens"] > 0:
-                                output[ld_slice["gen_token_start"]:
-                                       ld_slice["gen_token_end"]] = (
-                                           prep["ld_output"][n_ctx:])
-                        if locality_domain_id == 0:
-                            _resize_locality_domain_workspaces_from_domain0(
-                                metadata)
+                # Serialized mode forks and joins around each domain in turn, so
+                # the domains never overlap.
+                if not two_stream:
+                    runtime.fork()
+                try:
+                    with _locality_domain_metadata(metadata, ld_slice,
+                                                   locality_domain_id):
+                        with runtime.partition_context(locality_domain_id):
+                            yield (prep["q"], prep["k"], prep["v"],
+                                   prep["ld_args"])
+                            if prep["scatter_back"]:
+                                n_ctx = prep["num_ctx_tokens"]
+                                if n_ctx > 0:
+                                    output[ld_slice["ctx_token_start"]:
+                                           ld_slice["ctx_token_end"]] = (
+                                               prep["ld_output"][:n_ctx])
+                                if prep["num_gen_tokens"] > 0:
+                                    output[ld_slice["gen_token_start"]:
+                                           ld_slice["gen_token_end"]] = (
+                                               prep["ld_output"][n_ctx:])
+                            if locality_domain_id == 0:
+                                _resize_locality_domain_workspaces_from_domain0(
+                                    metadata)
+                finally:
+                    if not two_stream:
+                        runtime.join()
         finally:
-            runtime.join()
+            if two_stream:
+                runtime.join()
             prepared.clear()
 
     @classmethod
