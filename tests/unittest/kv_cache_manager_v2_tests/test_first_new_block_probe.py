@@ -31,8 +31,11 @@ variable-window managers -- supports VSWA here.
 import gc
 import os
 import unittest
+from dataclasses import replace
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
+
+import numpy as np
 
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
@@ -41,11 +44,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import CudaStream, KVCacheManager, TokenId
+    from kv_cache_manager_v2 import CudaStream, KVCacheManager, TokenId, _introspection
     from kv_cache_manager_v2._block_radix_tree import ReuseScope
     from kv_cache_manager_v2._utils import TemporaryCudaStream, init_cuda_once, temporary_sys_path
 else:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import CudaStream, KVCacheManager, TokenId
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        CudaStream,
+        KVCacheManager,
+        TokenId,
+        _introspection,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import ReuseScope
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         TemporaryCudaStream,
@@ -106,7 +114,9 @@ class TestFirstNewBlockProbe(unittest.TestCase):
         """What the scheduler's probe would return for *tokens*."""
         scope = ReuseScope() if reuse_scope is None else reuse_scope
         num_reusable = self.manager.probe_reuse(scope, tokens)
-        return _first_new_block_key(tokens, TOKENS_PER_BLOCK, scope, num_reusable)
+        key = self.manager.probe_first_new_block_key(scope, tokens)
+        self.assertEqual(key, _first_new_block_key(tokens, TOKENS_PER_BLOCK, scope, num_reusable))
+        return key
 
     def commit(self, tokens, reuse_scope=None):
         scope = ReuseScope() if reuse_scope is None else reuse_scope
@@ -200,6 +210,57 @@ class TestFirstNewBlockProbe(unittest.TestCase):
             self.probe_key(tokens, ReuseScope(salt=1234)),
         )
 
+    def test_partial_match_hashes_the_query_suffix(self):
+        tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
+        self.commit(tokens)
+        for shared_length in (0, 1, 3, 4, 5, 7, 8, 11):
+            with self.subTest(shared_length=shared_length):
+                query = tokens[:shared_length] + self.tokens(100, len(tokens) - shared_length)
+                # A partial tree block contains a different suffix, so using
+                # its key (rather than its complete predecessor) is incorrect.
+                if self.window_size is None:
+                    self.assertEqual(self.manager.probe_reuse(None, query), shared_length)
+                self.assertIsNotNone(self.probe_key(query))
+
+    def test_backoff_uses_the_last_complete_matched_block(self):
+        tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
+        scope = ReuseScope(lora_id=7, salt=1234)
+        for backoff in (1, TOKENS_PER_BLOCK, TOKENS_PER_BLOCK + 1, len(tokens)):
+            with self.subTest(backoff=backoff):
+                config = replace(self.manager.init_config, reuse_match_backoff=backoff)
+                self.manager.shutdown()
+                self.manager = KVCacheManager(config, event_manager=self.event_manager)
+                self.commit(tokens, scope)
+                if self.window_size is None:
+                    self.assertEqual(self.manager.probe_reuse(scope, tokens), len(tokens) - backoff)
+                # The reusable endpoint can be inside a block, on a boundary,
+                # or at the root. Compare with the complete hash-chain oracle.
+                self.assertIsNotNone(self.probe_key(tokens, scope))
+
+    def test_tree_removal_changes_the_probe(self):
+        tokens = self.tokens(0, 3 * TOKENS_PER_BLOCK)
+        cold_key = self.probe_key(tokens)
+        self.commit(tokens[: 2 * TOKENS_PER_BLOCK])
+        self.assertNotEqual(self.probe_key(tokens), cold_key)
+        self.manager.clear_reusable_blocks()
+        self.assertEqual(self.probe_key(tokens), cold_key)
+
+    def test_digest_tokens_in_the_prefix_and_new_block(self):
+        tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
+        tokens[3] = bytes([17]) * 32
+        tokens[9] = bytes([23]) * 32
+        scope = ReuseScope(lora_id=9, salt=4567)
+        self.commit(tokens[: 2 * TOKENS_PER_BLOCK], scope)
+        self.assertIsNotNone(self.probe_key(tokens, scope))
+        self.assertNotEqual(self.probe_key(tokens, scope), self.probe_key(tokens, ReuseScope()))
+
+    def test_int32_view_matches_list(self):
+        tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
+        view = np.asarray(tokens, dtype=np.int32)
+        self.assertEqual(self.probe_key(view), self.probe_key(tokens))
+        self.commit(tokens[: 2 * TOKENS_PER_BLOCK])
+        self.assertEqual(self.probe_key(view), self.probe_key(tokens))
+
 
 class TestFirstNewBlockProbeVswa(TestFirstNewBlockProbe):
     """Same contract on a variable-window layout.
@@ -211,3 +272,27 @@ class TestFirstNewBlockProbeVswa(TestFirstNewBlockProbe):
     """
 
     window_size = TOKENS_PER_BLOCK
+
+    def test_window_pruning_precedes_key_selection(self):
+        tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
+        query = tokens[: 2 * TOKENS_PER_BLOCK] + self.tokens(100, 2 * TOKENS_PER_BLOCK)
+        coverage = [TOKENS_PER_BLOCK] * len(_introspection.attention_life_cycle_ids(self.manager))
+        first = _introspection.make_test_block(self.manager, tokens[:TOKENS_PER_BLOCK], coverage)
+        blocks = [first]
+        try:
+            # Keep the second tree node and its full-attention page, but omit
+            # its SWA page as happens after eviction. A normal commit alone
+            # need not evict it, so construct this page-coverage state directly.
+            for life_cycle in _introspection.swa_life_cycle_ids(self.manager):
+                coverage[life_cycle] = 0
+            second = _introspection.make_test_block(
+                self.manager, tokens[TOKENS_PER_BLOCK : 2 * TOKENS_PER_BLOCK], coverage, first
+            )
+            blocks.append(second)
+            self.assertEqual(self.manager.probe_reuse(None, query), TOKENS_PER_BLOCK)
+            # The first block needing new pages already has a tree key: an
+            # absent-key-only lookup would incorrectly advance past it.
+            self.assertEqual(self.probe_key(query), _introspection.test_block_key(second))
+        finally:
+            for block in reversed(blocks):
+                _introspection.close_test_block(block)

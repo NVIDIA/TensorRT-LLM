@@ -75,6 +75,9 @@ def make_stub_manager(
     mgr._stream = Mock()
     mgr.impl = Mock()
     mgr.impl.probe_reuse.return_value = num_reusable
+    mgr.impl.probe_first_new_block_key.side_effect = lambda scope, tokens: _first_new_block_key(
+        tokens, tokens_per_block, scope, num_reusable
+    )
     mgr.impl.create_kv_cache.return_value = Mock(num_committed_tokens=0)
     # Resume touches real CUDA state; the token marshalling is already done.
     mgr._resume_and_restore = lambda req_id, kv_cache: True
@@ -163,9 +166,9 @@ def prepared_tokens_and_scope(mgr, req):
 
 def probed_tokens_and_scope(mgr, req):
     """Tokens and reuse scope that the probe hands to the impl."""
-    mgr.impl.probe_reuse.reset_mock()
+    mgr.impl.probe_first_new_block_key.reset_mock()
     mgr.probe_first_new_block_key(req)
-    args, _ = mgr.impl.probe_reuse.call_args
+    args, _ = mgr.impl.probe_first_new_block_key.call_args
     scope, tokens = args[0], args[1]
     return list(tokens), scope
 
@@ -300,7 +303,7 @@ class TestGuards:
     def test_none_without_block_reuse(self):
         mgr = make_stub_manager(enable_block_reuse=False)
         assert mgr.probe_first_new_block_key(make_request(range(20))) is None
-        mgr.impl.probe_reuse.assert_not_called()
+        mgr.impl.probe_first_new_block_key.assert_not_called()
 
     @pytest.mark.parametrize("num_tokens", [0, 1])
     def test_none_for_degenerate_prompts(self, num_tokens):
