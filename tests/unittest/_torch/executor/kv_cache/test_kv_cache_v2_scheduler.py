@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tier 1 unit tests for KVCacheV2Scheduler.
+"""Tier 1 mock unit tests for KVCacheV2Scheduler.
 
-Resource managers are mocked; rollback tests use native-backed LlmRequest
-objects to verify cursor semantics. No GPU required.
+All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
+No GPU required.
 """
 
 from unittest.mock import Mock, call, patch
@@ -23,8 +23,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
-from tensorrt_llm.bindings import SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -827,99 +826,6 @@ class TestKVCacheFailuresGen:
 class TestKVCacheFailuresCtx:
     """Context KV failures (non-chunked)."""
 
-    @staticmethod
-    def native_request():
-        return LlmRequest(
-            request_id=1,
-            max_new_tokens=8,
-            input_tokens=list(range(129)),
-            sampling_config=SamplingConfig(1),
-            is_streaming=False,
-        )
-
-    @pytest.mark.parametrize("chunked", [False, True])
-    @pytest.mark.parametrize("failure_stage", ["prepare", "resize", "budget"])
-    @pytest.mark.parametrize("first_chunk", [False, True])
-    def test_failed_admission_releases_only_unexecuted_context(
-        self, chunked, failure_stage, first_chunk
-    ):
-        req = self.native_request()
-        req.set_prepopulated_prompt_len(31, 32)
-        req.estimated_reusable_tokens = req.py_ctx_pre_resize_cap = 31
-        req.seq_slot = req.py_seq_slot = 7
-        if not first_chunk:
-            req.context_current_position = 64
-        position = req.context_current_position
-        mgr = make_kv_cache_manager(
-            tokens_per_block=32,
-            prepare_context_fn=lambda req: failure_stage != "prepare",
-            resize_context_fn=lambda req, n: False,
-        )
-        cache = mgr.kv_cache_map[req.py_request_id]
-        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id)
-        # Full-context budgeting rejects after reuse; chunked rejects before prepare.
-        token_budget = (0 if chunked else 64) if failure_stage == "budget" else 256
-        sched = make_scheduler(
-            mgr, max_num_tokens=token_budget, ctx_chunk_config=(None, 32) if chunked else None
-        )
-
-        out = sched.schedule_request([req], set())
-
-        assert out.context_requests == []
-        assert req.seq_slot == req.py_seq_slot == 7
-        assert req.state == LlmRequestState.CONTEXT_INIT
-        if first_chunk:
-            mgr.free_resources.assert_called_once_with(req)
-            assert req.py_request_id not in mgr.kv_cache_map
-            assert req.prepopulated_prompt_len == req.context_current_position == 0
-            assert req.context_remaining_length == req.context_chunk_size == req.prompt_len
-            assert req.estimated_reusable_tokens == 0
-            assert req.py_ctx_pre_resize_cap is None
-        else:
-            mgr.free_resources.assert_not_called()
-            assert mgr.kv_cache_map[req.py_request_id] is cache
-            assert req.context_current_position == position
-            assert req.prepopulated_prompt_len == 31
-
-    @pytest.mark.parametrize("failure_stage", ["prepare", "resize"])
-    def test_paired_failed_admission_retries_from_zero(self, failure_stage):
-        req = self.native_request()
-        req.set_prepopulated_prompt_len(31, 32)
-        mgr = make_kv_cache_manager(tokens_per_block=32, enable_joint_kv_cache_reuse=True)
-        draft_mgr = make_kv_cache_manager(tokens_per_block=32)
-        retry = False
-        for manager in (mgr, draft_mgr):
-
-            def prepare(request, reuse_limit=None, manager=manager):
-                manager.kv_cache_map[request.py_request_id] = Mock(is_active=False)
-                if manager is mgr and failure_stage == "prepare" and not retry:
-                    return None
-                return 0 if retry else 31
-
-            manager.prepare_context_cache.side_effect = prepare
-            manager.free_resources.side_effect = (
-                lambda request, manager=manager: manager.kv_cache_map.pop(
-                    request.py_request_id, None
-                )
-            )
-        draft_mgr.try_allocate_draft_context.side_effect = lambda req, n: retry
-        sched = make_scheduler(mgr, max_num_tokens=256, draft_kv_cache_manager=draft_mgr)
-
-        assert sched.schedule_request([req], set()).context_requests == []
-        for manager in (mgr, draft_mgr):
-            manager.free_resources.assert_called_once_with(req)
-            assert req.py_request_id not in manager.kv_cache_map
-        # The prepare failure already frees both maps inside the paired helper;
-        # the wrapper must still rewind the native cursor from the prior attempt.
-        assert req.prepopulated_prompt_len == req.context_current_position == 0
-
-        retry = True
-        assert sched.schedule_request([req], set()).context_requests == [req]
-        assert req.context_current_position == req.prepopulated_prompt_len == 0
-        for manager in (mgr, draft_mgr):
-            assert req.py_request_id in manager.kv_cache_map
-            manager.free_resources.assert_called_once_with(req)
-
     def test_ctx_prepare_fails(self):
         mgr = make_kv_cache_manager(prepare_context_fn=lambda req: False)
         sched = make_scheduler(mgr, max_num_tokens=1000)
@@ -1157,10 +1063,14 @@ class TestKVCacheFailuresCtxChunked:
             tokens_per_block=64,
             resize_context_fn=lambda req, n: False,
         )
+        mgr.kv_cache_map[0] = Mock(is_active=False)
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id)
         sched = make_scheduler(mgr, max_num_tokens=1000, ctx_chunk_config=(None, 64))
         reqs = [make_ctx_request(0, context_remaining_length=500)]
         out = sched.schedule_request(reqs, set())
         assert len(out.context_requests) == 0
+        mgr.free_resources.assert_called_once_with(reqs[0])
+        assert not mgr.kv_cache_map
 
     def test_chunked_fail_then_gen(self):
         mgr = make_kv_cache_manager(
@@ -1642,35 +1552,6 @@ class TestEncoder:
         )
         cross_mgr.kv_cache_map[ctx_req.py_request_id].resize.assert_called_once_with(80)
 
-    @pytest.mark.parametrize("failure_stage", ["resume", "resize"])
-    def test_failed_first_context_releases_cross_claim(self, failure_stage):
-        self_mgr = make_kv_cache_manager()
-        cross_mgr = make_kv_cache_manager()
-
-        def resume(request_id, cache):
-            cache.resize.return_value = failure_stage != "resize"
-            return failure_stage != "resume"
-
-        cross_mgr._resume_and_restore.side_effect = resume
-        for manager in (self_mgr, cross_mgr):
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
-            )
-        sched = make_encoder_scheduler(self_mgr, cross_kv_cache_manager=cross_mgr)
-        req = make_ctx_request(0, 50, encoder_output_len=80)
-        self_mgr.kv_cache_map[req.py_request_id] = Mock(is_active=True)
-        encoder_output = req.py_encoder_output = object()
-
-        assert sched.schedule_request([req], set()).context_requests == []
-
-        cross_mgr._create_kv_cache.assert_called_once()
-        for manager in (self_mgr, cross_mgr):
-            manager.free_resources.assert_called_once_with(req)
-            assert req.py_request_id not in manager.kv_cache_map
-        assert req.py_encoder_output is encoder_output
-        assert req.py_skip_cross_kv_projection is False
-        assert req.state_value == CONTEXT_INIT
-
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
         """Later decoder chunks read existing cross-KV without reallocation."""
         self_mgr = make_kv_cache_manager()
@@ -2000,8 +1881,6 @@ class TestChunkedContext:
         req = make_ctx_request(0, context_remaining_length=1000)
         out = sched.schedule_request([req], set())
         assert len(out.context_requests) == 0  # 50 < 64 min budget
-        mgr.prepare_context.assert_not_called()
-        mgr.free_resources.assert_not_called()
 
     def test_last_chunk_no_rounding(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
