@@ -155,7 +155,7 @@ def _dual_claim_executor() -> PyExecutor:
     executor.force_terminate_ctx_for_partial_reuse = False
     executor.dist = SimpleNamespace(rank=0, world_size=2)
     executor._terminate_request = Mock()
-    # Make the reap's trailing _check_cache_transfer_errors a no-op.
+    # Make the reap's trailing check_transfer_errors a no-op (multi-rank ADP).
     executor.enable_attention_dp = True
     return executor
 
