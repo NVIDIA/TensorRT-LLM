@@ -241,6 +241,7 @@ def _minimax_m3_swiglu_oai(gate_up: torch.Tensor, *, alpha: float, limit: float)
 def _build_swiglu_oai_dense_mlp(
     model_config: "ModelConfig[PretrainedConfig]",
     intermediate_size: int,
+    layer_idx: Optional[int] = None,
     *,
     is_shared_expert: bool = False,
 ) -> GatedMLP:
@@ -290,6 +291,7 @@ def _build_swiglu_oai_dense_mlp(
         overridden_tp_size=1 if enable_adp else None,
         reduce_output=reduce_output,
         is_shared_expert=is_shared_expert,
+        layer_idx=layer_idx,
     )
 
 
@@ -473,6 +475,7 @@ class MiniMaxM3MoE(nn.Module):
             self.shared_experts = _build_swiglu_oai_dense_mlp(
                 model_config=model_config,
                 intermediate_size=shared_intermediate,
+                layer_idx=layer_idx,
                 is_shared_expert=True,
             )
         else:
@@ -501,6 +504,7 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         final_all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
@@ -511,10 +515,11 @@ class MiniMaxM3MoE(nn.Module):
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=False,
+                lora_params=lora_params,
             )
 
         def _compute_shared_output():
-            return self.shared_experts(hidden_states)
+            return self.shared_experts(hidden_states, lora_params=lora_params)
 
         if self.shared_experts is None:
             result = _compute_routed_output()
@@ -1398,20 +1403,34 @@ class MiniMaxM3Attention(Attention):
         The backend runs the sparse GQA or dense paged GQA through its inherited
         FMHA forward; this layer selects the top-k blocks (sparse only) and
         builds the forward_args the FMHA reads.
+
+        This layer owns the cache write: write_layer_caches stores the
+        new-token K/V (and, on the bf16 indexer path, index-K) in one launch
+        before the indexer's proxy pass reads the index-K cache. forward()
+        then receives k=v=None, which is the backend's contract for "K/V are
+        already resident", so neither FMHA phase writes them again.
         """
         if self.is_sparse_attention_layer:
             assert idx_q is not None
+            # On the FP8 indexer path idx_k is None: the fused producer already
+            # inserted E4M3 index-K into the side cache, so only K/V are written.
+            self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
             # Publish the selected blocks so the FMHA runs the sparse path.
-            kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+            # idx_k_prewritten: index-K is already in the cache (written above
+            # on bf16, or by the FP8 producer), so run_indexer must not write it.
+            kv_block_indexes = self.attn.run_indexer(
+                idx_q, idx_k, attn_metadata, idx_k_prewritten=True
+            )
             forward_args = AttentionForwardArgs(
                 output=output,
                 sparse_backend_args=SparseBackendForwardArgs(topk_indices=kv_block_indexes),
             )
         else:
             assert idx_q is None and idx_k is None
+            self.attn.write_layer_caches(k, v, None, attn_metadata)
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
-        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        self.attn.forward(q, None, None, attn_metadata, forward_args=forward_args)
         return output
 
     def _sparse_forward(
@@ -1687,7 +1706,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 getattr(config, "dense_intermediate_size", config.intermediate_size)
             )
             self.mlp = _build_swiglu_oai_dense_mlp(
-                model_config=model_config, intermediate_size=dense_intermediate
+                model_config=model_config,
+                intermediate_size=dense_intermediate,
+                layer_idx=layer_idx,
             )
             self.block_sparse_moe = None
 
@@ -1747,6 +1768,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Layer-0 prologue only. For every subsequent layer the input_layernorm
@@ -1769,6 +1791,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=attn_all_reduce_params,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -1779,11 +1802,18 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             self.post_feed_forward_fusion = False
         if self.block_sparse_moe is not None:
             hidden_states, residual = self.forward_MoE(
-                hidden_states, attn_metadata, residual, spec_metadata=spec_metadata
+                hidden_states,
+                attn_metadata,
+                residual,
+                spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
         else:
             hidden_states, residual = self.forward_mlp(
-                hidden_states, residual, spec_metadata=spec_metadata
+                hidden_states,
+                residual,
+                spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         return hidden_states, residual
@@ -1859,6 +1889,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
@@ -1866,6 +1897,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             hidden_states,
             attn_metadata,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
+            lora_params=lora_params,
         )
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
@@ -1878,12 +1910,14 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=self._feed_forward_all_reduce_params(),
+            lora_params=lora_params,
         )
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
@@ -1969,6 +2003,7 @@ class MiniMaxM3Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                **kwargs,
             )
 
         # When setup_aliases has chained the final norm into the last decoder

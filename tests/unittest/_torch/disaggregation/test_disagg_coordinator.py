@@ -67,12 +67,13 @@ def test_orchestration_modules_do_not_depend_on_py_executor(module) -> None:
 
 def test_executor_facing_surface_is_a_closed_set() -> None:
     """The executor-owned behavior the coordinator can trigger is a closed set:
-    three effects plus one registry mutation. Growing it is a design decision,
+    four effects plus one registry mutation. Growing it is a design decision,
     not a convenience."""
     assert _public_methods(ExecutorEffects) == {
         "terminate_request",
         "stage_transfer_response",
         "fail_requests",
+        "fail_fatal",
     }
     assert _public_methods(ActiveRequestRegistry) == {
         "active_requests",
@@ -87,8 +88,6 @@ def test_delegated_methods_forward_to_their_own_delegate(name: str) -> None:
     """Each still-delegated entry point must reach exactly its own delegate with
     the arguments unchanged; a cross-wired or dropped call changes loop behavior
     and may break rank symmetry for collective-sensitive entry points."""
-    if name in ("check_transfer_errors", "requests_in_error_state"):
-        pytest.skip("reached from inside the reaps, not a coordinator entry point")
     delegates = DisaggLoopDelegates(**{f.name: Mock() for f in fields(DisaggLoopDelegates)})
     coordinator = _delegating_coordinator(delegates)
     method = getattr(coordinator, name)

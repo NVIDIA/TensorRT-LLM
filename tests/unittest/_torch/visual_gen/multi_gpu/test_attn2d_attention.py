@@ -33,19 +33,11 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-    from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
-        _flash_attn_fwd as _fa4_fwd,
-    )
-    from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-    _fa4_fwd = None
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
+from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
 
 # FA4 kernel availability (separate from the combine kernel used by Attention2DAttention)
 _flash_attn4_available = _fa4_fwd is not None
@@ -154,8 +146,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
