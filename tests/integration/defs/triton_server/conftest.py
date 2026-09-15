@@ -444,18 +444,6 @@ def whisper_large_model_root():
 
 
 @pytest.fixture(scope="session")
-def tiny_llama_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    tiny_llama_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
-
-    assert os.path.exists(
-        tiny_llama_model_root
-    ), f"{tiny_llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return tiny_llama_model_root
-
-
-@pytest.fixture(scope="session")
 def mistral_small_3_1_24b_model_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
