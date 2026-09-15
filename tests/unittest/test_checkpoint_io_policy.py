@@ -19,6 +19,7 @@ from typing import get_args
 
 import pytest
 import yaml
+from pydantic import BaseModel
 
 from tensorrt_llm._checkpoint_io_policy import (
     AUTO_IO_POLICY,
@@ -31,6 +32,7 @@ from tensorrt_llm._checkpoint_io_policy import (
     RANK_STRIPED_IO_POLICY,
     CheckpointIoPolicy,
 )
+from tensorrt_llm.usage.llmapi_config import manifest_rows
 
 pytestmark = pytest.mark.cpu_only
 
@@ -56,13 +58,15 @@ def test_policy_field_preserves_string_api() -> None:
 
 
 def test_policy_catalog_matches_committed_artifacts() -> None:
+    class PolicyArgs(BaseModel):
+        checkpoint_io_policy: CheckpointIoPolicy = AUTO_IO_POLICY
+
     root = Path(__file__).resolve().parents[2]
     manifest = json.loads((root / "tensorrt_llm/usage/llm_args_golden_manifest.json").read_text())
     entry = next(
         item for item in manifest["TorchLlmArgs"] if item["path"] == "checkpoint_io_policy"
     )
-    assert entry["allowed_values"] == sorted(CHECKPOINT_IO_POLICIES)
-    assert entry["capture_policy"] == "literal"
+    assert entry == manifest_rows(PolicyArgs)[0]
     reference = yaml.safe_load(
         (root / "tests/unittest/api_stability/references/llm.yaml").read_text()
     )["methods"]["__init__"]["parameters"]["checkpoint_io_policy"]

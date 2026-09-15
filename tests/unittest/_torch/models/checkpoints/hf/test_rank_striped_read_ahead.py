@@ -3,6 +3,7 @@
 
 import pickle
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -498,10 +499,10 @@ def test_reader_open_failure_closes_already_opened_descriptors(
     newly_opened_descriptors = []
     closed_descriptors = []
 
-    def fail_second_open(path, flags):
+    def fail_second_open(path, flags, *args, **kwargs):
         if path == str(failing_path):
             raise OSError("injected open failure")
-        descriptor = real_open(path, flags)
+        descriptor = real_open(path, flags, *args, **kwargs)
         if path == str(opened_path):
             newly_opened_descriptors.append(descriptor)
         return descriptor
@@ -510,13 +511,18 @@ def test_reader_open_failure_closes_already_opened_descriptors(
         closed_descriptors.append(descriptor)
         return real_close(descriptor)
 
-    monkeypatch.setattr(read_ahead.os, "open", fail_second_open)
-    monkeypatch.setattr(read_ahead.os, "close", record_close)
+    # os is process-wide: preserve unrelated opens and restore it before pytest
+    # resumes capture/fixture teardown.
+    with monkeypatch.context() as patch:
+        patch.setattr(read_ahead.os, "open", fail_second_open)
+        patch.setattr(read_ahead.os, "close", record_close)
 
-    with pytest.raises(OSError, match="injected open failure"):
-        read_ahead.RankStripedReadAheadSession(None, None, failed_plan)
-    assert newly_opened_descriptors
-    assert newly_opened_descriptors[0] in closed_descriptors
+        with pytest.raises(OSError, match="injected open failure"):
+            read_ahead.RankStripedReadAheadSession(None, None, failed_plan)
+        assert newly_opened_descriptors
+        assert newly_opened_descriptors[0] in closed_descriptors
+        with tempfile.TemporaryFile() as capture_file:
+            capture_file.write(b"unrelated capture I/O")
 
 
 @pytest.mark.parametrize(
@@ -1016,8 +1022,8 @@ def test_demand_ordered_planning_failure_degrades_before_start_without_reload(
         )
     elif failure_phase == "open":
         monkeypatch.setattr(
-            read_ahead.os,
-            "open",
+            weight_loader_module,
+            "RankStripedReadAheadSession",
             mock.Mock(side_effect=OSError(failure_message)),
         )
 
