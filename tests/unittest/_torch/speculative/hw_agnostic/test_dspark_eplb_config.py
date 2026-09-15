@@ -162,7 +162,7 @@ def test_dspark_draft_backend_auto_resolves_on_isolated_copy():
     with patch.object(
         modeling_dspark.ModelConfig, "resolve_moe_backend", return_value="TRTLLM"
     ) as resolve_backend:
-        draft_config = modeling_dspark.DSparkDraftModel._derive_draft_model_config(
+        draft_config = modeling_dspark.DSv4DSparkDraftModel._derive_draft_model_config(
             model_config, NUM_HIDDEN_LAYERS, NUM_STAGES, "AUTO"
         )
 
