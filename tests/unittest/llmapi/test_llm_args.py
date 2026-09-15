@@ -278,7 +278,8 @@ kv_cache_config:
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
 
     def test_from_yaml_enable_locality_domains(self, tmp_path):
-        assert TorchLlmArgs(model=llama_model_path).enable_locality_domains is False
+        assert TorchLlmArgs(
+            model=llama_model_path).enable_locality_domains is False
 
         yaml_path = tmp_path / "locality_domains.yaml"
         yaml_path.write_text(
