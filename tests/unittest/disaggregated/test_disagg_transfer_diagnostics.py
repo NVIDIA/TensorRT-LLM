@@ -16,6 +16,8 @@
 import json
 import os
 import threading
+import uuid
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -24,6 +26,14 @@ import pytest
 from tensorrt_llm._torch.disaggregation import diagnostics
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _isolate_diagnostic_sink(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    diagnostics._reset_diagnostic_sink_for_tests()
+    monkeypatch.delenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID", raising=False)
+    yield
+    diagnostics._reset_diagnostic_sink_for_tests()
 
 
 def test_suppress_diagnostic_errors_does_not_interrupt_request_progress() -> None:
@@ -46,7 +56,7 @@ def test_disabled_emit_event_does_no_diagnostic_work(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         diagnostics,
         "os",
-        SimpleNamespace(getpid=unexpected_call, write=unexpected_call),
+        SimpleNamespace(getpid=unexpected_call, write=unexpected_call, getenv=unexpected_call),
     )
     monkeypatch.setattr(
         diagnostics,
@@ -54,6 +64,9 @@ def test_disabled_emit_event_does_no_diagnostic_work(monkeypatch: pytest.MonkeyP
         SimpleNamespace(monotonic_ns=unexpected_call, time_ns=unexpected_call),
     )
     monkeypatch.setattr(diagnostics, "json", SimpleNamespace(dumps=unexpected_call))
+    monkeypatch.setattr(
+        diagnostics, "uuid", SimpleNamespace(uuid4=unexpected_call, UUID=unexpected_call)
+    )
 
     diagnostics.emit_event("ctx_send_ready", side="ctx", request_id=17)
 
@@ -61,7 +74,9 @@ def test_disabled_emit_event_does_no_diagnostic_work(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork support")
-def test_forked_child_replaces_inherited_diagnostic_sink() -> None:
+def test_forked_child_replaces_inherited_diagnostic_sink(monkeypatch: pytest.MonkeyPatch) -> None:
+    run_uuid = str(uuid.uuid4())
+    monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID", run_uuid)
     diagnostics._reset_diagnostic_sink_for_tests()
     parent_pid = os.getpid()
     parent_sink = diagnostics._get_sink(parent_pid)
@@ -78,6 +93,10 @@ def test_forked_child_replaces_inherited_diagnostic_sink() -> None:
                 and child_sink is not parent_sink
                 and child_sink.pid == os.getpid()
                 and child_sink._thread.is_alive()
+                and child_sink._identity["process_uuid"] != parent_sink._identity["process_uuid"]
+                and child_sink._identity["run_uuid"]
+                == parent_sink._identity["run_uuid"]
+                == run_uuid
             )
             diagnostics._reset_diagnostic_sink_for_tests()
             os.write(write_fd, b"ok" if result else b"failed")
@@ -99,6 +118,126 @@ def test_forked_child_replaces_inherited_diagnostic_sink() -> None:
     assert child_result == b"ok"
 
 
+@pytest.mark.parametrize(
+    ("configured_run_id", "expected_run_id", "expected_status"),
+    [
+        (None, None, "unset"),
+        ("", None, "invalid"),
+        ("not-a-run-uuid", None, "invalid"),
+        (
+            "9C74CDA0AA094C668F24B8B38F40A958",
+            "9c74cda0-aa09-4c66-8f24-b8b38f40a958",
+            "shared",
+        ),
+    ],
+)
+def test_sink_records_validated_run_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_run_id: str | None,
+    expected_run_id: str | None,
+    expected_status: str,
+) -> None:
+    if configured_run_id is not None:
+        monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID", configured_run_id)
+    records = []
+    monkeypatch.setattr(
+        diagnostics._AsyncDiagnosticSink,
+        "_write",
+        staticmethod(lambda record: records.append(record.copy())),
+    )
+    sink = diagnostics._get_sink(os.getpid())
+    sink.submit({"event": "diagnostic_capabilities", "request_id": None})
+    sink.flush()
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["run_uuid"] == expected_run_id
+    assert record["run_uuid_status"] == expected_status
+    assert str(uuid.UUID(record["process_uuid"])) == record["process_uuid"]
+
+
+def test_event_identity_is_cached_and_cannot_be_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
+    run_uuid = str(uuid.uuid4())
+    monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID", run_uuid)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    monkeypatch.setattr(diagnostics, "_host_identity", lambda: "node-a")
+    records = []
+    monkeypatch.setattr(
+        diagnostics._AsyncDiagnosticSink,
+        "_write",
+        staticmethod(lambda record: records.append(record.copy())),
+    )
+    sink = diagnostics._get_sink(os.getpid())
+    unexpected_call = MagicMock(side_effect=AssertionError("event regenerated identity"))
+    monkeypatch.setattr(
+        diagnostics, "uuid", SimpleNamespace(uuid4=unexpected_call, UUID=unexpected_call)
+    )
+    monkeypatch.setattr(
+        diagnostics, "os", SimpleNamespace(getpid=os.getpid, getenv=unexpected_call)
+    )
+
+    for event in ("diagnostic_capabilities", "ctx_send_ready"):
+        diagnostics.emit_event(
+            event,
+            side="ctx",
+            request_id=17,
+            run_uuid="forged-run",
+            process_uuid="forged-process",
+            run_uuid_status="invalid",
+            host="forged-host",
+            pid=-1,
+        )
+    sink.flush()
+
+    unexpected_call.assert_not_called()
+    assert len(records) == 2
+    for record in records:
+        assert record["run_uuid"] == run_uuid
+        assert record["run_uuid_status"] == "shared"
+        assert record["process_uuid"] == sink._identity["process_uuid"]
+        assert record["host"] == "node-a"
+        assert record["pid"] == os.getpid()
+
+
+@pytest.mark.parametrize("restart", ["same_pid", "changed_pid"])
+def test_recreated_sink_has_fresh_process_identity(
+    monkeypatch: pytest.MonkeyPatch, restart: str
+) -> None:
+    run_uuid = str(uuid.uuid4())
+    monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID", run_uuid)
+    pid = os.getpid()
+    original_sink = diagnostics._get_sink(pid)
+    assert diagnostics._get_sink(pid) is original_sink
+    if restart == "same_pid":
+        diagnostics._reset_diagnostic_sink_for_tests()
+        replacement_sink = diagnostics._get_sink(pid)
+    else:
+        # Model PID replacement without inheriting a live parent thread.
+        original_sink.close()
+        replacement_sink = diagnostics._get_sink(pid + 1)
+
+    assert replacement_sink is not original_sink
+    assert replacement_sink._identity["process_uuid"] != original_sink._identity["process_uuid"]
+    assert replacement_sink._identity["run_uuid"] == original_sink._identity["run_uuid"] == run_uuid
+
+
+@pytest.mark.parametrize("failing_dependency", ["uuid", "environment"])
+def test_identity_initialization_failure_does_not_affect_request_progress(
+    monkeypatch: pytest.MonkeyPatch, failing_dependency: str
+) -> None:
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    failure = MagicMock(side_effect=OSError("diagnostic identity unavailable"))
+    if failing_dependency == "uuid":
+        monkeypatch.setattr(diagnostics, "uuid", SimpleNamespace(uuid4=failure))
+    else:
+        monkeypatch.setattr(diagnostics, "os", SimpleNamespace(getpid=os.getpid, getenv=failure))
+
+    diagnostics.emit_event("gen_decode_ready", side="gen", request_id=42)
+
+    failure.assert_called_once()
+    assert diagnostics._sink is None
+
+
 def test_enabled_emit_event_records_request_and_rank_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -118,6 +257,7 @@ def test_enabled_emit_event_records_request_and_rank_context(
         SimpleNamespace(
             getpid=lambda: 321,
             write=write,
+            getenv=lambda _key: None,
         ),
     )
     monkeypatch.setattr(
@@ -156,6 +296,8 @@ def test_enabled_emit_event_records_request_and_rank_context(
     message = encoded_message.decode("utf-8").removesuffix("\n")
     assert message.startswith(diagnostics.DIAGNOSTICS_LOG_PREFIX)
     payload = message.removeprefix(diagnostics.DIAGNOSTICS_LOG_PREFIX)
+    process_uuid = json.loads(payload)["process_uuid"]
+    assert str(uuid.UUID(process_uuid)) == process_uuid
     assert json.loads(payload) == {
         "schema_version": diagnostics.DIAGNOSTICS_SCHEMA_VERSION,
         "event": "ctx_backend_submitted",
@@ -164,6 +306,9 @@ def test_enabled_emit_event_records_request_and_rank_context(
         "local_request_id": 7,
         "host": "node-a",
         "pid": 321,
+        "process_uuid": process_uuid,
+        "run_uuid": None,
+        "run_uuid_status": "unset",
         "monotonic_ns": 1_234,
         "wall_ns": 5_678,
         "instance": "ctx_0",
@@ -198,6 +343,7 @@ def test_enabled_emit_event_accepts_executor_rank_context(monkeypatch: pytest.Mo
         SimpleNamespace(
             getpid=lambda: 654,
             write=write,
+            getenv=lambda _key: None,
         ),
     )
     monkeypatch.setattr(
@@ -287,6 +433,7 @@ def test_async_sink_failure_does_not_stop_later_diagnostic_writes(
         SimpleNamespace(
             getpid=lambda: 123,
             write=write,
+            getenv=lambda _key: None,
         ),
     )
 
@@ -422,6 +569,10 @@ def test_full_diagnostic_queue_reports_dropped_events(
         record for record in records if record["event"] == "diagnostics_events_dropped"
     )
     assert drop_record["dropped_events"] == 1
+    for record in records:
+        assert record["process_uuid"] == sink._identity["process_uuid"]
+        assert record["run_uuid"] is None
+        assert record["run_uuid_status"] == "unset"
 
 
 def test_scheduler_kv_admission_guard_avoids_telemetry_state_inspection(

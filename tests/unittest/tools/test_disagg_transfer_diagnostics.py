@@ -4,6 +4,7 @@
 
 import json
 from pathlib import Path
+from uuid import NAMESPACE_DNS, uuid5
 
 import pytest
 
@@ -11,6 +12,15 @@ __extra_import_path__ = ["~/scripts"]
 from disagg_transfer_diagnostics import DIAGNOSTICS_LOG_PREFIX, analyze_lines, main  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _domain(host: str = "node-a", pid: int = 17) -> dict[str, object]:
+    return {
+        "host": host,
+        "pid": pid,
+        "run_uuid": "11111111-1111-4111-8111-111111111111",
+        "process_uuid": str(uuid5(NAMESPACE_DNS, f"{host}:{pid}")),
+    }
 
 
 def _event(
@@ -28,11 +38,12 @@ def _event(
         "event": name,
         "request_id": request_id,
         "side": side,
-        "host": host,
-        "pid": pid,
+        **_domain(host, pid),
         "monotonic_ns": monotonic_ns,
         "wall_ns": 100_000_000_000 + monotonic_ns,
     }
+    if name == "gen_request_data_sent":
+        record["writer_cohort_known"] = True
     record.update(details)
     return f"worker-prefix {DIAGNOSTICS_LOG_PREFIX}{json.dumps(record)}\n"
 
@@ -41,6 +52,22 @@ def _request(result: dict[str, object], request_id: int) -> dict[str, object]:
     requests = result["requests"]
     assert isinstance(requests, list)
     return next(request for request in requests if request["request_id"] == request_id)
+
+
+def _capabilities(*, pid: int = 17, rank: int | None = None) -> str:
+    return _event(
+        "diagnostic_capabilities",
+        None,
+        0,
+        pid=pid,
+        rank=rank,
+        side="runtime",
+        capability_schema_version=1,
+        transceiver_runtime="PYTHON",
+        python_transfer_events=True,
+        executor_events=True,
+        scheduler_kv_admission_events=True,
+    )
 
 
 def test_noisy_logs_are_counted_and_grouped_by_canonical_request() -> None:
@@ -82,7 +109,8 @@ def test_noisy_logs_are_counted_and_grouped_by_canonical_request() -> None:
     }
 
     request = _request(result, 22)
-    assert request["missing_boundaries"] == ["gen_receive_start"]
+    assert request["missing_boundaries"] == []
+    assert request["unassessed_boundaries"] == ["gen_receive_start"]
     assert [event["event"] for event in request["timeline"]] == [
         "gen_ingress",
         "gen_kv_admission_result",
@@ -294,8 +322,7 @@ def test_aggregate_kv_pool_snapshots_keep_headroom_fields() -> None:
     assert result["aggregate_timeline"][-1]["dropped_events"] == 3
     assert result["scheduler_decision_cadence"] == [
         {
-            "host": "node-a",
-            "pid": 17,
+            **_domain(),
             "rank": None,
             "snapshot_count": 2,
             "interval_count": 1,
@@ -340,8 +367,7 @@ def test_gen_transfer_settled_uses_the_next_same_rank_scheduler_decision() -> No
 
     assert result["gen_transfer_settled_to_next_scheduler_decision"] == [
         {
-            "host": "node-a",
-            "pid": 17,
+            **_domain(),
             "rank": 0,
             "settled_count": 2,
             "matched_count": 1,
@@ -356,6 +382,8 @@ def test_gen_transfer_settled_uses_the_next_same_rank_scheduler_decision() -> No
 def test_boundary_completeness_is_reported_per_participant() -> None:
     result = analyze_lines(
         [
+            _capabilities(rank=0),
+            _capabilities(pid=18, rank=1),
             _event("gen_ingress", 31, 1_000_000, rank=0),
             _event("gen_kv_admission_result", 31, 2_000_000, rank=0, outcome="admitted"),
             _event("gen_ingress", 31, 3_000_000, pid=18, rank=1),
@@ -363,8 +391,8 @@ def test_boundary_completeness_is_reported_per_participant() -> None:
     )
 
     request = _request(result, 31)
-    # Request-wide accounting sees rank 0's admission, while rank 1 remains incomplete.
-    assert "gen_kv_admission_result" not in request["missing_boundaries"]
+    # A peer's event cannot satisfy rank 1's expected admission boundary.
+    assert request["missing_boundaries"] == ["gen_kv_admission_result"]
     rank_one = next(
         participant for participant in request["participants"] if participant["rank"] == 1
     )
@@ -451,7 +479,9 @@ def test_cross_domain_monotonic_timestamps_are_not_subtracted() -> None:
         "phase": "ctx_receiver_readiness_offset",
         "reason": "clock_domain_mismatch",
     } in request["unmeasured_phases"]
-    assert request["missing_boundaries"] == [
+    assert request["missing_boundaries"] == []
+    assert request["unassessed_boundaries"] == [
+        "ctx_all_receivers_ready",
         "ctx_source_kv_released",
         "ctx_transfer_settled",
     ]
@@ -521,6 +551,7 @@ def test_writer_timeline_preserves_late_session_evidence() -> None:
 def test_writer_first_response_reports_an_unmatched_fanout_peer() -> None:
     result = analyze_lines(
         [
+            _capabilities(),
             _event("gen_request_data_sent", 42, 1_000_000, slice_id=0, peer_rank=0),
             _event("gen_request_data_sent", 42, 2_000_000, slice_id=0, peer_rank=1),
             _event("gen_writer_result_received", 42, 4_000_000, slice_id=0, peer_rank=0),
@@ -537,9 +568,190 @@ def test_writer_first_response_reports_an_unmatched_fanout_peer() -> None:
         "phase": "gen_writer_first_response",
         "reason": "missing_end",
         "count": 1,
-        "clock_domain": {"host": "node-a", "pid": 17},
+        "clock_domain": _domain(),
         "correlation": {"slice_id": 0, "peer_rank": 1},
     } in request["unmeasured_phases"]
+
+
+def _broadcast_send(peer_rank: int, *, expected_writers: int | None = 1, **details: object) -> str:
+    return _event(
+        "gen_request_data_sent",
+        58,
+        1_000_000,
+        slice_id=0,
+        peer_rank=peer_rank,
+        writer_cohort_known=False,
+        expected_writers=expected_writers,
+        **details,
+    )
+
+
+def _broadcast_response(peer_rank: int, **details: object) -> str:
+    return _event(
+        "gen_writer_result_received",
+        58,
+        3_000_000,
+        peer_rank=peer_rank,
+        **{"slice_id": 0, "outcome": "success", "is_last_slice": True, **details},
+    )
+
+
+def _writer_gaps(result: dict[str, object]) -> list[dict[str, object]]:
+    return [
+        gap
+        for gap in _request(result, 58)["unmeasured_phases"]
+        if gap["phase"] == "gen_writer_first_response"
+    ]
+
+
+def test_complete_adp_broadcast_does_not_require_unselected_peers_to_respond() -> None:
+    result = analyze_lines(
+        [
+            _capabilities(),
+            _broadcast_send(0),
+            _broadcast_send(1),
+            _broadcast_response(1),
+            _event("gen_destination_complete", 58, 4_000_000, slice_id=0, peer_rank=1),
+        ]
+    )
+
+    assert _writer_gaps(result) == []
+    duration = next(
+        sample
+        for sample in _request(result, 58)["durations"]
+        if sample["phase"] == "gen_writer_first_response"
+    )
+    assert duration["duration_ms"] == 2.0
+    assert duration["correlation"] == {"slice_id": 0, "peer_rank": 1}
+    assert _request(result, 58)["timeline"][0]["writer_cohort_known"] is False
+
+
+def test_incomplete_adp_broadcast_reports_missing_writer_count_not_candidate_peers() -> None:
+    result = analyze_lines(
+        [
+            _broadcast_send(0, expected_writers=2),
+            _broadcast_send(1, expected_writers=2),
+            _broadcast_send(2, expected_writers=2),
+            _broadcast_response(1, is_last_slice=False),
+            _broadcast_response(1),
+            _broadcast_response(2, session_found=False),
+        ]
+    )
+
+    assert _writer_gaps(result) == [
+        {
+            "phase": "gen_writer_first_response",
+            "reason": "missing_writer_responses",
+            "clock_domain": _domain(),
+            "correlation": {"slice_id": 0},
+            "observed_writers": 1,
+            "expected_writers": 2,
+            "count": 1,
+        }
+    ]
+
+
+@pytest.mark.parametrize("counts", ((None, None), (0, 0), (1, 2), (None, 1)))
+def test_ambiguous_broadcast_writer_count_is_unknown(counts: tuple[int | None, int | None]) -> None:
+    result = analyze_lines(
+        [
+            _broadcast_send(0, expected_writers=counts[0]),
+            _broadcast_send(1, expected_writers=counts[1]),
+            _broadcast_response(1),
+        ]
+    )
+
+    gaps = _writer_gaps(result)
+    assert len(gaps) == 1
+    assert gaps[0]["reason"] == "unknown_writer_cohort"
+    assert gaps[0]["detail"] == "missing_invalid_or_conflicting_expected_writers"
+
+
+@pytest.mark.parametrize("cohort_flag", (None, True))
+def test_missing_or_conflicting_writer_cohort_does_not_assume_exact_peers(
+    cohort_flag: bool | None,
+) -> None:
+    result = analyze_lines(
+        [
+            _broadcast_send(0),
+            _event(
+                "gen_request_data_sent",
+                58,
+                1_000_000,
+                slice_id=0,
+                peer_rank=1,
+                writer_cohort_known=cohort_flag,
+                expected_writers=1,
+            ),
+            _broadcast_response(1),
+        ]
+    )
+
+    assert [gap["reason"] for gap in _writer_gaps(result)] == ["unknown_writer_cohort"]
+
+
+@pytest.mark.parametrize(
+    "other_identity",
+    (
+        {"host": "node-b"},
+        {"pid": 18},
+        {"rank": 1},
+        {"slice_id": 1},
+        {"process_uuid": "22222222-2222-4222-8222-222222222222"},
+    ),
+)
+def test_other_participant_or_slice_cannot_complete_broadcast_cohort(
+    other_identity: dict[str, object],
+) -> None:
+    result = analyze_lines(
+        [
+            _broadcast_send(0),
+            _broadcast_response(0, **other_identity),
+        ]
+    )
+
+    missing = [gap for gap in _writer_gaps(result) if gap["reason"] == "missing_writer_responses"]
+    assert len(missing) == 1
+    assert missing[0]["observed_writers"] == 0
+    assert missing[0]["expected_writers"] == 1
+
+
+def test_duplicate_broadcast_publications_and_chunk_results_count_distinct_writers() -> None:
+    result = analyze_lines(
+        [
+            _broadcast_send(0),
+            _broadcast_send(0),
+            _broadcast_send(1),
+            _broadcast_response(1, is_last_slice=False),
+            _broadcast_response(1),
+            _broadcast_response(1),
+        ]
+    )
+
+    assert _writer_gaps(result) == []
+    durations = [
+        sample
+        for sample in _request(result, 58)["durations"]
+        if sample["phase"] == "gen_writer_first_response"
+    ]
+    assert len(durations) == 1
+
+
+def test_broadcast_does_not_hide_response_that_precedes_publication() -> None:
+    result = analyze_lines(
+        [
+            _capabilities(),
+            _broadcast_send(0, expected_writers=2),
+            _broadcast_send(1, expected_writers=2),
+            _event("gen_writer_result_received", 58, 0, slice_id=0, peer_rank=0),
+            _broadcast_response(1),
+        ]
+    )
+
+    gaps = _writer_gaps(result)
+    assert len(gaps) == 1
+    assert gaps[0]["reason"] == "missing_end"
+    assert gaps[0]["correlation"] == {"slice_id": 0, "peer_rank": 0}
 
 
 def test_pipelined_chunks_use_first_response_and_final_successful_destination() -> None:
@@ -753,6 +965,7 @@ def test_healthy_or_inapplicable_timeout_phases_are_not_reported_missing() -> No
 def test_ctx_worker_queue_wait_is_correlated_per_slice_and_peer() -> None:
     result = analyze_lines(
         [
+            _capabilities(),
             _event(
                 "ctx_transfer_queued",
                 88,
@@ -827,7 +1040,7 @@ def test_ctx_worker_queue_wait_is_correlated_per_slice_and_peer() -> None:
         "phase": "ctx_worker_queue_wait",
         "reason": "missing_end",
         "count": 1,
-        "clock_domain": {"host": "node-a", "pid": 17},
+        "clock_domain": _domain(),
         "correlation": {"slice_id": 1, "peer_rank": 1},
     } in request["unmeasured_phases"]
     queued = request["timeline"][0]
