@@ -71,6 +71,16 @@ def test_all_content_parts_are_kept():
     assert msg["content"] == "first second third"
 
 
+@pytest.mark.parametrize("role", ["user", "assistant", "system", "developer"])
+@pytest.mark.parametrize("content", ["APPLE", "", "  hello\n世界  "])
+def test_string_message_content_is_preserved(role: str, content: str) -> None:
+    item = {"type": "message", "role": role, "content": content}
+    assert _response_output_item_to_chat_completion_message(item) == {
+        "role": role,
+        "content": content,
+    }
+
+
 def test_reasoning_item_is_always_assistant():
     msg = _response_output_item_to_chat_completion_message(
         {
@@ -123,6 +133,130 @@ def _messages(request_kwargs):
 
 def test_string_input_becomes_a_user_message():
     assert _messages({"input": "hello"}) == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_request_preserves_string_message(typed: bool) -> None:
+    item = {"role": "user", "content": "APPLE"}
+    if typed:
+        item["type"] = "message"
+    assert _messages({"input": [item]}) == [{"role": "user", "content": "APPLE"}]
+
+
+@pytest.mark.parametrize("logprobs", [None, []])
+def test_returned_output_text_can_be_replayed(logprobs: list[object] | None) -> None:
+    item = {
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+            {"type": "output_text", "text": "APPLE", "annotations": [], "logprobs": logprobs}
+        ],
+    }
+    assert _messages({"input": [item]}) == [{"role": "assistant", "content": "APPLE"}]
+    # Normalization must not mutate the caller's response object.
+    assert item["content"][0]["logprobs"] is logprobs
+
+
+def test_reasoning_summary_and_empty_reasoning_can_be_replayed() -> None:
+    assert _response_output_item_to_chat_completion_message(
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Thinking"}],
+        }
+    ) == {"role": "assistant", "reasoning": "Thinking"}
+    assert (
+        _response_output_item_to_chat_completion_message(
+            {
+                "type": "reasoning",
+                "summary": [],
+                "content": None,
+            }
+        )
+        is None
+    )
+
+
+def test_replay_preserves_populated_logprobs() -> None:
+    """Accept null logprobs without discarding a client's actual probabilities."""
+    logprobs = [{"token": "APPLE", "logprob": -0.5, "bytes": [65], "top_logprobs": []}]
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_1",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "APPLE",
+                        "annotations": [],
+                        "logprobs": logprobs,
+                    }
+                ],
+            }
+        ],
+    )
+    assert request.model_dump()["input"][0]["content"][0]["logprobs"] == logprobs
+
+
+@pytest.mark.parametrize("harmony", [False, True])
+@pytest.mark.parametrize(
+    "reasoning,expected",
+    [
+        ({"summary": [], "content": None}, ""),
+        ({"summary": [{"type": "summary_text", "text": "Summary"}]}, "Summary"),
+        (
+            {
+                "summary": [],
+                "content": [
+                    {"type": "reasoning_text", "text": "First "},
+                    {"type": "reasoning_text", "text": "second"},
+                ],
+            },
+            "First second",
+        ),
+        (
+            {
+                "summary": [{"type": "summary_text", "text": "Summary"}],
+                "content": [{"type": "reasoning_text", "text": "Full reasoning"}],
+            },
+            "Full reasoning",
+        ),
+    ],
+)
+def test_validated_reasoning_replay(
+    reasoning: dict[str, list[dict[str, str]] | None], expected: str, harmony: bool
+) -> None:
+    """Exercise request validation and conversion on both prompt-building paths."""
+    import asyncio
+
+    from tensorrt_llm.serve.responses_utils import _construct_harmony_messages
+
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {"type": "reasoning", "id": "rs_1", **reasoning},
+            {"role": "user", "content": "Continue"},
+        ],
+    )
+    if harmony:
+        messages = _construct_harmony_messages(request, None)[2:]
+        assert messages[-1].author.role == "user"
+        assert messages[-1].content[0].text == "Continue"
+        if expected:
+            assert messages[0].author.role == "assistant"
+            assert messages[0].channel == "analysis"
+            assert messages[0].content[0].text == expected
+    else:
+        messages = asyncio.run(_create_input_messages(request, []))
+        assert messages[-1] == {"role": "user", "content": "Continue"}
+        if expected:
+            assert messages[0] == {"role": "assistant", "reasoning": expected}
+    assert len(messages) == (2 if expected else 1)
 
 
 def test_structured_input_round_trips_roles():

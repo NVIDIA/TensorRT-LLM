@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import json
@@ -133,7 +134,7 @@ def _decode_tokens(
 def _parse_response_input(
     input_msg: ResponseInputOutputItem,
     prev_responses: list[Union[ResponseOutputItem, ResponseReasoningItem]]
-) -> Message:
+) -> Message | None:
     if not isinstance(input_msg, dict):
         input_msg = input_msg.model_dump()
 
@@ -176,9 +177,12 @@ def _parse_response_input(
             Author.new(Role.TOOL, f"functions.{call_response.name}"),
             input_msg["output"])
     elif input_msg["type"] == "reasoning":
-        content = input_msg["content"]
-        assert len(content) == 1
-        msg = Message.from_role_and_content(Role.ASSISTANT, content[0]["text"])
+        content = input_msg.get("content") or input_msg.get("summary") or []
+        if not content:
+            return None
+        msg = Message.from_role_and_content(
+            Role.ASSISTANT, "".join(part["text"] for part in content))
+        msg = msg.with_channel("analysis")
     elif input_msg["type"] == "function_call":
         msg = Message.from_role_and_content(Role.ASSISTANT,
                                             input_msg["arguments"])
@@ -723,7 +727,16 @@ def _response_output_item_to_chat_completion_message(
             else:
                 raise ValueError(f"Invalid input message item: {item}")
         case "message" | "reasoning":
+            if item_type == "message" and isinstance(item.get("content"), str):
+                return {
+                    "role": item.get("role") or "assistant",
+                    "content": item["content"],
+                }
             content = item.get("content") or []
+            if item_type == "reasoning" and not content:
+                content = item.get("summary") or []
+                if not content:
+                    return None
             if not content:
                 raise ValueError(
                     f"Input item of type {item_type!r} has empty or missing 'content'"
