@@ -2117,7 +2117,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         config = mgr._build_cache_config(base_config)
         runtime_manager = RuntimeKVCacheManager(config)
         try:
-            statistics = _introspection.storage_statistics(runtime_manager)
+            statistics = runtime_manager.get_storage_statistics()
 
             def _slot_sizes(stat):
                 # cpp binding exposes `slot_sizes`; the Python backend `slot_size`.

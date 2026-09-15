@@ -167,6 +167,10 @@ class StorageStatistics:
     evictable: int
 
     @property
+    def slot_sizes(self) -> list[int]:
+        return list(self.slot_size)
+
+    @property
     def available(self) -> int:
         return self.free + self.evictable
 

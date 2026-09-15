@@ -419,6 +419,58 @@ class TestKVCacheManagerV2(unittest.TestCase):
         self.manager = KVCacheManager(self.cfg)
 
 
+class TestStorageStatistics(TestKVCacheManagerV2):
+    def test_statistics_are_detached_snapshots(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 2, 16, 0, tokens_per_block=4, kv_buf_size=4096)
+
+        def values(stats):
+            return [
+                (
+                    item.slot_sizes,
+                    item.total,
+                    item.free,
+                    item.evictable,
+                    item.available,
+                    item.unavailable,
+                )
+                for item in stats
+            ]
+
+        snapshots = [self.manager.get_storage_statistics(CacheLevel(level)) for level in range(2)]
+        saved = [values(stats) for stats in snapshots]
+        for level, stats in enumerate(snapshots):
+            self.assertTrue(stats)
+            mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(level))
+            # Both life cycles have the same slot sizes and share one pool group at each level.
+            self.assertEqual(mapping, [0, 0])
+            self.assertTrue(all(0 <= pool_group < len(stats) for pool_group in mapping))
+            mapping[0] = -1
+            self.assertNotEqual(
+                self.manager.get_life_cycle_pool_group_indices(CacheLevel(level))[0], -1
+            )
+            for item in stats:
+                self.assertEqual(item.total, item.available + item.unavailable)
+                self.assertEqual(item.available, item.free + item.evictable)
+                sizes = item.slot_sizes
+                sizes[0] = 0
+            self.assertEqual(
+                values(self.manager.get_storage_statistics(CacheLevel(level))), saved[level]
+            )
+
+        with TemporaryCudaStream([]) as stream:
+            cache = self.manager.create_kv_cache()
+            try:
+                self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                cache.resize(self.manager.tokens_per_block)
+                current = self.manager.get_storage_statistics()
+                self.assertGreater(sum(item.unavailable for item in current), 0)
+                self.assertEqual([values(stats) for stats in snapshots], saved)
+            finally:
+                cache.close()
+        stream.take_finish_event().synchronize()
+        self.assertEqual(values(self.manager.get_storage_statistics()), saved[0])
+
+
 class TestNoBatching(TestKVCacheManagerV2):
     class Request(NamedTuple):
         id: int
@@ -589,20 +641,16 @@ class TestNoBatching(TestKVCacheManagerV2):
         full_lc, short_swa_lc, long_swa_lc = [
             self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(3)
         ]
-        hot_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 0)
-            for lc_id in (full_lc, short_swa_lc, long_swa_lc)
-        ]
-        cold_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 1)
-            for lc_id in (full_lc, short_swa_lc, long_swa_lc)
-        ]
+        hot_mapping = self.manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        cold_mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(1))
+        hot_groups = [hot_mapping[lc_id] for lc_id in (full_lc, short_swa_lc, long_swa_lc)]
+        cold_groups = [cold_mapping[lc_id] for lc_id in (full_lc, short_swa_lc, long_swa_lc)]
         self.assertNotEqual(hot_groups[0], hot_groups[1])
         self.assertEqual(hot_groups[1], hot_groups[2])
         self.assertEqual(cold_groups[0], cold_groups[1])
         self.assertNotEqual(cold_groups[1], cold_groups[2])
 
-        hot_stats = _introspection.storage_statistics(self.manager, 0)
+        hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
         self.assertEqual(hot_stats[hot_groups[0]].total, 3)
         self.assertEqual(hot_stats[hot_groups[1]].total, 6)
         self._run_cold_page_codec_round_trip(
@@ -647,16 +695,14 @@ class TestNoBatching(TestKVCacheManagerV2):
         full_lc, swa_lc = [
             self.manager.get_layer_group_id(LayerId(layer_id)) for layer_id in range(2)
         ]
-        hot_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 0) for lc_id in (full_lc, swa_lc)
-        ]
-        cold_groups = [
-            _introspection.pool_group_index(self.manager, lc_id, 1) for lc_id in (full_lc, swa_lc)
-        ]
+        hot_mapping = self.manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        cold_mapping = self.manager.get_life_cycle_pool_group_indices(CacheLevel(1))
+        hot_groups = [hot_mapping[lc_id] for lc_id in (full_lc, swa_lc)]
+        cold_groups = [cold_mapping[lc_id] for lc_id in (full_lc, swa_lc)]
         self.assertEqual(hot_groups[0], hot_groups[1])
         self.assertNotEqual(cold_groups[0], cold_groups[1])
 
-        hot_stats = _introspection.storage_statistics(self.manager, 0)
+        hot_stats = self.manager.get_storage_statistics(GPU_LEVEL)
         self.assertEqual(hot_stats[hot_groups[0]].total, 6)
         self._run_cold_page_codec_round_trip(
             expected_num_pages=5,
@@ -796,7 +842,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         def overall_utilization() -> float:
             numerator = 0
             denominator = 0
-            for stat in _introspection.storage_statistics(self.manager):
+            for stat in self.manager.get_storage_statistics():
                 slot_size = sum(stat_slot_sizes(stat))
                 numerator += slot_size * stat.unavailable
                 denominator += slot_size * stat.total
@@ -3541,7 +3587,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(self._make_hybrid_config())
         ssm_lc = _introspection.ssm_life_cycle_id(manager)
         assert ssm_lc is not None
-        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+        ssm_pg = manager.get_life_cycle_pool_group_indices()[ssm_lc]
         attn_pg = 1 - ssm_pg
 
         batch = BatchDesc(
@@ -3698,8 +3744,7 @@ class TestInitRatioConfig(unittest.TestCase):
             return stat.slot_size
 
         slots_by_size = {
-            tuple(stat_slot_sizes(stat)): stat.total
-            for stat in _introspection.storage_statistics(manager)
+            tuple(stat_slot_sizes(stat)): stat.total for stat in manager.get_storage_statistics()
         }
         self.assertEqual(slots_by_size[(grain - 1,)], 2)
         self.assertEqual(slots_by_size[(grain,)], 3)
@@ -3762,7 +3807,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = _introspection.storage_statistics(manager)
+        stats = manager.get_storage_statistics()
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,
@@ -4007,7 +4052,7 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
 
         # Verify constraint clamping: each pool group has enough slots.
-        stats = _introspection.storage_statistics(manager)
+        stats = manager.get_storage_statistics()
         self.assertGreaterEqual(
             stats[0].total,
             slots_pg0,
@@ -4967,7 +5012,7 @@ class TestPoolRebalance(TestKVCacheManagerV2):
         return prompt
 
     def _slot_totals(self) -> list[int]:
-        return [s.total for s in _introspection.storage_statistics(self.manager, GPU_LEVEL)]
+        return [s.total for s in self.manager.get_storage_statistics(GPU_LEVEL)]
 
     def test_adjust_resizes_pool_groups(self) -> None:
         self.prepare_two_pool_groups()

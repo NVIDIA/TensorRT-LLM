@@ -2226,16 +2226,17 @@ class _KVCache:
         A disaggregated-serving transfer overwrites the incomplete tail block of the local match
         while complete blocks survive, so only the tail stops counting as a local hit.
         """
-        partial_tokens = self.num_committed_tokens % self.manager.tokens_per_block
+        partial_tokens = sum(self._cached_tokens_by_level) % self.manager.tokens_per_block
         if partial_tokens == 0:
             return
         # A partial cached prefix always has a final block, so it always has a level to discount.
         assert NDEBUG or self._last_cached_token_level is not None
         if self._last_cached_token_level is None:
             return
-        self._pending_stats.discount_cached_tokens_by_level(
-            self._last_cached_token_level, partial_tokens
-        )
+        # Admission can retry the same cache after resume/resize fails. Cap against the initial
+        # match so repeated calls preserve full blocks on the same source level.
+        full_tokens = self._cached_tokens_by_level[self._last_cached_token_level] - partial_tokens
+        self._pending_stats.limit_cached_tokens_by_level(self._last_cached_token_level, full_tokens)
         self._refresh_stats_dirty_state()
 
     def _setup_for_reuse(self, match: ReuseMatch) -> None:
