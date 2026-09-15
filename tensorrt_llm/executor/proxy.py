@@ -40,7 +40,8 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+from .request import (CancellingRequest, GenerationRequest,
+                      GenerationRequestBatch, StartProfileRequest,
                       StopProfileRequest)
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
@@ -162,6 +163,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.model_world_size = model_world_size
 
         _llm_args = worker_kwargs.get("llm_args", None)
+        self.llm_args = _llm_args
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
         _backend = None if _llm_args is None else _llm_args.backend
         self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
@@ -1166,12 +1168,44 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._results.pop(request.id, None)
             raise EngineDeadError(self._fatal_error)
 
+        if self._deferring:
+            self._defer(request)
+            self._handle_background_error()
+            return result
+
         with nvtx_range_debug("request_queue.put"):
             self.request_queue.put(request)
 
         self._handle_background_error()
 
         return result
+
+    def _deferral_limit(self) -> int:
+        """Cap the deferral buffer at what the engine can schedule at once."""
+        max_batch_size = self.llm_args.max_batch_size if self.llm_args else None
+        return max_batch_size or super()._deferral_limit()
+
+    def _discard_deferred(self, pending: List[GenerationRequest]) -> None:
+        """Unregister results for rows that were never sent."""
+        for request in pending:
+            self._results.pop(request.id, None)
+
+    def _flush_deferred(self, pending: List[GenerationRequest]) -> None:
+        """Send what was held back as one queue item.
+
+        One put, not N: the dispatch loop reads items one at a time.
+        """
+        if self._engine_dead or self._fatal_error is not None:
+            self._discard_deferred(pending)
+            raise EngineDeadError(self._fatal_error)
+
+        with nvtx_range_debug("request_queue.put_batch"):
+            self.request_queue.put(GenerationRequestBatch(pending))
+
+        for request in pending:
+            self._release_request_memory(request)
+
+        self._handle_background_error()
 
     def collective_rpc(
         self,

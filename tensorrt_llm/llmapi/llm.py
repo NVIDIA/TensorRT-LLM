@@ -724,22 +724,26 @@ class BaseLLM:
                     f"priority must be a float in [0.0, 1.0], got {priority}")
 
         futures = []
-        for i, request_input in enumerate(request_inputs_list):
-            future = self.generate_async(
-                request_input,
-                sampling_params=self._item_at(sampling_params, i),
-                lora_request=self._item_at(lora_request, i),
-                prompt_adapter_request=self._item_at(prompt_adapter_request, i),
-                kv_cache_retention_config=self._item_at(
-                    kv_cache_retention_config, i),
-                disaggregated_params=self._item_at(disaggregated_params, i),
-                scheduling_params=self._item_at(scheduling_params, i),
-                conversation_params=self._item_at(conversation_params, i),
-                cache_salt=self._item_at(cache_salt, i),
-                priority=self._item_at(priority, i),
-                streaming=False,
-            )
-            futures.append(future)
+        # Admit the rows together: submitted one by one, the scheduler takes
+        # whichever have arrived and one call can span several iterations.
+        with self._executor.deferred_admission():
+            for i, request_input in enumerate(request_inputs_list):
+                future = self.generate_async(
+                    request_input,
+                    sampling_params=self._item_at(sampling_params, i),
+                    lora_request=self._item_at(lora_request, i),
+                    prompt_adapter_request=self._item_at(
+                        prompt_adapter_request, i),
+                    kv_cache_retention_config=self._item_at(
+                        kv_cache_retention_config, i),
+                    disaggregated_params=self._item_at(disaggregated_params, i),
+                    scheduling_params=self._item_at(scheduling_params, i),
+                    conversation_params=self._item_at(conversation_params, i),
+                    cache_salt=self._item_at(cache_salt, i),
+                    priority=self._item_at(priority, i),
+                    streaming=False,
+                )
+                futures.append(future)
 
         for future in tqdm(futures,
                            desc="Processed requests",

@@ -252,6 +252,13 @@ class TruncateKVCacheRequest:
         self.messages = messages
 
 
+class GenerationRequestBatch:
+    """Requests to admit together, as one item on the proxy IPC queue."""
+
+    def __init__(self, requests: List[GenerationRequest]):
+        self.requests = requests
+
+
 class CancellingRequest:
     """The request to cancel a generation."""
 
