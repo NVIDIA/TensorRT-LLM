@@ -69,6 +69,7 @@ def make_stub_manager(
     # per-request stats are opt-in and off in this stub's manager.
     mgr.is_draft = False
     mgr.enable_stats = False
+    mgr.is_estimating_kv_cache = False
     mgr._request_stats_enabled_ids = set()
     mgr._stream = Mock()
     mgr.impl = Mock()
