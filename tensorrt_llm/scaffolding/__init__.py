@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 from .benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
+from .config import (CONTROLLER_REGISTRY, build_controller,
+                     load_controller_config, register_controller)
 from .controller import (BestOfNController, ChatWithMCPController, Controller,
                          MajorityVoteController, NativeChatController,
                          NativeGenerationController, NativeRewardController,
@@ -37,6 +39,10 @@ __all__ = [
     "NativeRewardController",
     "PRMController",
     "MajorityVoteController",
+    "CONTROLLER_REGISTRY",
+    "build_controller",
+    "load_controller_config",
+    "register_controller",
     "BestOfNController",
     "ChatWithMCPController",
     "Task",
