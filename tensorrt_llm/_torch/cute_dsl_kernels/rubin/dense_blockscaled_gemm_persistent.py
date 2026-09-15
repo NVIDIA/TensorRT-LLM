@@ -295,6 +295,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        layouts: cutlass.Constexpr = None,
     ):
         """Executes the wrapped GEMM kernel with dynamically shaped tensors.
 
@@ -321,18 +322,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             swap_ab (cutlass.Constexpr, optional): Whether to swap A and B. Defaults to False.
             epilogue_op (cutlass.Constexpr, optional): Elementwise lambda for epilogue.
                 Must be linear when split_k is greater than one.
+            layouts (cutlass.Constexpr, optional): A/B operand major modes and C layout.
+                Defaults to the layouts selected by swap_ab.
         """
-        # Determine layouts based on swap_ab
-        # When swap_ab=False: A is K-major, B is K-major, C is row-major (N-major)
-        # When swap_ab=True: same but tensors are swapped
-        a_major_mode = OperandMajorMode.K
-        b_major_mode = OperandMajorMode.K
-        if cutlass.const_expr(swap_ab):
-            c_layout = utils.LayoutEnum.COL_MAJOR
-        else:
-            c_layout = utils.LayoutEnum.ROW_MAJOR
-
-        layouts = (a_major_mode, b_major_mode, c_layout)
+        if cutlass.const_expr(layouts is None):
+            if cutlass.const_expr(swap_ab):
+                c_layout = utils.LayoutEnum.COL_MAJOR
+            else:
+                c_layout = utils.LayoutEnum.ROW_MAJOR
+            layouts = (OperandMajorMode.K, OperandMajorMode.K, c_layout)
         problem_mnkl = (cutlass.Int32(m), cutlass.Int32(n), cutlass.Int32(k), l)
 
         # Alpha scaling is applied inside the kernel epilogue (fused).
@@ -3703,13 +3701,15 @@ def scaled_mm(
     options: str = "",
     *,
     alpha_tensor: cute.Tensor,
+    batch_size: int = 1,
 ):
-    """Compile the base SM107 kernel through its pointer-based GEMM interface.
+    """Compile the base SM107 kernel through its wrapper interface.
 
     MixedClustersKernel is unsupported because its argument order differs.
 
     Alpha must be a single-element FP32 device tensor. The returned function
-    takes A/B/SFA/SFB/C pointers, alpha, an (M, N, K, L) tuple, and a stream.
+    takes M/N/K, scale-factor M/N/K, A/B/SFA/SFB/C pointers, alpha, C leading
+    dimension, and a stream. The batch size is fixed at compile time.
     Keep alpha's backing allocation alive until execution completes.
     """
     if type(gemm_obj) is not Sm107BlockScaledPersistentDenseGemmKernel:
@@ -3727,18 +3727,25 @@ def scaled_mm(
     b_major_mode = OperandMajorMode.K if b_major == "k" else OperandMajorMode.MN
     c_layout = utils.LayoutEnum.ROW_MAJOR if c_major == "n" else utils.LayoutEnum.COL_MAJOR
     return cute.compile(
-        gemm_obj,
+        gemm_obj.wrapper,
+        cutlass.Int64(0),  # m
+        cutlass.Int64(0),  # n
+        cutlass.Int64(0),  # k
+        cutlass.Int64(0),  # sf_m
+        cutlass.Int64(0),  # sf_n
+        cutlass.Int64(0),  # sf_k
+        batch_size,
         a_ptr,
         b_ptr,
         sfa_ptr,
         sfb_ptr,
         c_ptr,
         alpha_tensor,
-        (a_major_mode, b_major_mode, c_layout),
-        (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
+        cutlass.Int64(0),  # c_ld
         max_active_clusters,
         stream,
-        epilogue_op,
+        epilogue_op=epilogue_op,
+        layouts=(a_major_mode, b_major_mode, c_layout),
         options=options,
     )
 
@@ -3831,6 +3838,7 @@ def run_scaled_mm_with_emulated_dtype(
 
     # Unpack parameters
     m, n, k, l = mnkl
+    sf_m, sf_n, sf_k = m, n, ceil_div(k, sf_vec_size)
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
@@ -3847,7 +3855,7 @@ def run_scaled_mm_with_emulated_dtype(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    # Compile against the SM107 __call__ signature (alpha is a runtime tensor).
+    # Compile against the SM107 wrapper signature (alpha is a runtime tensor).
     alpha_torch = torch.full((1,), 0.5, dtype=torch.float32, device="cuda")
     alpha_tensor = from_dlpack(alpha_torch, assumed_align=16)
     compiled_gemm = scaled_mm(
@@ -3862,6 +3870,7 @@ def run_scaled_mm_with_emulated_dtype(
         max_active_clusters,
         current_stream,
         alpha_tensor=alpha_tensor,
+        batch_size=l,
     )
 
     # Create Torch Tensors for A, scale factor A, B, scale factor B, C
@@ -3896,13 +3905,19 @@ def run_scaled_mm_with_emulated_dtype(
     if not skip_ref_check:
         # Execute kernel once for reference checking
         compiled_gemm(
+            m,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
             a_ptr,
             b_ptr,
             sfa_reordered.iterator,
             sfb_reordered.iterator,
             c_ptr,
             alpha_tensor,
-            (m, n, k, l),
+            0,  # c_ld: contiguous output
             current_stream,
         )
 
@@ -3917,13 +3932,19 @@ def run_scaled_mm_with_emulated_dtype(
     if gemm_obj.split_k > 1:
 
         def benchmark_gemm(
+            m,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
             a_ptr,
             b_ptr,
             sfa_ptr,
             sfb_ptr,
             c_ptr,
             alpha,
-            problem_mnkl,
+            c_ld,
             stream,
             c_tensor,
         ):
@@ -3931,13 +3952,19 @@ def run_scaled_mm_with_emulated_dtype(
             # warmup and measured launch, including workspace reuse.
             c_tensor.zero_()
             compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
                 a_ptr,
                 b_ptr,
                 sfa_ptr,
                 sfb_ptr,
                 c_ptr,
                 alpha,
-                problem_mnkl,
+                c_ld,
                 stream,
             )
 
@@ -3971,13 +3998,19 @@ def run_scaled_mm_with_emulated_dtype(
         )
 
         kernel_args = [
+            m,
+            n,
+            k,
+            sf_m,
+            sf_n,
+            sf_k,
             a_ptr,
             b_ptr,
             sfa_reordered.iterator,
             sfb_reordered.iterator,
             c_ptr,
             alpha_tensor,
-            (m, n, k, l),
+            0,  # c_ld: contiguous output
             current_stream,
         ]
         if gemm_obj.split_k > 1:
