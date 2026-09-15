@@ -164,7 +164,6 @@
 /cpp/tests/unit_tests/kernels @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/cuda_tile_kernels @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/cute_dsl_kernels @NVIDIA/trt-llm-kernels-devs
-/tests/scripts/cute_dsl_kernels @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/thop @NVIDIA/trt-llm-kernels-devs
 
 # ===== MODELS =====
@@ -200,6 +199,10 @@
 /tensorrt_llm/tools/layer_wise_benchmarks @NVIDIA/trt-llm-perf-devs
 /tensorrt_llm/tools/profiler @NVIDIA/trt-llm-perf-devs
 /tests/microbenchmarks @NVIDIA/trt-llm-perf-devs
+# Last-match-wins: this rule must stay BELOW /tests/microbenchmarks above, or the
+# relocated CuteDSL benchmark drivers silently become perf-devs-owned.  The
+# per-team rules further down (attention / MoE / Top-K) override it in turn.
+/tests/microbenchmarks/cute_dsl_kernels @NVIDIA/trt-llm-kernels-devs
 /tests/scripts/allreduce_perf @NVIDIA/trt-llm-perf-devs
 /tests/scripts/iteration_log_parser.py @NVIDIA/trt-llm-perf-devs
 /tests/scripts/perf @NVIDIA/trt-llm-perf-devs
@@ -316,7 +319,7 @@
 /tensorrt_llm/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
-/tests/scripts/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
+/tests/microbenchmarks/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 # Exercises the sliding-block-table op that the sparse cache manager owns,
 # so a change to either side routes to that team as well.
@@ -356,8 +359,8 @@
 /tests/microbenchmarks/bench_moe @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe_comm.py @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/compare_moe_comm.py @NVIDIA/trt-llm-moe-devs
-/tests/scripts/cute_dsl_kernels/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
-/tests/scripts/cute_dsl_kernels/moe_workload_generator.py @NVIDIA/trt-llm-moe-devs
+/tests/microbenchmarks/cute_dsl_kernels/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
+/tests/microbenchmarks/cute_dsl_kernels/moe_workload_generator.py @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/moe @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/parallel/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/serial/*moe* @NVIDIA/trt-llm-moe-devs
@@ -366,7 +369,7 @@
 # ===== TOP-K =====
 /tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k @NVIDIA/trt-llm-topk-devs
 /tensorrt_llm/_torch/modules/top_k.py @NVIDIA/trt-llm-topk-devs
-/tests/scripts/cute_dsl_kernels/top_k @NVIDIA/trt-llm-topk-devs
+/tests/microbenchmarks/cute_dsl_kernels/top_k @NVIDIA/trt-llm-topk-devs
 /tests/unittest/_torch/attention/sparse/*topk* @NVIDIA/trt-llm-topk-devs
 /tests/unittest/_torch/modules/test_top_k.py @NVIDIA/trt-llm-topk-devs
 
