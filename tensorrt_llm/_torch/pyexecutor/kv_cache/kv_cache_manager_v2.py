@@ -47,6 +47,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -2693,12 +2694,23 @@ class KVCacheManagerV2(BaseResourceManager):
                 # CUDA graph generation warmup uses one request at max_seq_len and
                 # enough minimal decode requests to fill max_batch_size.
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
+                warmup_seq_len = self.max_seq_len
+                if self.is_estimating_kv_cache:
+                    quota = next(
+                        tier.quota for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)
+                    )
+                    remaining_tokens = self._get_max_tokens_from_quota(quota) - (
+                        self.max_batch_size - 1
+                    ) * pad_up(min_decode_capacity, self._ledger_tokens_per_block)
+                    # SWA estimates can be zero even when this mostly-minimal batch fits.
+                    if remaining_tokens >= min_decode_capacity:
+                        warmup_seq_len = int(min(warmup_seq_len, remaining_tokens))
                 constraints.append(
                     BatchDesc(
                         [
                             KVCacheDesc(
-                                capacity=self.max_seq_len,
-                                history_length=self.max_seq_len - 1,
+                                capacity=warmup_seq_len,
+                                history_length=warmup_seq_len - 1,
                             )
                         ]
                         + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]

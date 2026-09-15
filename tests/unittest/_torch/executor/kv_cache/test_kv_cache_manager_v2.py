@@ -122,6 +122,8 @@ def _make_cache_config_for_test(
     num_extra_kv_tokens: int = 0,
     max_attention_window_vec: list[int | None] | None = None,
     pp_layers: list[int] | None = None,
+    max_tokens_for_warmup: float = float("inf"),
+    is_estimating_kv_cache: bool = False,
 ) -> KVCacheManagerConfig:
     if max_attention_window_vec is None:
         max_attention_window_vec = [None]
@@ -138,6 +140,7 @@ def _make_cache_config_for_test(
     cache_manager.enable_stats = False
     cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_config.policy)
     cache_manager.is_draft = is_draft
+    cache_manager.is_estimating_kv_cache = is_estimating_kv_cache
     cache_manager.num_local_layers = len(pp_layers)
     cache_manager.pp_layers = pp_layers
     cache_manager.max_attention_window_vec = max_attention_window_vec
@@ -152,6 +155,7 @@ def _make_cache_config_for_test(
     # Mirrors __init__: without helix the ledger block equals the physical
     # page (the helper re-enacts construction for partial instances).
     cache_manager._ledger_tokens_per_block = 128
+    cache_manager._get_max_tokens_from_quota = Mock(return_value=max_tokens_for_warmup)
 
     return cache_manager._build_base_config(
         kv_cache_config,
@@ -788,6 +792,50 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
             KvCacheConfig(avg_seq_len=2048),
             max_seq_len=1024,
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_draft_len", [0, 128])
+@pytest.mark.parametrize("is_estimating_kv_cache", [True, False])
+def test_warmup_sequence_budget_reserves_other_requests(
+    max_draft_len: int, is_estimating_kv_cache: bool
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(use_kv_cache_manager_v2=True, avg_seq_len=262144),
+        max_seq_len=262144,
+        max_batch_size=3,
+        max_num_tokens=2048,
+        max_draft_len=max_draft_len,
+        max_tokens_for_warmup=4096,
+        is_estimating_kv_cache=is_estimating_kv_cache,
+    )
+    # Each of the other two requests needs its own whole 128-token blocks.
+    expected_long_capacity = 3840 if max_draft_len == 0 else 3584
+    if not is_estimating_kv_cache:
+        expected_long_capacity = 262144
+    assert config.constraints[0] == BatchDesc(
+        [KVCacheDesc(capacity=expected_long_capacity, history_length=expected_long_capacity - 1)]
+        + [KVCacheDesc(capacity=1 + max_draft_len, history_length=0)] * 2
+    )
+    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])
+    assert config.typical_step.kv_caches[1].capacity == 262144
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_tokens_for_warmup", [0, 256])
+def test_warmup_preserves_constraints_for_conservative_capacity_estimate(
+    max_tokens_for_warmup: int,
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(use_kv_cache_manager_v2=True, avg_seq_len=1024),
+        max_batch_size=3,
+        max_tokens_for_warmup=max_tokens_for_warmup,
+        is_estimating_kv_cache=True,
+    )
+    assert config.constraints[0] == BatchDesc(
+        [KVCacheDesc(capacity=1024, history_length=1023)]
+        + [KVCacheDesc(capacity=1, history_length=0)] * 2
+    )
 
 
 def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:
