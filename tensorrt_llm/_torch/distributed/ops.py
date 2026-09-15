@@ -179,6 +179,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+    pending_comms = MNNVLAllReduce.allreduce_mnnvl_pending_comms
 
     if mapping in allreduce_mnnvl_workspaces:
         workspace = allreduce_mnnvl_workspaces[mapping]
@@ -197,10 +198,15 @@ def get_or_scale_allreduce_mnnvl_workspace(
                                      or 0)
         # Creating the workspace if it doesn't exist
         if mapping not in allreduce_mnnvl_workspaces:
-            # Do the communicator split if there is no communicator in the workspace
-            comm = mpi_comm().Split(
-                int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
-                mapping.tp_rank)
+            # A construction attempt that failed before publishing a workspace
+            # left its communicator valid (McastDeviceMemory only borrows it),
+            # so reuse it instead of leaking one world-wide split per module.
+            comm = pending_comms.get(mapping)
+            if comm is None:
+                comm = mpi_comm().Split(
+                    int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
+                    mapping.tp_rank)
+                pending_comms[mapping] = comm
             # Use the predefined buffer size if no buffer size is provided
             buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             if mapping.tp_rank == 0:
@@ -266,6 +272,8 @@ def get_or_scale_allreduce_mnnvl_workspace(
             raise candidate_error
         assert candidate_workspace is not None
         _initialize_allreduce_mnnvl_protocol(candidate_workspace)
+        # Hand ownership of the communicator to the workspace.
+        pending_comms.pop(mapping, None)
         allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
 
@@ -650,6 +658,12 @@ class MNNVLAllReduce(nn.Module):
     """
     allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
                                                      _MnnvlWorkspace]] = {}
+
+    # Communicators split for a mapping whose workspace construction has not
+    # succeeded yet. Ownership moves to the workspace once it is published, so
+    # an entry here is never reachable from allreduce_mnnvl_workspaces.
+    allreduce_mnnvl_pending_comms: typing.ClassVar[dict[Mapping,
+                                                        _MpiCommProtocol]] = {}
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
