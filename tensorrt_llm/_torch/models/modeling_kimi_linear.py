@@ -361,19 +361,11 @@ _FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 
 
 KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
-"""Largest per-rank token count the fused epilogue is taken for.
+"""Largest per-rank token count for which the fused epilogue is taken.
 
-Under attention-DP this is a concurrency ceiling divided by the DP degree: at
-DEP16, 32 tokens per rank is concurrency 512, and the production
-``max_batch_size`` is 32 anyway. The default is the top of the measured range
-rather than a limit of the kernel, which will launch for any token count --
-past 32 there is simply no measurement, and the split-K variant is already
-spilling into a second wave there (256 CTAs against 212 SMs), so the trend is
-not safe to extrapolate.
-
-The default follows ``KIMI_K3_ATTN_RES_TOPOLOGY`` rather than being a constant:
-1 when the persistent port is off, which is the pre-existing decode-only gate,
-and 32 when it is on. Setting this explicitly overrides both.
+Accepts any integer >= 1. The default follows ``KIMI_K3_ATTN_RES_TOPOLOGY``:
+1 when the persistent port is off (the pre-existing decode-only gate) and 32
+when it is on. Setting this explicitly overrides both.
 
 Read at import, so CUDA-graph capture and replay cannot disagree about it.
 """
@@ -381,58 +373,20 @@ Read at import, so CUDA-graph capture and replay cannot disagree about it.
 KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
 """Which fused attention-residual kernel topology to use.
 
-Two implementations of the same fusion exist, and they are good at opposite
-ends of the token count:
+Accepted values:
 
-  ``per_token``   one CTA (N<=4) or one 8-CTA cluster (N>=5) per token. Wins
-                  when tokens are scarce enough that the machine is not full.
-  ``persistent``  one CTA per SM looping over tokens, so the score projection is
-                  loaded once per CTA rather than once per token.
+  ``per_token``   one CTA (N<=4) or one 8-CTA cluster (N>=5) per token; the
+                  persistent kernel is never used. This is the default, i.e.
+                  the feature is off and behaviour is unchanged.
+  ``persistent``  one CTA per SM looping over tokens, used at every shape the
+                  persistent kernel implements (H == 7168 and 2 <= N <= 9).
+  ``split``       persistent above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``
+                  tokens, per-token at or below it.
+  ``1``           the only accepted on-value; resolves to ``split``.
 
-Swept on SM103 (152 SM) and SM107 (212 SM) over N in [2, 9] and T in [1, 8192],
-``persistent`` wins everywhere except small token counts at N>=5 (4 of 21 cells
-on SM107, 2 of 21 on SM103). At T=8192 it beats the unfused three-kernel path
-by 17-43% while ``per_token`` loses by 46-468%, so the prefill case is not
-close.
-
-A third value, ``split``, routes by token count instead of picking one kernel
-for the whole run: at or below ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens the
-per-token kernels, above it the persistent one. That is the policy the sweep
-implies, and it is the only mode in which both fused paths are reachable in a
-single process.
-
-``split`` is deliberately one threshold and not a tuned table. The threshold is
-the production ``max_batch_size``, which makes it the prefill/decode boundary
-rather than a fitted constant: at most ``max_batch_size`` tokens can be in
-flight one-per-request, so anything above it is several tokens of one sequence.
-That is a fact about the deployment, not about a particular SM count, so it does
-not need re-measuring per machine. The alternative -- a per-(N, token-count)
-lookup table following the measured crossover -- has to be re-measured whenever
-the SM count, the candidate-count distribution, or the tile constants move, and
-nothing tells you when it has gone stale.
-
-The default is ``per_token``, i.e. off: the persistent kernel is not used at any
-shape, and the behaviour is what shipped before it landed. Enabling it is
-``KIMI_K3_ATTN_RES_TOPOLOGY=1``, which resolves to ``split`` -- the persistent
-kernel above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens, the per-token kernels
-at or below. In deployment terms that is persistent for prefill and per-token
-for decode.
-
-Off by default because the port is not uniformly safe, and the reason is not in
-this kernel. It measures as no-regression on NVFP4 and as a 2.98x context-phase
-regression on W4A8_MXFP4_MXFP8, and the difference is downstream: the kernel's
-output agrees with the per-token one to row_rel_max 3.087e-03, which flips 8.7%
-of top-16 expert selections with no bias at all, while the TRTLLM-gen MoE on
-that checkpoint turns the same perturbation into an 86.7x rank skew (gemm1 at
-48412 ms on rank 0 against 559 ms on rank 1, with rank 1 idling 78 s in the
-all-to-all). Swapping only the MoE implementation removes the regression
-entirely. A default that is free on one checkpoint and 3x slower on another is
-not a default, however well documented.
-
-Enabling it selects ``split`` rather than ``persistent`` because that is the
-strictly smaller change. Below the threshold it is byte-for-byte the previous
-behaviour, so the only shapes that move are the ones the persistent kernel
-exists for.
+Off by default because the persistent kernel measures as no-regression on
+NVFP4 but as a 2.98x context-phase regression on W4A8_MXFP4_MXFP8, through a
+downstream interaction with the TRTLLM-gen MoE rather than through this kernel.
 
 Read at import, so CUDA-graph capture and replay cannot disagree about it.
 """
@@ -440,28 +394,20 @@ Read at import, so CUDA-graph capture and replay cannot disagree about it.
 _ATTN_RES_TOPOLOGIES = ("per_token", "persistent", "split")
 
 # Turning the port on should not require knowing which of the three topologies
-# is the right one. "1" is the measured policy -- persistent at prefill,
-# per-token at decode -- so enabling the feature and choosing the policy are the
-# same action, through one variable rather than two.
-_ATTN_RES_TOPOLOGY_ON = ("1", "on", "true")
+# is the right one: "1" selects the measured policy (``split``), so enabling the
+# feature and choosing the policy are one action through one variable.
+_ATTN_RES_TOPOLOGY_ON = "1"
 
 
 def _read_attn_res_topology() -> str:
-    """Default off. The persistent kernel is opt-in.
+    """Default ``per_token``: the persistent kernel is opt-in.
 
-    ``per_token`` is what shipped before the port, so the default changes no
-    behaviour for anyone who does not ask for it. That is deliberate rather than
-    timid: the port measures as no-regression on NVFP4 but as a 2.98x
-    context-phase regression on W4A8_MXFP4_MXFP8, and the cause of that lives
-    downstream in the TRTLLM-gen MoE rather than in this kernel -- see the
-    module constant above.
-
-    Enabling it is ``=1``, which resolves to ``split``. The two named topologies
-    stay available for measurement: ``persistent`` uses the persistent kernel at
-    every shape, ``per_token`` at none.
+    ``1`` is the only accepted on-value and resolves to ``split``. The named
+    topologies stay available for measurement: ``persistent`` uses the
+    persistent kernel at every shape it implements, ``per_token`` at none.
     """
     raw = os.environ.get(KIMI_K3_ATTN_RES_TOPOLOGY_ENV, "per_token")
-    if raw.lower() in _ATTN_RES_TOPOLOGY_ON:
+    if raw == _ATTN_RES_TOPOLOGY_ON:
         return "split"
     if raw not in _ATTN_RES_TOPOLOGIES:
         # Loudly, for the same reason as the token ceiling below: a mistyped A/B
@@ -469,7 +415,7 @@ def _read_attn_res_topology() -> str:
         # twice and report no difference.
         raise ValueError(
             f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be one of "
-            f"{_ATTN_RES_TOPOLOGIES} or one of {_ATTN_RES_TOPOLOGY_ON} "
+            f"{_ATTN_RES_TOPOLOGIES} or {_ATTN_RES_TOPOLOGY_ON!r} "
             f"(which means 'split'), got {raw!r}"
         )
     return raw
@@ -478,15 +424,10 @@ def _read_attn_res_topology() -> str:
 def _read_fused_attn_res_max_tokens() -> int:
     """Resolved after the topology, because its default follows it.
 
-    With the persistent port off -- the default -- the ceiling is 1, which is
-    exactly the pre-existing gate: the fused epilogue is taken at the
-    single-token decode shape and nowhere else. Enabling the port raises it to
-    32, the top of the measured range.
-
-    Tying the two together is the point. A ceiling of 32 under a topology of
-    ``per_token`` would leave the shapes in 1 < M <= 32 quietly using the fused
-    add+RMSNorm ops while the feature reads as disabled, so "off" would not mean
-    "unchanged".
+    With the persistent port off -- the default -- the ceiling is 1, the
+    pre-existing gate: the fused epilogue is taken at the single-token decode
+    shape and nowhere else. Enabling the port raises it to 32, the top of the
+    measured range, so that "off" keeps meaning "unchanged".
     """
     default = "1" if _ATTN_RES_TOPOLOGY == "per_token" else "32"
     raw = os.environ.get(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, default)
@@ -509,10 +450,10 @@ _FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
 
 
 def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
-    """Shape gate for the persistent kernel.
+    """Shape gate for the persistent kernel: H == 7168 and 2 <= N <= 9.
 
-    Note what is absent: a token ceiling. The persistent grid is sized by the SM
-    count, not by the token count, so prefill is the case it exists for.
+    No token ceiling: the persistent grid is sized by the SM count, not by the
+    token count, so prefill is the case it exists for.
     """
     del M  # deliberately unused; see above
     return H == 7168 and 2 <= N <= 9
@@ -521,23 +462,11 @@ def _persistent_attn_res_applicable(M: int, H: int, N: int) -> bool:
 def _use_persistent_attn_res(M: int, H: int, N: int) -> bool:
     """Pick between the two fused kernels for this call site.
 
-    ``split`` routes by token count, which is the only thing this layer can see
-    and, as it happens, the thing that should decide. "Prefill" and "decode" are
-    not available here and would be the wrong question anyway: chunked prefill
-    produces intermediate token counts, a single forward can mix context and
-    generation requests, and whether the two phases even run in separate
-    processes is a deployment choice. A token-count threshold covers all three
-    cases with one rule.
-
-    The two gates here are different kinds of thing.
-    ``_persistent_attn_res_applicable`` is a capability gate -- the kernel is
-    only instantiated for those shapes, so it tracks the code and never needs
-    re-measuring. The token count is the only performance decision, and it stays
-    a single number rather than a per-(N, tokens) table.
-
-    Shapes the persistent kernel does not implement (N outside [2, 9], H other
-    than 7168) fall through to the caller's existing gate and land on the
-    unfused path.
+    ``persistent`` takes the persistent kernel at every shape it implements;
+    ``split`` takes it only above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens,
+    which stands in for the prefill/decode boundary. Shapes the persistent
+    kernel does not implement fall through to the caller's existing gate and
+    land on the unfused path.
     """
     if not _persistent_attn_res_applicable(M, H, N):
         return False
@@ -588,14 +517,12 @@ def _rms_norm_eps(norm: nn.Module) -> float:
 def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> None:
     """Report whether the fused path was actually reached, once per shape.
 
-    ``_FUSED_ATTN_RES_ENABLED`` only says the feature is switched on. It does
-    not say the shape gate let the call through, and a rejected call looks
-    exactly like a disabled one in the logs. Under attention-DP the per-rank
-    token count decides it, so one job can fuse at low concurrency and fall back
-    at high concurrency -- without this line, a benchmark that shows no change
-    is indistinguishable from one that never ran the kernel.
+    ``_FUSED_ATTN_RES_ENABLED`` only says the feature is switched on, not that
+    the shape gate let the call through, and a rejected call looks exactly like
+    a disabled one in the logs. Emitted at debug level: it is once per distinct
+    shape, not once per process, so it is a diagnostic rather than a summary.
     """
-    logger.info_once(
+    logger.debug_once(
         f"Kimi K3 attn-res fusion [{site}]: "
         f"{'FUSED' if fused else 'fallback'} (M={M}, H={H}, N={N})",
         key=f"kimi_k3_attn_res_fusion_{site}_{fused}_{M}_{H}_{N}",
@@ -619,25 +546,9 @@ def _apply_attn_res_rmsnorm_fused(
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
     N = K + 1
-    # Swept on SM107 over M in {1, 2, 4, 8, 16, 32} x N in {2, 5, 9, 12}: the
-    # fused kernel beat the unfused add + attn_res_fwd + RMSNorm path by 33-53%
-    # in every cell, because at these sizes all three kernels are bound by their
-    # fixed per-launch cost rather than by bandwidth or occupancy, and
-    # collapsing three into one removes two of those costs regardless of M.
-    #
-    # The ceiling is the largest token count measured, which is also the
-    # production max_batch_size. Prefill stays on the unfused path on a measured
-    # negative result, recorded on SM103 at T=8192: folding the trailing RMSNorm
-    # into the PERSISTENT attn_res grid was 41-108% slower than attn_res_fwd +
-    # FlashInfer RMSNorm, because the persistent grid runs one CTA per SM and
-    # loops over tokens, so a CTA-wide reduction inside that loop serializes
-    # across tokens while FlashInfer exposes an independent CTA per token.
-    #
-    # That result is about the persistent topology, and this gate selects the
-    # single-CTA / split-K kernels instead -- which put one CTA (or one cluster)
-    # on each token, i.e. the same shape the note credits FlashInfer with.
-    # Whether those hold up at prefill is a separate question that has not been
-    # measured; the ceiling stays at the top of the measured range until it is.
+    # The fused path is taken for M <= _FUSED_ATTN_RES_MAX_TOKENS, H == 7168 and
+    # N <= 12, which is the measured window; larger token counts have not been
+    # measured and fall back to the unfused add + attn_res_fwd + RMSNorm path.
     if _use_persistent_attn_res(M, H, N):
         try:
             persistent_op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
