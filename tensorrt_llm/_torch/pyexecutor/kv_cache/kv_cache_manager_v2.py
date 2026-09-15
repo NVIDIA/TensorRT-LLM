@@ -2736,7 +2736,7 @@ class KVCacheManagerV2(BaseResourceManager):
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
-        if kv_cache_config.dtype == "nvfp4":
+        if self.dtype == DataType.NVFP4:
             for layer_idx, hd in enumerate(self.head_dim_per_layer):
                 assert hd % 2 == 0, (
                     f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
