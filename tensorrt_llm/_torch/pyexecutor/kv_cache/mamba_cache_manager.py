@@ -85,6 +85,29 @@ class _PrefixReuseDiagnostics(Protocol):
 # the window is only partly full.
 MIN_REPLAY_HISTORY_SIZE = 16
 
+_KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
+
+
+def _allocate_kda_beta_cache(
+    shape: Tuple[int, ...],
+    device: Optional[torch.device],
+) -> torch.Tensor:
+    """Allocate a logically shaped beta cache with aligned physical rows."""
+    logical_num_heads = shape[-1]
+    heads_per_alignment = (_KDA_BETA_CACHE_ALIGNMENT_BYTES //
+                           torch.float32.itemsize)
+    padded_num_heads = ((logical_num_heads + heads_per_alignment - 1) //
+                        heads_per_alignment) * heads_per_alignment
+    # CuTe requires every nested cache view to be 16-byte aligned. Keep the
+    # logical head count while padding the physical stride (six fp32 heads are
+    # 24 bytes, so an unpadded row makes alternating views only 8-byte aligned).
+    return torch.zeros(
+        *shape[:-1],
+        padded_num_heads,
+        dtype=torch.float32,
+        device=device,
+    )[..., :logical_num_heads]
+
 
 def _get_num_cuda_graph_padding_dummy_slots(
     spec_config: Optional["DecodingBaseConfig"],
@@ -648,12 +671,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                          section_dim,
                                                          dtype=torch.float32,
                                                          device=device)
-                spec_kwargs['kda_beta_cache'] = torch.zeros(num_local_layers,
-                                                            max_batch_size,
-                                                            M,
-                                                            nheads,
-                                                            dtype=torch.float32,
-                                                            device=device)
+                spec_kwargs['kda_beta_cache'] = _allocate_kda_beta_cache(
+                    (num_local_layers, max_batch_size, M, nheads), device)
                 ssm_spec_cache = [
                     spec_kwargs['kda_conv_q'], spec_kwargs['kda_conv_k'],
                     spec_kwargs['kda_conv_v'], spec_kwargs['kda_qkg_cache'],
@@ -3483,13 +3502,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             dtype=torch.float32,
             device=device,
         )
-        self.kda_beta_cache = torch.zeros(
-            self.local_num_mamba_layers,
-            cache_size,
-            num_spec,
-            self.ssm_state_shape[0],
-            dtype=torch.float32,
-            device=device,
+        self.kda_beta_cache = _allocate_kda_beta_cache(
+            (self.local_num_mamba_layers, cache_size, num_spec,
+             self.ssm_state_shape[0]),
+            device,
         )
         logger.info("Mamba Cache (kda-replay) is allocated for "
                     f"{cache_size} state slots")
