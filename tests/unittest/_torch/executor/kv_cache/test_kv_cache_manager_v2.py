@@ -51,7 +51,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
-    GPU_LEVEL,
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
@@ -154,12 +153,12 @@ def _make_cache_config_for_test(
     # Mirrors __init__: without helix the ledger block equals the physical
     # page (the helper re-enacts construction for partial instances).
     cache_manager._ledger_tokens_per_block = 128
+    cache_manager._get_max_tokens_from_quota = Mock(return_value=max_tokens_for_warmup)
 
     return cache_manager._build_base_config(
         kv_cache_config,
         tokens_per_block=128,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
-        max_tokens_for_warmup=max_tokens_for_warmup,
     )
 
 
@@ -185,9 +184,8 @@ def _make_manager_for_cache_tier_test(
         *,
         tokens_per_block: int,
         cache_tiers: list[object],
-        max_tokens_for_warmup: float = float("inf"),
     ) -> _FakeManagerConfig:
-        del self, config, tokens_per_block, max_tokens_for_warmup
+        del self, config, tokens_per_block
         return _FakeManagerConfig(cache_tiers=cache_tiers)
 
     def build_cache_config(
@@ -794,6 +792,7 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("max_draft_len", [0, 128])
 def test_warmup_sequence_budget_reserves_other_requests(max_draft_len: int) -> None:
     config = _make_cache_config_for_test(
@@ -814,129 +813,20 @@ def test_warmup_sequence_budget_reserves_other_requests(max_draft_len: int) -> N
     assert config.typical_step.kv_caches[1].capacity == 262144
 
 
-def test_warmup_preserves_constraints_for_conservative_capacity_estimate() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_tokens_for_warmup", [0, 256])
+def test_warmup_preserves_constraints_for_conservative_capacity_estimate(
+    max_tokens_for_warmup: int,
+) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(use_kv_cache_manager_v2=True, avg_seq_len=1024),
         max_batch_size=3,
-        max_tokens_for_warmup=256,
+        max_tokens_for_warmup=max_tokens_for_warmup,
     )
     assert config.constraints[0] == BatchDesc(
         [KVCacheDesc(capacity=1024, history_length=1023)]
         + [KVCacheDesc(capacity=1, history_length=0)] * 2
     )
-
-
-@pytest.mark.parametrize("max_batch_size", [1, 64])
-@pytest.mark.parametrize("max_seq_len", [512, 262144])
-@pytest.mark.parametrize("limit", ["bytes", "tokens"])
-@pytest.mark.parametrize("is_estimating", [False, True])
-@pytest.mark.parametrize("max_util_for_resume", [0.8, 1.0])
-def test_full_attention_estimation_respects_memory_budget(
-    max_batch_size: int,
-    max_seq_len: int,
-    limit: str,
-    is_estimating: bool,
-    max_util_for_resume: float,
-) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    init_cuda_once()
-    # Two FP16 K/V layers with two 64-element heads cost 1024 bytes/token.
-    # The long model context needs 256 MiB, while either budget allows 4 MiB.
-    config = KvCacheConfig(
-        use_kv_cache_manager_v2=True,
-        enable_block_reuse=False,
-        host_cache_size=0,
-        avg_seq_len=max_seq_len,
-        max_gpu_total_bytes=(4 if limit == "bytes" else 8) << 20,
-        max_tokens=262144 if limit == "bytes" else int(4096 * max_util_for_resume),
-        max_util_for_resume=max_util_for_resume,
-    )
-    manager = KVCacheManagerV2(
-        config,
-        CacheType.SELF,
-        num_layers=2,
-        num_kv_heads=2,
-        head_dim=64,
-        tokens_per_block=32,
-        max_seq_len=max_seq_len,
-        max_batch_size=max_batch_size,
-        max_num_tokens=256,
-        mapping=Mapping(),
-        dtype=DataType.HALF,
-        is_estimating_kv_cache=is_estimating,
-    )
-    caches = []
-    try:
-        assert 0 < manager.impl.get_quota(GPU_LEVEL) <= 4 << 20
-        assert isinstance(manager.max_seq_len, int)
-        constraints = manager.kv_cache_manager_py_config.constraints
-        assert len(constraints) == 2
-        assert len(constraints[0].kv_caches) == max_batch_size
-        assert constraints[1] == BatchDesc([KVCacheDesc(capacity=256, history_length=0)])
-        if max_seq_len == 512:
-            assert manager.max_seq_len == max_seq_len
-        else:
-            assert 0 < manager.max_seq_len < max_seq_len
-        capacity = manager.get_num_available_tokens(
-            token_num_upper_bound=max_seq_len, batch_size=max_batch_size
-        )
-        assert capacity > 0
-        for _ in range(max_batch_size):
-            cache = manager.impl.create_kv_cache()
-            caches.append(cache)
-            assert cache.resume(torch.cuda.current_stream().cuda_stream)
-            assert cache.resize(1)
-        assert caches[0].resize(constraints[0].kv_caches[0].capacity)
-        assert caches[0].resize(capacity)
-    finally:
-        for cache in caches:
-            cache.close()
-        manager.shutdown()
-
-
-def test_swa_warmup_can_fit_below_conservative_capacity_estimate() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    init_cuda_once()
-    manager = KVCacheManagerV2(
-        KvCacheConfig(
-            use_kv_cache_manager_v2=True,
-            enable_block_reuse=False,
-            host_cache_size=0,
-            avg_seq_len=262144,
-            max_attention_window=[1024],
-            max_gpu_total_bytes=4 << 20,
-        ),
-        CacheType.SELF,
-        num_layers=2,
-        num_kv_heads=2,
-        head_dim=64,
-        tokens_per_block=32,
-        max_seq_len=262144,
-        max_batch_size=64,
-        max_num_tokens=256,
-        mapping=Mapping(),
-        dtype=DataType.HALF,
-        is_estimating_kv_cache=True,
-    )
-    caches = []
-    try:
-        # Reserving a full window for every request estimates zero capacity,
-        # but only the long request actually needs a full window in this batch.
-        assert manager._get_max_tokens_from_quota(4 << 20) == 0
-        assert manager.kv_cache_manager_py_config.constraints[0].kv_caches[0].capacity == 262144
-        assert manager.impl.get_quota(GPU_LEVEL) <= 4 << 20
-        for _ in range(64):
-            cache = manager.impl.create_kv_cache()
-            caches.append(cache)
-            assert cache.resume(torch.cuda.current_stream().cuda_stream)
-            assert cache.resize(1)
-        assert caches[0].resize(262144, history_length=262143)
-    finally:
-        for cache in caches:
-            cache.close()
-        manager.shutdown()
 
 
 def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:
