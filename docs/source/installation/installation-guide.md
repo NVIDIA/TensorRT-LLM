@@ -141,7 +141,7 @@ There are some known limitations when you pip install the pre-built TensorRT LLM
     to discover a SLURM installation in the usual places.
     ```
 
-2. Open MPI 5 rejects a long hostname when spawning workers
+2. Prevent Open MPI 5 from rejecting a long hostname when spawning workers
 
     Where the MPI implementation is Open MPI 5 -- which the release container now provides, since
     its base image ships it -- PMIx refuses the handshake behind `MPI_Comm_spawn` if the hostname
