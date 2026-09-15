@@ -15,6 +15,7 @@
 import gc
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
@@ -27,7 +28,7 @@ import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
-from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import LogitsProcessor
@@ -59,6 +60,26 @@ class ForceTokenLogitsProcessor(LogitsProcessor):
     def _force_token(self, logits: torch.Tensor) -> None:
         logits.fill_(float("-inf"))
         logits[..., self._forced_token_id] = 0
+
+
+def assert_guided_decoding_regex(llm: PyTorchLLM | AutoDeployLLM) -> None:
+    """Verify that an initialized model applies a regex grammar end to end."""
+    pattern = r"[0-9]{2}"
+    prompt_token_ids = llm.tokenizer.encode(
+        "Spell the word blue in lowercase letters. Do not use digits:")
+    outputs = llm.generate(
+        [prompt_token_ids],
+        sampling_params=SamplingParams(
+            max_tokens=8,
+            temperature=0,
+            guided_decoding=GuidedDecodingParams(regex=pattern),
+        ),
+        use_tqdm=False,
+    )
+
+    assert isinstance(outputs, list)
+    assert len(outputs) == 1
+    assert re.fullmatch(pattern, outputs[0].outputs[0].text)
 
 
 def compute_theta(num_samples: int,
@@ -145,12 +166,14 @@ Evaluated {self.metric_name}: {accuracy:.3f}
             assert accuracy <= self.threshold, err_msg
 
 
-def compute_acceptance_length(llm: PyTorchLLM) -> float:
-    """Mean acceptance length over speculative iterations.
+def acceptance_length_from_iteration_stats(stats: List[dict]) -> float:
+    """Mean acceptance length over the speculative iterations in ``stats``.
 
-    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
+    ``stats`` is a list of iteration-stats dicts, as returned by
+    ``LLM.get_stats()`` for an in-process engine or by the ``/metrics``
+    endpoint of a ``trtllm-serve`` worker. Both emit the same shape, so a
+    disaggregated test scores on the same definition as an aggregate one.
     """
-    stats = llm.get_stats(timeout=2)
     spec_iters = [
         stat["specDecodingStats"] for stat in stats
         if stat.get("specDecodingStats")
@@ -160,6 +183,14 @@ def compute_acceptance_length(llm: PyTorchLLM) -> float:
     accepted = sum(stat["numAcceptedTokens"] for stat in spec_iters)
     requests = sum(stat["numRequestsWithDraftTokens"] for stat in spec_iters)
     return (accepted + requests) / requests
+
+
+def compute_acceptance_length(llm: PyTorchLLM) -> float:
+    """Mean acceptance length over speculative iterations.
+
+    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
+    """
+    return acceptance_length_from_iteration_stats(llm.get_stats(timeout=2))
 
 
 def assert_acceptance_length(test_key: str, al_value: float) -> None:
