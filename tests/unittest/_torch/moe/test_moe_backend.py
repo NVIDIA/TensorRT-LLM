@@ -1216,6 +1216,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.MEGAMOE_CUTEDSL,
     MoeBackendType.CUTE_DSL_B12X,
     MoeBackendType.MARLIN,
+    MoeBackendType.CUTEDSL_FC12,
 ]
 
 # Data types to test
@@ -1252,6 +1253,12 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
 ]
 
 MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS if IS_CI_MODE else LOCAL_MOE_MODEL_CONFIGS
+
+# DeepSeek-V4-Pro routed-MoE shape (n_routed_experts=384, top_k=6,
+# hidden_size=7168, moe_intermediate_size=3072), tested in both CI and local mode.
+MOE_MODEL_CONFIGS = MOE_MODEL_CONFIGS + [
+    MoeModelConfig(384, 6, 7168, 3072),  # DeepSeek-V4-Pro
+]
 
 # Sequence lengths to test
 SEQ_LENS_TO_TEST = [1, 8]

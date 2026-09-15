@@ -891,6 +891,7 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
+        "CUTEDSL_FC12",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",

@@ -27,6 +27,7 @@ import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.moe.fused_moe import (
+    CuteDslFc12FusedMoE,
     CuteDslFusedMoE,
     CutlassFusedMoE,
     MarlinFusedMoE,
@@ -61,6 +62,7 @@ class MoeBackendType(str, Enum):
     CUTLASS = "CUTLASS"
     TRTLLM = "TRTLLM"
     CUTEDSL = "CUTEDSL"
+    CUTEDSL_FC12 = "CUTEDSL_FC12"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
     # Keep the two MegaMoE variants explicit.
@@ -76,6 +78,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.CUTLASS: CutlassFusedMoE,
         MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
+        MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
@@ -626,17 +629,18 @@ def should_skip_cutedsl(
     moe_tp_size: int = 1,
 ) -> Optional[str]:
     """
-    Check CuteDSL backend specific constraints.
+    Check constraints shared by the CuteDSL backends (CUTEDSL, CUTEDSL_FC12).
 
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    if backend_type != MoeBackendType.CUTEDSL:
+    if backend_type not in (MoeBackendType.CUTEDSL, MoeBackendType.CUTEDSL_FC12):
         return None
 
     if model_config is None:
         return None
 
+    backend_name = backend_type.value  # "CUTEDSL" or "CUTEDSL_FC12"
     intermediate_size = model_config.intermediate_size
 
     # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
@@ -655,7 +659,7 @@ def should_skip_cutedsl(
     # fused kernel keeping BF16 intermediate precision.
     if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
         return (
-            f"[Design Limitation] CuteDslFusedMoE NVFP4 with large "
+            f"[Design Limitation] {backend_name} NVFP4 with large "
             f"intermediate_size has accuracy issues due to FP4 intermediate "
             f"storage between FC1+SwiGLU and FC2 kernels "
             f"(intermediate_size={intermediate_size} >= 14336, "
@@ -681,7 +685,7 @@ def should_skip_cutedsl(
             and routing_method_cls == Llama4RenormalizeMoeRoutingMethod
         ):
             return (
-                "[Design Limitation] CuteDslFusedMoE NVFP4 with Llama4Renormalize "
+                f"[Design Limitation] {backend_name} NVFP4 with Llama4Renormalize "
                 "routing: FP4 intermediate errors amplified by non-normalized "
                 "sigmoid routing weights (mismatch up to 34.6%)."
             )
@@ -692,7 +696,7 @@ def should_skip_cutedsl(
         per_shard = intermediate_size // moe_tp_size
         if per_shard % 128 != 0:
             return (
-                f"CuteDslFusedMoE NVFP4: per-shard intermediate_size="
+                f"{backend_name} NVFP4: per-shard intermediate_size="
                 f"{per_shard} (= {intermediate_size} / {moe_tp_size}) is not "
                 f"128-aligned. fp4_utils asserts M % 128 == 0."
             )

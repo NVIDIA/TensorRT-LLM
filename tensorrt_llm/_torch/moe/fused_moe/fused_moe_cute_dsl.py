@@ -411,10 +411,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
             from ...custom_ops.cute_dsl_custom_ops import (
                 Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-                Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner)
+                Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+                Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner)
             checked_runner_types.extend([
                 Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner,
                 Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+                # The fused FC12 runner also requires mma_tiler_m == tile_size;
+                # without it the Cartesian replay pairs inner tactics captured
+                # under one routing tile with a different outer tile.
+                Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner,
             ])
 
         return _runner_tactics_match_tile_size(
