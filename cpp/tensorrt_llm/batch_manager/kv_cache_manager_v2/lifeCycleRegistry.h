@@ -159,7 +159,7 @@ public:
     // Number of unique life cycles.
     LifeCycleId size() const noexcept;
 
-    // Iteration over LifeCycles in registration order.
+    // Group ID order: SSM, full attention, then increasing SWA window and sink blocks.
     TypedVec<LifeCycleId, LifeCycle> const& getAll() const noexcept
     {
         return mLifeCycleList;

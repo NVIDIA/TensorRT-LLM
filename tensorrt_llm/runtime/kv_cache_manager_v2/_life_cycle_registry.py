@@ -82,16 +82,21 @@ class LifeCycleRegistry:
     _life_cycle_id_dict: dict[LifeCycle, LifeCycleId]
 
     def __init__(self, config: KVCacheManagerConfig) -> None:
-        self._life_cycle_list = cast(TypedIndexList[LifeCycleId, LifeCycle], [])
-        self._life_cycle_id_dict = dict[LifeCycle, LifeCycleId]()
-        for layer in config.layers:
-            details = make_life_cycle(layer, config.tokens_per_block)
-            if details not in self._life_cycle_id_dict:
-                assert len(self._life_cycle_id_dict) == len(self._life_cycle_list), (
-                    "corrupted life cycle registry"
-                )
-                self._life_cycle_list.append(details)
-                self._life_cycle_id_dict[details] = LifeCycleId(len(self._life_cycle_list) - 1)
+        def sort_key(life_cycle: LifeCycle) -> tuple[int, int, int]:
+            if isinstance(life_cycle, SsmLifeCycle):
+                return (0, 0, 0)
+            if life_cycle.window_size is None:
+                return (1, 0, 0)
+            return (2, life_cycle.window_size, life_cycle.num_sink_blocks)
+
+        # Group IDs define the public pool_ratio order, independent of layer order.
+        life_cycles = {make_life_cycle(layer, config.tokens_per_block) for layer in config.layers}
+        self._life_cycle_list = cast(
+            TypedIndexList[LifeCycleId, LifeCycle], sorted(life_cycles, key=sort_key)
+        )
+        self._life_cycle_id_dict = {
+            details: LifeCycleId(i) for i, details in enumerate(self._life_cycle_list)
+        }
 
     def get_life_cycle(self, id: LifeCycleId) -> LifeCycle:
         return self._life_cycle_list[id]

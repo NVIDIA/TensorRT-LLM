@@ -3375,6 +3375,89 @@ class TestClampMaxSeqLenForMem(unittest.TestCase):
         )
 
 
+class TestLayerGroupOrder(unittest.TestCase):
+    """Group IDs and pool ratios follow cache semantics regardless of layer order."""
+
+    @parameterized.expand(
+        [
+            ("mixed", (0, 1, 2, 3, 4, 5, 6, 7)),
+            ("attention_only", (1, 2, 3, 4, 5, 6, 7)),
+            ("no_full_attention", (0, 2, 3, 4, 5, 6, 7)),
+            ("swa_only", (2, 3, 4, 5, 6, 7)),
+            ("ssm_only", (0,)),
+            ("full_only", (1,)),
+        ]
+    )
+    def test_group_ids_and_allocations(self, _name: str, selected: tuple[int, ...]) -> None:
+        init_cuda_once()
+        # Canonical group rank, window, sinks. None and zero sinks coincide;
+        # one and 32 sink tokens also share a group at 32 tokens per block.
+        specs = [
+            (0, None, None),  # SSM
+            (1, None, None),  # full attention
+            (2, 128, None),
+            (2, 128, 0),
+            (3, 128, 1),
+            (3, 128, 32),
+            (4, 128, 33),
+            (5, 256, 0),
+        ]
+        ranks = sorted({specs[i][0] for i in selected})
+        ratio_weights = list(range(1, len(ranks) + 1))
+        ratios = [weight / sum(ratio_weights) for weight in ratio_weights]
+        quota = 128 << 20
+        for order in (selected, selected[::-1], selected[1:] + selected[:1]):
+            with self.subTest(order=order):
+                layers = []
+                expected_groups: list[list[int]] = [[] for _ in ranks]
+                for layer_id, spec_id in enumerate(order):
+                    rank, window, sinks = specs[spec_id]
+                    expected_groups[ranks.index(rank)].append(layer_id)
+                    # Distinct aggregate sizes prevent physical pools from merging.
+                    buffers = [BufferConfig(role=Role.KEY, size=256 * 4**rank)]
+                    if rank == 0:
+                        layers.append(SsmLayerConfig(layer_id=LayerId(layer_id), buffers=buffers))
+                    else:
+                        layers.append(
+                            AttentionLayerConfig(
+                                layer_id=LayerId(layer_id),
+                                buffers=buffers,
+                                sliding_window_size=window,
+                                num_sink_tokens=sinks,
+                            )
+                        )
+                manager = KVCacheManager(
+                    KVCacheManagerConfig(
+                        tokens_per_block=32,
+                        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+                        layers=layers,
+                        initial_pool_ratio=ratios,
+                        commit_min_snapshot=True,
+                    )
+                )
+                try:
+                    self.assertEqual(
+                        [sorted(group) for group in manager.layer_grouping], expected_groups
+                    )
+                    for group_id, layer_ids in enumerate(expected_groups):
+                        for layer_id in layer_ids:
+                            self.assertEqual(
+                                manager.get_layer_group_id(LayerId(layer_id)), group_id
+                            )
+                    allocated = [0] * len(ranks)
+                    for pool_group in manager.pool_group_descs:
+                        self.assertEqual(len(pool_group.slot_desc.variants), 1)
+                        group_id = int(pool_group.slot_desc.variants[0].layer_group_id)
+                        allocated[group_id] = pool_group.num_slots * sum(
+                            pool.slot_bytes for pool in pool_group.pools
+                        )
+                    for actual, expected in zip(allocated, ratios):
+                        # GPU pool allocations round to 2 MiB granularity.
+                        self.assertAlmostEqual(actual / sum(allocated), expected, delta=0.02)
+                finally:
+                    manager.shutdown()
+
+
 class TestInitRatioConfig(unittest.TestCase):
     """Tests for init_ratio computation from typical_step and constraints."""
 
@@ -3595,7 +3678,7 @@ class TestInitRatioConfig(unittest.TestCase):
         cfg = self._make_config(
             typical_step=typical,
             constraints=[constraint],
-            initial_pool_ratio=[0.8, 0.2],
+            initial_pool_ratio=[0.2, 0.8],  # full attention, then SWA
         )
         manager = KVCacheManager(cfg)
         ratio = _introspection.current_gpu_ratio(manager)

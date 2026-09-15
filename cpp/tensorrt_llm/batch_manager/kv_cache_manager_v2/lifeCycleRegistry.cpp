@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <stdexcept>
+#include <tuple>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -48,17 +49,38 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
 
 LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
 {
+    // Group IDs define the public pool_ratio order, independent of layer order.
+    auto const sortKey = [](LifeCycle const& lc)
+    {
+        if (std::holds_alternative<SsmLifeCycle>(lc))
+        {
+            return std::tuple{0, 0, 0};
+        }
+        auto const& attn = std::get<AttnLifeCycle>(lc);
+        if (!attn.windowSize.has_value())
+        {
+            return std::tuple{1, 0, 0};
+        }
+        return std::tuple{2, *attn.windowSize, attn.numSinkBlocks};
+    };
+    std::vector<LifeCycle> lifeCycles;
+    lifeCycles.reserve(config.layers.size());
     for (auto const& layer : config.layers)
     {
-        LifeCycle lc = makeLifeCycle(layer, config.tokensPerBlock);
-        if (mLifeCycleIdMap.find(lc) == mLifeCycleIdMap.end())
+        lifeCycles.push_back(makeLifeCycle(layer, config.tokensPerBlock));
+    }
+    std::sort(lifeCycles.begin(), lifeCycles.end(),
+        [&](LifeCycle const& lhs, LifeCycle const& rhs) { return sortKey(lhs) < sortKey(rhs); });
+    auto const uniqueEnd = std::unique(lifeCycles.begin(), lifeCycles.end());
+    for (auto it = lifeCycles.begin(); it != uniqueEnd; ++it)
+    {
+        auto const& lc = *it;
+        LifeCycleId const id = mLifeCycleList.size();
+        mLifeCycleList.push_back(lc);
+        mLifeCycleIdMap.emplace(lc, id);
+        if (std::holds_alternative<SsmLifeCycle>(lc))
         {
-            check();
-            LifeCycleId id = mLifeCycleList.size();
-            mLifeCycleList.push_back(lc);
-            mLifeCycleIdMap[lc] = id;
-            if (std::holds_alternative<SsmLifeCycle>(lc))
-                mSsmLifeCycleId = id;
+            mSsmLifeCycleId = id;
         }
     }
     check();

@@ -4362,8 +4362,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         min_length=1,
         status="prototype",
         description="Initial hot-tier byte ratios by layer group for KV cache "
-        "manager v2. Values map to KVCacheManagerV2 layer-group ID order and "
-        "must sum to 1.0. Cold tiers preserve the implied slot-count ratios. Hybrid Mamba "
+        "manager v2. Group order is SSM first, full attention next, then sliding "
+        "attention by increasing window size and increasing sink-token count "
+        "rounded up to blocks. Only groups present in the manager are included; "
+        "layers with the same window and rounded sink count share one entry. "
+        "Values must sum to 1.0. Cold tiers preserve the implied slot-count ratios. Hybrid Mamba "
         "models and DeepSeek-V4 use this directly, so avg_seq_len does not take "
         "effect when this is set.")
 
