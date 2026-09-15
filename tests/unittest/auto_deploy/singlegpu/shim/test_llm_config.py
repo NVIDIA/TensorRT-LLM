@@ -298,7 +298,6 @@ class TestSpeculativeConfigValidation:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model="some/model",
-            eagle3_one_model=True,
         )
         # Should not raise.
         args = LlmArgs(
@@ -313,7 +312,6 @@ class TestSpeculativeConfigValidation:
 
         spec_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         )
         # Should not raise.
         args = LlmArgs(
@@ -330,7 +328,6 @@ class TestSpeculativeConfigValidation:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model="some/model",
-            eagle3_one_model=True,
         )
 
         with pytest.raises(pydantic.ValidationError):
@@ -347,7 +344,6 @@ class TestSpeculativeConfigValidation:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model="some/model",
-            eagle3_one_model=True,
         )
 
         LlmArgs(
@@ -376,7 +372,7 @@ class TestSSMReplayValidation:
     def test_ssm_replay_with_spec_ok(self):
         from tensorrt_llm.llmapi import MTPDecodingConfig
 
-        spec_config = MTPDecodingConfig(num_nextn_predict_layers=3, mtp_eagle_one_model=True)
+        spec_config = MTPDecodingConfig(num_nextn_predict_layers=3)
         # Replay + spec is valid and must not raise.
         args = LlmArgs(
             model="test-model",

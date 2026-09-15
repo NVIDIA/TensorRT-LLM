@@ -226,21 +226,213 @@ Eviction controller
   public Python surface compatible with the runtime package; use the
   introspection API only for white-box tests and diagnostics.
 
-## Nanobind and concurrency
+## Concurrency model
 
-- C++ public APIs are called under the executor's single-threaded KV-cache
-  access model. Do not add mutexes or relax that model without auditing every
-  manager, cache, page, and callback path.
+`KvCacheManager` owns a single reader-writer lock (`ReentrantSharedMutex`,
+`utils/reentrantSharedMutex.h`) guarding every piece of mutable state reachable
+from it: the radix tree, the storage manager, and the living-`KvCache` set.
+Mutating APIs take it exclusively; read-only queries take it shared, so several
+`probeReuse()` lookups run concurrently while a writer is excluded.
+
+**What the lock does and does not cover.** It protects state *shared between*
+`KvCache`s, not the fields of an individual one, and it is a guarantee about the
+bound (Python-visible) API only -- see "Where the guarantee applies" below.
+
+A `KvCache` belongs to one request and is driven by its owning thread; calling
+methods on the *same* `KvCache` from two threads concurrently is not supported,
+and the lock does not make it safe.
+
+**Rule when adding or editing an API:** a method needs the lock iff it reaches
+the manager, the storage manager, or the radix tree.
+
+- Purely per-object accessors (`stopCommitting`, `updateBasePageIndex`, ...) do
+  not take it.
+- A wrapper whose only shared-state access is a call to an already-locking API
+  (`setCapacity` -> `resize`) does not take it either.
+- `std::shared_mutex` is not recursive, but public APIs call each other freely
+  here. `ReentrantSharedMutex` compares the owning thread before it looks at the
+  requested mode, so on a thread that already holds the lock **exclusively**
+  both a nested exclusive and a nested shared acquisition are no-ops. Internal
+  call sites therefore need no annotation: `adjust()` holds it exclusively and
+  calls `getQuota()`, which asks for it shared.
+  What does not work is nesting inside a *shared* acquisition -- either a second
+  shared one, which `std::shared_mutex` leaves undefined, or an upgrade to
+  exclusive, which deadlocks. Neither is checked -- a violation is a hang, not a
+  diagnostic -- so both have to be respected by construction. See the
+  "deliberate non-features" list in `utils/reentrantSharedMutex.h`.
+
+**Where the guarantee applies.** The thread-safety contract covers the API
+surface exposed through nanobind and declared in the `.pyi` stubs. Internal C++
+entry points carry no guarantee: a C++ caller is inside the implementation and
+is responsible for the lock discipline itself.
+
+That distinction matters because `blocks()`, `storage()` and `radixTree()` hand
+out references to shared structures, which locking cannot make safe -- the
+caller uses the reference after the lock drops. None of them is bound, so they
+are internal-only and out of scope rather than holes in the contract. Do not
+expose them without solving that first.
+
+Two exposed accessors look like they might leak shared state and do not:
+
+- `manager` returns the `KvCacheManager` itself, which is the lock owner. A
+  method on it locks iff it touches the radix tree, the storage manager's mutable
+  state, the eviction lists, or the stats aggregates. Accessors that read only
+  state fixed at construction are lock-free: `num_layers`, `layer_ids`,
+  `tokens_per_block`, `cache_tier_list`, `all_buffer_ids`, `get_layer_group_id`,
+  `get_page_stride`, `get_page_index_scale`, `get_page_index_converter`,
+  `get_mem_pool_base_address`, `supports_index_mode`, `init_config`, and the
+  config flags. `get_page_index_upper_bound` resembles that group but reads a
+  pool's current `numSlots`, which `_adjustLevel()` changes, so it takes the
+  shared lock. Anything added here that reads resize-mutable state must too.
+- `get_base_page_indices` returns a zero-copy numpy view, but into
+  `mBasePageIndices`, which is per-`KvCache` (an internal vector or a
+  caller-owned buffer). Consistent with one-owner-thread; not shared state. Its
+  only shared access is the `gDebug` cross-check calling
+  `getAggregatedPageIndices()`, which does take the shared lock because it reads
+  each `Page`'s slot id, and slot assignment is what migration changes.
+
+**Granularity is deliberate.** Per-block locks would not help: the hazards are
+structural mutation of the radix tree's `unordered_map`s (insert/erase/rehash)
+and the *non-atomic* refcounts in `utils/sharedPtr.h`, neither of which a
+per-node lock protects. Eviction is global (LRU across the whole tree), so a
+writer cannot be scoped to a subtree.
+
+**Event retirement sits outside the lock.** `CachedCudaEvent` returns its
+`CUevent` to the process-wide `CudaEventPool` from places that hold different
+locks or none: `scrubEvents()` under the exclusive lock, and the destructor on
+whichever thread drops the last copy. The pool is shared by every
+`KvCacheManager`, so no manager's lock could cover it anyway.
+
+Three properties make that sound, and a change that breaks any one of them
+reintroduces a hazard the type system will not catch:
+
+- `PooledEvent` holds the handle in an atomic and retires with an exchange, so
+  concurrent retirers race and exactly one returns the handle. A plain reset
+  would let two callers put the same `CUevent`, and the pool would hand one
+  event to two owners.
+- *While you hold a copy*, any retirement you can observe came from
+  `queryComplete()`, `synchronize()` or `close()`, and each of those runs only
+  after the work has completed -- so a copy that finds the handle gone skips a
+  dependency that was already satisfied, never a live one. Holding the copy is
+  what rules out the destructor, which retires unconditionally: the last drop
+  returns the handle even with work still in flight. That is why a raw `CUevent`
+  must not outlive the `CachedCudaEvent` it came from. Once the handle is back
+  in the pool another owner can re-record it, and a stale waiter would then wait
+  on that owner's work, which can finish earlier -- a missed wait, not a
+  spurious one.
+- `CudaEventPool` is unbounded and FIFO (see its declaration). Unbounded so a
+  handle already copied out of a `CachedCudaEvent` is never destroyed under its
+  user; FIFO so the reuse distance keeps a copied-out handle from being
+  re-recorded by another owner mid-call.
+
+Two rules follow for code that touches events:
+
+- Load the handle once per call and operate on the loaded value. Testing the
+  handle and then re-reading it can observe a concurrent retirement in between
+  and pass `nullptr` to the driver.
+- A raw `CUevent` that has left a `CachedCudaEvent` -- `handle()`,
+  `streamWaitEvents()`, `synchronizeAll()`, `mergeEvents()` -- is valid only
+  while the caller holds the **exclusive** lock, which excludes the shared-lock
+  lookups that would otherwise retire it. Do not copy handles out on a
+  shared-lock path.
+- Copies may be used concurrently; a single `CachedCudaEvent` **object** may
+  not. Two mechanisms cover two pieces of state, and confusing them is the easy
+  mistake here: **the atomic protects the payload, the lock protects the
+  object.** `PooledEvent`'s handle is an atomic, safe for any number of
+  concurrent callers; the `shared_ptr` that names it -- and the `std::optional`
+  that may wrap it, as in `KvCache::mFinishEvent` -- is ordinary memory and
+  needs the API lock.
+
+  So for a `CachedCudaEvent` held as a member:
+
+  | Operation on the member | Lock |
+  |---|---|
+  | assign, move-assign, `emplace`, `reset`, destroy | **exclusive** |
+  | copy it out, `handle()`, `isClosed()` | **shared** |
+  | `queryComplete()`, `synchronize()`, `close()`, `waitInStream()` | **shared** |
+
+  The third row is the counter-intuitive one. Those methods retire the handle,
+  which looks like a write, but they mutate only the atomic payload and never
+  `mEvent` -- which is why they are `const`. For locking purposes they are
+  readers.
+
+  `Slot::readyEvent` and `Page::readyEvent` are assigned in about ten places;
+  each is a first-row operation. An *unlocked* reader races those writers no
+  matter how carefully the writers lock: that is why `finish_event` is no longer
+  bound, since the binding copied out of a live `KvCache` with no lock at all.
+
+  Two riders. Once a copy exists it is independent and needs no lock -- that is
+  the point of the shared payload, and what makes handing a copy to another
+  thread viable. But a raw `CUevent` taken from it is not a copy: because
+  `queryComplete()` is a shared-lock operation that can retire, a handle read
+  under the shared lock can be reissued by a concurrent reader, so handles stay
+  exclusive-only as above.
+
+**Introspection is out of scope.** The `_introspection` submodule (`StorageStatistics`,
+`set_target_ratio_list_gpu`, `reuse_match_pages`, test block/codec helpers, ...)
+reaches private members directly, by design, and takes no locks. It is
+test/white-box only and is **not thread-safe**. Do not call it concurrently with
+anything, and do not treat it as part of the contract above.
+
+### Using KVCM2 from more than one thread
+
+The supported pattern is to build a cache on a helper thread and hand it to the
+consumer, e.g. `create_kv_cache()` -> `resume()` -> `resize()` in the background,
+then transfer ownership. Three requirements:
+
+1. **The handoff needs a happens-before edge** (a queue, or joining the thread).
+   `SharedPtr` refcounts are non-atomic, so sequential access is only safe with
+   real synchronisation between the threads.
+2. **Adopt the object with the `cuda_stream` setter, do not block.**
+   `setCudaStream()` records an event on the old stream and makes the new one
+   wait on it -- a GPU-side dependency. Calling `synchronize()` instead stalls
+   the helper until the offload completes, serialising the work that was moved
+   off the critical path in the first place.
+3. **The helper thread needs its own CUDA context** (`torch.cuda.set_device`
+   plus any allocation), otherwise the first KVCM2 call fails with
+   `CUDA_ERROR_INVALID_CONTEXT`.
+
+Writer hold time is the latency cost of the coarse lock: a `resize()` that
+evicts holds the exclusive lock for milliseconds, and a concurrent reader waits
+that long. If low-latency reads matter more than that, chunk the writer or give
+readers a separate index rather than making the lock finer-grained.
+
+## Nanobind
+
 - Binding code may release the GIL only while it touches no Python objects. Keep
   Python conversions and callbacks under the GIL, and keep non-owning token
   buffers alive for the entire C++ call.
 - Reacquire the GIL before invoking a Python callback, wrapping a C++ result,
-  creating an `nb::object`, or changing Python reference counts. If the
-  single-threaded access precondition is ever relaxed, concurrency protection
-  must be designed for the whole manager rather than added piecemeal.
+  creating an `nb::object`, or changing Python reference counts.
+- **Every binding that can block on the API lock must release the GIL first.**
+  This is a correctness requirement, not a throughput one. `KvCacheManager` calls
+  back into Python while holding the lock (the priority callback and the event
+  sink both do `nb::gil_scoped_acquire`), so a thread that waits for the lock
+  *while holding the GIL* deadlocks against a lock holder that is waiting for the
+  GIL. A binding that blocks with the GIL held also stops every other Python
+  thread for the duration of a `resize`, which is the opposite of the point.
+- Prefer `nb::call_guard<nb::gil_scoped_release>()` and bind the C++ method
+  directly. The guard wraps only the registered function: nanobind converts the
+  arguments before constructing it and the return value after destroying it, so
+  both conversions keep the GIL. A wrapper lambda that exists only to call
+  `nb::cast()` on the result is doing by hand what nanobind already does outside
+  the guard -- drop the lambda instead of working around it.
+- Use an inner `nb::gil_scoped_release`, scoped to the blocking call alone, only
+  when the lambda itself must do interpreter work: building a container
+  element-by-element (`castIterationStatsByLifeCycle`, `castPeakBlockStats`,
+  `castRequestIds`) or consuming an `nb::object` argument before the call
+  (`get_aggregated_pages`). `nb::call_guard` would run that work GIL-free.
+  Keep the scope tight, and never let an `nb::object` be destroyed inside it --
+  that is a GIL-free decref.
 - Exceptions crossing the binding boundary need an explicit nanobind mapping.
   Preserve Python exception type and attributes when adding or changing a C++
   exception.
+- Changing a class layout in a header requires rebuilding **everything that
+  compiles against it**: `tensorrt_llm`, `bindings`, and the `kvCacheManagerV2*`
+  gtest binaries. A stale consumer constructs the object with the old size,
+  which surfaces as heap corruption (`free(): invalid size`, or an abort inside
+  a destructor) rather than an obvious ABI error -- and the corruption appears
+  in whatever code runs next, not at the mismatch.
 
 ## High-risk changes
 

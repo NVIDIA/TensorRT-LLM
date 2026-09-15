@@ -43,6 +43,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, R
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import (
     classify_worker_error,
+    make_noise_generator,
     postprocess_video_tensor,
     synchronize_media_prepare_status,
 )
@@ -2580,7 +2581,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video=video,
             )
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
         logger.info("Tokenizing prompts...")
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._tokenize_request_prompts(
             request,
@@ -2976,7 +2977,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # scheduler from carrying over on a reused worker.
         self.scheduler = self._scheduler_for(flow_shift_target, use_karras_sigmas=False)
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
 
         if negative_prompt is None:
             negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT

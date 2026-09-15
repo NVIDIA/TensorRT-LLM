@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Model loader for diffusion pipelines.
 
@@ -26,7 +41,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
     CUTE_AVAILABLE,
 )
-from tensorrt_llm.llmapi.utils import download_hf_model
+from tensorrt_llm.llmapi.utils import download_hf_model, download_hf_partial
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
@@ -60,7 +75,7 @@ class PipelineLoader:
         args: VisualGenArgs,
         *,
         device: str = "cuda",
-    ):
+    ) -> None:
         """
         Initialize model loader.
 
@@ -78,8 +93,9 @@ class PipelineLoader:
 
         If checkpoint_dir is an existing local path, returns it unchanged.
         Otherwise, attempts to download from HuggingFace Hub using the
-        file-lock-protected ``download_hf_model`` utility (safe for
-        concurrent multi-process access).
+        file-lock-protected download utility. Pipelines may register an
+        allow-list so repositories with multiple checkpoint variants only
+        fetch the components supported by TRT-LLM.
 
         Args:
             checkpoint_dir: Local path or HuggingFace Hub model ID.
@@ -100,7 +116,22 @@ class PipelineLoader:
             f"attempting HuggingFace Hub download (revision={revision})"
         )
         try:
-            local_dir = download_hf_model(checkpoint_dir, revision=revision)
+            entry = next(
+                (
+                    candidate
+                    for candidate in PIPELINE_REGISTRY.values()
+                    if checkpoint_dir in candidate.hf_ids
+                ),
+                None,
+            )
+            if entry is not None and entry.download_patterns:
+                local_dir = download_hf_partial(
+                    checkpoint_dir,
+                    allow_patterns=entry.download_patterns,
+                    revision=revision,
+                )
+            else:
+                local_dir = download_hf_model(checkpoint_dir, revision=revision)
         except Exception as e:
             raise ValueError(
                 f"Could not resolve '{checkpoint_dir}' as a local path or "
@@ -272,6 +303,7 @@ class PipelineLoader:
         # =====================================================================
         weights = pipeline.load_transformer_weights(checkpoint_dir)
         pipeline.load_weights(weights)
+        del weights
 
         # =====================================================================
         # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)

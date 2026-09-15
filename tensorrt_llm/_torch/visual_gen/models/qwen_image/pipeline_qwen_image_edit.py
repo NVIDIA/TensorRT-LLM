@@ -21,6 +21,7 @@ import torch.distributed as dist
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
 from .pipeline_qwen_image import QwenImagePipeline, _calculate_shift
@@ -424,7 +425,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
         condition_images, vae_images, vae_image_sizes = self._preprocess_edit_images(pil_images)
         device = self.device
-        generator = torch.Generator(device=device).manual_seed(seed)
+        generator = make_noise_generator(seed, device)
 
         has_neg = negative_prompt is not None
         do_true_cfg = true_cfg_scale > 1.0 and has_neg

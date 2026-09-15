@@ -125,7 +125,7 @@ Export your token in the `HF_TOKEN` environment variable.
 - `NVFP4`
 
 For more information about quantization, refer to [](../features/quantization.md) and
-the [support matrix](../features/quantization.md#model-supported-matrix) of the supported quantization methods for each network.
+the [support matrix](../features/quantization.md#model-support-matrix) of the supported quantization methods for each network.
 
 ```{tip}
 Although TensorRT LLM supports more quantization modes than listed above, `trtllm-bench` currently only configures for

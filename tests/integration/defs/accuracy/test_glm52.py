@@ -33,7 +33,13 @@ from tensorrt_llm.llmapi import (
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_blackwell, skip_ray
-from .accuracy_core import GSM8K, ForceTokenLogitsProcessor, JsonModeEval, LlmapiAccuracyTestHarness
+from .accuracy_core import (
+    GSM8K,
+    ForceTokenLogitsProcessor,
+    JsonModeEval,
+    LlmapiAccuracyTestHarness,
+    assert_acceptance_length_for_llm,
+)
 
 
 class _JsonModeGrammarEval(JsonModeEvaluator):
@@ -437,11 +443,17 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             kv_cache_config=kv_cache_config,
             max_seq_len=8192,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
             **pytorch_config,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                "TestGLM52NVFP4::test_mtp_index_share",
+                llm,
+            )
             self._assert_mtp_acceptance_rate(llm)
 
     @staticmethod

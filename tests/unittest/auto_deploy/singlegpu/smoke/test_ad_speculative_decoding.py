@@ -69,7 +69,6 @@ def test_super_mtp_smoke():
     experiment_config["args"]["world_size"] = 1
     experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
         num_nextn_predict_layers=3,
-        mtp_eagle_one_model=True,
         speculative_model=model_path,
     )
     # Shrink the Eagle/MTP drafter model to match the target's reduced dimensions.
@@ -141,7 +140,6 @@ def test_super_mtp_ssm_replay_smoke():
     experiment_config["args"]["world_size"] = 1
     experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
         num_nextn_predict_layers=3,
-        mtp_eagle_one_model=True,
         speculative_model=model_path,
     )
     experiment_config["args"]["speculative_model_kwargs"] = experiment_config["args"][
@@ -190,7 +188,6 @@ def test_kv_cache_extra_seq_len_for_spec_dec():
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model="some/model",
-        eagle3_one_model=True,
     )
     args_eagle = LlmArgs(
         model="meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -223,7 +220,6 @@ def test_mtp_autodeploy_uses_eagle_one_model_capture():
         model=model,
         speculative_config=MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
         ),
         transforms=piecewise_disabled_transforms(),
     )
@@ -246,7 +242,6 @@ def test_detect_hidden_states_capture_last_layer_for_mtp_eagle_one_model():
         **config["args"],
         speculative_config=MTPDecodingConfig(
             num_nextn_predict_layers=3,
-            mtp_eagle_one_model=True,
             speculative_model=config["args"]["model"],
         ),
     )

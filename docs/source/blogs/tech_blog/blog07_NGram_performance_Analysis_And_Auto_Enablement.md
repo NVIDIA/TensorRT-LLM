@@ -23,7 +23,6 @@ In this blog, we introduce design choices in TensorRT‑LLM’s N-Gram speculati
         - [Effect of Multi-turn conversation](#effect-of-multi-turn-conversation)
     - [Case 2 with Translation Dataset](#case-2-with-translation-dataset)
 - [Auto‑Enablement with Heuristic](#autoenablement-with-heuristic)
-- [Feature Gaps](#featuregaps)
 
 ---
 

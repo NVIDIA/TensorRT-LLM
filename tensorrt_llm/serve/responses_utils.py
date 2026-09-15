@@ -72,7 +72,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
-from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+from tensorrt_llm.serve.tool_parser.base_tool_parser import (
+    BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.web_search import load_web_search_config
@@ -1302,6 +1303,8 @@ def _apply_tool_parser(
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
+        if not streaming:
+            warn_if_tool_call_unparsed(tool_parser_id, tool_parser, text, calls)
     else:
         normal_text, calls = text, []
 

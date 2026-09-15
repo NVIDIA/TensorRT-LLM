@@ -453,8 +453,8 @@ class CutlassFusedMoE(MoEImplBase):
         CudaGraphLoraManager does this automatically.
 
         Args:
-            max_num_tokens: Worst-case tokens in a captured forward
-                (max_batch_size * max_tokens_per_seq).
+            max_num_tokens: Larger of the captured-decode capacity
+                (max_batch_size * max_tokens_per_seq) and the engine-wide token limit.
             max_lora_rank: Largest LoRA rank across adapters.
             max_lora_size: Adapter-slot pool size for the slot-indexed device tables.
         """

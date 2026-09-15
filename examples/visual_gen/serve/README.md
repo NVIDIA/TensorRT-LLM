@@ -14,6 +14,8 @@ These examples show how to interact with the visual generation server using both
   - Multipart/form-data support for file uploads
 - **Video Management**: Retrieving and deleting generated videos
 
+For online benchmarking, see [Benchmarking VisualGen](../../../tensorrt_llm/serve/scripts/BENCHMARKING_VISUAL_GEN.md).
+
 ## Prerequisites
 
 Before running these examples, ensure you have:

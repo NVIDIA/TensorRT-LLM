@@ -190,6 +190,7 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
                     env=env,
                     capture_output=True,
                     text=True,
+                    timeout=120,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(expected, result.stdout)
@@ -228,6 +229,7 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
                 env={**os.environ, "stageName": "CPU-Generic-x86-1"},
                 capture_output=True,
                 text=True,
+                timeout=120,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(target, result.stdout)

@@ -631,3 +631,58 @@ def test_gdn_attaches_only_static_fp8_scale():
     layer.out_proj.force_dynamic_quantization = True
     layer.cache_derived_state()
     assert layer.norm.fp8_scale is None
+
+
+def test_verify_intermediate_state_indices_reuses_buffers():
+    """The verify path's row-index vector is built once, not per GDN layer.
+
+    With a cache-manager-owned ``intermediate_state_indices`` the helper must
+    return a view of it (no copy, no allocation); without one it must fall back
+    to a process-cached arange sized to the pool, again returned as a view.
+    """
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
+        _cached_arange,
+        _verify_intermediate_state_indices,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pool_size = 8
+    expected = torch.arange(3, dtype=torch.int32, device=device)
+
+    owned = torch.arange(pool_size, dtype=torch.int32, device=device)
+    manager = SimpleNamespace(
+        intermediate_state_indices=owned,
+        get_max_resource_count=lambda: pool_size,
+    )
+    indices = _verify_intermediate_state_indices(manager, 3, device)
+    assert torch.equal(indices, expected)
+    assert indices.data_ptr() == owned.data_ptr()  # a view, not a copy
+
+    # No manager-owned buffer (non-speculative manager types): cached fallback.
+    manager = SimpleNamespace(
+        intermediate_state_indices=None, get_max_resource_count=lambda: pool_size
+    )
+    first = _verify_intermediate_state_indices(manager, 3, device)
+    second = _verify_intermediate_state_indices(manager, 5, device)
+    assert torch.equal(first, expected)
+    assert torch.equal(second, torch.arange(5, dtype=torch.int32, device=device))
+    assert first.data_ptr() == second.data_ptr()  # same cached storage
+    assert first.data_ptr() == _cached_arange(pool_size, device).data_ptr()
+
+    # A batch larger than the pool still yields a full index vector: the cached
+    # fallback is sized to max(pool, num_decodes), not to the pool alone.
+    large = _verify_intermediate_state_indices(manager, pool_size + 4, device)
+    assert large.shape[0] == pool_size + 4
+    assert torch.equal(large, torch.arange(pool_size + 4, dtype=torch.int32, device=device))
+
+    # A manager-owned buffer shorter than the batch is abandoned for the cached
+    # fallback rather than silently returning a short index vector.
+    short_owned = torch.arange(2, dtype=torch.int32, device=device)
+    manager = SimpleNamespace(
+        intermediate_state_indices=short_owned,
+        get_max_resource_count=lambda: pool_size,
+    )
+    widened = _verify_intermediate_state_indices(manager, 5, device)
+    assert widened.shape[0] == 5
+    assert torch.equal(widened, torch.arange(5, dtype=torch.int32, device=device))
+    assert widened.data_ptr() != short_owned.data_ptr()

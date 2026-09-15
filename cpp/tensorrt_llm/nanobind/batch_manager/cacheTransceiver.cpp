@@ -18,7 +18,6 @@
 #include "cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
-#include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/bindingUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"

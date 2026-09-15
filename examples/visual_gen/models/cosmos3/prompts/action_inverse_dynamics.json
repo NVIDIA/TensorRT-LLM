@@ -1,5 +1,5 @@
 {
-    "model_mode": "image2video",
+    "model_mode": "video2video",
     "prompt": {
         "cinematography": {
             "framing": "This video is captured from a first-person perspective looking at the scene."

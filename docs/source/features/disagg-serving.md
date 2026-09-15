@@ -17,6 +17,9 @@
 For the internals of the component that actually moves the KV blocks, see
 [Introduction to KV Cache Transmission](../developer-guide/kv-transfer.md).
 
+For placing sub-agents with their parent while retaining independent conversation
+histories, see [Sub-agent Routing](subagent-routing.md).
+
 ## Motivation
 
 LLM inference has two stages: context (prefill) and generation (decode) phases. The context phase computes KV cache for prompt tokens whereas the generation phase generates tokens one by one using cached values. These phases have different compute characteristics.

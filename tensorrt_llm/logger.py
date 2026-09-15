@@ -319,6 +319,18 @@ class Logger(metaclass=Singleton):
     def debug_once(self, *msg, key):
         self.log_once(self.VERBOSE, *msg, key=key)
 
+    def is_debug_enabled(self) -> bool:
+        """Whether a ``debug()`` call from the caller's module would be emitted.
+
+        Guards debug messages whose *arguments* are expensive to build, so that
+        the guard and the emission agree on one predicate. Comparing
+        ``logger.level`` against the literal ``"debug"`` does not: ``verbose``
+        and ``trace`` are at least as verbose, and a per-module
+        ``TLLM_LOG_LEVEL_BY_MODULE`` override can enable or disable the
+        caller's module independently of the global level.
+        """
+        return self.is_severity_enabled(self.VERBOSE, _get_caller_module())
+
     @property
     def level(self) -> str:
         return self._min_severity

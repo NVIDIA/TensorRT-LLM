@@ -1100,20 +1100,60 @@ def main(args: argparse.Namespace):
                        f"{base_model_id}-{current_dt}-perf_metrics")
         if args.result_dir:
             output_stem = os.path.join(args.result_dir, output_stem)
-        perf_filename = f"{output_stem}.jsonl"
-        with open(perf_filename, "w", encoding="utf-8") as outfile:
-            for record in perf_metrics:
-                outfile.write(json.dumps(record, separators=(",", ":")) + "\n")
-        print(f"Request performance metrics saved to: {perf_filename}")
-
+        # Reduce the records we already hold rather than writing them out and reading
+        # them back: the round trip made the whole breakdown depend on output_stem
+        # being writable, so a read-only working directory (no --result-dir) cost the
+        # measurement instead of just the artifact.
         analyzer = RequestTimeBreakdown()
-        timing_data = analyzer.parse_json_file(perf_filename)
-        if timing_data:
-            diagram_filename = f"{output_stem}-time_diagram.html"
+        timing_data = analyzer.parse_records(perf_metrics)
+        if not timing_data:
+            print("No time data found; skipping time breakdown report.")
+            return
+
+        # Deliberately not printed as scrapeable "Time Breakdown ..." lines. The
+        # perf-sanity harness aggregates the same spans itself from the worker
+        # JSONLs, and a second producer of those lines is worse than none: this
+        # view is built from the client's copy of the file only, drops spans whose
+        # events overlapped (see compute_statistics), and models neither the
+        # per-step nor the per-chunk spans. Printing it made the harness's
+        # "no breakdown lines were parsed" check pass on the fallback, hiding the
+        # aggregation failure the check exists to surface. Written as an artifact
+        # instead, for whoever passed --save-request-time-breakdown by hand.
+        span_stats = analyzer.compute_statistics(timing_data)
+
+        # Each artifact is written independently: an unwritable output_stem would
+        # otherwise raise out of main() and make the client exit non-zero, which the
+        # harness reads as a failed benchmark. output_stem is relative to the current
+        # directory unless --result-dir was given. Report and continue. span_stats is
+        # passed in so the reduction is not run a second time over every request.
+        perf_filename = f"{output_stem}.jsonl"
+        try:
+            with open(perf_filename, "w", encoding="utf-8") as outfile:
+                for record in perf_metrics:
+                    outfile.write(
+                        json.dumps(record, separators=(",", ":")) + "\n")
+            print(f"Request performance metrics saved to: {perf_filename}")
+        except OSError as exc:
+            print(f"Could not write {perf_filename}: {exc}")
+
+        stats_filename = f"{output_stem}-time_breakdown_stats.json"
+        try:
+            analyzer.export_statistics_json(timing_data,
+                                            stats_filename,
+                                            span_stats=span_stats)
+            print(f"Span statistics saved to: {stats_filename}")
+        except OSError as exc:
+            print(f"Could not write {stats_filename}: {exc}")
+
+        diagram_filename = f"{output_stem}-time_diagram.html"
+        try:
             analyzer.create_timing_diagram(timing_data, diagram_filename)
             print(f"Time diagram saved to: {diagram_filename}")
-        else:
-            print("No time data found; skipping time breakdown diagram.")
+        except (OSError, ValueError, TypeError) as exc:
+            # plotly is a module-scope import of time_breakdown, so ImportError cannot
+            # surface here -- it would already have failed this module's import. What can
+            # surface is plotly rejecting the figure it was handed (ValueError/TypeError).
+            print(f"Could not write {diagram_filename}: {exc}")
 
 
 if __name__ == "__main__":

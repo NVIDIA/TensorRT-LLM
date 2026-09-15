@@ -769,8 +769,7 @@ void initRequestBindings(nb::module_& m)
     nb::class_<tle::SpeculativeDecodingFastLogitsInfo>(m, "SpeculativeDecodingFastLogitsInfo")
         .def(nb::init<>())
         .def_rw("draft_request_id", &tle::SpeculativeDecodingFastLogitsInfo::draftRequestId)
-        .def_rw("draft_participant_id", &tle::SpeculativeDecodingFastLogitsInfo::draftParticipantId)
-        .def("to_tensor", &tle::SpeculativeDecodingFastLogitsInfo::toTensor);
+        .def_rw("draft_participant_id", &tle::SpeculativeDecodingFastLogitsInfo::draftParticipantId);
 
     auto requestPerfMetrics = nb::class_<tle::RequestPerfMetrics>(m, "RequestPerfMetrics");
 

@@ -243,6 +243,29 @@ def _append(path: Path, agent: str, entry: dict[str, Any]) -> None:
     write_progress(path, data)
 
 
+def record_progress_entry(
+    path: Path, agent: str, iteration: int, fields: dict[str, Any]
+) -> dict[str, Any]:
+    """Stamp, append, and log a progress entry, returning the full entry.
+
+    The orchestrator uses this in no-in-process-MCP mode (``--no-mcp-tools``),
+    where the agent hands its ``summary`` / ``decision`` / ``weighted_score``
+    back through a file instead of the ``append_*_progress`` MCP tool.
+    ``iteration``, ``agent``, and ``timestamp`` are stamped here (not trusted
+    from the agent) so the shared log stays consistent with the MCP-mode path.
+    ``fields`` supplies the role-specific keys in their canonical order.
+    """
+    entry = {
+        "iteration": iteration,
+        "agent": agent,
+        "timestamp": _now_iso(),
+        **fields,
+    }
+    _append(path, agent, entry)
+    _log_progress_write(agent, entry)
+    return entry
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 

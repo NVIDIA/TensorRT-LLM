@@ -771,9 +771,6 @@ struct SpeculativeDecodingFastLogitsInfo
 
     /// @brief MPI world rank of the draft model leader
     int32_t draftParticipantId;
-
-    /// @brief Returns the struct serialized into a tensor that can be used as generation logits input
-    [[nodiscard]] Tensor toTensor() const;
 };
 
 struct AdditionalOutput

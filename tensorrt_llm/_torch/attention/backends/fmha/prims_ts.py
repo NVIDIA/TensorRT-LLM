@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -40,7 +40,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .utils import get_kv_page_offset
+from .utils import get_kv_page_offset, get_multi_processor_count_for_device
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
@@ -57,6 +57,96 @@ if TYPE_CHECKING:
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
+
+
+def get_paged_kv_storage_unsupported_reason(
+    attn: "TrtllmAttention",
+    metadata: "TrtllmAttentionMetadata",
+) -> Optional[str]:
+    """Return why the TRT-LLM paged KV storage cannot feed a fixed page-table kernel."""
+    if metadata.kv_cache_manager is None:
+        return "a KV cache manager is required."
+    if metadata.kv_cache_block_offsets is None:
+        return "paged KV-cache block offsets are required."
+    if metadata.host_kv_cache_pool_pointers is None:
+        return "KV-cache pool pointers are required."
+    pool_mapping = metadata.host_kv_cache_pool_mapping
+    if pool_mapping is None:
+        return "KV-cache pool mapping is required."
+    if metadata.kv_layout != "HND":
+        return "only HND KV-cache layout is supported."
+    manager = metadata.kv_cache_manager
+    if isinstance(manager, KVCacheManagerV2):
+        if manager.enable_swa_scratch_reuse:
+            return "KVCacheManagerV2 SWA scratch reuse is not supported."
+    elif isinstance(manager, KVCacheManager):
+        if manager.num_pools != 1:
+            return "KVCacheManagerV1 with multiple memory pools is not supported."
+        local_layer_idx = attn.local_layer_idx
+        if (
+            pool_mapping.ndim != 2
+            or pool_mapping.shape[1] < 2
+            or local_layer_idx is None
+            or not 0 <= local_layer_idx < pool_mapping.shape[0]
+        ):
+            return "KVCacheManagerV1 has an invalid layer-to-pool mapping."
+        pool_index = int(pool_mapping[local_layer_idx, 0])
+        layer_idx_in_pool = int(pool_mapping[local_layer_idx, 1])
+        if pool_index != 0 or not 0 <= layer_idx_in_pool < manager.num_local_layers:
+            return "KVCacheManagerV1 has an invalid layer-to-pool mapping."
+    else:
+        return f"unsupported KV cache manager {type(manager).__name__}."
+    return None
+
+
+def get_paged_kv_policy_unsupported_reason(
+    attn: "TrtllmAttention",
+    metadata: "TrtllmAttentionMetadata",
+) -> Optional[str]:
+    """Return why the request's decoding policy is outside the fixed page-table envelope."""
+    if metadata.beam_width != 1:
+        return "beam search is not supported."
+    if (
+        metadata.is_spec_decoding_enabled
+        or metadata.use_spec_decoding
+        or metadata.is_spec_dec_tree
+        or metadata.is_spec_dec_dynamic_tree
+    ):
+        return "speculative decoding is not supported by the initial adapter."
+    position_embedding_type = int(attn.position_embedding_type)
+    if position_embedding_type in (4, 5, 6, 7, 10):
+        return f"position embedding type {position_embedding_type} is not supported."
+    try:
+        quant_mode = QuantMode(attn.quant_mode)
+    except (TypeError, ValueError):
+        return "invalid KV-cache quantization mode."
+    if quant_mode.has_kv_cache_quant():
+        return "quantized KV cache is not supported by the initial adapter."
+    return None
+
+
+def get_attention_feature_unsupported_reason(
+    metadata: "TrtllmAttentionMetadata",
+    forward_args: "AttentionForwardArgs",
+) -> Optional[str]:
+    """Return which optional attention feature the fused-kernel adapters do not implement."""
+    if metadata.helix_position_offsets is not None:
+        return "Helix parallelism is not supported."
+    if forward_args.relative_attention_bias is not None:
+        return "relative attention bias is not supported."
+    if forward_args.attention_sinks is not None:
+        return "attention sinks are not supported."
+    if forward_args.attention_mask_data is not None:
+        return "custom attention masks are not supported."
+    if forward_args.enable_dsv4_epilogue_fusion:
+        return "DSv4 epilogue fusion is not supported."
+    if (
+        forward_args.sage_attn_num_elts_per_blk_q > 0
+        or forward_args.sage_attn_num_elts_per_blk_k > 0
+        or forward_args.sage_attn_num_elts_per_blk_v > 0
+    ):
+        return "SageAttention is not supported."
+    return None
 
 
 class PrimsTSFmha(PhasedFmha):
@@ -88,7 +178,7 @@ class PrimsTSFmha(PhasedFmha):
         self._decode_workspace_required_bytes = 0
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         sm = get_sm_version()
         if sm not in (100, 103):
             logger.debug(f"PrimTS FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
@@ -145,7 +235,7 @@ class PrimsTSFmha(PhasedFmha):
         )
         return [name for name in required_ops if not hasattr(thop, name)]
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
@@ -180,6 +270,7 @@ class PrimsTSFmha(PhasedFmha):
         phase: Optional[FmhaPhase] = None,
     ) -> tuple[bool, str]:
         """Return a conservative, side-effect-free whole-request support decision."""
+        sparse_runtime_params = fwd.sparse_runtime_params
         # PrimTS prepares workspace for every active request phase before
         # dispatch. Accept the phased dispatcher keyword, but do not narrow
         # support until that preparation is phase-aware too.
@@ -194,40 +285,9 @@ class PrimsTSFmha(PhasedFmha):
             return False, "only fused QKV input is supported."
         if meta.is_cross:
             return False, "cross attention is not supported."
-        if meta.kv_cache_manager is None:
-            return False, "a KV cache manager is required."
-        if meta.kv_cache_block_offsets is None:
-            return False, "paged KV-cache block offsets are required."
-        if meta.host_kv_cache_pool_pointers is None:
-            return False, "KV-cache pool pointers are required."
-        if meta.host_kv_cache_pool_mapping is None:
-            return False, "KV-cache pool mapping is required."
-        if meta.kv_layout != "HND":
-            return False, "only HND KV-cache layout is supported."
-        kv_cache_manager = meta.kv_cache_manager
-        if isinstance(kv_cache_manager, KVCacheManagerV2):
-            if kv_cache_manager.enable_swa_scratch_reuse:
-                return False, "KVCacheManagerV2 SWA scratch reuse is not supported."
-        elif isinstance(kv_cache_manager, KVCacheManager):
-            if kv_cache_manager.num_pools != 1:
-                return False, "KVCacheManagerV1 with multiple memory pools is not supported."
-            pool_mapping = meta.host_kv_cache_pool_mapping
-            local_layer_idx = attn.local_layer_idx
-            num_local_layers = kv_cache_manager.num_local_layers
-            if (
-                pool_mapping.ndim != 2
-                or pool_mapping.shape[1] < 2
-                or local_layer_idx is None
-                or local_layer_idx < 0
-                or local_layer_idx >= pool_mapping.shape[0]
-            ):
-                return False, "KVCacheManagerV1 has an invalid layer-to-pool mapping."
-            pool_index = int(pool_mapping[local_layer_idx, 0])
-            layer_idx_in_pool = int(pool_mapping[local_layer_idx, 1])
-            if pool_index != 0 or not 0 <= layer_idx_in_pool < num_local_layers:
-                return False, "KVCacheManagerV1 has an invalid layer-to-pool mapping."
-        else:
-            return False, f"unsupported KV cache manager {type(kv_cache_manager).__name__}."
+        storage_reason = get_paged_kv_storage_unsupported_reason(attn, meta)
+        if storage_reason is not None:
+            return False, storage_reason
 
         output = fwd.output
         if output is None:
@@ -240,38 +300,15 @@ class PrimsTSFmha(PhasedFmha):
         if attn.sparse_params is not None:
             return False, "sparse attention is not supported."
         if (
-            fwd.sparse_runtime_params.sparse_kv_indices is not None
-            or fwd.sparse_runtime_params.sparse_attn_indices is not None
+            sparse_runtime_params.sparse_kv_indices is not None
+            or sparse_runtime_params.sparse_attn_indices is not None
         ):
             return False, "sparse attention metadata is not supported."
         if meta.num_sparse_topk > 0:
             return False, "sparse attention metadata is not supported."
-        if meta.helix_position_offsets is not None:
-            return False, "Helix parallelism is not supported."
-        if fwd.relative_attention_bias is not None:
-            return False, "relative attention bias is not supported."
-        if fwd.attention_sinks is not None:
-            return False, "attention sinks are not supported."
-        if fwd.attention_mask_data is not None:
-            return False, "custom attention masks are not supported."
-        if fwd.enable_dsv4_epilogue_fusion:
-            return False, "DSv4 epilogue fusion is not supported."
-        if (
-            fwd.sage_attn_num_elts_per_blk_q > 0
-            or fwd.sage_attn_num_elts_per_blk_k > 0
-            or fwd.sage_attn_num_elts_per_blk_v > 0
-        ):
-            return False, "SageAttention is not supported."
-
-        if meta.beam_width != 1:
-            return False, "beam search is not supported."
-        if (
-            meta.is_spec_decoding_enabled
-            or meta.use_spec_decoding
-            or meta.is_spec_dec_tree
-            or meta.is_spec_dec_dynamic_tree
-        ):
-            return False, "speculative decoding is not supported by the initial adapter."
+        feature_reason = get_attention_feature_unsupported_reason(meta, fwd)
+        if feature_reason is not None:
+            return False, feature_reason
 
         try:
             mask_type = AttentionMaskType(fwd.mask_type)
@@ -279,17 +316,9 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the attention mask is not causal or dense."
         if mask_type not in (AttentionMaskType.causal, AttentionMaskType.padding):
             return False, f"attention mask type {mask_type} is not supported."
-
-        position_embedding_type = int(attn.position_embedding_type)
-        if position_embedding_type in (4, 5, 6, 7, 10):
-            return False, f"position embedding type {position_embedding_type} is not supported."
-
-        try:
-            quant_mode = QuantMode(attn.quant_mode)
-        except (TypeError, ValueError):
-            return False, "invalid KV-cache quantization mode."
-        if quant_mode.has_kv_cache_quant():
-            return False, "quantized KV cache is not supported by the initial adapter."
+        policy_reason = get_paged_kv_policy_unsupported_reason(attn, meta)
+        if policy_reason is not None:
+            return False, policy_reason
 
         input_type = fwd.attention_input_type
         if input_type not in (
@@ -431,6 +460,27 @@ class PrimsTSFmha(PhasedFmha):
                 f"{block_tables.shape[0]} rows."
             )
         return block_tables[:batch_size, 0, :]
+
+    def _get_generation_workspace_layout(
+        self,
+        dtype: torch.dtype,
+        num_requests: int,
+        num_tokens: int,
+    ) -> dict[str, int]:
+        """Return the shared TRT-LLM generation preprocessing layout."""
+
+        return thop.get_trtllm_gen_generation_workspace_layout(
+            dtype,
+            num_requests,
+            num_tokens,
+            self.attn.num_heads,
+            self.attn.head_dim,
+            self.attn.rope_dim,
+            self.attn.num_kv_heads,
+            0,
+            False,
+            skip_fmha_workspace=True,
+        )
 
     @staticmethod
     def _get_sequence_lengths(
@@ -626,9 +676,7 @@ class PrimsTSFmha(PhasedFmha):
             metadata.num_generations > 0 and input_type != AttentionInputType.context_only
         )
         if self._multi_processor_count is None:
-            self._multi_processor_count = torch.cuda.get_device_properties(
-                q.device
-            ).multi_processor_count
+            self._multi_processor_count = get_multi_processor_count_for_device(q.device.index)
 
         required_preprocess_bytes = 0
         if has_context and not self.attn.is_mla_enable:
@@ -652,17 +700,10 @@ class PrimsTSFmha(PhasedFmha):
                 if input_type == AttentionInputType.generation_only
                 else q.shape[0] - int(metadata.num_ctx_tokens)
             )
-            generation_layout = thop.get_trtllm_gen_generation_workspace_layout(
+            generation_layout = self._get_generation_workspace_layout(
                 q.dtype,
                 int(metadata.num_generations),
                 num_gen_tokens_for_layout,
-                self.attn.num_heads,
-                self.attn.head_dim,
-                self.attn.rope_dim,
-                self.attn.num_kv_heads,
-                0,
-                False,
-                skip_fmha_workspace=True,
             )
             required_preprocess_bytes = max(
                 required_preprocess_bytes, int(generation_layout["total_size"])
@@ -956,34 +997,17 @@ class PrimsTSFmha(PhasedFmha):
             skip_fmha_workspace=True,
         )
 
-    def run_generation(self, params: FmhaParams) -> None:
-        if params.qkv_input is None or params.context_buf is None:
-            raise RuntimeError("PrimTS decode requires QKV input and an output buffer.")
-        if params.sequence_lengths is None:
-            raise RuntimeError("PrimTS decode requires sequence lengths.")
-        if self._multi_processor_count is None:
-            raise RuntimeError("PrimTS decode workspace was not prepared.")
+    def _run_generation_preprocess(self, params: FmhaParams) -> tuple[Any, ...]:
+        """Run the shared TRT-LLM generation QKV and cache preprocessing."""
 
+        if self._multi_processor_count is None:
+            raise RuntimeError("PrimTS generation workspace was not prepared.")
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
         rope_params = attn.rope_params
-        batch_size = params.batch_size
         attention_chunk_size = attn.attention_chunk_size or 0
-        (
-            q_processed,
-            kv_pool,
-            block_tables,
-            _kv_scale_pool,
-            _bmm1_scale,
-            _bmm2_scale,
-            fmha_workspace,
-            _cu_seqlens,
-            _max_q_len,
-            _max_kv_len,
-            window_left,
-            is_multi_token_gen,
-        ) = thop.trtllm_gen_generation_preprocess(
+        return thop.trtllm_gen_generation_preprocess(
             params.qkv_input,
             params.workspace,
             params.sequence_lengths,
@@ -1008,7 +1032,7 @@ class PrimsTSFmha(PhasedFmha):
             params.max_attention_window_size,
             params.cyclic_attention_window_size,
             params.num_tokens,
-            batch_size,
+            params.batch_size,
             params.input_seq_length,
             params.max_past_kv_length,
             rope_params.dim,
@@ -1029,6 +1053,33 @@ class PrimsTSFmha(PhasedFmha):
             False,
             skip_fmha_workspace=True,
         )
+
+    def run_generation(self, params: FmhaParams) -> None:
+        if params.qkv_input is None or params.context_buf is None:
+            raise RuntimeError("PrimTS decode requires QKV input and an output buffer.")
+        if params.sequence_lengths is None:
+            raise RuntimeError("PrimTS decode requires sequence lengths.")
+        if self._multi_processor_count is None:
+            raise RuntimeError("PrimTS decode workspace was not prepared.")
+
+        attn = params.attn
+        meta = params.meta
+        fwd = params.fwd
+        batch_size = params.batch_size
+        (
+            q_processed,
+            kv_pool,
+            block_tables,
+            _kv_scale_pool,
+            _bmm1_scale,
+            _bmm2_scale,
+            fmha_workspace,
+            _cu_seqlens,
+            _max_q_len,
+            _max_kv_len,
+            window_left,
+            is_multi_token_gen,
+        ) = self._run_generation_preprocess(params)
         if fmha_workspace.numel() != 0:
             raise RuntimeError("PrimTS generation preprocessing returned an FMHA workspace.")
         if is_multi_token_gen:

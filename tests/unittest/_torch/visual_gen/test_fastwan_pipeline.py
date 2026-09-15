@@ -15,11 +15,7 @@
 """Pipeline-level tests for WanDMDPipeline.
 
 Run:
-    DIFFUSION_MODEL_PATH_FASTWAN=/path/to/checkpoint \\
-        pytest tests/unittest/_torch/visual_gen/test_fastwan_pipeline.py -v -s
-
-Override checkpoint path via DIFFUSION_MODEL_PATH_FASTWAN env var or place
-the checkpoint at $LLM_MODELS_ROOT/FastWan2.2-TI2V-5B-FullAttn-Diffusers
+    pytest tests/unittest/_torch/visual_gen/test_fastwan_pipeline.py -v -s
 """
 
 import gc
@@ -29,6 +25,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
@@ -40,25 +37,13 @@ def _cleanup_mpi_env():
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
-def _checkpoint_path() -> str:
-    if "DIFFUSION_MODEL_PATH_FASTWAN" in os.environ:
-        return os.environ["DIFFUSION_MODEL_PATH_FASTWAN"]
-    root = os.environ.get(
-        "LLM_MODELS_ROOT",
-        "/home/scratch.trt_llm_data_ci/llm-models",
-    )
-    return os.path.join(root, "FastWan2.2-TI2V-5B-FullAttn-Diffusers")
-
-
-FASTWAN_PATH = _checkpoint_path()
+FASTWAN_SUBDIR = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 
 
 @pytest.fixture(scope="module")
 def fastwan_pipeline():
-    if not os.path.exists(FASTWAN_PATH):
-        pytest.skip(f"Checkpoint not found: {FASTWAN_PATH}")
     args = VisualGenArgs(
-        model=FASTWAN_PATH,
+        model=get_checkpoint(FASTWAN_SUBDIR),
         torch_compile_config=TorchCompileConfig(enable=False),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
@@ -109,10 +94,8 @@ class TestFastWanFP8:
     """
 
     def test_fp8_trtllm(self):
-        if not os.path.exists(FASTWAN_PATH):
-            pytest.skip(f"Checkpoint not found: {FASTWAN_PATH}")
         args = VisualGenArgs(
-            model=FASTWAN_PATH,
+            model=get_checkpoint(FASTWAN_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
             attention_config=AttentionConfig(backend="TRTLLM"),

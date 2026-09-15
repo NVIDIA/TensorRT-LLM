@@ -1,22 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import json
 import pickle
-import tempfile
 import time
 from datetime import timedelta
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
-from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
 import tensorrt_llm.bindings.executor as _tbe
 from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
-from tensorrt_llm.mapping import Mapping
 
 
 def test_quant_mode():
@@ -217,116 +212,6 @@ def test_sampling_config():
     check_empty_then_set("beam_search_diversity_rate", 1.)
     check_empty_then_set("length_penalty", 1.)
     check_empty_then_set("early_stopping", 1)
-
-
-def test_gpt_json_config():
-    model_config = {
-        "vocab_size": 1000,
-        "num_layers": 18,  # >= attn + rnn
-        "num_attention_layers": 12,
-        "num_rnn_layers": 2,
-        "num_heads": 4,
-        "hidden_size": 512,
-        "data_type": _tb.DataType.FLOAT,
-    }
-    trt_model_config = _tb.ModelConfig(**model_config)
-    json_config = {
-        "name": "gpt",
-        "version": "none",
-        "precision": "float32",
-        "tensor_parallelism": 1,
-        "pipeline_parallelism": 1,
-        "context_parallelism": 1,
-        "gpus_per_node": 8,
-        "model_config": trt_model_config
-    }
-
-    gpt_json_config = _tb.GptJsonConfig(**json_config)
-
-    def check_properties(the_object, properties, model_config):
-        for property, value in properties.items():
-            if isinstance(value, _tb.ModelConfig):
-                object_config = getattr(the_object, property)
-                for subproperty, subvalue in model_config.items():
-                    member = getattr(object_config, subproperty)
-                    if callable(member):
-                        member = member()
-                    assert member == subvalue
-            else:
-                assert getattr(the_object, property) == value
-
-    check_properties(gpt_json_config, json_config, model_config)
-
-    assert gpt_json_config.runtime_defaults is None
-
-    json_dict = {
-        "builder_config": {
-            "name": json_config["name"],
-            "vocab_size": model_config["vocab_size"],
-            "num_layers": model_config["num_attention_layers"],
-            "num_heads": model_config["num_heads"],
-            "hidden_size": model_config["hidden_size"],
-            "precision": json_config["precision"],
-            "tensor_parallel": json_config["tensor_parallelism"],
-            "pipeline_parallel": json_config["pipeline_parallelism"],
-            "context_parallel": json_config["context_parallelism"],
-        },
-        "plugin_config": {
-            "paged_kv_cache": False,
-            "tokens_per_block": 0,
-            "gpt_attention_plugin": False,
-            "remove_input_padding": False,
-            "context_fmha": False,
-            "use_paged_context_fmha": False,
-            "lora_plugin": False,
-        }
-    }
-
-    gpt_json_config = _tb.GptJsonConfig.parse(json.dumps(json_dict))
-
-    with tempfile.NamedTemporaryFile("w", delete=False) as fp:
-        json.dump(json_dict, fp)
-        fp.close()
-
-        gpt_json_config = _tb.GptJsonConfig.parse_file(Path(fp.name))
-        Path(fp.name).unlink()
-
-    rank = 3
-    gpus_per_node = 10
-    world_config = _tb.WorldConfig(json_config["tensor_parallelism"],
-                                   json_config["pipeline_parallelism"],
-                                   json_config["context_parallelism"], rank,
-                                   gpus_per_node)
-
-    assert gpt_json_config.engine_filename(
-        world_config) == json_config["name"] + "_float32_tp1_rank3.engine"
-    assert gpt_json_config.engine_filename(
-        world_config, "llama") == "llama_float32_tp1_rank3.engine"
-
-    def parse_runtime_defaults(defaults_dict: dict | None = None):
-        config = _tb.GptJsonConfig.parse(
-            json.dumps({
-                "version": "some.version",
-                "build_config": {
-                    "plugin_config": json_dict["plugin_config"],
-                    "lora_config": {},
-                },
-                "pretrained_config": {
-                    **json_dict["builder_config"],
-                    "architecture": "LlamaForCausalLM",
-                    "mapping": Mapping().to_dict(),
-                    "dtype": "bfloat16",
-                    "num_hidden_layers": 1,
-                    "num_attention_heads": 1,
-                    "quantization": {},
-                    "runtime_defaults": defaults_dict,
-                },
-            }))
-        return config.runtime_defaults
-
-    strict_keys = False  # GptJsonConfig is written in cpp, and there is currently no nice way to throw on extra keys
-    assert_runtime_defaults_are_parsed_correctly(parse_runtime_defaults,
-                                                 strict_keys=strict_keys)
 
 
 def test_llm_request():

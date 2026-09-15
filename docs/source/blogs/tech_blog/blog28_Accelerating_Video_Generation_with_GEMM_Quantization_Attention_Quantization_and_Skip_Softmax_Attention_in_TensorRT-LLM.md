@@ -9,7 +9,7 @@ Video diffusion transformers (DiTs) repeatedly process long spatiotemporal token
 Figure 1 breaks down pipeline-forward time for Wan 2.2 T2V-A14B on a single NVIDIA B200. For an 81-frame, 1280×720 video with 40 denoising steps, attention and linear-layer GEMMs account for 70.3% and 21.0% of BF16 pipeline-forward time, respectively.
 
 <p align="center">
-  <img src="../media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that Wan 2.2 T2V-A14B in BF16 spends 70.3% of pipeline-forward time in attention, 21.0% in GEMMs, and 8.7% in other work" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that Wan 2.2 T2V-A14B in BF16 spends 70.3% of pipeline-forward time in attention, 21.0% in GEMMs, and 8.7% in other work" width="1080">
 </p>
 <p align="center"><sub><em>Figure 1. Diffusion pipeline-forward breakdown for Wan 2.2 T2V-A14B in BF16 on B200.</em></sub></p>
 
@@ -75,9 +75,9 @@ Because the score distribution depends on the input, a fixed threshold $\lambda$
 - `target_sparsity` expresses how aggressively to skip as an intuitive target.
 - `disabled_until_timestep` keeps the early denoising steps dense before enabling Skip Softmax.
 
-The mapping from `disabled_until_timestep` to actual denoising steps depends on the scheduler and is not linear. In the 40-step UniPC schedule used here, `disabled_until_timestep=0.86` keeps the 14/40 steps dense and enables Skip Softmax for the remaining 26. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#mapping-disabled_until_timestep-to-actual-denoising-steps) for the scheduler-dependent mapping.
+The mapping from `disabled_until_timestep` to actual denoising steps depends on the scheduler and is not linear. In the 40-step UniPC schedule used here, `disabled_until_timestep=0.86` keeps the 14/40 steps dense and enables Skip Softmax for the remaining 26. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/visualgen-sparse-attention.md#mapping-disabled_until_timestep-to-actual-denoising-steps) for the scheduler-dependent mapping.
 
-The ModelOpt checkpoints used in this experiment already include this calibration metadata. Without calibration, Skip Softmax can still be enabled by setting the threshold directly. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#skip-softmax-attention) for direct-threshold configuration.
+The ModelOpt checkpoints used in this experiment already include this calibration metadata. Without calibration, Skip Softmax can still be enabled by setting the threshold directly. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/visualgen-sparse-attention.md#skip-softmax-attention) for direct-threshold configuration.
 
 ## Results
 
@@ -122,7 +122,7 @@ Figure 2 organizes the 96 data points in two levels. Color identifies one of six
 The aggressive point shows the upper-speed end of the sweep rather than a recommended setting. The remaining Skip Softmax configurations are circles, and the dashed line traces the global Pareto frontier across all six families.
 
 <p align="center">
-  <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 2. Speedup–quality frontier across all 96 configurations. Both LPIPS and speedup are measured against compiled BF16 with standard attention and no Skip Softmax.</em></sub></p>
@@ -153,7 +153,7 @@ This layering explains the shape of the Pareto frontier: its higher-speed region
 Figure 3 isolates the attention optimizations within each GEMM precision. Each group starts with standard attention, adds SAGE, and then adds the conservative Skip Softmax setting from the frontier. The bars report absolute pipeline-forward latency, while their labels retain the common speedup against the compiled BF16 baseline.
 
 <p align="center">
-  <img src="../media/tech_blog28_latency_step_down.png" alt="Horizontal latency step-down bars for BF16, FP8 per-tensor, and NVFP4, each progressing from dense attention to SAGE and then SAGE with conservative Skip Softmax" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_latency_step_down.png" alt="Horizontal latency step-down bars for BF16, FP8 per-tensor, and NVFP4, each progressing from dense attention to SAGE and then SAGE with conservative Skip Softmax" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 3. Pipeline-forward latency after successively adding SAGE and conservative Skip Softmax within each GEMM precision. Lower is better.</em></sub></p>
@@ -181,31 +181,31 @@ The six videos below are grouped by GEMM precision, with the SAGE variant on the
 Figure 5 expands the first-frame comparison to all seven prompts. Each row compares the BF16 baseline with the same six conservative configurations as Figure 4. The previews are downsampled from the original videos.
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 5. First-frame comparison across all seven prompts. Every Skip Softmax result uses `target_sparsity=0.75` and `disabled_until_timestep=0.86`, corresponding to the stars in Figure 2.</em></sub></p>

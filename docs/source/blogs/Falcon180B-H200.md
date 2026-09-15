@@ -57,7 +57,7 @@ step further by performing FP8 computation on Hopper GPUs instead of the
 standard FP16.
 
 Similar examples running Falcon-180B with quantization in TensorRT LLM are
-available in [examples/models/contrib/falcon](/examples/models/contrib/falcon).
+available in [examples/models/contrib/falcon](source:examples/models/contrib/falcon).
 
 ## Llama-70B on H200 up to 6.7x A100
 
@@ -111,13 +111,13 @@ supports GQA, multi-query attention (MQA) and standard MHA. It leverages Tensor
 Cores, including in the generation phase, and delivers great performance on
 NVIDIA GPUs.
 
-###### Closing
+### Closing
 
 These improvements will be published in the `main` branch soon, and will be
 included in the v0.7 & v0.8 releases.
 
 Similar examples running Llama-70B in TensorRT LLM are published in
-[examples/models/core/llama](/examples/models/core/llama).
+[examples/models/core/llama](source:examples/models/core/llama).
 
 For more information about H200, please see the [H200 announcement blog](./H200launch.md).
 

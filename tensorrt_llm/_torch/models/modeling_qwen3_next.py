@@ -23,7 +23,7 @@
 import copy
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional
 
 import torch
 
@@ -52,6 +52,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -146,6 +147,10 @@ def _experts_excluded_from_quant(model_config: ModelConfig[Qwen3NextConfig],
 
 class Qwen3NextGate(nn.Module):
 
+    # The router weight is a bare parameter, not a Linear, so the dispatcher's
+    # name-based scan needs an explicit opt-in to reach it.
+    _low_m_gemm_opt_in = True
+
     def __init__(
         self,
         hidden_size: int,
@@ -169,6 +174,13 @@ class Qwen3NextGate(nn.Module):
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The low-M kernels return the input dtype, so cublas_mm below still
+        # owns any out_dtype promotion.
+        if _should_apply_low_m_gemm(
+                hidden_states) and self.out_dtype == hidden_states.dtype:
+            logits = apply_low_m_gemm(self, hidden_states, self.weight, None)
+            if logits is not None:
+                return logits
         logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
@@ -192,6 +204,19 @@ class Qwen3NextGate(nn.Module):
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
+
+
+class _DeferredSharedExpertFinalize(NamedTuple):
+    """The three tensors the shared-expert finalize would have combined.
+
+    Returned in place of ``routed + sigmoid(gate) * shared`` when the caller
+    asks to defer and no collective follows, so that a downstream consumer can
+    fold that expression into a kernel it already runs over these rows.
+    """
+
+    routed_output: torch.Tensor
+    shared_output: torch.Tensor
+    shared_gate_logits: torch.Tensor
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -307,7 +332,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         lora_params: Optional[dict] = None,
-    ) -> torch.Tensor:
+        defer_shared_expert_finalize: bool = False,
+    ) -> torch.Tensor | _DeferredSharedExpertFinalize:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -359,6 +385,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return final_hidden_states
 
         shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
+        # Deferring is sound only where no collective follows the finalize,
+        # which is exactly the negation of the all-reduce condition below.
+        # DP padding and >2D inputs are excluded: the rows handed over would no
+        # longer line up with the Hyper-Connection residual.
+        no_collective_after_finalize = (self.enable_attention_dp
+                                        or self.mapping.tp_size == 1)
+        if (defer_shared_expert_finalize and no_collective_after_finalize
+                and not use_dp_padding and len(orig_shape) == 2):
+            return _DeferredSharedExpertFinalize(
+                final_hidden_states,
+                shared_expert_output,
+                shared_expert_gate_logits,
+            )
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             output_tensor, _ = torch.ops.trtllm.allocate_output(
                 final_hidden_states, self.allreduce.output_buffer_kind,
@@ -401,7 +440,10 @@ class _DenseMlpAdapter(nn.Module):
         all_reduce_params=None,
         do_finalize=True,
         lora_params=None,
+        defer_shared_expert_finalize=False,
     ):
+        assert not defer_shared_expert_finalize, \
+            "a dense MLP has no shared-expert finalize to defer"
         all_rank_num_tokens = (attn_metadata.all_rank_num_tokens
                                if attn_metadata is not None else None)
         return self.mlp(

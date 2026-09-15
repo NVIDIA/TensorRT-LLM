@@ -16,7 +16,6 @@ context_servers:
   speculative_config: &eagle_spec
     decoding_type: Eagle
     max_draft_len: 3
-    eagle3_one_model: true
     speculative_model: gpt_oss/gpt-oss-120b-Eagle3
   kv_cache_config:
     enable_block_reuse: false

@@ -5,17 +5,13 @@
 
 Loads the full model and calls pipeline.forward() with cpu_offload_config.enable=True;
 offloaded output is checked against the non-offload TRT-LLM baseline. CUDA graphs
-with offloading must raise. These skip unless the checkpoint is available.
+with offloading must raise.
 
 Fast, GPU-free offload unit tests (including the Cosmos3-specific offload wiring)
 live in test_offloading.py.
 
 Run:
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py -v -s
-
-Override checkpoint path:
-    DIFFUSION_MODEL_PATH_COSMOS3=/path/to/cosmos3 \\
-        pytest tests/unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py -v -s
 """
 
 import os
@@ -30,11 +26,11 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 os.environ.setdefault("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "1")
 
 import gc
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_GENERATOR_OFFLOAD_COMPONENT,
@@ -60,24 +56,7 @@ def _cleanup_gpu():
     torch.cuda.empty_cache()
 
 
-def _llm_models_root() -> Path:
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    else:
-        root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return root
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or str(_llm_models_root() / default_name)
-
-
-COSMOS3_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
+COSMOS3_SUBDIR = "Cosmos3-Nano"
 
 # Mirrors a validated manual offload run; reduced steps keep the test fast.
 INFER_PROMPT = "A cute cat playing piano."
@@ -106,8 +85,6 @@ def _make_pipeline(checkpoint_path: str, *, enable_offload: bool = False):
     from tensorrt_llm.visual_gen.args import CpuOffloadConfig as ArgsOffloadConfig
     from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
@@ -139,7 +116,7 @@ def _capture_video(pipe) -> torch.Tensor:
 
 @pytest.fixture
 def cosmos3_offload_pipeline():
-    pipeline = _make_pipeline(COSMOS3_PATH, enable_offload=True)
+    pipeline = _make_pipeline(get_checkpoint(COSMOS3_SUBDIR), enable_offload=True)
     yield pipeline
     del pipeline
     gc.collect()
@@ -163,13 +140,13 @@ class TestCosmos3Offload:
         print(f"  stages: {pipeline.offloader.stages()}")
 
     def test_cosmos3_offload_matches_baseline(self):
-        offload_pipe = _make_pipeline(COSMOS3_PATH, enable_offload=True)
+        offload_pipe = _make_pipeline(get_checkpoint(COSMOS3_SUBDIR), enable_offload=True)
         offload_video = _capture_video(offload_pipe)
         del offload_pipe
         gc.collect()
         torch.cuda.empty_cache()
 
-        baseline_pipe = _make_pipeline(COSMOS3_PATH, enable_offload=False)
+        baseline_pipe = _make_pipeline(get_checkpoint(COSMOS3_SUBDIR), enable_offload=False)
         baseline_video = _capture_video(baseline_pipe)
         del baseline_pipe
         gc.collect()
@@ -201,10 +178,8 @@ class TestCosmos3OffloadCudaGraphRaisesError:
         from tensorrt_llm.visual_gen.args import CpuOffloadConfig as ArgsOffloadConfig
         from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
-        if not os.path.exists(COSMOS3_PATH):
-            pytest.skip(f"Checkpoint not found: {COSMOS3_PATH}")
         args = VisualGenArgs(
-            model=COSMOS3_PATH,
+            model=get_checkpoint(COSMOS3_SUBDIR),
             torch_compile_config=TorchCompileConfig(enable=False),
             cuda_graph_config=CudaGraphConfig(enable=True),
             cpu_offload_config=ArgsOffloadConfig(enable=True, stages=INFER_OFFLOAD_STAGES),

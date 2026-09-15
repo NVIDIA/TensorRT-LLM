@@ -127,6 +127,15 @@ rank-striped communicator or reader setup. An explicit incompatible
 `rank_striped_read_ahead` request emits a warning instead of failing startup;
 `auto` records the native selection at info level.
 
+Sessionless compatibility is a separate structural fallback:
+
+- Direct `load_weights()` calls use native I/O because they cannot keep
+  `open_weight_session()` alive through model materialization. Current callers
+  include separate draft/MTP checkpoint loading and the GMS restore path; the
+  primary built-in HF path remains eligible for rank-striped read-ahead. This
+  structural fallback is reported at info level even for an explicit
+  `rank_striped_read_ahead` request.
+
 Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
 loading, raw-weight caching, layer overrides, insufficient host-memory
 headroom, and `.bin`/`.pth` select native materialization before readers start
@@ -148,8 +157,34 @@ TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
 effective policy, so `auto` selection and native fallback remain observable;
 activation logs also report the local reader assignment.
 
-This policy remains separate from future ModelStreamer, MX, GMS, or snapshot
-integration. Those systems may change the source or bypass raw loading without
+### CI startup experiment
+
+Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
+built-in PyTorch/HF launches to the default `auto` policy, so merge decisions do
+not depend on an unrelated CI identifier. Post-merge telemetry runs use the
+numeric root Jenkins build number modulo 4 to assign one native bucket and
+three auto buckets before generated server configs are written. Every rank and
+node in one distributed startup therefore receives the same concrete policy.
+Non-telemetry runs, invalid or missing post-merge build identities,
+incompatible configurations, and purpose-built configs with an explicit
+`checkpoint_io_policy` are not assigned and retain their normal configuration,
+whose checkpoint I/O default remains `auto`.
+
+Set `TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY=auto` or `native` to reproduce an
+experiment arm without bucket assignment. Uploaded rows record the experiment
+version, bucket, assigned arm, assignment source, PR number or root build
+number, actual checkpoint loader/source metadata,
+requested/selected/activated/effective policy, and a bounded fallback category
+and reason. The primary comparison is intent-to-treat across post-merge rows
+whose assignment source is `postmerge_build_number`: an `auto` assignment that
+executes native I/O remains an auto fallback, not a native control. Pre-merge
+rows use `premerge_default` and are excluded from that comparison.
+Multiple client rows can share one server startup; use
+`s_startup_observation_id` to group them and filter
+`b_startup_observation_primary_row:true` to count each startup once.
+
+This policy remains separate from ModelStreamer, MX, GMS, or snapshot
+integrations. Those systems may change the source or bypass raw loading without
 requiring a new combined checkpoint format.
 
 ## Using Checkpoint Loaders

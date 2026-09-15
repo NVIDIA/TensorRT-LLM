@@ -182,8 +182,7 @@ python quickstart_advanced.py \
   --max_seq_len 4096 \
   --kv_cache_fraction 0.5 \
   --spec_decode_algo MTP \
-  --spec_decode_max_draft_len N \
-  --use_one_model
+  --spec_decode_max_draft_len N
 ```
 
 `N` is the number of draft tokens to predict. Start with `N=1` for bring-up, then increase it after

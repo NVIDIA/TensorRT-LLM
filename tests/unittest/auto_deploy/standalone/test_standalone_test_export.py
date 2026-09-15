@@ -58,6 +58,7 @@ def _tracked_autodeploy_tests() -> set[Path]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     return {
         Path(path)

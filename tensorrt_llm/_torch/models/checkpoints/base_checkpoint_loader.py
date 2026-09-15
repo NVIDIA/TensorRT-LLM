@@ -17,6 +17,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
 from tensorrt_llm._torch.models.modeling_utils import \
     CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
 from tensorrt_llm.logger import logger
@@ -89,6 +91,11 @@ class BaseCheckpointLoader(ABC):
         verified and the incoming bytes can safely skip module transform hooks.
         """
         return False
+
+    def build_checkpoint_catalog(self, checkpoint_dir: str,
+                                 **kwargs) -> CheckpointCatalog | None:
+        """Return source metadata for shadow planning when available."""
+        return None
 
     def post_load_apply(self,
                         model: nn.Module,

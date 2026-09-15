@@ -28,8 +28,6 @@ server_configs:
         backend: openai-images
         generation_mode: t2i
         size: 1024x1024
-        num_frames: 1
-        fps: 1
         num_inference_steps: 50
         seed: 42
         max_concurrency: 1

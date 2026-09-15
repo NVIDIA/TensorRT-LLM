@@ -366,7 +366,6 @@ exclude = [
     "tensorrt_llm/_torch/speculative/drafter.py",
     "tensorrt_llm/_torch/speculative/eagle3.py",
     "tensorrt_llm/_torch/speculative/interface.py",
-    "tensorrt_llm/_torch/speculative/model_drafter.py",
     "tensorrt_llm/_torch/speculative/mtp.py",
     "tensorrt_llm/_torch/speculative/ngram.py",
     "tensorrt_llm/_torch/speculative/save_hidden_state.py",

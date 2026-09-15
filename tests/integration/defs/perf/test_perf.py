@@ -58,6 +58,11 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
+QWEN38_MTP_MODELS = {
+    "qwen3.8_max_fp4_mtp",
+    "qwen3.8_flash_next_fp8_mtp",
+    "qwen3.8_flash_next_fp4_mtp",
+}
 KIMI_K3_SERVER_ENV = {
     "KIMI_K3_FP8_WEIGHT_READ": "1",
     "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
@@ -65,6 +70,7 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
     "kimi_k3",
     "minimax_m3_fp4",
@@ -104,6 +110,8 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "deepseek_v4_pro_base_fp8",
+    *QWEN38_MTP_MODELS,
     "qwen3_4b_eagle3",
     "qwen3_235b_a22b_fp4_eagle3",
     "gpt_oss_120b_eagle3",
@@ -423,8 +431,7 @@ class PerfTestConfig:
         runtime: str = "python",
         api: str = "",
         streaming: str = "",
-        backend: str = "",
-        mode: str = "plugin",
+        backend: str = "pytorch",
         data_type: str = "float16",
         max_batch_size: int = 512,
         max_num_tokens: int = 2048,
@@ -443,8 +450,7 @@ class PerfTestConfig:
         tp_size: int = 1,
         pp_size: int = 1,
         num_gpus: int = 1,
-        # only for torch-backend currently
-        extra: bool = False,
+        moe_backend: str | None = None,
         # _autodeploy backend specific parameters
         ad_compile_backend: str = "torch-cudagraph",
         extra_runtime: str = "trtllm",
@@ -452,16 +458,14 @@ class PerfTestConfig:
     ):
         # The model name.
         self.model_name = model_name
-        # Python, cpp, bench, or serve runtime.
+        # Python, bench, or serve runtime.
         self.runtime = runtime
         # API Type: only executor is allowed
         self.api = api
-        # Backend Type: pytorch or cpp
+        # Backend type: pytorch or _autodeploy
         self.backend = backend
         # Streaming responses
         self.streaming = streaming
-        # Plugin or OOTB mode.
-        self.mode = mode
         # Activation dtype.
         self.data_type = data_type
         # Percentage of weights that resides on GPU.
@@ -500,14 +504,11 @@ class PerfTestConfig:
         self.pp_size = pp_size
         # Number of GPUs.
         self.num_gpus = num_gpus
-        # Extra flag to enable pytorch_model_config reading for TRT backend
-        self.extra = extra
+        self.moe_backend = moe_backend
         # _autodeploy backend specific parameters
         self.ad_compile_backend = ad_compile_backend
         self.extra_runtime = extra_runtime
         self.skip_loading_weights = skip_loading_weights
-        # Just build engines
-        self.build_only = False
 
     def to_string(self,
                   custom_server_name: str = None,
@@ -524,26 +525,22 @@ class PerfTestConfig:
         if device_subtype:
             entries.append(f"subtype:{device_subtype}")
 
-        if self.runtime == "cpp":  # bertBenchmark runtime
-            entries.append(f"cpp")
-        elif self.runtime == "serve":
-            entries.append(f"serve")
+        if self.runtime == "serve":
+            entries.append("serve")
             if self.backend == 'pytorch':
-                entries.append(f"pytorch")
+                entries.append("pytorch")
             if self.streaming == "streaming":
-                entries.append(f"streaming")
-        elif self.runtime == "bench":  # trtllm-bench
-            entries.append(f"bench")
+                entries.append("streaming")
+        elif self.runtime == "bench":
+            entries.append("bench")
             if self.backend == 'pytorch':
-                entries.append(f"pytorch")
+                entries.append("pytorch")
             elif self.backend == '_autodeploy':
-                entries.append(f"_autodeploy")
+                entries.append("_autodeploy")
             if self.streaming == "streaming":
-                entries.append(f"streaming")
+                entries.append("streaming")
 
-        # Add mode and dtype.
-        if self.runtime not in ("bench", "serve"):
-            entries.append(self.mode)
+        # Add dtype.
         entries.append(self.data_type)
 
         if self.gpu_weights_percent != -1:
@@ -561,9 +558,6 @@ class PerfTestConfig:
         # Add kv cache free gpu mem fraction.
         if self.kv_cache_free_gpu_mem_fraction != 0.9:
             entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
-
-        if self.build_only:
-            entries.append(f"build_only")
 
         if self.batch_sizes[0] > 0:
             # Add batch size(s).
@@ -632,9 +626,8 @@ class PerfTestConfig:
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
 
-        # Add extra flag for llm-api-config.yml.
-        if self.extra:
-            entries.append("extra")
+        if self.moe_backend is not None:
+            entries.append(f"moe:{self.moe_backend}")
 
         # Concatenate labels with "-".
         return "-".join(entries)
@@ -663,10 +656,8 @@ class PerfTestConfig:
 
         self.api = labels.pop(0) if labels[0] == "exe" else ""
         self.backend = labels.pop(0) if labels[0] in ["pytorch", "_autodeploy"
-                                                      ] else ""
+                                                      ] else "pytorch"
         self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
-        if self.runtime not in ("bench", "serve"):
-            self.mode = labels.pop(0)
         self.data_type = labels.pop(0)
         if labels[0].startswith("gwp"):
             self.gpu_weights_percent = float(labels.pop(0).replace("gwp:", ""))
@@ -685,32 +676,26 @@ class PerfTestConfig:
             self.kv_cache_free_gpu_mem_fraction = float(
                 labels.pop(0).replace("kv_frac:", ""))
 
-        if labels[0] == "build_only":
-            self.build_only = True
-            labels.pop(0)
+        if labels[0].startswith("bs:"):
+            self.batch_sizes = [
+                int(x) for x in labels.pop(0).replace("bs:", "").split("+")
+            ]
+        else:
+            self.batch_sizes = [0]
 
-        if not self.build_only:
-            if labels[0].startswith("bs:"):
-                self.batch_sizes = [
-                    int(x) for x in labels.pop(0).replace("bs:", "").split("+")
-                ]
-            else:
-                self.batch_sizes = [0]
-
-            if labels[0].startswith("input_output_len"):
-                io_lens = labels.pop(0).replace("input_output_len:",
-                                                "").split("+")
-                self.input_lens = [int(x.split(",")[0]) for x in io_lens]
-                self.output_lens = [int(x.split(",")[1]) for x in io_lens]
-            elif labels[0].startswith("input_len"):
-                self.input_lens = [
-                    int(x)
-                    for x in labels.pop(0).replace("input_len:", "").split("+")
-                ]
-                self.output_lens = []
-            else:
-                raise RuntimeError(
-                    f"Unexpected test name label for seq lens: {labels[0]}!")
+        if labels[0].startswith("input_output_len"):
+            io_lens = labels.pop(0).replace("input_output_len:", "").split("+")
+            self.input_lens = [int(x.split(",")[0]) for x in io_lens]
+            self.output_lens = [int(x.split(",")[1]) for x in io_lens]
+        elif labels[0].startswith("input_len"):
+            self.input_lens = [
+                int(x)
+                for x in labels.pop(0).replace("input_len:", "").split("+")
+            ]
+            self.output_lens = []
+        else:
+            raise RuntimeError(
+                f"Unexpected test name label for seq lens: {labels[0]}!")
 
         if len(labels) > 0:
             self.num_beams = 1 if not labels[0].startswith("beams:") else int(
@@ -753,10 +738,9 @@ class PerfTestConfig:
             self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
                 labels.pop(0).replace("gpus:", ""))
 
-        if len(labels) > 0:
-            self.extra = True if labels[0] == "extra" else False
-            if self.extra:
-                labels.pop(0)
+        self.moe_backend = None
+        if labels and labels[0].startswith("moe:"):
+            self.moe_backend = labels.pop(0).removeprefix("moe:")
 
         assert len(
             labels
@@ -781,10 +765,16 @@ class PerfTestConfig:
         VALID_RUNTIMES = ["serve", "bench"]
         assert self.runtime in VALID_RUNTIMES, \
             f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
+        assert self.backend in ["pytorch", "_autodeploy"], \
+            f"Unsupported backend '{self.backend}'."
+        if self.runtime == "serve":
+            assert self.backend == "pytorch", \
+                "The serve runtime supports only the pytorch backend."
 
-        # Validate plugin mode.
-        VALID_MODES = ["plugin", "ootb", "ootb_except_mha"]
-        assert self.mode in VALID_MODES, f"Invalid mode {self.mode}!"
+        if self.moe_backend is not None:
+            assert self.moe_backend, "moe backend must not be empty!"
+            assert self.backend == "pytorch", \
+                "moe backend overrides require the pytorch backend!"
 
         # Validate dtype.
         VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
@@ -829,26 +819,24 @@ class PerfTestConfig:
         assert self.num_gpus == self.tp_size * self.pp_size, f"Num of GPU shall be equal to TP*PP: {self.num_gpus}, {self.tp_size}, {self.pp_size}"
         if self.gpu_weights_percent != -1:
             assert 0 <= self.gpu_weights_percent <= 1, f"Invalid gpu_weights_percent: {self.gpu_weights_percent}!"
-        if not self.build_only:
-            assert len(self.input_lens) > 0, f"Empty input_lens!"
-            if self.is_bert_like():
-                assert len(
-                    self.output_lens
-                ) == 0, f"BERT-like models must not have output_lens!"
-            else:
-                assert len(
-                    self.output_lens
-                ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
+        assert len(self.input_lens) > 0, f"Empty input_lens!"
+        if self.is_bert_like():
+            assert len(self.output_lens
+                       ) == 0, f"BERT-like models must not have output_lens!"
+        else:
+            assert len(
+                self.output_lens
+            ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
 
-            # BERT with small BS is very unstable. Try to avoid it.
-            if self.is_bert_like():
-                if self.runtime == "trtllm-bench":
-                    self.batch_sizes[
-                        0] = self.max_batch_size if self.max_batch_size > 0 else 1
-                    print(f"batch_sizes: {self.batch_sizes}")
-                assert all(
-                    [b >= 32 for b in self.batch_sizes]
-                ), f"BERT with small BS is very unstable! Please increase to at least 32."
+        # BERT with small BS is very unstable. Try to avoid it.
+        if self.is_bert_like():
+            if self.runtime == "bench":
+                self.batch_sizes[
+                    0] = self.max_batch_size if self.max_batch_size > 0 else 1
+                print(f"batch_sizes: {self.batch_sizes}")
+            assert all(
+                [b >= 32 for b in self.batch_sizes]
+            ), f"BERT with small BS is very unstable! Please increase to at least 32."
 
         # Skip if not enough GPUs. TRTLLM_TOTAL_GPU_COUNT overrides
         # auto-detection for multi-node setups.
@@ -926,7 +914,7 @@ class PerfTestConfig:
 
     def get_fixed_dataset_sequence_length(self) -> int | None:
         """Return the common total length when every dataset shape is fixed."""
-        if self.build_only or not self.output_lens:
+        if not self.output_lens:
             return None
 
         if len(self.input_lens) != len(self.output_lens):
@@ -996,18 +984,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         else:
             raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
 
-        if self._config.runtime == "bench":
-            build_script = "trtllm-bench"
-        elif self._config.runtime == "serve":
-            build_script = None
-        elif self._config.runtime == "aggr_server":
-            build_script = None
-        elif self._config.runtime == "multi_node_disagg_server":
-            build_script = None
-        else:
-            raise RuntimeError(
-                f"Invalid runtime {self._config.runtime}: engine-build flows "
-                "were removed with the legacy TensorRT backend.")
+        build_script = "trtllm-bench" if self._config.runtime == "bench" else None
 
         self._build_script = build_script
         self._benchmark_script = benchmark_script
@@ -1023,6 +1000,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def _get_model_yaml_config(self) -> dict:
         config = get_model_yaml_config(self._config.to_string(),
                                        lora_dirs=self.lora_dirs)
+        if self._config.moe_backend is not None:
+            config.setdefault('moe_config',
+                              {})['backend'] = self._config.moe_backend
         uses_pytorch_backend = (self._config.runtime == "serve"
                                 or self._config.backend == "pytorch")
         fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
@@ -1056,36 +1036,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             config['kv_cache_config'] = kv_cache_config
         kv_cache_config.setdefault('avg_seq_len', fixed_sequence_length)
         return config
-
-    def get_trtllm_bench_build_command(self, engine_dir) -> list:
-        model_dir = self.get_trtllm_bench_model()
-        if model_dir == "":
-            pytest.skip("Model Name is not supported by trtllm-bench")
-        # Legacy "<name>_hf" label; weights load from --model_path.
-        model_name = self._config.model_name
-        if not model_name.endswith("_hf"):
-            model_name = model_name + "_hf"
-        build_cmd = [
-            self._build_script, "--log_level=info", f"--workspace={engine_dir}",
-            f"--model={model_name}", f"--model_path={model_dir}", "build",
-            f"--tp_size={self._config.tp_size}",
-            f"--pp_size={self._config.pp_size}"
-        ]
-        max_seq_len = max(self._config.input_lens) + max(
-            self._config.output_lens)
-        build_cmd.append(f"--max_seq_len={max_seq_len}")
-        # Add max_batch_size and max_num_tokens to ensure build matches runtime configuration
-        # Note: trtllm-bench requires both to be specified together (option group constraint)
-        assert self._config.max_batch_size > 0, f"max_batch_size must be > 0, got {self._config.max_batch_size}"
-        assert self._config.max_num_tokens > 0, f"max_num_tokens must be > 0, got {self._config.max_num_tokens}"
-        build_cmd.append(f"--max_batch_size={self._config.max_batch_size}")
-        build_cmd.append(f"--max_num_tokens={self._config.max_num_tokens}")
-        if self._config.quantization:
-            build_cmd.append(
-                f"--quantization={self._config.quantization.upper()}")
-        if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
-            build_cmd.append(f"--trust_remote_code=True")
-        return build_cmd
 
     def get_prepare_data_command(self, engine_dir, input_len,
                                  output_len) -> list:
@@ -1202,14 +1152,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--report_json={report_path}",
             f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
         ]
-        if self._config.backend == "pytorch":
-            benchmark_cmd += ["--backend=pytorch"]
-        elif self._config.backend == "_autodeploy":
-            benchmark_cmd += ["--backend=_autodeploy"]
-        else:
-            benchmark_cmd += [
-                f"--backend=tensorrt", f"--engine_dir={engine_dir}"
-            ]
+        benchmark_cmd += [f"--backend={self._config.backend}"]
         if self._config.num_reqs > 0:
             benchmark_cmd += [f"--num_requests={self._config.num_reqs}"]
         if self._config.concurrency != -1:
@@ -1225,19 +1168,23 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.num_gpus > 1:
             benchmark_cmd += [f"--warmup={2 * self._config.num_gpus}"]
 
-        #Add extra-llm-api-config.yml for pytorch backend and tensorrt backend with extra flag
-        if self._config.backend == "pytorch" or (self._config.backend == ""
-                                                 and self._config.extra):
+        # Add extra-llm-api-config.yml for the PyTorch backend.
+        if self._config.backend == "pytorch":
             pytorch_config_path = os.path.join(engine_dir,
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
                 os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
             config = self._get_model_yaml_config()
             if config:
-                print_info(f"pytorch/TRT model config: {config}")
+                print_info(f"PyTorch model config: {config}")
                 with open(pytorch_config_path, 'w') as f:
                     yaml.dump(config, f, default_flow_style=False)
                 benchmark_cmd += [f"--config={pytorch_config_path}"]
+                # Throughput initializes the dataset tokenizer before loading YAML.
+                if config.get('custom_tokenizer') is not None:
+                    benchmark_cmd += [
+                        f"--custom_tokenizer={config['custom_tokenizer']}"
+                    ]
                 # If guided_decoding_backend is set, we need to initialize tokenizer
                 if config.get('guided_decoding_backend') is not None:
                     benchmark_cmd += ["--no_skip_tokenizer_init"]
@@ -1517,11 +1464,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         real_dataset_path=real_dataset_path)
                     client_cmds.append(client_cmd)
             server_env = os.environ.copy()
+            if self._config.model_name.startswith("qwen3.8_flash_next_"):
+                server_env["TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"] = "1"
             if self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             if self._config.model_name in KIMI_K3_MODELS:
                 server_env.update(KIMI_K3_SERVER_ENV)
-            if self._config.model_name in NEMOTRON_SUPER_MODELS:
+            if self._config.model_name in QWEN38_MTP_MODELS:
+                server_timeout = 5400
+            elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
@@ -1533,14 +1484,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                            server_env=server_env,
                                            server_timeout=server_timeout)
 
-        # Construct engine build command.
+        # PyTorch and AutoDeploy load model checkpoints directly.
         build_cmd = []
-        if self._config.runtime == "bench":
-            if self._config.backend in ["pytorch", "_autodeploy"]:
-                pass
-            else:
-                build_cmd = self.get_trtllm_bench_build_command(engine_dir)
-        else:
+        if self._config.runtime != "bench":
             pytest.skip("only support trtllm-bench and serve runtime")
 
         # Construct prepare synthetic data command
@@ -1827,8 +1773,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         metric_type),
                     cmd_idx=cmd_idx,
                 ))
-        if self._config.build_only:
-            return metrics
 
         # Then, construct inference latency and gpu mem usage metrics, for each
         # bs and each seq len.

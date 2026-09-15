@@ -28,6 +28,19 @@ environment variable as follows:
 | 1                               | Affinity is unconditionally auto-configured.                                                                                 |
 | 0 or any other value            | Affinity remains as configured by the user and/or environment                                                                |
 
+The mask is applied to each TID from a single `/proc/self/task` enumeration,
+not to the main thread alone, so threads created earlier (for example by MPI
+or communication libraries) are covered too. This is best effort: threads
+created concurrently may be missed. A final existing-thread refresh is done
+immediately before the executor worker threads start; later threads inherit
+their creator's mask.
+
+Where the worker shares a process with caller code, non-worker threads in that
+process are rebound too, and the mask is not restored at shutdown. This covers
+a single-process TP1 worker on the classic IPC executor (not the Ray or RPC
+orchestrators), rank 0 of an external `MpiCommSession` or VisualGen launch,
+and the MGMN leader from `trtllm-llmapi-launch`. To opt out, set
+`TLLM_NUMA_AWARE_WORKER_AFFINITY=0` in the launch environment.
 
 ## Other environmental considerations
 

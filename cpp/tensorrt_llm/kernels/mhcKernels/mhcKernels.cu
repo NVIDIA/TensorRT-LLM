@@ -322,13 +322,19 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
 #endif
 }
 
+// The parameter list below must repeat the definition's spelling verbatim, including `__restrict__` and any top-level
+// `const`. cudafe1 rewrites every kernel parameter into a reference when it emits `__wrapper__device_stub_*`, which
+// turns those otherwise-ignored qualifiers into part of the function type. Clang then rejects the instantiation;
+// GCC does not diagnose it.
 #define INST_BIGFUSE(NS, BS)                                                                                           \
-    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/false>(float const*, float const*,                 \
-        __nv_bfloat16 const*, float const*, float const*, float*, float*, __nv_bfloat16*, int, int, int, float, float, \
-        float, float, int, __nv_bfloat16 const*, float);                                                               \
-    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/true>(float const*, float const*,                  \
-        __nv_bfloat16 const*, float const*, float const*, float*, float*, __nv_bfloat16*, int, int, int, float, float, \
-        float, float, int, __nv_bfloat16 const*, float);
+    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/false>(float const* __restrict__,                  \
+        float const* __restrict__, __nv_bfloat16 const* __restrict__, float const* __restrict__,                       \
+        float const* __restrict__, float* __restrict__, float* __restrict__, __nv_bfloat16* __restrict__, int, int,    \
+        int, float, float, float, float, int, __nv_bfloat16 const* __restrict__, float);                               \
+    template __global__ void mhcBigFuseKernel<NS, BS, /*kFuseNorm=*/true>(float const* __restrict__,                   \
+        float const* __restrict__, __nv_bfloat16 const* __restrict__, float const* __restrict__,                       \
+        float const* __restrict__, float* __restrict__, float* __restrict__, __nv_bfloat16* __restrict__, int, int,    \
+        int, float, float, float, float, int, __nv_bfloat16 const* __restrict__, float);
 
 INST_BIGFUSE(1, 128)
 INST_BIGFUSE(1, 256)
@@ -535,9 +541,10 @@ __launch_bounds__(256) __global__ void mhcGemmSqrsumFmaKernel(__nv_bfloat16 cons
     }
 }
 
+// See the note above INST_BIGFUSE: the parameter spelling must match the definition, `__restrict__` included.
 #define INST_FMA(NPB)                                                                                                  \
-    template __global__ void mhcGemmSqrsumFmaKernel<NPB>(                                                              \
-        __nv_bfloat16 const*, float const*, float*, float*, int, int, int);
+    template __global__ void mhcGemmSqrsumFmaKernel<NPB>(__nv_bfloat16 const* __restrict__, float const* __restrict__, \
+        float* __restrict__, float* __restrict__, int, int, int);
 
 INST_FMA(1)
 INST_FMA(2)

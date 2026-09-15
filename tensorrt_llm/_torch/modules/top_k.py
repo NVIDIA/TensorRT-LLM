@@ -11,8 +11,6 @@ import torch.nn as nn
 
 from tensorrt_llm.logger import logger
 
-from ..memory_buffer_utils import get_memory_buffers
-
 
 class TopKImplementation(str, Enum):
     """Top-K implementations grouped by backend and algorithm."""
@@ -36,9 +34,9 @@ class TopK(nn.Module):
 
     GVR decode state is owned by the caller so it can be shared with the
     request metadata and retain a stable address across CUDA Graph replays.
+    Native CUDA scratch is supplied by the caller so its lifetime follows the
+    caller's eager or CUDA-graph metadata.
     """
-
-    _memory_buffers = get_memory_buffers()
 
     def __init__(
         self,
@@ -89,6 +87,8 @@ class TopK(nn.Module):
         next_n: int = 1,
         max_seq_len: int | None = None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
+        radix_aux_indices: torch.Tensor | None = None,
+        radix_aux_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write prefill or decode Top-K indices into ``output_indices``.
 
@@ -110,6 +110,10 @@ class TopK(nn.Module):
                 self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
                 shape ``[num_requests]`` on the same device.
+            radix_aux_indices: Caller-owned int32 workspace for native CUDA
+                Radix split work.
+            radix_aux_logits: Caller-owned float32 workspace for native CUDA
+                Radix split work.
 
         Returns:
             ``output_indices`` after the selected implementation writes it.
@@ -127,6 +131,8 @@ class TopK(nn.Module):
             next_n,
             max_seq_len,
             gvr_ext_kwargs,
+            radix_aux_indices,
+            radix_aux_logits,
         )
 
     def _forward_prefill(
@@ -242,6 +248,8 @@ class TopK(nn.Module):
         next_n: int,
         max_seq_len: int | None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
@@ -253,6 +261,8 @@ class TopK(nn.Module):
                 output_indices,
                 next_n,
                 max_seq_len=max_seq_len,
+                radix_aux_indices=radix_aux_indices,
+                radix_aux_logits=radix_aux_logits,
                 **(gvr_ext_kwargs or {}),
             )
 
@@ -262,6 +272,8 @@ class TopK(nn.Module):
             scan_lengths,
             output_indices,
             next_n,
+            radix_aux_indices,
+            radix_aux_logits,
         )
 
     def _forward_decode_radix(
@@ -271,6 +283,8 @@ class TopK(nn.Module):
         scan_lengths: torch.Tensor,
         output_indices: torch.Tensor,
         next_n: int,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         use_cute_dsl = self.decode_implementation == TopKImplementation.CUTE_DSL_RADIX and not (
             self.compress_ratio > 1 and next_n > 1
@@ -285,7 +299,9 @@ class TopK(nn.Module):
             )
             return output_indices
 
-        radix_indices, radix_values = self._get_radix_workspace(scores)
+        radix_indices, radix_values = self._get_radix_workspace(
+            scores, radix_aux_indices, radix_aux_logits
+        )
         torch.ops.trtllm.indexer_topk_decode(
             scores,
             sequence_lengths,
@@ -298,52 +314,26 @@ class TopK(nn.Module):
         )
         return output_indices
 
-    def _get_workspace(
+    def _get_radix_workspace(
         self,
         scores: torch.Tensor,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-        buffer_name: str,
-    ) -> torch.Tensor:
-        device_buffer_name = f"{buffer_name}_{scores.device}"
-        if scores.is_cuda:
-            with torch.cuda.device(scores.device):
-                capture_graph = torch.cuda.is_current_stream_capturing()
-                return self._memory_buffers.get_buffer(
-                    shape,
-                    dtype=dtype,
-                    buffer_name=device_buffer_name,
-                    reserve_buffer=capture_graph,
-                )
-        return self._memory_buffers.get_buffer(
-            shape,
-            dtype=dtype,
-            buffer_name=device_buffer_name,
-            reserve_buffer=False,
-        )
-
-    def _get_radix_workspace(
-        self, scores: torch.Tensor
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if scores.dtype != torch.float32:
             # The C++ bf16/fp16 entry has no split-work tier or aux-buffer
             # arguments and rejects widths that would require split work.
             return None, None
 
-        shape = (scores.shape[0], _MAX_RADIX_BLOCKS_PER_ROW, self.top_k)
-        radix_indices = self._get_workspace(
-            scores,
-            shape,
-            torch.int32,
-            "top_k_radix_indices_workspace",
+        if radix_aux_indices is None or radix_aux_logits is None:
+            raise ValueError(
+                "Native CUDA Radix TopK requires radix_aux_indices and radix_aux_logits"
+            )
+        num_rows = scores.shape[0]
+        return (
+            radix_aux_indices[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
+            radix_aux_logits[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
         )
-        radix_values = self._get_workspace(
-            scores,
-            shape,
-            torch.float32,
-            "top_k_radix_values_workspace",
-        )
-        return radix_indices, radix_values
 
     def _forward_decode_gvr(
         self,
@@ -352,6 +342,8 @@ class TopK(nn.Module):
         output_indices: torch.Tensor,
         next_n: int,
         max_seq_len: int | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -405,7 +397,9 @@ class TopK(nn.Module):
                 "falling back to the CUDA insertion/radix Top-K path.",
                 key="selfsampling_topk_fallthrough",
             )
-            radix_indices, radix_values = self._get_radix_workspace(scores)
+            radix_indices, radix_values = self._get_radix_workspace(
+                scores, radix_aux_indices, radix_aux_logits
+            )
             torch.ops.trtllm.indexer_topk_decode(
                 scores,
                 sequence_lengths,

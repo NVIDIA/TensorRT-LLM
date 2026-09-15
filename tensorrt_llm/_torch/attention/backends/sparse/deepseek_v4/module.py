@@ -161,7 +161,10 @@ def create_sparse_attn_weights(self) -> None:
             ),
             requires_grad=False,
         )
-        if is_sm_100f():
+        from tensorrt_llm._torch.attention.mla import _is_cute_dsl_fp8_bmm_available
+
+        # The FP8 o_a_proj is consumed by the SM-specific CuTe DSL BMM below.
+        if _is_cute_dsl_fp8_bmm_available():
             self.o_a_proj = nn.Parameter(
                 torch.empty(
                     (
@@ -218,8 +221,10 @@ def _run_dsv4_o_lora_bmms(
         o_lora_bmm_input: tuple[torch.Tensor, torch.Tensor],
         phase_o_lora_output: torch.Tensor,
     ) -> None:
+        from tensorrt_llm._torch.attention.mla import _cute_dsl_fp8_bmm_out
+
         attn_fp8, attn_scale = o_lora_bmm_input
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        _cute_dsl_fp8_bmm_out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,
@@ -301,7 +306,14 @@ def project_sparse_attn_output(
 
     # Fuse inverse RoPE with FP8 quantization to avoid a BF16 latent read/write.
     # This is independent of the K/V absorption BMM implementation.
-    fused_inv_rope_fp8 = self.o_a_proj.dtype == torch.float8_e4m3fn and is_sm_100f()
+    from tensorrt_llm._torch.attention.mla import (
+        _cute_dsl_fp8_bmm_out,
+        _is_cute_dsl_fp8_bmm_available,
+    )
+
+    fused_inv_rope_fp8 = (
+        self.o_a_proj.dtype == torch.float8_e4m3fn and _is_cute_dsl_fp8_bmm_available()
+    )
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
         attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
@@ -320,7 +332,7 @@ def project_sparse_attn_output(
             device=attn_output_tensor.device,
             dtype=self.dtype,
         )
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        _cute_dsl_fp8_bmm_out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,

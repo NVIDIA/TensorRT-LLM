@@ -273,8 +273,8 @@ PlanDrafter's progress entry.
 
 When the orchestrator's replan-review prompt declares the turn
 **feedback-triggered**, the PlanDrafter holds a one-turn override: it
-may interrupt the `— IN_PROGRESS` Stage. Call `read_human_feedback` to
-see the feedback the revision must serve, then audit the interrupt
+may interrupt the `— IN_PROGRESS` Stage. Use the human feedback you are
+given to see what the revision must serve, then audit the interrupt
 against the override's exact shape instead of auto-REJECTing it:
 
 - Legal interrupt edits: the active Stage's header flipped to

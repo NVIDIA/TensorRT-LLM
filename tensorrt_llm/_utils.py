@@ -472,11 +472,22 @@ def mpi_comm():
     return comm
 
 
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+_local_comm = None
 
 
 def local_mpi_comm():
-    return local_comm
+    # Split lazily instead of at import time. Splitting needs an MPI runtime
+    # that supports it, and `import tensorrt_llm` must not require one: a
+    # CPU-only build container can complete MPI_Init and handle Comm.Dup,
+    # Comm.Split and Create_group, yet still fail Split_type with
+    # MPI_ERR_OTHER — for the portable MPI_COMM_TYPE_SHARED just as much as for
+    # OMPI_COMM_TYPE_HOST — which turned the import itself into a hard error.
+    # Every consumer of this communicator is already lazy, so nothing needs it
+    # before first use.
+    global _local_comm
+    if _local_comm is None:
+        _local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+    return _local_comm
 
 
 # Global TorchDist instance for Ray orchestrator
@@ -541,7 +552,7 @@ def local_mpi_rank():
 
 
 def local_mpi_size():
-    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+    return local_mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def default_gpus_per_node():
@@ -560,7 +571,7 @@ def mpi_barrier():
 
 def local_mpi_barrier():
     if ENABLE_MULTI_DEVICE:
-        local_comm.Barrier()
+        local_mpi_comm().Barrier()
 
 
 def mpi_broadcast(obj, root=0):

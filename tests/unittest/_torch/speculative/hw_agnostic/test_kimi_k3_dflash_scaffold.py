@@ -193,6 +193,7 @@ def test_generator_tiny_roundtrip(tmp_path):
     subprocess.run(
         [sys.executable, GEN.__file__, "--tiny", "--out", str(out)],
         check=True,
+        timeout=120,
     )
     with open(out / "config.json") as f:
         cfg = json.load(f)
@@ -250,6 +251,7 @@ def test_generator_real_config_mode(tmp_path):
     subprocess.run(
         [sys.executable, GEN.__file__, "--config", str(cfg_path), "--out", str(out)],
         check=True,
+        timeout=120,
     )
     with open(out / "config.json") as f:
         emitted = json.load(f)

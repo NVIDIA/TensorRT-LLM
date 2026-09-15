@@ -31,7 +31,7 @@ from pydantic import BaseModel
 from tensorrt_llm.usage.config import TelemetryField
 
 CAPTURE_VERSION = "2"
-FIELD_POLICY_VERSION = "2"
+FIELD_POLICY_VERSION = "3"
 API_CONTRACT_VERSION = "0.2.0"
 CAPTURE_SOURCE = "effective_validated_llm_args"
 
@@ -43,7 +43,6 @@ MAX_CONFIG_BYTES = 16384
 
 _TELEMETRY_EXTRA_KEY = "telemetry"
 _TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
-_APPROVED_CONVERTERS = {"allowlist"}
 
 # Per-sequence cap, applied recursively so each inner list of a nested
 # List[List[int]] is bounded independently. 256 sits above the longest realistic
@@ -72,10 +71,6 @@ def _is_pydantic_model(value: Any) -> bool:
     return isinstance(value, BaseModel)
 
 
-def _none_type() -> type[None]:
-    return type(None)
-
-
 def _unwrap_annotated(annotation: Any) -> Any:
     while get_origin(annotation) is Annotated:
         annotation = get_args(annotation)[0]
@@ -86,75 +81,21 @@ def _is_union(annotation: Any) -> bool:
     return get_origin(annotation) in {Union, types.UnionType}
 
 
-def _unwrap_optional(annotation: Any) -> Any:
-    annotation = _unwrap_annotated(annotation)
-    if not _is_union(annotation):
-        return annotation
-    branches = [arg for arg in get_args(annotation) if arg is not _none_type()]
-    if len(branches) == 1:
-        return branches[0]
-    return annotation
-
-
 def _is_literal(annotation: Any) -> bool:
     return get_origin(annotation) is Literal
 
 
 def _is_enum_annotation(annotation: Any) -> bool:
-    try:
-        return isinstance(annotation, type) and issubclass(annotation, Enum)
-    except TypeError:
-        return False
+    return isinstance(annotation, type) and issubclass(annotation, Enum)
 
 
 def _is_path_annotation(annotation: Any) -> bool:
-    try:
-        return isinstance(annotation, type) and issubclass(annotation, Path)
-    except TypeError:
-        return False
+    return isinstance(annotation, type) and issubclass(annotation, Path)
 
 
 def _is_callable_annotation(annotation: Any) -> bool:
     origin = get_origin(annotation)
     return annotation is Callable or origin is Callable
-
-
-def _is_safe_annotation_branch(annotation: Any) -> bool:
-    annotation = _unwrap_annotated(annotation)
-    origin = get_origin(annotation)
-
-    if annotation is Any:
-        return False
-    if annotation is _none_type():
-        return True
-    if _is_literal(annotation):
-        return True
-    if _is_enum_annotation(annotation):
-        return True
-    if annotation in {bool, int, float}:
-        return True
-    if annotation is str or annotation is object:
-        return False
-    if _is_path_annotation(annotation) or _is_callable_annotation(annotation):
-        return False
-    if _is_union(annotation):
-        return all(_is_safe_annotation_branch(arg) for arg in get_args(annotation))
-    if origin in {list, tuple, set}:
-        args = get_args(annotation)
-        return bool(args) and all(_is_safe_annotation_branch(arg) for arg in args)
-    if origin is dict:
-        return False
-    return False
-
-
-def _union_needs_converter(annotation: Any) -> bool:
-    annotation = _unwrap_annotated(annotation)
-    if not _is_union(annotation):
-        return False
-    branches = [arg for arg in get_args(annotation) if arg is not _none_type()]
-    if len(branches) <= 1:
-        return False
-    return not all(_is_safe_annotation_branch(arg) for arg in branches)
 
 
 def _normalize_metadata(metadata: Any) -> dict[str, Any] | None:
@@ -163,7 +104,7 @@ def _normalize_metadata(metadata: Any) -> dict[str, Any] | None:
     if metadata is False:
         return {"exclude": True}
     if metadata is True:
-        return {"kind": "value"}
+        return {}
     if isinstance(metadata, TelemetryField):
         return metadata.as_json_schema_extra()
     if isinstance(metadata, dict):
@@ -180,81 +121,230 @@ def _get_telemetry_metadata(field_info: Any) -> dict[str, Any] | None:
     return _normalize_metadata(json_schema_extra.get(_TELEMETRY_EXTRA_KEY))
 
 
-def _converter_is_approved(metadata: dict[str, Any]) -> bool:
-    return metadata.get("converter") in _APPROVED_CONVERTERS
-
-
 def _is_explicit_exclude(metadata: dict[str, Any] | None) -> bool:
     return bool(metadata) and metadata.get("exclude") is True
 
 
-def _metadata_has_allowlist(metadata: dict[str, Any]) -> bool:
-    return _converter_is_approved(metadata) or metadata.get("allowed_values") is not None
+@dataclass(frozen=True)
+class _CapturePolicy:
+    """Compiled runtime sanitizer policy for one annotated field."""
+
+    policy_type: str
+    runtime_type: Any = None
+    allowed_values: tuple[Any, ...] = ()
+    branches: tuple["_CapturePolicy", ...] = ()
 
 
-def derive_kind(annotation: Any, metadata: dict[str, Any]) -> str:
-    """Derive a telemetry field's kind from its annotation and metadata.
+@dataclass(frozen=True)
+class _PolicyVariant:
+    """Policy for a field as declared by one reachable model arm."""
 
-    Categorical iff the Optional-unwrapped annotation is a Literal or Enum, or it
-    carries an allowlist; otherwise a plain value. Any registered kind is ignored
-    so kind stays annotation-driven.
-    """
-    if _metadata_has_allowlist(metadata):
-        return "categorical"
-    unwrapped = _unwrap_optional(annotation)
-    if _is_literal(unwrapped) or _is_enum_annotation(unwrapped):
-        return "categorical"
-    return "value"
-
-
-def _annotation_is_capture_safe(annotation: Any) -> bool:
-    return _is_safe_annotation_branch(annotation)
+    owner: type[BaseModel]
+    policy: _CapturePolicy
 
 
 @dataclass(frozen=True)
 class _ManifestEntry:
     path: str
-    annotation: Any  # real type object — needed by the sanitizer
     kind: str
-    converter: str
-    allowed_values: tuple[str, ...]
-    metadata: dict[str, Any]  # normalized metadata (allowlist) for the sanitizer
+    capture_types: tuple[str, ...]
+    allowed_values: tuple[Any, ...]
+    variants: tuple[_PolicyVariant, ...]
 
 
-def _domain_values(annotation: Any, metadata: dict[str, Any]) -> list[str]:
-    """Compute a field's allowed-value domain.
+def _is_safe_scalar(value: Any) -> bool:
+    if value is None:
+        return True
+    if type(value) not in {bool, int, float, str}:
+        return False
+    return not isinstance(value, float) or math.isfinite(value)
 
-    Explicit allowlist wins; else Literal args AND Enum members found anywhere in
-    the annotation tree, order-preserving + deduped. Mirrors what _sanitize_value
-    would emit for an Enum (str value, else name).
-    """
-    allowlist = metadata.get("allowed_values") if metadata else None
-    if isinstance(allowlist, (list, tuple, set)):
-        return [str(v) for v in allowlist]
 
-    values: list[str] = []
+def _typed_equal(left: Any, right: Any) -> bool:
+    return type(left) is type(right) and left == right
 
-    def rec(ann: Any) -> None:
-        ann = _unwrap_annotated(ann)
-        if _is_literal(ann):
-            for v in get_args(ann):
-                if isinstance(v, (bool, int, float, str)) or v is None:
-                    values.append(str(v))
-            return
-        if _is_enum_annotation(ann):
-            for member in ann:
-                values.append(member.value if isinstance(member.value, str) else member.name)
-            return
-        if _is_union(ann) or get_origin(ann) in {list, tuple, set}:
-            for arg in get_args(ann):
-                rec(arg)
 
-    rec(annotation)
-    seen: list[str] = []
-    for v in values:
-        if v not in seen:
-            seen.append(v)
-    return seen
+def _dedupe_typed(values: list[Any]) -> tuple[Any, ...]:
+    deduped: list[Any] = []
+    for value in values:
+        if not any(_typed_equal(value, seen) for seen in deduped):
+            deduped.append(value)
+    return tuple(deduped)
+
+
+def _policy_key(policy: _CapturePolicy) -> tuple[Any, ...]:
+    """Typed structural identity for a compiled capture policy."""
+    return (
+        policy.policy_type,
+        policy.runtime_type,
+        tuple((type(value), value) for value in policy.allowed_values),
+        tuple(_policy_key(branch) for branch in policy.branches),
+    )
+
+
+def _combine_policies(policies: list[_CapturePolicy]) -> _CapturePolicy | None:
+    branches: list[_CapturePolicy] = []
+    for policy in policies:
+        candidates = policy.branches if policy.policy_type == "union" else (policy,)
+        for candidate in candidates:
+            if not any(_policy_key(candidate) == _policy_key(branch) for branch in branches):
+                branches.append(candidate)
+    if not branches:
+        return None
+    if len(branches) == 1:
+        return branches[0]
+    return _CapturePolicy("union", branches=tuple(branches))
+
+
+def _compile_sequence_policy(annotation: Any) -> _CapturePolicy | None:
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in {list, set} and len(args) == 1:
+        element_annotations = args
+    elif origin is tuple and args:
+        element_annotations = args[:1] if len(args) == 2 and args[1] is Ellipsis else args
+    else:
+        return None
+
+    element_policies: list[_CapturePolicy] = []
+    for element_annotation in element_annotations:
+        policy = _compile_annotation_policy(element_annotation)
+        if policy is None:
+            return None
+        element_policies.append(policy)
+    if any(
+        _policy_key(policy) != _policy_key(element_policies[0]) for policy in element_policies[1:]
+    ):
+        return None
+    return _CapturePolicy("sequence", runtime_type=origin, branches=(element_policies[0],))
+
+
+def _compile_annotation_policy(annotation: Any) -> _CapturePolicy | None:
+    """Compile only capture-safe annotation branches into a sanitizer policy."""
+    annotation = _unwrap_annotated(annotation)
+
+    if annotation is Any or annotation in {str, object}:
+        return None
+    if annotation is types.NoneType:
+        return _CapturePolicy("none")
+    if _is_path_annotation(annotation) or _is_callable_annotation(annotation):
+        return None
+    if _is_literal(annotation):
+        values = list(get_args(annotation))
+        if not values or not all(_is_safe_scalar(value) for value in values):
+            return None
+        return _CapturePolicy("literal", allowed_values=_dedupe_typed(values))
+    if _is_enum_annotation(annotation):
+        return _CapturePolicy("enum", runtime_type=annotation)
+    if annotation in {bool, int, float}:
+        return _CapturePolicy(annotation.__name__)
+    if _is_union(annotation):
+        policies: list[_CapturePolicy] = []
+        for branch in get_args(annotation):
+            policy = _compile_annotation_policy(branch)
+            if policy is not None:
+                policies.append(policy)
+        # Optional does not make an otherwise unsafe field capturable by itself.
+        if not any(policy.policy_type != "none" for policy in policies):
+            return None
+        return _combine_policies(policies)
+
+    return _compile_sequence_policy(annotation)
+
+
+def _annotation_allows_none(annotation: Any) -> bool:
+    annotation = _unwrap_annotated(annotation)
+    return annotation is types.NoneType or (
+        _is_union(annotation)
+        and any(_unwrap_annotated(branch) is types.NoneType for branch in get_args(annotation))
+    )
+
+
+def _annotation_accepts_allowed_value(annotation: Any, value: Any) -> bool:
+    """Whether an unsafe annotation branch can own an explicit scalar token."""
+    annotation = _unwrap_annotated(annotation)
+    if annotation is Any or annotation is object:
+        return _is_safe_scalar(value)
+    if annotation is str:
+        return type(value) is str
+    if _is_path_annotation(annotation) or _is_callable_annotation(annotation):
+        return False
+    if _is_union(annotation):
+        return any(
+            _annotation_accepts_allowed_value(branch, value) for branch in get_args(annotation)
+        )
+    return False
+
+
+def _explicit_allowlist_policy(annotation: Any, metadata: dict[str, Any]) -> _CapturePolicy | None:
+    if "allowed_values" not in metadata:
+        return None
+    allowed_values = metadata["allowed_values"]
+    if not isinstance(allowed_values, (list, tuple, set)) or not allowed_values:
+        raise ValueError("telemetry allowed_values must be a non-empty sequence")
+    values = list(allowed_values)
+    if isinstance(allowed_values, set):
+        values.sort(key=lambda value: f"{type(value).__name__}:{_canonical_json(value)}")
+    if not all(_is_safe_scalar(value) for value in values):
+        raise ValueError("telemetry allowed_values must contain only finite JSON scalars")
+    if not all(_annotation_accepts_allowed_value(annotation, value) for value in values):
+        raise ValueError(
+            "telemetry allowed_values must belong to an unsafe scalar annotation branch"
+        )
+    return _CapturePolicy("allowlist", allowed_values=_dedupe_typed(values))
+
+
+def _compile_field_policy(annotation: Any, metadata: dict[str, Any]) -> _CapturePolicy | None:
+    annotation_policy = _compile_annotation_policy(annotation)
+    policies: list[_CapturePolicy] = []
+    allowlist_policy = _explicit_allowlist_policy(annotation, metadata)
+    if allowlist_policy is not None:
+        policies.append(allowlist_policy)
+        if annotation_policy is None and _annotation_allows_none(annotation):
+            policies.append(_CapturePolicy("none"))
+    if annotation_policy is not None:
+        policies.append(annotation_policy)
+    return _combine_policies(policies)
+
+
+def _enum_output(member: Enum) -> str:
+    return member.value if isinstance(member.value, str) else member.name
+
+
+def _policy_allowed_values(policy: _CapturePolicy) -> tuple[Any, ...]:
+    values: list[Any] = []
+    if policy.policy_type in {"literal", "allowlist"}:
+        values.extend(policy.allowed_values)
+    elif policy.policy_type == "enum":
+        values.extend(_enum_output(member) for member in policy.runtime_type)
+    elif policy.policy_type in {"union", "sequence"}:
+        for branch in policy.branches:
+            values.extend(_policy_allowed_values(branch))
+    return _dedupe_typed(values)
+
+
+def _policy_signature(policy: _CapturePolicy) -> str:
+    if policy.policy_type == "sequence":
+        return f"{policy.runtime_type.__name__}[{_policy_signature(policy.branches[0])}]"
+    if policy.policy_type == "union":
+        signatures = sorted({_policy_signature(branch) for branch in policy.branches})
+        return "|".join(signatures)
+    if policy.policy_type == "enum":
+        return f"enum[{policy.runtime_type.__name__}]"
+    return policy.policy_type
+
+
+def _policy_capture_types(policy: _CapturePolicy) -> tuple[str, ...]:
+    branches = policy.branches if policy.policy_type == "union" else (policy,)
+    return tuple(sorted({_policy_signature(branch) for branch in branches}))
+
+
+def _policy_kind(policy: _CapturePolicy) -> str:
+    if policy.policy_type in {"literal", "enum", "allowlist"}:
+        return "categorical"
+    if any(_policy_kind(branch) == "categorical" for branch in policy.branches):
+        return "categorical"
+    return "value"
 
 
 def _nested_models(annotation: Any) -> list[type]:
@@ -282,32 +372,16 @@ def _nested_models(annotation: Any) -> list[type]:
     return deduped
 
 
-def _defining_class(cls: type, field_name: str) -> str:
-    for klass in cls.__mro__:
-        if field_name in getattr(klass, "__annotations__", {}):
-            return f"{klass.__name__}.{field_name}"
-    return f"{cls.__name__}.{field_name}"
-
-
-def _field_is_selected(annotation: Any, metadata: dict[str, Any] | None) -> bool:
-    if _is_explicit_exclude(metadata):
-        return False
-    if _annotation_is_capture_safe(annotation):
-        return True
-    if metadata is not None and _converter_is_approved(metadata):
-        return True
-    return False
-
-
 def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     """Walk real type objects and emit the complete capturable manifest.
 
     The single source of truth. Type-safe annotations auto-enroll; str/Any
     allowlist escape hatches opt in; telemetry=False opts out. Recurses into
     statically reachable nested BaseModels with a cycle guard. Collapses
-    duplicate keys (shared union-arm base fields): keeps the first by
-    (key, defining_class), unions allowed_values across arms, and FAILS if two
-    arms give a key a different kind.
+    duplicate keys shared by nested model union arms while retaining an
+    owner-specific compiled policy for every arm. Display domains and capture
+    types are merged, but runtime sanitization selects only the active arm's
+    policy. Conflicting kinds fail manifest construction.
     """
     rows: list[dict[str, Any]] = []
 
@@ -318,72 +392,83 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
             key = f"{prefix}.{fname}" if prefix else fname
             ann = finfo.annotation
             meta = _get_telemetry_metadata(finfo)
-            if _field_is_selected(ann, meta):
-                normalized = meta if (meta and not _is_explicit_exclude(meta)) else {}
+            if _is_explicit_exclude(meta):
+                continue
+            policy = _compile_field_policy(ann, meta or {})
+            if policy is not None:
                 rows.append(
                     {
                         "key": key,
-                        "defining": _defining_class(cls, fname),
-                        "annotation": ann,
-                        "kind": derive_kind(ann, normalized),
-                        "converter": str(normalized.get("converter", "")),
-                        "allowed": _domain_values(ann, normalized),
-                        "metadata": normalized,
+                        "owner": cls,
+                        "policy": policy,
+                        "kind": _policy_kind(policy),
                     }
                 )
-            if not _is_explicit_exclude(meta):
-                for sub in _nested_models(ann):
-                    walk(sub, key, (*stack, cls))
+            for sub in _nested_models(ann):
+                walk(sub, key, (*stack, cls))
 
     walk(model_cls, "", ())
 
-    rows.sort(key=lambda r: (r["key"], r["defining"]))
-    first: dict[str, dict] = {}
-    union_allowed: dict[str, list[str]] = {}
+    rows.sort(key=lambda r: (r["key"], r["owner"].__module__, r["owner"].__qualname__))
+    grouped: dict[str, dict[str, Any]] = {}
     for r in rows:
-        if r["key"] not in first:
-            first[r["key"]] = r
-        elif first[r["key"]]["kind"] != r["kind"]:
+        key = r["key"]
+        if key not in grouped:
+            grouped[key] = {"kind": r["kind"], "variants": []}
+        elif grouped[key]["kind"] != r["kind"]:
             raise ValueError(
-                f"telemetry manifest: key '{r['key']}' has conflicting kinds "
-                f"across union arms: {first[r['key']]['kind']} vs {r['kind']}"
+                f"telemetry manifest: key '{key}' has conflicting kinds "
+                f"across model arms: {grouped[key]['kind']} vs {r['kind']}"
             )
-        seen = union_allowed.setdefault(r["key"], [])
-        for v in r["allowed"]:
-            if v not in seen:
-                seen.append(v)
+        variants: list[_PolicyVariant] = grouped[key]["variants"]
+        matching = [variant for variant in variants if variant.owner is r["owner"]]
+        if matching:
+            if any(_policy_key(variant.policy) != _policy_key(r["policy"]) for variant in matching):
+                raise ValueError(
+                    f"telemetry manifest: key '{key}' has conflicting policies "
+                    f"for model arm {r['owner'].__qualname__}"
+                )
+            continue
+        variants.append(_PolicyVariant(owner=r["owner"], policy=r["policy"]))
 
-    entries = [
-        _ManifestEntry(
-            path=key,
-            annotation=r["annotation"],
-            kind=r["kind"],
-            converter=r["converter"],
-            allowed_values=tuple(union_allowed[key]),
-            metadata=r["metadata"],
+    entries = []
+    for key, group in grouped.items():
+        variants = tuple(group["variants"])
+        allowed_values: list[Any] = []
+        capture_types: set[str] = set()
+        for variant in variants:
+            allowed_values.extend(_policy_allowed_values(variant.policy))
+            capture_types.update(_policy_capture_types(variant.policy))
+        entries.append(
+            _ManifestEntry(
+                path=key,
+                kind=group["kind"],
+                capture_types=tuple(sorted(capture_types)),
+                allowed_values=_dedupe_typed(allowed_values),
+                variants=variants,
+            )
         )
-        for key, r in first.items()
-    ]
     entries.sort(key=lambda e: e.path)
     return entries
 
 
-def manifest_rows(model_cls: type[BaseModel]) -> list[dict[str, Any]]:
-    """Serializable, human-legible projection of build_capture_manifest.
-
-    Used by the committed golden, the docs renderer, and the
-    capture_manifest_digest.
-    """
-    return [
-        {
-            "path": e.path,
-            "annotation": _annotation_repr(e.annotation),
-            "kind": e.kind,
-            "converter": e.converter,
-            "allowed_values": list(e.allowed_values),
+def _manifest_rows(entries: list[_ManifestEntry]) -> list[dict[str, Any]]:
+    rows = []
+    for entry in entries:
+        row = {
+            "path": entry.path,
+            "kind": entry.kind,
+            "capture_policy": "|".join(entry.capture_types),
         }
-        for e in build_capture_manifest(model_cls)
-    ]
+        if entry.allowed_values:
+            row["allowed_values"] = list(entry.allowed_values)
+        rows.append(row)
+    return rows
+
+
+def manifest_rows(model_cls: type[BaseModel]) -> list[dict[str, Any]]:
+    """Serializable projection used by the golden, docs, and manifest digest."""
+    return _manifest_rows(build_capture_manifest(model_cls))
 
 
 def golden_manifest() -> dict[str, list[dict[str, Any]]]:
@@ -394,124 +479,74 @@ def golden_manifest() -> dict[str, list[dict[str, Any]]]:
     }
 
 
-def _sanitize_allowlist(value: Any, metadata: dict[str, Any]) -> tuple[bool, Any]:
-    """Capture value only when it matches field-owned allowed values."""
-    allowed_values = metadata.get("allowed_values")
-    if not isinstance(allowed_values, (list, tuple, set)):
-        return False, None
+def _sanitize_allowed_value(value: Any, allowed_values: tuple[Any, ...]) -> tuple[bool, Any]:
+    """Capture only a finite scalar matching an exact typed allowed value."""
     candidates = [value]
     if isinstance(value, Enum):
-        candidates.append(value.value)
-        candidates.append(value.name)
-        candidates.append(value.name.lower())
-
+        enum_output = _enum_output(value)
+        candidates.extend((value.value, enum_output))
+        if isinstance(enum_output, str):
+            candidates.append(enum_output.lower())
     for candidate in candidates:
-        if candidate in allowed_values and (
-            isinstance(candidate, (bool, int, float, str)) or candidate is None
+        if _is_safe_scalar(candidate) and any(
+            _typed_equal(candidate, allowed) for allowed in allowed_values
         ):
             return True, candidate
     return False, None
 
 
-def _sanitize_literal(value: Any, annotation: Any) -> tuple[bool, Any]:
-    """Capture only values declared by Literal annotation."""
-    allowed = get_args(annotation)
-    if value in allowed:
-        return True, value
-    return False, None
-
-
-def _sanitize_sequence(
+def _sanitize_policy(
     value: Any,
-    annotation: Any,
-    metadata: dict[str, Any],
+    policy: _CapturePolicy,
     state: _CaptureState | None = None,
 ) -> tuple[bool, Any]:
-    """Sanitize homogeneous sequence values. Reject whole sequence on one bad item.
-
-    Captured items are capped at MAX_SEQ_ITEMS. The cap rides the recursive
-    _sanitize_value call, so each inner list of a nested sequence is bounded
-    independently. When any sequence is clipped, state.sequence_truncated is
-    set so the metadata reports the truncation honestly.
-    """
-    annotation = _unwrap_optional(annotation)
-    origin = get_origin(annotation)
-    if origin not in {list, tuple, set}:
-        element_annotation = Any
-    else:
-        args = get_args(annotation)
-        # Homogeneous only. tuple[int, str] uses first annotation and rejects on
-        # mismatch. Fail closed if future telemetry field adds heterogeneous tuple.
-        element_annotation = args[0] if args else Any
-
-    sanitized = []
-    for item in value:
-        item_safe, item_value = _sanitize_value(item, element_annotation, metadata, state)
-        if not item_safe:
+    """Try the compiled policy branches and return one telemetry-safe value."""
+    if policy.policy_type == "union":
+        for branch in policy.branches:
+            is_safe, sanitized = _sanitize_policy(value, branch, state)
+            if is_safe:
+                return True, sanitized
+        return False, None
+    if policy.policy_type == "none":
+        return (True, None) if value is None else (False, None)
+    if policy.policy_type == "bool":
+        return (True, value) if type(value) is bool else (False, None)
+    if policy.policy_type == "int":
+        return (True, value) if type(value) is int else (False, None)
+    if policy.policy_type == "float":
+        # The Python numeric tower permits an int where float is annotated,
+        # and Pydantic does not validate every default. Normalize such values
+        # to the annotation's JSON number shape, while still excluding bool.
+        if type(value) not in {int, float}:
             return False, None
-        sanitized.append(item_value)
-    if origin is set:
-        sanitized = sorted(sanitized, key=_canonical_json)
-    if len(sanitized) > MAX_SEQ_ITEMS:
-        sanitized = sanitized[:MAX_SEQ_ITEMS]
-        if state is not None:
-            state.sequence_truncated = True
-    return True, sanitized
-
-
-def _sanitize_value(
-    value: Any,
-    annotation: Any,
-    metadata: dict[str, Any],
-    state: _CaptureState | None = None,
-) -> tuple[bool, Any]:
-    """Return telemetry-safe primitive value, else exclude it.
-
-    Bare strings are unsafe unless Literal or allowlist-converted. Exclusion is
-    visible through unsafe_excluded metadata.
-    """
-    has_converter = _converter_is_approved(metadata)
-    if _union_needs_converter(annotation) and not has_converter:
-        return False, None
-    if not has_converter and not _annotation_is_capture_safe(annotation):
-        return False, None
-    annotation = _unwrap_optional(annotation)
-
-    # None: Optional field unset -> capture as null, regardless of converter.
-    # Must precede the allowlist branch, else None on an Optional allowlist field
-    # fails the allowlist and falsely flips unsafe_excluded.
-    if value is None:
-        return True, None
-
-    if has_converter:
-        return _sanitize_allowlist(value, metadata)
-    if isinstance(value, Enum):
-        enum_value = value.value
-        if isinstance(enum_value, str):
-            return True, enum_value
-        # Enum.name always str. Prefer stable names for int-valued enums.
-        return True, value.name
-    # bool before int. Python bool is int subclass; keep True/False not 1/0.
-    if isinstance(value, bool):
-        return True, value
-    if isinstance(value, int) and not isinstance(value, bool):
-        return True, value
-    if isinstance(value, float):
-        # Reject nan/inf. json.dumps emits the bare NaN/Infinity tokens for
-        # non-finite floats, which are invalid JSON and break downstream
-        # parsing and digest stability.
-        if not math.isfinite(value):
+        try:
+            normalized = float(value)
+        except OverflowError:
             return False, None
-        return True, value
-    if isinstance(value, str):
-        if _is_literal(annotation):
-            return _sanitize_literal(value, annotation)
-        # Bare str can be path/secret/user text. Require Literal or allowlist.
-        return False, None
-    if isinstance(value, Path):
-        return False, None
-    if isinstance(value, (list, tuple, set)):
-        return _sanitize_sequence(value, annotation, metadata, state)
+        return (True, normalized) if math.isfinite(normalized) else (False, None)
+    if policy.policy_type in {"literal", "allowlist"}:
+        return _sanitize_allowed_value(value, policy.allowed_values)
+    if policy.policy_type == "enum":
+        if type(value) is not policy.runtime_type:
+            return False, None
+        return True, _enum_output(value)
+    if policy.policy_type == "sequence":
+        if type(value) is not policy.runtime_type:
+            return False, None
+        element_policy = policy.branches[0]
+        sanitized = []
+        for item in value:
+            item_safe, item_value = _sanitize_policy(item, element_policy, state)
+            if not item_safe:
+                return False, None
+            sanitized.append(item_value)
+        if policy.runtime_type is set:
+            sanitized.sort(key=_canonical_json)
+        if len(sanitized) > MAX_SEQ_ITEMS:
+            sanitized = sanitized[:MAX_SEQ_ITEMS]
+            if state is not None:
+                state.sequence_truncated = True
+        return True, sanitized
     return False, None
 
 
@@ -533,27 +568,34 @@ def _schema_digest(model_cls: type[BaseModel]) -> str:
     return _digest({"class": model_cls.__name__, "fields": schema_fields})
 
 
-def _resolve_path(instance: BaseModel, path: str) -> tuple[bool, Any]:
+def _resolve_path(instance: BaseModel, path: str) -> tuple[bool, Any, BaseModel | None]:
     """Resolve a dotted manifest path against a live instance.
 
-    Returns (present, value). Skips when a parent segment is missing/None or is
-    not a pydantic model (unset config, or a discriminated-union arm that isn't
-    the active one). A present leaf whose value is None resolves as (True, None).
+    Returns (present, value, leaf owner). Skips when a parent segment is
+    missing/None or is not a pydantic model (unset config, or a union arm that
+    is not active). The owner selects that arm's compiled capture policy.
     """
     segments = path.split(".")
     obj: Any = instance
     for seg in segments[:-1]:
         if not _is_pydantic_model(obj):
-            return False, None
+            return False, None, None
         if seg not in obj.__class__.model_fields:
-            return False, None
+            return False, None, None
         obj = getattr(obj, seg, None)
         if obj is None:
-            return False, None
+            return False, None, None
     leaf = segments[-1]
     if not _is_pydantic_model(obj) or leaf not in obj.__class__.model_fields:
-        return False, None
-    return True, getattr(obj, leaf, None)
+        return False, None, None
+    return True, getattr(obj, leaf, None), obj
+
+
+def _policy_for_owner(entry: _ManifestEntry, owner: BaseModel) -> _CapturePolicy | None:
+    return next(
+        (variant.policy for variant in entry.variants if type(owner) is variant.owner),
+        None,
+    )
 
 
 def _truncate_to_budget(values: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -608,10 +650,13 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
         entries = build_capture_manifest(cls)
         state = _CaptureState()
         for entry in entries:
-            present, value = _resolve_path(llm_args, entry.path)
-            if not present:
+            present, value, owner = _resolve_path(llm_args, entry.path)
+            if not present or owner is None:
                 continue
-            is_safe, sanitized = _sanitize_value(value, entry.annotation, entry.metadata, state)
+            policy = _policy_for_owner(entry, owner)
+            if policy is None:
+                continue
+            is_safe, sanitized = _sanitize_policy(value, policy, state)
             if is_safe:
                 state.values[entry.path] = sanitized
             else:
@@ -623,7 +668,7 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
             state.values, config_json = _truncate_to_budget(state.values)
             state.payload_truncated = True
 
-        rows = manifest_rows(cls)
+        rows = _manifest_rows(entries)
         metadata = {
             "api_contract_version": API_CONTRACT_VERSION,
             "args_class": cls.__name__,

@@ -12,20 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, Sequence, Type
+from typing import Dict, List, Optional, Sequence, Type
 
+import numpy as np
 import torch
 
 from tensorrt_llm.logger import logger
 
 from ....models.modeling_utils import QuantConfig
 from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
+from .interface import (AttentionBackend, AttentionMetadata, MLAParams,
+                        PositionalEmbeddingParams)
 from .sparse import (get_flashinfer_sparse_attn_attention_backend,
                      get_trtllm_sparse_attn_attention_backend,
                      get_vanilla_sparse_attn_attention_backend)
 from .sparse.params import SparseParams
-from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
 
 
@@ -33,6 +34,10 @@ def get_attention_backend(
     backend_name: str,
     sparse_params: Optional[SparseParams] = None,
 ) -> Type[AttentionBackend]:
+    # Imported lazily (like FlashInferAttention below) so importing this module
+    # does not pull in .trtllm at load time: .trtllm imports helpers from here,
+    # and a module-level import here would create a circular import.
+    from .trtllm import TrtllmAttention
     backend_name = backend_name.upper()
     if backend_name == "VANILLA":
         if sparse_params is not None:
@@ -280,3 +285,161 @@ def append_mla_latent_cache(
         offset += q_len
 
     return kv_cache
+
+
+def _describe_int_tensor(name: str, tensor: Optional[torch.Tensor]) -> str:
+    """Summarize a 1-D length tensor as count/min/max."""
+    if tensor is None:
+        return f"{name}=None"
+    try:
+        values = tensor.detach().flatten().tolist()
+    except Exception as exc:  # pragma: no cover - diagnostics must never mask the original error
+        return f"{name}=<unreadable: {exc}>"
+    if not values:
+        return f"{name}=[]"
+    return f"{name}(n={len(values)}, min={min(values)}, max={max(values)})"
+
+
+def log_attention_failure_context(backend_name: str, layer_idx: Optional[int],
+                                  metadata: "AttentionMetadata",
+                                  attention_window_size: Optional[int],
+                                  exc: BaseException) -> None:
+    """Log the attention metadata that explains a kernel-level failure.
+
+    Kernel failures reach Python as opaque CUDA/cuBLAS errors ("illegal memory
+    access", "CUBLAS_STATUS_EXECUTION_FAILED") with nothing identifying the
+    batch, the sequence lengths, or the sliding window in effect, which is
+    exactly what is needed to tell a kernel bug from a sequence that just grew
+    past its attention window. Callers log this and then re-raise the original
+    exception unchanged.
+
+    Only reached on the failure path, so the tensor reads below cost nothing in
+    a healthy run.
+    """
+    try:
+        parts = [
+            f"backend={backend_name}",
+            f"layer_idx={layer_idx}",
+            f"attention_window_size={attention_window_size}",
+            f"num_contexts={getattr(metadata, 'num_contexts', None)}",
+            f"num_generations={getattr(metadata, 'num_generations', None)}",
+            f"num_tokens={getattr(metadata, 'num_tokens', None)}",
+            f"max_seq_len={getattr(metadata, 'max_seq_len', None)}",
+            _describe_int_tensor("seq_lens", getattr(metadata, "seq_lens",
+                                                     None)),
+            _describe_int_tensor("seq_lens_kv",
+                                 getattr(metadata, "seq_lens_kv", None)),
+            _describe_int_tensor("kv_lens",
+                                 getattr(metadata, "kv_lens_runtime", None)),
+            f"request_ids={getattr(metadata, 'request_ids', None)}",
+        ]
+
+        block_offsets = getattr(metadata, "kv_cache_block_offsets", None)
+        if block_offsets is not None:
+            parts.append(
+                f"kv_cache_block_offsets_shape={tuple(block_offsets.shape)}")
+        workspace = getattr(metadata, "workspace", None)
+        if workspace is not None:
+            parts.append(f"workspace_numel={workspace.numel()}, "
+                         f"workspace_dtype={workspace.dtype}")
+        kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+        if kv_cache_manager is not None:
+            parts.append(
+                "max_attention_window_vec="
+                f"{getattr(kv_cache_manager, 'max_attention_window_vec', None)}"
+            )
+            parts.append(
+                f"tokens_per_block={getattr(kv_cache_manager, 'tokens_per_block', None)}"
+            )
+
+        logger.error(f"Attention kernel failed ({type(exc).__name__}): " +
+                     ", ".join(parts))
+    except Exception:  # pragma: no cover - never let diagnostics mask the failure
+        logger.error(
+            f"Attention kernel failed ({type(exc).__name__}); "
+            f"could not collect diagnostic context for backend {backend_name}")
+
+
+# Page id used as a placeholder for evicted, out-of-window pages. Repeats of it
+# inside one row are expected -- the sliding-window mask drops those pages -- so
+# the duplicate check ignores it.
+PLACEHOLDER_PAGE_INDEX = 0
+
+
+def check_page_table(
+    pool_indices: Dict[int, Optional[np.ndarray]],
+    num_blocks: Sequence[int],
+    logical_num_blocks: Sequence[int],
+    kv_lens: Sequence[int],
+    page_size: int,
+    pool_size: Optional[int] = None,
+    max_rows_reported: int = 8,
+) -> List[str]:
+    """Return a list of structural problems with a page table, empty if it is sound.
+
+    Checks, per pool:
+
+    * a page id outside ``[0, pool_size)``, which makes the kernel read memory
+      no one wrote;
+    * the same page claimed twice inside one row, so two positions of the same
+      sequence append over each other;
+    * a flat index array whose length disagrees with the indptr implied by
+      ``num_blocks``.
+
+    And, across rows:
+
+    * ``num_blocks``, ``logical_num_blocks`` and ``kv_lens`` disagreeing on the
+      number of rows in the batch;
+    * a ``last_page_len`` outside ``[1, page_size]``, derived from ``kv_lens``
+      and the committed page count;
+    Every input is already on the host when a plan is built, so this costs no
+    GPU work and no device synchronization.
+    """
+    problems: List[str] = []
+    num_blocks_arr = np.asarray(num_blocks, dtype=np.int64)
+    logical_arr = np.asarray(logical_num_blocks, dtype=np.int64)
+    kv_lens_arr = np.asarray(kv_lens, dtype=np.int64)
+    starts = np.concatenate([[0], np.cumsum(num_blocks_arr)])
+
+    for pool_id, indices in sorted(pool_indices.items()):
+        if indices is None:
+            continue
+        flat = np.asarray(indices).reshape(-1)
+        if pool_size is not None and flat.size:
+            out_of_range = np.flatnonzero((flat < 0) | (flat >= pool_size))
+            if out_of_range.size:
+                worst = int(flat[out_of_range[0]])
+                problems.append(
+                    f"pool {pool_id}: {out_of_range.size} page ids outside "
+                    f"[0, {pool_size}), first at flat index "
+                    f"{int(out_of_range[0])} value {worst} "
+                    f"(0x{worst & 0xFFFFFFFF:08x})")
+        if flat.size != int(starts[-1]):
+            problems.append(
+                f"pool {pool_id}: {flat.size} page ids for an indptr that ends at {int(starts[-1])}"
+            )
+            continue
+        for row in range(num_blocks_arr.size):
+            span = flat[int(starts[row]):int(starts[row + 1])]
+            real = span[span != PLACEHOLDER_PAGE_INDEX]
+            if real.size and np.unique(real).size != real.size:
+                problems.append(
+                    f"pool {pool_id} row {row}: repeated page id in a span of {span.size}"
+                )
+
+    if not (num_blocks_arr.size == logical_arr.size == kv_lens_arr.size):
+        problems.append(
+            f"row counts disagree: num_blocks has {num_blocks_arr.size}, "
+            f"logical_num_blocks has {logical_arr.size}, "
+            f"kv_lens has {kv_lens_arr.size}")
+    else:
+        last_page_len = kv_lens_arr - (logical_arr - 1) * page_size
+        bad_len = np.flatnonzero((last_page_len < 1)
+                                 | (last_page_len > page_size))
+        if bad_len.size:
+            problems.append(
+                f"last_page_len outside [1, {page_size}] on rows "
+                f"{bad_len.tolist()[:max_rows_reported]}: "
+                f"{last_page_len[bad_len].tolist()[:max_rows_reported]}")
+
+    return problems

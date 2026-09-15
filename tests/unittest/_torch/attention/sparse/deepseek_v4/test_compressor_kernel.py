@@ -724,6 +724,66 @@ def test_decode_accepts_bf16_kv_score_with_fp32_state():
             )
 
 
+@pytest.mark.parametrize("next_n", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_decode_cr128_hd512_bf16_state(next_n):
+    """Validate the production CR128 BF16/BF16 decode instantiation."""
+    batch_size, compress_ratio, head_dim = 2, 128, 512
+    page_size = compress_ratio
+    start_pos_val = compress_ratio - next_n
+
+    kv = torch.randn(batch_size, compress_ratio, head_dim, device="cuda").bfloat16()
+    score = torch.randn_like(kv)
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    score_with_ape = (score.float() + ape.unsqueeze(0)).bfloat16()
+
+    paged_kv = torch.zeros(batch_size, page_size, head_dim, device="cuda", dtype=torch.bfloat16)
+    paged_score = torch.zeros_like(paged_kv)
+    paged_kv[:, :start_pos_val] = kv[:, :start_pos_val]
+    paged_score[:, :start_pos_val] = score_with_ape[:, :start_pos_val]
+    block_table = torch.arange(batch_size, device="cuda", dtype=torch.int32).view(batch_size, 1)
+
+    kv_score = fuse_kv_score(
+        kv[:, start_pos_val:].reshape(-1, head_dim),
+        score[:, start_pos_val:].reshape(-1, head_dim),
+    )
+    kv_lens = torch.full((batch_size,), compress_ratio, device="cuda", dtype=torch.int32)
+    start_pos = torch.full((batch_size,), start_pos_val, device="cuda", dtype=torch.int32)
+    cu_seq_lens, cu_outputs = prepare_decode_metadata(
+        batch_size,
+        compress_ratio,
+        head_dim,
+        torch.device("cuda"),
+        next_n=next_n,
+    )
+    kv_comp = prepare_compress_output(
+        cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
+    )
+
+    decode_kernel(
+        kv_score,
+        ape,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_outputs,
+        kv_comp,
+        paged_kv,
+        paged_score,
+        block_table,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        next_n=next_n,
+    )
+
+    weights = torch.softmax(score_with_ape.float(), dim=1)
+    expected = torch.sum(weights * kv.float(), dim=1).to(torch.bfloat16)
+    assert torch.allclose(expected, kv_comp, rtol=2e-3, atol=5e-3)
+    assert torch.equal(paged_kv[:, start_pos_val:], kv[:, start_pos_val:])
+    assert torch.equal(paged_score[:, start_pos_val:], score_with_ape[:, start_pos_val:])
+
+
 STATE_UPDATE_CONFIGS = [
     pytest.param(1, 12, 4, 128, True, id="overlap_hd128_3chunks"),
     pytest.param(1, 13, 4, 512, True, id="overlap_hd512_3chunks_1remainder"),
@@ -1424,12 +1484,19 @@ MTP_CONFIGS = [
     pytest.param(1, 4, 128, True, 4, id="overlap_hd128_next4"),
     pytest.param(1, 4, 512, True, 3, id="overlap_hd512_next3"),
     pytest.param(1, 4, 512, True, 8, id="overlap_hd512_next8"),
+    pytest.param(1, 4, 128, True, 16, id="overlap_hd128_next16"),
     pytest.param(2, 128, 128, False, 4, id="basic_hd128_multi_batch_next4"),
+    pytest.param(1, 128, 512, False, 2, id="basic_hd512_next2"),
+    pytest.param(1, 128, 512, False, 3, id="basic_hd512_next3"),
     pytest.param(1, 128, 512, False, 4, id="basic_hd512_next4"),
     pytest.param(1, 128, 512, False, 5, id="basic_hd512_next5"),
     pytest.param(1, 128, 512, False, 6, id="basic_hd512_next6"),
     pytest.param(1, 128, 512, False, 7, id="basic_hd512_next7"),
     pytest.param(1, 128, 512, False, 8, id="basic_hd512_next8"),
+    pytest.param(1, 128, 128, False, 16, id="chunk_hd128_next16"),
+    pytest.param(1, 128, 128, False, 128, id="chunk_hd128_next128"),
+    pytest.param(1, 128, 128, False, 129, id="chunk_hd128_next129"),
+    pytest.param(1, 128, 128, False, 257, id="chunk_hd128_next257"),
 ]
 
 
@@ -1551,12 +1618,11 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
     "next_n,storage_next_n",
     [
         pytest.param(0, 1, id="zero"),
-        pytest.param(9, 9, id="above_max"),
         pytest.param((1 << 32) + 1, 1, id="large_int64"),
     ],
 )
-def test_decode_rejects_unsupported_next_n(next_n, storage_next_n):
-    """Decode rejects next_n outside the supported range before narrowing."""
+def test_decode_rejects_invalid_next_n(next_n, storage_next_n):
+    """Decode rejects next_n outside the int-backed runtime range before narrowing."""
     batch_size, compress_ratio, head_dim = 1, 4, 128
     state_dim = 2 * head_dim
     page_size = 8
@@ -1574,7 +1640,7 @@ def test_decode_rejects_unsupported_next_n(next_n, storage_next_n):
     cu_seq_lens = torch.tensor([0, storage_next_n], device="cuda", dtype=torch.int32)
     cu_outputs = torch.tensor([0, num_outputs], device="cuda", dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match=r"next_n.*\[1, 8\]"):
+    with pytest.raises(RuntimeError, match=r"next_n.*\[1, 2147483647\]"):
         decode_kernel(
             kv_score,
             ape,

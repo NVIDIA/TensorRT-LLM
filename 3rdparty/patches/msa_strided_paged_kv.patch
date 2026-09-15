@@ -362,7 +362,7 @@ diff --git a/python/fmha_sm100/cute/test_sparse_atten.py b/python/fmha_sm100/cut
 index 21c777e..b5f078b 100644
 --- a/python/fmha_sm100/cute/test_sparse_atten.py
 +++ b/python/fmha_sm100/cute/test_sparse_atten.py
-@@ -61,6 +61,81 @@ DECODE_DIM = 128
+@@ -61,6 +61,78 @@ DECODE_DIM = 128
  DECODE_KV_TOKEN_SWEEP = tuple(2**exp for exp in range(3, 21))
 
 
@@ -387,14 +387,11 @@ index 21c777e..b5f078b 100644
 +
 +def test_prepare_paged_hnd_input_materializes_unpacked_tokens() -> None:
 +    pages, heads, page_size, head_dim = 5, 2, 128, 128
-+    storage = torch.empty(
-+        pages,
-+        heads,
-+        page_size * 2,
-+        head_dim,
-+        dtype=torch.float8_e4m3fn,
++    storage = torch.arange(
++        pages * heads * page_size * 2 * head_dim,
++        dtype=torch.int32,
 +        device="cuda",
-+    )
++    ).remainder(16).to(torch.float8_e4m3fn).reshape(pages, heads, page_size * 2, head_dim)
 +    view = storage[:, :, ::2, :]
 +
 +    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
@@ -406,11 +403,11 @@ index 21c777e..b5f078b 100644
 +def test_prepare_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
 +    pages, heads, page_size, head_dim = 5, 2, 128, 128
 +    outer_stride = heads * page_size * head_dim + 1
-+    storage = torch.empty(
++    storage = torch.arange(
 +        pages * outer_stride,
-+        dtype=torch.float8_e4m3fn,
++        dtype=torch.int32,
 +        device="cuda",
-+    )
++    ).remainder(16).to(torch.float8_e4m3fn)
 +    view = storage.as_strided(
 +        (pages, heads, page_size, head_dim),
 +        (outer_stride, page_size * head_dim, head_dim, 1),
@@ -444,7 +441,7 @@ index 21c777e..b5f078b 100644
  @contextmanager
  def _nvtx_range(message: str):
      torch.cuda.nvtx.range_push(message)
-@@ -1786,6 +1861,74 @@ def test_sparse_page_atten(
+@@ -1786,6 +1858,74 @@ def test_sparse_page_atten(
 
      _assert_forward_close(out, out_ref, out_pt.float(), lse, lse_ref)
 

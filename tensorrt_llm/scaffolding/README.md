@@ -38,6 +38,6 @@ Future work includes the following aspects:
 
 - Provide information for combined performance optimization with backends. Scaffolding can provide some information which is helpful for LLM inference engine. For a example, Controller may aware the prefix relation between generation requests, that would be helpful for kvcache reuse.
 
-- Develop auxiliary components to support generic requirements. Now we have developed some interesting auxiliary components. For an [example](examples/scaffolding/token_budget_majority_vote.py), we developed `GenerationTokenCounter` as a task collection decorator so that Controller could get the output tokens count for itself and its Sub-Controller. There are still many such works waiting for us to do.
+- Develop auxiliary components to support generic requirements. Now we have developed some interesting auxiliary components. For an [example](../../examples/scaffolding/token_budget_majority_vote.py), we developed `GenerationTokenCounter` as a task collection decorator so that Controller could get the output tokens count for itself and its Sub-Controller. There are still many such works waiting for us to do.
 
 You can see more specific work in this [link](https://github.com/NVIDIA/TensorRT-LLM/issues/3706#issuecomment-2820015957).

@@ -76,6 +76,7 @@ def _run(cmd, *, cwd=None, check=True):
         check=check,
         capture_output=True,
         text=True,
+        timeout=300,
     )
 
 
@@ -107,7 +108,10 @@ def _file_url(path: Path) -> str:
 
 def _have_lfs() -> bool:
     try:
-        return subprocess.run(["git", "lfs", "version"], capture_output=True).returncode == 0
+        return (
+            subprocess.run(["git", "lfs", "version"], capture_output=True, timeout=30).returncode
+            == 0
+        )
     except FileNotFoundError:
         return False
 

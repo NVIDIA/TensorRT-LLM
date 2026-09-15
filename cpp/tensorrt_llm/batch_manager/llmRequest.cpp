@@ -52,17 +52,6 @@ runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool
 
 template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
-std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)
-{
-    auto requestId = isChild() ? mParentRequestId : mRequestId;
-    auto result = createResult(useFastLogits, mpiWorldRank);
-    if (result.has_value())
-    {
-        return executor::Response(requestId, result.value(), mClientId);
-    }
-    return std::nullopt;
-}
-
 void LlmRequest::createSerializedResult(
     std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits, int32_t mpiWorldRank)
 {
@@ -353,29 +342,6 @@ std::shared_ptr<LlmRequest> LlmRequest::createChildRequest(RequestIdType request
 
     mChildRequests.push_back(childReq);
     return childReq;
-}
-
-void LlmRequest::movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
-{
-    if (!mPromptEmbeddingTable.has_value()
-        || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
-    {
-        return;
-    }
-
-    TensorPtr gpuPromptEmbeddingTable = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
-    mPromptEmbeddingTable = gpuPromptEmbeddingTable;
-}
-
-void LlmRequest::moveLoraWeightsToGpu(runtime::BufferManager const& manager)
-{
-    if (!mLoraWeights.has_value() || mLoraWeights.value()->getMemoryType() == runtime::MemoryType::kGPU)
-    {
-        return;
-    }
-    // TODO for tp / pp models we only need to move the bit that belong on the local device
-    TensorPtr gpuLoraWeights = manager.copyFrom(*mLoraWeights.value(), runtime::MemoryType::kGPU);
-    mLoraWeights = gpuLoraWeights;
 }
 
 void LlmRequest::removeLoraTensors()

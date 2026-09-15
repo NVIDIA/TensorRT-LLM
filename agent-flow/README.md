@@ -186,6 +186,15 @@ covers the diagnosis pipeline, task schema and workspace layout that both share.
   the human a question when it hits user-only information (credentials,
   environment facts, etc.). Off by default — the build phase is
   expected to be unattended once the plan is approved.
+- **Run without MCP tools:** pass `--no-mcp-tools` when the machine
+  blocks dynamically configured MCP servers (e.g. an enterprise
+  `managed-mcp.json` lockdown). Every role — on both the claude-code and
+  codex backends — then runs with no custom tools: the orchestrator
+  inlines the context the `read_*` tools used to return, and each agent
+  ends its turn by writing a small `.turn/<role>.yaml` handoff file that
+  the orchestrator folds back into `progress.yaml`. `ask_human` is
+  unavailable in this mode, so it cannot be combined with
+  `--plan-human-review` / `--build-human-review`. Off by default.
 - **Replan after every QA turn:** pass `--replan-on-qa` to re-invoke
   the PlanDrafter after each QA turn so it can rewrite `plan.md` and
   `acceptance-criteria.md` based on the latest coder/reviewer/qa

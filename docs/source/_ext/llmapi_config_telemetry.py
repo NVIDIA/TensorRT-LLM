@@ -34,12 +34,16 @@ for the user-facing collection and opt-out overview, and the
 for the wire schema.
 
 **No PII or free-form fields are captured.** LLM API configuration capture is
-*type-driven*: fields whose type is categorical (`Literal`/`Enum`/`bool`) or
-numeric (`int`/`float`), plus safe collections of those, are captured
-automatically. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are never captured
-unless a field carries an explicit allowlist (`TelemetryField.categorical(...)`),
-and any field may opt out with `telemetry=False`. Every captured field is listed
-below; the runtime can capture nothing absent from this list.
+automatic for `bool`, `int`, finite `float`, `Literal`, `Enum`, supported unions,
+and homogeneous sequences. Unsafe scalar `str`, `Any`, and `object` branches
+require `TelemetryField.categorical(...)`; paths, mappings, callables, and
+unsupported structures always fail closed. Use `telemetry=False` to exclude a
+field. The runtime can capture nothing absent from the list below.
+
+`capture_policy` branches separated by `|` are tried independently; `enum[X]`
+requires the exact enum type `X`. The categorical domain lists tokens from
+`Literal`/`Enum` annotations or explicit `allowed_values`; it does not restrict
+`bool`, `int`, or `float` branches.
 
 If the manifest check fails, run `python3 scripts/generate_llm_args_golden_manifest.py`, then commit
 `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
@@ -55,20 +59,24 @@ def _escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def _format_values(values: list[str]) -> str:
-    return ", ".join(f"`{_escape(v)}`" for v in values) if values else ""
+def _format_values(values: list[object]) -> str:
+    def format_value(value: object) -> str:
+        text = value if isinstance(value, str) else json.dumps(value)
+        return f"`{_escape(text)}`"
+
+    return ", ".join(format_value(value) for value in values)
 
 
 def _table(rows: list[dict]) -> str:
     lines = [
-        "| Captured key | Annotation | Kind | Converter | Allowed values |",
-        "|--------------|------------|------|-----------|----------------|",
+        "| Captured key | Capture policy | Kind | Categorical domain |",
+        "|--------------|----------------|------|--------------------|",
     ]
     for row in rows:
         lines.append(
-            f"| `{_escape(row['path'])}` | `{_escape(row['annotation'])}` | "
-            f"`{_escape(row['kind'])}` | {_escape(row['converter'])} | "
-            f"{_format_values(row['allowed_values'])} |"
+            f"| `{_escape(row['path'])}` | `{_escape(row['capture_policy'])}` | "
+            f"`{_escape(row['kind'])}` | "
+            f"{_format_values(row.get('allowed_values', []))} |"
         )
     return "\n".join(lines)
 

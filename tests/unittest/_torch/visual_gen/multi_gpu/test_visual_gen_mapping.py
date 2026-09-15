@@ -12,12 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -50,8 +45,6 @@ def _worker(rank, world_size, test_fn, port):
 
 
 def _run_multi_gpu(world_size, test_fn):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} GPUs, have {torch.cuda.device_count()}")
     # Spawn distributed workers via a helper that retries with a fresh master
@@ -596,7 +589,6 @@ def _logic_tp2_attn2d_2x1_groups(rank, world_size):
     assert x.item() == 2.0, f"Rank {rank}: attn2d_col all_reduce expected 2, got {x.item()}"
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
         _run_multi_gpu(4, _logic_default_order_cfg2_ulysses2)

@@ -18,10 +18,6 @@ Run audio only:
 
 Run prompt metadata unit tests (no GPU):
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -k FormatPromptWithMetadata
-
-Override checkpoint:
-    DIFFUSION_MODEL_PATH_COSMOS3=/path/to/Cosmos3-Nano \\
-        pytest tests/unittest/_torch/visual_gen/test_cosmos3_pipeline.py -v -s
 """
 
 import gc
@@ -37,6 +33,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import PIL.Image
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import resolve_action_content_size
@@ -87,24 +84,6 @@ def _cleanup_gpu():
         torch.cuda.empty_cache()
 
 
-def _llm_models_root() -> str:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-COSMOS3_NANO_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
-
 PROMPT = "A serene mountain lake at sunrise with mist rising from the water."
 NUM_STEPS = 4
 SEED = 42
@@ -128,11 +107,9 @@ COSMOS3_FP8_QUANT_CONFIG = {
 
 
 def _require_checkpoint() -> str:
-    if not COSMOS3_NANO_PATH or not os.path.exists(COSMOS3_NANO_PATH):
-        pytest.skip(f"Checkpoint not found: {COSMOS3_NANO_PATH}")
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    return COSMOS3_NANO_PATH
+    return get_checkpoint("Cosmos3-Nano")
 
 
 def _load_pipeline(checkpoint_path: str, **visual_gen_kwargs):
@@ -232,14 +209,14 @@ def _assert_valid_audio(
 
 def _require_audio_pipeline(pipeline) -> None:
     if not getattr(pipeline, "audio_gen", False):
-        pytest.skip("Checkpoint does not enable audio generation")
+        pytest.fail("Checkpoint does not enable audio generation")
     if not hasattr(pipeline, "audio_tokenizer"):
-        pytest.skip("Audio tokenizer was not loaded for this pipeline")
+        pytest.fail("Audio tokenizer was not loaded for this pipeline")
 
 
 def _require_action_pipeline(pipeline) -> None:
     if not getattr(pipeline, "action_gen", False):
-        pytest.skip("Checkpoint does not enable action generation")
+        pytest.fail("Checkpoint does not enable action generation")
 
 
 def _assert_valid_action(action: torch.Tensor, *, raw_action_dim: int, chunk_size: int):

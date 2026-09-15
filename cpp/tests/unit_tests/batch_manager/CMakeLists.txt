@@ -64,6 +64,17 @@ add_gtest(kvCacheManagerV2SlotAllocatorTest
 target_include_directories(
   kvCacheManagerV2SlotAllocatorTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2ReentrantSharedMutexTest
+          kvCacheManagerV2ReentrantSharedMutexTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ReentrantSharedMutexTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+add_gtest(kvCacheManagerV2ConcurrencyTest kvCacheManagerV2ConcurrencyTest.cpp)
+target_include_directories(
+  kvCacheManagerV2ConcurrencyTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+
 add_gtest(kvCacheManagerV2DigestPoolTest kvCacheManagerV2DigestPoolTest.cpp)
 target_include_directories(
   kvCacheManagerV2DigestPoolTest
@@ -73,7 +84,6 @@ add_gtest(kvCacheUtilsTest kvCacheUtilsTest.cpp)
 add_gtest(llmRequestTest llmRequestTest.cpp)
 add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)
 add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
-add_gtest(staticThreadPoolTest staticThreadPoolTest.cpp)
 add_gtest(rnnCacheFormatterTest rnnCacheFormatterTest.cpp)
 add_gtest(agentTreeTest agentTreeTest.cpp)
 add_gtest(truncateBlocksTest truncateBlocksTest.cpp)

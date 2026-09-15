@@ -29,8 +29,11 @@ from tensorrt_llm.llmapi.disagg_utils import (
     MinimalInstances,
     ServerRole,
 )
+from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -246,6 +249,148 @@ def test_get_ctx_request_preserves_conversation_params_on_wire():
 
     wire_request = ctx_request.model_dump(exclude_unset=True)
     assert wire_request["conversation_params"]["conversation_id"] == "conv-completion"
+
+
+def test_get_ctx_request_isolates_subagent_affinity_from_gen():
+    # The ctx request must carry the parent affinity key on its OWN
+    # conversation_params copy, so stripping the gen request (which shares the
+    # original object via a shallow model_copy) never mutates the ctx copy.
+    service = _make_service("context_first")
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(
+            conversation_id="child", subagent_affinity_id="parent"
+        ),
+    )
+
+    ctx_request = service._get_ctx_request(request, 42)
+    assert ctx_request.conversation_params.subagent_affinity_id == "parent"
+    # The ctx copy is a distinct object from the original conversation_params.
+    assert ctx_request.conversation_params is not request.conversation_params
+
+    # Simulate the gen request, which shares conversation_params with the original.
+    gen_req = request.model_copy(update={"disaggregated_params": None})
+    assert gen_req.conversation_params is request.conversation_params
+    service._strip_gen_subagent_affinity(gen_req)
+
+    assert gen_req.conversation_params.subagent_affinity_id is None
+    # Stripping gen did not disturb the ctx copy's parent pin.
+    assert ctx_request.conversation_params.subagent_affinity_id == "parent"
+
+
+def test_strip_gen_subagent_affinity_context_scope_clears_gen():
+    service = _make_service("context_first")
+    service._subagent_affinity_scope = "context"
+    gen_req = CompletionRequest(
+        model="test-model",
+        prompt="hi",
+        conversation_params=ConversationParams(
+            conversation_id="child", subagent_affinity_id="parent"
+        ),
+    )
+
+    service._strip_gen_subagent_affinity(gen_req)
+
+    # "context" scope: gen load-balances on its own id, no parent pin.
+    assert gen_req.conversation_params.subagent_affinity_id is None
+    assert gen_req.conversation_params.conversation_id == "child"
+
+
+def test_strip_gen_subagent_affinity_both_scope_keeps_gen():
+    service = _make_service("context_first")
+    service._subagent_affinity_scope = "both"
+    gen_req = CompletionRequest(
+        model="test-model",
+        prompt="hi",
+        conversation_params=ConversationParams(
+            conversation_id="child", subagent_affinity_id="parent"
+        ),
+    )
+
+    service._strip_gen_subagent_affinity(gen_req)
+
+    # "both" scope: the parent pin is preserved on the gen request too.
+    assert gen_req.conversation_params.subagent_affinity_id == "parent"
+
+
+def test_subagent_affinity_id_excluded_from_wire():
+    # The whole rolling-deploy guarantee: subagent_affinity_id is server-private
+    # and must never cross the wire in the body (an old worker's extra="forbid"
+    # schema would reject an unknown field). It is forwarded as a header instead.
+    params = ConversationParams(conversation_id="child", subagent_affinity_id="parent")
+    dumped = params.model_dump(mode="json", exclude_unset=True)
+    assert "subagent_affinity_id" not in dumped
+    assert dumped["conversation_id"] == "child"
+
+    # Same at the request level, matching OpenAIClient's wire encoding.
+    request = CompletionRequest(model="m", prompt="hi", conversation_params=params)
+    wire = request.model_dump(mode="json", exclude_unset=True)
+    assert "subagent_affinity_id" not in wire["conversation_params"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+@pytest.mark.parametrize("scope", ["context", "both"])
+async def test_subagent_body_id_and_affinity_at_router_dispatch(
+    monkeypatch: pytest.MonkeyPatch, schedule_style: str, scope: str
+) -> None:
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service._subagent_affinity_scope = scope
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hello"}],
+        conversation_params=ConversationParams(conversation_id="body-child"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        SimpleNamespace(headers={"x-session-id": "header-child", "x-parent-id": "parent"}),
+        "x-parent-id",
+    )
+    observed: dict[str, tuple[str, str]] = {}
+
+    async def select_context(req, **kwargs):
+        # Snapshot values at dispatch: generation subsequently mutates the request.
+        observed["context"] = (req.conversation_params.conversation_id, get_request_routing_id(req))
+        return "ctx:9000", {"server_info": {}}
+
+    async def select_generation(req, **kwargs):
+        observed["generation"] = (
+            req.conversation_params.conversation_id,
+            get_request_routing_id(req),
+        )
+        return "gen:9001", {"server_info": {}}
+
+    async def context_response(*args, **kwargs):
+        yield _make_chat_response("length").model_dump()
+
+    async def generation_response(*args, **kwargs):
+        yield _make_chat_response("stop").model_dump()
+
+    service._ctx_router.get_next_server.side_effect = select_context
+    service._gen_router.get_next_server.side_effect = select_generation
+    # Isolate metrics registration across parametrized cases and other client tests.
+    monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", mock.Mock())
+    # Keep client-side router selection, mocking the HTTP exchange.
+    service._ctx_client = OpenAIHttpClient(
+        service._ctx_router, ServerRole.CONTEXT, session=mock.Mock()
+    )
+    service._gen_client = OpenAIHttpClient(
+        service._gen_router, ServerRole.GENERATION, session=mock.Mock()
+    )
+    monkeypatch.setattr(service._ctx_client, "_post_with_retry", context_response)
+    monkeypatch.setattr(service._gen_client, "_post_with_retry", generation_response)
+
+    await service._send_disagg_request(request)
+
+    service._ctx_router.get_next_server.assert_awaited_once()
+    service._gen_router.get_next_server.assert_awaited_once()
+    assert observed == {
+        "context": ("body-child", "parent"),
+        "generation": ("body-child", "parent" if scope == "both" else "body-child"),
+    }
 
 
 @pytest.mark.asyncio

@@ -83,6 +83,60 @@ def test_subclass_without_super_init_uses_native_compatibility_defaults(
     reader_start.assert_not_called()
 
 
+def test_sessionless_rank_striped_load_uses_native_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _rank_striped_loader()
+    native_weights = {"native": object()}
+    native_load = mock.Mock(return_value=native_weights)
+    reader_start = mock.Mock(side_effect=AssertionError("must not start"))
+    open_weight_session = mock.Mock(side_effect=AssertionError("must not open a session"))
+    warning = mock.Mock(side_effect=AssertionError("must not warn"))
+    log_info = mock.Mock()
+    monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(loader, "open_weight_session", open_weight_session)
+    monkeypatch.setattr(read_ahead.RankStripedReadAheadSession, "start", reader_start)
+    monkeypatch.setattr(weight_loader_module.logger, "warning", warning)
+    monkeypatch.setattr(weight_loader_module.logger, "info", log_info)
+    mapping = Mapping()
+
+    weights = loader.load_weights("/unused", mapping=mapping)
+
+    assert weights is native_weights
+    native_load.assert_called_once_with("/unused", mapping, False)
+    status = loader.last_checkpoint_io_status
+    assert status.requested == "rank_striped_read_ahead"
+    assert status.selected == "native"
+    assert status.activated is False
+    assert status.effective == "native"
+    assert "open_weight_session" in status.fallback_reason
+    open_weight_session.assert_not_called()
+    reader_start.assert_not_called()
+    warning.assert_not_called()
+    assert any(
+        "requested=rank_striped_read_ahead" in message
+        and "selected=native" in message
+        and "open_weight_session" in message
+        for message, *_ in (call.args for call in log_info.call_args_list)
+    )
+
+
+def test_checkpoint_io_status_log_escapes_multiline_fallback_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = _rank_striped_loader()
+    loader._last_checkpoint_io_status.fallback_reason = "first line\r\nsecond line"
+    log_info = mock.Mock()
+    monkeypatch.setattr(weight_loader_module.logger, "info", log_info)
+
+    loader._log_checkpoint_io_status()
+
+    message = log_info.call_args.args[0]
+    assert "\r" not in message
+    assert "\n" not in message
+    assert r"fallback_reason=first line\r\nsecond line." in message
+
+
 def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     monkeypatch.setattr(read_ahead, "_CHUNK_SIZE", 4)
     monkeypatch.setattr(read_ahead, "_WORKERS_PER_LOAD_GROUP", 3)
@@ -326,7 +380,8 @@ def test_disabled_weight_cache_does_not_force_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", "0")
 
     loader = _rank_striped_loader()
-    loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+        pass
 
     assert loader.last_checkpoint_io_status.activated
 
@@ -355,7 +410,8 @@ def test_reader_start_failure_cleans_up_and_falls_back(tmp_path, monkeypatch):
         mock.Mock(side_effect=RuntimeError("start failed")),
     )
 
-    weights = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as weights:
+        pass
 
     assert weights is native_weights
     assert close_file_descriptors
@@ -401,7 +457,8 @@ def test_advisory_read_failure_keeps_materialized_weights(tmp_path, monkeypatch)
         mock.Mock(side_effect=OSError("injected read failure")),
     )
 
-    weights = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as weights:
+        pass
 
     assert torch.equal(weights["model.norm.weight"], expected["model.norm.weight"])
     native_load.assert_not_called()
@@ -421,7 +478,8 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     )
 
     with pytest.raises(RuntimeError, match="mapping failed"):
-        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
+            pass
     native_load.assert_not_called()
 
     loader = _rank_striped_loader()
@@ -453,9 +511,12 @@ def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
     native_loader = HfWeightLoader()
     native = native_loader.load_weights(str(checkpoint_dir), mapping=Mapping())
-    striped = _rank_striped_loader().load_weights(str(checkpoint_dir), mapping=Mapping())
+    striped_loader = _rank_striped_loader()
+    with striped_loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as striped:
+        pass
 
     assert native_loader.last_checkpoint_io_status.effective == "native"
+    assert striped_loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
     assert set(native) == set(striped) == set(expected)
     for name, expected_tensor in expected.items():
         assert torch.equal(native[name], expected_tensor)
@@ -474,7 +535,8 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     rank_striped_read_ahead._CHUNK_SIZE = 8
 
     success_loader = _rank_striped_loader()
-    success_weights = success_loader.load_weights(checkpoint_dir, mapping=mapping)
+    with success_loader.open_weight_session(checkpoint_dir, mapping=mapping) as success_weights:
+        pass
     success = success_loader.last_checkpoint_io_status.effective
     communicator.Barrier()
 
@@ -489,9 +551,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         fallback_failure_loader._load_weights_native = fail_after_native_load
     fallback_failure_error = None
     try:
-        fallback_failure_loader.load_weights(
+        with fallback_failure_loader.open_weight_session(
             checkpoint_dir, mapping=Mapping(world_size=1, rank=0, tp_size=1)
-        )
+        ):
+            pass
     except BaseException as error:
         fallback_failure_error = str(error)
     communicator.Barrier()
@@ -501,9 +564,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
     subgroup_error = None
     try:
         subgroup_loader = _rank_striped_loader(partial_model_loading=rank == 0)
-        subgroup_weights = subgroup_loader.load_weights(
+        with subgroup_loader.open_weight_session(
             checkpoint_dir, mapping=Mapping(world_size=1, rank=0, tp_size=1)
-        )
+        ) as subgroup_weights:
+            pass
         subgroup_effective = subgroup_loader.last_checkpoint_io_status.effective
     except BaseException as error:
         subgroup_error = f"{type(error).__name__}: {error}"

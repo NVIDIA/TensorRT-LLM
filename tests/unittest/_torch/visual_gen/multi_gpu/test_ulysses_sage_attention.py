@@ -36,17 +36,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-try:
-    from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
-    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
-    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-    MODULES_AVAILABLE = True
-    ATTENTION_META_DICT = threading.local()
-    ATTENTION_META_DICT.metadata = create_attention_metadata_state()
-except ImportError:
-    MODULES_AVAILABLE = False
+ATTENTION_META_DICT = threading.local()
+ATTENTION_META_DICT.metadata = create_attention_metadata_state()
 
 
 def _cuda_cc():
@@ -94,8 +90,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for SageAttention")
     if _cuda_cc()[0] != 10:

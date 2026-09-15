@@ -320,6 +320,7 @@ class TestStandalonePackage:
             text=True,
             cwd=pkg_dir,
             env=standalone_env,
+            timeout=600,
         )
 
         lines = result.stdout.strip().split("\n")

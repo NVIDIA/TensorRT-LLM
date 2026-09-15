@@ -221,10 +221,10 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert ssm_pv.bytes_per_layer == SSM_SLOT_BYTES
 
         # qwen3_next 3-sectioning: equal sections summing to the conv slot.
-        assert mlg.conv_section_bytes == [CONV_SLOT_BYTES // 3] * 3
-        assert sum(mlg.conv_section_bytes) == conv_pv.bytes_per_layer
-        assert mlg.ssm_bytes_per_head == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-        assert ssm_pv.bytes_per_layer // mlg.ssm_bytes_per_head == KDA_NUM_HEADS
+        assert conv_pv.section_bytes == [CONV_SLOT_BYTES // 3] * 3
+        assert sum(conv_pv.section_bytes) == conv_pv.bytes_per_layer
+        assert ssm_pv.bytes_per_head == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
+        assert ssm_pv.bytes_per_layer // ssm_pv.bytes_per_head == KDA_NUM_HEADS
 
         # local_layers cover exactly the KDA layers (by global_layer_id).
         assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
@@ -356,6 +356,7 @@ def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_i
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=conv_slot_bytes,
+            section_bytes=[conv_slot_bytes // 3] * 3,
         ),
         PoolView(
             pool_idx=1,
@@ -365,14 +366,13 @@ def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_i
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_slot_bytes,
+            bytes_per_head=KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize,
         ),
     ]
     mlg = MambaLayerGroup(
         pool_group_idx=0,
         local_layers=local_layers,
         pool_views=pool_views,
-        conv_section_bytes=[conv_slot_bytes // 3] * 3,
-        ssm_bytes_per_head=KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize,
     )
     return KVCachePageTable(
         tokens_per_block=8,

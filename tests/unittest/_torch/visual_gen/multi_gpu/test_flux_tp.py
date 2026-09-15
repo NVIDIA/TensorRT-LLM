@@ -34,30 +34,25 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-        create_attention_metadata_state,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
-        FluxJointAttnMLPProj,
-        FluxJointQKVMLPProj,
-    )
-    from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+    create_attention_metadata_state,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
+    FluxJointAttnMLPProj,
+    FluxJointQKVMLPProj,
+)
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
-    from .tp_shard_utils import (
-        copy_tp_parameter,
-        shard_dim1,
-        shard_fused_gate_up,
-        shard_fused_qkv_by_heads,
-    )
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from .tp_shard_utils import (
+    copy_tp_parameter,
+    shard_dim1,
+    shard_fused_gate_up,
+    shard_fused_qkv_by_heads,
+)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -103,9 +98,6 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     """Run a test function in a distributed environment."""
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
-
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 

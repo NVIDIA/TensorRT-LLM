@@ -64,20 +64,18 @@ def test_fixed_dataset_sequence_length(
 
 
 @pytest.mark.parametrize(
-    ("runtime", "model_name", "num_loras", "build_only"),
+    ("runtime", "model_name", "num_loras"),
     [
-        ("bench", "", 0, True),
-        ("bench", "", 1, False),
-        ("serve", "qwen3_4b_eagle3", 0, False),
-        ("serve", "nemotron_3_nano_omni_nvfp4", 0, False),
-        ("serve", "nemotron_3_nano_omni_nvfp4_image", 0, False),
+        ("bench", "", 1),
+        ("serve", "qwen3_4b_eagle3", 0),
+        ("serve", "nemotron_3_nano_omni_nvfp4", 0),
+        ("serve", "nemotron_3_nano_omni_nvfp4_image", 0),
     ],
 )
 def test_variable_dataset_does_not_infer_sequence_length(
     runtime: str,
     model_name: str,
     num_loras: int,
-    build_only: bool,
 ) -> None:
     config = perf_test.PerfTestConfig(
         model_name=model_name,
@@ -86,7 +84,6 @@ def test_variable_dataset_does_not_infer_sequence_length(
         output_lens=[2000],
         num_loras=num_loras,
     )
-    config.build_only = build_only
 
     assert config.get_fixed_dataset_sequence_length() is None
 

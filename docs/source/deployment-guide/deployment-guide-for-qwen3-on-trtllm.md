@@ -24,7 +24,7 @@ This is a functional quick-start guide for running the Qwen3 model on TensorRT L
 
 ### Run Docker Container
 
-Build and run the docker container. See the [Docker guide](../../../docker/README.md) for details.
+Build and run the docker container. See the [Docker guide](source:docker/README.md) for details.
 
 ```shell
 cd TensorRT-LLM

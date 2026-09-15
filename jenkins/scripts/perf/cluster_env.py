@@ -11,7 +11,8 @@ backend clusters in bloom's SlurmConfig), so the rules below are keyed on
 
 Cluster names follow SlurmPartition.clusterName in the bloom Jenkins shared
 library (src/com/nvidia/bloom/SlurmConfig.groovy), e.g. "gcp-nrt", "aws-cmh",
-"aws-dfw", "oci-hsg", "nsc-svg", "dlcluster", "computelabSC01". In CI,
+"aws-dfw", "oci-hsg", "oci-aga", "oci-jhb", "nsc-svg", "dlcluster",
+"computelabSC01". In CI,
 L0_Test.groovy passes the resolved cluster via --cluster-name; for local
 submission it can be given explicitly or is best-effort detected from the
 Slurm frontend. Slurm's own ClusterName carries a deployment suffix (e.g.
@@ -44,10 +45,16 @@ UCX_ENV_RULES = [
         "rocep198s0:1,rocep199s0:1,rocep205s0:1,rocep206s0:1"
         " UCX_IB_GID_INDEX=auto UCX_IB_TRAFFIC_CLASS=52 UCX_IB_SL=0",
     ),
-    # oci-aga: use TCP over IPv4 alongside the local CUDA/shared-memory
-    # transports.
+    # oci-aga / oci-jhb: UCX auto-selects tcp/rdma_vf_rail0 and binds a
+    # unique-local IPv6 that is not assignable in the container, so NIXL
+    # fails to create the UCX worker. Pin CUDA/shm/tcp and prefer IPv4.
     (
         "oci-aga*",
+        "*",
+        "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
+    ),
+    (
+        "oci-jhb*",
         "*",
         "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
     ),

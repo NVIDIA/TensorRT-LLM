@@ -38,6 +38,21 @@ def main(
                        "flashinfer_temporary_cleanup"]
 ) -> None:
     """Run the requested remote MPI session test task."""
+    # TODO(dlfw-26.08): drop once the nested-spawn failure is settled. The DVM
+    # that MPI_Comm_spawn starts inherits this process's environment, so this is
+    # the environment that decides whether PRRTE will fork as root and which
+    # hostname PMIx hands out. The shell that launched mpirun dumps the same
+    # variables; a difference between the two means mpirun dropped them.
+    mpi_env = {
+        k: v
+        for k, v in sorted(os.environ.items())
+        if k.startswith(("PRTE_", "OMPI_", "PMIX_", "PMI_"))
+    }
+    print(
+        f"[pid {os.getpid()}] MPI environment in rank process: "
+        f"{mpi_env or '(none set)'}",
+        flush=True)
+
     tasks = [0]
     assert os.environ[
         'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] is not None, "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set"

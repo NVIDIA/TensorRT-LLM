@@ -712,9 +712,11 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
 std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(
     size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity)
 {
+    TLLM_CHECK_WITH_INFO(granularity > 0, "Cache storage granularity must be positive");
     TypedVec<PoolIndex, size_t> minPoolGrains(slotSizeList.size());
     for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
     {
+        TLLM_CHECK_WITH_INFO(slotSizeList[poolIdx] > 0, "Cache slot size must be positive");
         minPoolGrains[poolIdx] = divUp(slotSizeList[poolIdx], granularity);
     }
 

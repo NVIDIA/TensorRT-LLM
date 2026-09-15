@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 
@@ -5,6 +8,11 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
+from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
+    WeightDemand, WeightLoadOrderConfidence, WeightLoadPlan,
+    WeightLoadPlanCoverage)
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
 
@@ -75,6 +83,35 @@ class BaseWeightMapper(ABC):
     def cleanup(self) -> None:
         self._model = None
         self._config = None
+
+    def build_weight_load_plan(self,
+                               catalog: CheckpointCatalog) -> WeightLoadPlan:
+        """Build a conservative shadow plan for this rank.
+
+        The generic mapper cannot infer model-specific fusion, transformation,
+        or ordering dependencies. Treat the entire catalog as one indivisible
+        demand so consumers may use the plan for all-source read-ahead, but not
+        destination-aware selective I/O. Specialized mappers may override this
+        method to return an exact plan.
+        """
+        if self._model is None:
+            raise ValueError(
+                "weight mapper must be initialized before building a load plan")
+        mapping = self._model.model_config.mapping
+        plan = WeightLoadPlan(
+            catalog_id=catalog.catalog_id,
+            rank=mapping.rank,
+            world_size=mapping.world_size,
+            coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+            ordering=WeightLoadOrderConfidence.OPAQUE,
+            demands=(WeightDemand(
+                group_id="all_checkpoint_tensors",
+                source_names=tuple(sorted(catalog.tensor_names)),
+                destination_ranks=(mapping.rank, ),
+            ), ),
+        )
+        plan.validate_against(catalog)
+        return plan
 
     def begin_update_weights(self) -> None:
         """Prepare mapper-owned state for an incremental weight update."""

@@ -590,7 +590,7 @@ STATUS_DONE_TODO_RUBRIC = """\
 In addition to the rolling-state sections (current status, execution
 path, what was tried, pointers for the next step), `status.md` must
 carry a `## Done / TODO` section that both the Coder and the Reviewer
-keep current when they call `update_status`. It is the cheap signal
+keep current when they update it. It is the cheap signal
 the next agent uses to pick up where this iteration left off and the
 human uses to read out progress at a glance.
 

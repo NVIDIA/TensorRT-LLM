@@ -908,6 +908,9 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe.iter_counter = 0
     exe._mm_encoder_item_scheduling_enabled = False
     exe._pending_recompute_pause_ids = set()
+    # The loop wraps forward+sample in ``_step_scope()``, which reads this to
+    # decide whether to open a profiler range. False keeps it at nullcontext.
+    exe._profile_enabled = False
 
     # Rebalance state uses the executor's global KV manager gate.
     exe._is_kv_manager_v2 = True

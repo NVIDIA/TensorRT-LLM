@@ -532,7 +532,7 @@ def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
     )
 
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     commands = result.stdout.splitlines()
 
@@ -573,7 +573,7 @@ def test_precheck_commands_split_pytest_common_vars(monkeypatch):
     )
 
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     tokens = shlex.split(result.stdout.splitlines()[0])
 
@@ -624,6 +624,7 @@ def test_precheck_commands_export_model_root_safely(model_root, monkeypatch):
         text=True,
         capture_output=True,
         check=True,
+        timeout=60,
     )
     assert result.stdout == model_root
 
@@ -776,7 +777,9 @@ pytestCommandCTXPrecheck=ctx-command
 precheckRunScript=/unused
 run_cache_transceiver_precheck
 """
-    subprocess.run(["bash"], input=shell_script, capture_output=True, check=True, text=True)
+    subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
+    )
 
     status_dir = tmp_path / "output" / "cache_transceiver_precheck" / "status"
     for name in ("gen_0", "ctx_0"):
@@ -838,7 +841,7 @@ run_cache_transceiver_precheck
 printf '%s\n%s\n' "$DISAGG_SERVING_TYPE" "$pytestCommand"
 """
     result = subprocess.run(
-        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
     )
     assert result.stdout.splitlines()[-2:] == ["REAL_PERF_PARENT", "real-perf-command"]
 

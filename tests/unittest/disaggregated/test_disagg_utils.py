@@ -1,3 +1,4 @@
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -395,3 +396,74 @@ def test_get_local_request_id():
     assert min(ids) == 0
     assert max(ids) == MIN_GLOBAL_ID - 1
     assert max(ids) - min(ids) == MIN_GLOBAL_ID - 1
+
+
+def _yaml_config_with_conversation_routers():
+    """Configure conversation routing on both fleets for sub-agent affinity."""
+    config = get_yaml_config()
+    config["context_servers"]["router"] = {"type": "conversation"}
+    config["generation_servers"]["router"] = {"type": "conversation"}
+    return config
+
+
+def test_subagent_affinity_scope_defaults_to_context():
+    config = extract_disagg_cfg(**get_yaml_config())
+    assert config.subagent_affinity_scope == "context"
+    assert config.conversation_affinity_header_for_subagents is None
+
+
+def test_subagent_affinity_scope_rejects_invalid_value():
+    with pytest.raises(ValueError, match="subagent_affinity_scope"):
+        extract_disagg_cfg(**get_yaml_config(),
+                           subagent_affinity_scope="everything")
+
+
+def test_subagent_affinity_warns_when_ctx_router_not_conversation(caplog):
+    # Default ctx router is round_robin, not conversation -> instance affinity
+    # for "context" scope is inactive; expect a startup warning.
+    with caplog.at_level(logging.WARNING):
+        config = extract_disagg_cfg(
+            **get_yaml_config(),
+            conversation_affinity_header_for_subagents=
+            "X-Dynamo-Parent-Session-ID",
+        )
+    assert config.conversation_affinity_header_for_subagents == "X-Dynamo-Parent-Session-ID"
+    assert "conversation" in caplog.text
+    assert "context" in caplog.text
+
+
+def test_subagent_affinity_no_warning_when_router_prerequisite_met(caplog):
+    with caplog.at_level(logging.WARNING):
+        extract_disagg_cfg(
+            **_yaml_config_with_conversation_routers(),
+            conversation_affinity_header_for_subagents=
+            "X-Dynamo-Parent-Session-ID",
+        )
+    assert "router type" not in caplog.text
+
+
+def test_subagent_affinity_both_scope_warns_with_conditional_disagg(caplog):
+    # "both" scope + conditional disaggregation is unsupported (router-type
+    # conflict); expect a warning rather than a hard rejection.
+    with caplog.at_level(logging.WARNING):
+        extract_disagg_cfg(
+            **_yaml_config_with_conversation_routers(),
+            conversation_affinity_header_for_subagents=
+            "X-Dynamo-Parent-Session-ID",
+            subagent_affinity_scope="both",
+            conditional_disagg_config={"max_local_prefill_length": 32},
+        )
+    assert "unsupported with conditional" in caplog.text
+
+
+def test_subagent_affinity_inert_when_header_unset(caplog):
+    # No configured header -> feature off -> no warnings even with a non-conversation
+    # router or conditional disagg present.
+    with caplog.at_level(logging.WARNING):
+        extract_disagg_cfg(
+            **get_yaml_config(),
+            subagent_affinity_scope="both",
+            conditional_disagg_config={"max_local_prefill_length": 32},
+        )
+    assert "sub-agent" not in caplog.text.lower()
+    assert "subagent_affinity_scope" not in caplog.text

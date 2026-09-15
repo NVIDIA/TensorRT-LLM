@@ -20,6 +20,7 @@ It reuses existing TRT-LLM attention backends (TrtllmAttention, VanillaAttention
 simplified metadata that doesn't require KV caching.
 """
 
+from .cudnn import CuDNNAttention
 from .cute_dsl import (
     VSA_TILE_SIZE,
     CuTeDSLAttention,
@@ -42,6 +43,7 @@ __all__ = [
     "Attention2DAttention",
     "AttentionBackend",
     "AttentionTensorLayout",
+    "CuDNNAttention",
     "CuTeDSLAttention",
     "FlashAttn4Attention",
     "FlashInferAttention",

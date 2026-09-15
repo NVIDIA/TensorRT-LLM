@@ -15,7 +15,7 @@ A simple inference example with TinyLlama using the LLM API:
     :linenos:
 ```
 
-For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this [README](../../../examples/llm-api/README.md).
+For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this [README](source:examples/llm-api/README.md).
 
 ## Model Input
 
@@ -76,8 +76,7 @@ A typical result has the following structure:
 The `model_loader` object contains timings for the main LLM weights. If a draft
 model is used, the additional fields `draft_checkpoint_preparation_seconds`,
 `draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds`
-appear. A `draft_model_loader` object can also appear in the deprecated
-two-model MTP configuration.
+appear.
 
 | Metric | Description |
 |--------|-------------|

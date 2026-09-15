@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Low-Precision-AllReduce
 
 ```{note}

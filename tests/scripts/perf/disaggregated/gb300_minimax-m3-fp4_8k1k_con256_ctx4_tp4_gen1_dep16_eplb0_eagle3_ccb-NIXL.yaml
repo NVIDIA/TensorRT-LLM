@@ -136,7 +136,6 @@ worker_config:
     speculative_config: &eagle3_config
       decoding_type: Eagle3
       max_draft_len: 3
-      eagle3_one_model: true
       speculative_model: inferact_minimax-m3-eagle3-gqa/hf/hf-9669248_orig
     scheduler_config:
       capacity_scheduler_policy: MAX_UTILIZATION

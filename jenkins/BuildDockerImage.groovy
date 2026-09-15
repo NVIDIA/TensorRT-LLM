@@ -700,12 +700,18 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        (stageNames.ciImageSBSAUbuntu): [
-            arch: "arm64",
-            target: "ubuntu24",
-            args: "PYTHON_VERSION=3.12.3",
-            postTag: "-py312",
-        ],
+        // TODO(dlfw-26.08): re-enable once a CUDA 13.4 base image exists. This one builds on
+        // nvcr.io/nvidia/cuda:13.3.1-devel-ubuntu24.04 and, unlike rockylinux8, never reinstalls
+        // the toolkit (install_cuda_toolkit.sh only handles Rocky), so its nvcc would stay at
+        // 13.3.1 while the libraries move to 13.4. nvcr.io/nvidia/cuda tops out at 13.3.1 today.
+        // Disabled by commenting out the build config rather than the stage name, so the name
+        // stays valid where it is referenced below.
+        // (stageNames.ciImageSBSAUbuntu): [
+        //     arch: "arm64",
+        //     target: "ubuntu24",
+        //     args: "PYTHON_VERSION=3.12.3",
+        //     postTag: "-py312",
+        // ],
         (stageNames.ngcReleaseX86): [
             target: "ngc-release",
             action: release_action,
@@ -758,7 +764,9 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
     if (buildCiImage) {
-        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+        // TODO(dlfw-26.08): restore ciImageSBSAUbuntu here when its build config above is
+        // uncommented.
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312]
     }
     if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]

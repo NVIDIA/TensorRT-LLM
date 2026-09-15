@@ -464,7 +464,6 @@ class TestEvictionLifecycle:
             else Eagle3DecodingConfig(
                 max_draft_len=1,
                 speculative_model="draft",
-                eagle3_one_model=True,
             )
         )
 

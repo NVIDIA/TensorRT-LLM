@@ -173,15 +173,15 @@ def get_cached_cuda_event_type():
     backend = KV_CACHE_MANAGER_V2_BACKEND
     if backend == "cpp":
         try:
-            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
         except ImportError:
             from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
-                CachedCudaEvent,
+                _introspection,
             )
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
 
     if find_spec("kv_cache_manager_v2") is not None:
         from kv_cache_manager_v2._utils import CachedCudaEvent
@@ -264,6 +264,17 @@ class TestTypedSlotIds(unittest.TestCase):
 
 
 class TestCacheLevelStorage(unittest.TestCase):
+    def test_grains_to_slots_rejects_zero_divisors(self) -> None:
+        invalid_inputs = [
+            (1, [0], 16 << 20),
+            (1, [16 << 20], 0),
+        ]
+
+        for grains, slot_sizes, granularity in invalid_inputs:
+            with self.subTest(slot_sizes=slot_sizes, granularity=granularity):
+                with self.assertRaisesRegex((ValueError, RuntimeError), "must be positive"):
+                    _introspection.grains_to_slots(grains, slot_sizes, granularity)
+
     def test_grains_to_slots_refines_proportional_lower_bound(self) -> None:
         granularity = 16 << 20
         slot_size_list = [16_252_928, 4_063_232]
@@ -1007,7 +1018,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(
             self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
         )
-        with self.assertRaisesRegex(ValueError, "already been dropped"):
+        with self.assertRaisesRegex(RuntimeError, "already been dropped"):
             long_handle.drop()
 
     @requires_python_backend

@@ -23,12 +23,18 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
     HNDHeadMismatchMapper,
     IntactMapper,
     NHDHeadMismatchMapper,
     ReplicatedMapper,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+    ConvStateMismatchMapper,
+    MambaHeadMatchMapper,
+    MambaPolicy,
+)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -37,6 +43,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
     MAMBA_SSM_ROLE,
     AttentionLayerGroup,
+    CacheKind,
     KVCachePageTable,
     LocalLayer,
     MambaLayerGroup,
@@ -110,6 +117,7 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=conv_slot_bytes,
+            section_bytes=[1024 // mamba_tp, 512 // mamba_tp, 512 // mamba_tp],
         ),
         PoolView(
             pool_idx=1,
@@ -119,14 +127,13 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_slot_bytes,
+            bytes_per_head=64,
         ),
     ]
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
         local_layers=mamba_local_layers,
         pool_views=mamba_pool_views,
-        conv_section_bytes=[1024 // mamba_tp, 512 // mamba_tp, 512 // mamba_tp],
-        ssm_bytes_per_head=64,
     )
     conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=128)
     ssm_pool = PhysicalPool(base_address=0xB000, slot_bytes=ssm_slot_bytes, num_slots=128)
@@ -1256,3 +1263,104 @@ def test_indexed_head_mismatch_inconsistent_slot_geometry_raises():
             self_buffers_per_layer=2,
             peer_buffers_per_layer=2,
         )
+
+
+# ---------------------------------------------------------------------------
+# Policy dispatch: the policy is chosen by CacheKind; each policy picks the
+# mapper for a view from its MapperKind, including REPLICATED.
+# ---------------------------------------------------------------------------
+
+
+def _add_replicated_side_view(page_table, *, bytes_per_layer=8):
+    """Graft a replicated recurrent side view (e.g. PLE) onto the mamba group."""
+    mamba_lg = page_table.layer_groups[1]
+    pool_group = page_table.pool_groups[mamba_lg.pool_group_idx]
+    pool_group.pools.append(
+        PhysicalPool(base_address=0xC000, slot_bytes=bytes_per_layer, num_slots=128)
+    )
+    mamba_lg.pool_views.append(
+        PoolView(
+            pool_idx=len(pool_group.pools) - 1,
+            buffer_entries=np.array(
+                [(0, 0, bytes_per_layer), (1, bytes_per_layer, bytes_per_layer)],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=frozenset({"ple_ngram_context"}),
+            mapper_kind=MapperKind.REPLICATED,
+            bytes_per_layer=bytes_per_layer,
+        )
+    )
+    return len(mamba_lg.pool_views) - 1
+
+
+def test_policy_dispatch_keys_on_cache_kind_only():
+    reg = _make_peer_registrar(make_rankinfo(instance_name="local"))
+    assert isinstance(reg._get_policy(CacheKind.PAGED), AttentionPolicy)
+    assert isinstance(reg._get_policy(CacheKind.STATE), MambaPolicy)
+
+
+def test_mamba_replicated_side_view_elects_one_sender():
+    """Replicated side state elects one sender per fan-in group.
+
+    Sharded conv state on the same layer group is sent by every mamba TP rank.
+    """
+    peer_pt = make_page_table(mamba_tp=1)
+    _add_replicated_side_view(peer_pt)
+    peer_ri = make_rankinfo(instance_name="peer", tp_size=1, page_table=peer_pt)
+    overlap = PeerOverlap()
+
+    conv_ownership = []
+    side_ownership = []
+    for tp_rank in range(2):
+        self_pt = make_page_table(mamba_tp=2)
+        side_idx = _add_replicated_side_view(self_pt)
+        self_ri = make_rankinfo(
+            instance_name="local", tp_size=2, tp_rank=tp_rank, page_table=self_pt
+        )
+        reg = _make_peer_registrar(self_ri)
+        conv_ownership.append(reg.should_send_pool(overlap, peer_ri, 1, 0))
+        side_ownership.append(reg.should_send_pool(overlap, peer_ri, 1, side_idx))
+
+    assert conv_ownership == [True, True]
+    assert side_ownership == [True, False]
+
+
+def test_mamba_replicated_side_view_copies_whole_layers_under_tp_mismatch():
+    """REPLICATED state ignores mamba TP.
+
+    The head-match mapper is used even when conv/SSM on the same group need a
+    resharding mapper.
+    """
+    self_pt = make_page_table(mamba_tp=2)
+    self_side = _add_replicated_side_view(self_pt)
+    peer_pt = make_page_table(mamba_tp=1)
+    peer_side = _add_replicated_side_view(peer_pt)
+    self_ri = make_rankinfo(instance_name="local", tp_size=2, page_table=self_pt)
+    peer_ri = make_rankinfo(instance_name="peer", tp_size=1, page_table=peer_pt)
+    reg = _make_peer_registrar(self_ri)
+
+    mapper = reg.get_kv_map(peer_ri, (1, self_side), (1, peer_side))
+    assert isinstance(mapper, MambaHeadMatchMapper)
+    conv_mapper = reg.get_kv_map(peer_ri, (1, 0), (1, 0))
+    assert isinstance(conv_mapper, ConvStateMismatchMapper)
+
+
+def test_attention_replicated_validation_ignores_state_groups():
+    """A STATE-only replicated-role mismatch is MambaPolicy's to reject."""
+    self_pt = make_page_table()
+    _add_replicated_side_view(self_pt)
+    peer_pt = make_page_table()
+    AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
+    ri = make_rankinfo(instance_name="local", page_table=self_pt)
+    with pytest.raises(ValueError, match="MambaPolicy.*differ on overlapping layers"):
+        MambaPolicy.validate_peer_compatible(ri, ri, self_pt, peer_pt)
+
+
+def test_attention_replicated_validation_rejects_missing_index_key_view():
+    self_pt = make_page_table(global_layer_ids=[0])
+    view = self_pt.layer_groups[0].pool_views[0]
+    view.pool_role = frozenset({"index_key"})
+    view.mapper_kind = MapperKind.REPLICATED
+    peer_pt = make_page_table(global_layer_ids=[0])
+    with pytest.raises(ValueError, match="AttentionPolicy.*differ on overlapping layers"):
+        AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)

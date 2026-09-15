@@ -18,19 +18,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-# Try to import the modules - skip tests if not available
-try:
-    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-    from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
-    from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
-    from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
-        AttentionBackend,
-        AttentionTensorLayout,
-    )
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
+from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
+from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
+    AttentionBackend,
+    AttentionTensorLayout,
+)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -82,9 +76,6 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
                  Should accept (rank, world_size) as arguments.
         use_cuda: Whether to use CUDA (requires sufficient GPUs)
     """
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
-
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 

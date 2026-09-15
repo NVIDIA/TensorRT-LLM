@@ -1124,6 +1124,66 @@ def test_fused_qsa_sparse_gqa_matches_reference(head_dim: int, cache_dtype: torc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_splitk_merge_output_gate_matches_separate_gate() -> None:
+    torch.manual_seed(42)
+    rows = 1
+    num_pages = 289
+    num_kv_heads = 2
+    num_q_heads = 24
+    tokens_per_block = 32
+    head_dim = 256
+    selected_width = 2051
+    q = torch.randn(rows, num_q_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(
+        num_pages,
+        num_kv_heads,
+        tokens_per_block,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+    block_table = torch.arange(num_pages, dtype=torch.int32, device="cuda").reshape(1, -1)
+    request_indices = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    selected = torch.arange(selected_width, dtype=torch.int32, device="cuda").reshape(rows, -1)
+    output_gate = torch.randn_like(q)
+    metadata = SimpleNamespace(
+        qsa_block_table=block_table,
+        kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
+    )
+
+    attention = qsa_sparse_gqa(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=head_dim**-0.5,
+    )
+    actual = qsa_sparse_gqa(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected,
+        request_indices=request_indices,
+        metadata=metadata,
+        softmax_scale=head_dim**-0.5,
+        output_gate=output_gate,
+    )
+    # Compare against the kernel the unfused path actually runs, so the test
+    # pins "fused == unfused" rather than "Triton sigmoid == torch sigmoid".
+    from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
+        fused_sigmoid_mul_inplace,
+    )
+
+    expected = attention.clone()
+    fused_sigmoid_mul_inplace(expected.view(rows, num_q_heads * head_dim), output_gate)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fused_qsa_prefill_bounds_sparse_attention_to_visible_tokens() -> None:
     torch.manual_seed(43)
     rows = 257

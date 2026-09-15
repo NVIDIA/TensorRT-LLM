@@ -10,7 +10,9 @@ if TYPE_CHECKING:
     from tensorrt_llm.visual_gen.output import VisualGenMetrics
 
 SERVER_TIMING_HEADER = "Server-Timing"
+VISUAL_GEN_PRE_DENOISE_TIMING = "pre_denoise"
 VISUAL_GEN_DENOISE_TIMING = "denoise"
+VISUAL_GEN_POST_DENOISE_TIMING = "post_denoise"
 VISUAL_GEN_GENERATION_TIMING = "generation"
 VISUAL_GEN_TOTAL_TIMING = "total"
 
@@ -19,16 +21,27 @@ def build_visual_gen_server_timings(
     metrics: Optional["VisualGenMetrics"] = None,
     total: Optional[float] = None,
 ) -> Dict[str, float]:
-    """Flatten engine ``generation``/``denoise`` + serve ``total`` into one timings dict (seconds).
+    """Flatten the engine's phases + serve ``total`` into one timings dict (seconds).
 
     Engine metrics carry no ``total`` — the route measures it — so it is passed
     separately here. Absent values are omitted. Mirrors how the LLM serve path
     merges engine + server timings into one record.
+
+    ``pre_denoise`` and ``post_denoise`` are ``0.0`` on a pipeline that does not
+    record them, and a phase that ran has a nonzero GPU-stream span, so a zero
+    is left out: a consumer reading it as a measurement would see a phase that
+    cost nothing rather than one nobody timed.
     """
     timings: Dict[str, float] = {}
     if metrics is not None:
         timings[VISUAL_GEN_GENERATION_TIMING] = metrics.generation
         timings[VISUAL_GEN_DENOISE_TIMING] = metrics.denoise
+        for name, value in (
+            (VISUAL_GEN_PRE_DENOISE_TIMING, metrics.pre_denoise),
+            (VISUAL_GEN_POST_DENOISE_TIMING, metrics.post_denoise),
+        ):
+            if value:
+                timings[name] = value
     if total is not None:
         timings[VISUAL_GEN_TOTAL_TIMING] = total
     return timings

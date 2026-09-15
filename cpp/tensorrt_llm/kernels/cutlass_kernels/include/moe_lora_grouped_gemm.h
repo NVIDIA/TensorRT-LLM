@@ -72,7 +72,7 @@ using MoeLoraGroupedGemmRunFn = void (*)(MoeLoraGroupedGemmModule const& mod, in
 //   lda/ldb/ldd_*    -> int64_t*                  (device, [P_max])
 //   splitk_offsets   -> int64_t*                  (device, [P_max + 1])
 //   lowrank_ws_dev   -> void*                     (device, [P_max, max_lora_rank, dtype_bytes])
-//   host_max_*       -> cutlass::gemm::GemmCoord* (pinned host, [1])
+//   host_max_*       -> cutlass::gemm::GemmCoord* (pinned host, [P_max])
 //
 // The split-K in-GEMM's partial-sum scratch is allocated internally by the
 // cuda_graph_split_k_grouped_gemm wrapper (sized from the host max-problem

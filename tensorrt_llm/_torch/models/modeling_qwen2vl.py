@@ -2210,7 +2210,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
             self.mm_encoder = None
 
         # Surface the in-vocab image / vision / video placeholder IDs to the
-        # model engine's ``_prepare_multimodal_indices`` so it selects the
+        # ``runners.prepare_multimodal_indices`` so it selects the
         # ``torch.isin`` predicate. Filter out None — some Qwen2-VL variants
         # only define a subset of these.
         _mm_ids = [
