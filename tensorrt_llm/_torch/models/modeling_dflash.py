@@ -26,7 +26,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
-from .modeling_utils import get_model_architecture, register_draft_model
+from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
 def dspark_layer_window_size(
@@ -323,6 +323,12 @@ class DFlashForCausalLM(nn.Module):
     Reference: https://arxiv.org/pdf/2602.06036
     """
 
+    # Whether ``dflash_attention_backend`` drives this drafter's block decode.
+    # Subclasses that bring their own attention set this False: neither backend
+    # can express every drafter shape, the ops behind them are optional
+    # dependencies, and the worker's per-backend shape checks do not apply.
+    _uses_worker_attention_backend = True
+
     def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
         """Build the draft model, resolving its architecture from the draft config
         (falling back to a model_type-derived name when the checkpoint uses a
@@ -374,23 +380,32 @@ class DFlashForCausalLM(nn.Module):
             "block_size", getattr(pretrained_config, "block_size", None)
         )
         self.dflash_attention_backend = dflash_attention_backend
-        # Each backend loads only its own ops; the rest stay None so the
-        # shared paged prologue can read them unconditionally.
-        self._dflash_trtllm_gen_ops = None
-        self._dflash_fa4_fwd = None
-        self._dflash_paged_append = None
-        if self.dflash_attention_backend == "VANILLA":
-            self._dflash_flash_attention = get_dflash_flash_attention()
-        elif self.dflash_attention_backend == "TRTLLM":
-            self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
-        elif self.dflash_attention_backend == "FA4":
-            self._dflash_fa4_fwd = get_dflash_fa4_fwd()
-            self._dflash_paged_append = get_dflash_paged_append()
-        else:
+        if self.dflash_attention_backend not in ("VANILLA", "TRTLLM", "FA4"):
             raise ValueError(
                 "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
                 f"{self.dflash_attention_backend!r}."
             )
+        # Each backend loads only its own ops; the rest stay None so the
+        # shared paged prologue can read them unconditionally.
+        self._dflash_flash_attention = None
+        self._dflash_trtllm_gen_ops = None
+        self._dflash_fa4_fwd = None
+        self._dflash_paged_append = None
+        if not self._uses_worker_attention_backend:
+            # Still validated above so a typo fails here rather than silently,
+            # but no op set is loaded: this drafter calls none of them.
+            logger.info_once(
+                f"{type(self).__name__} brings its own block decode; "
+                f"attention_backend={self.dflash_attention_backend!r} is not used.",
+                key=f"dflash_own_attention_{type(self).__name__}",
+            )
+        elif self.dflash_attention_backend == "VANILLA":
+            self._dflash_flash_attention = get_dflash_flash_attention()
+        elif self.dflash_attention_backend == "TRTLLM":
+            self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
+        else:
+            self._dflash_fa4_fwd = get_dflash_fa4_fwd()
+            self._dflash_paged_append = get_dflash_paged_append()
         self._dflash_trtllm_gen_workspace = None
         self._dflash_trtllm_gen_counters = None
         self.register_buffer("_dflash_batch_indices", None, persistent=False)
@@ -727,6 +742,21 @@ class DFlashForCausalLM(nn.Module):
             else:
                 remapped[key] = value
 
+        # Wrapper-owned and built FROM the checkpoint, so they are never in
+        # draft_model_full's module tree and _assert_backbone_complete cannot
+        # see them: a module conjured from data cannot be reported missing by
+        # walking modules. One tuple drives both the extraction below and this
+        # check, so the two cannot drift. Without fc the drafter has no capture
+        # projection, has_target_features stays False, _ctx_len never advances
+        # and it drafts from an empty context forever (the `hasattr` guards on
+        # that path are degradation, not a supported mode).
+        wrapper_missing = [k for k in self.WRAPPER_OWNED_WEIGHTS if k not in remapped]
+        if wrapper_missing:
+            raise ValueError(
+                f"{type(self).__name__}: checkpoint is missing {wrapper_missing}, "
+                "which this wrapper owns and builds from the checkpoint."
+            )
+
         # Load DFlash-specific weights directly
         if "fc.weight" in remapped:
             self.fc = nn.Linear(
@@ -751,9 +781,10 @@ class DFlashForCausalLM(nn.Module):
             self.hidden_norm.weight.data.copy_(remapped["hidden_norm.weight"])
             del remapped["hidden_norm.weight"]
 
-        # Load remaining weights into the draft model.
-        # DFlash checkpoints don't include embed_tokens or lm_head, so allow partial loading
-        # since those modules won't find matching weights.
+        # allow_partial_loading is what lets the shared modules below be absent.
+        # It is also why a truncated checkpoint loads clean, so gate it on the
+        # subclass's own declaration of what may legitimately be missing.
+        self._assert_backbone_complete(remapped, weight_mapper)
         self.draft_model_full.load_weights(
             weights=remapped, weight_mapper=weight_mapper, allow_partial_loading=True
         )
@@ -804,6 +835,78 @@ class DFlashForCausalLM(nn.Module):
         self.mlp_convs = mlp_convs
         self.candidate_selector = selector
         return {k: v for k, v in weights.items() if k not in consumed}
+
+    #: Tensors the wrapper itself owns: not in draft_model_full, built from the
+    #: checkpoint in load_weights, and required.
+    WRAPPER_OWNED_WEIGHTS = ("fc.weight", "hidden_norm.weight")
+
+    #: Parameter-name prefixes this drafter takes from the target instead of its
+    #: own checkpoint. Everything else in ``draft_model_full`` must be provided.
+    #: GQA DFlash checkpoints ship neither embedding nor head; an MLA drafter
+    #: ships its own embedding and overrides this.
+    WEIGHTS_SHARED_WITH_TARGET = ("embed_tokens", "lm_head")
+
+    def _assert_backbone_complete(self, weights: Dict, weight_mapper=None) -> None:
+        """Fail on a checkpoint missing weights the drafter does not share.
+
+        The truth is the constructed module tree, not a hand-kept list that
+        rots as the backbone changes.
+
+        Checked at module granularity. For a PLAIN module that is the hole the
+        flag cannot close: the loader skips one whose subtree filters to
+        nothing (modeling_utils.py `if module_weights:`) whatever the flag
+        says. For a FUSED module `allow_partial_loading=False` would catch it
+        (linear.py asserts all three shards) -- but the flag has to stay True
+        for the target-shared modules, so the check covers that case here
+        instead, and requires every component rather than any.
+
+        Missing parameters INSIDE a present component stay tolerated: a
+        checkpoint with all three weights but only `q_proj.bias` takes the same
+        per-shard copy and leaves the rest at `torch.empty`. Module-granular
+        checking cannot see that and does not pretend to.
+        """
+        provided = set(weights)
+
+        # Whichever fusion table the load below will actually use, not a third
+        # copy: with a mapper modeling_utils dispatches to _load_weights_impl_v2
+        # and the mapper's own table applies; without one it falls back to
+        # _load_weights_impl, whose table is FUSED_MODULE_COMPONENTS. An empty
+        # `mapping` means init_model_and_config has not run, so the mapper has
+        # no table to offer yet and the constant is still the right answer.
+        fusion = dict(getattr(weight_mapper, "mapping", None) or FUSED_MODULE_COMPONENTS)
+
+        def _has(prefix: str) -> bool:
+            return any(k == prefix or k.startswith(prefix + ".") for k in provided)
+
+        def _supplied(module_name: str) -> bool:
+            # A fused module is named once here and stored unfused in the
+            # checkpoint. ALL components must be present, not any: the fused
+            # load path is happy with a subset under allow_partial_loading
+            # (linear.py load_weights_fused_qkv_helper) and leaves the absent
+            # shards at torch.empty -- uninitialised device memory, not zeros.
+            if _has(module_name):
+                return True
+            for fused, parts in fusion.items():
+                if fused in module_name:
+                    return all(_has(module_name.replace(fused, p)) for p in parts)
+            return False
+
+        missing = sorted(
+            {
+                name.rsplit(".", 1)[0]
+                for name, _ in self.draft_model_full.named_parameters()
+                if not any(part in name for part in self.WEIGHTS_SHARED_WITH_TARGET)
+                and not _supplied(name.rsplit(".", 1)[0])
+            }
+        )
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__}: checkpoint provides no weights for "
+                f"{missing[:8]}{' ...' if len(missing) > 8 else ''}. These are "
+                f"not in WEIGHTS_SHARED_WITH_TARGET "
+                f"({', '.join(self.WEIGHTS_SHARED_WITH_TARGET)}), so loading "
+                "would leave them randomly initialized."
+            )
 
     def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
         """Share embed_tokens and lm_head from the target model."""
