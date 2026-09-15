@@ -616,6 +616,17 @@ def test_resume_routes_agents_from_checkpointed_task_and_ignores_new_task(tmp_pa
         workflow.close()
 
 
+def test_casebook_disable_reaches_every_backend(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text("casebook: {enabled: false}\n", encoding="utf-8")
+    try:
+        workflow._configure_agents()
+        for role in _AGENT_ROLES:
+            assert getattr(workflow, role).config.backend.disabled_skills
+    finally:
+        workflow.close()
+
+
 def test_completed_resume_constructs_no_agents_and_close_is_safe(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     ws.mkdir()

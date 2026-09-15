@@ -33,6 +33,8 @@ from .state import (
     save_state,
 )
 from .task_schema import (
+    CASEBOOK_SKILL_NAMES,
+    casebook_enabled,
     concurrency_points,
     dump_task_yaml,
     is_curve_mode,
@@ -103,6 +105,7 @@ def _make_agent(
     tools: list | None = None,
     required_tools: list[str] | None = None,
     session_mode: str = "persistent",
+    disabled_skills: tuple[str, ...] = (),
 ) -> AgentLayer:
     return AgentLayer(
         AgentLayerConfig(
@@ -112,6 +115,7 @@ def _make_agent(
                 kind=agent_config.backend,
                 model=agent_config.model,
                 reasoning_effort=agent_config.reasoning_effort,
+                disabled_skills=disabled_skills,
                 tools=tools,
                 extra_mcp_servers=agent_config.extra_mcp_servers,
             ),
@@ -233,6 +237,7 @@ class PerfAnalyzeWorkflow:
 
         self._progress_tools = progress_tools
         self._agent_configs: dict[str, AgentConfig] = {}
+        self._disabled_skills: tuple[str, ...] = ()
         for role in ROLES:
             setattr(self, role, None)
 
@@ -250,6 +255,7 @@ class PerfAnalyzeWorkflow:
 
     def _configure_agents(self) -> None:
         task_data = self._task_data()
+        self._disabled_skills = () if casebook_enabled(task_data) else CASEBOOK_SKILL_NAMES
         self._agent_configs = {role: resolve_agent_config(task_data, role) for role in ROLES}
         for role in ROLES:
             setattr(
@@ -261,6 +267,7 @@ class PerfAnalyzeWorkflow:
                     self._agent_configs[role],
                     self._progress_tools[role],
                     required_tools=[f"append_{role}_progress"],
+                    disabled_skills=self._disabled_skills,
                 ),
             )
 
@@ -417,11 +424,13 @@ class PerfAnalyzeWorkflow:
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, the optional `extra_llm_api_options` path, "
             f"and the `benchmark` block.\n\n"
-            f"Then **load the `perf-optimization-casebook` skill** (via the "
-            f"`Skill` tool) as read-only reference, as your system prompt "
-            f"directs, so your Configuration/Notes are grounded in known "
-            f"TRT-LLM performance precedents.\n\n"
-            f"Launch `trtllm-serve` (passing `--extra_llm_api_options` when "
+            + self._casebook_instruction(
+                "Then **load the `perf-optimization-casebook` skill** (via the "
+                "`Skill` tool) as read-only reference, as your system prompt "
+                "directs, so your Configuration/Notes are grounded in known "
+                "TRT-LLM performance precedents.\n\n"
+            )
+            + f"Launch `trtllm-serve` (passing `--extra_llm_api_options` when "
             f"set), poll it to "
             f"readiness, {load_instruction}. Use the "
             f"**canonical `benchmark_serving.py` command in your system "
@@ -525,12 +534,14 @@ class PerfAnalyzeWorkflow:
             f"baseline.\n\n"
             + curve_context
             + projection_context
-            + f"Early on, **load the `perf-optimization-casebook` skill** (via "
-            f"the `Skill` tool) as read-only reference, as your system prompt "
-            f"directs, and match each ranked bottleneck hypothesis against its "
-            f"*bottleneck signal → candidate pattern* index so the Reporter "
-            f"inherits a known precedent.\n\n"
-            f"First **verify this checkout's profiling knobs** with "
+            + self._casebook_instruction(
+                "Early on, **load the `perf-optimization-casebook` skill** (via "
+                "the `Skill` tool) as read-only reference, as your system prompt "
+                "directs, and match each ranked bottleneck hypothesis against its "
+                "*bottleneck signal → candidate pattern* index so the Reporter "
+                "inherits a known precedent.\n\n"
+            )
+            + f"First **verify this checkout's profiling knobs** with "
             f"`grep -rn`/`rg` via `Bash` under "
             f"`{self._trtllm_hint()}` — `py_executor.py` for "
             f"`TLLM_PROFILE_START_STOP` (the iteration-window gate), and "
@@ -679,6 +690,9 @@ class PerfAnalyzeWorkflow:
         On by default — only ``sol.enabled: false`` turns it off.
         """
         return sol_enabled(self._task_data())
+
+    def _casebook_instruction(self, text: str) -> str:
+        return "" if self._disabled_skills else text
 
     def _profile_ranks(self) -> tuple[int, ...]:
         """The rank ids nsys must capture, from the resolved spec."""

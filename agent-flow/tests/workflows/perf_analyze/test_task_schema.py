@@ -9,6 +9,7 @@ import yaml
 
 from agent_flow.workflows.perf_analyze.task_schema import (
     TaskSchemaError,
+    casebook_enabled,
     concurrency_points,
     dump_task_yaml,
     has_slurm_environment,
@@ -58,6 +59,7 @@ def test_valid_minimal_applies_defaults(tmp_path):
         # spawn-launched server can give.
         "profile_ranks": [0],
     }
+    assert data["casebook"] == {"enabled": True}
     assert has_slurm_environment(data) is False
     # The projector is on by default, and the block is materialized so
     # the resolved spec states the gate the agents read.
@@ -1008,3 +1010,27 @@ def test_agents_accept_only_perf_analyze_roles(tmp_path):
     )
     with pytest.raises(TaskSchemaError, match="optimizer"):
         load_and_validate_task_yaml(invalid)
+
+
+def test_casebook_can_be_disabled(tmp_path):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "casebook": {"enabled": False},
+        },
+    )
+    assert casebook_enabled(load_and_validate_task_yaml(path)) is False
+
+
+@pytest.mark.parametrize("block", [False, {"enabled": "no"}, {"enable": False}])
+def test_casebook_rejects_invalid_config(tmp_path, block):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {"checkpoint_path": ckpt, "trtllm_repo_path": repo, "casebook": block},
+    )
+    with pytest.raises(TaskSchemaError, match="casebook"):
+        load_and_validate_task_yaml(path)

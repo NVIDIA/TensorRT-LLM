@@ -26,6 +26,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
     # perf-analyze base defaults still merge.
     assert data["benchmark"]["random_input_len"] == 1024
     assert data["profile"]["methods"] == ["nsys", "ncu"]
+    assert data["casebook"] == {"enabled": True}
     # perf-optimize defaults merge.
     assert data["optimize"] == {
         "max_rounds": 5,

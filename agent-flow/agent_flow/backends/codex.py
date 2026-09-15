@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -141,10 +142,22 @@ def _codex_backend_version() -> str:
 _REASONING_EFFORT = "max"
 
 
+def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
+    if not names:
+        return ()
+    entries = ", ".join(f"{{name={json.dumps(name)}, enabled=false}}" for name in names)
+    return (f"skills.config=[{entries}]",)
+
+
 class CodexBackend(Backend):
-    def __init__(self, reasoning_effort: str | None = None) -> None:
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        disabled_skills: tuple[str, ...] = (),
+    ) -> None:
         self._transport: CodexTransport | None = None
         self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._disabled_skills = disabled_skills
 
     def version(self) -> str:
         return _codex_backend_version()
@@ -154,7 +167,11 @@ class CodexBackend(Backend):
 
     async def __aenter__(self) -> "CodexBackend":
         self._transport = CodexTransport(
-            CodexConfig(codex_bin=_resolve_codex_bin(), experimental_api=True)
+            CodexConfig(
+                codex_bin=_resolve_codex_bin(),
+                experimental_api=True,
+                config_overrides=_disabled_skills_override(self._disabled_skills),
+            )
         )
         await self._transport.start()
         return self

@@ -19,6 +19,10 @@ trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
 #     projector: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
 #     analyzer: {backend: codex, model: gpt-6-astra, reasoning_effort: ultra}
 
+# Optional A/B switch. The optimization casebook is enabled by default.
+# casebook:
+#   enabled: false
+
 # Optional: the benchmark operating point(s) driven by
 # benchmark_serving.py.
 benchmark:
