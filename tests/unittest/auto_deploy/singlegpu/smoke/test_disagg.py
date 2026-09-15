@@ -43,6 +43,7 @@ def small_model_config_disagg(model_id, attn_backend, compile_backend, **overrid
             "tokens_per_block": 4,
             "max_tokens": 64,
             "free_gpu_memory_fraction": 0.001,
+            "use_kv_cache_manager_v2": False,
         }
     )
     args.update(
@@ -58,7 +59,10 @@ def small_model_config_disagg(model_id, attn_backend, compile_backend, **overrid
             "max_batch_size": 2,
             "max_seq_len": 64,
             "max_num_tokens": 16,
-            "cache_transceiver_config": {"backend": "DEFAULT"},
+            "cache_transceiver_config": {
+                "backend": "DEFAULT",
+                "transceiver_runtime": "CPP",
+            },
         }
     )
     args.update(overrides)
