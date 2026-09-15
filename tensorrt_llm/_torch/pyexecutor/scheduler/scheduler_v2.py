@@ -15,6 +15,7 @@
 
 import enum
 import os
+import time
 from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
@@ -161,6 +162,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # prompt, the original plus tokens generated so far, to this.
         self.max_input_len = max_input_len
         self._stalled_schedules = 0
+        self._stall_reports = 0
+        self._stall_started_at: Optional[float] = None
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
         )
@@ -1096,10 +1099,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         return False
 
     # Consecutive scheduling passes that reclaimed nothing before this counts
-    # as a deadlock. A stalled pass costs ~2ms, so it trips within seconds,
-    # while transient one-iteration deferrals (multimodal chunk alignment,
-    # PEFT budget, IndexMapper slots) clear long before.
+    # as a suspected deadlock. A stalled pass costs ~2ms, so it trips within
+    # seconds, while transient one-iteration deferrals (multimodal chunk
+    # alignment, PEFT budget, IndexMapper slots) clear long before.
     _DEADLOCK_STALL_ITERS = 1000
+
+    def _reset_stall_state(self) -> None:
+        self._stalled_schedules = 0
+        self._stall_reports = 0
+        self._stall_started_at = None
 
     def _detect_deadlock(
         self,
@@ -1109,16 +1117,20 @@ class KVCacheV2Scheduler(RequestScheduler):
         preempted_ids: set[int],
         made_progress: bool,
     ) -> None:
-        """Fail loudly when no request can be scheduled or reclaimed.
+        """Report when no request can be scheduled or reclaimed.
 
         Without this the executor spins at full speed while scheduling
         nothing, which looks healthy to the hang detector and to `/health`
         while the job burns its wall clock. Context candidates count alongside
         generation ones because a disaggregated prefill server has no
         generation requests at all.
+
+        A stall is not proof of a deadlock — a connector still draining pages
+        clears on its own — so this only reports. Tearing the job down is the
+        deadlock detector's call.
         """
         if made_progress:
-            self._stalled_schedules = 0
+            self._reset_stall_state()
             return
 
         num_gen_candidates = sum(
@@ -1135,22 +1147,59 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         if num_gen_candidates == 0 and num_ctx_candidates == 0:
             # Legitimately idle: nothing to schedule.
-            self._stalled_schedules = 0
+            self._reset_stall_state()
             return
 
+        now = time.monotonic()
+        if self._stall_started_at is None:
+            self._stall_started_at = now
         self._stalled_schedules += 1
-        if self._stalled_schedules < self._DEADLOCK_STALL_ITERS:
+        # Repeat on a doubling stall count so a stall that outlives its first
+        # report keeps leaving a trail without flooding the log at the few
+        # hundred passes per second a stalled loop runs at.
+        if self._stalled_schedules < self._DEADLOCK_STALL_ITERS * (2**self._stall_reports):
             return
+        self._stall_reports += 1
+        stalled_seconds = now - self._stall_started_at
 
-        raise RuntimeError(
-            f"V2 scheduler deadlock: {num_gen_candidates} generation and "
-            f"{num_ctx_candidates} context request(s) active but none could "
+        self._log_stalled_pool_report()
+        logger.warning(
+            f"V2 scheduler suspected deadlock: {num_gen_candidates} generation "
+            f"and {num_ctx_candidates} context request(s) active but none could "
             f"be scheduled, suspended or preempted in "
-            f"{self._stalled_schedules} consecutive attempts. The KV cache "
+            f"{self._stalled_schedules} consecutive attempts over "
+            f"{stalled_seconds:.3f}s. The KV cache "
             f"pool is likely exhausted. Configure "
             f"kv_cache_config.host_cache_size, increase "
-            f"kv_cache_config.max_tokens, or lower max_batch_size."
+            f"kv_cache_config.max_tokens, or lower max_batch_size. "
+            f"See the [V2Scheduler] scheduling stalled report logged above "
+            f"for the pool breakdown."
         )
+
+    def _log_stalled_pool_report(self) -> None:
+        """Log GPU block counts per pool so the exhausted pool is identifiable.
+
+        The draft and cross pools are sized independently of the self pool, so
+        either can be the one that ran dry while the others look healthy.
+        """
+        managers = [("self", self.kv_cache_manager)]
+        if self.draft_kv_cache_manager is not None:
+            managers.append(("draft", self.draft_kv_cache_manager))
+        if self.cross_kv_cache_manager is not None:
+            managers.append(("cross", self.cross_kv_cache_manager))
+
+        for name, manager in managers:
+            stats = manager.get_kv_cache_stats()
+            free_by_window = ", ".join(
+                f"{window_size}:{num_free}"
+                for window_size, num_free in sorted(stats.num_free_blocks_per_window_size.items())
+            )
+            logger.warning(
+                f"[V2Scheduler] scheduling stalled report: {name} pool has "
+                f"{stats.free_num_blocks}/{stats.max_num_blocks} GPU blocks free "
+                f"at {stats.tokens_per_block} tokens per block, free blocks by "
+                f"window size: {free_by_window}"
+            )
 
     def _is_evictable(self, req: LlmRequest) -> bool:
         """A started request whose KV cache is still active on GPU.

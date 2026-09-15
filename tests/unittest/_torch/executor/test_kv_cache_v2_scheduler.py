@@ -18,6 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -184,6 +185,15 @@ def make_kv_cache_manager(
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
     mgr.has_pending_preemption.return_value = has_pending_preemption
     mgr.preempt_request.side_effect = preempt_request_fn or (lambda req: True)
+    # Read only by the stalled-scheduling report, which formats the pool
+    # breakdown and therefore needs real numbers rather than Mock attributes.
+    mgr.get_kv_cache_stats.return_value = SimpleNamespace(
+        max_num_blocks=64,
+        free_num_blocks=0,
+        used_num_blocks=64,
+        tokens_per_block=tokens_per_block,
+        num_free_blocks_per_window_size={4096: 0},
+    )
     return mgr
 
 
@@ -1034,14 +1044,28 @@ class TestContextPreemption:
 # ===========================================================================
 
 
+@pytest.fixture
+def stall_warnings():
+    """Capture the scheduler's warnings without touching the global logger."""
+    from tensorrt_llm._torch.pyexecutor.scheduler import scheduler_v2
+
+    with patch.object(scheduler_v2.logger, "warning") as warning:
+        yield warning
+
+
+def stall_messages(warning_mock):
+    return [call.args[0] for call in warning_mock.call_args_list]
+
+
 class TestDeadlockDetection:
-    """The scheduler must fail loudly rather than spin scheduling nothing.
+    """The scheduler must warn rather than silently spin scheduling nothing.
 
     A stalled pass costs a couple of milliseconds, so an undetected stall
-    burns a job's whole wall clock.
+    burns a job's whole wall clock. Tearing the job down is left to the
+    deadlock detector, so the scheduler only reports.
     """
 
-    def test_raises_after_repeated_stalls_with_context_candidates(self):
+    def test_warns_after_repeated_stalls_with_context_candidates(self, stall_warnings):
         """A prefill-only worker has no generation requests to count."""
         mgr = make_kv_cache_manager(
             resize_context_fn=lambda req, n: False,
@@ -1053,10 +1077,14 @@ class TestDeadlockDetection:
 
         for _ in range(2):
             sched.schedule_request(reqs, set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-            sched.schedule_request(reqs, set())
+        assert stall_messages(stall_warnings) == []
 
-    def test_raises_after_repeated_stalls_with_generation_candidates(self):
+        sched.schedule_request(reqs, set())
+        messages = stall_messages(stall_warnings)
+        assert any("scheduling stalled report" in m for m in messages)
+        assert any("V2 scheduler suspected deadlock" in m for m in messages)
+
+    def test_warns_after_repeated_stalls_with_generation_candidates(self, stall_warnings):
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
         sched = make_scheduler(mgr, max_num_tokens=100)
         sched._DEADLOCK_STALL_ITERS = 3
@@ -1066,10 +1094,29 @@ class TestDeadlockDetection:
 
         for _ in range(3):
             sched.schedule_request(reqs, set())
-        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        assert stall_messages(stall_warnings) == []
+
+        sched.schedule_request(reqs, set())
+        assert any("V2 scheduler suspected deadlock" in m for m in stall_messages(stall_warnings))
+
+    def test_warning_repeats_on_a_doubling_stall_count(self, stall_warnings):
+        """A stalled loop runs hundreds of passes a second; don't flood."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 2
+        reqs = [make_ctx_request(0, 100, is_first_context_chunk=False)]
+
+        # Stalled passes 2, 4 and 8 report, so 12 passes warn three times.
+        for _ in range(12):
             sched.schedule_request(reqs, set())
 
-    def test_transient_stall_does_not_raise(self):
+        suspected = [m for m in stall_messages(stall_warnings) if "suspected deadlock" in m]
+        assert len(suspected) == 3
+
+    def test_transient_stall_does_not_warn(self, stall_warnings):
         """One bad iteration is normal; the counter has to reset."""
         fail = [True]
 
@@ -1085,7 +1132,9 @@ class TestDeadlockDetection:
             sched.schedule_request(reqs, set())
             fail[0] = not fail[0]
 
-    def test_idle_scheduler_never_raises(self):
+        assert stall_messages(stall_warnings) == []
+
+    def test_idle_scheduler_never_warns(self, stall_warnings):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=1000)
         sched._DEADLOCK_STALL_ITERS = 2
@@ -1094,7 +1143,9 @@ class TestDeadlockDetection:
             out = sched.schedule_request([], set())
             assert len(out.context_requests) == 0
 
-    def test_all_candidates_inflight_never_raises(self):
+        assert stall_messages(stall_warnings) == []
+
+    def test_all_candidates_inflight_never_warns(self, stall_warnings):
         """Requests in the PP pipeline are progressing, just not here."""
         mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
         sched = make_scheduler(mgr, max_num_tokens=1000)
@@ -1103,6 +1154,8 @@ class TestDeadlockDetection:
 
         for _ in range(5):
             sched.schedule_request(reqs, {0})
+
+        assert stall_messages(stall_warnings) == []
 
 
 # ===========================================================================
