@@ -22,12 +22,6 @@ def _has_supported_gpu() -> bool:
     }
 
 
-pytestmark = pytest.mark.skipif(
-    not _has_supported_gpu(),
-    reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
-)
-
-
 def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
     actual_float = actual.float()
     expected_float = expected.float()
@@ -38,6 +32,12 @@ def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, fl
     return cosine, relative_l2
 
 
+# Scoped to this test rather than the module: the snapshot-bank test below runs
+# entirely on CPU tensors against the reference path and does not need a GPU.
+@pytest.mark.skipif(
+    not _has_supported_gpu(),
+    reason="Kimi K3 is supported only on Blackwell (SM100/SM103/SM107)",
+)
 @pytest.mark.parametrize(
     ("num_tokens", "num_snapshots"),
     [

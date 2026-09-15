@@ -1130,6 +1130,17 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     long long const block_stride_r = static_cast<long long>(T) * 7168;
     TLLM_CHECK_WITH_INFO(block_stride_r <= std::numeric_limits<int>::max(),
         "attn_res persistent fused: candidate stride %lld overflows the kernel's int stride", block_stride_r);
+    // One candidate step is not the largest address the kernel forms.
+    // ``residual_addr`` widens the token term but evaluates
+    // ``source * block_stride_r`` in int arithmetic, and ``source`` reaches
+    // ``numCandidates - 2`` (the ``source < N - 1`` branch). With N == 9 that
+    // product overflows from T == 42801 upward and the load leaves
+    // blockResidual. Persistent topology accepts any token count, so nothing
+    // upstream bounds T.
+    long long const max_candidate_offset = block_stride_r * (params.numCandidates - 2);
+    TLLM_CHECK_WITH_INFO(max_candidate_offset <= std::numeric_limits<int>::max(),
+        "attn_res persistent fused: candidate offset %lld (T=%d, N=%d) overflows the kernel's int stride",
+        max_candidate_offset, T, params.numCandidates);
 
     bool const has_delta = params.layerResidualAdd != nullptr;
     auto launch = [&](auto nsrc_tok, auto nc_tok, auto release_tmem_tok)

@@ -35,9 +35,14 @@ namespace kernels::kimiK3AttnRes
 //! N == 1 case: the persistent kernel always has at least one snapshot plus the
 //! layer residual.
 //!
-//! layerResidualAdd and outputRmsWeight are both required -- this entry point
-//! exists for the fully fused form. updatedLayerResidual must alias
-//! layerResidual: the kernel folds the residual add in place.
+//! outputRmsWeight is required -- this entry point exists for the fully fused
+//! form. layerResidualAdd is optional: shapes with no residual add to fold
+//! would otherwise be pushed back onto the per-token path. When it is non-null
+//! updatedLayerResidual must be non-null too (see
+//! attnResPersistentFusedSupported). updatedLayerResidual may alias
+//! layerResidual to recover the in-place fold, but it does not have to -- the
+//! residual the kernel consumes comes from its shared-memory copy rather than
+//! a reload of layerResidual.
 void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream);
 
 //! True when invokeAttnResPersistentFusedFwd can serve this shape, so callers

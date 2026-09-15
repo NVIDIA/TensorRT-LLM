@@ -312,6 +312,17 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_persistent_fwd(at::Tenso
 
     // Without an addend there is no updated prefix sum to materialize; return
     // the input so the Python contract (updated_prefix, output) is uniform.
+    //
+    // NOTE: on this branch the first result aliases layer_residual's storage,
+    // which the unannotated Tensor return type does not advertise. That is
+    // deliberate. Cloning to break the alias would copy [T, B, H] bf16 on a
+    // path whose only caller discards the value (``_, output = persistent_op``
+    // in modeling_kimi_linear.py), and the persistent kernel has no token
+    // ceiling by design -- at prefill lengths that is hundreds of MB of pure
+    // waste. Do not consume the first result when layer_residual_add is None,
+    // and add a register_fake before putting this operator on a torch.compile
+    // path, since the aliasing is conditional and cannot be expressed in the
+    // schema.
     auto updated_layer_residual = has_add ? at::empty_like(layer_residual) : layer_residual;
     auto output = at::empty_like(layer_residual);
     kernels::kimiK3AttnRes::AttnResFwdParams params{};
