@@ -169,6 +169,7 @@ full:GB300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_
 full:GB300/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/6581064)
 full:GB300/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
 full:GB300/unittest/_torch/modeling/test_modeling_gpt_oss.py::test_gpt_oss_trtllmgen[CUTLASS] SKIP (https://nvbugs/6633932)
+full:GB300/unittest/_torch/modules/tests_lora_modules/test_qwen3_sanity.py::TestQwen3LoRA::test_qwen3_fp8_lora SKIP (https://nvbugs/6668777)
 full:H100/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False] SKIP (https://nvbugs/6313072)
 full:H100/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True] SKIP (https://nvbugs/6313072)
 full:H100/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format SKIP (https://nvbugs/6626640)
