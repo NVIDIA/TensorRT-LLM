@@ -801,7 +801,7 @@ class KvCacheCreator:
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
-                max_num_tokens=self._max_num_tokens if is_draft else 0,
+                max_num_tokens=self._max_num_tokens,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
@@ -836,14 +836,29 @@ class KvCacheCreator:
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
+        draft_cost = self._get_draft_cache_cost(
+            kv_cache_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
+        if draft_cost is not None:
+            total += draft_cost
+        return total
+
+    def _get_draft_cache_cost(
+        self,
+        kv_cache_config: KvCacheConfig,
+        *,
+        use_separate_draft_kv_cache: bool,
+    ) -> Optional[CacheCost]:
+        """Return the draft manager's standalone cache cost, if it has one."""
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
-            total += self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                  draft_model_config,
-                                                  kv_cache_config)
-        elif use_separate_draft_kv_cache:
+            return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                                draft_model_config,
+                                                kv_cache_config)
+        if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
             # different layer count than what is actually used at runtime
@@ -861,20 +876,19 @@ class KvCacheCreator:
                     effective_draft_config,
                     draft_kv_cache_config,
                     is_disagg=self._is_disagg)
-                total += self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls,
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    is_draft=True)
+                return self._per_manager_cache_cost(draft_kv_cache_manager_cls,
+                                                    effective_draft_config,
+                                                    draft_kv_cache_config,
+                                                    is_draft=True)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
-                total += self._per_manager_cache_cost(
+                return self._per_manager_cache_cost(
                     self._kv_cache_manager_cls,
                     effective_draft_config,
                     draft_kv_cache_config,
                     num_layers=self._get_num_draft_layers(),
                     is_draft=True)
-        return total
+        return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
@@ -1732,7 +1746,6 @@ class KvCacheCreator:
         """Per-manager KV cache costs for target and draft layers."""
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
-        total_kv = self._get_kv_size_per_token(target_kv_cache_config)
         use_separate_draft_kv_cache = (
             self._should_create_separate_draft_kv_cache())
         target_kv = self._per_manager_cache_cost(
@@ -1740,8 +1753,14 @@ class KvCacheCreator:
             self._model_engine.model.model_config,
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
-                             intercept=total_kv.intercept - target_kv.intercept)
+        # Estimate the draft component directly so its independently modelled
+        # affine intercept is preserved exactly.
+        draft_kv = self._get_draft_cache_cost(
+            target_kv_cache_config,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+        )
+        if draft_kv is None:
+            return None
         costs = (target_kv, draft_kv)
         if any(cost.slope < 0 or cost.intercept < 0 or (
                 cost.slope == 0 and cost.intercept == 0) for cost in costs):
@@ -1843,7 +1862,7 @@ class KvCacheCreator:
                 raise ValueError(
                     f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
                     f"insufficient after the combined fixed cost "
-                    f"({intercept_total / GB:.2f} GiB, e.g. mamba SSM state) "
+                    f"({intercept_total / GB:.2f} GiB, e.g. SWA or mamba state) "
                     f"for target+draft. Increase free_gpu_memory_fraction or "
                     f"max_gpu_total_bytes, or reduce max_batch_size (the fixed "
                     f"cost scales with batch size).")
