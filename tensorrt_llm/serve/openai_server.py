@@ -951,8 +951,16 @@ class OpenAIServer(_VideoRoutesMixin):
             self.media_storage_path = Path(explicit_storage_path)
             self.media_storage_path.mkdir(parents=True, exist_ok=True)
         else:
-            self.media_storage_path = _new_media_dir(Path.cwd() /
-                                                     "trtllm_generated")
+            try:
+                self.media_storage_path = _new_media_dir(Path.cwd() /
+                                                         "trtllm_generated")
+            except OSError:
+                # A deployment may start the server from a directory it cannot
+                # write to, and that must not stop a server whose caller never
+                # asks for media. OSError rather than PermissionError: a
+                # read-only mount raises EROFS, which is not one.
+                self.media_storage_path = _new_media_dir(
+                    Path("/tmp/trtllm_generated"))  # nosec B108
         logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
 

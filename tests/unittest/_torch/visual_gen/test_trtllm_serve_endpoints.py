@@ -702,6 +702,43 @@ def test_the_default_media_storage_path_is_timestamped(tmp_path, monkeypatch):
     datetime.strptime(server.media_storage_path.name, "%y%m%d-%H%M%S")
 
 
+def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, monkeypatch):
+    """Some deployments start the server from a read-only directory. Media has
+    to land somewhere else rather than the server failing to come up, since the
+    caller may never ask for any."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    if os.geteuid() == 0:
+        # root writes through the mode bits, so the directory this test needs
+        # cannot exist.
+        pytest.skip("cannot make a directory unwritable for root")
+
+    monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    read_only = tmp_path / "read_only"
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    monkeypatch.chdir(read_only)
+    try:
+        with patch(
+            "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+            return_value=True,
+        ):
+            server = OpenAIServer(
+                generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+                model="test-model",
+                tool_parser=None,
+                server_role=ServerRole.VISUAL_GEN,
+                metadata_server_cfg=None,
+            )
+    finally:
+        read_only.chmod(0o755)
+
+    assert server.media_storage_path.parent == Path("/tmp/trtllm_generated")
+    assert server.media_storage_path.is_dir()
+    assert list(read_only.iterdir()) == []
+
+
 def test_servers_starting_in_the_same_second_get_separate_directories(tmp_path):
     """The stamp has one-second resolution, so two servers that start together
     would otherwise share a directory and interleave their media."""
