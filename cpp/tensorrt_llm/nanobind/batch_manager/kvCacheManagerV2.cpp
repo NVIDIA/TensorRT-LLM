@@ -1661,7 +1661,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
-            "One positive, normalized cache-tier quota weight per layer group.")
+            "One positive, normalized hot-tier byte-quota weight per layer group: SSM, full attention, "
+            "then increasing sliding window size and sink-block count. Only groups present are included; "
+            "sink tokens round up to blocks and identical lifecycles share one entry.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
@@ -2401,9 +2403,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
         .def_prop_ro(
             "layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); },
-            "Layers grouped by shared lifecycle/pool allocation. The iteration order of the "
-            "layer lists (and of the groups) is NOT an API contract and may differ across "
-            "backends/runs; do not rely on it for buffer/pool memory order -- use "
+            "Layers grouped in ID order: SSM, full attention, then increasing sliding window size "
+            "and sink-block count. Only groups present are included. Layer order within each group "
+            "is not an API contract; for buffer/pool memory order use "
             "pool_group_descs (PoolGroupDesc.pools[i].base_address + coalesced_buffers) instead.")
         .def(
             "get_layer_group_id",

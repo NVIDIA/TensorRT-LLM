@@ -287,7 +287,9 @@ struct KVCacheManagerConfig
     // Constraint-based memory partitioning.
     std::vector<BatchDesc> constraints;   // batches that must always be supportable
     std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
-    // One normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
+    // One normalized hot-tier byte-quota weight per layer group in ID order: SSM, full attention,
+    // then increasing SWA window and sink-block count, including only groups present in this manager.
+    // Cold initialization preserves the implied
     // layer-group slot-count proportions while accounting for cold page sizes.
     std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
 

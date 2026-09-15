@@ -113,7 +113,8 @@ worker_config:
       block_reuse_config:
         policy: per_conversation
         max_num_turns: 5
-      pool_ratio: [0.55, 0.22, 0.23]
+      # Full attention, short-window compressor state, then SWA.
+      pool_ratio: [0.22, 0.23, 0.55]
       host_cache_size: 193273528320
     moe_config:
       backend: CUTEDSL

@@ -153,6 +153,9 @@ layer-group slot-count proportions when hot and cold representations use differe
 Runtime sampling remains level-specific and byte-based. The low-level `initial_pool_ratio` and the higher-level
 `KvCacheConfig.pool_ratio` therefore contain exactly one hot-tier byte ratio per layer group in layer-group ID order,
 not one per hot pool group.
+Group IDs are assigned independently of layer order: SSM first, full attention next, then increasing sliding window
+size and, for equal windows, increasing sink-block count. Sink tokens round up to blocks, and layers with identical
+lifecycles share one ratio entry. Only groups present in the manager are included.
 Hot-level constraints remain feasibility floors and may clamp the resulting hot allocation; they are not projected into
 cold storage. Cold pool groups use only the structural minimum needed by their allocators.
 

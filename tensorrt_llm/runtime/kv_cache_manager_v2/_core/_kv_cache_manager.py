@@ -768,9 +768,10 @@ class KVCacheManager:
         Layers are divided into multiple groups.
         Buffers in the same layer group for the same token block are always allocated/deallocated together.
 
-        NOTE: the iteration order of the layer lists (and of the groups) is NOT part of
-        the API contract and may differ across backends/runs. Do not rely on it for
-        buffer/pool memory order -- query ``pool_group_descs`` (PoolGroupDesc.pools[i]
+        Groups follow ID order: SSM, full attention, then increasing sliding window
+        size and sink-block count. Only groups present in this manager are included.
+        Layer order within each group is not part of the API contract. For
+        buffer/pool memory order, query ``pool_group_descs`` (PoolGroupDesc.pools[i]
         .base_address + coalesced_buffers) for that.
         """
         layer_to_life_cycle_ids = self._storage._layer_to_life_cycle_ids

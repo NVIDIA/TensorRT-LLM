@@ -225,7 +225,10 @@ class KVCacheManagerConfig:
 
     initial_pool_ratio: list[float] | None = None
     """
-    One positive, normalized hot-tier byte-quota weight per layer group. Cold-tier
+    One positive, normalized hot-tier byte-quota weight per layer group, ordered by
+    SSM, full attention, then increasing sliding window size and sink-block count.
+    Sink tokens round up to blocks; identical lifecycles share one entry. Only groups
+    present in this manager are included. Cold-tier
     initialization preserves the implied layer-group slot-count proportions while
     accounting for cold page sizes. When set, this takes precedence over typical_step
     and constraints for initial ratio selection; constraints remain hot-level feasibility

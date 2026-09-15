@@ -134,7 +134,14 @@ and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Set `avg_seq_len` to the workload's average total sequence length
 so V2 can size the attention KV and Mamba state pools in the right proportion.
 `pool_ratio` contains one positive, normalized cache-tier quota weight per
-layer group in layer-group ID order.
+layer group in stable layer-group ID order: SSM first, full attention next,
+then sliding-window attention by increasing window size and, for equal
+windows, increasing sink-token count rounded up to blocks. Only groups
+present in the manager are included. Layers with the same window and rounded
+sink count share one entry. For example, a manager with SSM, full attention,
+and SWA windows of 128 and 256 uses `[ssm, full, swa128, swa256]`.
+Existing ratio lists based on first-seen layer order must be reordered to
+preserve their intended allocation.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
