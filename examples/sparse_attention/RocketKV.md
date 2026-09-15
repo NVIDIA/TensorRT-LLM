@@ -83,7 +83,6 @@ python3 ../llm-api/llm_sparse_attention.py \
     --kernel_size 63 \
     --prompt_budget 2048 \
     --topk 64 \
-    --topr 128 \
     --kt_cache_dtype float8_e5m2 \
     --max_seq_len 10240 \
     --max_num_tokens 10240 \
