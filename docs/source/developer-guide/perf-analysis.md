@@ -9,9 +9,9 @@ Given the potential long runtimes of Large Languages Models (LLMs) and the diver
 
 ## Feature Descriptions
 
-### Strict Workspace Memory Management
+### Workspace Reclamation
 
-`TLLM_STRICT_WORKSPACE_MEMORY=1` (the default) reduces retained eager attention
+`TRTLLM_RECLAIM_WORKSPACE=1` (the default) reduces retained eager attention
 workspace memory on supported PyTorch fallback paths. After three consecutive
 underfilled model forwards, excess capacity is released to the PyTorch allocator,
 without shrinking below the warmup baseline. CUDA graph workspace is unchanged.
@@ -19,7 +19,7 @@ without shrinking below the warmup baseline. CUDA graph workspace is unchanged.
 This can reduce memory retained after workload spikes, but demand tracking and
 repeated reclamation/reallocation can affect performance. It does not reduce the
 initial spike's allocation requirement or necessarily reduce allocator-reserved
-memory. Set `TLLM_STRICT_WORKSPACE_MEMORY=0` before starting the process to disable
+memory. Set `TRTLLM_RECLAIM_WORKSPACE=0` before starting the process to disable
 this behavior if it causes performance regression. Currently this setting only
 controls eager attention workspace reclamation, not all GPU memory management.
 

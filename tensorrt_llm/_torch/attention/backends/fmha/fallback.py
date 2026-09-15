@@ -110,7 +110,6 @@ class FallbackFmha(Fmha):
             output=forward_args.output,
             output_sf=forward_args.output_sf,
             workspace_=metadata.effective_workspace,
-            workspace_required_bytes=metadata.workspace_required_bytes,
             # --- Per-step batch state (TrtllmAttentionMetadata) ---
             sequence_length=metadata.kv_lens_cuda_runtime,
             host_past_key_value_lengths=metadata.kv_lens_runtime,

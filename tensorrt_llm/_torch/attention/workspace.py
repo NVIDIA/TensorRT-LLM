@@ -53,7 +53,6 @@ class EagerWorkspaceReclaimer:
         if metadata.workspace is None:
             raise ValueError("Warmup must initialize eager workspace before reclamation")
         self.policy = WorkspaceShrinkPolicy(metadata.workspace.untyped_storage().nbytes())
-        self._required_bytes = torch.zeros(1, dtype=torch.int64, device="cpu")
         self._metadata = weakref.ref(metadata)
         self._stream: torch.cuda.Stream | None = None
         self._active = False
@@ -88,22 +87,23 @@ class EagerWorkspaceReclaimer:
         # resets the policy anyway; start collecting demand on the next one.
         collect_demand = capacity_before > self.policy.floor_bytes
         if collect_demand:
-            self._required_bytes.zero_()
-            metadata.workspace_required_bytes = self._required_bytes
+            # Retain storage; grow-only layer sizing accumulates this forward's peak.
+            metadata.workspace.resize_(0)
         self._active = True
         completed = False
         try:
             yield
             completed = True
         finally:
-            metadata.workspace_required_bytes = None
             self._active = False
             if not completed or not metadata.workspace_reclaimable or not collect_demand:
                 self.policy.reset()
             else:
                 capacity = metadata.workspace.untyped_storage().nbytes()
                 target = self.policy.finish_forward(
-                    int(self._required_bytes.item()), capacity, grew=capacity > capacity_before
+                    metadata.workspace.numel() * metadata.workspace.element_size(),
+                    capacity,
+                    grew=capacity > capacity_before,
                 )
                 if target is not None:
                     device = metadata.workspace.device
