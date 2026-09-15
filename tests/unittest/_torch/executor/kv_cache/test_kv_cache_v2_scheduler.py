@@ -1063,10 +1063,14 @@ class TestKVCacheFailuresCtxChunked:
             tokens_per_block=64,
             resize_context_fn=lambda req, n: False,
         )
+        mgr.kv_cache_map[0] = Mock(is_active=False)
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id)
         sched = make_scheduler(mgr, max_num_tokens=1000, ctx_chunk_config=(None, 64))
         reqs = [make_ctx_request(0, context_remaining_length=500)]
         out = sched.schedule_request(reqs, set())
         assert len(out.context_requests) == 0
+        mgr.free_resources.assert_called_once_with(reqs[0])
+        assert not mgr.kv_cache_map
 
     def test_chunked_fail_then_gen(self):
         mgr = make_kv_cache_manager(
