@@ -82,7 +82,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     if (topk_ids.has_value() && topk_weights.has_value() && routing_logits.has_value())
     {
-        TLLM_LOG_WARNING(
+        TLLM_LOG_DEBUG(
             "When logits and (topk_ids and topk_weights) are both provided, we only use (topk_ids and topk_weights).");
     }
 
@@ -195,9 +195,12 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     auto routing_device = routing_logits.has_value() ? routing_logits.value().device() : topk_ids.value().device();
     at::Tensor num_tokens_per_expert
         = at::detail::empty_cuda({num_experts}, at::ScalarType::Int, routing_device, std::nullopt);
+    // The routing domain uses global expert IDs, but expert-parallel GEMMs only materialize rows for the experts owned
+    // by this rank. Padding intermediate buffers for every global expert over-allocates by up to the EP size, which can
+    // exhaust memory for large-token prefill shapes.
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
-            args.num_tokens, top_k, num_experts, tile_tokens_dim);
+            args.num_tokens, top_k, local_num_experts, tile_tokens_dim);
     int32_t max_num_padded_tokens_gemm1
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
@@ -262,7 +265,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
-        args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
+        args.num_tokens, args.top_k, args.local_num_experts, tile_tokens_dim);
     at::Tensor cta_idx_xy_to_batch_idx
         = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt);
     at::Tensor cta_idx_xy_to_mn_limit
