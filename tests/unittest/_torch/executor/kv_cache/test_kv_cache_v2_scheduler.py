@@ -14,7 +14,8 @@
 # limitations under the License.
 """Tier 1 mock unit tests for KVCacheV2Scheduler.
 
-All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
+KVCacheManagerV2 and PeftCacheManager objects are mocked. Most requests are
+mocked; admission rollback tests use native request cursor properties.
 No GPU required.
 """
 
@@ -23,7 +24,7 @@ from unittest.mock import Mock, call, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -1078,6 +1079,223 @@ class TestKVCacheFailuresCtxChunked:
         out = sched.schedule_request(reqs, set())
         assert len(out.context_requests) == 0
         assert ids(out.generation_requests) == [1]
+
+
+class TestContextAdmissionRollback:
+    """An unexecuted context must not retain a failed KV admission's claims."""
+
+    @staticmethod
+    def make_request(request_id: int = 1, prompt_len: int = 65) -> LlmRequest:
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=8,
+            input_tokens=list(range(prompt_len)),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+
+    @pytest.mark.parametrize("failure_stage", ["prepare", "resize"])
+    def test_failed_claim_does_not_block_next_generation_step(self, failure_stage: str) -> None:
+        """A two-slot pool must reclaim an unexecuted context's reusable page.
+
+        Generation grows from 31 to 32 tokens without a new block. Context
+        then holds the other cached block but cannot finish admission. The
+        next generation step needs a second block: suspend alone leaves the
+        context's hold in place and prevents that step from ever running.
+        """
+        block_size = 32
+        pool_slots = 2
+        gen = make_gen_request(0)
+        ctx = self.make_request()
+        gen_cache = Mock(capacity=block_size - 1, is_active=True)
+        mgr = make_kv_cache_manager(
+            tokens_per_block=block_size,
+            can_evict=True,
+            enable_block_reuse=True,
+            block_reuse_policy=BlockReusePolicy.ALL_REUSABLE,
+        )
+        mgr.kv_cache_map[gen.py_request_id] = gen_cache
+
+        def blocks(capacity: int) -> int:
+            return (capacity + block_size - 1) // block_size
+
+        def allocate_generation(req: LlmRequest) -> bool:
+            assert req is gen
+            # Resume can lock existing pages even when a subsequent grow fails.
+            gen_cache.is_active = True
+            held_context_slots = sum(
+                blocks(cache.capacity)
+                for request_id, cache in mgr.kv_cache_map.items()
+                if request_id != gen.py_request_id
+            )
+            next_capacity = gen_cache.capacity + 1
+            if blocks(next_capacity) + held_context_slots > pool_slots:
+                return False
+            gen_cache.capacity = next_capacity
+            return True
+
+        def prepare_context(req: LlmRequest) -> bool:
+            # After generation takes both slots the reusable page is gone.
+            if blocks(gen_cache.capacity) == pool_slots:
+                return False
+            cache = Mock(capacity=block_size, is_active=False)
+            mgr.kv_cache_map[req.py_request_id] = cache
+            if failure_stage == "prepare":
+                return False
+            cache.is_active = True
+            req.set_prepopulated_prompt_len(block_size, block_size)
+            return True
+
+        def resize_context(req: LlmRequest, num_tokens: int) -> bool:
+            cache = mgr.kv_cache_map[req.py_request_id]
+            target = req.context_current_position + num_tokens
+            if blocks(gen_cache.capacity) + blocks(target) > pool_slots:
+                cache.is_active = False
+                return False
+            cache.capacity = target
+            return True
+
+        mgr.try_allocate_generation.side_effect = allocate_generation
+        mgr.prepare_context.side_effect = prepare_context
+        mgr.resize_context.side_effect = resize_context
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id, None)
+        sched = make_scheduler(mgr, max_num_tokens=33, ctx_chunk_config=(None, block_size))
+
+        first = sched.schedule_request([gen, ctx], set())
+        assert ids(first.generation_requests) == [gen.request_id]
+        assert first.context_requests == []
+        assert gen_cache.capacity == block_size
+
+        second = sched.schedule_request([gen, ctx], set())
+        assert ids(second.generation_requests) == [gen.request_id]
+        assert second.paused_requests == []
+        assert second.recompute_paused_requests == []
+        assert gen_cache.capacity == block_size + 1
+        assert ctx.py_request_id not in mgr.kv_cache_map
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("failure_stage", ["prepare", "resize"])
+    @pytest.mark.parametrize("first_chunk", [False, True])
+    def test_failed_admission_only_rewinds_unexecuted_context(
+        self, chunked: bool, failure_stage: str, first_chunk: bool
+    ) -> None:
+        req = self.make_request(prompt_len=129)
+        req.set_prepopulated_prompt_len(31, 32)
+        req.estimated_reusable_tokens = 31
+        if not first_chunk:
+            req.context_current_position = 64
+        original_position = req.context_current_position
+        req.py_ctx_pre_resize_cap = 31
+        cache = Mock(capacity=original_position, is_active=False)
+        mgr = make_kv_cache_manager(
+            tokens_per_block=32,
+            prepare_context_fn=lambda req: failure_stage != "prepare",
+            resize_context_fn=lambda req, n: False,
+        )
+        mgr.kv_cache_map[req.py_request_id] = cache
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id, None)
+        sched = make_scheduler(
+            mgr, max_num_tokens=256, ctx_chunk_config=(None, 32) if chunked else None
+        )
+
+        out = sched.schedule_request([req], set())
+
+        assert out.context_requests == []
+        if first_chunk:
+            assert req.py_request_id not in mgr.kv_cache_map
+            assert req.prepopulated_prompt_len == 0
+            assert req.context_current_position == 0
+            assert req.context_remaining_length == req.prompt_len
+            assert req.context_chunk_size == req.prompt_len
+            assert req.estimated_reusable_tokens == 0
+            assert req.py_ctx_pre_resize_cap is None
+        else:
+            assert mgr.kv_cache_map[req.py_request_id] is cache
+            assert req.context_current_position == original_position
+            assert req.prepopulated_prompt_len == 31
+            mgr.free_resources.assert_not_called()
+
+    def test_budget_rejection_after_reuse_releases_claim(self) -> None:
+        req = self.make_request(prompt_len=129)
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+
+        def prepare_context(req: LlmRequest) -> bool:
+            mgr.kv_cache_map[req.py_request_id] = Mock(capacity=31, is_active=True)
+            req.set_prepopulated_prompt_len(31, 32)
+            return True
+
+        mgr.prepare_context.side_effect = prepare_context
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id, None)
+        sched = make_scheduler(mgr, max_num_tokens=64)
+
+        out = sched.schedule_request([req], set())
+
+        assert out.context_requests == []
+        assert req.py_request_id not in mgr.kv_cache_map
+        assert req.context_current_position == 0
+        assert req.context_remaining_length == req.prompt_len
+        assert req.context_chunk_size == req.prompt_len
+        mgr.resize_context.assert_not_called()
+
+    def test_budget_rejection_before_prepare_does_not_finish_unclaimed_request(self) -> None:
+        req = self.make_request(prompt_len=129)
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        draft_mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=64,
+            enable_prefix_aware_scheduling=False,
+            draft_kv_cache_manager=draft_mgr,
+        )
+
+        out = sched.schedule_request([req], set())
+
+        assert out.context_requests == []
+        # free_resources also finishes conversation-mode requests before its
+        # cache lookup; an admission with no claim must not call that hook.
+        mgr.prepare_context.assert_not_called()
+        mgr.free_resources.assert_not_called()
+        draft_mgr.free_resources.assert_not_called()
+        assert req.context_current_position == 0
+        assert req.context_remaining_length == req.prompt_len
+
+    def test_draft_failure_releases_both_claims(self) -> None:
+        req = self.make_request()
+        mgr = make_kv_cache_manager(tokens_per_block=32, enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager(tokens_per_block=32)
+        for manager in (mgr, draft_mgr):
+            manager.kv_cache_map[req.py_request_id] = Mock(capacity=31, is_active=True)
+            manager.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 31
+            manager.free_resources.side_effect = (
+                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id, None)
+            )
+        draft_mgr.try_allocate_draft_context.side_effect = lambda req, n: False
+        sched = make_scheduler(mgr, max_num_tokens=128, draft_kv_cache_manager=draft_mgr)
+
+        out = sched.schedule_request([req], set())
+
+        assert out.context_requests == []
+        assert req.py_request_id not in mgr.kv_cache_map
+        assert req.py_request_id not in draft_mgr.kv_cache_map
+        assert req.prepopulated_prompt_len == 0
+        assert req.context_current_position == 0
+        assert req.context_chunk_size == req.prompt_len
+
+    @pytest.mark.parametrize("inflight", [False, True])
+    def test_scheduled_or_inflight_context_keeps_claim(self, inflight: bool) -> None:
+        req = self.make_request()
+        req.set_prepopulated_prompt_len(31, 32)
+        cache = Mock(capacity=31, is_active=True)
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        mgr.kv_cache_map[req.py_request_id] = cache
+        sched = make_scheduler(mgr, max_num_tokens=128)
+
+        out = sched.schedule_request([req], {req.request_id} if inflight else set())
+
+        assert out.context_requests == ([] if inflight else [req])
+        assert mgr.kv_cache_map[req.py_request_id] is cache
+        assert req.context_current_position == 31
+        mgr.free_resources.assert_not_called()
 
 
 # ===========================================================================

@@ -713,9 +713,27 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
         """
+        first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
-            return self._try_schedule_context_chunked(req, budget)
-        return self._try_schedule_context_full(req, budget)
+            result = self._try_schedule_context_chunked(req, budget)
+        else:
+            result = self._try_schedule_context_full(req, budget)
+
+        if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
+            # Unexecuted claims can hold reusable pages in every cache tier.
+            # Suspension retains those holds, preventing running requests from
+            # growing once the last tier fills. Drop the failed admission.
+            for manager in (self.kv_cache_manager, self.draft_kv_cache_manager):
+                if manager is not None and req.py_request_id in manager.kv_cache_map:
+                    manager.free_resources(req)
+            req.set_prepopulated_prompt_len(0, self.tokens_per_block)
+            # Setting prepopulation to zero does not rewind the native cursor.
+            req.context_current_position = 0
+            req.context_chunk_size = req.prompt_len
+            req.estimated_reusable_tokens = 0
+            req.py_ctx_pre_resize_cap = None
+
+        return result
 
     def _try_schedule_context_full(
         self, req: LlmRequest, budget: BudgetTracker
