@@ -4,7 +4,7 @@
 
 Generates random inputs, runs the kernel, and compares against a pure-torch
 reference. Intended for local development / sanity checks; not wired into CI
-(matching the convention of other scripts under ``tests/scripts/cute_dsl_kernels/``).
+(matching the convention of other scripts under ``tests/microbenchmarks/cute_dsl_kernels/``).
 
 - Reference and data prep are inlined from
   tests/unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py.

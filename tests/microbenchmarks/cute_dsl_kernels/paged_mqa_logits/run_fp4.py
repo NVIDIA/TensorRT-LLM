@@ -4,7 +4,7 @@
 
 Generates random inputs, runs the kernel, and compares against a reference
 implementation. Intended for local development / sanity checks; not wired into
-CI (matching the convention of other scripts under ``tests/scripts/cute_dsl_kernels/``).
+CI (matching the convention of other scripts under ``tests/microbenchmarks/cute_dsl_kernels/``).
 
 - Helpers (FP4 quant, KV cast, ref) are inlined from
   tests/unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py.
