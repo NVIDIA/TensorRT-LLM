@@ -35,16 +35,6 @@ from .trt_test_alternative import call, check_call, print_info
 LLM_ROOT = os.environ.get("LLM_ROOT", find_repo_root())
 
 
-def _qwen_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    qwen_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
-    assert os.path.exists(qwen_model_root), (
-        f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    )
-    return qwen_model_root
-
-
 @pytest.fixture(autouse=True)
 def stop_triton_server():
     # Make sure Triton server are killed before each test.
@@ -77,7 +67,12 @@ def test_llmapi_backend(
     if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
         pytest.skip("Skipping. Not enough GPUs.")
 
-    qwen_model_root = _qwen_model_root()
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    qwen_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(qwen_model_root), (
+        f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    )
 
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
@@ -194,7 +189,12 @@ def test_llmapi_backend_multi_instance(
     llm_backend_dataset_root,
 ):
     llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
-    qwen_model_root = _qwen_model_root()
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    qwen_model_root = os.path.join(models_root, "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(qwen_model_root), (
+        f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    )
 
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
