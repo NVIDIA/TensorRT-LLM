@@ -133,15 +133,7 @@ This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Set `avg_seq_len` to the workload's average total sequence length
 so V2 can size the attention KV and Mamba state pools in the right proportion.
-`pool_ratio` contains one positive, normalized cache-tier quota weight per
-layer group in stable layer-group ID order: SSM first, full attention next,
-then sliding-window attention by increasing window size and, for equal
-windows, increasing sink-token count rounded up to blocks. Only groups
-present in the manager are included. Layers with the same window and rounded
-sink count share one entry. For example, a manager with SSM, full attention,
-and SWA windows of 128 and 256 uses `[ssm, full, swa128, swa256]`.
-Existing ratio lists based on first-seen layer order must be reordered to
-preserve their intended allocation.
+See [Pool Ratio Ordering](#pool-ratio-ordering) for explicit ratios.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
@@ -152,6 +144,52 @@ Mamba models select V2 by default (see
 compatibility manager. In disaggregated serving, V2 Mamba requires the Python
 NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
 snapshots only.
+
+### Pool Ratio Ordering
+
+For KV cache manager v2, `pool_ratio` contains one positive, normalized
+hot-tier byte-quota weight per layer group in stable layer-group ID order:
+SSM first, full attention next, then sliding-window attention by increasing
+window size and, for equal windows, increasing sink-token count rounded up
+to blocks. Layers with the same window and rounded sink count share one entry.
+
+Include only groups present in the manager. The list has no reserved positions
+for absent categories, and zero placeholders are invalid. All entries must be
+positive and sum to 1.0. For example:
+
+| Groups present | Entry order | Example `pool_ratio` |
+| --- | --- | --- |
+| SSM and full attention | `[ssm, full]` | `[0.2, 0.8]` |
+| Full attention and one SWA group | `[full, swa]` | `[0.5, 0.5]` |
+| SSM and one SWA group | `[ssm, swa]` | `[0.2, 0.8]` |
+| Full attention only | `[full]` | `[1.0]` |
+| SSM, full attention, and SWA windows of 128 and 256 | `[ssm, full, swa128, swa256]` | `[0.1, 0.5, 0.2, 0.2]` |
+
+The ratios above illustrate entry order, not recommended memory allocations.
+Multiple SWA groups each need an entry, including groups with the same window
+but different rounded sink counts.
+
+Previously, groups followed the order in which their lifecycles first appeared
+in the manager's layer configuration. Consequently, there is no fixed old-to-new
+index permutation that applies to every model. To preserve an existing split,
+identify the lifecycle associated with each old entry for that model and cache
+configuration, then move each ratio with its lifecycle into the order above.
+If the old order already matches, the vector stays unchanged.
+
+The existing startup INFO logs can help identify this mapping. Look for the
+`role-to-pool/lifecycle mapping:` section, whose entries contain `role`,
+`pool_group_id`, and `layer_group_id`. Compare the old and new logs for the
+same model and cache configuration. For each lifecycle identified in both,
+set `new_ratio[new_layer_group_id] = old_ratio[old_layer_group_id]`.
+Use `layer_group_id` as the ratio index; physical `pool_group_id` values and
+the order of log lines do not define the ratio positions.
+
+SSM buffers have roles such as `ssm_state` and `conv_state`. DeepSeek-V4 also
+logs `deepseek_role` and `compress_ratio`, which help identify its groups.
+Generic entries do not include window sizes or sink counts, so multiple
+attention groups may have indistinguishable roles. In that case, use the
+model's cache layer configuration to identify the lifecycle associated with
+each entry; the logs alone are insufficient.
 
 ### KV Cache Salting for Secure Reuse
 

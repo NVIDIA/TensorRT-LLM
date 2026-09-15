@@ -156,6 +156,9 @@ not one per hot pool group.
 Group IDs are assigned independently of layer order: SSM first, full attention next, then increasing sliding window
 size and, for equal windows, increasing sink-block count. Sink tokens round up to blocks, and layers with identical
 lifecycles share one ratio entry. Only groups present in the manager are included.
+Absent categories have no reserved positions: SSM plus full attention uses `[ssm, full]`, while full attention plus
+one SWA group uses `[full, swa]`. Do not insert zero placeholders. See [Pool Ratio Ordering](../features/kvcache.md#pool-ratio-ordering)
+for examples and migration guidance; the old order depends on the manager's layer configuration.
 Hot-level constraints remain feasibility floors and may clamp the resulting hot allocation; they are not projected into
 cold storage. Cold pool groups use only the structural minimum needed by their allocators.
 
