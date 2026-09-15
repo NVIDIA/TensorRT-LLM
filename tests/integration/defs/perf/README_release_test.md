@@ -109,17 +109,12 @@ if self._config.backend == "pytorch":
 
 ### 3.1 Full Test Cycles
 
-1. **llm_perf_full.yml** - Release performance test
-   - [test_lists/qa/llm_perf_full.yml](../../test_lists/qa/llm_perf_full.yml)
-2. **llm_perf_cluster.yml** - Cluster performance test(for Blackwell)
-   - [test_lists/qa/llm_perf_cluster.yml](../../test_lists/qa/llm_perf_cluster.yml)
-3. **llm_perf_nim.yml** - NIM performance test
-   - [test_lists/qa/llm_perf_nim.yml](../../test_lists/qa/llm_perf_nim.yml)
-
-### 3.2 Sanity Test Cycles
-
-- **llm_perf_sanity.yml** - Release performance sanity test
-  - [test_lists/qa/llm_perf_sanity.yml](../../test_lists/qa/llm_perf_sanity.yml)
+1. **llm_perf_core.yml** - Release performance test; the former `llm_perf_full.yml`, `llm_perf_cluster.yml` and `llm_perf_sanity.yml` were merged into it
+   - [test_lists/qa/llm_perf_core.yml](../../test_lists/qa/llm_perf_core.yml)
+2. **llm_perf_disagg.yml** - Disaggregated serving performance test
+   - [test_lists/qa/llm_perf_disagg.yml](../../test_lists/qa/llm_perf_disagg.yml)
+3. **llm_perf_multinode.yml** - Multi-node performance test
+   - [test_lists/qa/llm_perf_multinode.yml](../../test_lists/qa/llm_perf_multinode.yml)
 
 ## 4. Test Configuration Description
 

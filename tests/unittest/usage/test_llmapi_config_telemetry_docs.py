@@ -200,6 +200,7 @@ def test_manifest_generator_subprocess_resolves_local_source_without_pythonpath(
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
 
     assert result.returncode == 0, result.stderr
@@ -241,6 +242,7 @@ def test_manifest_generator_subprocess_prefers_checkout_over_shadow_package(tmp_
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
 
     assert result.returncode == 0, result.stderr
