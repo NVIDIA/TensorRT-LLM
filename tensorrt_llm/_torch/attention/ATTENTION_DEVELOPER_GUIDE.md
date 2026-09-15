@@ -598,13 +598,15 @@ Key test files:
 
 Eager scratch reclamation is enabled automatically for supported execution
 paths after successful warmup, which freezes the minimum eager capacity.
-There is no environment-variable switch.
+Set `TRTLLM_RECLAIM_WORKSPACE=0` to disable reclamation.
 
-- Native sizing reports the maximum required bytes across one model forward
-  into a CPU scalar, without GPU synchronization. Three underfilled forwards
+- Above the warmup floor, reset the Tensor's logical size to zero without
+  releasing storage at the start of each eager forward. Grow-only layer sizing
+  accumulates the maximum requirement in that logical size, without GPU
+  synchronization. Three underfilled forwards
   trigger replacement with `max(warmup floor, window maximum requirement)`.
-  Growth, exact-capacity demand, or failure resets the counter; no report
-  leaves it unchanged.
+  Growth, exact-capacity demand, or failure resets the counter; no workspace use
+  leaves it unchanged. At the floor, skip demand collection.
 - Drop the old Tensor before replacement: `resize_` alone retains storage.
   Memory returns to PyTorch's allocator, not necessarily the driver; stream
   ordering may delay reuse. This does not prevent peak OOM and can add
@@ -614,7 +616,7 @@ There is no environment-variable switch.
   changing the serving stream disables reclamation.
 - Only fallback FMHA opts in. Any other eager FMHA use, including warmup,
   disables reclamation for that metadata. Opting in requires pure scratch
-  with no cross-forward state and complete requirement reporting.
+  with no cross-forward state and grow-only sizing on every forward.
 
 Tests: policy, ownership branches, and engine wiring run on CPU (CUDA calls
 are mocked). These tests do not validate GPU asynchronous lifetimes or native

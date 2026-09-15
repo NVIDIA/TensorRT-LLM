@@ -48,11 +48,11 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             return self.engine.model_forward(attn_metadata=self.metadata)
 
     def test_forward_scope_and_warmup_bypass(self) -> None:
-        with patch.dict(os.environ, {"TLLM_STRICT_WORKSPACE_MEMORY": "0"}):
+        with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "0"}):
             self.freeze()
             self.assertIsNone(self.engine._eager_workspace_reclaimer)
             self.reclaimer_class.assert_not_called()
-        with patch.dict(os.environ, {"TLLM_STRICT_WORKSPACE_MEMORY": "1"}):
+        with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "1"}):
             self.freeze()
         self.reclaimer_class.assert_called_once_with(self.metadata)
         self.assertIs(self.engine._eager_workspace_reclaimer, self.reclaimer_class.return_value)

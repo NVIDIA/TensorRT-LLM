@@ -102,10 +102,6 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
-    # Host-only maximum written by native sizing during one eager forward.
-    workspace_required_bytes: Optional[torch.Tensor] = field(default=None,
-                                                             init=False,
-                                                             repr=False)
     workspace_reclaimable: bool = field(default=True, init=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,

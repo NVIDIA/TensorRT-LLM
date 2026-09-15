@@ -1547,7 +1547,7 @@ class PyTorchModelEngine(ModelEngine):
         self._freeze_eager_workspace_floor()
 
     def _freeze_eager_workspace_floor(self) -> None:
-        if os.environ.get("TLLM_STRICT_WORKSPACE_MEMORY", "1") == "0":
+        if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
             return
         metadata = self.attn_metadata
         if (self.is_spec_decode or self.mapping.cp_size != 1

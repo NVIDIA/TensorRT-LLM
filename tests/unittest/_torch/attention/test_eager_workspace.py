@@ -19,7 +19,6 @@ class _ScratchMetadata:
     workspace: torch.Tensor
     is_cuda_graph: bool = False
     workspace_reclaimable: bool = True
-    workspace_required_bytes: torch.Tensor | None = None
     cuda_graph_workspace: torch.Tensor | None = None
 
 
@@ -77,33 +76,46 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
 
     def report_forward(self, required: int) -> None:
         with self.reclaimer.forward(self.metadata):
-            self.metadata.workspace_required_bytes.fill_(required)
+            self.size_layer(required)
+
+    def size_layer(self, required: int) -> None:
+        if self.metadata.workspace.numel() < required:
+            self.metadata.workspace.resize_(required)
 
     def test_layers_count_once_and_storage_is_replaced(self) -> None:
         with self.reclaimer.forward(self.metadata):
-            self.assertIsNone(self.metadata.workspace_required_bytes)
+            self.assertEqual(self.metadata.workspace.numel(), 4096)
             self.metadata.workspace.resize_(16384)
         self.assertEqual(self.reclaimer.policy.remaining, 3)
         self.current_stream.assert_called_once_with(0)
         previous = weakref.ref(self.metadata.workspace)
+        pointer = self.metadata.workspace.data_ptr()
         for remaining in (2, 1, 3):
             with self.reclaimer.forward(self.metadata):
-                for _ in range(2):
-                    self.metadata.workspace_required_bytes.fill_(4096)
+                self.assertEqual(self.metadata.workspace.numel(), 0)
+                for required in (8192, 4096):
+                    self.size_layer(required)
+                self.assertEqual(self.metadata.workspace.numel(), 8192)
+                self.assertEqual(self.metadata.workspace.data_ptr(), pointer)
                 self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
             self.assertEqual(self.reclaimer.policy.remaining, remaining)
         self.assertIsNone(previous())
+        self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 8192)
+        for _ in range(3):
+            self.report_forward(2048)
         self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 4096)
-        self.assertIsNone(self.metadata.workspace_required_bytes)
 
     def test_failed_and_overlapping_forwards(self) -> None:
         self.metadata.workspace.resize_(16384)
         self.report_forward(4096)
+        with self.reclaimer.forward(self.metadata):
+            pass
+        self.assertEqual(self.reclaimer.policy.remaining, 2)
         with self.assertRaisesRegex(RuntimeError, "model failure"):
             with self.reclaimer.forward(self.metadata):
                 raise RuntimeError("model failure")
         self.assertEqual(self.reclaimer.policy.remaining, 3)
-        self.assertIsNone(self.metadata.workspace_required_bytes)
+        self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
         with self.reclaimer.forward(self.metadata):
             with self.assertRaisesRegex(RuntimeError, "Overlapping forwards"):
                 with self.reclaimer.forward(self.metadata):
@@ -115,17 +127,17 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
         self.metadata.is_cuda_graph = True
         graph_tensor = self.metadata.cuda_graph_workspace
         with self.reclaimer.forward(self.metadata):
-            self.assertIsNone(self.metadata.workspace_required_bytes)
+            self.assertEqual(self.metadata.workspace.numel(), 4096)
         self.metadata.is_cuda_graph = False
         with patch("torch.cuda.is_current_stream_capturing", return_value=True):
             with self.reclaimer.forward(self.metadata):
-                self.assertIsNone(self.metadata.workspace_required_bytes)
+                self.assertEqual(self.metadata.workspace.numel(), 4096)
         self.assertEqual(self.reclaimer.policy.remaining, 2)
         self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
         self.assertIs(self.metadata.cuda_graph_workspace, graph_tensor)
         self.report_forward(4096)
         with self.reclaimer.forward(self.metadata):
-            self.metadata.workspace_required_bytes.fill_(4096)
+            self.size_layer(4096)
             self.metadata.workspace_reclaimable = False
         self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
         self.assertEqual(self.reclaimer.policy.remaining, 3)
@@ -135,15 +147,15 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
                 self.metadata.workspace_reclaimable = True
                 self.reclaimer = EagerWorkspaceReclaimer(self.metadata)
                 with self.reclaimer.forward(self.metadata):
-                    self.assertIsNone(self.metadata.workspace_required_bytes)
+                    self.assertEqual(self.metadata.workspace.numel(), 4096)
                 if not multi_stream:
                     self.current_device.return_value = 1
                     self.current_stream.return_value = object()
                 with with_multi_stream(multi_stream), self.reclaimer.forward(self.metadata):
-                    self.assertIsNone(self.metadata.workspace_required_bytes)
+                    self.assertEqual(self.metadata.workspace.numel(), 4096)
                 self.current_stream.assert_called_with(self.current_device.return_value)
                 with self.reclaimer.forward(self.metadata):
-                    self.assertIsNone(self.metadata.workspace_required_bytes)
+                    self.assertEqual(self.metadata.workspace.numel(), 4096)
 
 
 if __name__ == "__main__":
