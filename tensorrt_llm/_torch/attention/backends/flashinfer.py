@@ -174,6 +174,60 @@ def _append_paged_kv_cache(
         )
 
 
+# Perf knob for the FlashInfer decode wrapper's kernel choice; see
+# ``FlashInferAttentionMetadata._use_tensor_cores``. "auto" (default) keeps
+# FlashInfer's GQA-ratio heuristic, "0" forces the split-K decode kernel, "1"
+# forces the tensor-core (paged-prefill) one. It never applies where only the
+# tensor-core kernel exists.
+FI_DECODE_TENSOR_CORES_ENV = "TRTLLM_FI_DECODE_TENSOR_CORES"
+
+_TENSOR_CORE_OVERRIDES = {
+    "0": False,
+    "false": False,
+    "off": False,
+    "1": True,
+    "true": True,
+    "on": True,
+}
+
+
+def decode_tensor_cores_override() -> Optional[bool]:
+    """Read ``TRTLLM_FI_DECODE_TENSOR_CORES``; ``None`` means keep the heuristic."""
+    value = os.environ.get(FI_DECODE_TENSOR_CORES_ENV, "").strip().lower()
+    if value in ("", "auto"):
+        return None
+    if value not in _TENSOR_CORE_OVERRIDES:
+        raise ValueError(
+            f"{FI_DECODE_TENSOR_CORES_ENV} must be one of 0/1/auto, got "
+            f"{value!r}")
+    return _TENSOR_CORE_OVERRIDES[value]
+
+
+def warn_if_decode_tensor_cores_forced_on(use_graph_tensor_cores: bool,
+                                          flashinfer_backend: str,
+                                          use_tensor_cores: bool) -> None:
+    """Warn when a requirement overrides ``TRTLLM_FI_DECODE_TENSOR_CORES=0``.
+
+    CUDA graphs with head_dim > 128 and the trtllm-gen backend are
+    requirements, not preferences, so they correctly outrank an "off"
+    override -- but they must not do it silently. The override names an A/B
+    leg, and a leg that is quietly the other leg gets recorded as "no
+    difference", which is the one outcome worse than an error: it costs a
+    measurement and reads as a finding. Same reason ``_use_tensor_cores``
+    raises on a misspelled value instead of falling back to the default.
+    """
+    if ((use_graph_tensor_cores or flashinfer_backend == "trtllm-gen")
+            and not use_tensor_cores
+            and decode_tensor_cores_override() is False):
+        reason = ("CUDA graph with head_dim > 128"
+                  if use_graph_tensor_cores else "the trtllm-gen backend")
+        logger.warning_once(
+            f"{FI_DECODE_TENSOR_CORES_ENV}=0 ignored: {reason} requires "
+            "the tensor-core decode wrapper. This plan runs WITH tensor "
+            "cores, so it is not the split-K arm.",
+            key="fi_decode_tensor_cores_override_forced_on")
+
+
 @dataclass(kw_only=True, frozen=True)
 class FlashInferMultiItemParams:
     """Multi-item scoring related parameters for FlashInfer APIs.
@@ -2021,9 +2075,40 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self._plan_with_params(plan_params, flashinfer_backend)
 
     def _use_tensor_cores(self, plan_params: PlanParams):
-        return plan_params.kv_dtype in [
+        # FlashInfer's BatchDecodeWithPagedKVCacheWrapper with tensor cores on
+        # plans and runs the paged-*prefill* kernel against a synthetic
+        # qo_indptr instead of the split-K decode kernel. FP8 KV needs it, and
+        # so does a >= 4 query-to-KV head ratio by FlashInfer's own perf
+        # heuristic -- which is a preference, not a requirement, and is worth
+        # measuring per model.
+        needs_tensor_cores = plan_params.kv_dtype in [
             torch.float8_e4m3fn, torch.float8_e5m2
-        ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
+        ]
+        heuristic = needs_tensor_cores or (plan_params.num_heads //
+                                           plan_params.num_kv_heads >= 4)
+        override = decode_tensor_cores_override()
+        # Multi-token queries (speculative decode) have no split-K decode
+        # kernel either, so the knob only applies where both kernels exist.
+        #
+        # Those two are the exemptions this function owns; flashinfer 0.6.18
+        # enforces a third. Passing a fixed_split_size raises "fixed_split_size
+        # is only supported by tensor core decode for now" (decode.py:1136).
+        # Nothing in this repo passes one, so it is always None here and that
+        # guard cannot fire -- but if it ever starts being passed, an off
+        # override would show up as a ValueError from inside plan() rather than
+        # as a kernel choice, and this needs a third exemption.
+        #
+        # Two facts checked against the installed wheel rather than assumed,
+        # because an A/B between these kernels depends on both. The
+        # non-tensor-core module is selected with use_sliding_window =
+        # (window_left != -1) and is passed window_left, so it serves
+        # sliding-window layers too. And the CUDA-graph split-K replan
+        # bookkeeping keys on the wrapper's backend, not on the tensor-core
+        # choice, so replay stays correct either way.
+        if (override is None or needs_tensor_cores
+                or plan_params.q_len_per_req > 1):
+            return heuristic
+        return override
 
     @staticmethod
     @functools.wraps(flashinfer.BatchPrefillWithPagedKVCacheWrapper)
@@ -2159,6 +2244,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # Gemma4's H256/H512 plans need a tensor-core wrapper with a stable
             # CUDA Graph launch layout. prepare() may refresh its split-K
             # schedule in the wrapper's fixed workspace as KV pages change.
+
+            warn_if_decode_tensor_cores_forced_on(use_graph_tensor_cores,
+                                                  flashinfer_backend,
+                                                  use_tensor_cores)
 
             wrappers.decode_wrapper = \
                 flashinfer.BatchDecodeWithPagedKVCacheWrapper(
