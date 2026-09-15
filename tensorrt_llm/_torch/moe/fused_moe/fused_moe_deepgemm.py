@@ -756,7 +756,7 @@ def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
 class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
     """``deepgemm.cuda.grouped_gemm.fp8_block_scales``.
 
-    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103. One
+    DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107. One
     class carries the identity and the whole contract: construction, the
     pooled memory buffers, workspace sizing, eligibility, quantization, and
     ``run_moe``. That is the shape ``MOE_DEVELOPER_GUIDE.md`` asks for while
@@ -791,7 +791,8 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
             routing_scales_dtype=torch.float32,
             requires_run_moe_workspace=True,
         ),
-        doc="DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103.",
+        doc=
+        "DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107.",
     )
 
     # Taken off the descriptor rather than restated. The scheduler reads these
@@ -816,14 +817,15 @@ class DeepgemmCudaFp8BlockScalesImpl(MoEImplBase):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """DeepGEMM grouped GEMM: FP8 block scales on SM100/SM103."""
+        """DeepGEMM grouped GEMM: FP8 block scales on SM100/SM103/SM107."""
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
-        if sm_version not in {100, 103}:
+        if sm_version not in {100, 103, 107}:
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"DeepGemmFusedMoE requires SM100 or SM103, got SM{sm_version}")
+                f"DeepGemmFusedMoE requires SM100, SM103, or SM107, "
+                f"got SM{sm_version}")
 
         # moe_permute_op only supports float32, bfloat16, float16
         if p.dtype_act not in {torch.float32, torch.bfloat16, torch.float16}:
