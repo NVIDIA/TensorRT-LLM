@@ -47,7 +47,6 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
-                                          DraftTargetDecodingConfig,
                                           DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -973,36 +972,6 @@ class TestKvCacheManagerV2AutoResolution:
         assert "_PreferV2" in message
         assert "transceiver_runtime='CPP'" in message
         assert "backend='NIXL'" in message
-        assert "kv_cache_config.use_kv_cache_manager_v2=True" in message
-
-    def test_two_model_spec_dec_demotion_warns(self, tllm_caplog):
-        """Arm 2 (two-model speculative decoding) must be loud.
-
-        Every public two-model switch is currently deprecated to one-model --
-        ``eagle3_one_model=False`` and ``mtp_eagle_one_model=False`` are both
-        reset to True by their validators, and ``_draft_target_one_model`` is a
-        PrivateAttr pinned to True -- so the only way to reach the arm is to set
-        that private attribute directly. Do it before ``spec_dec_mode`` is read
-        (it is a cached_property).
-        """
-        spec_config = DraftTargetDecodingConfig(
-            max_draft_len=3, speculative_model="/tmp/dummy_draft_model")
-        spec_config._draft_target_one_model = False
-        assert spec_config.spec_dec_mode.has_draft_model()
-
-        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
-                                speculative_config=spec_config)
-        tllm_caplog.clear()
-
-        assert _resolve_kv_cache_manager_v2_auto(llm_args,
-                                                 self._PreferV2) is False
-
-        messages = self._warnings(tllm_caplog)
-        assert len(messages) == 1, messages
-        message = messages[0]
-        assert "two-model speculative-decoding arm" in message
-        assert "_PreferV2" in message
-        assert "draft model in a separate engine" in message
         assert "kv_cache_config.use_kv_cache_manager_v2=True" in message
 
     @pytest.mark.parametrize(

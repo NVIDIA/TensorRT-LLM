@@ -78,6 +78,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..._utils import prefer_pinned
+from ...logger import logger
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PredefinedAttentionMask
@@ -266,6 +267,29 @@ def _validate_clips(t: int) -> int:
     if t < 1:
         raise ValueError(f"grid_thw clip count must be at least 1, got {t}")
     return t
+
+
+def vision_attn_backend(decoder_attn_backend: str) -> str:
+    """The tower's attention backend, given the decoder's.
+
+    The TRTLLM backend has no fused context-FMHA kernel for this tower's
+    head_dim (96), so every tower call takes the padded unfused-MHA fallback.
+    That path sizes its workspace from the metadata MAXIMA
+    (``max_num_requests * max_seq_len ** 2`` per head, see
+    ``AttentionOp::getWorkspaceSizeForContext``), not from the call's actual
+    segment lengths. The window metadata declares one request per budget token,
+    so with an 8192-token encoder budget the first windowed layer asked for a
+    232 GiB workspace at startup encoder profiling; the full-attention metadata
+    (``max_num_tokens // 4`` requests at a budget-length maximum) would ask for
+    far more. No capacity declaration fixes this: the two maxima cannot
+    co-occur under the packed token budget, but the workspace formula prices
+    them as if they did.
+
+    FLASHINFER runs the same segments ragged with no quadratic workspace and is
+    the backend the tower was validated on, so a TRTLLM decoder gets a
+    FLASHINFER tower. Other decoder backends keep their choice.
+    """
+    return "FLASHINFER" if decoder_attn_backend == "TRTLLM" else decoder_attn_backend
 
 
 def _unquantized_vision_model_config(
@@ -483,13 +507,28 @@ class MuseSparkOpenVisionAdapter(nn.Module):
     ) -> None:
         super().__init__()
         mapping = model_config.mapping
+        # Under attention DP the tower runs per-rank on that rank's local
+        # requests only, so no cross-rank collective may appear anywhere in
+        # it: a rank whose batch has no image never enters the tower, and a
+        # row-parallel c_proj all-reduce would then wait on peers that are
+        # already inside the decoder's MoE dispatch (deadlock until the
+        # dispatch completion-flag timeout). Replicate the adapter in that
+        # case, matching the tower attention (tp_size=1 under attention DP)
+        # and MLP (overridden_tp_size=1); the math of the full-width GEMMs
+        # is identical to the sharded column+row pair.
+        adapter_tp = not mapping.enable_attention_dp
+        logger.info_once(
+            "MuseSparkOpenVisionAdapter: "
+            + ("TP-sharded" if adapter_tp else "replicated (attention DP)"),
+            key="musespark_open_vision_adapter_tp",
+        )
         self.c_fc = Linear(
             input_dim,
             output_dim,
             bias=False,
             dtype=model_config.torch_dtype,
             mapping=mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            tensor_parallel_mode=TensorParallelMode.COLUMN if adapter_tp else None,
             quant_config=None,
             allreduce_strategy=model_config.allreduce_strategy,
         )
@@ -499,7 +538,7 @@ class MuseSparkOpenVisionAdapter(nn.Module):
             bias=False,
             dtype=model_config.torch_dtype,
             mapping=mapping,
-            tensor_parallel_mode=TensorParallelMode.ROW,
+            tensor_parallel_mode=TensorParallelMode.ROW if adapter_tp else None,
             quant_config=None,
             allreduce_strategy=model_config.allreduce_strategy,
         )
@@ -528,6 +567,10 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
 
         self.model_config = _unquantized_vision_model_config(model_config)
         self.model_config.pretrained_config.head_dim = vision_config.head_dim
+        # Why the tower may not share the decoder's attention backend: see
+        # vision_attn_backend. Set before _frozen so every tower submodule and
+        # metadata_cls below read the same choice.
+        self.model_config.attn_backend = vision_attn_backend(model_config.attn_backend)
         self.model_config._frozen = True
         mapping = self.model_config.mapping
         dtype = self.model_config.torch_dtype

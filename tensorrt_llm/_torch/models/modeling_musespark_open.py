@@ -2133,8 +2133,8 @@ class MuseSparkOpenModel(DecoderModel):
 def assert_supported_spec_config(spec_config: Any) -> None:
     """Admit only the speculative modes this decoder can serve.
 
-    Two-model drafters (NGram, draft/target, user-provided) run outside the
-    model and need nothing from it. The suffix automaton is one-engine and
+    External drafters (NGram, user-provided) run outside the model and need
+    nothing from it. The suffix automaton is one-engine and
     weight-free, so ``SpecDecOneEngineForCausalLM`` runs its worker inside
     this forward. DFlash is one-engine but its drafter weights come from the
     separate ``speculative_model`` checkpoint, not this one; the decoder
@@ -2146,8 +2146,8 @@ def assert_supported_spec_config(spec_config: Any) -> None:
         return
     mode = spec_config.spec_dec_mode
     assert (not mode.use_one_engine()) or mode.is_sa() or mode.is_dflash(), (
-        "MuseSparkOpen supports speculative decoding only with two-model "
-        "drafters, the suffix automaton, or DFlash; "
+        "MuseSparkOpen supports speculative decoding only with external "
+        "drafters (NGram, user-provided), the suffix automaton, or DFlash; "
         f"{mode.name} needs draft weights the checkpoint does not carry"
     )
 

@@ -1402,7 +1402,7 @@ def test_causal_lm_is_a_one_engine_speculative_model():
     assert "infer_max_seq_len" in vars(MuseSparkOpenForCausalLM)
 
 
-def test_spec_admission_accepts_no_speculation_two_model_sa_and_dflash():
+def test_spec_admission_accepts_no_speculation_external_drafters_sa_and_dflash():
     from tensorrt_llm.llmapi import DFlashDecodingConfig, NGramDecodingConfig, SADecodingConfig
 
     assert_supported_spec_config(None)

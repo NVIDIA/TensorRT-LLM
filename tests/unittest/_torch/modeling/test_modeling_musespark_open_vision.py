@@ -44,6 +44,7 @@ from tensorrt_llm._torch.models.musespark_open_vision import (
     _window_geometry,
     apply_rope_2d,
     precompute_rope_freqs_cis,
+    vision_attn_backend,
     vision_rows_for_grid,
 )
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
@@ -887,3 +888,65 @@ class TestNoDeviceHostSyncs:
         assert ".tolist()" in source
         assert ".cpu()" not in source, "the device-to-host fallback is back"
         assert "raise" in source, "a device tensor must be refused, not copied"
+
+
+# ---------------------------------------------------------------------------
+# Tower attention-backend selection
+# ---------------------------------------------------------------------------
+
+
+class TestVisionAttnBackend:
+    """A TRTLLM decoder gets a FLASHINFER tower; everyone else keeps theirs.
+
+    TRTLLM has no fused context-FMHA kernel for the tower's head_dim (96), so
+    it falls back to the padded unfused MHA, whose workspace is sized from the
+    metadata maxima (``max_num_requests * max_seq_len ** 2``). The window
+    metadata declares one request per encoder-budget token, so an 8192-token
+    budget requested a 232 GiB workspace during startup encoder profiling and
+    the boot OOMed before serving anything. See ``vision_attn_backend``.
+    """
+
+    def test_trtllm_decoder_gets_flashinfer_tower(self):
+        assert vision_attn_backend("TRTLLM") == "FLASHINFER"
+
+    @pytest.mark.parametrize("backend", ["FLASHINFER", "VANILLA"])
+    def test_other_decoders_keep_their_backend(self, backend):
+        # Negative control: the swap is TRTLLM-specific, not a blanket pin.
+        assert vision_attn_backend(backend) == backend
+
+    def test_tower_applies_the_swap_without_mutating_the_caller(self, monkeypatch):
+        # Construction is enough: the tower must land on FLASHINFER while the
+        # decoder's config still says TRTLLM. Backend classes resolve at
+        # Attention.__init__, so stub the resolution to stay CPU-only and
+        # independent of whether flashinfer is importable in this environment.
+        import tensorrt_llm._torch.attention.attention as attention_mod
+        import tensorrt_llm._torch.models.musespark_open_vision as vision_mod
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+
+        seen = []
+        real_get = get_attention_backend
+        real_create = attention_mod.create_attention
+
+        def recording_get(backend_name, *args, **kwargs):
+            seen.append(backend_name)
+            return real_get("VANILLA")
+
+        def recording_create(backend_name, *args, **kwargs):
+            seen.append(backend_name)
+            return real_create("VANILLA", *args, **kwargs)
+
+        monkeypatch.setattr(vision_mod, "get_attention_backend", recording_get)
+        monkeypatch.setattr(attention_mod, "get_attention_backend", recording_get)
+        monkeypatch.setattr(attention_mod, "create_attention", recording_create)
+
+        decoder_config = _tiny_model_config()
+        decoder_config.attn_backend = "TRTLLM"
+        tower = MuseSparkOpenNaViTVisionTower(decoder_config)
+
+        assert tower.model_config.attn_backend == "FLASHINFER"
+        assert decoder_config.attn_backend == "TRTLLM", "caller's config was mutated"
+        assert seen, "no attention backend was ever resolved"
+        assert set(seen) == {"FLASHINFER"}, (
+            f"tower resolved backends {sorted(set(seen))}; every tower-side "
+            "resolution must see the swapped backend"
+        )
