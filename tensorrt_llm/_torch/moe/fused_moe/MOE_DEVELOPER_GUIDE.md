@@ -354,12 +354,14 @@ operands. TensorRT-LLM currently drives it for **MXFP8 only**, through
   shards scatter-add into the shared, pre-zeroed output, so the split is not
   bitwise equal to the full-GPU kernel. It is a separate autotuned op:
   `CuteDslFusedMoE.run_moe_mxfp8` profiles it only for shapes passing
-  `CuteDslFusedMoEMxfp8Runner.admits_locality_domain` (at most 64 rows and
-  ~128 estimated local routes, i.e. decode) and uses it for a token count only
-  when the autotuner's recorded time beats the full-GPU op by at least 1%
-  (`_select_mxfp8_locality_domain`); every other shape runs the unchanged
-  full-GPU path. Measured on Rubin: -7 to -16% for TEP8 16-32 tokens, -2 to
-  -4% for 2-64 tokens, neutral on DEP16, +20% on prefill (hence excluded).
+  `CuteDslFusedMoEMxfp8Runner.admits_locality_domain` (at most 2048 rows and
+  ~4096 estimated local routes, the measured neutral point) and uses it for a
+  token count only when the autotuner's recorded time beats the full-GPU op
+  by at least 1% (`_select_mxfp8_locality_domain`); every other shape runs
+  the unchanged full-GPU path. Measured on Rubin at the peak HBM clock with
+  the strict 100+100 SM split (TEP8, 64 local experts): -3 to -15% from 2 to
+  1024 rows (most at 16-32), neutral at 2048, +3 to +22% from 3072 rows up
+  and +20% on DEP4 prefill (hence excluded).
   The MXFP8 path keeps the full weights resident after sharding so RLHF refit
   can reload them and rebuild the shards in `post_load_weights`.
 - **DSL build requirement.** The kernel needs a newer internal Cutlass DSL

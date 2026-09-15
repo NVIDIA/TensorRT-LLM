@@ -678,14 +678,17 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
     tuning cache entries (shard shapes and compute topology).
     """
     tuning_config_cache = dict()
-    # Static admission rule for the locality-domain split, from the paired
-    # Rubin measurements: it wins on decode shapes with few valid local
-    # routes (TEP8 replicated input, 16-32 tokens: -7 to -16%; 2-64 tokens:
-    # -2 to -4%), is neutral on DEP16 with ~340 local routes and loses on
-    # 128+ tokens and on prefill (+20%). Shapes outside the rule never
-    # profile the split, so they carry no extra warmup or host cost.
-    LOCALITY_DOMAIN_MAX_TOKENS = 64
-    LOCALITY_DOMAIN_MAX_LOCAL_ROUTES = 128
+    # Static admission rule for profiling the locality-domain split. The
+    # measured selection (1% margin against the full-GPU op) decides whether
+    # it runs; this rule only bounds the extra autotuner warmup by excluding
+    # shapes where the split cannot win. Paired Rubin measurements at the peak
+    # HBM clock with the engine's strict 100+100 SM split (TEP8, 64 local
+    # experts): the split wins from 2 to 1024 rows (-3 to -15% vs the tuned
+    # full-GPU kernel), is neutral at 2048 and loses from 3072 rows up,
+    # reaching +22% at 16K, so the cap sits at the neutral point. The route
+    # cap keeps prefill-like full expert sweeps out regardless of EP layout.
+    LOCALITY_DOMAIN_MAX_TOKENS = 2048
+    LOCALITY_DOMAIN_MAX_LOCAL_ROUTES = 4096
 
     def __init__(self,
                  forward_impl: Callable,

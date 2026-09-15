@@ -4691,10 +4691,12 @@ def test_mxfp8_fused_fc12_sparse_gather_selection():
 
 
 def test_mxfp8_moe_locality_domain_admission_rule():
-    """The inner-channel split is only profiled for decode shapes with few local routes.
+    """The inner-channel split is profiled up to the measured neutral point, never on prefill.
 
     Qwen3.5-397B geometry (512 experts, top-k 10). ``num_tokens`` is the
-    number of rows this rank processes.
+    number of rows this rank processes. Measured at the peak HBM clock with
+    the strict 100+100 SM split: wins from 2 to 1024 rows, neutral at 2048,
+    losses from 3072 rows up.
     """
     from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoEMxfp8Runner
 
@@ -4703,22 +4705,25 @@ def test_mxfp8_moe_locality_domain_admission_rule():
             num_tokens, 10, num_local_experts, 512
         )
 
-    # TEP8 (64 local experts), replicated input: measured wins from 2 to 64
-    # tokens, losses at 128 and 256.
-    for tokens in (2, 4, 8, 16, 21, 32, 64):
+    # TEP8 (64 local experts), replicated input: measured wins 2..1024 rows,
+    # neutral at 2048 -> admitted; losses from 3072 up -> not profiled.
+    for tokens in (1, 2, 4, 8, 16, 21, 32, 64, 128, 256, 512, 1024, 2048):
         assert admits(tokens, 64), tokens
-    for tokens in (128, 256):
+    for tokens in (3072, 4096, 16384):
         assert not admits(tokens, 64), tokens
-    # DEP16 after alltoall dispatch: ~340 local routes on 32 tokens/rank ->
-    # measured neutral, so not admitted; nor DEP4 prefill.
-    assert not admits(337, 32)
+    # DEP16 after alltoall dispatch (~340 rows) and DEP4 decode (~320 rows)
+    # are now profiled; DEP4 prefill (16K rows) is not.
+    assert admits(337, 32)
+    assert admits(320, 128)
     assert not admits(16384, 128)
-    # Empty and single-token (no local routes) shapes stay on the full path.
+    # Empty shapes stay on the full path.
     assert not admits(0, 64)
     assert admits(1, 64)
-    # With all experts local every token has top_k routes.
-    assert admits(12, 512)
-    assert not admits(13, 512)
+    # With all experts local the estimated route count caps admission at 409
+    # rows (4096 routes); a full expert sweep of 2048 rows is not profiled.
+    assert admits(409, 512)
+    assert not admits(410, 512)
+
 
 
 @pytest.mark.skipif(
