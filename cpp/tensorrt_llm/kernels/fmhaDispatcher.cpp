@@ -25,6 +25,23 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace
+{
+
+// The trtllm-gen epilogue copies TMEM->SMEM in 16-element atoms over a tile of
+// gcd(headDimV, 128b/dtypeQ) elements, and KernelTraits asserts the atom fits the tile. For
+// headDimV > 64 that gcd only reaches 16 when headDimV is a multiple of 16, so head dims such as
+// 72 and 104 (Pixtral-family vision encoders) have no trtllm-gen kernel and must run on fmha v2,
+// whose SM100 kernels cover them (see VISION_ENCODER_HEAD_SIZES in fmha_v2/setup.py).
+bool trtllmGenSupportsHeadDim(MHARunnerFixedParams const& fixedParams)
+{
+    // A zero headSizeV means "same as headSize", matching FusedMHARunnerV2's normalization.
+    int const headDimV = fixedParams.headSizeV != 0 ? fixedParams.headSizeV : fixedParams.headSize;
+    return headDimV <= 64 || headDimV % 16 == 0;
+}
+
+} // namespace
+
 QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 {
     if (layout == AttentionInputLayout::PACKED_QKV)
@@ -49,10 +66,9 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 
 FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
-    // TRTLLM-GEN only supports power of 2 head sizes (and 80 with padding).
-    // The exception will fall back to fmha v2.
+    // Head sizes trtllm-gen has no kernel for fall back to fmha v2.
     // Please update fmha_v2/setup.py if you want to add more supported head sizes.
-    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72)
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && trtllmGenSupportsHeadDim(fixedParams))
     , mMultiProcessorCount(tensorrt_llm::common::getMultiProcessorCount())
 {
     if (mUseTllmGen)
