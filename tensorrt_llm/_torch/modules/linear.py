@@ -34,7 +34,8 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
@@ -1234,6 +1235,38 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
               bias: Optional[torch.Tensor]):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
         # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
+        if isinstance(input, tuple):
+            if len(input) != 2:
+                raise ValueError(
+                    "Pre-quantized FP8 input must contain activation and scale")
+            activation, activation_scale = input
+            sm_version = get_sm_version()
+            uses_cute_dsl_rubin = (activation_scale.dtype == torch.uint8
+                                   and sm_version == 107
+                                   and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+                                   and (module.use_cute_dsl_blockscaling_mm
+                                        or module.disable_deep_gemm))
+            if uses_cute_dsl_rubin:
+                output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                    activation, module.weight, activation_scale,
+                    module.weight_scale)
+            elif (activation_scale.dtype == torch.int32 and is_sm_100f()
+                  and not module.disable_deep_gemm):
+                output = torch.ops.trtllm.fp8_prequantized_swap_ab_gemm(
+                    activation,
+                    activation_scale,
+                    module.weight,
+                    module.weight_scale,
+                    disable_ue8m0_cast=True,
+                )
+            else:
+                raise RuntimeError(
+                    "Pre-quantized FP8 scale layout is incompatible with the "
+                    "selected block-scale GEMM backend")
+            if bias is not None:
+                output = output + bias
+            return output
+
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -2023,7 +2056,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         # interleaves in 64-row groups to match the kernel layout.
         #
         # Weight scales are similarly unswizzled, interleaved, and re-swizzled.
-        if not module.use_cute_dsl_blockscaling_mm:
+        if not module.can_use_cute_dsl_nvfp4_swiglu_blackwell():
             return
 
         group_size = 64
@@ -3609,6 +3642,7 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
+        use_cute_dsl_nvfp4_swiglu_blackwell: bool = False,
         disable_deep_gemm: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
@@ -3619,6 +3653,9 @@ class Linear(nn.Module):
     ):
         """
         Args:
+            use_cute_dsl_nvfp4_swiglu_blackwell: Allow this fused gate/up
+                projection to use the Blackwell-only NVFP4 GEMM + SwiGLU
+                kernel and its required interleaved weight layout.
             nvfp4_allowed_backends: List of backends to consider for NVFP4 GEMM auto-selection.
                 Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
                 Add 'cutedsl' for extreme performance at the cost of longer build time.
@@ -3643,6 +3680,8 @@ class Linear(nn.Module):
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        self.use_cute_dsl_nvfp4_swiglu_blackwell = \
+            use_cute_dsl_nvfp4_swiglu_blackwell
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
         # Store NVFP4 GEMM allowed backends configuration
@@ -3990,6 +4029,18 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    def can_use_cute_dsl_nvfp4_swiglu_blackwell(self) -> bool:
+        """Return whether this layer can use the Blackwell NVFP4 SwiGLU op.
+
+        Keep this predicate shared by weight transformation and forward
+        dispatch so a fallback backend never consumes the fused layout.
+        """
+        return (self.use_cute_dsl_nvfp4_swiglu_blackwell
+                and self.use_cute_dsl_blockscaling_mm
+                and IS_CUTLASS_DSL_AVAILABLE
+                and self.has_nvfp4_activation_quantization
+                and get_sm_version() in (100, 103) and not self.has_bias)
 
     @property
     def has_nvfp4_activation_quantization(self):

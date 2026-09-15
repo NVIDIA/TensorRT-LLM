@@ -42,6 +42,58 @@ except ImportError:
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 
+_KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
+
+# Both dense MXFP8 wrappers pass a scalar one to the CuTe kernel. Keep one
+# read-only tensor per CUDA device so steady-state calls, including CUDA graph
+# replay, do not launch a scalar fill kernel.
+_MXFP8_GEMM_ALPHA_CACHE: "dict[torch.device, torch.Tensor]" = {}
+
+
+def _get_mxfp8_gemm_alpha(device: torch.device) -> torch.Tensor:
+    """Return the cached FP32 scalar one for ``device``.
+
+    Allocation is deliberately rejected during CUDA graph capture. Callers
+    must run one eager warmup on each device, which is already required for
+    GEMM autotuning, before capturing the steady-state path.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(
+            f"MXFP8 GEMM alpha requires a CUDA device, got {device}.")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    alpha = _MXFP8_GEMM_ALPHA_CACHE.get(device)
+    if alpha is None:
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "MXFP8 GEMM alpha cache must be initialized before CUDA graph "
+                    f"capture on {device}; run one eager GEMM warmup first.")
+            alpha = torch.ones((), dtype=torch.float32, device=device)
+        _MXFP8_GEMM_ALPHA_CACHE[device] = alpha
+    return alpha
+
+
+def _get_kimi_k3_mxfp8_tuning_buckets(max_num_tokens: int) -> Tuple[int, ...]:
+    """Generate every K3 bucket used through ``max_num_tokens``."""
+    max_bucket = _kimi_k3_mxfp8_tuning_bucket(max_num_tokens)
+    low_m = [m for m in _KIMI_K3_MXFP8_TUNING_BUCKETS if m <= max_bucket]
+    high_m = [
+        m for m in get_last_power_of_2_num_tokens_buckets(max_bucket) if m > 192
+    ]
+    return tuple((*low_m, *high_m))
+
+
+def _kimi_k3_mxfp8_tuning_bucket(num_tokens: int) -> int:
+    """Use lower power-of-two buckets for small M, then upper-bound buckets."""
+    if num_tokens <= 32:
+        return last_positive_power_of_2(num_tokens)
+    if num_tokens <= 192:
+        return next(m for m in _KIMI_K3_MXFP8_TUNING_BUCKETS if num_tokens <= m)
+    return next_positive_power_of_2(num_tokens)
+
 
 def _with_input_cuda_device(function):
     """Run a custom-op implementation under its input tensor's CUDA device."""
@@ -13055,7 +13107,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if input_scale.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
                 raise ValueError("CuteDSL MXFP8 scales must be UE8M0 uint8")
 
-            alpha = torch.ones((), dtype=torch.float32, device=input.device)
+            alpha = _get_mxfp8_gemm_alpha(input.device)
             runner = CuteDSLMXFP8RubinLinear(output_dtype=output_dtype,
                                              use_tvm_ffi=use_tvm_ffi)
             inputs = [input, weight, input_scale, weight_scale, alpha]
