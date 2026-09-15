@@ -116,6 +116,7 @@ class _FakeKVCache:
 def _make_cache_config_for_test(
     kv_cache_config: KvCacheConfig,
     *,
+    kv_cache_type: CacheType = CacheType.SELFKONLY,
     is_draft: bool = False,
     max_batch_size: int = 1,
     max_seq_len: int = 1024,
@@ -132,7 +133,7 @@ def _make_cache_config_for_test(
     assert len(max_attention_window_vec) == len(pp_layers)
 
     cache_manager = object.__new__(KVCacheManagerV2)
-    cache_manager.kv_cache_type = CacheType.SELFKONLY
+    cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = DataType.HALF
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
     cache_manager.enable_swa_scratch_reuse = False
@@ -745,13 +746,21 @@ def test_default_uses_allocator_fallback() -> None:
 
 
 @pytest.mark.parametrize(
-    "attention_windows,generation_capacity",
-    [([None, None], 3), ([None, 256], 1024)],
-    ids=["full_attention", "mixed_attention"],
+    "kv_cache_type,attention_windows,generation_capacity",
+    [
+        (CacheType.SELF, [None, None], 3),
+        (CacheType.SELF, [None, 256], 1024),
+        (CacheType.CROSS, [None, None], 1024),
+        (CacheType.SELFKONLY, [None, None], 1024),
+    ],
+    ids=["full_attention", "mixed_attention", "cross_attention", "key_only"],
 )
-def test_avg_seq_len_builds_warmup_constraints(attention_windows, generation_capacity) -> None:
+def test_avg_seq_len_builds_warmup_constraints(
+    kv_cache_type, attention_windows, generation_capacity
+) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(use_kv_cache_manager_v2=True, host_cache_size=0, avg_seq_len=1024),
+        kv_cache_type=kv_cache_type,
         max_batch_size=3,
         max_seq_len=1024,
         max_num_tokens=2048,
