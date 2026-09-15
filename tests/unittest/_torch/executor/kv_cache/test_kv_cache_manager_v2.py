@@ -34,6 +34,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -778,6 +780,7 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
         max_seq_len=1024,
         max_num_tokens=2048,
         max_draft_len=2,
+        max_attention_window_vec=[None, 256],
     )
 
     assert config.typical_step == BatchDesc(
@@ -794,6 +797,132 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
         ),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
     ]
+
+
+@pytest.fixture(params=[0, 16], ids=["decode", "speculative"])
+def _budget_warmup_spec_config(request: pytest.FixtureRequest):
+    return (
+        Eagle3DecodingConfig(max_draft_len=request.param, speculative_model="dummy")
+        if request.param
+        else None
+    )
+
+
+@pytest.fixture(params=[False, True], ids=["no_guard", "guard"])
+def _budget_warmup_guard_page(request: pytest.FixtureRequest, monkeypatch):
+    if request.param:
+        monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_KV_GUARD_PAGE", raising=False)
+    return request.param
+
+
+@pytest.fixture(params=["bytes", "tokens"])
+def _budget_limited_full_attention_manager(
+    request: pytest.FixtureRequest,
+    _budget_warmup_spec_config,
+    _budget_warmup_guard_page,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    budget = {"max_gpu_total_bytes": 17 << 20} if request.param == "bytes" else {"max_tokens": 8192}
+    config = KvCacheConfig(
+        use_kv_cache_manager_v2=True,
+        enable_block_reuse=False,
+        host_cache_size=0,
+        avg_seq_len=32768,
+        **budget,
+    )
+    manager = KVCacheManagerV2(
+        config,
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=131072,
+        max_batch_size=8,
+        max_num_tokens=2048,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        spec_config=_budget_warmup_spec_config,
+    )
+    try:
+        assert len(manager.kv_cache_map) == int(_budget_warmup_guard_page)
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def test_full_attention_warmup_respects_allocated_budget(
+    _budget_limited_full_attention_manager: KVCacheManagerV2,
+) -> None:
+    manager = _budget_limited_full_attention_manager
+    requested_quota = manager.kv_cache_manager_py_config.cache_tiers[0].quota
+    allocated_bytes = manager.impl.get_quota(kv_cache_v2_module.GPU_LEVEL)
+    # These small quotas round up to a 2 MiB GPU allocation grain. The model's
+    # full context would require 256 MiB, far beyond either configured budget.
+    assert 0 < allocated_bytes <= requested_quota + (2 << 20)
+    assert manager.max_num_tokens < manager.max_seq_len < 131072
+
+    requests = manager.add_dummy_requests(
+        [0], token_nums=[manager.max_num_tokens // 2], is_gen=False
+    )
+    assert requests is not None
+    try:
+        cache = manager.kv_cache_map[requests[0].py_request_id]
+        assert cache.resize(manager.max_num_tokens, history_length=0)
+        assert cache.capacity == manager.max_num_tokens
+        cache.suspend()
+        assert cache.resume(torch.cuda.current_stream().cuda_stream)
+    finally:
+        for request in requests:
+            manager.free_resources(request)
+
+
+def test_full_attention_budget_supports_cuda_graph_warmup(
+    _budget_limited_full_attention_manager: KVCacheManagerV2,
+    _budget_warmup_spec_config,
+) -> None:
+    manager = _budget_limited_full_attention_manager
+    # Exercise the real graph request builder: it allocates the short requests,
+    # queries the remaining capacity, then grows the longest generation request.
+    engine = SimpleNamespace()
+    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.spec_config = _budget_warmup_spec_config
+    engine.max_beam_width = 1
+    engine.max_draft_loop_tokens = manager.max_draft_len
+    engine.max_seq_len = 131072
+    engine.use_mrope = False
+    engine.get_runtime_tokens_per_gen_step = lambda draft_len: draft_len + 1
+    engine._get_draft_kv_cache_manager = lambda _: None
+    engine._is_encoder_decoder_model = lambda: False
+    engine.model = SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+    )
+    resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+
+    batch = PyTorchModelEngine._create_cuda_graph_warmup_request(
+        engine, resources, batch_size=manager.max_batch_size, draft_len=manager.max_draft_len
+    )
+    assert batch is not None
+    requests = list(batch.generation_requests)
+    try:
+        assert len(requests) == manager.max_batch_size
+        longest_request = requests[0]
+        cache = manager.kv_cache_map[longest_request.py_request_id]
+        assert cache.capacity > manager.max_num_tokens
+        manager.free_resources(longest_request)
+        requests.remove(longest_request)
+        # Once the longest request finishes, another generation request can
+        # grow across page boundaries into the released capacity.
+        cache = manager.kv_cache_map[requests[0].py_request_id]
+        assert cache.capacity < manager.max_num_tokens
+        assert cache.resize(manager.max_num_tokens, history_length=cache.history_length + 1)
+    finally:
+        for request in requests:
+            manager.free_resources(request)
 
 
 def test_avg_seq_len_updates_typical_step() -> None:
