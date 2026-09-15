@@ -2249,6 +2249,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'targetArch': "aarch64-linux-gnu",
                                 'branch': globalVars[BUILD_BRANCH],
                                 'promote': "true",
+                                // Republish this run's SBSA tarball at artifactPath as the
+                                // BOLTed build (original kept as unbolted-<tarball>), so
+                                // canonical means BOLTed for the post-merge build exactly
+                                // as it does for the pre-merge build (Build.groovy's
+                                // bolt-consume) and for published images (the overlay
+                                // below). In-run effect: the SBSA test stages that follow
+                                // pull that canonical, so post-merge tests exercise the
+                                // BOLTed build -- coverage on the very bundle this run
+                                // promotes for pre-merge to consume.
+                                // applyProfiles is passed explicitly even though it already
+                                // defaults on: publishing REQUIRES it (no BOLT_APPLY=1 in
+                                // the merge job means no bolted tarball to push), and the
+                                // helper skips publishing when it is off, so pinning it
+                                // here keeps a later default flip from quietly turning the
+                                // canonical republish back off.
+                                'applyProfiles': "true",
+                                'boltPublishCanonical': "true",
                             ]
                             launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
                         }
