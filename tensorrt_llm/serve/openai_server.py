@@ -611,6 +611,25 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
     return begin_prefix, guided
 
 
+def _new_media_dir(root: Path) -> Path:
+    """Create a directory under ``root`` stamped with the current time.
+
+    ``mkdir`` without ``exist_ok`` is what makes this safe: the kernel either
+    creates the directory or raises, so two servers starting in the same
+    second take separate names instead of sharing one.
+    """
+    stamp = datetime.now().strftime("%y%m%d-%H%M%S")
+    root.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        candidate = root / (stamp if n == 1 else f"{stamp}-{n}")
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            n += 1
+
+
 def _normalize_image_output(image) -> list:
     """Normalize image output to a list of individual images.
 
@@ -924,10 +943,25 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self.media_storage_path = Path(
-            os.getenv("TRTLLM_MEDIA_STORAGE_PATH",
-                      "/tmp/trtllm_generated"))  # nosec B108
-        self.media_storage_path.mkdir(exist_ok=True, parents=True)
+        # Without an explicit path, take a timestamped directory beside the
+        # working directory, so concurrent servers keep their media apart and
+        # it outlives a reboot.
+        explicit_storage_path = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
+        if explicit_storage_path:
+            self.media_storage_path = Path(explicit_storage_path)
+            self.media_storage_path.mkdir(parents=True, exist_ok=True)
+        else:
+            try:
+                self.media_storage_path = _new_media_dir(Path.cwd() /
+                                                         "trtllm_generated")
+            except OSError:
+                # A deployment may start the server from a directory it cannot
+                # write to, and that must not stop a server whose caller never
+                # asks for media. OSError rather than PermissionError: a
+                # read-only mount raises EROFS, which is not one.
+                self.media_storage_path = _new_media_dir(
+                    Path("/tmp/trtllm_generated"))  # nosec B108
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.video_gen_tasks = {}
 
     def _supports_image_edit(self) -> bool:
