@@ -131,7 +131,12 @@ def launch_smg_server(
                 logger.info("LLM engine stopped")
                 logger.info("Shutdown complete")
 
-    uvloop.run(serve_grpc_async())
+    # Imported here rather than at module scope: tensorrt_llm.commands.serve
+    # reaches into this module to launch the server.
+    from tensorrt_llm.commands.serve import _provision_kv_cache_pool
+
+    with _provision_kv_cache_pool(llm_args):
+        uvloop.run(serve_grpc_async())
 
 
 __all__ = ["launch_smg_server"]
