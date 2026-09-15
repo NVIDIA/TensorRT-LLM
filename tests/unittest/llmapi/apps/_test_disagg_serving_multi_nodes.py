@@ -84,7 +84,7 @@ def env():
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "llama-3.1-model/Llama-3.1-8B-Instruct"
+    return "Qwen3.5-4B"
 
 
 @pytest.fixture(scope="module", params=['pytorch'], ids=["pytorch"])
