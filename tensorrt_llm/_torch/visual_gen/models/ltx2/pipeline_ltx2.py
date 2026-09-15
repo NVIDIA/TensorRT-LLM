@@ -18,6 +18,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
@@ -504,7 +505,8 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
         # would reject.
         with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
             for _ in range(self.WARMUP_STEPS):
-                fn(*static_args, **static_kwargs)
+                with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
+                    fn(*static_args, **static_kwargs)
                 torch.cuda.synchronize()
                 gc.collect()
                 torch.cuda.empty_cache()
