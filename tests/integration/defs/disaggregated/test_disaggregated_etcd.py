@@ -19,7 +19,6 @@ import signal
 import subprocess
 import time
 
-import pytest
 import requests
 from defs.conftest import get_sm_version
 
@@ -434,13 +433,11 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
         kill_automated_disaggregated_processes()
 
 
-@pytest.mark.parametrize("llama_model_root", ['Qwen3-0.6B'], indirect=True)
 def test_automated_disaggregated_complete(disaggregated_test_root,
                                           disaggregated_example_root, llm_venv,
-                                          llama_model_root):
+                                          qwen_model_root):
     src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
+        qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):

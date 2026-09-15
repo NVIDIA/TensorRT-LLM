@@ -131,10 +131,10 @@ l0_dgx_b200:
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part3"
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part4"
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part5"
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[Qwen3-0.6B]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[Qwen3-0.6B]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[Qwen3-0.6B]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[Qwen3-0.6B]
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2]
     - examples/test_ray.py::test_ray_disaggregated_serving[tp2]
     - examples/test_ray.py::test_ray_disaggregated_serving_python[tp2]

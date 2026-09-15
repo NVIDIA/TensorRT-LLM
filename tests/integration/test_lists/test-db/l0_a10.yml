@@ -83,23 +83,23 @@ l0_a10:
   - unittest/tools/test_unittest_culprits.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_mixed[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_conditional[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ngram[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_sa[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[Qwen3-0.6B]
-  - disaggregated/test_workers.py::test_workers_conditional_disaggregation[Qwen3-0.6B]
-  - disaggregated/test_workers.py::test_workers_kv_cache_events[Qwen3-0.6B]
-  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[Qwen3-0.6B]
-  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu
+  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap
+  - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens
+  - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output
+  - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics
+  - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance
+  - disaggregated/test_disaggregated.py::test_disaggregated_conditional
+  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv
+  - disaggregated/test_disaggregated.py::test_disaggregated_ngram
+  - disaggregated/test_disaggregated.py::test_disaggregated_sa
+  - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls
+  - disaggregated/test_workers.py::test_workers_conditional_disaggregation
+  - disaggregated/test_workers.py::test_workers_kv_cache_events
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]

@@ -51,8 +51,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_preserves_moe_graph_addresses
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_engine_checkpoint_coordination
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_mnnvl_checkpoint_failure_is_collective_and_bounded
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory[Qwen3-0.6B]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce
 
 - condition:
     ranges:
