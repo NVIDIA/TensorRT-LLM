@@ -1264,11 +1264,14 @@ class GSM8KInferenceX(LmEvalEvaluator):
     """GSM8K under the InferenceX (formerly InferenceMAX) protocol.
 
     Mirrors SemiAnalysisAI/InferenceX (infx/evals/gsm8k.yaml + run_lm_eval):
-    chat template, 5-shot multiturn, the documented 12288-token eval-only
-    generation budget, strict "#### N" extraction, and lm-eval's default
-    exemplar selection (unshuffled data, few-shot seed 1234), so scores are
-    comparable to inferencex.semianalysis.com/evaluation. Thinking mode
-    follows the chat template default unless chat_template_kwargs sets it.
+    chat template with the 5 exemplars in the single user turn (InferenceX
+    passes --apply_chat_template but not --fewshot_as_multiturn), the
+    documented 12288-token eval-only generation budget, strict "#### N"
+    extraction, and lm-eval's default exemplar selection (unshuffled data,
+    few-shot seed 1234), so scores are comparable to
+    inferencex.semianalysis.com/evaluation. Thinking mode follows the chat
+    template default unless chat_template_kwargs sets it; InferenceX serves
+    with thinking enabled where the framework offers a server-side default.
     The answer filter sees the raw generation, whereas a served InferenceX
     run scores the reasoning-parsed content; this only matters if a model
     writes "#### N" inside its thinking.
@@ -1276,7 +1279,7 @@ class GSM8KInferenceX(LmEvalEvaluator):
 
     def __init__(self, **kwargs):
         kwargs.setdefault("apply_chat_template", True)
-        kwargs.setdefault("fewshot_as_multiturn", True)
+        kwargs.setdefault("fewshot_as_multiturn", False)
         kwargs.setdefault("shuffle_dataset", False)
         kwargs.setdefault("fewshot_random_seed", 1234)
         super().__init__("gsm8k_inferencex", **kwargs)
@@ -1310,8 +1313,9 @@ class GSM8KInferenceX(LmEvalEvaluator):
         'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
     @click.option("--fewshot_as_multiturn",
                   type=click.BOOL,
-                  default=True,
-                  help="Apply fewshot as multiturn.")
+                  default=False,
+                  help="Apply fewshot as multiturn. InferenceX keeps the "
+                  "exemplars in the single user turn.")
     @click.option("--num_fewshot",
                   type=int,
                   default=None,
