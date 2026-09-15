@@ -182,6 +182,38 @@ def test_topology_probe_initializes_nvml() -> None:
     mock_nvml_init.assert_called_once_with()
 
 
+def test_support_nvlink_stops_at_first_rejected_link_index() -> None:
+    # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures. GB200 has
+    # 18 links, and the driver rejects every index past them with InvalidArgument.
+    # NotSupported marks a hole inside the range, which must be skipped, not treated
+    # as the end.
+    def get_capability(_handle, link_idx, _capability):
+        if link_idx == 5:
+            raise pynvml.NVMLError_NotSupported()
+        if link_idx >= 18:
+            raise pynvml.NVMLError_InvalidArgument()
+        return 1
+
+    with (
+        patch.object(MnnvlMemory, "_ensure_nvml_initialized"),
+        patch("tensorrt_llm._mnnvl_utils.pynvml.NVML_NVLINK_MAX_LINKS", 36),
+        patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", return_value=0),
+        patch(
+            "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetNvLinkCapability",
+            side_effect=get_capability,
+        ) as mock_get_capability,
+        patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetNvLinkState", return_value=1),
+        patch("tensorrt_llm._mnnvl_utils.logger.info") as mock_log_info,
+    ):
+        assert MnnvlMemory.support_nvlink(0)
+
+    # Probing skips the hole at index 5 and stops at index 18 instead of issuing the
+    # 17 remaining rejected queries.
+    assert mock_get_capability.call_count == 19
+    message = mock_log_info.call_args.args[0]
+    assert "17/17 links up (18 of 36 link indices accepted by the driver)" in message
+
+
 @patch("tensorrt_llm._mnnvl_utils.get_sm_version", return_value=90)
 @patch("tensorrt_llm._mnnvl_utils.torch.cuda.current_device", return_value=0)
 @patch.object(MnnvlMemory, "_is_pcie_nvl_sku", return_value=True)
