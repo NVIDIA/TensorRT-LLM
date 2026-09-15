@@ -82,7 +82,6 @@ soundfile
 # since PEP 440 ordered comparisons put 3.8.0a0+... below 3.8.0. The floor is what public
 # torch 2.12.0 pins, and is the version the vendored triton_kernels below track.
 triton>=3.7.0,<=3.8.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
-xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeploy
 tiktoken
 blobfile
 openai-harmony==0.0.4

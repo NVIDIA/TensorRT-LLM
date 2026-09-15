@@ -210,7 +210,7 @@ def get_kv_cache_manager_cls(
                 # results. Model loading resolves ``auto`` to PYTHON via
                 # KimiLinearForCausalLM.get_preferred_transceiver_runtime
                 # (NIXL-gated); this rejects explicit non-Python routes and
-                # paths that skip model defaults (e.g. AutoDeploy).
+                # paths that skip model defaults.
                 raise ValueError(
                     "Kimi K3 disaggregated serving requires the Python "
                     "transceiver: set cache_transceiver_config "

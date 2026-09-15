@@ -433,14 +433,10 @@ class CachedModelLoader:
                 if resolve_from_checkpoint is not None:
                     resolve_from_checkpoint()
 
-        # AutoDeploy doesn't use ModelLoader
-        if self.llm_args.backend == "_autodeploy":
-            return None, ""
-
         self._hf_model_dir = None
         self.model_loader = ModelLoader(self.llm_args)
 
-        if self.llm_args.backend not in ["pytorch", "_autodeploy"]:
+        if self.llm_args.backend != "pytorch":
             raise ValueError(
                 f'backend {self.llm_args.backend} is not supported.')
 

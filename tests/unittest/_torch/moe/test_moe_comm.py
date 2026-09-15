@@ -1805,7 +1805,7 @@ def _simulate_nvfp4_round_trip(tensor: torch.Tensor, group_size: int = 16) -> to
     N, H = x.shape
     assert H % group_size == 0
 
-    # E2M1 lookup tables (same as torch_quant.py)
+    # E2M1 lookup tables.
     e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
     e2m1_pos_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
 
