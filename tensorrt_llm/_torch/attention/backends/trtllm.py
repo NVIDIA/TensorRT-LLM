@@ -2071,9 +2071,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
-        if not metadata.is_cuda_graph and not fmha.supports_workspace_reclamation:
-            # Other backends can retain staged state in this storage. Once one
-            # has used it, never reclaim based on fallback-only sizing reports.
+        if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
+            # Conservatively disable reclamation for metadata used by graphs
+            # or backends that can retain staged workspace state.
             metadata.workspace_reclaimable = False
         try:
             fmha.forward(q, k, v, metadata, forward_args)
