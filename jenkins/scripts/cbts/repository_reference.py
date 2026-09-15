@@ -103,6 +103,15 @@ class RepositoryReferenceIndex:
         callee = _dotted_name(node.func)
         return bool(callee and callee.rpartition(".")[2] in {"__import__", "import_module"})
 
+    @staticmethod
+    def _references_identifier(tree: ast.Module, name: str) -> bool:
+        """Whether executable syntax references ``name`` as a complete identifier."""
+        return any(
+            (isinstance(node, ast.Name) and node.id == name)
+            or (isinstance(node, ast.Attribute) and node.attr == name)
+            for node in ast.walk(tree)
+        )
+
     def direct_importers(self, defining_path: str) -> ImporterFacts:
         """Return direct Python importers, or an incomplete result on ambiguity."""
         if defining_path in self._importer_cache:
@@ -164,7 +173,7 @@ class RepositoryReferenceIndex:
                         self._importer_cache[defining_path] = result
                         return result
 
-            if target_leaf in source and not imports_target:
+            if self._references_identifier(parsed.tree, target_leaf) and not imports_target:
                 result = ImporterFacts((), False, f"unresolved module reference in {path}")
                 self._importer_cache[defining_path] = result
                 return result
@@ -263,10 +272,9 @@ class RepositoryReferenceIndex:
                     if f"{imported_from}.{alias.name}" == target_module:
                         module_aliases.add(alias.asname or alias.name)
             elif isinstance(node, ast.Call) and node.args:
-                callee = _dotted_name(node.func)
                 first = node.args[0]
                 if (
-                    callee in {"__import__", "importlib.import_module"}
+                    RepositoryReferenceIndex._is_dynamic_import(node)
                     and isinstance(first, ast.Constant)
                     and first.value == target_module
                 ):
