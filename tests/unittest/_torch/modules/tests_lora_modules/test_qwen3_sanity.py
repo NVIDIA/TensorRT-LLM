@@ -31,6 +31,7 @@ from tensorrt_llm._torch.peft.lora import layer as lora_layer_module
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.llmapi import KvCacheConfig
 
 # HF module name -> block path relative to layers.{idx}.
 # Attention targets work on all architectures. MLP targets only apply to
@@ -110,12 +111,15 @@ def _create_lora_adapter(
     return output_dir
 
 
-def _run_with_and_without_lora(model_path, lora_config, lora_dir, prompts):
+def _run_with_and_without_lora(
+    model_path, lora_config, lora_dir, prompts, kv_cache_config: KvCacheConfig | None = None
+):
     """Run inference with and without LoRA, return (lora_outputs, base_outputs)."""
     with LLM(
         model=model_path,
         backend="pytorch",
         lora_config=lora_config,
+        kv_cache_config=kv_cache_config or KvCacheConfig(),
         tensor_parallel_size=1,
         max_batch_size=4,
         max_num_tokens=256,
@@ -177,6 +181,7 @@ def _run_lora_test(
     dtype=torch.bfloat16,
     overlap=False,
     specialize_cuda_graph=False,
+    kv_cache_config: KvCacheConfig | None = None,
 ):
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -200,11 +205,14 @@ def _run_lora_test(
             lora_config,
             lora_dir,
             ["The capital of France is", "Hello, how are you"],
+            kv_cache_config=kv_cache_config,
         )
         _assert_lora_changes_output(out_lora, out_base)
 
 
-def _run_mixed_lora_cuda_graph_test(model_path, target_modules, trtllm_modules):
+def _run_mixed_lora_cuda_graph_test(
+    model_path, target_modules, trtllm_modules, kv_cache_config: KvCacheConfig
+):
     """Verify base rows remain unchanged when sharing a LoRA-specialized graph."""
     with tempfile.TemporaryDirectory() as tmpdir:
         lora_dir = _create_lora_adapter(
@@ -223,6 +231,7 @@ def _run_mixed_lora_cuda_graph_test(model_path, target_modules, trtllm_modules):
             model=model_path,
             backend="pytorch",
             lora_config=lora_config,
+            kv_cache_config=kv_cache_config,
             tensor_parallel_size=1,
             max_batch_size=4,
             max_num_tokens=256,
@@ -235,13 +244,27 @@ def _run_mixed_lora_cuda_graph_test(model_path, target_modules, trtllm_modules):
                 "Hello, how are you",
             ]
             lora_request = LoRARequest("test-lora", 0, lora_dir)
+            mixed_lora_requests = [lora_request, None, lora_request, None]
+            if kv_cache_config.enable_block_reuse:
+                # Warm both adapter and base prefixes before either measured call.
+                # Comparing a cold prefill with a partial cache hit exercises
+                # different attention shapes, which can change BF16 logprobs.
+                llm.generate(prompts, sampling, lora_request=mixed_lora_requests)
             mixed_outputs = llm.generate(
                 prompts,
                 sampling,
-                lora_request=[lora_request, None, lora_request, None],
+                lora_request=mixed_lora_requests,
             )
             base_outputs = llm.generate(prompts, sampling)
 
+        for mixed_output, base_output in zip(mixed_outputs, base_outputs, strict=True):
+            expected_cached_tokens = 0
+            if kv_cache_config.enable_block_reuse:
+                # The final prompt token must still be computed to produce logits.
+                expected_cached_tokens = len(mixed_output.prompt_token_ids) - 1
+                assert expected_cached_tokens > 0
+            assert mixed_output.cached_tokens == expected_cached_tokens
+            assert base_output.cached_tokens == expected_cached_tokens
         for index in (1, 3):
             _assert_outputs_match(mixed_outputs[index], base_outputs[index])
         _assert_lora_changes_output(
@@ -286,6 +309,7 @@ class TestQwen3LoRA:
     @pytest.fixture(autouse=True)
     def setup(self):
         self.model_path = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
+        self.kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
         if not os.path.exists(self.model_path):
             pytest.skip(f"Model not found: {self.model_path}")
 
@@ -294,6 +318,7 @@ class TestQwen3LoRA:
             self.model_path,
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_fp8_lora(self):
@@ -302,6 +327,7 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             dtype=torch.float8_e4m3fn,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_bf16_lora_overlap(self):
@@ -310,6 +336,7 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             overlap=True,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_fp8_lora_overlap(self):
@@ -319,6 +346,7 @@ class TestQwen3LoRA:
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             dtype=torch.float8_e4m3fn,
             overlap=True,
+            kv_cache_config=self.kv_cache_config,
         )
 
     def test_qwen3_bf16_lora_cuda_graph_specialization(self):
@@ -327,13 +355,17 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             specialize_cuda_graph=True,
+            kv_cache_config=self.kv_cache_config,
         )
 
-    def test_qwen3_bf16_lora_cuda_graph_specialization_mixed_batch(self):
+    @pytest.mark.parametrize("enable_block_reuse", [False, True], ids=["no_reuse", "warmed_reuse"])
+    def test_qwen3_bf16_lora_cuda_graph_specialization_mixed_batch(self, enable_block_reuse):
+        self.kv_cache_config.enable_block_reuse = enable_block_reuse
         _run_mixed_lora_cuda_graph_test(
             self.model_path,
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            kv_cache_config=self.kv_cache_config,
         )
 
 
