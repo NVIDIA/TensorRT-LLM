@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import pytest
 import torch
 
 import tensorrt_llm
@@ -25,16 +26,47 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import CudaGraphConfig
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.speculative.utils import update_draft_len
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PARDDecodingConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
+def test_warmup_overrides_dynamic_draft_length(config_cls):
+    config = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
+    engine = SimpleNamespace(
+        spec_config=config,
+        max_draft_len=3,
+        max_total_draft_tokens=config.tokens_per_gen_step - 1,
+        runtime_draft_len=3,
+    )
+    requests = [
+        SimpleNamespace(
+            py_draft_tokens=[7, 8, 9] + [0] * (config.tokens_per_gen_step - 4),
+            py_needs_onehot_draft_probs=False,
+        )
+        for _ in range(2)
+    ]
+    batch = SimpleNamespace(batch_size=2, generation_requests=requests)
+
+    # Normal iteration selects K=2. Each explicit warmup shape must then
+    # update both the engine and buffers, even when the batch size is unchanged.
+    update_draft_len(engine, batch)
+    assert engine.runtime_draft_len == 2
+    assert all(request.py_draft_tokens[:2] == [7, 8] for request in requests)
+    for draft_len in (0, 3, 1):
+        update_draft_len(engine, batch, draft_len=draft_len)
+        assert engine.runtime_draft_len == draft_len
+        assert all(
+            len(request.py_draft_tokens) == config.get_runtime_tokens_per_gen_step(draft_len) - 1
+            for request in requests
+        )
+    update_draft_len(engine, batch)
+    assert engine.runtime_draft_len == 2
 
 
 # Minimal fixtures mirroring sibling test_pytorch_model_engine.py — duplicated
@@ -96,13 +128,14 @@ def _build_engine_and_resource_manager():
         model="dummy",
         max_batch_size=batch_size,
         max_num_tokens=max_tokens,
+        kv_cache_config=KvCacheConfig(max_tokens=max_tokens, use_kv_cache_manager_v2=True),
         cuda_graph_config=CudaGraphConfig(
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]
         ),
     )
     model_engine = _DummyModelEngine(llm_args, torch.half)
-    kv_cache_manager = KVCacheManager(
-        KvCacheConfig(max_tokens=max_tokens),
+    kv_cache_manager = KVCacheManagerV2(
+        llm_args.kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,
         num_kv_heads=model_engine.model.config.num_key_value_heads,
@@ -110,6 +143,7 @@ def _build_engine_and_resource_manager():
         tokens_per_block=tokens_per_block,
         max_seq_len=max_tokens,
         max_batch_size=batch_size,
+        max_num_tokens=max_tokens,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=tensorrt_llm.bindings.DataType.HALF,
     )
