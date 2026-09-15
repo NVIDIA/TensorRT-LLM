@@ -746,13 +746,22 @@ def is_sm_100f(sm_version=None):
 
 
 @lru_cache(maxsize=1)
-def is_flashinfer_gdn_supported_arch(sm_version=None):
-    """Whether FlashInfer ships GDN (gated-delta-rule) kernels for this arch.
+def is_flashinfer_gdn_prefill_supported_arch(sm_version=None):
+    """Whether FlashInfer ships the GDN (gated-delta-rule) chunk-prefill kernel.
 
-    FlashInfer's GDN chunk-prefill and bf16-state decode kernels are built only
-    for Hopper (SM90) and datacenter Blackwell (SM100/SM103). On consumer
-    Blackwell (SM120) and other architectures the kernels abort at launch, so
-    callers must fall back to the vendored Triton kernels.
+    FlashInfer builds the chunk-prefill kernel for Hopper (SM90) and Blackwell (SM100/SM103/SM120).
+    On other architectures the kernel aborts at launch, so callers must fall back to the vendored Triton kernels.
+    """
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version in (90, 100, 103, 120)
+
+
+@lru_cache(maxsize=1)
+def is_flashinfer_gdn_decode_supported_arch(sm_version=None):
+    """Whether FlashInfer ships the GDN bf16-state decode / MTP-verify kernels.
+
+    These are built only for Hopper (SM90) and datacenter Blackwell (SM100/SM103).
     """
     if sm_version is None:
         sm_version = get_sm_version()
