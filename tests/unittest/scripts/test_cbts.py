@@ -492,8 +492,19 @@ def test_case_counts_include_coverage_multi_gpu_at_full_size(
     assert (cbts_cases, total_cases) == (80, 160)
 
 
+@pytest.mark.parametrize(
+    ("cbts_applied", "coverage_pilot_eligible"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
 def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
     report_module: ModuleType,
+    cbts_applied: bool,
+    coverage_pilot_eligible: bool,
 ) -> None:
     decision = _decision()
     decision["affected_stage_split_counts"] = {
@@ -510,12 +521,16 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
         total_cases=100,
         multi_gpu_required=True,
         multi_gpu_label_gate_open=False,
+        cbts_applied=cbts_applied,
+        coverage_pilot_eligible=coverage_pilot_eligible,
     )
 
     assert document["d_case_skip_rate"] == 0.75
     assert document["b_case_skip_rate_valid"] is True
     assert document["b_non_cbts_multi_gpu_required"] is True
     assert document["b_multi_gpu_label_gate_open"] is False
+    assert document["b_cbts_applied"] is cbts_applied
+    assert document["b_coverage_pilot_eligible"] is coverage_pilot_eligible
     assert document["flat_detail"]["hit_stages"] == [
         "H100-PyTorch-1",
         "H100-PyTorch-2",
@@ -523,10 +538,22 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
     assert document["flat_detail"]["split_counts"] == {"H100-PyTorch-1": 1}
 
 
+@pytest.mark.parametrize(
+    ("flag_args", "expected_cbts_applied", "expected_coverage_pilot_eligible"),
+    [
+        ((), False, False),
+        (("--cbts-applied",), True, False),
+        (("--coverage-pilot-eligible",), False, True),
+        (("--cbts-applied", "--coverage-pilot-eligible"), True, True),
+    ],
+)
 def test_main_posts_case_skip_rate_to_opensearch(
     report_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    flag_args: tuple[str, ...],
+    expected_cbts_applied: bool,
+    expected_coverage_pilot_eligible: bool,
 ) -> None:
     posted_documents: list[dict[str, object]] = []
 
@@ -561,6 +588,7 @@ def test_main_posts_case_skip_rate_to_opensearch(
                 ".",
                 "--multi-gpu-required",
                 "--multi-gpu-label-gate-open",
+                *flag_args,
             ]
         )
         == 0
@@ -570,6 +598,8 @@ def test_main_posts_case_skip_rate_to_opensearch(
     assert posted_documents[0]["b_case_skip_rate_valid"] is True
     assert posted_documents[0]["b_non_cbts_multi_gpu_required"] is True
     assert posted_documents[0]["b_multi_gpu_label_gate_open"] is True
+    assert posted_documents[0]["b_cbts_applied"] is expected_cbts_applied
+    assert posted_documents[0]["b_coverage_pilot_eligible"] is expected_coverage_pilot_eligible
 
 
 # Test-definition rule
