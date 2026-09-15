@@ -34,6 +34,24 @@ void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 cons
     float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat,
     int num_splits, int block_size, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
 
+// Coefficient-only half of the hyper-connection boundary: the same split and
+// Sinkhorn arithmetic mhcBigFuseLaunch runs, returning all three coefficient
+// tensors and applying none of them.
+//
+//   pre_mix:  fp32 [M, 4]     post_mix: fp32 [M, 4]     comb_mix: fp32 [M, 4, 4]
+//
+// mhcBigFuseLaunch keeps `pre` in shared memory and spends it on the residual
+// stream in the same launch. A model whose pre coefficients are consumed by the
+// NEXT sublayer rather than the current one (DeepSeek-V4.1-Flash) needs them as
+// a value, so this launcher exists beside it rather than inside it.
+//
+// hc_mult is compiled in at 4, so `y_acc` is [M, 24] and `hc_base` is [24].
+// There is no split-K input: y_acc/r_acc are the direct
+// mhcGemmSqrsumFmaLaunch outputs. M <= 0 returns without launching.
+void mhcSplitSinkhornLaunch(float const* y_acc, float const* r_acc, float const* hc_scale, float const* hc_base,
+    float* pre_mix, float* post_mix, float* comb_mix, int M, int K, float rms_eps, float hc_pre_eps,
+    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, cudaStream_t stream);
+
 void mhcGemmSqrsumFmaLaunch(__nv_bfloat16 const* x, float const* w_t, float* y, float* r, int M, int N, int K,
     int tile_n, int tile_m, cudaStream_t stream);
 
@@ -43,6 +61,25 @@ void mhcHcHeadApplyLaunch(float const* mixes, float const* sqrsum, __nv_bfloat16
 
 void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x, float const* post_mix,
     float const* comb_mix, __nv_bfloat16* out, int B, int hidden_size, cudaStream_t stream);
+
+// Collapse the hyper-connection copies into one sublayer input using
+// coefficients the caller already holds:
+//
+//   out[t, h] = bf16( sum_j pre_mix[t, j] * float(x[t, j, h]) )
+//
+//   x: bf16 [M, 4, hidden_size]   pre_mix: fp32 [M, 4]   out: bf16 [M, hidden_size]
+//
+// mhcHcHeadApplyLaunch runs the same weighted sum but derives `pre` from
+// `mixes` inside the launch; mhcBigFuseLaunch keeps it in shared memory and
+// spends it there. Neither accepts pre as a value, which is what a model whose
+// pre coefficients come from the PREVIOUS sublayer (DeepSeek-V4.1-Flash)
+// needs, so this launcher exists beside them.
+//
+// hc_mult is compiled in at 4. hidden_size must be a multiple of 8: loads and
+// stores are uint4-vectorized with no scalar tail. M <= 0 returns without
+// launching.
+void mhcPreMappingLaunch(
+    __nv_bfloat16 const* x, float const* pre_mix, __nv_bfloat16* out, int M, int hidden_size, cudaStream_t stream);
 
 // Single-launch fused hyper-connection boundary op (SM100 only).
 //

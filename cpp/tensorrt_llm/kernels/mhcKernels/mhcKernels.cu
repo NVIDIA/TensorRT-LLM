@@ -348,6 +348,127 @@ INST_BIGFUSE(16, 512)
 #undef INST_BIGFUSE
 
 // ===================================================================
+// Kernel 2: split_sinkhorn — the coefficient half of big_fuse
+//
+//  Phases 1a and 1b of mhcBigFuseKernel, arithmetic for arithmetic, with
+//  two differences and no others: `pre_mix` is written to global memory
+//  instead of being consumed from shared memory, and phase 2 (the
+//  residual-stream weighted sum) does not exist here.
+//
+//    rstd       = rsqrt(r_acc[t] / K + rms_eps)
+//    pre[j]     = sigmoid(y[j]       * rstd * scale0 + base[j])     + hc_pre_eps
+//    post[j]    = sigmoid(y[4 + j]   * rstd * scale1 + base[4 + j]) * post_mult
+//    comb[j][k] = sinkhorn(softmax_k(y[8 + 4j + k] * rstd * scale2 + base[...]))
+//
+//  A model whose pre coefficients are consumed by the NEXT sublayer
+//  cannot fuse the pre map into the transform that produces them; that
+//  delayed schedule is the whole reason this kernel sits beside big_fuse
+//  rather than inside it.
+//
+//  Layout: one ALIGNED QUAD of lanes per token, so the Sinkhorn column
+//  normalization's butterfly (xor 1, xor 2) stays inside the quad and
+//  each quad converges on its own lane mask. A block covers
+//  BLOCK_SIZE / 4 tokens; BLOCK_SIZE is a multiple of 32, so a quad
+//  never straddles two warps.
+// ===================================================================
+
+template <int BLOCK_SIZE>
+__launch_bounds__(BLOCK_SIZE) __global__ void mhcSplitSinkhornKernel(float const* __restrict__ y_acc,
+    float const* __restrict__ r_acc, float const* __restrict__ hc_scale, float const* __restrict__ hc_base,
+    float* __restrict__ pre_mix, float* __restrict__ post_mix, float* __restrict__ comb_mix, int M, int K,
+    float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat)
+{
+    constexpr int HC_MULT = 4;
+    constexpr int HC_MULT2 = HC_MULT * HC_MULT;       // 16 comb_mix entries
+    constexpr int HC_MULT3 = HC_MULT * (2 + HC_MULT); // 24 = pre(4) + post(4) + comb(16)
+    constexpr int WARP_SIZE = 32;
+    constexpr int TOKENS_PER_BLOCK = BLOCK_SIZE / HC_MULT;
+
+    static_assert(BLOCK_SIZE % WARP_SIZE == 0, "a quad must not straddle two warps");
+
+    int const tid = threadIdx.x;
+    int const lane = tid % HC_MULT; // hc slot, and the comb matrix row
+    int const token = blockIdx.x * TOKENS_PER_BLOCK + tid / HC_MULT;
+
+    // The quad's own lanes, the only threads its shuffles must converge on.
+    unsigned const quad_mask = ((1u << HC_MULT) - 1) << (tid % WARP_SIZE - lane);
+
+    if (token >= M)
+        return;
+
+    float const* y_row = y_acc + static_cast<long long>(token) * HC_MULT3;
+    // Every row offset is formed in 64 bits, as y_row and cm_out are: the
+    // narrow product is the one that would wrap silently, and a kernel whose
+    // three output addresses do not agree about that is a defect waiting for
+    // the one caller that reaches it.
+    long long const coef_row = static_cast<long long>(token) * HC_MULT;
+
+    // RMS norm: rstd = 1/sqrt(mean(x²) + eps), from the stream's row square sum.
+    float const rstd = rsqrtf(r_acc[token] / static_cast<float>(K) + rms_eps);
+    float const s0 = hc_scale[0], s1 = hc_scale[1], s2 = hc_scale[2];
+
+    // y_row layout: [pre_mix(4) | post_mix(4) | comb_mix(4×4)]
+    float v = y_row[lane] * rstd * s0 + hc_base[lane];
+    pre_mix[coef_row + lane] = 1.0f / (1.0f + expf(-v)) + hc_pre_eps;
+
+    v = y_row[HC_MULT + lane] * rstd * s1 + hc_base[HC_MULT + lane];
+    post_mix[coef_row + lane] = 1.0f / (1.0f + expf(-v)) * hc_post_mult_value;
+
+    // comb_mix init: norm * scale2 + base → cm[4] per lane (one row of the 4×4)
+    float cm[HC_MULT];
+#pragma unroll
+    for (int k = 0; k < HC_MULT; k++)
+        cm[k] = y_row[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
+
+    // ---- Sinkhorn normalization ----
+    // Softmax rows: subtract the row max to avoid inf / inf when comb logits
+    // are large.
+    float const rowMax = fmaxf(fmaxf(cm[0], cm[1]), fmaxf(cm[2], cm[3]));
+#pragma unroll
+    for (int k = 0; k < HC_MULT; k++)
+        cm[k] = expf(cm[k] - rowMax);
+    // One reciprocal + 4 fmul rather than 4 fdiv, as in mhcBigFuseKernel.
+    float inv_rs = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3]);
+#pragma unroll
+    for (int k = 0; k < HC_MULT; k++)
+        cm[k] = cm[k] * inv_rs + hc_sinkhorn_eps;
+
+        // Column normalize: sum across the quad's lanes (rows) via butterfly shuffle
+#pragma unroll
+    for (int k = 0; k < HC_MULT; k++)
+    {
+        float cs = cm[k];
+        cs += __shfl_xor_sync(quad_mask, cs, 1);
+        cs += __shfl_xor_sync(quad_mask, cs, 2);
+        cm[k] *= 1.0f / (cs + hc_sinkhorn_eps);
+    }
+
+    // Remaining Sinkhorn iterations: alternate row / column normalize
+    for (int it = 1; it < sinkhorn_repeat; it++)
+    {
+        inv_rs = 1.0f / (cm[0] + cm[1] + cm[2] + cm[3] + hc_sinkhorn_eps);
+#pragma unroll
+        for (int k = 0; k < HC_MULT; k++)
+            cm[k] *= inv_rs;
+
+#pragma unroll
+        for (int k = 0; k < HC_MULT; k++)
+        {
+            float cs = cm[k];
+            cs += __shfl_xor_sync(quad_mask, cs, 1);
+            cs += __shfl_xor_sync(quad_mask, cs, 2);
+            cm[k] *= 1.0f / (cs + hc_sinkhorn_eps);
+        }
+    }
+
+    // Write the 4×4 comb_mix to global (lane = row index, k = col index)
+    float* cm_out = comb_mix + static_cast<long long>(token) * HC_MULT2;
+#pragma unroll
+    for (int k = 0; k < HC_MULT; k++)
+        cm_out[lane * HC_MULT + k] = cm[k];
+}
+
+// ===================================================================
 // Kernel 3: gemm_sqrsum_fma — split-N FP32 FMA GEMM with fused sqrsum
 //
 //  Y[m, n] = dot(X[m, :], W_T[n, :])     for each (m, n)
@@ -836,6 +957,26 @@ void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 cons
 #undef DISPATCH_BF_INNER
 }
 
+void mhcSplitSinkhornLaunch(float const* y_acc, float const* r_acc, float const* hc_scale, float const* hc_base,
+    float* pre_mix, float* post_mix, float* comb_mix, int M, int K, float rms_eps, float hc_pre_eps,
+    float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, cudaStream_t stream)
+{
+    if (M <= 0)
+        return;
+
+    // One token per aligned quad of lanes. 128 threads is 4 warps and 32
+    // tokens; there is no tuning knob here because there is nothing to tune:
+    // every token is 24 fp32 loads, ~160 flops of Sinkhorn and 24 fp32 stores,
+    // all in registers.
+    constexpr int kBlockSize = 128;
+    constexpr int kTokensPerBlock = kBlockSize / 4;
+
+    dim3 const grid(static_cast<unsigned int>((M + kTokensPerBlock - 1) / kTokensPerBlock));
+
+    mhcSplitSinkhornKernel<kBlockSize><<<grid, dim3(kBlockSize), 0, stream>>>(y_acc, r_acc, hc_scale, hc_base, pre_mix,
+        post_mix, comb_mix, M, K, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat);
+}
+
 void mhcGemmSqrsumFmaLaunch(__nv_bfloat16 const* x, float const* w_t, float* y, float* r, int M, int N, int K,
     int tile_n, int tile_m, cudaStream_t stream)
 {
@@ -882,6 +1023,91 @@ void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x,
     dim3 block(256);
 
     mhcPostMappingKernel<<<grid, block, 0, stream>>>(residual, x, post_mix, comb_mix, out, hidden_size);
+}
+
+// Collapse the HC_MULT residual copies into one sublayer input, weighted by
+// coefficients the caller already holds:
+//
+//   out[t, h] = bf16( sum_j pre_mix[t, j] * float(x[t, j, h]) )
+//
+// mhcPostMappingKernel is the complementary expansion at the other end of the
+// sublayer, NOT an algebraic inverse: it takes the [B, hidden] sublayer output
+// back out to HC_MULT copies while mixing the residual in,
+//   out[t, j, h] = post[j] * x[h] + sum_k comb[k][j] * residual[k][h],
+// under different coefficients. This kernel is rank-reducing, so nothing
+// inverts it, and composing the two recovers neither operand.
+//
+// This is also the half of mhcHcHeadApplyKernel that follows its sigmoid: that
+// kernel DERIVES pre from `mixes` and applies it in the same launch, so it
+// cannot serve a model whose pre coefficients were produced by the previous
+// sublayer (DeepSeek-V4.1-Flash). Here pre_mix is an input, and nothing else in
+// this file takes it as one.
+__launch_bounds__(256) __global__ void mhcPreMappingKernel(__nv_bfloat16 const* __restrict__ x,
+    float const* __restrict__ pre_mix, __nv_bfloat16* __restrict__ out, int hidden_size)
+{
+    constexpr int HC_MULT = 4;
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int BF16_VEC = 8; // one uint4 is 16 bytes is 8 bf16
+
+    int const token = blockIdx.x;
+    int const tid = threadIdx.x;
+
+    // Every lane needs all HC_MULT coefficients, so stage them once.
+    __shared__ float s_pre[HC_MULT];
+    if (tid < HC_MULT)
+        s_pre[tid] = pre_mix[static_cast<long long>(token) * HC_MULT + tid];
+    __syncthreads();
+
+    float pm[HC_MULT];
+#pragma unroll
+    for (int j = 0; j < HC_MULT; j++)
+        pm[j] = s_pre[j];
+
+    // Both offsets in 64 bits: the narrow product is the one that wraps
+    // silently, and hidden_size is 5120 here, so x's row index is the widest
+    // in this file.
+    long long const tok_x = static_cast<long long>(token) * HC_MULT * hidden_size;
+    long long const tok_out = static_cast<long long>(token) * hidden_size;
+
+    for (int h = tid * BF16_VEC; h < hidden_size; h += BLOCK_SIZE * BF16_VEC)
+    {
+        // fp32 accumulation across the HC copies, exactly as the reference's
+        // `sum(pre.unsqueeze(-1) * x.float(), dim=2)` does.
+        float acc[BF16_VEC] = {};
+
+#pragma unroll
+        for (int j = 0; j < HC_MULT; j++)
+        {
+            uint4 raw = *reinterpret_cast<uint4 const*>(&x[tok_x + static_cast<long long>(j) * hidden_size + h]);
+            __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+            for (int v = 0; v < BF16_VEC / 2; v++)
+            {
+                float2 f = __bfloat1622float2(pairs[v]);
+                acc[2 * v + 0] += pm[j] * f.x;
+                acc[2 * v + 1] += pm[j] * f.y;
+            }
+        }
+
+        uint4 out_raw;
+        __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+        for (int v = 0; v < BF16_VEC / 2; v++)
+            opairs[v] = __float22bfloat162_rn(make_float2(acc[2 * v], acc[2 * v + 1]));
+        *reinterpret_cast<uint4*>(&out[tok_out + h]) = out_raw;
+    }
+}
+
+void mhcPreMappingLaunch(
+    __nv_bfloat16 const* x, float const* pre_mix, __nv_bfloat16* out, int M, int hidden_size, cudaStream_t stream)
+{
+    if (M <= 0)
+        return;
+
+    dim3 grid(static_cast<unsigned int>(M));
+    dim3 block(256);
+
+    mhcPreMappingKernel<<<grid, block, 0, stream>>>(x, pre_mix, out, hidden_size);
 }
 
 } // namespace kernels::mhc

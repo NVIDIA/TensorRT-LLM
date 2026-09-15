@@ -188,3 +188,131 @@ deepseek-ai/DeepSeek-R1-0528:
   eval:
     task: gsm8k
     scores_filter: exact_match,flexible-extract
+
+# ── DeepSeek-V4.1-Flash ───────────────────────────────────────────────────
+# The only `reference-implementation` anchor in this file, and the reason
+# that source kind exists. This checkpoint publishes no GSM8K or MMLU score
+# (its `evaluation/` directory covers agentic SWE through a DeepSeek-API
+# endpoint plus Docker), and stock TensorRT-LLM cannot serve
+# `DeepseekV41ForCausalLM` at all — so `trtllm`, `model-card` and
+# `trtllm-eval` are all unavailable and the number below was produced by
+# running the checkpoint's own `inference/` tree. It is therefore NEVER
+# written back over with a target score: the point of the kind is that the
+# anchor came from outside the target.
+#
+# MEASUREMENT. `exact_match,flexible-extract` 87.1114 over all 1,319 GSM8K
+# questions, stderr 0.9230. `strict-match` on the same run was 86.8840, and
+# 1,296 of 1,319 generations arrive in the strict `#### N` form, so only 3
+# questions are won by flexible extraction alone (doc_ids 290, 757, 1166) —
+# under 5-shot completion this checkpoint answers in the exemplars' format
+# rather than opening a reasoning block, which is what makes 87 reachable
+# inside 256 output tokens.
+#
+# PROTOCOL, which is `trtllm-eval gsm8k`'s own defaults so that the target
+# leg is the same measurement: 1,319 documents, 5-shot, random_seed 0, no
+# chat template, no fewshot-as-multiturn, greedy (temperature 0.0),
+# max_input_length 4096, max_output_length 256, lm_eval 0.4.10,
+# `exact_match,flexible-extract`. Prompt lengths 549/869/1501
+# min/median/max. Generation ran through the reference at model-parallel 4,
+# max_seq_len 4352, torch seed 33377335 (inference/generate.py's own), and
+# **batch size 1** — see BATCH SIZE below, it is not a detail.
+#
+# IDENTICAL TOKEN IDS ON BOTH LEGS. The request set is frozen at
+# anchor/requests.jsonl with prompt_tokens_sha256
+# fe7810168018c866bb07d0d3afd331ab1f673f937519f7d185e0d29f1d657104. The
+# same set rebuilt under the *repo* venv the target leg runs in (transformers
+# 5.5.4 there against 5.17.0 in the reference venv) produced a byte-identical
+# digest, so the two legs demonstrably hand the model the same prompts
+# rather than being assumed to.
+#
+# CHECKPOINT IDENTITY. sha256 config.json
+# 8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879,
+# model.safetensors.index.json
+# 74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8,
+# tokenizer.json
+# c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b,
+# tokenizer_config.json
+# 6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547. The
+# four converted rank files are hashed in anchor/ckpt-mp4-sha256.txt
+# (model0..3-mp4.safetensors, 130.67 GB each, fb7a665d…/3f9280ff…/8b010d19…/
+# 3c3cf384…). The merge re-derives the four digests above and re-stats the
+# four rank files, and refuses to score if either has moved; it does NOT
+# re-hash 487 GiB of weights, so the rank-file sha256s in that text file are
+# a conversion-time record rather than a merge-time check.
+#
+# SOFTWARE PINS. python 3.12.3, torch 2.12.0a0+5aff3928d8.nv26.05,
+# tilelang 0.1.8, apache-tvm-ffi 0.1.8.post2 (the image ships 0.1.13.post2,
+# which satisfies tilelang's declared range but dies registering
+# ir.DictAttrs), transformers 5.17.0, tokenizers 0.23.1, safetensors 0.8.0,
+# lm_eval 0.4.10, NVIDIA GB300 compute capability 10.3.
+#
+# COMMANDS, all `sbatch staircase_v41_anchor.sbatch <mode> …` at the repo
+# root: `convert` once; then six `shard 1 <lo:hi> s<n>` jobs covering
+# 0:220 / 220:440 / 440:660 / 660:880 / 880:1100 / 1100:1319 (jobs 724362,
+# 724483, 724365-724368, every one exit 0, 2h50m-2h55m each); then one
+# `merge 0 <the six files> full1319` (job 726352, exit 0, 2m04s) which is
+# where the score is computed. Sharding exists because batch-1 generation
+# costs ~46 s/document and 1,319 of those do not fit the partition's 4-hour
+# limit; it changes nothing about the protocol, because scoring happens
+# once over the union in a single lm_eval.evaluate pass.
+#
+# HOST:PATH. nvl72-cluster (`batch` partition, GB300),
+# /scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/fredw/
+# staircase-v41/anchor/ — reference-full1319.json is the record, with every
+# prompt, prompt token id, generated token id, label and per-filter verdict;
+# reference-s0..s5.json are its six generation shards; requests.jsonl the
+# frozen protocol; ckpt-mp4/ the converted reference checkpoint.
+#
+# BATCH SIZE 1, and why the anchor would otherwise be wrong by 34 points.
+# The reference's shipped `generate()` right-pads a batch, prefills
+# min(prompt_lens) once for the whole batch and pushes the remaining prompt
+# tokens through the decode path; rows whose generation starts near that
+# shared boundary degenerate into repetition loops. Measured: the same 32
+# documents score 43.75 at batch 32 and 78.1250 at batch 1 (jobs 723978 /
+# 724165), and eight prompts of IDENTICAL length at batch 8 all collapsed
+# (job 724124), which rules out length heterogeneity. anchor.py enforces
+# batch 1 for anything read as a result rather than documenting it.
+#
+# NOISE FLOOR — read this before treating any later difference as a result.
+# Greedy decoding through this reference is not reproducible across physical
+# nodes: the 4-rank MoE and all-reduce reduction order is not bitwise stable,
+# so a near-tie at one position forks the continuation. Two independent
+# batch-1 runs of the same 32 documents under this exact protocol produced
+# **0 of 32 token-identical generations**, yet disagreed on the verdict for
+# only 3 of them, scoring 78.1250 and 75.0000 (job 726444). A 3-in-32
+# verdict-flip rate implies a run-to-run spread of roughly ±1 point at
+# n=1,319 — a fifth of the 5.0 tolerance, comfortably inside it but well
+# above zero. That is an extrapolation from n=32, not a measurement: a
+# direct full-set spread costs a second six-shard run, about three hours,
+# and was not taken because the tolerance already clears it several times
+# over. Two consequences: a sub-1-point difference against this anchor is
+# not a result, and the target can never be checked against the reference
+# token-for-token on this benchmark, only in aggregate.
+#
+# FIXED GREEDY FIXTURES. Five, in anchor/fixtures-frozen-frozen.json,
+# fixtures_sha256
+# 6eed4eca2013d24989490463959dc801e93616e1c5dbb83bebd1834d24919c36. Each was
+# token-identical across 13 independent batch-1 runs on 13 distinct GB300
+# nodes; the exact token ids are in that file. They were *selected* by
+# measured agreement, not chosen for looking obvious — 4 of the 9 candidates
+# produced 2, 9, 10 and 11 competing continuations across the same 13 runs
+# and are recorded as rejected, with their variants, in the same file.
+#   "Question: What is 100 minus 37?\nAnswer:"
+#       -> " 63\nPrevious QuestionNext Question"                    (7 tokens)
+#   "Question: What is 17 multiplied by 24?\nAnswer:"
+#       -> " 408\nRelated Questions:\nWhat is 17 multiplied by 24?…" (24 tokens)
+#   "The capital city of France is"
+#       -> " Paris. The Eiffel Tower is in Paris. The Louvre is…"    (48 tokens)
+#   "The chemical symbol for gold is"
+#       -> " Au."                                                    (2 tokens)
+#   "Water freezes at a temperature of"
+#       -> " 0 degrees Celsius. What is the temperature in degrees…" (48 tokens)
+deepseek-ai/DeepSeek-V4.1-Flash:
+  target_ckpt: v41_flash
+  score: 87.1114
+  n_samples: 1319
+  source: reference-implementation
+  tol: 5.0
+  eval:
+    task: gsm8k
+    scores_filter: exact_match,flexible-extract

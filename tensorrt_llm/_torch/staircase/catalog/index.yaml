@@ -130,14 +130,26 @@ entries:
     impl: torch.ops.trtllm.flashinfer_silu_and_mul
     summary: "SwiGLU activation: silu(x[..., :d]) * x[..., d:] over a packed gate/up last dim"
 
+  - path: activation/mhc_split_sinkhorn.py
+    impl: torch.ops.trtllm.mhc_split_sinkhorn
+    summary: "Hyper-Connection coefficient split: one [M,24] projection + its square sum -> pre = sigmoid(.)+eps, post = mult*sigmoid(.), and an [M,4,4] comb from a row softmax followed by sinkhorn_repeat alternating normalizations (doubly stochastic at the certified sinkhorn_repeat=20, not at every count); hc_mult is a compile-time 4; applies none of the three to a stream, which is what lets a delayed-pre model use it"
+
   # ─── gemm ──────────────────────────────────────────────────────
+  - path: gemm/mhc_gemm_sqrsum_fma.py
+    impl: torch.ops.trtllm.mhc_gemm_sqrsum_fma
+    summary: "Hyper-Connection mix projection with the stream square sum fused in: bf16 [M,K] @ fp32 [N,K].T -> fp32 [M,N] plus the RAW per-row sum(x^2) as [M], fp32 fmaf accumulation; applies no normalization (the /K and rsqrt belong to activation/mhc_split_sinkhorn), which is what lets one square sum feed a normalization the caller schedules later"
+
   - path: gemm/cublas_mm.py
     impl: torch.ops.trtllm.cublas_mm
     summary: "General matmul via one cuBLASLt call with optional fused bias: [M,K] @ [K,N] col-major (+ bias), fp32 accumulation"
 
   - path: gemm/bmm_out.py
     impl: torch.ops.trtllm.bmm_out
-    summary: "Batched matmul into a caller-provided (possibly strided-view) out buffer: [B,M,K] @ [B,K,N] -> [B,M,N], fp32 accumulation"
+    summary: "Batched matmul into a caller-provided (possibly strided-view) out buffer: [B,M,K] @ [B,K,N] -> [B,M,N], fp32 accumulation; never checks `out`'s shape, so a wrong-shaped one is silently resized -- reallocated when standalone, resized in place and corrupting the surrounding layout when it is a view into an arena"
+
+  - path: gemm/mxfp8_mxfp8_gemm.py
+    impl: torch.ops.trtllm.mxfp8_mxfp8_gemm
+    summary: "MXFP8 x MXFP8 dense GEMM in nn.Linear layout with in-kernel block-scale dequantization: alpha * ([M,K] e4m3 + 128x4-swizzled UE8M0 scales) @ ([N,K] e4m3 + swizzled scales)^T -> fresh [M,N] bf16/fp16/fp32 buffer, fp32 accumulation; both operands ordinary contiguous row-major; rejects M=0 loudly; never checks either scale buffer's length, so a short one is silently wrong or an illegal memory access"
 
   - path: gemm/nvfp4_gemm.py
     impl: torch.ops.trtllm.nvfp4_gemm
@@ -184,7 +196,7 @@ entries:
   # ─── quantization ──────────────────────────────────────────────
   - path: quantization/mxfp8_quantize.py
     impl: torch.ops.trtllm.mxfp8_quantize
-    summary: "Dynamic MXFP8 activation quantization: bf16/fp16 -> e4m3 data (last dim zero-padded up to `alignment`) + one UE8M0 power-of-two scale per 32 contiguous elements, emitted either row-major linear or 128x4 swizzled"
+    summary: "Dynamic MXFP8 activation quantization: bf16/fp16 -> e4m3 data (last dim zero-padded up to `alignment`) + one UE8M0 power-of-two scale per 32 contiguous elements, emitted either row-major linear or 128x4 swizzled; never checks `alignment`'s sign, so 0 returns an empty [M,0] result on aarch64 and a negative multiple of 32 silently truncates K"
 
   - path: quantization/fp4_quantize.py
     impl: torch.ops.trtllm.fp4_quantize

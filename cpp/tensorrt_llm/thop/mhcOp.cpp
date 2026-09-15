@@ -41,6 +41,19 @@ void mhcBigFuseOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor residu
         static_cast<int>(num_splits), static_cast<int>(block_size), /*norm_weight=*/nullptr, /*norm_eps=*/0.f, stream);
 }
 
+void mhcSplitSinkhornOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor hc_scale, torch::Tensor hc_base,
+    torch::Tensor pre_mix, torch::Tensor post_mix, torch::Tensor comb_mix, int64_t M, int64_t K, double rms_eps,
+    double hc_pre_eps, double hc_sinkhorn_eps, double hc_post_mult_value, int64_t sinkhorn_repeat)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    tk::mhcSplitSinkhornLaunch(y_acc.data_ptr<float>(), r_acc.data_ptr<float>(), hc_scale.data_ptr<float>(),
+        hc_base.data_ptr<float>(), pre_mix.data_ptr<float>(), post_mix.data_ptr<float>(), comb_mix.data_ptr<float>(),
+        static_cast<int>(M), static_cast<int>(K), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
+        static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value), static_cast<int>(sinkhorn_repeat),
+        stream);
+}
+
 void mhcGemmSqrsumFmaOp(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch::Tensor r, int64_t M, int64_t N,
     int64_t K, int64_t tile_n, int64_t tile_m)
 {
@@ -62,6 +75,15 @@ void mhcHcHeadApplyOp(torch::Tensor mixes, torch::Tensor sqrsum, torch::Tensor x
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), scale.data_ptr<float>(),
         base_t.data_ptr<float>(), static_cast<int>(M), static_cast<int>(mult), static_cast<int>(hidden_size),
         static_cast<int>(K), static_cast<float>(norm_eps), static_cast<float>(eps), stream);
+}
+
+void mhcPreMappingOp(torch::Tensor x, torch::Tensor pre_mix, torch::Tensor out, int64_t M, int64_t hidden_size)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    tk::mhcPreMappingLaunch(reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr<at::BFloat16>()),
+        pre_mix.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()), static_cast<int>(M),
+        static_cast<int>(hidden_size), stream);
 }
 
 void mhcPostMappingOp(torch::Tensor residual, torch::Tensor x, torch::Tensor post_mix, torch::Tensor comb_mix,
@@ -188,6 +210,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int block_size=0) -> ()");
 
     m.def(
+        "mhc_split_sinkhorn("
+        "Tensor y_acc, Tensor r_acc, Tensor hc_scale, Tensor hc_base, "
+        "Tensor(a!) pre_mix, Tensor(b!) post_mix, Tensor(c!) comb_mix, "
+        "int M, int K, "
+        "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
+        "float hc_post_mult_value, int sinkhorn_repeat) -> ()");
+
+    m.def(
         "mhc_gemm_sqrsum_fma("
         "Tensor x, Tensor w, Tensor(a!) y, Tensor(b!) r, "
         "int M, int N, int K, "
@@ -199,6 +229,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor scale, Tensor base_t, "
         "int M, int mult, int hidden_size, int K, "
         "float norm_eps, float eps) -> ()");
+
+    m.def(
+        "mhc_pre_mapping("
+        "Tensor x, Tensor pre_mix, Tensor(a!) out, "
+        "int M, int hidden_size) -> ()");
 
     m.def(
         "mhc_post_mapping("
@@ -227,8 +262,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mhc_big_fuse", &mhcBigFuseOp);
+    m.impl("mhc_split_sinkhorn", &mhcSplitSinkhornOp);
     m.impl("mhc_gemm_sqrsum_fma", &mhcGemmSqrsumFmaOp);
     m.impl("mhc_hc_head_apply", &mhcHcHeadApplyOp);
+    m.impl("mhc_pre_mapping", &mhcPreMappingOp);
     m.impl("mhc_post_mapping", &mhcPostMappingOp);
     m.impl("mhc_fused_hc", &mhcFusedHcOp);
 }

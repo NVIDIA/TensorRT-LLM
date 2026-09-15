@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the mxfp8_quantize catalog entry."""
 
+import subprocess
+import sys
+
+import pytest
 import torch
 
 from tensorrt_llm._torch.staircase.catalog.quantization.mxfp8_quantize import mxfp8_quantize
@@ -262,28 +266,206 @@ def test_input_not_mutated() -> None:
     assert torch.equal(x, before)
 
 
-def test_rejects_unsupported() -> None:
-    """Domains the contract declares unsupported must be rejected, not silently wrong."""
+# ── Preconditions, driven on this arch and version ───────────────────────────
+#
+# Each rejection asserts the EXACT message, not merely that something raised. A
+# broad `except (RuntimeError, NotImplementedError)` passes whether the op
+# rejected the domain the contract names or failed for an unrelated reason --
+# and two of the cases below (`alignment=48` and `alignment=16`) turn out to
+# share one message, so they are one check in the op rather than two.
+
+LOUD_CASES = [
+    ("k_not_multiple_of_32", "k must be divisible by SF_VEC_SIZE = 32"),
+    ("alignment_not_multiple_of_32", "alignment must be divisible by SF_VEC_SIZE = 32"),
+    ("alignment_below_block_size", "alignment must be divisible by SF_VEC_SIZE = 32"),
+    ("fp32_input", "mxfp8_quantize only supports input tensor with dtypes fp16/bf16."),
+    ("one_d_input", "Input should be >=2D tensor."),
+    ("noncontiguous_column_slice", "self must be contiguous"),
+    ("noncontiguous_transpose", "self must be contiguous"),
+    ("cpu_input", "Could not run 'trtllm::mxfp8_quantize' with arguments from the 'CPU' backend"),
+]
+
+
+@pytest.mark.parametrize("case,message", LOUD_CASES)
+def test_op_rejects_loudly(case: str, message: str) -> None:
+    """Domains the op rejects itself, each with the message the contract quotes."""
     x = torch.randn(4, 128, dtype=torch.bfloat16, device="cuda")
-    cases = {
-        "k not a multiple of 32": lambda: mxfp8_quantize(
-            torch.randn(4, 112, dtype=torch.bfloat16, device="cuda"), False, 32
-        ),
-        "alignment not a multiple of 32": lambda: mxfp8_quantize(x, False, 48),
-        "alignment below the block size": lambda: mxfp8_quantize(x, False, 16),
-        "fp32 input": lambda: mxfp8_quantize(x.float(), False, 32),
-        "1-D input": lambda: mxfp8_quantize(x.reshape(-1), False, 32),
-        "non-contiguous column slice": lambda: mxfp8_quantize(
-            torch.randn(8, 256, dtype=torch.bfloat16, device="cuda")[:, :128], False, 32
-        ),
-        "non-contiguous transpose": lambda: mxfp8_quantize(
-            torch.randn(128, 8, dtype=torch.bfloat16, device="cuda").t(), False, 32
-        ),
-        "cpu input": lambda: mxfp8_quantize(torch.randn(4, 128, dtype=torch.bfloat16), False, 32),
-    }
-    for name, fn in cases.items():
-        try:
-            fn()
-        except (RuntimeError, NotImplementedError):
-            continue
-        raise AssertionError(f"{name}: expected a raise, got a result")
+    if case == "k_not_multiple_of_32":
+        args = (torch.randn(4, 112, dtype=torch.bfloat16, device="cuda"), False, 32)
+    elif case == "alignment_not_multiple_of_32":
+        args = (x, False, 48)
+    elif case == "alignment_below_block_size":
+        args = (x, False, 16)
+    elif case == "fp32_input":
+        args = (x.float(), False, 32)
+    elif case == "one_d_input":
+        args = (x.reshape(-1), False, 32)
+    elif case == "noncontiguous_column_slice":
+        args = (torch.randn(8, 256, dtype=torch.bfloat16, device="cuda")[:, :128], False, 32)
+    elif case == "noncontiguous_transpose":
+        args = (torch.randn(128, 8, dtype=torch.bfloat16, device="cuda").t(), False, 32)
+    else:  # cpu_input
+        args = (torch.randn(4, 128, dtype=torch.bfloat16), False, 32)
+
+    with pytest.raises((RuntimeError, NotImplementedError)) as excinfo:
+        mxfp8_quantize(*args)
+    assert message in str(excinfo.value), f"{case}: got {excinfo.value}"
+
+
+def test_negative_alignment_truncates_silently() -> None:
+    """A negative multiple of 32 passes the modulus check and TRUNCATES K.
+
+    The op computes `padded_k = ((k + alignment - 1) / alignment) * alignment`
+    in C, where the division truncates toward zero, so a negative alignment
+    turns the round-up into a round-DOWN. Nothing raises, the surviving columns
+    are bit-exact and the scale tensor is self-consistent, so the result looks
+    entirely well-formed -- the tail of every row is simply gone. The op is
+    driven directly here because the wrapper's guard rejects this.
+    """
+    torch.manual_seed(40)
+    k = 2880
+    x = torch.randn(8, k, dtype=torch.bfloat16, device="cuda")
+    tight, _ = torch.ops.trtllm.mxfp8_quantize(x, False, 32)
+    for alignment, padded_k in ((-32, 2816), (-64, 2752), (-512, 2048)):
+        data, sf = torch.ops.trtllm.mxfp8_quantize(x, False, alignment)
+        assert data.shape == (8, padded_k), (alignment, data.shape)
+        assert sf.numel() == 8 * padded_k // BLOCK
+        assert torch.equal(
+            data.view(torch.uint8), tight[:, :padded_k].reshape(data.shape).view(torch.uint8)
+        ), "the surviving columns should be bit-exact -- only the tail is dropped"
+    with pytest.raises(AssertionError, match="alignment must be positive"):
+        mxfp8_quantize(x, False, -32)
+
+
+def test_alignment_zero_returns_empty_instead_of_trapping() -> None:
+    """`alignment=0` does NOT kill the process on this host; it returns an empty result.
+
+    `0 % 32 == 0` passes the op's own check, and `mxFp8Quantize.cpp:60` then
+    divides by it with no zero guard. On x86 that integer division traps with
+    SIGFPE; on this aarch64 host SDIV returns 0 instead, so `padded_k` becomes
+    0 and the call comes back with `[M, 0]` data and an empty scale buffer --
+    the silent direction, and what earns the wrapper's guard.
+
+    Driven in a CHILD process, because if the SIGFPE behaviour ever returns on
+    this host it would take the whole test session with it; the child's exit
+    status is the evidence either way.
+    """
+    child = (
+        "import torch, tensorrt_llm._torch.custom_ops;"
+        "x = torch.randn(4, 128, device='cuda', dtype=torch.bfloat16);"
+        "d, s = torch.ops.trtllm.mxfp8_quantize(x, False, 0);"
+        "assert tuple(d.shape) == (4, 0), d.shape;"
+        "assert s.numel() == 0, s.numel();"
+        "print('EMPTY_RESULT_NO_TRAP')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", child], capture_output=True, text=True, timeout=900
+    )
+    assert proc.returncode == 0, (
+        f"alignment=0 exited {proc.returncode} "
+        f"({'SIGFPE' if proc.returncode == -8 else 'unexpected'}); "
+        f"stderr tail: {proc.stderr.strip().splitlines()[-3:]}"
+    )
+    assert "EMPTY_RESULT_NO_TRAP" in proc.stdout, proc.stdout
+    with pytest.raises(AssertionError, match="alignment must be positive"):
+        mxfp8_quantize(torch.randn(4, 128, dtype=torch.bfloat16, device="cuda"), False, 0)
+
+
+# ── DeepSeek-V4.1-Flash column ────────────────────────────────────────────────
+#
+# This op feeds `gemm/mxfp8_mxfp8_gemm`, so its K set is that entry's activation
+# widths -- the distinct K of this checkpoint's dense FP8 surfaces, read from the
+# RAW checkpoint's safetensors headers (`[out, in]`), which is what the target's
+# `weights.py` reads. All are multiples of 32, so the target calls
+# `alignment=32` and `padded_k == K`: no padding on this path.
+#
+# K=8192 IS THE ONE AN EARLIER REVISION MISSED. It is `wo_b`'s input width:
+# `layers.<L>.attn.wo_b.weight` is `[5120, 8192]` in the raw checkpoint. The
+# reference implementation declares `wo_b` as a `RowParallelLinear`, which
+# splits the REDUCTION dim, so each of its four ranks quantizes a 2048-wide
+# activation and 8192 never appears. The staircase target replicates it
+# (plan.md lines 30 and 79), so 8192 is the width it actually quantizes and
+# 2048 is a shape it never calls.
+V41_WIDTHS = [
+    pytest.param(8192, id="wo_b_in_8192"),
+    pytest.param(6144, id="engram_wkv_in_6144"),
+    pytest.param(5120, id="wq_a_wkv_shared_w1w3_in_5120"),
+    pytest.param(2304, id="shared_w2_in_2304"),
+    pytest.param(1280, id="wq_b_indexer_in_1280"),
+]
+
+#: The reference implementation's row-parallel shard of `wo_b`'s input. Not a
+#: target call; kept because the module-parity leg runs the reference at it.
+V41_REF_ONLY_WIDTH = 2048
+
+#: Row counts a served target reaches; a quantize runs at every one of them.
+V41_ROWS = [1, 2, 3, 7, 8, 16, 31, 32, 64, 127, 128, 129, 255, 256, 512, 1024, 4096]
+
+#: A representative subset for the reference-only width.
+V41_REF_ONLY_ROWS = [1, 129, 4096]
+
+
+def _check_v41_width(k: int, m: int) -> None:
+    """Bit-exact data and scale bytes, plus the swizzled length the GEMM requires."""
+    gen = torch.Generator(device="cuda").manual_seed(k * 131 + m)
+    x = torch.randn(m, k, generator=gen, device="cuda", dtype=torch.bfloat16)
+
+    data_lin, sf_lin = mxfp8_quantize(x, False, 32)
+    data_sw, sf_sw = mxfp8_quantize(x, True, 32)
+    ref_data, ref_sf = _ref(x, k)
+    cols = k // BLOCK
+
+    assert data_lin.shape == (m, k) and data_lin.dtype == torch.float8_e4m3fn
+    assert torch.equal(data_lin.view(torch.uint8), ref_data.view(torch.uint8))
+    assert torch.equal(data_sw.view(torch.uint8), data_lin.view(torch.uint8)), (
+        "data must be byte-identical under both layouts"
+    )
+    assert torch.equal(sf_lin.view(m, cols), ref_sf)
+
+    # The length the MXFP8 GEMM contract requires of act_scale.
+    assert sf_sw.numel() == _pad_up(m, 128) * _pad_up(cols, 4)
+    idx = _swizzle_index(m, cols, x.device)
+    assert torch.equal(sf_sw[idx.flatten()].view(m, cols), ref_sf), (
+        "the swizzled buffer must carry the same bytes at the 128x4 offsets"
+    )
+
+
+@pytest.mark.parametrize("k", V41_WIDTHS)
+@pytest.mark.parametrize("m", V41_ROWS)
+def test_v41_width_by_row_bucket(k: int, m: int) -> None:
+    """TARGET: bit-exact at every V4.1 activation width and every engine row count.
+
+    The full cross-product rather than a sample: the target quantizes before
+    every dense projection, at whatever token count the engine is serving, so
+    certifying the widths at one row count and the rows at one width would leave
+    exactly the combinations in use uncovered.
+
+    Both layouts are checked in one case because `data` is documented as
+    byte-identical under either, and the swizzled scale buffer is checked at the
+    exact length `gemm/mxfp8_mxfp8_gemm` states for its `act_scale` -- the two
+    entries are certified separately, so this is the only place that agreement
+    is pinned.
+    """
+    _check_v41_width(k, m)
+
+
+@pytest.mark.parametrize("m", V41_REF_ONLY_ROWS)
+def test_v41_reference_rank_shard_width(m: int) -> None:
+    """REFERENCE-ONLY: `wo_b`'s input at the native implementation's row-parallel shard.
+
+    Not a target width -- the target replicates `wo_b` and quantizes 8192. Kept
+    because the module-parity leg runs the reference at 2048.
+    """
+    _check_v41_width(V41_REF_ONLY_WIDTH, m)
+
+
+def test_v41_leading_dims_collapse_at_checkpoint_width() -> None:
+    """A `[B, S, K]` activation collapses to `B*S` scale rows but keeps its data shape."""
+    gen = torch.Generator(device="cuda").manual_seed(4141)
+    x = torch.randn(3, 43, 5120, generator=gen, device="cuda", dtype=torch.bfloat16)
+    data, sf = mxfp8_quantize(x, False, 32)
+    assert data.shape == (3, 43, 5120)
+    assert sf.shape == (3 * 43 * 5120 // BLOCK,)
+    ref_data, ref_sf = _ref(x, 5120)
+    assert torch.equal(data.reshape(129, 5120).view(torch.uint8), ref_data.view(torch.uint8))
+    assert torch.equal(sf.view(129, 160), ref_sf)
