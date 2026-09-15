@@ -108,14 +108,14 @@ def _write_routed_expert_lora_adapter(
 
 def _run_routed_expert_multi_lora(
     model_dir: str,
-    lora_paths: list,
+    lora_paths: list[str],
     *,
     max_rank: int,
-    target_modules: list,
-    trtllm_modules_to_hf_modules: dict,
-    cuda_graph_config,
+    target_modules: list[str],
+    trtllm_modules_to_hf_modules: dict[str, str],
+    cuda_graph_config: CudaGraphConfig | None,
     preallocate_all_adapters: bool = True,
-    peft_cache_config=None,
+    peft_cache_config: PeftCacheConfig | None = None,
 ) -> None:
     """Serve a MoE checkpoint with routed-expert LoRA and assert it applies.
 
@@ -128,6 +128,19 @@ def _run_routed_expert_multi_lora(
     calibration. With a CUDA graph the decode takes the slot-indexed input
     schema; without one it takes the per-request schema. Both feed the same
     grouped-GEMM LoRA core.
+
+    Args:
+        model_dir: Path to the base model checkpoint.
+        lora_paths: Paths to routed-expert LoRA adapters.
+        max_rank: Maximum adapter rank accepted by the cache.
+        target_modules: TensorRT-LLM LoRA module names to enable.
+        trtllm_modules_to_hf_modules: TensorRT-LLM to Hugging Face module mapping.
+        cuda_graph_config: CUDA graph configuration, or None for eager execution.
+        preallocate_all_adapters: Whether to reserve every adapter slot up front.
+        peft_cache_config: Optional explicit PEFT cache configuration.
+
+    Returns:
+        None.
     """
     cache_config = {}
     if preallocate_all_adapters:
