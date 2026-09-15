@@ -296,7 +296,7 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
         "CftLeManager: Failed to create LE endpoint bound to workspace on device ", localDevIdx);
 
     auto allgatherFn = [](void const* sendBuf, void* recvBuf, size_t bytesPerRank) {
-        tensorrt_llm::mpi::MpiComm::world().allgather(
+        tensorrt_llm::mpi::MpiComm::session().allgather(
             sendBuf, recvBuf, bytesPerRank, tensorrt_llm::mpi::MpiType::kBYTE);
     };
 
@@ -308,7 +308,7 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
         fprintf(stderr, "CftLeManager[rank%d]: cudaDeviceSynchronize after init FAILED: %s\n", (int) epRank,
             cudaGetErrorString(initErr));
     }
-    tensorrt_llm::mpi::MpiComm::world().barrier();
+    tensorrt_llm::mpi::MpiComm::session().barrier();
 }
 
 // MoE All-to-All Dispatch Operation

@@ -33,11 +33,8 @@ static constexpr int kRankMaskWords = 2; // uint64 words to hold the active-rank
                                          // (kRankMaskWords * 64 must be >= kMaxRanks)
 static_assert(kRankMaskWords * 64 >= kMaxRanks, "active_rank_mask too small for kMaxRanks");
 
-// Default completion-flag wait budget: 300 s at an assumed 2 GHz clock64 rate.
-static constexpr int64_t kDefaultTimeoutCycles = 300ll * 2000ll * 1000ll * 1000ll;
-
-// CFT counted write counter stride: 256B per counter, so that concurrent counter
-// updates do not contend for the same L2 port.
+// CFT counted write counter stride: 256B per counter to avoid L2 XBAR port camping
+// when concurrent counters update. See NCCL CFT perf study (CST tracking structure).
 static constexpr size_t kCftCounterStride = 256;
 static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64_t);
 
@@ -47,16 +44,19 @@ static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64
 // 16 B-aligned (cp.async.bulk requires 16 B-aligned source AND destination).
 static constexpr int kCftMbarrierSlotBytes = 64;
 
-// Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
-// cudaFuncAttributeMaxDynamicSharedMemorySize.
-static constexpr int kDefaultDynamicSmemBytes = 48 * 1024;
-
 // Fixed-size peer metadata passed by value to the CFT combine push kernel.
 struct CftPeerLeIds
 {
     uint32_t ids[kMaxRanks];
     uint64_t active_rank_mask[kRankMaskWords];
 };
+
+// Default completion-flag wait budget: 300 s at an assumed 2 GHz clock64 rate.
+static constexpr int64_t kDefaultTimeoutCycles = 300ll * 2000ll * 1000ll * 1000ll;
+
+// Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
+// cudaFuncAttributeMaxDynamicSharedMemorySize.
+static constexpr int kDefaultDynamicSmemBytes = 48 * 1024;
 
 // Describes a single payload type to be communicated
 struct PayloadDescriptor
