@@ -594,7 +594,7 @@ class Etcd3ClusterStorage(ClusterStorage):
 
     @handle_etcd_error(return_on_error=False)
     async def delete(self, key: str) -> bool:
-        self.client.delete(key)
+        return self.client.delete(key)
 
     @handle_etcd_error(return_on_error=False)
     async def expire(self, key: str, ttl: int) -> bool:
