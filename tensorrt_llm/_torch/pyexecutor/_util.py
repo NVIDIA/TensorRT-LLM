@@ -1774,6 +1774,29 @@ class KvCacheCreator:
         # Get the effective draft config (explicit draft_config if available,
         # otherwise fall back to target model config for MTP).
         effective_draft_config = self._get_effective_draft_config()
+        if (self._speculative_config.spec_dec_mode.is_external_drafter()
+                and effective_draft_config.quant_config is not None
+                and effective_draft_config.quant_config.quant_mode.
+                has_fp8_kv_cache()):
+            # The args-level kv_cache_config.dtype sync stamps the TARGET's
+            # fp8 KV algo onto every loaded model, including the external
+            # drafter. The drafter stores and reads its pool in its weights
+            # dtype (DFlash validates a bf16 pool and otherwise falls back to
+            # the max_seq_len-dense private arena, which OOMs at long
+            # context), so the pool dtype must follow the drafter, not the
+            # target.
+            logger.info(
+                "External drafter KV pool keeps the drafter dtype; dropping "
+                "the fp8 KV quant algo inherited from the target.")
+            neutral_quant = copy.copy(effective_draft_config.quant_config)
+            neutral_quant.kv_cache_quant_algo = None
+            # QuantConfig.quant_mode is a cached_property; the copy carries
+            # the already-computed cache, so drop it for the mutation to take.
+            neutral_quant.__dict__.pop("quant_mode", None)
+            effective_draft_config = copy.copy(effective_draft_config)
+            effective_draft_config._frozen = False
+            effective_draft_config.quant_config = neutral_quant
+            effective_draft_config._frozen = True
 
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
@@ -1799,6 +1822,21 @@ class KvCacheCreator:
                 f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
                 "layer group.")
             draft_kv_config.pool_ratio = [1.0]
+        draft_quant = effective_draft_config.quant_config
+        draft_has_fp8_kv = bool(
+            draft_quant is not None
+            and draft_quant.layer_quant_mode.has_fp8_kv_cache())
+        if draft_kv_config.dtype == "fp8" and not draft_has_fp8_kv:
+            # kv_cache_config.dtype describes the TARGET pool. An external
+            # drafter without fp8-KV quantization stores and reads its pool in
+            # its own dtype (DFlash validates the pool as bf16 and otherwise
+            # falls back to the max_seq_len-dense private arena, which OOMs at
+            # long context). Resolve the draft pool from the drafter's quant
+            # config instead.
+            logger.info(
+                "Separate one-model draft KV cache keeps the drafter dtype "
+                "(kv_cache_config.dtype=fp8 applies to the target pool only).")
+            draft_kv_config.dtype = "auto"
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
