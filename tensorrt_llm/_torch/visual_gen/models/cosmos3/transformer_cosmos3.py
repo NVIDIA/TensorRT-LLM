@@ -66,6 +66,20 @@ def _noop_offload_context(_tower_name: str) -> ContextManager:
     return nullcontext()
 
 
+def _add_action_timestep_embedding(
+    hidden_action: torch.Tensor,
+    time_embed: torch.Tensor,
+    noisy_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    time_embed = time_embed.unsqueeze(1).expand_as(hidden_action)
+    if noisy_mask is not None:
+        time_embed = time_embed * noisy_mask.to(hidden_action.dtype)
+    indexes = torch.arange(hidden_action.shape[1], device=hidden_action.device)
+    indexes = indexes.view(1, -1, 1).expand_as(hidden_action)
+    # Match Framework's BF16 store before timestep scatter-add under torch.compile.
+    return hidden_action.scatter_add(1, indexes, time_embed)
+
+
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 
 
@@ -1669,12 +1683,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 self.pack_action(action_latents), action_domain_ids_tensor
             )
             hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
-            if action_noisy_mask is None:
-                hidden_action = hidden_action + time_embed.unsqueeze(1)
-            else:
-                hidden_action = hidden_action + time_embed.unsqueeze(1) * action_noisy_mask.to(
-                    hidden_action.dtype
-                )
+            hidden_action = _add_action_timestep_embedding(
+                hidden_action, time_embed, action_noisy_mask
+            )
             hidden_gen = torch.cat([hidden_gen, hidden_action], dim=1)
             # The rotary table is request-invariant: chunk size, prompt lengths,
             # fps and the frame offset are all fixed once the request starts.
