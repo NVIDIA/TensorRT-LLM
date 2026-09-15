@@ -167,6 +167,7 @@ def _stub_agents(
     *,
     analyzer_items: list[list[dict]] | None = None,
     evaluator_verdicts: list[tuple] | None = None,
+    evaluator_native_changes: list[bool] | None = None,
     baseline_curve: list[dict] | None = None,
     evaluator_curve: list[dict] | None = None,
 ):
@@ -188,6 +189,7 @@ def _stub_agents(
     trace: list[str] = []
     items_per_round = list(analyzer_items if analyzer_items is not None else [[_item()]])
     verdicts = list(evaluator_verdicts or [("APPROVE", "none", 8.4, 108.4)])
+    native_changes = list(evaluator_native_changes or [False])
     counters = {"analyzer": 0, "evaluator": 0}
 
     def _append(entry: dict, local_path: Path | None = None) -> None:
@@ -270,6 +272,7 @@ def _stub_agents(
             "reason_category": reason,
             "measured_gain_pct": gain,
             "measured_value": value,
+            "has_native_changes": native_changes[min(idx, len(native_changes) - 1)],
         }
         if evaluator_curve is not None:
             entry["curve"] = [dict(p) for p in evaluator_curve]
@@ -311,6 +314,9 @@ def _stub_agents(
             "measured_value": float(best.get("measured_value") or 100),
             "required_gain_pct": max(noise_floor, best_gain - noise_floor),
             "best_candidate_id": included[0] if included else "",
+            "has_native_changes": any(
+                bool(candidate.get("has_native_changes", False)) for candidate in candidates
+            ),
         }
         if best.get("curve"):
             verdict["curve"] = best["curve"]
@@ -451,6 +457,7 @@ def test_integrator_rejects_invalid_acceptance_verdict(
             "measured_value": 108.4,
             "required_gain_pct": 7.4,
             "best_candidate_id": "opt-001",
+            "has_native_changes": False,
         }
         verdict.update(verdict_overrides)
         data["optimization"].append(verdict)
@@ -464,6 +471,7 @@ def test_integrator_rejects_invalid_acceptance_verdict(
             workflow.close()
 
     assert fake_git.count("fast_forward") == 0
+    assert integrator_prompts[0].startswith("Historical accepted native changes: `false`.")
     active_repo = str(ws / "worktrees" / "round_1" / "integration")
     assert f"Active runtime checkout: `{active_repo}`" in integrator_prompts[0]
     assert (
@@ -1257,6 +1265,56 @@ def test_serial_items_reuse_worker_and_accept_directly(tmp_path, fake_git):
     second_worktree = [i for i, name in enumerate(calls) if name == "create_worktree"][1]
     assert first_fast_forward < second_worktree
     assert fake_git.count("fast_forward") == 2
+
+
+@pytest.mark.parametrize("item_execution", ["serial", "parallel"])
+def test_accepted_native_change_updates_campaign_history(tmp_path, fake_git, item_execution):
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"item_execution": item_execution, "max_rounds": 1}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow, evaluator_native_changes=[True])
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.has_accepted_native_changes is True
+
+
+def test_rejected_native_change_does_not_update_campaign_history(tmp_path, fake_git):
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"item_execution": "serial", "max_rounds": 1}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(
+        workflow,
+        evaluator_verdicts=[("REJECT", "functionality", 0.0, 100.0)],
+        evaluator_native_changes=[True],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.has_accepted_native_changes is False
+
+
+def test_native_history_note_is_dynamic():
+    state = state_module.WorkflowState(task_path="task.yaml")
+    assert Workflow._native_history_note(state) == (
+        "Historical accepted native changes: `false`.\n\n"
+    )
+    state.has_accepted_native_changes = True
+    assert Workflow._native_history_note(state) == (
+        "Historical accepted native changes: `true`.\n\n"
+    )
 
 
 def test_serial_target_stops_before_unstarted_batch_items(tmp_path, fake_git):
@@ -2992,6 +3050,12 @@ def test_driving_prompts_avoid_removed_builtin_tools(tmp_path):
     for role, prompt in captured.items():
         for name in ("Grep", "Glob"):
             assert not re.search(rf"\b{name}\b", prompt), (role, name)
+
+
+def test_every_role_turn_starts_with_native_history(tmp_path):
+    captured = _capture_driving_prompts(tmp_path)
+    for role, prompt in captured.items():
+        assert prompt.startswith("Historical accepted native changes: `false`."), role
 
 
 def test_driving_prompts_reinforce_casebook_for_serving_analysis_roles(tmp_path):
