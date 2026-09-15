@@ -41,6 +41,29 @@ from typing import TYPE_CHECKING
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
+
+def _setup_cutlass_dsl_compatibility():
+    """Expose legacy CuTe APIs required by TensorRT-LLM and its dependencies."""
+    try:
+        import cutlass.cute as cute
+    except ImportError:
+        return
+
+    # The pinned CUTLASS DSL exposes these types at cute.*, while QuACK and
+    # Transformer Engine still resolve their annotations from cute.core.
+    # Keep this list explicit: copying the full namespace also replaces
+    # cute.core.tuple with the cutlass.cute.tuple module.
+    for name in ("ThrCopy", "ThrMma"):
+        if hasattr(cute, name) and not hasattr(cute.core, name):
+            setattr(cute.core, name, getattr(cute, name))
+
+    # CUTLASS DSL renamed make_fragment to make_rmem_tensor.
+    if hasattr(cute, "make_rmem_tensor") and not hasattr(cute, "make_fragment"):
+        cute.make_fragment = cute.make_rmem_tensor
+
+
+_setup_cutlass_dsl_compatibility()
+
 from .logger import logger
 from .version import __version__
 
