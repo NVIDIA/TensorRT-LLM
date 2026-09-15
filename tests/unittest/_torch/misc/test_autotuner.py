@@ -1301,12 +1301,15 @@ def test_single_pair_shortcut_failure_is_logged_as_inf(monkeypatch):
                               **kwargs) -> List[int]:
             return [0]
 
+        # No do_preparation in the signature: the shortcut fires that hook
+        # OUTSIDE its try (same as the timed path), so a runner that raises
+        # there crashes choose_one before the candidate is ever attempted --
+        # this test is about the attempted-and-failed candidate.
         def forward(self,
                     /,
                     inputs: List[torch.Tensor],
                     *,
                     tactic: int = -1,
-                    do_preparation: bool = False,
                     **kwargs) -> torch.Tensor:
             raise RuntimeError("single-pair candidate crash")
 
