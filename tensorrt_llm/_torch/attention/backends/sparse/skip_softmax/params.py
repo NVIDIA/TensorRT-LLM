@@ -379,17 +379,23 @@ class SkipSoftmaxScheduler:
         *,
         runtime_params: Optional[SparseRuntimeParams] = None,
         timestep: Any = None,
+        graph_phase: Optional[int] = None,
     ) -> SparseRuntimeParams:
-        """Return runtime parameters with skip-softmax thresholds."""
+        """Return runtime parameters with skip-softmax thresholds.
+
+        ``graph_phase`` lets a caller that already resolved the dense-prefix
+        phase host-side (the CUDA-graph runner does, to build its key) pass it
+        in, so this never has to read ``timestep`` -- a ``.item()`` on a CUDA
+        tensor -- while a graph is being captured.
+        """
         if runtime_params is None:
             runtime_params = SparseRuntimeParams()
-        if (
-            self.get_graph_phase_for_timestep(
+        if graph_phase is None:
+            graph_phase = self.get_graph_phase_for_timestep(
                 timestep,
                 disabled_until_timestep=self.disabled_until_timestep,
             )
-            == 0
-        ):
+        if graph_phase == 0:
             return replace(
                 runtime_params,
                 threshold_scale_factor_prefill=0.0,
