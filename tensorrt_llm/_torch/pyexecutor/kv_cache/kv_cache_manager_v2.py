@@ -1479,10 +1479,22 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.vocab_size = vocab_size
 
+        max_tokens_for_warmup = float("inf")
+        if (
+            kv_cache_config.pool_ratio is None
+            and self._get_typical_seq_len(kv_cache_config) is not None
+        ):
+            # The native manager stores the resume watermark as float32.
+            resume_util = min(max_util_for_resume, float(np.float32(max_util_for_resume)))
+            max_tokens_for_warmup = self._get_max_tokens_from_quota(int(quota * resume_util))
+            if kv_cache_config.max_tokens is not None:
+                max_tokens_for_warmup = min(max_tokens_for_warmup, kv_cache_config.max_tokens)
+
         config = self._build_base_config(
             kv_cache_config,
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
+            max_tokens_for_warmup=max_tokens_for_warmup,
         )
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
@@ -2649,6 +2661,7 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         tokens_per_block: int,
         cache_tiers: List[CacheTierConfig],
+        max_tokens_for_warmup: float = float("inf"),
     ) -> KVCacheManagerConfigPy:
         """Build the general cache configuration used by most models.
 
@@ -2693,12 +2706,34 @@ class KVCacheManagerV2(BaseResourceManager):
                 # CUDA graph generation warmup uses one request at max_seq_len and
                 # enough minimal decode requests to fill max_batch_size.
                 min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
+                warmup_seq_len = self.max_seq_len
+                if math.isfinite(max_tokens_for_warmup):
+                    block_size = self._ledger_tokens_per_block
+                    available_blocks = int(max_tokens_for_warmup) // block_size
+                    min_decode_blocks = (min_decode_capacity + block_size - 1) // block_size
+                    long_request_blocks = available_blocks - min_decode_blocks * (
+                        self.max_batch_size - 1
+                    )
+                    # The inverse reserves full SWA windows for every request.
+                    # It can underestimate this mostly-minimal batch; let the
+                    # existing allocator decide feasibility when it cannot fit.
+                    if long_request_blocks >= min_decode_blocks:
+                        warmup_seq_len = min(warmup_seq_len, long_request_blocks * block_size)
+                    if warmup_seq_len < self.max_seq_len:
+                        logger.info(
+                            f"Capping KV cache warmup sequence length from {self.max_seq_len} "
+                            f"to {warmup_seq_len} for max_batch_size={self.max_batch_size} "
+                            f"within {available_blocks * block_size} usable KV tokens"
+                        )
+                # This is the long member of a full batch, not the manager's
+                # single-request limit. Keep the latter's actual-pool capacity
+                # clamp after allocation, as warmup also adapts to its batch size.
                 constraints.append(
                     BatchDesc(
                         [
                             KVCacheDesc(
-                                capacity=self.max_seq_len,
-                                history_length=self.max_seq_len - 1,
+                                capacity=warmup_seq_len,
+                                history_length=warmup_seq_len - 1,
                             )
                         ]
                         + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
@@ -2793,20 +2828,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
-        if (
-            self.is_estimating_kv_cache
-            and config.layers
-            and all(
-                isinstance(layer, AttentionLayerConfig) and layer.sliding_window_size is None
-                for layer in config.layers
-            )
-        ):
-            # Full attention has one lifecycle, so warmup constraints cannot
-            # improve the pool split. They can instead force allocation of the
-            # model's entire context beyond the profiling memory budget, before
-            # the manager and warmup can clamp sequence lengths to GPU capacity.
-            # Specialized managers retain control of their constraints via this hook.
-            return replace(config, constraints=[])
         return config
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
