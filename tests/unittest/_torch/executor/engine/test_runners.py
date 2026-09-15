@@ -249,7 +249,6 @@ def _model_engine_with_runner(
     engine.model = SimpleNamespace(extra_attrs={})
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine._runner = runner
-    engine._is_packed_runner = False
     engine.cuda_graph_lora_manager = None
     engine.runtime_draft_len = 0
     engine.moe_load_balancer = None
@@ -308,7 +307,6 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
         model_config=SimpleNamespace(is_encoder_decoder=True),
     )
     engine._runner = runner
-    engine._is_packed_runner = False
     requests = [object(), object()]
     resource_manager = object()
 

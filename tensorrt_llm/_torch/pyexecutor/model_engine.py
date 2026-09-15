@@ -320,8 +320,6 @@ class PyTorchModelEngine(ModelEngine):
         self.forward_pass_callable = None
         self._cleanup_done = False
         self._runner: Optional[Union[ModelRunner, PackedModelRunner]] = None
-        # Which of the two runner contracts `_runner` implements.
-        self._is_packed_runner = False
         # Transitional snapshot for decoder capture and encoder scheduling.
         # Encoder graph resources and lifecycle remain entirely runner-owned.
         self._encoder_graph_shapes: frozenset[tuple[int, int]] = frozenset()
@@ -816,7 +814,6 @@ class PyTorchModelEngine(ModelEngine):
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
         self._runner = self._initialize_runner(runner_cls)
-        self._is_packed_runner = isinstance(self._runner, EncoderRunner)
 
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = \
@@ -1122,6 +1119,11 @@ class PyTorchModelEngine(ModelEngine):
     @property
     def use_beam_search(self):
         return self.max_beam_width > 1
+
+    @property
+    def _is_packed_runner(self) -> bool:
+        """Which of the two runner contracts `_runner` implements."""
+        return isinstance(self._runner, EncoderRunner)
 
     def _get_draft_kv_cache_manager(
         self, resource_manager: ResourceManager
@@ -3582,7 +3584,6 @@ class PyTorchModelEngine(ModelEngine):
         # clearing the engine's attribute alone would leave the weights
         # reachable past `release_gc()` below.
         self._runner = None
-        self._is_packed_runner = False
         self._mm_item_scheduler = None
         self.model = None
 
