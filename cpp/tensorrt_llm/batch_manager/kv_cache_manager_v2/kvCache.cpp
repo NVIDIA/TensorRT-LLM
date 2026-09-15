@@ -2596,9 +2596,13 @@ std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex 
     result.reserve(mBlocks.stdSize());
     for (auto const& sb : mBlocks)
     {
-        SharedPtr<Page> pg;
+        // Borrow under the shared lock. Copying SharedPtr would race on its non-atomic reference count
+        // with concurrent readers; this cache keeps the page alive while we read its slot id.
+        Page const* pg = nullptr;
         if (beamIdx < sb.pages.size())
-            pg = blockPageGetPage(sb.pages[beamIdx][lgId]);
+        {
+            pg = blockPageGetPage(sb.pages[beamIdx][lgId]).get();
+        }
         if (!pg)
         {
             if (!validOnly)
