@@ -66,6 +66,9 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(patch("torch.cuda.is_current_stream_capturing", return_value=False))
+        self.current_device = stack.enter_context(
+            patch("torch.cuda.current_device", return_value=0)
+        )
         self.current_stream = stack.enter_context(
             patch("torch.cuda.current_stream", return_value=object())
         )
@@ -81,6 +84,7 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
             self.assertIsNone(self.metadata.workspace_required_bytes)
             self.metadata.workspace.resize_(16384)
         self.assertEqual(self.reclaimer.policy.remaining, 3)
+        self.current_stream.assert_called_once_with(0)
         previous = weakref.ref(self.metadata.workspace)
         for remaining in (2, 1, 3):
             with self.reclaimer.forward(self.metadata):
@@ -133,9 +137,11 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
                 with self.reclaimer.forward(self.metadata):
                     self.assertIsNone(self.metadata.workspace_required_bytes)
                 if not multi_stream:
+                    self.current_device.return_value = 1
                     self.current_stream.return_value = object()
                 with with_multi_stream(multi_stream), self.reclaimer.forward(self.metadata):
                     self.assertIsNone(self.metadata.workspace_required_bytes)
+                self.current_stream.assert_called_with(self.current_device.return_value)
                 with self.reclaimer.forward(self.metadata):
                     self.assertIsNone(self.metadata.workspace_required_bytes)
 

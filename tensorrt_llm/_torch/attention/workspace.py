@@ -72,7 +72,7 @@ class EagerWorkspaceReclaimer:
             self.policy.reset()
             yield
             return
-        stream = torch.cuda.current_stream()
+        stream = torch.cuda.current_stream(torch.cuda.current_device())
         if do_multi_stream() or (self._stream is not None and stream != self._stream):
             self._disabled = True
             logger.warning("Disabling eager workspace reclamation after a stream change")
