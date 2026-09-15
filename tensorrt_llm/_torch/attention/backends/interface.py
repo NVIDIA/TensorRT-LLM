@@ -932,6 +932,9 @@ class AttentionForwardArgs:
     cu_q_seqlens: Optional[torch.Tensor] = None
     cu_kv_seqlens: Optional[torch.Tensor] = None
     fmha_scheduler_counter: Optional[torch.Tensor] = None
+
+    # Locality domain this call runs against; -1 means the whole batch.
+    locality_domain_id: int = -1
     # Testing only: skip the RoPE step of MLA generation (the standalone harness
     # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
     # and inits the trtllm-gen scheduler buffers itself.
