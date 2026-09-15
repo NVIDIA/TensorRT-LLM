@@ -185,7 +185,6 @@ full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[t
 full:H20/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6597570)
 full:H20/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:H20/accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16] SKIP (https://nvbugs/6618649)
-full:H20/disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6692009)
 full:L40S/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6728119)
 full:L40S/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6728119)
 full:L40S/disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6728119)
