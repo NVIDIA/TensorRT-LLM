@@ -450,6 +450,7 @@ class PyTorchModelEngine(ModelEngine):
         if mapping.has_pp():
             init_pp_comm(mapping)
         from ._util import (compute_max_num_sequences,
+                            resolved_kv_cache_manager_is_v2,
                             should_enable_adp_dummy_fixes,
                             should_enable_non_overlap_adp_forward_intent,
                             should_enable_overlap_headroom,
@@ -559,8 +560,11 @@ class PyTorchModelEngine(ModelEngine):
         self._enable_overlap_headroom = should_enable_overlap_headroom(
             mapping,
             llm_args.disable_overlap_scheduler,
-            kv_cache_manager_is_v2=(
-                llm_args.kv_cache_config.use_kv_cache_manager_v2 is True),
+            kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
+                llm_args.kv_cache_config,
+                self.max_beam_width,
+                has_kv_connector=getattr(llm_args, "kv_connector_config",
+                                         None) is not None),
             is_hybrid=is_hybrid_linear(pretrained_config))
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping,

@@ -105,6 +105,39 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
+def kv_cache_manager_v2_incompatible_features(
+        max_beam_width: Optional[int], has_kv_connector: bool) -> List[str]:
+    """Runtime features a V2 manager cannot serve.
+
+    ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
+    V2 manager to ``KVCacheManager`` when this list is non-empty, and rejects the
+    model families that require V2 outright. ``resolved_kv_cache_manager_is_v2``
+    reads the same list so that callers sizing pools from the manager version
+    cannot disagree with the selection itself.
+    """
+    incompat: List[str] = []
+    if has_kv_connector:
+        incompat.append("kv_connector_manager")
+    if max_beam_width is not None and max_beam_width > 1:
+        incompat.append("max_beam_width > 1")
+    return incompat
+
+
+def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
+                                    max_beam_width: Optional[int],
+                                    has_kv_connector: bool) -> bool:
+    """Whether the executor will actually hold a V2 manager.
+
+    ``use_kv_cache_manager_v2`` is a request, not the outcome: model loading has
+    already resolved ``"auto"``, but a plain model is still demoted to V1 at
+    manager-selection time when its runtime features are V2-incompatible. Sizing
+    a pool from the request would leave V2 geometry on a V1 executor.
+    """
+    return (kv_cache_config.use_kv_cache_manager_v2 is True
+            and not kv_cache_manager_v2_incompatible_features(
+                max_beam_width, has_kv_connector))
+
+
 def _resolve_disagg_transceiver_route(
     cache_transceiver_config: Optional[CacheTransceiverConfig],
 ) -> tuple[Optional[str], Optional[str]]:
@@ -749,11 +782,8 @@ class KvCacheCreator:
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             sparse_attn_config = model_config.sparse_attention_config
-            incompat: List[str] = []
-            if self._kv_connector_manager is not None:
-                incompat.append("kv_connector_manager")
-            if self._max_beam_width is not None and self._max_beam_width > 1:
-                incompat.append("max_beam_width > 1")
+            incompat = kv_cache_manager_v2_incompatible_features(
+                self._max_beam_width, self._kv_connector_manager is not None)
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Never silently replace a sparse V2 manager with V1. Some

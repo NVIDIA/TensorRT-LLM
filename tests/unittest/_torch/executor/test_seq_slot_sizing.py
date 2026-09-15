@@ -20,7 +20,10 @@ attention DP the else-branch subtracts ``len(active_requests)`` with retirees
 included and residency is capped at ``max_batch_size * pp_size`` however many
 seats exist. It stays off for V1 (the V1 capacity schedulers hardcode
 ``GENERATION_COMPLETE``) and for hybrid models (SSM state is sized from
-``max_batch_size``).
+``max_batch_size``). "V1" there is the manager the creator *selects*, not the
+``use_kv_cache_manager_v2`` request: a plain model with ``max_beam_width > 1`` is
+demoted to V1 after the request is honoured, so the gate reads
+``resolved_kv_cache_manager_is_v2``.
 
 The **index pool** (``KVCacheManagerV2.max_admissible_sequences``) is widened by
 a deliberately *broader* predicate -- ``is_disagg or (non-PP and overlap-on)``,
@@ -54,14 +57,19 @@ from tensorrt_llm._torch.pyexecutor._util import (
     compute_max_num_sequences,
     create_torch_sampler_args,
     is_disagg_enabled,
+    kv_cache_manager_v2_incompatible_features,
     resolve_max_num_sequences,
+    resolved_kv_cache_manager_is_v2,
     should_enable_adp_dummy_fixes,
     should_enable_non_overlap_adp_forward_intent,
     should_enable_overlap_headroom,
     should_enable_scheduler_aware_adp_dummy,
     validate_seq_slot_pool_covers_admission,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
@@ -181,6 +189,103 @@ def test_non_adp_seat_pool_stays_at_max_batch_size(enable_attention_dp):
         ),
     )
     assert seats == (2 * max_batch_size if enable_attention_dp else max_batch_size)
+
+
+@pytest.mark.parametrize("max_beam_width,expected_factor", [(1, 2), (2, 1), (4, 1)])
+def test_v2_requested_but_beam_search_selects_v1_keeps_b_slots(max_beam_width, expected_factor):
+    """``use_kv_cache_manager_v2=True`` is a request, not the manager selected.
+
+    ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
+    V2 manager to ``KVCacheManager`` when ``max_beam_width > 1``, so gating the
+    seat pool on the *configured* preference left V2 geometry -- ``2B`` seats,
+    plus ``ADPRouter.exclude_retiring_requests`` admitting a replacement cohort
+    on top of a retiring one -- on a V1 executor whose capacity scheduler
+    hardcodes ``GENERATION_COMPLETE`` and never releases the retirees early. The
+    seats would be unusable and the sampler/spec-dec state sized for them
+    wasted, so the request must be resolved through
+    ``resolved_kv_cache_manager_is_v2`` before it reaches the gate.
+    """
+    max_batch_size = 8
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+
+    is_v2 = resolved_kv_cache_manager_is_v2(kv_cache_config, max_beam_width, has_kv_connector=False)
+    assert is_v2 is (max_beam_width == 1)
+
+    seats = compute_max_num_sequences(
+        mapping,
+        max_batch_size,
+        False,
+        enable_overlap_headroom=should_enable_overlap_headroom(
+            mapping, False, kv_cache_manager_is_v2=is_v2
+        ),
+    )
+    assert seats == expected_factor * max_batch_size
+
+
+@pytest.mark.parametrize(
+    "max_beam_width,has_kv_connector",
+    [(1, False), (2, False), (1, True), (4, True)],
+)
+def test_resolved_v2_agrees_with_the_manager_the_creator_selects(max_beam_width, has_kv_connector):
+    """Pin the predicate to the selection instead of restating its conditions.
+
+    A value test over ``max_beam_width`` would still pass if the creator grew a
+    third demotion trigger, and the pool would silently go back to being sized
+    for a manager the executor does not hold. Driving both off
+    ``kv_cache_manager_v2_incompatible_features`` and asserting they agree is
+    what makes a new trigger a test failure rather than a regression.
+    """
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    # A plain model: not Gemma4 hybrid (no per-layer head_dim) and not hybrid
+    # linear, so the creator falls back rather than raising.
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"], num_hidden_layers=2),
+        sparse_attention_config=None,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._max_beam_width = max_beam_width
+    creator._kv_connector_manager = object() if has_kv_connector else None
+
+    selected = creator._validate_or_fallback_kv_cache_manager_v2(
+        KVCacheManagerV2, model_config, kv_cache_config
+    )
+    resolved = resolved_kv_cache_manager_is_v2(
+        kv_cache_config, max_beam_width, has_kv_connector=has_kv_connector
+    )
+
+    assert resolved is issubclass(selected, KVCacheManagerV2)
+    assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
+
+
+def test_resolved_v2_respects_an_explicit_v1_request():
+    """A V1 request stays V1 however compatible the runtime features are."""
+    assert (
+        resolved_kv_cache_manager_is_v2(
+            KvCacheConfig(use_kv_cache_manager_v2=False), 1, has_kv_connector=False
+        )
+        is False
+    )
+    # "auto" is resolved to a bool during model loading; an unresolved value is
+    # not a V2 selection.
+    assert (
+        resolved_kv_cache_manager_is_v2(
+            KvCacheConfig(use_kv_cache_manager_v2="auto"), 1, has_kv_connector=False
+        )
+        is False
+    )
+
+
+def test_v2_incompatible_features_reports_every_trigger():
+    """The strings reach the creator's user-facing fallback/rejection message."""
+    assert kv_cache_manager_v2_incompatible_features(1, False) == []
+    assert kv_cache_manager_v2_incompatible_features(None, False) == []
+    assert kv_cache_manager_v2_incompatible_features(2, False) == ["max_beam_width > 1"]
+    assert kv_cache_manager_v2_incompatible_features(1, True) == ["kv_connector_manager"]
+    assert kv_cache_manager_v2_incompatible_features(2, True) == [
+        "kv_connector_manager",
+        "max_beam_width > 1",
+    ]
 
 
 @pytest.mark.parametrize("pp_size,expected", [(1, True), (2, False)])
