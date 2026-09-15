@@ -109,8 +109,16 @@ Async loading may remove every real request from an owner's scheduled batch.
 The executor attempts to add a compute dummy so other owners can advance while
 the transfer proceeds. If the owner has no dummy capacity or sequence slot,
 it polls local transfer completion until at least one request is ready, then
-runs the already-prepared batch. Peers wait at the normal forward gate during
-this fallback; their V1 allocations and connector plans are preserved.
+runs the already-prepared batch. Owners exchange readiness and failure status
+at an executor gate during this fallback; their V1 allocations and connector
+plans are preserved. The wait is bounded to 60 seconds. Shutdown or cancellation
+of a blocked load shortens the remaining wait to at most one second, allowing
+a healthy transfer to drain normally. A timeout or backend exception fails the
+whole executor through its rank-synchronized error path. Pending transfer memory is
+retained for process teardown; restarting the process is required because the
+generic connector API cannot abort DMA safely. Workers must keep asynchronous
+start/poll callbacks nonblocking; a callback that itself hangs remains subject
+to the executor's hang detector.
 
 This support uses the existing single-primary-pool connector interface with
 `KVCacheManagerV1` and guaranteed-no-evict scheduling. PP=1, CP=1 and beam width
