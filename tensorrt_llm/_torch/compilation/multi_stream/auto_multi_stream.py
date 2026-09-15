@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import time
 from dataclasses import dataclass, field
 from operator import getitem
@@ -161,6 +164,12 @@ class MultiStreamDAG:
 
         latest_inplace_stat = {}
         inplace_map = inplace_info()
+        begin_scope = torch.ops.trtllm.begin_nccl_window_tensor_scope.default
+        end_scope = torch.ops.trtllm.end_nccl_window_tensor_scope.default
+        ordering_barriers = {
+            begin_scope: ("inputs", ),
+            end_scope: ("inputs", "outputs"),
+        }
 
         def flatten_args(args):
             """Recursively flatten nested arguments into a flat list."""
@@ -213,6 +222,11 @@ class MultiStreamDAG:
                         args = flatten_args([node.kwargs[inplace_arg]])
                         for arg in args:
                             latest_inplace_stat[arg] = vertex
+                if func in ordering_barriers:
+                    for arg_name in ordering_barriers[func]:
+                        args = flatten_args([node.kwargs[arg_name]])
+                        for arg in args:
+                            latest_inplace_stat[arg] = vertex
 
             for edge in in_edges.values():
                 edge.out_edges.append(vertex)
@@ -255,8 +269,17 @@ class MultiStreamDAG:
             return (-distance) * num_nodes + node_id
 
         streams = [Stream(i) for i in range(max_num_streams)]
+        # Scope boundaries stay on the primary stream; output dependencies make the
+        # end op wait for auxiliary-stream producers before releasing their leases.
+        primary_stream_ops = {
+            torch.ops.trtllm.begin_nccl_window_tensor_scope.default,
+            torch.ops.trtllm.end_nccl_window_tensor_scope.default,
+        }
 
         def pick_stream(start_time, node) -> Stream:
+            if (node.node.op == "call_function"
+                    and node.node.target in primary_stream_ops):
+                return streams[0]
             if node.weight == 0:
                 # This is a symint node or a getitem node.
                 # It always assigns to the stream that produce the node.

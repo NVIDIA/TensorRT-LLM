@@ -25,8 +25,15 @@ import torch.nn as nn
 from pydantic import Field
 
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.nccl_window_graph import release_nccl_window_graph_owner
+from tensorrt_llm._torch.nccl_window_tensor_scope import (
+    discard_nccl_window_tensor_outputs,
+    install_module_nccl_window_tensor_scopes,
+    nccl_window_tensor_scope,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
@@ -126,6 +133,9 @@ class BasePipeline(nn.Module):
         self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
         self._device = torch.device(getattr(pipeline_config, "device", "cuda"))
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._cuda_graph_shared_pool: Optional[SharedGraphPool] = None
+        self._nccl_window_tensor_scope_hooks: List[torch.utils.hooks.RemovableHandle] = []
+        self._nccl_window_tensor_scope_device_anchor: Optional[torch.Tensor] = None
         self.offloader = PipelineOffloader(self)
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
@@ -148,6 +158,8 @@ class BasePipeline(nn.Module):
         # Initialize transformer
         self._init_transformer()
 
+        self._install_nccl_window_tensor_scope_hooks()
+
         # CUDA graph runner - wrap transformer.forward
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.
@@ -155,10 +167,16 @@ class BasePipeline(nn.Module):
 
     def run_inference(self, req: Any) -> Any:
         """Run model-specific inference within shared request profiler boundaries."""
-        if self._is_warmup:
-            return self.infer(req)
-        with self._profiler.request_scope():
-            return self.infer(req)
+        profiler_scope = (
+            contextlib.nullcontext() if self._is_warmup else self._profiler.request_scope()
+        )
+        with profiler_scope:
+            anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
+            anchor = anchor_fn() if anchor_fn is not None else None
+            if anchor is None:
+                return self.infer(req)
+            with nccl_window_tensor_scope(anchor) as scope:
+                return scope.escape(self.infer(req))
 
     def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
         """Enumerate a denoise loop's steps within its profiling windows.
@@ -174,6 +192,14 @@ class BasePipeline(nn.Module):
         if self._is_warmup:
             return enumerate(timesteps)
         return self._profiler.steps(timesteps)
+
+    def _get_or_create_cuda_graph_shared_pool(self) -> SharedGraphPool:
+        """Return the pipeline-owned pool shared by non-concurrent graph runners."""
+        shared_pool = getattr(self, "_cuda_graph_shared_pool", None)
+        if shared_pool is None:
+            shared_pool = SharedGraphPool()
+            self._cuda_graph_shared_pool = shared_pool
+        return shared_pool
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
@@ -199,7 +225,7 @@ class BasePipeline(nn.Module):
             logger.info(
                 "CUDA graph runner: multiple transformer components, using shared graph pool"
             )
-            shared_pool = SharedGraphPool()
+            shared_pool = self._get_or_create_cuda_graph_shared_pool()
         else:
             shared_pool = None
 
@@ -777,6 +803,7 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
+        self._remove_nccl_window_tensor_scope_hooks()
         tc_config = self.pipeline_config.torch_compile
 
         # Using default as max-autotune mode takes more initialization time and
@@ -820,6 +847,9 @@ class BasePipeline(nn.Module):
                     fullgraph=tc_config.enable_fullgraph,
                 )
                 setattr(self, name, compiled)
+        # Hooks stay outside the lazy-compiled blocks, so their opaque operations
+        # execute on every invocation rather than only while Dynamo traces.
+        self._install_nccl_window_tensor_scope_hooks()
 
     @staticmethod
     def _find_transformer_blocks(model: nn.Module) -> list:
@@ -832,6 +862,48 @@ class BasePipeline(nn.Module):
             if isinstance(child, nn.ModuleList) and len(child) > 1:
                 block_names.append(name)
         return block_names
+
+    def _uses_nccl_window_tensors(self) -> bool:
+        strategy = self.pipeline_config.allreduce_strategy
+        mapping = getattr(self, "mapping", None)
+        tp_size = getattr(mapping, "tp_size", 1)
+        return (
+            os.environ.get("TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1"
+            and isinstance(tp_size, int)
+            and tp_size > 1
+            and strategy
+            in (
+                AllReduceStrategy.NCCL,
+                AllReduceStrategy.NCCL_SYMMETRIC,
+                AllReduceStrategy.AUTO,
+            )
+        )
+
+    def _nccl_window_tensor_scope_anchor(self) -> Optional[torch.Tensor]:
+        if not self._uses_nccl_window_tensors():
+            return None
+        if self._nccl_window_tensor_scope_device_anchor is None:
+            self._nccl_window_tensor_scope_device_anchor = torch.empty(0, device=self.device)
+        return self._nccl_window_tensor_scope_device_anchor
+
+    def _remove_nccl_window_tensor_scope_hooks(self) -> None:
+        handles = getattr(self, "_nccl_window_tensor_scope_hooks", [])
+        for handle in handles:
+            handle.remove()
+        handles.clear()
+
+    def _install_nccl_window_tensor_scope_hooks(self) -> None:
+        self._remove_nccl_window_tensor_scope_hooks()
+        if not self._uses_nccl_window_tensors():
+            return
+        blocks = []
+        for name in self.transformer_components:
+            model = getattr(self, name, None)
+            if model is None:
+                continue
+            for block_name in self._find_transformer_blocks(model):
+                blocks.extend(getattr(model, block_name))
+        self._nccl_window_tensor_scope_hooks = install_module_nccl_window_tensor_scopes(blocks)
 
     def warmup(self) -> None:
         """Run warmup inference to trigger torch.compile and CUDA initialization.
@@ -906,7 +978,12 @@ class BasePipeline(nn.Module):
     def _run_warmup_pass(self, shapes, steps) -> None:
         """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
         for height, width, num_frames in shapes:
-            self._run_warmup(height, width, num_frames, steps)
+            anchor = self._nccl_window_tensor_scope_anchor()
+            if anchor is None:
+                self._run_warmup(height, width, num_frames, steps)
+            else:
+                with discard_nccl_window_tensor_outputs(anchor):
+                    self._run_warmup(height, width, num_frames, steps)
             torch.cuda.synchronize()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
@@ -1469,6 +1546,14 @@ class BasePipeline(nn.Module):
         self._profiler.close_window()
 
         self.offloader.cleanup()
+        self._remove_nccl_window_tensor_scope_hooks()
+        graph_pools = {
+            runner._get_pool()
+            for runner in self._cuda_graph_runners.values()
+            if runner._get_pool() is not None
+        }
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
+        for graph_pool in graph_pools:
+            release_nccl_window_graph_owner(graph_pool)

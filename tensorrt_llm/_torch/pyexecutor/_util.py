@@ -48,6 +48,7 @@ from ..disaggregation.kv_cache_transceiver import (
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
@@ -1031,11 +1032,14 @@ class KvCacheCreator:
                             None,
                         ),
                     )
-                output = self._model_engine.model.encode_multimodal_inputs(
-                    encoder_inputs)
-                # Runtime item state owns detached copies rather than views of
-                # an encoder batch. Reproduce that allocation boundary here.
-                return output.detach().clone()
+                # The clone is retained only for memory accounting; no tensor
+                # data is consumed after this profiling forward returns.
+                with discard_nccl_window_tensor_outputs(encoder_inputs):
+                    output = self._model_engine.model.encode_multimodal_inputs(
+                        encoder_inputs)
+                    # Runtime item state owns detached copies rather than views
+                    # of an encoder batch. Reproduce that allocation boundary.
+                    return output.detach().clone()
         finally:
             self._dummy_encoder_inputs = []
 
@@ -1336,7 +1340,7 @@ class KvCacheCreator:
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
                 py_executor.is_warmup = False
-                py_executor.shutdown()
+                py_executor.shutdown_for_kv_cache_estimation()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
 
