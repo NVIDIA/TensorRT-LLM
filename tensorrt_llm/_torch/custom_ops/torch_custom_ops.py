@@ -237,6 +237,7 @@ def fused_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_clamp_after_silu: bool = False,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -363,8 +364,8 @@ def fused_moe(
         input, token_selected_experts, token_final_scales, fc1_expert_weights,
         fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales,
         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit,
-        tp_size, tp_rank, ep_size, ep_rank, cluster_size,
-        cluster_rank, enable_alltoall, min_latency_mode,
+        swiglu_clamp_after_silu, tp_size, tp_rank, ep_size, ep_rank,
+        cluster_size, cluster_rank, enable_alltoall, min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2
          ], activation_type, unpadded_hidden_size, tuner_num_tokens, out_tensor
     ]
@@ -417,6 +418,7 @@ def _(input: torch.Tensor,
       swiglu_alpha: Optional[torch.Tensor] = None,
       swiglu_beta: Optional[torch.Tensor] = None,
       swiglu_limit: Optional[torch.Tensor] = None,
+      swiglu_clamp_after_silu: bool = False,
       tp_size: int = 1,
       tp_rank: int = 0,
       ep_size: int = 1,

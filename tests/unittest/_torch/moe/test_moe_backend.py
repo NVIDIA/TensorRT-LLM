@@ -952,6 +952,25 @@ def test_megamoe_plain_swiglu_carries_no_constants():
 
     assert (params.alpha, params.beta) == (None, None)
     assert params.clamp is None
+    assert params.clamp_after_silu is False
+
+
+def test_cutlass_materializes_post_silu_clamp_mode():
+    params = materialize_activation_params(
+        SwigluActivation(clamp=5.0, clamp_after_silu=True),
+        CutlassFusedMoE.activation_support,
+        num_local_experts=2,
+        device="cpu",
+        owner="CutlassFusedMoE",
+    )
+
+    assert torch.equal(params.clamp, torch.full((2,), 5.0))
+    assert params.clamp_after_silu is True
+
+
+def test_post_silu_clamp_mode_requires_limit():
+    with pytest.raises(ValueError, match="requires a clamp value"):
+        SwigluActivation(clamp_after_silu=True)
 
 
 def test_create_moe_forwards_situ_activation_as_one_carrier(monkeypatch):

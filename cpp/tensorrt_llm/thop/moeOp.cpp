@@ -373,12 +373,12 @@ public:
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
         torch::optional<torch::Tensor> const& input_sf, bool const swizzled_input_sf,
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
-        torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
-        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
-        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor,
-        bool use_dynamic_fc2_scale = false,
+        torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu, int64_t const tp_size,
+        int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
+        int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids, torch::optional<int64_t> const& activation_type,
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
+        torch::optional<torch::Tensor> const& out_tensor, bool use_dynamic_fc2_scale = false,
         // Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
         // Each *_ranks   : CPU int32  [num_seqs]
         // Each *_weights : CPU int64  [num_seqs, 3], holding (A_ptr, B_ptr, DoRA_ptr); DoRA unused.
@@ -578,7 +578,8 @@ public:
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
+            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr),
+            swiglu_clamp_after_silu);
 
         // ===== Routed-expert LoRA activation flags =====
         // LoRA is activated by the per-request (fc1_lora_ranks) or slot-indexed
@@ -730,11 +731,12 @@ public:
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
         torch::optional<torch::Tensor> const& input_sf, bool const swizzled_input_sf,
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
-        torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
-        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& activation_type, torch::optional<int64_t> const& unpadded_hidden_size,
-        torch::optional<int64_t> const& num_valid_tokens, torch::optional<torch::Tensor> const& out_tensor)
+        torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu, int64_t const tp_size,
+        int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size,
+        int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids, torch::optional<int64_t> const& activation_type,
+        torch::optional<int64_t> const& unpadded_hidden_size, torch::optional<int64_t> const& num_valid_tokens,
+        torch::optional<torch::Tensor> const& out_tensor)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -846,7 +848,8 @@ public:
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
+            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr),
+            swiglu_clamp_after_silu);
 
         // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
         // non-gated) is finalized. INT8-woq uses a transposed weight layout, so its fc1/fc2 dim
