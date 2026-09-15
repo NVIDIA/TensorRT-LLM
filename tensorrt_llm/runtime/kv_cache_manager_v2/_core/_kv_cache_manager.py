@@ -52,7 +52,7 @@ from .._stats import (
 )
 from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
-from .._storage_manager import StorageManager
+from .._storage_manager import StorageManager, StorageStatistics
 from .._utils import (
     HalfOpenRange,
     HomoTuple,
@@ -729,6 +729,21 @@ class KVCacheManager:
         counts = self._iter_cached_tokens_by_level
         self._iter_cached_tokens_by_level = []
         return counts
+
+    def get_storage_statistics(
+        self, cache_level: CacheLevel = GPU_LEVEL
+    ) -> list[StorageStatistics]:
+        """Return independent per-pool values; this backend requires serialized access."""
+        return deepcopy(list(self._storage.get_statistics(cache_level)))
+
+    def get_life_cycle_pool_group_indices(
+        self, cache_level: CacheLevel = GPU_LEVEL
+    ) -> list[PoolGroupIndex]:
+        """Return lifecycle-to-pool indices; this backend shares the hot grouping at all levels."""
+        return [
+            self._storage.get_pool_group_index(life_cycle)
+            for life_cycle in typed_range(self._storage.num_life_cycles)
+        ]
 
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel

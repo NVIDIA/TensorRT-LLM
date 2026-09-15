@@ -79,7 +79,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SwaScratchReuseConfig,
     TokenIdExt,
     _cpp_introspection,
-    _introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -3853,7 +3852,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._stats_window_size(life_cycle.window_size)
 
     def _get_storage_statistics(self, cache_level: CacheLevel):
-        return _introspection.storage_statistics(self.impl, cache_level)
+        return self.impl.get_storage_statistics(cache_level)
 
     def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
         """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
@@ -3866,7 +3865,7 @@ class KVCacheManagerV2(BaseResourceManager):
             membership: tuple[tuple[int, frozenset[int]], ...] = ()
             if len(self.impl.cache_tier_list) > 1:
                 grouped: dict[int, set[int]] = defaultdict(set)
-                mapping = _introspection.life_cycle_pool_group_indices(self.impl, CacheLevel(1))
+                mapping = self.impl.get_life_cycle_pool_group_indices(CacheLevel(1))
                 for life_cycle_id, pool_group_id in enumerate(mapping):
                     grouped[pool_group_id].add(life_cycle_id)
                 membership = tuple(sorted((pg, frozenset(lcs)) for pg, lcs in grouped.items()))

@@ -232,18 +232,22 @@ public:
         mCachedTokensByLevel.clear();
     }
 
-    //! Remove `numTokens` from `level`. Clamps at zero: the attribution only feeds an observability
-    //! counter, so an inconsistency must not underflow it into a nonsense negative reading.
-    void discountCachedTokensByLevel(CacheLevel level, int64_t numTokens)
+    //! Limit a level's staged attribution without restoring counts already dropped or committed.
+    void limitCachedTokensByLevel(CacheLevel level, int64_t maxTokens)
     {
+        // No attribution is staged when stats are disabled, discarded, or already committed.
+        if (mCachedTokensByLevel.empty())
+        {
+            return;
+        }
         TLLM_CHECK_DEBUG(level < mCachedTokensByLevel.size());
         if (level >= mCachedTokensByLevel.size())
         {
             return;
         }
         auto& count = mCachedTokensByLevel.at(level);
-        TLLM_CHECK_DEBUG(count >= numTokens);
-        count = std::max(int64_t{0}, count - numTokens);
+        TLLM_CHECK_DEBUG(maxTokens >= 0);
+        count = std::min(count, std::max(int64_t{0}, maxTokens));
     }
 
     [[nodiscard]] CountsByLevel const& cachedTokensByLevel() const noexcept

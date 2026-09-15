@@ -506,6 +506,30 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     return stats;
 }
 
+TypedVec<PoolGroupIndex, StorageStatistics> KvCacheManager::getStorageStatistics(CacheLevel cacheLevel) const
+{
+    auto const apiLock = lockShared();
+    TypedVec<PoolGroupIndex, StorageStatistics> result;
+    PoolGroupIndex const numPoolGroups = mStorage->numPoolGroups(cacheLevel);
+    result.reserve(numPoolGroups);
+    for (PoolGroupIndex poolGroup{0}; poolGroup < numPoolGroups; ++poolGroup)
+    {
+        result.push_back(mStorage->getStatistics(cacheLevel, poolGroup));
+    }
+    return result;
+}
+
+TypedVec<LifeCycleId, PoolGroupIndex> KvCacheManager::getLifeCyclePoolGroupIndices(CacheLevel cacheLevel) const
+{
+    TypedVec<LifeCycleId, PoolGroupIndex> result;
+    result.reserve(mLifeCycles.size());
+    for (LifeCycleId lifeCycle{0}; lifeCycle < mLifeCycles.size(); ++lifeCycle)
+    {
+        result.push_back(mStorage->getPoolGroupIndex(cacheLevel, lifeCycle));
+    }
+    return result;
+}
+
 void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle)
 {
     for (auto const& [lifeCycle, byLevel] : byLifeCycle)
@@ -519,6 +543,7 @@ void KvCacheManager::commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle co
 
 ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksByLevel()
 {
+    auto const apiLock = lockExclusive();
     ReusedBlocksByLevelByLifeCycle byLifeCycle;
     byLifeCycle.swap(mIterReusedBlocksByLevel);
     return byLifeCycle;
@@ -556,6 +581,7 @@ void KvCacheManager::recordDiskPrefetchBlocks(int64_t numBlocks)
 
 int64_t KvCacheManager::getAndResetIterationDiskPrefetchBlocks()
 {
+    auto const apiLock = lockExclusive();
     auto const numBlocks = mIterDiskPrefetchBlocks;
     mIterDiskPrefetchBlocks = 0;
     return numBlocks;
@@ -573,6 +599,7 @@ void KvCacheManager::commitCachedTokensByLevel(CountsByLevel const& counts)
 
 CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
 {
+    auto const apiLock = lockExclusive();
     CountsByLevel counts;
     std::swap(counts, mIterCachedTokensByLevel);
     return counts;
@@ -652,6 +679,7 @@ PeakBlockStatsByPoolGroup KvCacheManager::getAndResetIterationPeakBlockStats(Cac
 
 PeakBlockStatsByCacheLevel KvCacheManager::getAndResetIterationPeakBlockStatsByLevel()
 {
+    auto const apiLock = lockExclusive();
     _updateIterationPeakNumBlocks();
     PeakBlockStatsByCacheLevel peak = mIterationPeakNumBlocksByCacheLevel;
     _resetIterationPeakNumBlocks();

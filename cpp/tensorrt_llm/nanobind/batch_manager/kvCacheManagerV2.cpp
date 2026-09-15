@@ -1292,6 +1292,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__eq__", &kv::SsmSnapshotIterationStatsDelta::operator==, nb::arg("other"))
         .def("__repr__", &ssmSnapshotStatsDeltaRepr);
 
+    nb::class_<kv::StorageStatistics>(m, "StorageStatistics")
+        .def_prop_ro("slot_sizes", [](kv::StorageStatistics const& self) { return self.slotSizes.raw(); })
+        .def_ro("total", &kv::StorageStatistics::total)
+        .def_ro("free", &kv::StorageStatistics::free)
+        .def_ro("evictable", &kv::StorageStatistics::evictable)
+        .def_prop_ro("available", &kv::StorageStatistics::available)
+        .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
+
     nb::class_<kv::PoolGroupPeakBlockStats>(m, "PoolGroupPeakBlockStats")
         .def(
             "__init__",
@@ -1701,8 +1709,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def("commit_pending_stats", &kv::KvCache::commitPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def("discard_pending_stats", &kv::KvCache::discardPendingStats, nb::call_guard<nb::gil_scoped_release>())
-        .def("drop_cached_token_attribution", &kv::KvCache::dropCachedTokenAttribution)
-        .def("drop_partial_block_cached_token_attribution", &kv::KvCache::dropPartialBlockCachedTokenAttribution)
+        .def("drop_cached_token_attribution", &kv::KvCache::dropCachedTokenAttribution,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("drop_partial_block_cached_token_attribution", &kv::KvCache::dropPartialBlockCachedTokenAttribution,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
@@ -1991,13 +2001,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](kv::EventManager& eventManager, EventManagerTestBlock const& block, int lifeCycleId)
         { eventManager.addStoredLifeCycle(*block.block, kv::LifeCycleId{lifeCycleId}); },
         nb::arg("event_manager"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
-    nb::class_<kv::StorageStatistics>(mIntrospection, "StorageStatistics")
-        .def_prop_ro("slot_sizes", [](kv::StorageStatistics const& self) { return self.slotSizes.raw(); })
-        .def_ro("total", &kv::StorageStatistics::total)
-        .def_ro("free", &kv::StorageStatistics::free)
-        .def_ro("evictable", &kv::StorageStatistics::evictable)
-        .def_prop_ro("available", &kv::StorageStatistics::available)
-        .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
     mIntrospection.def(
         "active_page_stats",
         [](kv::KvCache const& kvCache)
@@ -2041,27 +2044,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 manager, kv::TypedVec<kv::PoolGroupIndex, float>{std::move(ratios)});
         },
         nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def(
-        "storage_statistics",
-        [](kv::KvCacheManager& manager, int cacheLevel)
-        {
-            auto stats = kv::KvCacheIntrospection::storageStatistics(manager, kv::CacheLevel{cacheLevel});
-            return std::move(stats.raw());
-        },
-        nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
-    mIntrospection.def(
-        "life_cycle_pool_group_indices",
-        [](kv::KvCacheManager& manager, int cacheLevel)
-        {
-            std::vector<int> result;
-            result.reserve(manager.lifeCycles().size().value());
-            for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
-            {
-                result.push_back(manager.storage().getPoolGroupIndex(kv::CacheLevel{cacheLevel}, lifeCycle).value());
-            }
-            return result;
-        },
-        nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     // White-box reuse-tree introspection: mirror the Python manager's _life_cycles
     // and _radix_tree attributes so shared tests can inspect reuse state.
     mIntrospection.def(
@@ -2158,11 +2140,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"),
         nb::arg("enable_partial") = false);
-    mIntrospection.def(
-        "pool_group_index",
-        [](kv::KvCacheManager& manager, int lcId, int cacheLevel)
-        { return manager.storage().getPoolGroupIndex(kv::CacheLevel{cacheLevel}, kv::LifeCycleId{lcId}).value(); },
-        nb::arg("manager"), nb::arg("lc_id"), nb::arg("cache_level") = kv::kHotLevel.value());
     mIntrospection.def(
         "compute_slots_for_batch",
         [](kv::KvCacheManager& manager, kv::BatchDesc const& batch, int tokensPerBlock,
@@ -2373,14 +2350,40 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_and_reset_iteration_suspend_resume_stats",
             &kv::KvCacheManager::getAndResetIterationSuspendResumeStats, nb::call_guard<nb::gil_scoped_release>())
         .def(
-            "get_and_reset_iteration_disk_prefetch_blocks", &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks)
-        .def("get_and_reset_iteration_cached_tokens_by_level",
-            [](kv::KvCacheManager& self) { return self.getAndResetIterationCachedTokensByLevel().raw(); })
+            "get_storage_statistics",
+            [](kv::KvCacheManager const& self, int cacheLevel)
+            { return self.getStorageStatistics(kv::CacheLevel{cacheLevel}).raw(); },
+            nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_and_reset_iteration_disk_prefetch_blocks",
+            &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_life_cycle_pool_group_indices",
+            [](kv::KvCacheManager const& self, int cacheLevel)
+            {
+                auto const mapping = self.getLifeCyclePoolGroupIndices(kv::CacheLevel{cacheLevel});
+                std::vector<int> result;
+                result.reserve(mapping.stdSize());
+                for (auto const poolGroup : mapping)
+                {
+                    result.push_back(poolGroup.value());
+                }
+                return result;
+            },
+            nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_and_reset_iteration_cached_tokens_by_level",
+            [](kv::KvCacheManager& self) { return self.getAndResetIterationCachedTokensByLevel().raw(); },
+            nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_reused_blocks_by_level",
             [](kv::KvCacheManager& self)
             {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetIterationReusedBlocksByLevel();
+                }();
                 nb::dict result;
-                for (auto const& [lifeCycle, byLevel] : self.getAndResetIterationReusedBlocksByLevel())
+                for (auto const& [lifeCycle, byLevel] : stats)
                 {
                     result[nb::cast(lifeCycle.value())] = nb::cast(byLevel);
                 }
@@ -2401,8 +2404,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_and_reset_iteration_peak_block_stats_by_level",
             [](kv::KvCacheManager& self)
             {
+                auto stats = [&]
+                {
+                    nb::gil_scoped_release release;
+                    return self.getAndResetIterationPeakBlockStatsByLevel();
+                }();
                 nb::list result;
-                for (auto const& statsByPoolGroup : self.getAndResetIterationPeakBlockStatsByLevel())
+                for (auto const& statsByPoolGroup : stats)
                 {
                     result.append(castPeakBlockStats(statsByPoolGroup));
                 }

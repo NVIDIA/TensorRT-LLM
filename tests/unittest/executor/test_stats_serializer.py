@@ -537,6 +537,7 @@ class TestStatsSerializer:
 
         storage = _FakePeakStorage()
         manager = object.__new__(KVCacheManager)
+        manager._living_kv_caches = set()
         manager._storage = storage
         manager._radix_tree = SimpleNamespace(clear=lambda: [])
         manager._reset_iteration_peak_num_blocks()
@@ -581,6 +582,7 @@ class TestStatsSerializer:
         def make_manager():
             storage = _FakePeakStorage()
             manager = object.__new__(KVCacheManager)
+            manager._living_kv_caches = set()
             manager._storage = storage
             manager._radix_tree = SimpleNamespace(clear=lambda: [])
             manager._reset_iteration_peak_num_blocks()

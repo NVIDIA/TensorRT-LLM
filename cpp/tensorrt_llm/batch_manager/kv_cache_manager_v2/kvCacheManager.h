@@ -226,6 +226,12 @@ public:
 
     // ---- Statistics -------------------------------------------------------
 
+    // Independent per-pool values sampled together under the shared API lock.
+    TypedVec<PoolGroupIndex, StorageStatistics> getStorageStatistics(CacheLevel cacheLevel = kHotLevel) const;
+    // Pool-group numbering is level-specific; cold grouping can differ from the hot layout.
+    TypedVec<LifeCycleId, PoolGroupIndex> getLifeCyclePoolGroupIndices(CacheLevel cacheLevel = kHotLevel) const;
+
+    // Internal commit* and recordDiskPrefetchBlocks helpers require the caller's exclusive API lock.
     void commitStats(KVCacheStatsDelta const& stats, IterationStatsByLifeCycle const& iterationStatsByLifeCycle = {});
     KVCacheStatsDelta getCommittedStats() const;
     IterationStatsByLifeCycle getAndResetIterationStats();

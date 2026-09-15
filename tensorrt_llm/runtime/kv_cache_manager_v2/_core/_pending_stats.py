@@ -100,17 +100,18 @@ class _PendingStats:
         self.cached_tokens_by_level = add_counts_by_level(self.cached_tokens_by_level, counts)
         return True
 
-    def discount_cached_tokens_by_level(self, level: CacheLevel, num_tokens: int) -> None:
-        """Remove ``num_tokens`` from ``level``.
-
-        Clamps at zero: the attribution only feeds an observability counter, so an inconsistency
-        must not underflow it into a nonsense negative reading.
-        """
+    def limit_cached_tokens_by_level(self, level: CacheLevel, max_tokens: int) -> None:
+        """Limit staged attribution without restoring counts already dropped or committed."""
+        # No attribution is staged when stats are disabled, discarded, or already committed.
+        if not self.cached_tokens_by_level:
+            return
         assert NDEBUG or level < len(self.cached_tokens_by_level)
         if level >= len(self.cached_tokens_by_level):
             return
-        assert NDEBUG or self.cached_tokens_by_level[level] >= num_tokens
-        self.cached_tokens_by_level[level] = max(0, self.cached_tokens_by_level[level] - num_tokens)
+        assert NDEBUG or max_tokens >= 0
+        self.cached_tokens_by_level[level] = min(
+            self.cached_tokens_by_level[level], max(0, max_tokens)
+        )
 
     def add(self, delta: _PendingStatsDelta) -> bool:
         if delta.empty:

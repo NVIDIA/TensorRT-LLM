@@ -2062,7 +2062,7 @@ void KvCache::dropCachedTokenAttribution()
 
 void KvCache::dropPartialBlockCachedTokenAttribution()
 {
-    int const partialTokens = numCommittedTokens() % mTokensPerBlock;
+    int64_t const partialTokens = countsByLevelTotal(mCachedTokensByLevel) % mTokensPerBlock;
     if (partialTokens == 0)
     {
         return;
@@ -2073,7 +2073,10 @@ void KvCache::dropPartialBlockCachedTokenAttribution()
     {
         return;
     }
-    mPendingStats.discountCachedTokensByLevel(*mLastCachedTokenLevel, partialTokens);
+    // Admission can retry the same cache after resume/resize fails. Cap against the initial match
+    // so repeated calls exclude the tail once, preserving full blocks on the same source level.
+    int64_t const fullTokens = mCachedTokensByLevel.at(*mLastCachedTokenLevel) - partialTokens;
+    mPendingStats.limitCachedTokensByLevel(*mLastCachedTokenLevel, fullTokens);
     _refreshStatsDirtyState();
 }
 
