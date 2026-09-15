@@ -549,6 +549,8 @@ class GenerationResultBase:
 
             self._outputs[
                 0].request_perf_metrics = response.request_perf_metrics
+            if response.time_breakdown_metrics is not None:
+                self.time_breakdown_metrics = response.time_breakdown_metrics
             if not self._outputs[0].disaggregated_params:
                 disaggregated_params = response.disaggregated_params
 

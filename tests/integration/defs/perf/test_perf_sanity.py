@@ -287,13 +287,12 @@ GEN_ONLY_REGRESSION_METRICS = (
 # or "aggr-ctx_only-time_breakdown-.." with no new grammar.
 #
 # The run is otherwise the same workload as the unmodified mode; the only
-# differences are the three worker_config keys injected in
+# differences are the two worker_config keys injected in
 # _parse_disagg_config_file and the --save-request-time-breakdown flag on the
-# client. One of those keys forces num_postprocess_workers to 0 to keep the
-# per-step detail, which measurably changes throughput -- so the modifier is
-# part of the composed test label (see format_test_label) and therefore of
-# s_test_case_name, giving the case its own baseline series. Its aggregate
-# numbers are deliberately not comparable to the unmodified sibling's.
+# client. Collecting the timestamps still costs the serving loop some host time,
+# so the modifier is part of the composed test label (see format_test_label) and
+# therefore of s_test_case_name, giving the case its own baseline series. Its
+# aggregate numbers are deliberately not comparable to the unmodified sibling's.
 TIME_BREAKDOWN_MODIFIER = "time_breakdown"
 
 # Every modifier the test-id grammar recognises, i.e. the closed vocabulary that
@@ -3723,10 +3722,13 @@ class PerfSanityTestConfig:
           prefers the "disagg" file) but they carry per-step and per-chunk detail
           the header transport cannot express; in ctx_only they are the only
           record, and _perf_metrics_files falls back to the "server" kind.
-        - num_postprocess_workers=0 preserves that detail: PostprocWorker.Output
-          forwards request_perf_metrics but not time_breakdown_metrics, so a
-          non-zero value silently flattens the per-step bars. This measurably
-          changes throughput, which is why the mode has its own baseline series.
+
+        num_postprocess_workers is deliberately NOT overridden. It used to be
+        forced to 0 because PostprocWorker.Output forwarded request_perf_metrics
+        but not time_breakdown_metrics, so a non-zero value silently flattened
+        the per-step bars. Output now carries time_breakdown_metrics, so the
+        shared yaml's value stands and this mode no longer changes the serving
+        topology it is supposed to be measuring.
         """
         perf_metrics_dir = self.time_breakdown_dir()
         if not perf_metrics_dir:
@@ -3734,7 +3736,6 @@ class PerfSanityTestConfig:
         return {
             "return_perf_metrics": True,
             "perf_metrics_output_dir": perf_metrics_dir,
-            "num_postprocess_workers": 0,
         }
 
     def _resolve_internal_request_auth_key(self, config: dict) -> str:
