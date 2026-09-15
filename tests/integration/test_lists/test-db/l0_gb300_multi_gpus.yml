@@ -54,6 +54,7 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   # KDA runtime: host-derived prefill metadata, bf16 state pool round-trip,
   # and bounded prefill scratch caches.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
