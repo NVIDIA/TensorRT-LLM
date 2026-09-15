@@ -79,7 +79,7 @@ class _BaseCoderController(Controller):
         Each clone runs in its own :class:`ExecutionScope` (assigned
         automatically by :class:`ScaffoldingLlm` when entering a
         ``ParallelProcess`` branch), so ``ApiaryMCPWorker`` routes its
-        tool calls to a dedicated SSE connection without manual wiring.
+        tool calls to a dedicated MCP session without manual wiring.
         """
         cloned_ctrl = self.chat_with_tools_controller.clone()
         return type(self)(chat_with_tools_controller=cloned_ctrl)
@@ -261,7 +261,7 @@ def create_coder_scaffolding_llm(
         # Start CoderMCP server first:
         # python examples/scaffolding/mcp/coder/coder_mcp.py --port 8083
 
-        mcp_worker = ApiaryMCPWorker("http://localhost:8083/sse")
+        mcp_worker = ApiaryMCPWorker("http://localhost:8083/mcp")
 
         # Create the Coder agent
         coder = create_coder_scaffolding_llm(
