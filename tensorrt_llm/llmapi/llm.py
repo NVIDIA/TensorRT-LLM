@@ -400,11 +400,11 @@ class BaseLLM:
                     f"Unknown backend: {backend!r}. Supported backends are "
                     "'pytorch' and '_autodeploy'.")
 
-            # TRTLLM_STAIRCASE=require promises the run measured a staircase
+            # TRTLLM_MODELING_V2=require promises the run measured a modeling_v2
             # target. Only the pytorch backend reaches the resolver that could
             # select one, so on any other backend the promise would be broken
             # silently -- the one failure that mode exists to prevent.
-            from .._torch.staircase import assert_backend_can_route
+            from .._torch.modeling_v2 import assert_backend_can_route
             assert_backend_can_route(backend)
 
             # check the kwargs and raise ValueError directly
