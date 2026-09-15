@@ -185,7 +185,11 @@ def test_topology_probe_initializes_nvml() -> None:
 def test_support_nvlink_stops_at_first_rejected_link_index() -> None:
     # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures. GB200 has
     # 18 links, and the driver rejects every index past them with InvalidArgument.
+    # NotSupported marks a hole inside the range, which must be skipped, not treated
+    # as the end.
     def get_capability(_handle, link_idx, _capability):
+        if link_idx == 5:
+            raise pynvml.NVMLError_NotSupported()
         if link_idx >= 18:
             raise pynvml.NVMLError_InvalidArgument()
         return 1
@@ -203,9 +207,11 @@ def test_support_nvlink_stops_at_first_rejected_link_index() -> None:
     ):
         assert MnnvlMemory.support_nvlink(0)
 
-    # Probing stops at index 18 instead of issuing the 17 remaining rejected queries.
+    # Probing skips the hole at index 5 and stops at index 18 instead of issuing the
+    # 17 remaining rejected queries.
     assert mock_get_capability.call_count == 19
-    assert "(18 of 36 link indices accepted by the driver)" in mock_log_info.call_args.args[0]
+    message = mock_log_info.call_args.args[0]
+    assert "17/17 links up (18 of 36 link indices accepted by the driver)" in message
 
 
 @patch("tensorrt_llm._mnnvl_utils.get_sm_version", return_value=90)
