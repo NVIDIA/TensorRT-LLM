@@ -16,13 +16,23 @@ starts.
 | Same UCX env vars (incl. the `unset UCX_TLS` cases) | `jenkins/scripts/perf/submit.py` builds the precheck commands from the **same** `ucx_tls_cmd` + `$CTX/GEN_WORKER_ENV_VARS` strings as the worker steps; `slurm_precheck_run.sh` sources the same `slurm_env_setup.sh` (the `UCX_TLS=tcp` fixup) as `slurm_run.sh`. |
 | Same instance count / parallelism | One precheck `srun` per ctx/gen server with the same `-N/--ntasks/--ntasks-per-node/--mpi=pmix` and the same node slices (`-w`) as the real server steps (`slurm_launch_draft.sh`). TP/PP/CP/attention-DP come from the same `worker_config`. |
 | Same transceiver config | `CacheTransceiverConfig(**yaml["worker_config"][role]["cache_transceiver_config"])` — the yaml block is passed through verbatim (backend, `max_tokens_in_buffer`, timeouts, ...). |
-| Same KV cache manager version + transceiver runtime | The launch generator forwards the real test's `LLM_MODELS_ROOT` into every precheck process. Explicit per-side `kv_cache_config.use_kv_cache_manager_v2` wins; absent means "auto" and requires a registered model class, then resolves via `get_preferred_kv_cache_manager_version()`. `transceiver_runtime: auto` resolves via `get_preferred_transceiver_runtime()` (NIXL-gated) — both through the same llm_utils code serving uses. An unresolved manager-version `auto` setting fails with INIT_ERROR instead of silently assuming V1. V2 requires the Python transceiver (the C++ one only supports V1); a V2+CPP combination also fails fast. |
+| Same KV cache manager version + transceiver runtime | The launch generator forwards the real test's `LLM_MODELS_ROOT` into every precheck process. Explicit per-side `kv_cache_config.use_kv_cache_manager_v2` wins; absent means "auto" and requires a registered model class, then resolves via `get_preferred_kv_cache_manager_version()`. `transceiver_runtime: auto` resolves via `get_preferred_transceiver_runtime()` (NIXL-gated) — both through the same llm_utils code serving uses. The model class comes from the checkpoint's `config.json`, falling back to the yaml's `metadata.architectures` when the checkpoint is not staged on this cluster (the preference hooks key off the architecture, not the weights). An `auto` setting with neither source available fails with INIT_ERROR instead of silently assuming V1. V2 requires the Python transceiver (the C++ one only supports V1); a V2+CPP combination also fails fast. |
 
 Asymmetric layouts (ctx dep4 → gen dep16, ctx pp8 → gen tp32, ...) are
 supported: data is seeded per (request, **global** layer) and constant along
 the KV-head axis, so the receiver regenerates its expected slice locally under
 any TP/PP resharding. KV shape (layers/heads/head_dim, MLA vs GQA, MTP nextn
-layers) is read from the real model's `config.json` under `$LLM_MODELS_ROOT`.
+layers) is read from the real model's `config.json` under `$LLM_MODELS_ROOT`,
+falling back to a generic pool when it is absent — the check exercises the
+network/transceiver path, not the exact KV layout. The manager version and
+transceiver runtime must still match serving, so a yaml whose checkpoint may
+not be staged everywhere should declare the architecture:
+
+```yaml
+metadata:
+  architectures:
+  - DeepseekV4ForCausalLM
+```
 
 ## Enabling / disabling
 
