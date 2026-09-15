@@ -339,8 +339,8 @@ srun --mpi=pmix \
         # either has the setting it was submitted with or fails visibly - a
         # silently-unset precision flag would look like a clean A/B while
         # actually re-running the same configuration twice.
-        export KIMI_K3_FP8_WEIGHT_READ=\"${KIMI_K3_FP8_WEIGHT_READ:-0}\"
-        echo \"[k3] KIMI_K3_FP8_WEIGHT_READ=\$KIMI_K3_FP8_WEIGHT_READ\"
+        export KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=\"${KIMI_K3_FP8_WEIGHT_READ_MOE_MLP:-1}\"
+        echo \"[k3] KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=\$KIMI_K3_FP8_WEIGHT_READ_MOE_MLP\"
 
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;

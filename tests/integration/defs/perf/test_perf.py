@@ -64,8 +64,6 @@ QWEN38_MTP_MODELS = {
     "qwen3.8_flash_next_fp4_mtp",
 }
 KIMI_K3_SERVER_ENV = {
-    "KIMI_K3_FP8_WEIGHT_READ": "1",
-    "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING": "1",
 }
 
