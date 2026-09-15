@@ -15,8 +15,7 @@ separate memory costs; the sparse GPU-cache budget does not bound those costs.
 
 Port SGLang's `load_cache_to_device_buffer_kernel` from [hisparse.cuh](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/kvcacheio/hisparse.cuh)
 for GPU lookup, LRU replacement, refetch, and attention indices. Integrate the kernel source
-with KVCM V2 through a small wrapper. The existing local Triton cache is a correctness reference
-for this integration.
+with KVCM V2 through a small wrapper.
 
 ### Key terms
 
@@ -117,8 +116,7 @@ selected GPU entries, described in section 3.4.
 Residency controls, selection/layout interfaces, retained host copies, and the GPU entry cache
 are implemented locally. `ensure_resident()` now uses the pinned HiSparse kernel. The wrapper
 adds host/layout checks, duplicate handling, GPU read protection, newest-entry writes, and shared
-miss plans. The earlier Triton path remains available for comparison. See step 5 of
-[HiSparse.md](HiSparse.md) for validation; model wiring and scheduler budgets follow later.
+miss plans. A separate CUDA kernel releases read protection after attention. 
 
 ## 3. Proposed changes
 
@@ -230,14 +228,11 @@ host copies and GPU entries separately; `Page::cacheLevel` alone cannot describe
 - Integrate the HiSparse kernel source and required helpers. Record the upstream revision and
 preserve its license. Limit changes to the KVCM binding, layouts, and required lifetime checks.
 - Keep selection/layout interfaces and KVCM ownership separate from kernel execution.
-HiSparse handles LRU and transfer together through `ensure_resident`. Eviction and transfer
-interfaces remain extension points for experiments; they do not require separate GPU launches.
+HiSparse handles LRU and transfer together through `ensure_resident`. Future kernels can use
+the same selection, layout, and ownership interfaces.
 This follows the [generalization principle](hisparse_design_principle.md).
 - Connect `DSACacheManagerV2`, `DeepseekV4CacheManager`, and `MiniMaxM3KVCacheManagerV2` through
 `sparse/registry.py`, using each model's layout and selection format.
-
-Use the local Triton implementation for correctness comparisons. Measure the integrated HiSparse
-path and tune its launch settings with the same KV format, usable capacity, and protection rules.
 
 > **KVCM, transfer, and attention owner review:** confirm ownership, copy addresses,
 > index-buffer lifetimes, ordering, and the kernel binding.
@@ -341,7 +336,7 @@ when unselected; native SWA follows its own window rules.
 
 
 
-### Optional disaggregated serving
+### Disaggregated serving
 
 **Exchange all history the destination needs, including unselected sparse KV.** Extend the
 [disaggregation adapter](tensorrt_llm/_torch/disaggregation/resource/cache_reuse.py) to support host addresses:
@@ -369,36 +364,8 @@ protected data. Reject budgets that cannot hold a valid selection.
 Use the HiSparse kernel; choose its launch settings from tests and benchmarks. Keep tuning internal
 unless a user setting is needed. New public settings need the review listed in section 6.
 
-## 6. Open decisions
 
-The eight directions below, including direct use of the HiSparse kernel, are agreed. Exact APIs,
-model layouts, budget scope, and integration review remain open.
-
-
-| #   | Decision                  | Agreed direction                                                                                                          | Remaining review and checks                                                         |
-| --- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| 1   | Residency groups          | Keep indexer/required dense KV and lookup tables on GPU; use a separate bounded GPU cache for sparse KV.                  | Model buffer split, sinks/window, and writable data.                                |
-| 2   | Transfer size             | Fetch selected tokens or compressed entries; allocate pages where useful.                                                 | Offsets/scales and bytes copied for scattered selections.                           |
-| 3   | Host copies               | Keep host copies; replace GPU copies only when host data is valid and protected uses finish.                              | Copy validity, writes, stable addresses, uncommitted KV, and host exhaustion.       |
-| 4   | Execution and graphs      | Run model selection on GPU, then the HiSparse fused lookup/LRU/refetch kernel with preallocated buffers.                  | Changed selections, full capacity, ordering, and no per-layer CPU allocation/sync.  |
-| 5   | Lifecycle API             | Keep `KvCache`, separate host/GPU-cache components, and policy extension points; call HiSparse through `ensure_resident`. | Resume, suspend, commit, close, ownership, and fused execution.                     |
-| 6   | Capacity and failures     | Reserve GPU/host space before admitting work; clean up safely on unexpected failure.                                      | All memory costs and partial-write failures; retry needs separate work.             |
-| 7   | Disaggregation            | Prefer direct host transfers; use bounded staging as needed. Keep it optional.                                            | Supported transports, address lifetimes, large histories, and local prefill/decode. |
-| 8   | Configuration and kernels | Use `load_cache_to_device_buffer_kernel` directly. Reuse host/top-K settings; add enablement and GPU budget as needed.    | KVCM bindings/layouts, newest-token space, model support, and launch tuning.        |
-
-
-SGLang's [HiSparse kernel](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/kvcacheio/hisparse.cuh) is the chosen GPU implementation. Its
-[coordinator](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/hisparse_coordinator.py) is the integration reference for retained host copies,
-the small GPU cache, and graph execution. See also the [HiSparse paper](https://arxiv.org/abs/2608.07009).
-Its [documented deployment](https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/hisparse_guide.mdx)
-uses a disaggregated decode instance with radix caching disabled. Our prefix reuse and local
-prefill/decode support need V2-specific work and tests.
-
-Validate changing graph inputs, full-cache progress, shared prefixes, and host exhaustion before
-finalizing APIs. New public settings need documentation, validation, golden-manifest updates, and
-telemetry/privacy CODEOWNER review. Leave room for future speculative steps; MTP remains out of scope.
-
-## 7. Validation and deliverables
+## 6. Validation and deliverables
 
 
 | Area                  | Required checks                                                                                                                                                                                                                   |
@@ -413,9 +380,9 @@ telemetry/privacy CODEOWNER review. Leave room for future speculative steps; MTP
 | Prefill               | Host-copy readiness, actual release/shrink of full-history GPU storage, and the separate prefill peak.                                                                                                                            |
 | Disaggregation        | Full required history larger than decode sparse-cache capacity, bounded staging, concurrent transfers, prefix reuse, and destination readiness.                                                                                   |
 | Failures              | GPU/host exhaustion, supported disk-restore errors, rejected copy submissions, partial writes, shared-data protection, and cleanup.                                                                                               |
-| Memory/performance    | Measure integrated HiSparse latency, throughput, and transfer bytes across batch sizes and miss rates. Count all GPU/host storage, including newest-token space and metadata. Compare with reference timings and check for leaks. |
+| Memory/performance    | Measure latency, throughput, and transfer bytes across batch sizes and miss rates. Count all GPU/host storage, including newest-token space and metadata. Compare with recorded HiSparse timings and check for leaks. |
 
 
 Deliver reviewed ownership and lifecycle rules, selection/transfer APIs, reservations and cleanup,
 model layouts, and graph/performance results. Document codec changes and supported combinations.
-Keep [HiSparse.md](HiSparse.md) aligned with those results.
+Keep [HiSparse_implementation.md](HiSparse_implementation.md) aligned with those results.
