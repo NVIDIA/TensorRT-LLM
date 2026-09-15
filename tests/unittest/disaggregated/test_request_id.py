@@ -72,7 +72,7 @@ def _make_recv_task(ctx_request_id, disagg_request_id, unique_rid=123):
     return SimpleNamespace(
         _params=SimpleNamespace(ctx_request_id=ctx_request_id, disagg_request_id=disagg_request_id),
         _unique_rid=unique_rid,
-        _kv_slice=SimpleNamespace(block_ids_per_layer_groups=[]),
+        _kv_slice=SimpleNamespace(block_ids_per_layer_groups=[], beam_tails_per_layer_groups=None),
         _aux_slot=None,
         slice_id=0,
     )

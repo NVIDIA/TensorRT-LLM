@@ -46,18 +46,29 @@ class LayerRange:
 class KVSlice:
     """KV-cache blocks for one request transfer slice.
 
-    Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
-    Pipelined transfers use a block-aligned ``token_range`` and mark only the
-    final chunk with ``is_last_slice``. Block lists may omit cached or evicted
-    prefixes.
+    ``block_ids_per_layer_groups[g]`` is positional: entry ``i`` is the local
+    pool slot holding block ordinal ``i`` (tokens ``[i * tpb, (i + 1) * tpb)``),
+    or ``-1`` when this side has nothing to offer/accept there -- SWA-evicted,
+    not yet allocated, already cached on the receiver, or outside a pipelined
+    chunk. Paged groups carry ``ceil(prompt_len / tpb)`` entries; STATE groups
+    carry a single slot. The sender pairs ordinals that are ``>= 0`` on both
+    sides, so neither side needs to know the other's eviction or reuse state.
+
+    ``beam_tails_per_layer_groups`` (beam search, V1 only) carries the per-beam
+    final blocks that diverge from beam 0; they are not positional and are
+    paired index-wise after the positional window.
+
+    Pipelined transfers set a block-aligned ``token_range`` and mark only the
+    final chunk with ``is_last_slice``.
     """
 
     layer_range: Optional[LayerRange] = None
     block_ids_per_layer_groups: List[np.ndarray] = field(
         default_factory=list
-    )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
+    )  # Positional pool slots per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
     token_range: Optional[TokenRange] = None
+    beam_tails_per_layer_groups: Optional[List[np.ndarray]] = None
 
 
 class SessionStatus(Enum):
