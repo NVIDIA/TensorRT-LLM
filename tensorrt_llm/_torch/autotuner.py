@@ -1286,8 +1286,14 @@ class AutoTuner:
             runner = runners[runner_id]
             if type(runner) not in jit_classes:
                 continue
+            # ``get_opt_shapes()`` belongs in the key: the JIT caches these
+            # runners compile per shape-derived kernel parameters, which
+            # ``unique_id()`` does not carry. Without it the first profile to
+            # pick a (runner, tactic) suppresses priming for every other
+            # profile sharing that pair, and their buckets compile during
+            # serving -- exactly what this function exists to prevent.
             key = (custom_op, type(runner).__name__, str(runner.unique_id()),
-                   str(tactic))
+                   p.get_opt_shapes(), str(tactic))
             if key in primed:
                 continue
             primed.add(key)

@@ -1506,6 +1506,13 @@ class MegaMoECuteDsl(MoEImplBase):
             top_k,
             self.combine_format,
             self.act_clamp,
+            # The op has no activation-kind argument: it reads SwiGLU vs SiTU
+            # off these two (None/None means SwiGLU), and the runner's
+            # unique_id keys on them. The ladder set is process-global, so
+            # without them a shape-identical layer with a different activation
+            # skips priming and compiles its buckets while serving.
+            self.act_alpha,
+            self.act_beta,
             str(device),
             output_dtype,
         )

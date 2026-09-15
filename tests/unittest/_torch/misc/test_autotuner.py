@@ -1599,12 +1599,18 @@ def test_prime_cached_tactics_on_cache_hit(monkeypatch):
     with autotune(cache_path=cache_path):
         tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
     assert set(JitGemmRunner.kernel_cache) == winners
-    assert len(JitGemmRunner.calls) == len(winners)
+    # Priming is keyed by (runner, profile opt shapes, tactic), not by tactic
+    # alone: these runners compile per shape-derived kernel parameters, so two
+    # profiles that picked the same tactic must each still be launched.
+    assert {tactic for _, tactic in JitGemmRunner.calls} == winners
+    assert len(JitGemmRunner.calls) == len(set(JitGemmRunner.calls))
+    assert len(JitGemmRunner.calls) >= len(winners)
+    primed_launches = len(JitGemmRunner.calls)
 
     # Already primed in this process: no further launches.
     with autotune(cache_path=cache_path):
         tuner.choose_one(op, [JitGemmRunner()], tuning_config, [x, w])
-    assert len(JitGemmRunner.calls) == len(winners)
+    assert len(JitGemmRunner.calls) == primed_launches
 
     # Opt-out knob.
     monkeypatch.setenv("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "0")
