@@ -22,7 +22,7 @@ module-scope import here would close a cycle.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
@@ -78,18 +78,17 @@ class MsaDecodeFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
+        params: FmhaParams,
         metadata: "TrtllmAttentionMetadata",
-        forward_args: "AttentionForwardArgs",
-        workspace: torch.Tensor,
     ) -> None:
+        forward_args = cast("AttentionForwardArgs", params.fwd)
         if forward_args.sparse_runtime_params.sparse_attn_indices is not None:
             # A sparse layer; the Triton kernel takes its split-K scratch from
             # the arena itself, sized by the grid it just chose.
             return
-        self._reserve_dense_workspace(q, metadata, workspace)
+        self._reserve_dense_workspace(
+            cast(torch.Tensor, params.qkv_or_q), metadata, cast(torch.Tensor, params.workspace)
+        )
 
     def _reserve_dense_workspace(
         self,
@@ -151,8 +150,8 @@ class MsaDecodeFmha(PhasedFmha):
             )
         write_msa_phase_kv(
             params.attn,
-            params.key_input,
-            params.value_input,
+            params.k,
+            params.v,
             metadata,
             params.fwd.attention_input_type,
             token_offset=params.token_offset,
@@ -187,7 +186,7 @@ class MsaDecodeFmha(PhasedFmha):
         # q may still be FP8 from a fused producer; the kernel widens it
         # in-register, so it is passed through as it arrives.
         minimax_m3_sparse_attn_decode(
-            params.attention_input.view(num_tokens, attn.num_heads, head_dim),
+            params.qkv_or_q.view(num_tokens, attn.num_heads, head_dim),
             k_paged,
             v_paged,
             # The kernel reads the top-k table head-major and the indexer
@@ -199,7 +198,7 @@ class MsaDecodeFmha(PhasedFmha):
             block_table,
             seq_lens,
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
-            output=params.context_buf.view(num_tokens, attn.num_heads, head_dim),
+            output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
         )
 
@@ -237,13 +236,13 @@ class MsaDecodeFmha(PhasedFmha):
             )
         workspace, counters = split_dense_decode_workspace(params.workspace, self._dense_layout)
         minimax_m3_trtllm_gen_dense_decode(
-            params.attention_input.view(num_tokens, attn.num_heads, head_dim),
+            params.qkv_or_q.view(num_tokens, attn.num_heads, head_dim),
             metadata.kv_cache_manager,
             attn.layer_idx,
             block_table,
             seq_lens,
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
-            output=params.context_buf.view(num_tokens, attn.num_heads, head_dim),
+            output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
             max_seq_len=int(metadata.msa_max_kv_len),
             max_num_requests=int(metadata.max_num_requests),

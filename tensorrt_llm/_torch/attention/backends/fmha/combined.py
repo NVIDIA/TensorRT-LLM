@@ -15,10 +15,6 @@
 
 from typing import TYPE_CHECKING, Optional
 
-import torch
-
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
-
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -56,31 +52,13 @@ class CombinedFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
+        params: FmhaParams,
         metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
     ) -> None:
-        context_impl = self._get_context_impl()
-        generation_impl = self._get_generation_impl()
-        context_impl.prepare_workspace(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-            workspace,
-        )
-        generation_impl.prepare_workspace(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-            workspace,
-        )
+        # Both phases carve from the same workspace, so each impl must get a chance
+        # to grow it before either runs.
+        for impl in (self._get_context_impl(), self._get_generation_impl()):
+            impl.prepare_workspace(params, metadata)
 
     def run_context(self, params: FmhaParams) -> None:
         self._get_context_impl().run_context(params)
