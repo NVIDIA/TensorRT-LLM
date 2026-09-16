@@ -506,6 +506,33 @@ def test_success_records_startup_without_inference_requests(trial: argparse.Name
     ]
 
 
+def test_eviction_is_once_before_each_launch_and_after_previous_teardown(
+    trial: argparse.Namespace,
+) -> None:
+    events = Mock()
+    for name, operation in (
+        ("evict", trial.evict),
+        ("launch", trial.launch),
+        ("ready", trial.ready),
+        ("metrics", trial.opener.open),
+        ("stop", trial.stop),
+    ):
+        events.attach_mock(operation, name)
+    for policy in ("native", "rank_striped_read_ahead"):
+        trial.variant = {"name": policy, "config": {"checkpoint_io_policy": policy}}
+        trial.policy = _policy(
+            requested=policy, selected=policy, effective=policy, activated=policy != "native"
+        )
+        assert _run_trial(trial)["status"] == "passed"
+    assert [call[0] for call in events.mock_calls] == [
+        "evict",
+        "launch",
+        "ready",
+        "metrics",
+        "stop",
+    ] * 2
+
+
 def test_invalid_cache_never_launches_server(trial: argparse.Namespace) -> None:
     evidence = {"verified": False, "errors": ["resident pages"]}
     trial.evict.side_effect = runner.CacheVerificationError("not cold", evidence)

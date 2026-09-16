@@ -36,11 +36,33 @@ Every trial evicts all discovered main/draft/auxiliary checkpoint data files wit
 file identities are checked. Supply unindexed auxiliary directories explicitly
 in `checkpoint_dirs`; external draft models must also be listed there.
 
-**This does not evict or verify NFS server, storage-appliance or device caches.**
-Their state is uncontrolled, even when client-cache verification passes. Run
-paired trials close together and avoid concurrent storage-heavy jobs; a cold
-client can still receive data from a warm storage server. Backend-cold testing
-needs a storage-owner-approved mechanism outside this implementation.
+For NFS checkpoints, node-local FS-Cache must be disabled. Before eviction,
+the runner matches each open file's `/proc/self/fdinfo` mount ID to
+`/proc/self/mountinfo`, including container bind mounts. It rejects `fsc` or
+`fsc=<tag>` in the effective superblock options; Linux reports these whenever
+NFS FS-Cache is enabled (absence means the default `nofsc`). Missing, ambiguous
+or malformed mount information fails closed. Per-file mount/source/options and
+`nfs_fscache` status are saved in `result.json` and the CSV cache evidence. Mount
+information is checked again after eviction, including an approved reset helper.
+No remount or cache-service shutdown is performed.
+
+Non-NFS checkpoints remain supported: their NFS check is `not_applicable`,
+and only RAM page-cache coldness is verified. Other local-disk caching layers,
+including caches underneath stacked filesystems, are **not** certified cold.
+Keep checkpoint sources matched between policies and qualify the storage setup;
+do not interpret `cache.verified` as proof that every storage layer is cold.
+
+**NFS-server caches are allowed; they are not cleared or verified.** This is a
+client-cold comparison, not a storage-backend-cold benchmark. Storage-appliance
+and device caches are also outside scope. Run paired trials close together and
+avoid concurrent storage-heavy jobs.
+
+Eviction/verification runs before **every policy and repetition**, outside the
+timed interval. During startup, the harness does not evict checkpoint pages or
+disable normal buffered I/O: native caching and rank-striped read-ahead remain
+unchanged. Exclusive checkpoint use and stable mounts are required so another
+process cannot repopulate pages or change storage settings between verification
+and launch.
 
 Execution requires an exclusive whole-node allocation and explicit acknowledgment.
 Never use `--exclusive-node` as a substitute for actually reserving the node.

@@ -367,7 +367,9 @@ def collect_results(root: Path) -> dict:
         "",
         "Descriptive matched-pair results only; no pooled fleet speedup or significance claim. "
         "Positive reduction means faster. Medians use matched trials only; zero native values have no percentage. "
-        "Cache verification covers the client checkpoint page cache, not storage-backend caches. "
+        "Cache verification covers the client checkpoint page cache; per-file mount evidence "
+        "records NFS FS-Cache checks when available. Other disk and storage-backend caches "
+        "are not verified. "
         "Launch-to-ready is not launch-to-first-token; loader timings retain their reported rank scope.",
         "",
         "| Case / profile | Variant | Identity | Metric | Pairs | Native median | Candidate median "

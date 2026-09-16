@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fail-closed, client-page-cache verification for exclusive startup QA nodes."""
+"""Client page-cache verification and NFS disk-cache guards for startup QA."""
 
 import ctypes
 import hashlib
@@ -166,10 +166,48 @@ def _resident_pages(fd: int, size: int, page_size: int) -> int:
     return resident
 
 
+def _checkpoint_mount(fd: int) -> dict[str, object]:
+    # Match the open file's mount ID, not a path prefix: bind mounts and stacked
+    # mounts can otherwise select the wrong filesystem or mount options.
+    fdinfo = Path(f"/proc/self/fdinfo/{fd}").read_text(encoding="utf-8")
+    mount_ids = re.findall(r"^mnt_id:\s*([0-9]+)$", fdinfo, re.MULTILINE)
+    if len(mount_ids) != 1:
+        raise ValueError("Checkpoint mount ID is unavailable or ambiguous")
+    mount_id = mount_ids[0]
+    lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    matches = [line for line in lines if line.split(maxsplit=1)[0:1] == [mount_id]]
+    if len(matches) != 1:
+        raise ValueError(f"Checkpoint mount {mount_id} is unavailable or ambiguous")
+    before, separator, after = matches[0].partition(" - ")
+    fields, filesystem = before.split(), after.split()
+    if not separator or len(fields) < 6 or len(filesystem) != 3:
+        raise ValueError(f"Malformed checkpoint mount information: {matches[0]}")
+    options = filesystem[2].split(",")
+    if not all(options) or not {"ro", "rw"}.intersection(options):
+        raise ValueError(f"Checkpoint mount {mount_id} has unverifiable superblock options")
+    is_nfs = filesystem[0] in {"nfs", "nfs4"}
+    # Linux nfs_show_options reports fsc (or fsc=<tag>) whenever enabled;
+    # its absence in the effective superblock options means the default nofsc.
+    fscache = "not_applicable"
+    if is_nfs:
+        fscache = (
+            "enabled" if any(opt.partition("=")[0] == "fsc" for opt in options) else "disabled"
+        )
+    return {
+        "mount_id": int(mount_id),
+        "filesystem": filesystem[0],
+        "source": re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), filesystem[1]),
+        "mount_point": re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4]),
+        "root": re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[3]),
+        "super_options": options,
+        "nfs_fscache": fscache,
+    }
+
+
 def evict_and_verify(
     files: list[Path], *, exclusive: bool, reset_command: list[str] | None = None
 ) -> dict[str, object]:
-    """Evict checkpoint data and require zero resident pages before launch.
+    """Reject NFS disk caching, then evict and verify RAM pages before launch.
 
     Args:
         files: Complete checkpoint data-file list (including draft/auxiliary weights).
@@ -178,7 +216,8 @@ def evict_and_verify(
             shell or implicit privilege escalation instead of per-file fadvise.
 
     Returns:
-        Client-cache evidence only; storage-server/backend coldness is not proven.
+        RAM residency and per-file mount evidence. NFS FS-Cache must be disabled;
+        other disk caches and storage-server/backend coldness are not proven.
 
     Raises:
         CacheVerificationError: Reset, identity or residency validation failed.
@@ -187,6 +226,9 @@ def evict_and_verify(
     evidence: dict[str, object] = {
         "verified": False,
         "scope": "client_checkpoint_page_cache",
+        "disk_cache_scope": "nfs_fscache_only",
+        "mount_verification_method": "proc_fdinfo_mountinfo",
+        "other_disk_caches_verified": False,
         "backend_cache_verified": False,
         "host": platform.node(),
         "exclusive_acknowledged": exclusive,
@@ -218,6 +260,15 @@ def evict_and_verify(
         evidence["total_pages"] = sum(
             (entry["bytes"] + page_size - 1) // page_size for entry in manifest
         )
+        for entry in manifest:
+            path = Path(entry["path"])
+            with path.open("rb") as handle:
+                if _identity(path, os.fstat(handle.fileno())) != entry:
+                    raise ValueError(f"Checkpoint changed before mount verification: {path}")
+                mount = _checkpoint_mount(handle.fileno())
+            observations.append({**entry, "mount": mount})
+            if mount["nfs_fscache"] == "enabled":
+                raise ValueError(f"NFS FS-Cache is enabled for checkpoint: {path}")
         if reset_command is not None:
             if (
                 not isinstance(reset_command, list)
@@ -241,13 +292,15 @@ def evict_and_verify(
                     if _identity(path, os.fstat(handle.fileno())) != entry:
                         raise ValueError(f"Checkpoint changed before reset: {path}")
                     os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        for entry in manifest:
+        for entry, observation in zip(manifest, observations):
             path = Path(entry["path"])
             with path.open("rb") as handle:
                 if _identity(path, os.fstat(handle.fileno())) != entry:
                     raise ValueError(f"Checkpoint changed during reset: {path}")
+                if _checkpoint_mount(handle.fileno()) != observation["mount"]:
+                    raise ValueError(f"Checkpoint mount changed during reset: {path}")
                 resident = _resident_pages(handle.fileno(), entry["bytes"], page_size)
-                observations.append({**entry, "resident_pages": resident})
+                observation["resident_pages"] = resident
         evidence["resident_pages"] = sum(item["resident_pages"] for item in observations)
         if checkpoint_manifest(files) != manifest:
             raise ValueError("Checkpoint identity changed during verification")
