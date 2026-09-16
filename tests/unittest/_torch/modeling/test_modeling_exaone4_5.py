@@ -112,8 +112,10 @@ EXAONE_4_5_TEST_CONFIG = {
 _EXAONE_4_5_ASSET_PATH = EXAONE_4_5_TEST_CONFIG.get("_name_or_path")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
-def test_exaone4_construction_and_forward():
+def test_exaone4_construction_and_forward() -> None:
+    """Check EXAONE 4 construction, BF16 weights, and forward behavior."""
     from transformers import Exaone4Config
 
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -159,6 +161,9 @@ def test_exaone4_construction_and_forward():
                 parameter.normal_(mean=0.0, std=0.02)
 
     assert isinstance(model, Exaone4ForCausalLM)
+    assert model.config.torch_dtype == torch.bfloat16
+    assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+    assert model.lm_head.weight.dtype == torch.bfloat16
     assert len(model.model.layers) == 2
     assert [layer.self_attn.is_sliding for layer in model.model.layers] == [True, False]
 
