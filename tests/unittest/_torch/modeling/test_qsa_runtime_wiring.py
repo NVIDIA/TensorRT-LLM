@@ -263,12 +263,12 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
     monkeypatch.setattr(_util, "is_kimi_linear", lambda config: False)
     monkeypatch.setattr(_util, "is_mla", lambda config: False)
     monkeypatch.setattr(_util, "is_nemotron_hybrid", lambda config: False)
-    monkeypatch.setattr(_util, "is_qwen3_hybrid", lambda config: True)
+    monkeypatch.setattr(_util, "is_qwen3_hybrid", lambda config: False)
+    monkeypatch.setattr(_util, "is_qwen4_exp", lambda config: True)
     monkeypatch.setattr(
         _util, "extract_mamba_kv_cache_params", lambda *args, **kwargs: mamba_params
     )
     monkeypatch.setattr(_util, "get_sm_version", lambda: 103)
-    monkeypatch.setattr(_util, "is_gdn_replay_enabled", lambda: False)
     monkeypatch.setattr(MambaHybridCacheManagerV2, "__init__", lambda self, *args, **kwargs: None)
 
     manager = _create_kv_cache_manager(
@@ -296,9 +296,11 @@ def test_qsa_cache_manager_uses_resolved_index_geometry(
     assert manager.qsa_index_kv_heads == 1
 
 
-def test_qsa_cache_manager_requires_sparse_config() -> None:
-    with pytest.raises(ValueError, match="sparse_attention_config is required"):
-        QSAMambaHybridCacheManagerV2(layer_mask=[True])
+def test_qwen4_manager_also_supports_dense_attention(monkeypatch) -> None:
+    monkeypatch.setattr(MambaHybridCacheManagerV2, "__init__", lambda self, *args, **kwargs: None)
+    manager = QSAMambaHybridCacheManagerV2(layer_mask=[True])
+    assert not manager._qsa_enabled
+    assert manager._extra_buffers_per_layer(tokens_per_block=32) == {}
 
 
 @pytest.mark.parametrize("dtype", (DataType.NVFP4, DataType.FLOAT))
@@ -307,6 +309,7 @@ def test_qsa_cache_manager_delegates_regular_kv_layout(
 ) -> None:
     manager = object.__new__(QSAMambaHybridCacheManagerV2)
     manager.dtype = dtype
+    manager._qsa_enabled = True
     sentinel = torch.empty(0, dtype=torch.int8)
     calls: list[tuple[object, int, str]] = []
 
