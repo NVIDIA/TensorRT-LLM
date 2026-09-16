@@ -33,15 +33,18 @@ permissions:
   pull-requests: read
   issues: write
 
-# Coalesce repeated events per PR or main; each run reads current refs.
-concurrency:
-  group: coderabbit-semantic-conflict-${{ github.event.pull_request.number || inputs.pull_number || 'main' }}
-  cancel-in-progress: false
-
 jobs:
   request-review:
     name: Request advisory semantic review
-    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      (github.event_name != 'pull_request_target' ||
+       contains(github.event.pull_request.labels.*.name, 'ai: semantic-conflict'))
+    # Serialize eligible jobs, so skipped PR events cannot replace queued work.
+    # Every run sweeps opted-in PRs so coalesced pending events are not lost.
+    concurrency:
+      group: coderabbit-semantic-conflict-requests
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -57,25 +60,21 @@ jobs:
 
             const pullNumber = process.env.DISPATCH_PULL_NUMBER;
             const repo = context.repo;
-            let numbers;
+            let retryNumber;
             if (context.eventName === 'workflow_dispatch') {
               const raw = (pullNumber || '').trim();
-              const number = Number(raw);
-              if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(number)) {
+              retryNumber = Number(raw);
+              if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(retryNumber)) {
                 throw new Error('pull_number must be a positive integer');
               }
-              numbers = [number];
-            } else if (context.eventName === 'push') {
-              const pulls = await github.paginate(github.rest.pulls.list, {
-                ...repo, state: 'open', base: 'main', per_page: 100,
-              });
-              numbers = pulls.filter(pr => !pr.draft && pr.labels.some(l => l.name === LABEL))
-                .map(pr => pr.number);
-            } else if (context.eventName === 'pull_request_target') {
-              numbers = [context.payload.pull_request.number];
-            } else {
+            } else if (!['push', 'pull_request_target'].includes(context.eventName)) {
               throw new Error(`Unsupported event: ${context.eventName}`);
             }
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              ...repo, state: 'open', base: 'main', per_page: 100,
+            });
+            const numbers = pulls.filter(pr => !pr.draft && pr.labels.some(l => l.name === LABEL))
+              .map(pr => pr.number);
 
             for (const number of numbers) {
               // Read current metadata instead of trusting a possibly queued event payload.
@@ -94,7 +93,7 @@ jobs:
               });
               // Only our own bot's comments can suppress an automatic request. A manual
               // dispatch always retries, including after a CodeRabbit timeout or failure.
-              if (context.eventName !== 'workflow_dispatch' && comments.some(comment =>
+              if (number !== retryNumber && comments.some(comment =>
                 comment.user?.login === BOT && comment.body?.includes(marker))) {
                 core.info(`PR #${number}: this SHA pair has already been requested.`);
                 continue;

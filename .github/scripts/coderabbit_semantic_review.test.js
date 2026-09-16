@@ -30,10 +30,12 @@ const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
 const NEW_BASE = 'c'.repeat(40);
 
+/** Run the actual workflow script against an in-memory GitHub API. */
 function harness(overrides = {}) {
   const pr = {number: 12, state: 'open', draft: false,
     head: {sha: HEAD}, base: {ref: 'main', sha: 'outdated-event-sha'},
     labels: [{name: 'ai: semantic-conflict'}], ...overrides};
+  const prs = [pr];
   const comments = [];
   const posted = [];
   let target = BASE;
@@ -42,7 +44,10 @@ function harness(overrides = {}) {
     rest: {
       pulls: {
         list: 'list-pulls',
-        get: async args => {calls.push(['get-pr', args]); return {data: pr};},
+        get: async args => {
+          calls.push(['get-pr', args]);
+          return {data: prs.find(p => p.number === args.pull_number)};
+        },
       },
       git: {getRef: async args => {
         calls.push(['get-ref', args]);
@@ -53,13 +58,13 @@ function harness(overrides = {}) {
         createComment: async args => {
           posted.push(args);
           comments.push({body: args.body, user: {login: 'github-actions[bot]'}});
-          return {data: {html_url: `https://github.com/example/repo/pull/12#${posted.length}`}};
+          return {data: {html_url: `https://github.com/example/repo/pull/${args.issue_number}#${posted.length}`}};
         },
       },
     },
     paginate: async (method, args) => {
       calls.push([method, args]);
-      if (method === 'list-pulls') return [pr];
+      if (method === 'list-pulls') return prs;
       assert.equal(method, 'list-comments');
       return comments;
     },
@@ -71,7 +76,7 @@ function harness(overrides = {}) {
   }};
   const context = {repo: {owner: 'example', repo: 'repo'},
     eventName: 'pull_request_target', payload: {pull_request: {number: 12}}};
-  return {pr, comments, posted, calls, summaries,
+  return {pr, prs, comments, posted, calls, summaries,
     setTarget: sha => {target = sha;},
     run: (eventName = 'pull_request_target', pullNumber = '') =>
       execute(github, {...context, eventName}, core, {env: {DISPATCH_PULL_NUMBER: pullNumber}}),
@@ -146,4 +151,16 @@ test('invalid dispatch inputs and unsupported events cannot post comments', asyn
     assert.equal(h.posted.length, 0);
   }
   await assert.rejects(harness().run('issue_comment'), /Unsupported event/);
+});
+
+test('a coalesced event sweeps all opted-in PRs; manual retry is limited to its PR', async () => {
+  const h = harness();
+  h.prs.push({...h.pr, number: 13, head: {sha: 'd'.repeat(40)}});
+  await h.run();
+  assert.deepEqual(h.posted.map(c => c.issue_number), [12, 13]);
+  h.setTarget(NEW_BASE);
+  await h.run();
+  assert.deepEqual(h.posted.map(c => c.issue_number), [12, 13, 12, 13]);
+  await h.run('workflow_dispatch', '13');
+  assert.deepEqual(h.posted.map(c => c.issue_number), [12, 13, 12, 13, 13]);
 });
