@@ -406,8 +406,8 @@ def test_prepare_keeps_small_real_request_slots_across_steps():
     assert worker._position_initialized[slots].tolist() == [True, True]
 
 
-def test_prepare_resets_small_cuda_graph_warmup_slots():
-    """CUDA-graph metadata gives warmup rows distinct, resettable slots."""
+def test_prepare_keeps_cuda_graph_slots_across_replays():
+    """Graph metadata must not reset rolling state before each replay."""
     worker = _make_worker()
     meta = _make_metadata(max_num_requests=4)
     worker._lazy_init(_fake_draft_model(), meta)
@@ -426,9 +426,9 @@ def test_prepare_resets_small_cuda_graph_warmup_slots():
 
     meta.prepare()
     slots = worker._batch_to_slot[:3]
-    assert worker._ctx_len[slots].tolist() == [0, 0, 0]
-    assert worker._valid_len[slots].tolist() == [0, 0, 0]
-    assert worker._position_initialized[slots].tolist() == [False, False, False]
+    assert worker._ctx_len[slots].tolist() == [7, 8, 9]
+    assert worker._valid_len[slots].tolist() == [1, 2, 3]
+    assert worker._position_initialized[slots].tolist() == [True, True, True]
 
 
 class _RecordingDraftModel:
