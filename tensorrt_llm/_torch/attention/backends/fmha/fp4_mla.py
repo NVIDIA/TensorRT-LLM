@@ -378,6 +378,7 @@ class Fp4MlaFmha(PhasedFmha):
                 prequantized_q=prequantized_q,
                 prequantized_q_sf=prequantized_q_sf,
                 q_batch_capacity=q_batch_capacity,
+                softmax_stats_tensor=params.fwd.softmax_stats_tensor,
             )
         finally:
             metadata._fp4_mla_prequantized_q = None
