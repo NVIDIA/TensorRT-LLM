@@ -34,6 +34,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.situ import SituAndMul
+from tensorrt_llm._torch.moe.fused_moe.activation import DEFAULT_MOE_ACTIVATION, SiTuActivation
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoECommPlan, MoERunContext
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
@@ -49,9 +50,9 @@ situ_supported = pytest.mark.skipif(
     "Current SM is %d." % getSMVersion(),
 )
 
-# Kimi K3 defaults. ``trtllm_gen_activation_alpha`` is the gate-side SiTU beta
-# (the cubin's ``alpha``); ``trtllm_gen_activation_beta`` is the linear-side
-# SiTU beta (the cubin's ``beta``). See modeling_kimi_linear.py.
+# Kimi K3 defaults. ``gate_softcap`` is the gate-side SiTU beta (the cubin's
+# ``alpha``); ``linear_softcap`` is the linear-side SiTU beta (the cubin's
+# ``beta``). See modeling_kimi_linear.py.
 GATE_ALPHA = 4.0
 LINEAR_BETA = 25.0
 
@@ -71,13 +72,6 @@ def _build_backend(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         moe_backend="TRTLLM",
     )
-    situ_kwargs = {}
-    if situ:
-        situ_kwargs = dict(
-            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-            trtllm_gen_activation_alpha=GATE_ALPHA,
-            trtllm_gen_activation_beta=LINEAR_BETA,
-        )
     return TRTLLMGenFusedMoE(
         routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
         num_experts=num_experts,
@@ -88,10 +82,14 @@ def _build_backend(
         model_config=model_config,
         init_load_balancer=False,
         weight_loading_mode=MoEWeightLoadingMode.VANILLA,
-        # SiTU rides the generic SwiGLU geometry; the fused activation is
-        # selected by trtllm_gen_activation_type, not by activation_type.
-        activation_type=ActivationType.Swiglu,
-        **situ_kwargs,
+        # The activation carrier is the selector: the kind picks the fused
+        # SiTU cubin family and the two soft-caps travel with it, so there is
+        # no separate activation_type / alpha / beta to pass.
+        activation=(
+            SiTuActivation(gate_softcap=GATE_ALPHA, linear_softcap=LINEAR_BETA)
+            if situ
+            else DEFAULT_MOE_ACTIVATION
+        ),
     )
 
 
@@ -173,23 +171,13 @@ def _rel_l2(actual: torch.Tensor, reference: torch.Tensor) -> float:
     return ((actual.float() - reference.float()).norm() / reference.float().norm()).item()
 
 
-def test_situ_backend_activation_overrides_generic_swiglu():
-    """The backend-local SiTu selector must win over generic SwiGLU geometry."""
-    backend = object.__new__(TRTLLMGenFusedMoE)
-    backend.trtllm_gen_activation_type = ActType_TrtllmGen.SiTu
-
-    assert backend._to_trtllm_gen_activation_type(ActivationType.Swiglu) == int(
-        ActType_TrtllmGen.SiTu
-    )
-
-
 @situ_supported
 @pytest.mark.parametrize("num_tokens", [1, 8, 512])
 def test_nvfp4_situ_runner_has_valid_configs(num_tokens):
     """The NVFP4 SiTU cubins must be reachable through tactic selection."""
     runner = torch.classes.trtllm.FP4BlockScaleMoERunner(int(ActType_TrtllmGen.SiTu))
-    # (topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, useLamport)
-    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, True)
+    # (topK, hiddenSize, intermediateSize, numLocalExperts, numTokens)
+    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens)
     assert tactics, f"no valid NVFP4 SiTU tactic for num_tokens={num_tokens}"
 
 
