@@ -18,6 +18,8 @@ Contract under test (see the host module docstring): batch-uniform host-int
 ``n_valid`` in compressed index space, fp32 logits with a 64-element-multiple
 row stride, output = exact (tie-interchangeable) top-K indices of
 ``logits[:, :n_valid]`` per row.
+The production ``run_varlen`` entry additionally accepts native BF16 logits
+and per-request device KV lengths, including CUDA graph replay.
 
 Checks per case:
   - tie-aware exactness: the multiset of gathered output values equals the
@@ -912,11 +914,9 @@ def test_selfsampling_launcher_cache_identity_includes_device_profile(monkeypatc
     assert ss_host._varlen_launcher(*shape, num_sms=148, sm_version=103) is launcher_sm103
 
 
-def test_selfsampling_topk_varlen_rejects_non_fp32():
-    """Engine-level dtype contract: bf16/fp16 logits must raise a clear
-    error (the dispatch seam falls through before this; direct callers get
-    the loud contract message instead of a CuTe typing failure)."""
-    logits = torch.randn(1, 8192, device=_DEV, dtype=torch.bfloat16)
+def test_selfsampling_topk_varlen_rejects_fp16():
+    """Unsupported FP16 logits fail before compilation; BF16 is supported."""
+    logits = torch.randn(1, 8192, device=_DEV, dtype=torch.float16)
     kv = torch.tensor([8000], dtype=torch.int32, device=_DEV)
     out = torch.empty(1, 512, dtype=torch.int32, device=_DEV)
     with pytest.raises(RuntimeError, match="float32"):
@@ -1791,3 +1791,237 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan():
         ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
         torch.cuda.synchronize()
         _check_prefill_exact(lg, out, rs, re, k)
+
+
+def _bf16_varlen_lengths(kv: list[int], next_n: int, compress_ratio: int, ncols: int) -> list[int]:
+    return [
+        min(max(kv[row // next_n] - next_n + row % next_n + 1, 0) // compress_ratio, ncols)
+        for row in range(len(kv) * next_n)
+    ]
+
+
+def _make_bf16_varlen_case(
+    rows: int,
+    ncols: int,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    pattern: str,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
+    # An aligned storage offset and an odd logical width exercise arena views.
+    stride = (ncols + 255) // 256 * 256 + (256 if rows > 1 else 0)
+    offset = 8
+    storage = torch.empty(rows * stride + offset, dtype=torch.bfloat16, device=_DEV)
+    arena = storage[offset:].view(rows, stride)
+    arena.copy_(torch.randn((rows, stride), generator=generator, device=_DEV))
+    if pattern == "ties":
+        arena.copy_((arena.float() * 2).round())
+        arena[:, 0::7] = -0.0
+        arena[:, 1::7] = 0.0
+    elif pattern == "infinities":
+        arena[:, 17] = float("inf")
+        arena[1::4] = float("-inf")
+        arena[2::4, top_k // 2 :] = float("-inf")
+        arena[3::4, : top_k + 11] = float("inf")
+    elif pattern == "crosszero":
+        arena.copy_(-arena.float().abs() * 0.015625)
+        arena[:, : top_k // 2].abs_()
+        arena[:, top_k // 2 : 3 * top_k // 4] = 0.0
+    else:
+        raise ValueError(f"unknown test pattern: {pattern}")
+    logits = arena[:, :ncols]
+    kv_pattern = [ncols * compress_ratio, (ncols - 7) * compress_ratio, top_k - 3, 0]
+    kv = [kv_pattern[request % len(kv_pattern)] for request in range(rows // next_n)]
+    lengths = _bf16_varlen_lengths(kv, next_n, compress_ratio, ncols)
+    for row, valid in enumerate(lengths):
+        arena[row, valid:] = float("inf")
+    return logits, torch.tensor(kv, dtype=torch.int32, device=_DEV), lengths
+
+
+def _check_bf16_varlen_exact(
+    logits: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: list[int],
+    values: torch.Tensor | None = None,
+) -> None:
+    top_k = indices.shape[1]
+    output_values = None
+    if values is not None:
+        # Optional values retain the existing flattened [rows * K] ABI even
+        # when the supplied scratch buffer has more than K columns.
+        count = logits.shape[0] * top_k
+        output_values = values.flatten()[:count].view(-1, top_k)
+        assert bool((values.flatten()[count:] == 7.0).all())
+    for row, valid in enumerate(lengths):
+        count = min(valid, top_k)
+        idx = indices[row, :count].long()
+        assert bool(((idx >= 0) & (idx < valid)).all()), f"row {row}: out-of-range index"
+        assert idx.unique().numel() == count, f"row {row}: duplicate indices"
+        assert bool((indices[row, count:] == -1).all()), f"row {row}: invalid tail padding"
+        gathered = logits[row, idx]
+        reference = torch.topk(logits[row, :valid], count).values
+        assert torch.equal(
+            (gathered.float() + 0.0).sort().values,
+            (reference.float() + 0.0).sort().values,
+        ), f"row {row}: BF16 top-K value multiset mismatch"
+        if output_values is not None:
+            assert torch.equal(output_values[row, :count], gathered.float())
+            assert bool((output_values[row, count:] == torch.finfo(torch.float32).min).all())
+
+
+@pytest.mark.parametrize(
+    "rows,ncols,top_k,next_n,compress_ratio,pattern",
+    [
+        pytest.param(1, 65536, 2048, 1, 1, "ties", id="hybrid128"),
+        pytest.param(4, 131072, 1024, 1, 4, "infinities", id="regclus_cr4"),
+        pytest.param(4, 32768, 512, 4, 4, "ties", id="regclus_mtp4"),
+        pytest.param(4, 8192, 2048, 4, 1, "infinities", id="reg_mtp4"),
+        pytest.param(8, 4099, 512, 4, 4, "ties", id="reg_odd_width"),
+        pytest.param(4, 2048, 1024, 1, 4, "infinities", id="reg_small"),
+        pytest.param(64, 65536, 2048, 1, 1, "crosszero", id="dense_crosszero_b64"),
+        pytest.param(128, 65536, 2048, 1, 1, "crosszero", id="dense_crosszero_b128"),
+        pytest.param(16, 262144, 2048, 1, 1, "infinities", id="dense_split"),
+        pytest.param(256, 32768, 1024, 1, 4, "ties", id="main_nonsplit"),
+        pytest.param(32, 262144, 512, 4, 4, "infinities", id="cluster_mtp4"),
+        pytest.param(4, 8195, 512, 1, 1, "infinities", id="reg_odd_tail"),
+    ],
+)
+def test_selfsampling_topk_varlen_bf16_exactness(
+    rows: int,
+    ncols: int,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    pattern: str,
+) -> None:
+    """Native BF16 paths preserve values, index validity and padded row windows."""
+    logits, kv_lens, lengths = _make_bf16_varlen_case(
+        rows, ncols, top_k, next_n, compress_ratio, pattern
+    )
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    values = torch.full((rows, top_k + 13), 7.0, dtype=torch.float32, device=_DEV)
+    ss_host.run_varlen(
+        logits,
+        kv_lens,
+        indices,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        values=values,
+        max_seq_len=ncols * compress_ratio,
+    )
+    torch.cuda.synchronize()
+    _check_bf16_varlen_exact(logits, indices, lengths, values)
+
+
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("extra", [1, 2, 3])
+def test_selfsampling_topk_varlen_bf16_complement(top_k: int, extra: int) -> None:
+    """Near-K complement selection remains exact across BF16 ties and infinities."""
+    rows, ncols = 4, top_k + extra
+    logits, _, _ = _make_bf16_varlen_case(rows, ncols, top_k, 1, 1, "ties")
+    logits[0, :ncols] = float("-inf")
+    logits[0, 0] = float("inf")
+    logits[1, :ncols] = 0.0
+    lengths = [ncols, ncols, top_k - 1, 0]
+    kv_lens = torch.tensor(lengths, dtype=torch.int32, device=_DEV)
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv_lens, indices, max_seq_len=ncols)
+    torch.cuda.synchronize()
+    _check_bf16_varlen_exact(logits, indices, lengths)
+
+
+@pytest.mark.parametrize(
+    "rows,ncols,top_k,next_n,compress_ratio",
+    [
+        pytest.param(8, 8195, 512, 4, 4, id="reg_mtp4"),
+        pytest.param(4, 32768, 1024, 1, 4, id="regclus"),
+        pytest.param(1, 65536, 2048, 1, 1, id="hybrid128"),
+        pytest.param(16, 262144, 2048, 1, 1, id="main_split"),
+    ],
+)
+def test_selfsampling_topk_varlen_bf16_cuda_graph(
+    rows: int, ncols: int, top_k: int, next_n: int, compress_ratio: int
+) -> None:
+    """BF16 warmup permits graph capture and replay with changed device KV lengths."""
+    logits, kv_lens, lengths = _make_bf16_varlen_case(
+        rows, ncols, top_k, next_n, compress_ratio, "ties"
+    )
+    original = logits.clone()
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.warmup_varlen(
+        top_k,
+        ncols * compress_ratio,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        num_rows_list=(rows,),
+        row_stride=logits.stride(0) if rows > 1 else logits.shape[1],
+        dtype=torch.bfloat16,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(
+            logits,
+            kv_lens,
+            indices,
+            next_n=next_n,
+            compress_ratio=compress_ratio,
+            max_seq_len=ncols * compress_ratio,
+        )
+    for step in range(3):
+        if step:
+            options = [top_k - 3, ncols - 11, 0, top_k + 3]
+            kv = [
+                options[(request + step) % len(options)] * compress_ratio
+                for request in range(rows // next_n)
+            ]
+            kv_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+            lengths = _bf16_varlen_lengths(kv, next_n, compress_ratio, ncols)
+            logits.copy_(original)
+            for row, valid in enumerate(lengths):
+                logits[row, valid:] = float("inf")
+        indices.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_bf16_varlen_exact(logits, indices, lengths)
+
+
+def test_selfsampling_topk_varlen_bf16_layout_guards() -> None:
+    """Reject unsafe BF16 vector-load layouts before compiling a launcher."""
+    kv_lens = torch.full((2,), 8192, dtype=torch.int32, device=_DEV)
+    indices = torch.empty((2, 512), dtype=torch.int32, device=_DEV)
+    arena = torch.empty((2, 8256), dtype=torch.bfloat16, device=_DEV)
+    unaligned_storage = torch.empty(2 * 8256 + 1, dtype=torch.bfloat16, device=_DEV)
+    unaligned = unaligned_storage[1:].view(2, 8256)[:, :8192]
+    for logits, message in (
+        (arena[:, ::2], "inner stride"),
+        (torch.empty((2, 8193), dtype=torch.bfloat16, device=_DEV), "multiple of 8"),
+        (unaligned, "aligned"),
+    ):
+        with pytest.raises(RuntimeError, match=message):
+            ss_host.run_varlen(logits, kv_lens, indices, max_seq_len=8192)
+    with pytest.raises(RuntimeError, match="float32"):
+        ss_host.run_varlen(
+            arena, kv_lens, indices, values=torch.empty_like(indices, dtype=torch.bfloat16)
+        )
+
+
+def test_selfsampling_topk_varlen_bf16_cache_device_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BF16 launchers must not alias across CUDA devices or architecture profiles."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+        gvr_topk_decode_self_sampling_bf16_host as bf16_host,
+    )
+
+    shape = (160, 8192, 512, 8192, 1, 1)
+    profile_sm100 = ss_host._pack_device_profile(148, 100)
+    profile_sm103 = ss_host._pack_device_profile(148, 103)
+    launchers = {
+        (*shape, 0, profile_sm100): ("device0_sm100",),
+        (*shape, 1, profile_sm100): ("device1_sm100",),
+        (*shape, 0, profile_sm103): ("device0_sm103",),
+    }
+    monkeypatch.setattr(bf16_host, "_VARLEN_CACHE_BF16", launchers)
+    for key, launcher in launchers.items():
+        assert bf16_host._varlen_launcher_bf16(*key) is launcher

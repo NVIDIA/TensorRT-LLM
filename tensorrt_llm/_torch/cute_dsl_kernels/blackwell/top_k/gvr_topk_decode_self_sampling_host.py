@@ -1466,6 +1466,10 @@ def run_varlen(
     host reads.  Without ``max_seq_len`` the envelope comes from ONE
     ``kv_lens.max()`` host read (documented sync, refused under capture).
 
+    Native BF16 decode uses a separate dispatch and launch cache. BF16 logits
+    require a row stride divisible by eight and a 16-byte aligned base; optional
+    values remain FP32. Input conversion, if needed, belongs to the caller.
+
     KNOWN LIMITATION: on rows containing NaN logits the selected index SET
     can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
     implementation-specifically). Finite inputs — including +/-inf and
@@ -1476,11 +1480,21 @@ def run_varlen(
     selection (streaming main / clustered register-resident) is a pure
     function of the capture-stable launcher key.
     """
-    if logits.dtype is not torch.float32:
-        raise RuntimeError(
-            f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
-            "are a follow-up — see the PR roadmap"
+    if logits.dtype is torch.bfloat16:
+        from . import gvr_topk_decode_self_sampling_bf16_host
+
+        return gvr_topk_decode_self_sampling_bf16_host.run_varlen_bf16(
+            logits,
+            kv_lens,
+            indices,
+            next_n=next_n,
+            compress_ratio=compress_ratio,
+            values=values,
+            max_seq_len=max_seq_len,
+            workspace=workspace,
         )
+    if logits.dtype is not torch.float32:
+        raise RuntimeError(f"logits must be float32 or bfloat16 (got {logits.dtype})")
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
     if kv_lens.dtype is not _I32:
@@ -1774,6 +1788,8 @@ def warmup_varlen(
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
+    *,
+    dtype: torch.dtype = torch.float32,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -1791,6 +1807,19 @@ def warmup_varlen(
     the same way.
 
     """
+    if dtype is torch.bfloat16:
+        from . import gvr_topk_decode_self_sampling_bf16_host
+
+        return gvr_topk_decode_self_sampling_bf16_host.warmup_varlen(
+            top_k,
+            max_seq_len,
+            compress_ratio=compress_ratio,
+            next_n=next_n,
+            num_rows_list=num_rows_list,
+            row_stride=row_stride,
+        )
+    if dtype is not torch.float32:
+        raise RuntimeError(f"decode warmup requires float32 or bfloat16, got {dtype}")
     dev = torch.cuda.current_device()
     profile = _device_profile_key(dev)
     num_sms, sm_version = _unpack_device_profile(profile)
