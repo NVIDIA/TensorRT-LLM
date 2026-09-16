@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Tests for CuTeDSL MoE FC2 tactic selection."""
+
 from collections.abc import Generator
 from types import SimpleNamespace
 
