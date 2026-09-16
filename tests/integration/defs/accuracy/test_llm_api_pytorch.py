@@ -2523,6 +2523,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=1,
                  kv_cache_config=kv_cache_config,
                  enable_attention_dp=True,
+                 enable_chunked_prefill=True,
                  trust_remote_code=True,
                  speculative_config=None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4

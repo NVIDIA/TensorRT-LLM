@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import tensorrt_llm.bindings.internal.batch_manager as batch_manager
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
     _derive_v2_layer_type_attention_windows,
     _get_num_pool_groups_for_estimation,
+    get_mla_context_workspace_kv_len_cap,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -54,6 +56,100 @@ def _make_mock_request(num_input_tokens, beam_width=1):
     req.input_token_ids = list(range(num_input_tokens))
     req.sampling_config.beam_width = beam_width
     return req
+
+
+def _make_mla_profile_creator() -> KvCacheCreator:
+    creator = object.__new__(KvCacheCreator)
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(vocab_size=128, kv_lora_rank=512, qk_rope_head_dim=64),
+        attn_backend="TRTLLM",
+        sparse_attention_config=None,
+    )
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(model_config=config),
+        attn_runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=8192),
+        use_mrope=False,
+    )
+    creator._mapping = Mapping()
+    creator._max_num_tokens = 8192
+    creator._max_beam_width = 1
+    creator._speculative_config = None
+    creator._tokens_per_block = 32
+    return creator
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_mla_profile_builds_full_cached_chunk(attention_dp: bool) -> None:
+    creator = _make_mla_profile_creator()
+    creator._mapping = Mapping(world_size=4, tp_size=4, enable_attention_dp=attention_dp)
+    requests = creator._create_dummy_context_requests(262143)
+    assert len(requests) == (4 if attention_dp else 1)
+    assert all(len(req.input_token_ids) == 40992 for req in requests)
+    # These are successive prefill steps of each long request. A fresh 8K
+    # prompt never reaches either of the cached-KV shapes being protected.
+    steps = [(position, min(8192, 40992 - position)) for position in range(0, 40992, 8192)]
+    assert (32768, 8192) in steps
+    assert (40960, 32) in steps
+
+
+@pytest.mark.parametrize("input_seq_len", [40992, 40991, 8192, 4095])
+def test_mla_profile_respects_context_limit(input_seq_len: int) -> None:
+    creator = _make_mla_profile_creator()
+    requests = creator._create_dummy_context_requests(input_seq_len)
+    assert all(len(req.input_token_ids) <= input_seq_len for req in requests)
+    if input_seq_len == 40992:
+        assert creator._mla_chunked_profile_length == 40992
+    else:
+        assert creator._mla_chunked_profile_length is None
+        assert sum(len(req.input_token_ids) for req in requests) == 8192
+
+
+def test_mla_profile_uses_runtime_chunk_dimensions() -> None:
+    creator = _make_mla_profile_creator()
+    features = creator._model_engine.attn_runtime_features
+    features.chunk_size = 4096
+    features.chunked_prefill_buffer_batch_size = 3
+    # 12288 cached tokens round up to two 8192-token scheduler steps.
+    assert creator._get_mla_chunked_profile_length(262143) == 24576 + 32
+
+
+@pytest.mark.parametrize("profiled", [False, True])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_mla_profile_reserve_requires_measured_chunk(profiled: bool, bounded: bool) -> None:
+    config = SimpleNamespace(enable_block_reuse=True, fp8_context_mla_kv_len_cap=None)
+    cap = get_mla_context_workspace_kv_len_cap(
+        config,
+        max_batch_size=16,
+        max_num_tokens=8192,
+        max_seq_len=262144,
+        enable_chunked_prefill=True,
+        workspace_is_chunked_prefill_bounded=bounded,
+        chunked_workspace_profiled=profiled,
+    )
+    assert cap == (None if profiled and bounded else 16 * 262144)
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["disabled", "non_mla", "backend", "sparse", "beam", "spec"]
+)
+def test_mla_profile_leaves_other_paths_unchanged(unsupported: str) -> None:
+    creator = _make_mla_profile_creator()
+    config = creator._model_engine.model.model_config
+    if unsupported == "disabled":
+        creator._model_engine.attn_runtime_features.chunked_prefill = False
+    elif unsupported == "non_mla":
+        config.pretrained_config.kv_lora_rank = None
+    elif unsupported == "backend":
+        config.attn_backend = "FLASHINFER"
+    elif unsupported == "sparse":
+        config.sparse_attention_config = SimpleNamespace(algorithm="dsa")
+    elif unsupported == "beam":
+        creator._max_beam_width = 2
+    else:
+        creator._speculative_config = object()
+    requests = creator._create_dummy_context_requests(262143)
+    assert creator._mla_chunked_profile_length is None
+    assert sum(len(req.input_token_ids) for req in requests) == 8192
 
 
 class _TextModel:
