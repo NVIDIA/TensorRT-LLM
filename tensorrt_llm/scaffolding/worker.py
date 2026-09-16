@@ -113,10 +113,11 @@ class OpenaiWorker(Worker):
     ):
         # Dynamic patch to support KV cache hint
         async def send_kv_cache_hint(self, task: DropKVCacheTask, params: dict):
-            base_url = str(self.base_url)
-            if not base_url.endswith("/"):
-                base_url += "/"
-            url = base_url + "kv_cache_hints"
+            base_url = str(self.base_url).rstrip("/")
+            # The control endpoint is outside the OpenAI-compatible /v1 API.
+            if base_url.endswith("/v1"):
+                base_url = base_url[:-3]
+            url = base_url + "/_control/kv_cache/truncate"
 
             headers = {}
             if self.api_key is not None:
