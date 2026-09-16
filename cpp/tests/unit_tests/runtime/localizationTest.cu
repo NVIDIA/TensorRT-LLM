@@ -151,8 +151,6 @@ protected:
 
         StreamHolder() = default;
 
-        // The declarations below make this a non-aggregate since C++20 ([dcl.init.aggr], P1008), so
-        // StreamHolder{someStream} no longer resolves to aggregate initialization.
         explicit StreamHolder(CUstream stream, bool owned = false) noexcept
             : stream(stream)
             , owned(owned)
