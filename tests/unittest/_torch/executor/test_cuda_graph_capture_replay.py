@@ -12,30 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CUDAGraphRunner.capture()/replay() and the shared_static_tensors they share.
+"""Tests for CUDAGraphRunner.capture()/replay(), the shared_static_tensors they
+share, the opt-in strict buffer-stability check, and the capture-allowed gate.
 
-These guard against a static input being added without a corresponding copy
-in replay(): a captured graph reads from shared_static_tensors at fixed
-addresses, and replay() is responsible for copying every live input into
-those buffers before each graph.replay() call. A missed copy_ silently
-leaves stale (or poisoned) data in the region the graph reads.
+TestCaptureReplayStaticTensors guards against a missing copy_ in replay()
+leaving shared_static_tensors stale or poisoned at the fixed addresses the
+captured graph reads from.
 
-Five invariants, six tests:
-  - Poison-fill completeness: replay() must overwrite every sentinel-poisoned
-    static tensor. Catches a key whose copy_ was dropped entirely.
-  - input_ids extent agreement: replay() must reject an input_ids whose
-    length doesn't match the key's captured extent, rather than silently
-    under-copying and leaving a stale tail.
-  - mrope_delta_read_seq_slots extent agreement: same invariant, but for
-    mrope_delta_read_seq_slots, whose copy extent comes from the caller's
-    tensor shape rather than from input_ids' seqlen.
-  - mrope_delta_read_seq_slots omission fill: a replay that omits
-    mrope_delta_read_seq_slots entirely must still fill the static buffer
-    with the dummy seq slot's permanently-zero delta, both right after
-    capture (uninitialized buffer) and after a prior replay left real slot
-    values in the buffer (two tests, same invariant, two starting states).
-  - Staleness detection: two replays with different inputs must produce
-    different outputs. A dropped copy_ makes them identical.
+TestStrictBufferCheck guards a different staleness class: attn_metadata/
+spec_metadata tensor attributes aren't copied into by replay() at all, so
+TLLM_CUDA_GRAPH_STRICT_BUFFERS checks their data_ptr() stays stable across
+replay() calls, catching a rebind (vs. an in-place update) to stale memory.
+
+TestCaptureAllowedGate guards allow_capture(): live capture must stay
+confined to warmup, since capturing outside it could resize shared buffers
+and invalidate addresses already baked into other graphs.
 """
 
 from types import SimpleNamespace
