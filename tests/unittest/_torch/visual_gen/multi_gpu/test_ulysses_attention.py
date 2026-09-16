@@ -7,11 +7,10 @@ Run with:
     pytest tests/visual_gen/multi_gpu/test_ulysses_attention.py -v
 """
 
-import os
-
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
 import math
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Callable
 
 import pytest
@@ -20,20 +19,23 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
-from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
-    AttentionBackend,
-    AttentionTensorLayout,
-)
+
+@contextmanager
+def _disable_mpi() -> Iterator[None]:
+    """Temporarily use torch.distributed, preserving the caller's MPI setting."""
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("TLLM_DISABLE_MPI", "1")
+        yield
 
 
-@pytest.fixture(autouse=True, scope="module")
-def _cleanup_mpi_env():
-    """Clean up TLLM_DISABLE_MPI env var after tests complete."""
-    yield
-    os.environ.pop("TLLM_DISABLE_MPI", None)
+with _disable_mpi():
+    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+    from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
+    from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
+    from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
+        AttentionBackend,
+        AttentionTensorLayout,
+    )
 
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "gloo", port: int = 29500):
@@ -86,16 +88,18 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     # Spawn processes
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
+    # Spawned workers inherit this setting before importing the test module.
+    with _disable_mpi():
+        from ._visual_gen_dist_utils import spawn_with_retry
 
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
+        spawn_with_retry(
+            lambda port: mp.spawn(
+                _distributed_worker,
+                args=(world_size, backend, test_fn, port),
+                nprocs=world_size,
+                join=True,
+            )
         )
-    )
 
 
 # =============================================================================

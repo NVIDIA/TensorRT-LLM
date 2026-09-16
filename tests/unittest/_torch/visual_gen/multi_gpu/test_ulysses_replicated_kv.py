@@ -14,15 +14,9 @@
 # limitations under the License.
 """CI-routed CPU coverage for Ulysses attention with replicated K/V."""
 
-import os
-
 import pytest
 
-_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
-from .test_ulysses_attention import (  # noqa: E402
-    MODULES_AVAILABLE,
+from .test_ulysses_attention import (
     _logic_ulysses_replicated_kv_equal_lengths,
     _logic_ulysses_replicated_kv_unequal_lengths,
     run_test_in_distributed,
@@ -31,16 +25,6 @@ from .test_ulysses_attention import (  # noqa: E402
 pytestmark = pytest.mark.cpu_only
 
 
-@pytest.fixture(autouse=True, scope="module")
-def _cleanup_mpi_env():
-    yield
-    if _TLLM_DISABLE_MPI is None:
-        os.environ.pop("TLLM_DISABLE_MPI", None)
-    else:
-        os.environ["TLLM_DISABLE_MPI"] = _TLLM_DISABLE_MPI
-
-
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 def test_ulysses_replicated_kv_unequal_lengths():
     """Unequal replicated context and generated padding match unpadded SDPA."""
     run_test_in_distributed(
@@ -50,7 +34,6 @@ def test_ulysses_replicated_kv_unequal_lengths():
     )
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 def test_ulysses_replicated_kv_equal_lengths():
     """Uniform replicated context stays on the batched attention path."""
     run_test_in_distributed(
