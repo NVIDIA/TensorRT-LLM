@@ -128,6 +128,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch
   # visual_gen
   - unittest/_torch/visual_gen/test_profiler.py
+  - unittest/visual_gen/test_executor_shared_tensor_ipc.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
