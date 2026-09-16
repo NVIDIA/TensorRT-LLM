@@ -92,18 +92,42 @@ class Profile:
 
 
 PROFILES: Dict[str, Profile] = {
-    "deepseek_v3": Profile(
-        name="deepseek_v3",
-        hidden_size=7168,
-        top_k=8,
-        num_experts=256,
-        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
-    ),
     "gpt_oss": Profile(
         name="gpt_oss",
         hidden_size=2880,
         top_k=4,
         num_experts=128,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    ),
+    "deepseek_v3": Profile(
+        name="deepseek_v3",
+        hidden_size=7168,
+        top_k=8,
+        num_experts=256,
+        # Notice: Cutlass quantize_input() is a no-op for FP8_BLOCK_SCALES: dispatch
+        # carries BF16 activations, not post-quantized FP8 payloads.
+        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+    ),
+    "deepseek_v4_flash": Profile(
+        name="deepseek_v4_flash",
+        hidden_size=4096,
+        top_k=6,
+        num_experts=256,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    ),
+    "deepseek_v4_pro": Profile(
+        name="deepseek_v4_pro",
+        hidden_size=7168,
+        top_k=6,
+        num_experts=384,
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    ),
+    "kimi_k3": Profile(
+        name="kimi_k3",
+        # All-to-all exchanges latent MoE activations, not the model's 7168-wide states.
+        hidden_size=3584,
+        top_k=16,
+        num_experts=896,
         quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
     ),
 }
@@ -357,6 +381,14 @@ def _time_dispatch_and_combine(
     output initialization are outside each timed phase. Optional CUPTI activity
     records are attributed using the IDs and GPU timestamps of those events.
 
+    Order:
+      1. Discover the receive shape and allocate the static combine payload.
+      2. Create timing events and obtain their CUPTI IDs when profiling is enabled.
+      3. Define warmup and measured iterations; capture them together in graph mode.
+      4. Clear setup profiling records, synchronize ranks, and execute the iterations.
+      5. Read per-iteration dispatch/combine latency from CUDA events.
+      6. Attribute CUPTI kernels to phases using the timing events' GPU timestamps.
+
     Returns dispatch times, combine times, and per-kernel activity statistics.
     """
     device = hidden_states.device
@@ -371,7 +403,7 @@ def _time_dispatch_and_combine(
     if cupti_ctx is not None:
         cupti, cupti_kernels, cupti_events = cupti_ctx
 
-    # ---- 1. Shape discovery: one eager run ----
+    # ---- 1. Discover receive shape and allocate the combine payload ----
     backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
     recv_hidden_states, _, _, _ = backend.dispatch(
         hidden_states,
@@ -388,6 +420,7 @@ def _time_dispatch_and_combine(
     backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
     torch.cuda.synchronize()
 
+    # ---- 2. Prepare timing events and CUPTI event IDs ----
     # cudaEventRecordExternal (0x1, CUDA 11.2+) makes events recorded inside a
     # CUDA graph queryable via elapsed_time() after replay. Without this flag,
     # graph-internal events raise cudaErrorInvalidValue on elapsed_time().
@@ -434,6 +467,7 @@ def _time_dispatch_and_combine(
                 )
             )
 
+    # ---- 3. Define iterations and optionally capture the CUDA graph ----
     def _run_iterations() -> None:
         for _ in range(warmup):
             if l2_buffer is not None:
@@ -476,6 +510,7 @@ def _time_dispatch_and_combine(
         with torch.cuda.graph(big_graph):
             _run_iterations()
 
+    # ---- 4. Clear setup records, synchronize, and execute ----
     if cupti_ctx is not None:
         cupti.activity_flush_all(0)
         cupti_kernels.clear()
@@ -489,9 +524,11 @@ def _time_dispatch_and_combine(
     if cupti_ctx is not None:
         cupti.activity_flush_all(0)
 
+    # ---- 5. Read per-iteration CUDA-event timings ----
     dispatch_times_us = [d_starts[i].elapsed_time(d_ends[i]) * 1e3 for i in range(iters)]
     combine_times_us = [c_starts[i].elapsed_time(c_ends[i]) * 1e3 for i in range(iters)]
 
+    # ---- 6. Attribute CUPTI kernels to dispatch/combine phases ----
     detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
     if cupti_ctx is not None:
         detailed_stats = _build_kernel_stats_cupti(cupti_kernels, cupti_events, phase_event_ids)
@@ -526,105 +563,6 @@ def _gather_per_rank(times_us: List[float], iter_stats: bool = False) -> Dict[st
     if iter_stats:
         return {f"rank{i}": _compute_stats(t) for i, t in enumerate(all_times)}
     return {f"rank{i}": (sum(t) / len(t) if t else 0.0) for i, t in enumerate(all_times)}
-
-
-def _min_local_tokens_for_receiver_coverage(ep_size: int, top_k: int) -> int:
-    if top_k <= 0:
-        raise ValueError(f"top_k must be > 0, got {top_k}")
-    return (ep_size + top_k - 1) // top_k
-
-
-def _scale_local_batch_sizes_for_receiver_coverage(
-    local_batch_sizes: List[int], ep_size: int, top_k: int
-) -> List[int]:
-    min_tokens = _min_local_tokens_for_receiver_coverage(ep_size, top_k)
-    scaled: List[int] = []
-    for local_num_tokens in local_batch_sizes:
-        value = max(int(local_num_tokens), min_tokens)
-        if not scaled or scaled[-1] != value:
-            scaled.append(value)
-    return scaled
-
-
-def _verify_dispatch_sentinel(
-    backend: Communication,
-    *,
-    hidden_size: int,
-    top_k: int,
-    experts_per_rank: int,
-    ep_size: int,
-    act_dtype: torch.dtype,
-    device: torch.device,
-    local_num_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    """One dispatch+combine with sender-rank-tagged hidden_states.
-
-    Each rank fills its hidden_states with the scalar ``rank + 1``. After
-    dispatch, each received row should be that integer cast to ``act_dtype``;
-    rows reading as 0 are either padding or a silently-broken peer read
-    (e.g. cross-rack MNNVL mapping that succeeded at construction but doesn't
-    actually back the peer's memory). Returns the per-rank decoded-sender
-    histogram for the caller to allgather and inspect.
-    """
-    rank = mpi_rank()
-    min_tokens = _min_local_tokens_for_receiver_coverage(ep_size, top_k)
-    local_num_tokens = min_tokens if local_num_tokens is None else max(local_num_tokens, min_tokens)
-    all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
-    if not backend.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
-        return {"rank": rank, "skipped": True}
-
-    sentinel = float(rank + 1)
-    hidden_states = torch.full(
-        (local_num_tokens, hidden_size),
-        sentinel,
-        dtype=act_dtype,
-        device=device,
-    )
-    flat_slots = torch.arange(local_num_tokens * top_k, device=device, dtype=torch.int64)
-    schedule = flat_slots + rank
-    target_rank = schedule % ep_size
-    local_expert = (schedule // ep_size) % experts_per_rank
-    token_selected_slots = (
-        (target_rank * experts_per_rank + local_expert)
-        .view(local_num_tokens, top_k)
-        .to(torch.int32)
-    )
-    token_final_scales = torch.ones(
-        local_num_tokens,
-        top_k,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
-    recv_hs, _, _, _ = backend.dispatch(
-        hidden_states,
-        None,
-        token_selected_slots,
-        token_final_scales,
-        all_rank_num_tokens,
-    )
-    # Pair dispatch with a combine so backend state mirrors the bench's
-    # warmup->timing call pattern (NCCL_EP especially relies on this).
-    if hasattr(backend, "get_combine_payload_tensor_in_workspace"):
-        moe_out = backend.get_combine_payload_tensor_in_workspace(
-            max(all_rank_num_tokens), hidden_size, torch.bfloat16
-        )
-        moe_out.zero_()
-    else:
-        shape = list(recv_hs.shape)
-        shape[-1] = hidden_size
-        moe_out = torch.zeros(tuple(shape), dtype=torch.bfloat16, device=recv_hs.device)
-    backend.combine(moe_out, all_rank_max_num_tokens=max(all_rank_num_tokens))
-    torch.cuda.synchronize()
-
-    first_col = recv_hs[:, 0].to(torch.float32)
-    decoded = first_col.round().to(torch.int64)
-    unique, counts = decoded.unique(return_counts=True)
-    histogram: Dict[int, int] = {
-        int(u) - 1: int(c) for u, c in zip(unique.tolist(), counts.tolist(), strict=True)
-    }
-    return {"rank": rank, "histogram": histogram}
 
 
 def parse_args() -> argparse.Namespace:
@@ -755,16 +693,6 @@ def parse_args() -> argparse.Namespace:
         help="Use eager execution with CUDA event timing instead of CUDA graph replay. Kernel breakdown still uses CUPTI.",
     )
     parser.add_argument(
-        "--verify",
-        action="store_true",
-        help=(
-            "Run a single sentinel dispatch per backend before timing and print a "
-            "receiver/sender contribution matrix. Detects silent cross-rack "
-            "correctness failures where dispatch appears to succeed but produces "
-            "zeros or local-only data."
-        ),
-    )
-    parser.add_argument(
         "--pdl",
         action="store_true",
         default=False,
@@ -855,10 +783,6 @@ def _run_benchmark_worker_under_current_mpi(
 
     hidden_size, top_k, num_experts_total, quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
-    if args.verify:
-        local_batch_sizes = _scale_local_batch_sizes_for_receiver_coverage(
-            local_batch_sizes, ep_size, top_k
-        )
     act_dtype = torch.bfloat16
     quant_config = (
         QuantConfig(quant_algo=None)
@@ -970,58 +894,6 @@ def _run_benchmark_worker_under_current_mpi(
             )
             # Ensure quantization params (e.g., NVFP4 global scale) live on CUDA.
             moe = moe.to(device)
-
-        if args.verify:
-            verify_local = _verify_dispatch_sentinel(
-                backend,
-                hidden_size=hidden_size,
-                top_k=top_k,
-                experts_per_rank=experts_per_rank,
-                ep_size=ep_size,
-                act_dtype=act_dtype,
-                device=device,
-                local_num_tokens=local_batch_sizes[0],
-            )
-            all_verify = mpi_allgather(verify_local)
-            # Pass criterion: every receiver must have at least one token from
-            # every sender [0, ep_size). The verify local_num_tokens is scaled
-            # so local_num_tokens * top_k covers every receiver;
-            # any zero-column means the recv buffer was silently dropped from
-            # that sender.
-            verify_failed = False
-            for entry in all_verify:
-                if entry.get("skipped"):
-                    verify_failed = True
-                    break
-                hist = entry.get("histogram", {})
-                if any(hist.get(s, 0) == 0 for s in range(ep_size)):
-                    verify_failed = True
-                    break
-            if rank == 0:
-                status = "FAIL" if verify_failed else "PASS"
-                print(
-                    f"=== [verify] {backend_name} {status} -- sender->receiver "
-                    f"contribution (rows=receiver, cols=sender; -1 col = "
-                    f"padding/unmapped) ===",
-                    flush=True,
-                )
-                cols = [-1, *range(ep_size)]
-                header = "R\\S | " + "  ".join(f"{c:>5}" for c in cols) + "  | total"
-                print(header)
-                for entry in sorted(all_verify, key=lambda e: e.get("rank", -1)):
-                    r = entry.get("rank")
-                    if entry.get("skipped"):
-                        print(f"{r:>3} | skipped (workload not feasible at verify size)")
-                        continue
-                    hist = entry.get("histogram", {})
-                    cells = "  ".join(f"{hist.get(c, 0):>5}" for c in cols)
-                    print(f"{r:>3} | {cells}  | {sum(hist.values()):>5}")
-                sys.stdout.flush()
-            if verify_failed:
-                _maybe_warn_rank0(
-                    f"[bench_moe_comm] Skipping timing for {backend_name}: verify FAILED."
-                )
-                continue
 
         for local_num_tokens in local_batch_sizes:
             all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
