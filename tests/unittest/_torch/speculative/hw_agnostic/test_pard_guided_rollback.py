@@ -92,7 +92,10 @@ def test_pard_worker_rolls_back_after_verification(monkeypatch):
     batch_size = num_contexts = 2
     meta, attn, *inputs = _worker_inputs(batch_size, num_contexts, runtime_draft_len=K)
     accepted = torch.zeros(batch_size, K + 1, dtype=torch.int32, device="cuda")
-    num_accepted = torch.ones(batch_size, dtype=torch.int32, device="cuda")
+    # Distinct per-row counts: one row accepts the whole draft, the other only
+    # the golden token. Uniform values would let a broken forward that drops or
+    # transposes rows still pass the equality below.
+    num_accepted = torch.tensor([K + 1, 1], dtype=torch.int32, device="cuda")
     next_new = torch.zeros(batch_size, K + 1, dtype=torch.int32, device="cuda")
     monkeypatch.setattr(
         worker, "sample_and_accept_draft_tokens", lambda *a, **k: (accepted, num_accepted)
