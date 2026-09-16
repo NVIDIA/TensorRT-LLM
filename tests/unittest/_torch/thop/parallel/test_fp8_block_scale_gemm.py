@@ -578,6 +578,48 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
     )
 
 
+@pytest.mark.cpu_only
+def test_cute_dsl_scaled_mm_rejects_mixed_clusters():
+    from unittest import mock
+
+    import cutlass
+
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin.dense_blockscaled_gemm_persistent import (
+        Sm107BlockScaledPersistentDenseGemmMixedClustersKernel, scaled_mm)
+
+    gemm = Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
+        sf_vec_size=32,
+        mma_inst_shape=(128, 128, 128),
+        mma_tiler=(128, 128, 128),
+        preferred_cluster_shape_mn=(2, 1),
+        fallback_cluster_shape_mn=(1, 1),
+    )
+
+    with mock.patch(
+            "cutlass.cute.compile",
+            side_effect=AssertionError("Unexpected kernel compilation"),
+    ) as compile_mock:
+        with pytest.raises(
+                TypeError,
+                match="^scaled_mm only supports the base "
+                "Sm107BlockScaledPersistentDenseGemmKernel$",
+        ):
+            scaled_mm(
+                gemm,
+                a_dtype=cutlass.Float32,
+                b_dtype=cutlass.Float32,
+                c_dtype=cutlass.Float32,
+                sf_dtype=cutlass.Float32,
+                a_major="k",
+                b_major="k",
+                c_major="n",
+                max_active_clusters=1,
+                stream=None,
+                alpha_tensor=None,
+            )
+        compile_mock.assert_not_called()
+
+
 @pytest.mark.skipif(
     not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 CuTe DSL support.",
