@@ -20,8 +20,7 @@ Mapping and audit use key names and config only; the model loader places tensors
 from __future__ import annotations
 
 import re
-from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,47 +47,14 @@ _LANGUAGE_PREFIX = "model.language_model."
 _HC_RE = re.compile(r"^(model\.layers\.\d+\.)hc_(attn|ffn)_(fn|base|scale)$")
 
 
-class Disposition:
-    """How a checkpoint tensor reaches (or does not reach) the runtime."""
-
-    #: Placed on a destination parameter unchanged.
-    LOADED = "loaded"
-    #: Routed through expert packing or scale-layout conversion.
-    TRANSFORMED = "transformed"
-    #: Deliberately not loaded, under an exact allowlisted namespace.
-    IGNORED = "ignored"
-
-
 @dataclass
 class Glm5NextWeightAudit:
-    """Exhaustive per-key accounting for a GLM-5.3-Flash checkpoint."""
+    """Checkpoint destinations, explicitly ignored keys and unresolved keys."""
 
-    #: destination module/parameter name -> source key
+    # Runtime destination -> checkpoint source key.
     destinations: dict[str, str] = field(default_factory=dict)
-    #: source key -> disposition
-    disposition: dict[str, str] = field(default_factory=dict)
-    #: source key -> why it was transformed / ignored
-    reason: dict[str, str] = field(default_factory=dict)
-    #: keys that could not be placed at all -- always a hard error
+    ignored: set[str] = field(default_factory=set)
     unresolved: list[str] = field(default_factory=list)
-
-    def counts(self) -> dict[str, int]:
-        return dict(Counter(self.disposition.values()))
-
-    def keys_with(self, disposition: str) -> list[str]:
-        return sorted(k for k, d in self.disposition.items() if d == disposition)
-
-    def reasons(self) -> dict[str, int]:
-        return dict(Counter(self.reason.values()))
-
-
-def _ignored_reason(key: str, mtp_prefixes: Sequence[str]) -> str | None:
-    if key.startswith(_VISION_PREFIX):
-        return "vision tower weights are loaded by Glm5NextVLM, not the text decoder"
-    for prefix in mtp_prefixes:
-        if key.startswith(prefix):
-            return "MTP / next-n prediction layer is not enabled (no speculative_config)"
-    return None
 
 
 def remap_glm5_next_key(key: str) -> str | None:
@@ -141,31 +107,14 @@ def audit_glm5_next_checkpoint(
     audit = Glm5NextWeightAudit()
 
     for key in keys:
-        ignored = _ignored_reason(key, mtp_prefixes)
-        if ignored is not None:
-            audit.disposition[key] = Disposition.IGNORED
-            audit.reason[key] = ignored
+        if key.startswith((_VISION_PREFIX, *mtp_prefixes)):
+            audit.ignored.add(key)
             continue
-
         dest = remap_glm5_next_key(key)
         if dest is None:
             audit.unresolved.append(key)
-            continue
-
-        if dest.endswith(".weight_scale_inv"):
-            audit.disposition[key] = Disposition.TRANSFORMED
-            audit.reason[key] = "block-FP8 128x128 weight scale"
+        else:
             audit.destinations[dest] = key
-            continue
-
-        if ".mlp.experts." in dest:
-            audit.disposition[key] = Disposition.TRANSFORMED
-            audit.reason[key] = "routed expert stacked into the fused MoE layout"
-            audit.destinations[dest] = key
-            continue
-
-        audit.disposition[key] = Disposition.LOADED
-        audit.destinations[dest] = key
 
     return audit
 
@@ -191,7 +140,7 @@ def glm5_next_is_quantized(model_config: ModelConfig[PretrainedConfig]) -> bool:
     return True
 
 
-def _destination_owner(dest: str, num_layers: int) -> Any:
+def glm5_next_weight_owner(dest: str, num_layers: int) -> Any:
     """Which materialization unit owns ``dest``: a layer index or a named part."""
     match = re.match(r"^model\.layers\.(\d+)\.", dest)
     if match is not None:
@@ -221,13 +170,3 @@ class Glm5NextHfWeightMapper(HfWeightMapper):
         return audit_glm5_next_checkpoint(
             keys, self.config.pretrained_config, num_mtp_layers=num_mtp_layers
         )
-
-    @staticmethod
-    def destination(key: str) -> str | None:
-        """Runtime parameter name for a checkpoint key (``None``: not loaded)."""
-        return remap_glm5_next_key(key)
-
-    @staticmethod
-    def owner(dest: str, num_layers: int) -> Any:
-        """Materialization owner of a destination: a layer index or a named part."""
-        return _destination_owner(dest, num_layers)

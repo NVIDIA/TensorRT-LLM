@@ -3002,107 +3002,20 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
-    if config_utils.is_glm5_next(config):
-        # GLM-5.3-Flash hybrid: KDA recurrent/conv states on the mamba side,
-        # sparse-MLA latent cache (num_kv_heads=1, head_dim = kv_lora_rank +
-        # qk_rope_head_dim, SELFKONLY) plus one Role.INDEX_KEY indexer buffer
-        # per sparse layer on the paged side, all owned by one
-        # Glm5NextCacheManager. Must come before the is_mla(...) route: the
-        # glm5_next text config carries MLA fields, but only 11 of its 45
-        # layers are sparse MLA.
-        if max_beam_width > 1:
-            raise ValueError("glm5_next + beam search is not supported yet.")
-        if not estimating_kv_cache and kv_connector_manager is not None:
-            raise NotImplementedError(
-                "Connector manager is not supported for glm5_next.")
-        text_config = config_utils.unwrap_glm5_next_text_config(config)
-        mamba_params = extract_mamba_kv_cache_params(
-            config,
-            spec_config=spec_config,
-            quant_config=quant_config,
-        )
-        mamba_layer_mask, full_attention_layer_mask = (
-            _get_mamba_cache_layer_masks(
-                mamba_params,
-                mapping,
-                spec_config,
-                is_draft,
-            ))
-        num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
-                            else mamba_params.num_mamba_layers)
-        # The indexer state rides the same layer ids as the sparse latent
-        # pages; both are slot-addressed through the manager's slot-major
-        # views (see Glm5NextCacheManager.get_batch_slot_tables).
-        sparse_layer_ids = [
-            i for i, is_sparse in enumerate(full_attention_layer_mask)
-            if is_sparse
-        ]
-        # KDA fused multi-token verify (trtllm::kda_mtp_decode, shared with
-        # Kimi K3): the per-slot replay caches replace the per-step
-        # intermediate verification buffers. glm5_next has no other verify
-        # path, so the kernel must be available when speculating.
-        glm_extra_kwargs = {}
-        if spec_config is not None:
-            from ..modules.kimi_kda._kda_kernels import \
-                is_kda_mtp_verify_available
-            if not is_kda_mtp_verify_available():
-                raise RuntimeError(
-                    "glm5_next speculative decoding requires the fused KDA "
-                    "verify kernel (trtllm::kda_mtp_decode, CUTLASS DSL), "
-                    "which is unavailable on this device/build.")
-            glm_extra_kwargs["kda_replay_num_spec"] = (
-                spec_config.tokens_per_gen_step - 1)
-        kv_cache_manager = kv_cache_manager_cls(
-            # mamba (KDA) cache parameters
-            mamba_params.state_size,
-            mamba_params.conv_kernel,
-            mamba_params.num_heads,
-            mamba_params.n_groups,
-            mamba_params.head_dim,
-            num_mamba_layers,
-            mamba_layer_mask,
-            mamba_params.dtype,
-            mamba_params.mamba_ssm_cache_dtype,
-            # kv cache parameters (sparse-MLA latent + indexer state)
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
-            num_layers=sum(full_attention_layer_mask),
-            layer_mask=full_attention_layer_mask,
-            num_kv_heads=1,
-            head_dim=int(text_config.kv_lora_rank) +
-            int(getattr(text_config, "qk_rope_head_dim", 0) or 0),
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_num_tokens=max_num_tokens,
-            is_draft=is_draft,
-            max_batch_size=max_batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
-            spec_config=spec_config,
-            is_estimating_kv_cache=estimating_kv_cache,
-            execution_stream=execution_stream,
-            sparse_layer_ids=sparse_layer_ids,
-            # One indexer cache row is [k | gate | pool key] (see
-            # Glm5NextIndexer.cache_state_dim).
-            index_state_dim=3 * int(text_config.index_head_dim),
-            # KDA's conv state is a [Q | K | V] concatenation whose three
-            # sections have identical width, i.e. the qwen3_next layout.
-            **_mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"),
-            **glm_extra_kwargs,
-            **manager_extra_kwargs,
-        )
-    elif is_kimi_linear(config):
-        # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
-        # the mamba side of the hybrid manager, absorbed-MQA MLA latent cache
-        # (num_kv_heads=1, head_dim = kv_lora_rank + qk_rope_head_dim,
-        # SELFKONLY) on the paged-KV side. Must come before the is_mla(...)
-        # route: the kimi_linear config carries MLA fields, but only 24 of
-        # its 93 layers are MLA.
+    if config_utils.is_glm5_next(config) or is_kimi_linear(config):
+        is_glm = config_utils.is_glm5_next(config)
+        text_config = config_utils.unwrap_glm5_next_text_config(
+            config) if is_glm else config
+        # Both families combine KDA state with latent MLA pages. GLM adds
+        # paged indexer state; both use sequential verify when replay is unavailable.
         if max_beam_width > 1:
             raise ValueError(
+                "glm5_next + beam search is not supported yet." if is_glm else
                 "MambaHybridCacheManager + beam search is not supported yet.")
         if not estimating_kv_cache and kv_connector_manager is not None:
             raise NotImplementedError(
+                "Connector manager is not supported for glm5_next."
+                if is_glm else
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
         mamba_params = extract_mamba_kv_cache_params(
@@ -3119,31 +3032,29 @@ def _create_kv_cache_manager(
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
-        # Kimi K3 KDA state sharding follows the attention-family TP
-        # semantics (Qwen3-Next pattern): replicated under attention-DP,
-        # head-sharded across tp_size otherwise. That is exactly the cache
-        # manager's own internal gate (`tp_size = 1 if enable_attention_dp
-        # else tp_size`, then num_heads / n_groups / conv_dim divide by
-        # it), so the params pass through unscaled.
-        # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
-        # kernel can run here, allocate the per-slot replay caches instead
-        # of the legacy per-step intermediate verification buffers. The
-        # kernel replays accepted drafts from these caches and commits
-        # states in place, replacing the intermediate-buffer + promotion
-        # flow for KDA layers.
-        kimi_extra_kwargs = {}
+        # Pass full KDA head counts: the manager applies attention-TP sharding.
+        kda_extra_kwargs = {}
         kda_replay_manager_types = (MixedMambaHybridCacheManager,
                                     MambaHybridCacheManagerV2)
-        if (spec_config is not None
-                and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
+        if (spec_config is not None and
+            (is_glm
+             or issubclass(kv_cache_manager_cls, kda_replay_manager_types))):
             from ..modules.kimi_kda._kda_kernels import \
                 is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():
-                kimi_extra_kwargs["kda_replay_num_spec"] = (
+                kda_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+        if is_glm:
+            kda_extra_kwargs.update(
+                sparse_layer_ids=[
+                    i for i, sparse in enumerate(full_attention_layer_mask)
+                    if sparse
+                ],
+                index_state_dim=3 * int(text_config.index_head_dim),
+            )
         # KDA's conv state is a [Q | K | V] concatenation whose three sections
         # have identical width, i.e. the qwen3_next section layout.
-        kimi_extra_kwargs.update(
+        kda_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
@@ -3162,7 +3073,10 @@ def _create_kv_cache_manager(
             num_layers=sum(full_attention_layer_mask),
             layer_mask=full_attention_layer_mask,
             num_kv_heads=1,
-            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            head_dim=(int(text_config.kv_lora_rank) +
+                      int(getattr(text_config, "qk_rope_head_dim", 0) or 0)
+                      if is_glm else config.kv_lora_rank +
+                      config.qk_rope_head_dim),
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_num_tokens=max_num_tokens,
@@ -3173,7 +3087,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            **kimi_extra_kwargs,
+            **kda_extra_kwargs,
             **manager_extra_kwargs,
         )
     elif is_mla(config):

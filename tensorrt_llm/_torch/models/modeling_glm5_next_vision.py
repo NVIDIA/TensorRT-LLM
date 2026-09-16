@@ -9,7 +9,7 @@ Blocks use per-head Q/K RMSNorm, FP32 two-axis RoPE and clamped SwiGLU.
 Vision attention uses the TRTLLM backend with per-item full-attention segments
 and no KV cache, reusing Qwen-VL metadata preparation. The HF Glm5NextProcessor
 handles preprocessing and placeholder expansion; the required Transformers
-revision is documented in the deployment guide.
+version is documented in the deployment guide.
 """
 
 import copy
@@ -775,7 +775,7 @@ def _glm5_next_build_batched_input(multimodal_params: List[MultimodalParams]) ->
 class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Adapt HF image/video preprocessing and placeholder expansion to engine inputs.
 
-    Requires the GLM-specific Transformers revision in the deployment guide.
+    Requires the Transformers version specified in the deployment guide.
     """
 
     def __init__(
@@ -888,14 +888,9 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return max(side, self._merge_size)
 
     def _processor_max_patches(self) -> int:
-        """The HF image processor's own patch cap (its ``max_pixels`` budget),
-        measured by asking it about an oversized square image."""
-        big = 64 * 1024
-        return int(
-            self._processor._get_num_multimodal_tokens(image_sizes=[(big, big)])[
-                "num_image_patches"
-            ][0]
-        )
+        """HF's image-token budget expressed in pre-merge patch rows."""
+        processor = self._processor.image_processor
+        return int(processor.max_image_tokens) * int(processor.merge_size) ** 2
 
     def get_mm_max_tokens_per_item(
         self, max_num_encoder_tokens: Optional[int] = None
@@ -1065,6 +1060,10 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
         self.post_config()
 
     # -- engine contracts -----------------------------------------------------
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        return Glm5NextForCausalLM.get_model_defaults(llm_args)
+
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
         return Glm5NextForCausalLM.get_preferred_kv_cache_manager_version(pretrained_config)
