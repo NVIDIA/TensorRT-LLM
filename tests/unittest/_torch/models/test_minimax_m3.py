@@ -92,7 +92,8 @@ class _M3CompositionExperts(nn.Module):
 
 
 class _M3CompositionShared(nn.Module):
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, lora_params: dict | None = None) -> torch.Tensor:
+        del lora_params
         return torch.full_like(hidden_states, 2.0)
 
 
