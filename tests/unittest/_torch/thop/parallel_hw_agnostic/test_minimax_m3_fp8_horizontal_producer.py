@@ -42,7 +42,7 @@ def _index_cache(num_pages, stride_scale=5):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 129])
-@pytest.mark.parametrize("num_kv_heads,num_index_heads", [(4, 4), (2, 4), (1, 4)])
+@pytest.mark.parametrize("num_kv_heads,num_index_heads", [(4, 4), (2, 2), (1, 1)])
 def test_minimax_m3_horizontal_producer_matches_separate_producers(
     num_tokens, num_kv_heads, num_index_heads
 ):

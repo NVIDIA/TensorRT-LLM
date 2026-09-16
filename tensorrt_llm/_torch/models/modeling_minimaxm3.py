@@ -47,6 +47,7 @@ from ..attention.backends.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
+from ..attention.backends.sparse.minimax_m3.common import index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
@@ -85,13 +86,12 @@ def _moe_routed_output_is_global(experts: nn.Module) -> bool:
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
-    """Five-way MiniMax-M3 projection preserving unfused TP head mapping.
+    """Five-way MiniMax-M3 projection with vLLM-compatible TP sharding.
 
     Each rank emits ``[Q | K | V | index-Q | index-K]``. Q follows normal
-    attention head sharding, K/V follow KV-head sharding (including
-    replication when TP exceeds the KV-head count), and all index-Q heads
-    and the single index-K head are replicated, just as in index_qk_proj.
-    The underlying :class:`Linear` remains the standard
+    attention head sharding, K/V/index-Q follow KV-head sharding (including
+    replication when TP exceeds the KV-head count), and the single index-K
+    head is replicated. The underlying :class:`Linear` remains the standard
     quantized implementation; only checkpoint packing is model-specific.
     """
 
@@ -151,12 +151,12 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         self.index_head_dim = int(index_head_dim)
         self.local_num_heads = total_num_heads // tp_size
         self.local_num_kv_heads = local_num_kv_heads
-        self.local_num_index_heads = total_num_index_heads
+        self.local_num_index_heads = local_num_kv_heads
         self.local_output_sizes = (
             self.local_num_heads * head_dim,
             local_num_kv_heads * head_dim,
             local_num_kv_heads * head_dim,
-            total_num_index_heads * index_head_dim,
+            local_num_kv_heads * index_head_dim,
             index_head_dim,
         )
         local_out_features = sum(self.local_output_sizes)
@@ -183,10 +183,12 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         """Return effective (world size, rank) for one checkpoint shard."""
         if shard_name == "q":
             return self.tp_size, self.tp_rank
-        if shard_name in ("index_q", "index_k"):
+        if shard_name == "index_k":
             return 1, 0
 
-        total_heads = self.total_num_kv_heads
+        total_heads = (
+            self.total_num_index_heads if shard_name == "index_q" else self.total_num_kv_heads
+        )
         if self.tp_size <= total_heads:
             return self.tp_size, self.tp_rank
         replicas = self.tp_size // total_heads
@@ -1003,19 +1005,31 @@ class MiniMaxM3Attention(Attention):
                 )
                 self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
             else:
-                # Compatibility path: index Q/K remain replicated and use a
-                # separate GEMM with output [index-Q | index-K].
+                # Use the same KV-group ownership as the five-way projection.
+                # Linear's existing per-shard override handles index-Q slicing
+                # and index-K replication without a custom checkpoint loader.
+                index_start, index_end = index_head_range(
+                    total_num_index_heads, config.num_key_value_heads, self.qkv_proj.mapping
+                )
+                self.sparse_num_index_heads = index_end - index_start
                 self.index_qk_proj = Linear(
                     config.hidden_size,
                     total_num_index_heads * self.sparse_index_dim + self.sparse_index_dim,
                     bias=False,
                     dtype=config.torch_dtype,
-                    mapping=model_config.mapping,
-                    tensor_parallel_mode=None,
+                    mapping=self.qkv_proj.mapping,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
                     quant_config=None,
                     weights_loading_config=WeightsLoadingConfig(
                         weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
                     ),
+                    override_tp_sharding={
+                        "gate": (
+                            index_start * self.sparse_index_dim,
+                            index_end * self.sparse_index_dim,
+                        ),
+                        "up": (0, self.sparse_index_dim),
+                    },
                     skip_create_weights_in_init=model_config.skip_create_weights_in_init,
                 )
 
@@ -1075,7 +1089,7 @@ class MiniMaxM3Attention(Attention):
 
         Mirrors :meth:`apply_qk_norm` for the index branch: reshapes
         ``idx_q`` (shape ``[..., num_index_heads * sparse_index_dim]``,
-        replicated across TP ranks) and ``idx_k`` (shape
+        sharded with the KV heads) and ``idx_k`` (shape
         ``[..., sparse_index_dim]`` — single replicated head, not per
         index head) to per-head rows of width ``sparse_index_dim``,
         applies :attr:`index_q_norm` / :attr:`index_k_norm`, and reshapes
@@ -1288,7 +1302,7 @@ class MiniMaxM3Attention(Attention):
             or position_ids is None
             or self.head_dim != 128
             or self.sparse_index_dim != 128
-            or self.sparse_num_index_heads % self.num_key_value_heads != 0
+            or self.sparse_num_index_heads != self.num_key_value_heads
             or not self.use_gemma_norm
             or self.pos_embd_params is None
             or not self.pos_embd_params.is_neox

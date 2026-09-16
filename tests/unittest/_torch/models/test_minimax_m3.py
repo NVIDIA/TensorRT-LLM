@@ -33,7 +33,12 @@ from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3SparseConfig,
+    MiniMaxM3SparseMetadataParams,
+    MiniMaxM3SparseParams,
+    index_head_range,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -281,17 +286,24 @@ def test_fused_qkv_index_projection_preserves_index_head_groups(
     )
     sparse_params = cfg.to_sparse_params()
     metadata_params = cfg.to_sparse_metadata_params()
-    mapping = SimpleNamespace(tp_size=tp_size, enable_attention_dp=attention_dp)
+    checkpoint_cfg = cfg.model_copy(
+        update={"num_attention_heads": None, "num_key_value_heads": None}
+    )
+    checkpoint = SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    assert checkpoint_cfg.to_sparse_params(pretrained_config=checkpoint) == sparse_params
+    assert checkpoint_cfg.to_sparse_metadata_params(pretrained_config=checkpoint) == metadata_params
+    mapping = SimpleNamespace(tp_size=tp_size, tp_rank=0, enable_attention_dp=attention_dp)
     local_q_heads = 64 if attention_dp else 64 // tp_size
     local_kv_heads = 4 if attention_dp else max(4 // tp_size, 1)
 
     assert sparse_params.fuse_qkv_index_projection is True
     assert metadata_params.sharded_head_counts(mapping) == (local_q_heads, local_kv_heads)
     assert metadata_params.num_index_heads == 4
+    assert metadata_params.sharded_index_head_count(mapping) == local_kv_heads
     kernel_cfg = MiniMaxM3SparseConfig.from_sparse_params(
         sparse_params, num_q_heads=local_q_heads, num_kv_heads=local_kv_heads, head_dim=128
     )
-    assert kernel_cfg.num_index_heads == 4
+    assert kernel_cfg.num_index_heads == local_kv_heads
 
     compatibility_cfg = cfg.model_copy(update={"fuse_qkv_index_projection": False})
     assert compatibility_cfg.to_sparse_metadata_params() == metadata_params
@@ -301,13 +313,13 @@ def test_fused_qkv_index_projection_preserves_index_head_groups(
         num_kv_heads=local_kv_heads,
         head_dim=128,
     )
-    # Each index head favors a different block. Dropping heads under TP
-    # changes the group maximum and therefore the selected sparse blocks.
+    # Rank zero keeps its own index/KV pairs, not a max over other ranks'
+    # index heads. Each head favors a distinct block to expose misgrouping.
     scores = torch.diag(torch.tensor([1.0, 2.0, 3.0, 4.0])).unsqueeze(-1)
-    fused_scores = _group_max_reduce(scores, kernel_cfg)
-    reference_scores = _group_max_reduce(scores, compatibility_kernel_cfg)
+    fused_scores = _group_max_reduce(scores[:local_kv_heads], kernel_cfg)
+    reference_scores = _group_max_reduce(scores[:local_kv_heads], compatibility_kernel_cfg)
     torch.testing.assert_close(fused_scores, reference_scores)
-    expected_blocks = torch.arange(4 // local_kv_heads - 1, 4, 4 // local_kv_heads)
+    expected_blocks = torch.arange(local_kv_heads)
     torch.testing.assert_close(fused_scores.argmax(dim=1).flatten(), expected_blocks)
     with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
         MiniMaxM3SparseAttentionConfig(implementation="triton", fuse_qkv_index_projection=True)
@@ -771,7 +783,7 @@ def test_get_moe_layer_ids_length_mismatch_raises():
 #    ``use_gemma=True`` and ``hidden_size=head_dim``; the
 #    :meth:`apply_qk_norm` reshape matches an independent hand-written
 #    reference.
-#  * Sparse index branch: fused replicated (tp_mode None) index_qk_proj with
+#  * Sparse index branch: KV-group-sharded index_qk_proj with
 #    output [idx_q | idx_k] = num_index_heads * sparse_index_dim + sparse_index_dim
 #    (idx_k is one K per token).
 #  * Dense layers do not expose any index branch attributes (negative
@@ -970,9 +982,9 @@ def test_minimax_m3_attention_apply_qk_norm_matches_reference():
 def test_minimax_m3_attention_sparse_construction_matches_config():
     """Sparse layer adds the index branch with the fused index projection.
 
-    * index_qk_proj is replicated (tp_mode None), out =
+    * At TP1, index_qk_proj retains all index heads, out =
       num_index_heads * sparse_index_dim (idx_q) + sparse_index_dim (idx_k),
-      where idx_k is one K per token (SGLang ReplicatedLinear contract).
+      where idx_k is one replicated K per token.
     * index_q_norm / index_k_norm are per-head Gemma RMSNorm of width
       sparse_index_dim.
     """
@@ -991,16 +1003,12 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
     assert attn.is_sparse_attention_layer is True
     assert attn.disable_index_value is True
 
-    # Replication keeps the idx_q -> [num_tokens, num_index_heads,
-    # sparse_index_dim] reshape valid at any TP geometry, whereas a
-    # column-parallel split would slice the head dimension.
+    # Explicit shard ranges retain whole index heads and replicate index-K.
     assert attn.index_q_size == num_index_heads * sparse_index_dim
     assert attn.index_k_size == sparse_index_dim
     assert attn.index_qk_proj.in_features == hidden
     assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
-    assert attn.index_qk_proj.tp_mode is None, (
-        f"index_qk_proj must be replicated, got {attn.index_qk_proj.tp_mode!r}"
-    )
+    assert attn.index_qk_proj.tp_mode == modeling_minimaxm3.TensorParallelMode.COLUMN
     # Only the fused projection exists.
     assert not hasattr(attn, "index_q_proj")
     assert not hasattr(attn, "index_k_proj")
@@ -1030,19 +1038,21 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
 def test_minimax_m3_five_way_projection_shard_geometry(tp_size: int) -> None:
     shard_geometry = MiniMaxM3QKVIndexerLinear._shard_geometry
     for tp_rank in range(tp_size):
-        module = SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank, total_num_kv_heads=4)
+        module = SimpleNamespace(
+            tp_size=tp_size, tp_rank=tp_rank, total_num_kv_heads=4, total_num_index_heads=4
+        )
         kv_world = min(tp_size, 4)
         kv_rank = tp_rank // max(tp_size // 4, 1)
         assert shard_geometry(module, "q") == (tp_size, tp_rank)
         assert shard_geometry(module, "k") == (kv_world, kv_rank)
         assert shard_geometry(module, "v") == (kv_world, kv_rank)
-        assert shard_geometry(module, "index_q") == (1, 0)
+        assert shard_geometry(module, "index_q") == (kv_world, kv_rank)
         assert shard_geometry(module, "index_k") == (1, 0)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_minimax_m3_five_way_projection_replicates_index_rows(monkeypatch, tp_size: int) -> None:
+def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: int) -> None:
     def init_linear(self, in_features, out_features, **kwargs) -> None:
         nn.Module.__init__(self)
         self.tp_size = kwargs["mapping"].tp_size
@@ -1083,10 +1093,10 @@ def test_minimax_m3_five_way_projection_replicates_index_rows(monkeypatch, tp_si
             64 // tp_size * 128,
             kv_heads * 128,
             kv_heads * 128,
-            4 * 128,
+            kv_heads * 128,
             128,
         )
-        assert projection.local_num_index_heads == 4
+        assert projection.local_num_index_heads == kv_heads
         assert projection.out_features == sum(projection.local_output_sizes)
         shards = {
             name: {"weight": torch.arange(heads * 128 * 2).reshape(heads * 128, 2)}
@@ -1096,11 +1106,139 @@ def test_minimax_m3_five_way_projection_replicates_index_rows(monkeypatch, tp_si
         projection.load_weights = loaded.extend
         projection.load_five_way_weights(shards)
         packed = loaded[0]["weight"].split(projection.local_output_sizes)
-        torch.testing.assert_close(packed[3], shards["index_q"]["weight"])
         torch.testing.assert_close(packed[4], shards["index_k"]["weight"])
         kv_rank = tp_rank // max(tp_size // 4, 1)
+        torch.testing.assert_close(
+            packed[3], shards["index_q"]["weight"].chunk(min(tp_size, 4))[kv_rank]
+        )
         torch.testing.assert_close(packed[1], shards["k"]["weight"].chunk(min(tp_size, 4))[kv_rank])
         assert projection.tp_size == tp_size and projection.tp_rank == tp_rank
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("num_index_heads", [4, 8])
+def test_minimax_m3_index_tp_matches_unsharded_reference(
+    tp_size: int, attention_dp: bool, num_index_heads: int
+) -> None:
+    """Checkpoint row ownership and selected blocks must be TP invariant."""
+    generator = torch.Generator().manual_seed(2718)
+    head_dim, hidden_dim, global_kv_heads = 2, 8, 4
+    q_weight = torch.randn(num_index_heads * head_dim, hidden_dim, generator=generator)
+    k_weight = torch.randn(head_dim, hidden_dim, generator=generator)
+    hidden = torch.randn(5, hidden_dim, generator=generator)
+    key_hidden = torch.randn(11, 3, hidden_dim, generator=generator)
+    global_q = torch.nn.functional.linear(hidden, q_weight).reshape(5, num_index_heads, head_dim)
+    keys = torch.nn.functional.linear(key_hidden, k_weight)
+    global_scores = torch.einsum("thd,bkd->hbkt", global_q, keys).amax(dim=2)
+    params = MiniMaxM3SparseParams(num_index_heads=num_index_heads, global_num_kv_heads=4)
+    reference_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+        params, num_q_heads=64, num_kv_heads=4, head_dim=head_dim
+    )
+    reference_scores = _group_max_reduce(global_scores, reference_cfg)
+    metadata = MiniMaxM3SparseMetadataParams(
+        global_num_q_heads=64, global_num_kv_heads=4, num_index_heads=num_index_heads
+    )
+    effective_tp = 1 if attention_dp else tp_size
+    local_kv_heads = max(global_kv_heads // effective_tp, 1)
+    for rank in range(tp_size):
+        mapping = SimpleNamespace(tp_size=tp_size, tp_rank=rank, enable_attention_dp=attention_dp)
+        start, end = index_head_range(num_index_heads, global_kv_heads, mapping)
+        kv_start = 0 if attention_dp else rank // max(tp_size // 4, 1) * local_kv_heads
+        assert (start, end) == (
+            kv_start * (num_index_heads // 4),
+            (kv_start + local_kv_heads) * (num_index_heads // 4),
+        )
+        assert metadata.sharded_index_head_count(mapping) == end - start
+
+        # Exercise Linear's real per-shard loader, as used by index_qk_proj:
+        # index-Q uses the KV group's rows; index-K always uses all its rows.
+        projection = object.__new__(modeling_minimaxm3.Linear)
+        nn.Module.__init__(projection)
+        projection.tp_size = effective_tp
+        projection.tp_rank = 0 if attention_dp else rank
+        projection.tp_mode = modeling_minimaxm3.TensorParallelMode.COLUMN
+        projection.tp_sharding = {"gate": (start * head_dim, end * head_dim), "up": (0, head_dim)}
+        projection.weights_loading_config = modeling_minimaxm3.WeightsLoadingConfig(
+            weight_mode=modeling_minimaxm3.WeightMode.FUSED_GATE_UP_LINEAR
+        )
+        local_q_weight = projection.load_shard({"weight": q_weight}, "weight", name="gate")
+        local_k_weight = projection.load_shard({"weight": k_weight}, "weight", name="up")
+        assert (
+            projection.calculate_local_out_features((num_index_heads + 1) * head_dim)
+            == (end - start + 1) * head_dim
+        )
+        torch.testing.assert_close(local_k_weight, k_weight)
+        local_q = torch.nn.functional.linear(hidden, local_q_weight).reshape(
+            5, end - start, head_dim
+        )
+        torch.testing.assert_close(local_q, global_q[:, start:end])
+        local_scores = torch.einsum("thd,bkd->hbkt", local_q, keys).amax(dim=2)
+        local_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+            params, num_q_heads=64 // effective_tp, num_kv_heads=local_kv_heads, head_dim=head_dim
+        )
+        assert local_cfg.num_index_heads == end - start
+        grouped_scores = _group_max_reduce(local_scores, local_cfg)
+        expected = reference_scores[kv_start : kv_start + local_kv_heads]
+        torch.testing.assert_close(grouped_scores, expected)
+        torch.testing.assert_close(
+            grouped_scores.topk(3, dim=1).indices, expected.topk(3, dim=1).indices
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_index_heads,num_kv_heads,tp_size", [(0, 4, 1), (6, 4, 2), (4, 4, 3), (4, 0, 2)]
+)
+def test_minimax_m3_index_head_range_rejects_invalid_geometry(
+    num_index_heads: int, num_kv_heads: int, tp_size: int
+) -> None:
+    with pytest.raises(ValueError):
+        index_head_range(
+            num_index_heads,
+            num_kv_heads,
+            SimpleNamespace(tp_size=tp_size, tp_rank=0, enable_attention_dp=False),
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_minimax_m3_unfused_index_projection_tp_construction(
+    tp_size: int, attention_dp: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify the model wires Linear's shard overrides to effective attention TP."""
+    import tensorrt_llm._torch.distributed as distributed
+
+    # Simulate each rank on one GPU without creating distributed workspaces.
+    # No forward runs here; projection construction and shard sizing stay real.
+    monkeypatch.setattr(distributed, "AllReduce", lambda **_kwargs: nn.Identity())
+    for rank in range(tp_size):
+        text_cfg, model_cfg = _make_attention_test_config()
+        text_cfg.hidden_size = 256
+        text_cfg.num_attention_heads = 8
+        text_cfg.num_key_value_heads = 4
+        text_cfg.sparse_attention_config["sparse_num_index_heads"] = 4
+        model_cfg.mapping = Mapping(
+            world_size=tp_size, rank=rank, tp_size=tp_size, enable_attention_dp=attention_dp
+        )
+        attn = MiniMaxM3Attention(
+            model_config=model_cfg,
+            layer_idx=3,
+            is_sparse_attention_layer=True,
+            disable_index_value=True,
+        )
+        kv_heads = 4 if attention_dp else max(4 // tp_size, 1)
+        kv_start = 0 if attention_dp else rank // max(tp_size // 4, 1) * kv_heads
+        assert attn.sparse_num_index_heads == kv_heads
+        assert attn.index_qk_proj.out_features == (kv_heads + 1) * 32
+        assert attn.index_qk_proj.tp_sharding == {
+            "gate": (kv_start * 32, (kv_start + kv_heads) * 32),
+            "up": (0, 32),
+        }
+        assert attn.index_qk_proj.mapping == attn.qkv_proj.mapping
 
 
 @pytest.mark.cpu_only
@@ -1504,7 +1642,7 @@ def test_minimax_m3_attention_real_config_index_branch_shapes():
     assert attn.index_k_size == sparse_index_dim
     assert attn.index_qk_proj.in_features == int(text_cfg.hidden_size)
     assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
-    assert attn.index_qk_proj.tp_mode is None
+    assert attn.index_qk_proj.tp_mode == modeling_minimaxm3.TensorParallelMode.COLUMN
     assert not hasattr(attn, "index_q_proj")
     assert not hasattr(attn, "index_k_proj")
 

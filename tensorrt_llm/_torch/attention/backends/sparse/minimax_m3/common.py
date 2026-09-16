@@ -32,12 +32,39 @@ _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
 
 
+def index_head_range(
+    num_index_heads: int, num_kv_heads: int, mapping: Optional["Mapping"] = None
+) -> Tuple[int, int]:
+    """Return this rank's global index-head interval, preserving KV groups.
+
+    Whole KV groups (including all their index heads) replicate when TP
+    exceeds the KV-head count. Attention-DP retains every head on each rank.
+    """
+    tp_size = 1 if mapping is None or mapping.enable_attention_dp else mapping.tp_size
+    if num_index_heads <= 0:
+        raise ValueError("MiniMax-M3 requires positive index heads")
+    # Metadata without model geometry is usable only for an unsharded view.
+    if num_kv_heads == 0 and tp_size == 1:
+        return 0, num_index_heads
+    if num_kv_heads <= 0 or num_index_heads % num_kv_heads != 0:
+        raise ValueError("MiniMax-M3 index heads must be divisible by global KV heads")
+    shard_count = min(tp_size, num_kv_heads)
+    if tp_size % shard_count != 0 or num_kv_heads % shard_count != 0:
+        raise ValueError("MiniMax-M3 TP and KV heads must divide one another")
+    rank = 0 if tp_size == 1 else mapping.tp_rank // (tp_size // shard_count)
+    count = num_index_heads // shard_count
+    return rank * count, (rank + 1) * count
+
+
 @dataclass(frozen=True)
 class MiniMaxM3SparseParams(SparseParams):
     """Lowered runtime parameters for the MiniMax-M3 sparse backend."""
 
     algorithm: Literal["minimax_m3"] = field(init=False, default="minimax_m3")
     num_index_heads: int = 4
+    # None keeps explicit rank-local backend construction supported. Model
+    # lowering supplies the global count so both backends preserve KV groups.
+    global_num_kv_heads: Optional[int] = None
     sparse_index_dim: int = 128
     block_size: int = 128
     topk: int = 16
@@ -83,6 +110,10 @@ class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
             return (int(num_heads) + tp_size - 1) // tp_size
 
         return _shard(self.global_num_q_heads), _shard(self.global_num_kv_heads)
+
+    def sharded_index_head_count(self, mapping: Optional["Mapping"] = None) -> int:
+        start, end = index_head_range(self.num_index_heads, self.global_num_kv_heads, mapping)
+        return end - start
 
 
 @dataclass(frozen=True)
@@ -150,13 +181,17 @@ class MiniMaxM3SparseConfig:
         """Build a kernel param bundle from lowered ``MiniMaxM3SparseParams``
         and the per-rank model geometry.
         """
+        num_index_heads = int(sparse_params.num_index_heads)
+        if sparse_params.global_num_kv_heads is not None:
+            global_kv_heads = int(sparse_params.global_num_kv_heads)
+            if global_kv_heads <= 0 or num_index_heads % global_kv_heads != 0:
+                raise ValueError("MiniMax-M3 index heads must be divisible by global KV heads")
+            num_index_heads = num_index_heads // global_kv_heads * int(num_kv_heads)
         return cls(
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(num_kv_heads),
             head_dim=int(head_dim),
-            # Both projection paths replicate index heads. The indexer groups
-            # these over local KV heads, independently of projection fusion.
-            num_index_heads=int(sparse_params.num_index_heads),
+            num_index_heads=num_index_heads,
             sparse_index_dim=int(sparse_params.sparse_index_dim),
             block_size=int(sparse_params.block_size),
             topk=int(sparse_params.topk),
