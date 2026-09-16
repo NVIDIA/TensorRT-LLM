@@ -294,15 +294,25 @@ The full ideal bound is $T_{\mathrm{roof}}=\max(Q_{\min}/\mathrm{BW},W/R_{\mathr
 
 ## Decode and Prefill in TensorRT-LLM
 
+### One Selection Core, Two Row Interfaces
+
+TensorRT-LLM integrates GVR V2 around a **shared selection core with phase-specific row adapters**. The `TopK` module connects the sparse-attention indexer to the selected engine and writes INT32 indices into the caller's output buffer. The same configuration selects self-sampling for supported decode and prefill paths, giving both phases a common exact-selection contract.
+
+The adapters express each phase's work as a valid score interval. Decode's `run_varlen` derives each row's length from device-resident KV lengths, the multi-token prediction offset, and the indexer's compression ratio. Prefill's `run_prefill` receives `[start, end)` intervals already expressed in compressed score columns and returns indices relative to `start`. Both preserve identity indices for short rows and fill unused output slots with `-1`.
+
+The kernel reuse is concrete: prefill specializes the **same `GvrMainKernel` streaming implementation used by decode**. A compile-time window mode adapts row addressing, masks values outside the valid interval, and translates the selected indices into the local output frame. The self-sampling, multi-threshold counting, candidate collection, and exact refinement remain in the shared implementation. Prefill uses one thread block per row, while decode retains its register and cluster specializations for other workload shapes. This keeps the selection logic shared while allowing each phase to use an appropriate execution plan. [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) introduces this reuse.
+
+Self-sampling also simplifies the lifecycle around that core. Each invocation builds its bracket from the current scores, so the V2 path needs no previous-step selection buffer, prefill-to-decode prior seeding, or post-decode prior write-back. The integration allocates and updates that state only for the temporal engine. This lets the same selection design serve both a newly computed prefill window and a growing decode row. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) makes the dispatch and state ownership consistent.
+
 ### Stable Launches, Dynamic Row Lengths
 
-CUDA Graph replay needs a stable launch configuration even as requests grow. The host chooses a kernel family and launch envelope before capture. At execution time, each row reads its actual length from device-resident metadata, including its multi-token prediction offset and compression ratio.
+CUDA Graph replay needs a stable launch configuration even as requests grow. The host chooses a kernel family and launch envelope before capture. During decode, each row reads its actual length from device-resident metadata, including its multi-token prediction offset and compression ratio.
 
-Two details matter for correctness and integration. [PR #18683](https://github.com/NVIDIA/TensorRT-LLM/pull/18683) keeps the physical row-width bound separate from the routing bound and ensures warmup populates launchers for exact row counts. [PR #18446](https://github.com/NVIDIA/TensorRT-LLM/pull/18446) makes dispatch configuration-based and limits previous-step prior allocation and updates to the temporal engine. The device-side prior-seeding change in [PR #18646](https://github.com/NVIDIA/TensorRT-LLM/pull/18646) benefits that retained temporal path; V2 does not need prior seeding.
+The framework separates the physical row-width bound used for safe memory access from the routing bound used to choose an execution plan. Warmup prepares the decode launchers for exact row counts and the prefill launchers for a bounded set of row-count tiers and width buckets. Decode and prefill specializations have distinct compilation-cache keys, even though they share the streaming implementation. [PR #18683](https://github.com/NVIDIA/TensorRT-LLM/pull/18683) and [PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) establish these launch and warmup rules.
 
-### The Same Approach Extends to Prefill
+The `TopK` boundary also checks whether the score layout supports the fast path. Unsupported layouts use exact native selection; a prefill specialization missing during graph capture falls back to radix without compiling inside capture. Configuration, warmup, and fallback therefore support the same selection contract as the shared kernel.
 
-[PR #18702](https://github.com/NVIDIA/TensorRT-LLM/pull/18702) applies the streaming engine to each prefill row's valid interval `[start, end)`. Output indices are relative to `start`, and short windows retain identity indices with `-1` padding. There is no previous token's selection to initialize.
+### Serving Gains from the Shared Engine
 
 In B200 profiles, V2 makes prefill Top-K **1.84–2.61×** faster than radix CUDA. Adding V2 prefill to a deployment already using V2 decode improves serving throughput by **2.9–4.5%** on long-input workloads. This is the incremental benefit of the prefill change.
 
