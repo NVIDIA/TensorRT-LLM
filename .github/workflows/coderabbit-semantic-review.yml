@@ -16,6 +16,12 @@
 name: CodeRabbit Semantic Conflict Review
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.coderabbit.yaml'
+      - '.github/workflows/coderabbit-semantic-review*.yml'
+      - '.github/scripts/coderabbit_semantic_review*.js'
   pull_request_target:
     branches: [main]
     types: [opened, reopened, synchronize, ready_for_review, labeled, edited, auto_merge_enabled]
@@ -43,7 +49,7 @@ jobs:
       checks: write
     if: >-
       github.repository == 'NVIDIA/TensorRT-LLM' &&
-      github.event_name != 'issue_comment' &&
+      contains(fromJSON('["push", "pull_request_target", "workflow_dispatch"]'), github.event_name) &&
       (github.event_name != 'pull_request_target' ||
        contains(github.event.pull_request.labels.*.name, 'ai: semantic-conflict'))
     # Automatic runs sweep opted-in PRs so coalesced events are not lost.
@@ -117,7 +123,8 @@ jobs:
                 output: {
                   title: 'Awaiting CodeRabbit analysis',
                   summary: `No AI verdict yet for PR #${number}, head ${head} + main ${base}. ` +
-                    'This advisory check does not block merging.',
+                    'CodeRabbit can make mistakes. This check is advisory and must remain non-required; ' +
+                    'its failure does not block merging under that configuration.',
                 },
               });
               const body = [
@@ -161,18 +168,52 @@ jobs:
       contains(github.event.comment.body, 'Semantic conflict with target branch')
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    steps:
-      # Read comments as data. Never checkout or execute PR code with this token.
+    steps: &result-steps
+      # Shared with the read-only PR preview. No checkout or execution of PR code.
       - name: Publish a result only for the current requested revision pair
         uses: actions/github-script@v8
         with:
           script: |
             const name = 'Semantic conflict with target branch';
             const repo = context.repo;
-            const number = context.payload.issue.number;
-            const {data: comment} = await github.rest.issues.getComment({
-              ...repo, comment_id: context.payload.comment.id,
-            });
+            const preview = context.eventName === 'pull_request';
+            const number = preview ? context.payload.pull_request.number : context.payload.issue.number;
+            const advisory = 'CodeRabbit can make mistakes, including false positives. Review the evidence. ' +
+              'This check is advisory and must remain non-required; its failure does not block merging ' +
+              'under that configuration. Other merge requirements still apply.';
+            const {data: pr} = await github.rest.pulls.get({...repo, pull_number: number});
+            const eligible = pr => pr.state === 'open' && pr.base.ref === 'main' &&
+              (preview || (!pr.draft && pr.labels.some(label => label.name === 'ai: semantic-conflict')));
+            if (!eligible(pr)) return;
+            if (preview && pr.head.sha !== context.payload.pull_request.head.sha) {
+              core.warning('This preview run is stale; use a run for the current PR head.');
+              return;
+            }
+            const {data: ref} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
+            const head = pr.head.sha;
+            const base = ref.object.sha;
+            let comment;
+            if (preview) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...repo, issue_number: number, per_page: 100,
+              });
+              comment = comments.filter(c => c.user?.login === 'coderabbitai[bot]' &&
+                c.user?.type === 'Bot' && c.body?.toLowerCase().includes(name.toLowerCase()) &&
+                c.body.toLowerCase().includes(`semantic_result head=${head} target=${base} `))
+                .sort((a, b) => b.id - a.id)[0];
+              if (!comment) {
+                const message = `No CodeRabbit result for head ${head} + main ${base}. ` +
+                  'This preview has no AI verdict. Request a custom pre-merge evaluation for these SHAs, ' +
+                  'then rerun this job after the reply arrives.';
+                core.warning(message);
+                await core.summary.addRaw(`${message}\n\n${advisory}\n`).write();
+                return;
+              }
+            } else {
+              ({data: comment} = await github.rest.issues.getComment({
+                ...repo, comment_id: context.payload.comment.id,
+              }));
+            }
             const body = comment.body || '';
             if (comment.user?.login !== 'coderabbitai[bot]' || comment.user?.type !== 'Bot') return;
             if (!body.includes('<!-- pre-merge-checks-results -->') &&
@@ -183,19 +224,16 @@ jobs:
             const details = body.match(/<summary>Full details: Semantic conflict with target branch<\/summary>([\s\S]*?)<\/details>/i);
             const result = details ? details[1] : row.join('|');
 
-            const {data: pr} = await github.rest.pulls.get({...repo, pull_number: number});
-            if (pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' ||
-                !pr.labels.some(label => label.name === 'ai: semantic-conflict')) return;
-            const {data: ref} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
-            const head = pr.head.sha;
-            const base = ref.object.sha;
-            const checks = await github.paginate(github.rest.checks.listForRef, {
-              ...repo, ref: head, check_name: name, filter: 'all', per_page: 100,
-            });
-            const check = checks.filter(check => check.app?.slug === 'github-actions' &&
-              check.external_id === `semantic-conflict:${number}:${head}:${base}`)
-              .sort((a, b) => b.id - a.id)[0];
-            if (!check) return; // Includes unrelated manual fixture evaluations.
+            let check;
+            if (!preview) {
+              const checks = await github.paginate(github.rest.checks.listForRef, {
+                ...repo, ref: head, check_name: name, filter: 'all', per_page: 100,
+              });
+              check = checks.filter(check => check.app?.slug === 'github-actions' &&
+                check.external_id === `semantic-conflict:${number}:${head}:${base}`)
+                .sort((a, b) => b.id - a.id)[0];
+              if (!check) return; // Includes unrelated manual fixture evaluations.
+            }
 
             const pattern = /semantic_result head=([a-f0-9]{40}) target=([a-f0-9]{40}) merge_base=([a-f0-9]{40}) verdict=(pass|fail|inconclusive)\b/g;
             const records = [...new Set([...result.toLowerCase().matchAll(pattern)].map(match => match[0]))];
@@ -222,22 +260,37 @@ jobs:
             const {data: current} = await github.rest.pulls.get({...repo, pull_number: number});
             const {data: currentRef} = await github.rest.git.getRef({...repo, ref: 'heads/main'});
             if (current.head.sha !== head || currentRef.object.sha !== base ||
-                current.state !== 'open' || current.draft || current.base.ref !== 'main' ||
-                !current.labels.some(label => label.name === 'ai: semantic-conflict')) return;
+                !eligible(current)) {
+              if (preview) core.warning('The PR or main changed during this preview; rerun for fresh evidence.');
+              return;
+            }
             const titles = {
               PASS: 'No semantic conflict found (best effort)',
-              FAIL: '⚠️ Possible semantic conflict',
+              FAIL: 'Possible semantic conflict — CodeRabbit may be wrong',
               INCONCLUSIVE: '⚠️ Semantic analysis inconclusive',
             };
-            await github.rest.checks.update({
+            const summary = `${reason}\n\n[CodeRabbit analysis](${comment.html_url})\n\n${advisory}`;
+            if (!preview) await github.rest.checks.update({
               ...repo, check_run_id: check.id, status: 'completed',
-              conclusion: verdict === 'PASS' ? 'success' : 'neutral',
+              conclusion: {PASS: 'success', FAIL: 'failure', INCONCLUSIVE: 'neutral'}[verdict],
               details_url: comment.html_url,
               output: {
                 title: titles[verdict],
-                summary: `${reason}\n\n[CodeRabbit analysis](${comment.html_url})\n\n` +
-                  'Advisory only; applies to this SHA pair and does not prove compatibility.',
+                summary,
               },
             });
-            if (verdict !== 'PASS') core.warning(`${titles[verdict]}: ${comment.html_url}`);
-            await core.summary.addRaw(`${titles[verdict]}: [CodeRabbit analysis](${comment.html_url})\n`).write();
+            await core.summary.addRaw(`${preview ? 'Read-only PR preview\n\n' : ''}` +
+              `${titles[verdict]}\n\n${summary}\n`).write();
+            if (verdict === 'FAIL') core.setFailed(`${titles[verdict]}. ${advisory} ${comment.html_url}`);
+            if (verdict === 'INCONCLUSIVE') core.warning(`${titles[verdict]}: ${comment.html_url}`);
+
+  preview-result:
+    name: Semantic conflict preview (advisory)
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps: *result-steps
