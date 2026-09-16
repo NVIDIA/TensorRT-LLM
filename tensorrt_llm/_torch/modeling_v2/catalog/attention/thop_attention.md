@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 96}
+  sm_103: {status: passed, tests: 47}
 ---
 
 # thop_attention

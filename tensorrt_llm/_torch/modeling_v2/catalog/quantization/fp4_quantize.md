@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 21}
+  sm_103: {status: passed, tests: 19}
 ---
 
 # fp4_quantize

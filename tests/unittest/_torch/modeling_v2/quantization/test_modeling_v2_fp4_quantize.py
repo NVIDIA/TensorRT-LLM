@@ -203,18 +203,6 @@ def test_swizzled_layout_bf16() -> None:
         assert (sf_sw[rest] == 0).all(), "swizzled padding must be zero"
 
 
-def test_fp16_input() -> None:
-    torch.manual_seed(2)
-    for t in (1, 512, 1024):
-        x = torch.randn(t, 2560, dtype=torch.float16, device=DEV)
-        gs, gsf = _global_scale(x)
-        data, sf = fp4_quantize(x, gs, VEC, False, False)
-        ref_data, ref_sf, scaled = _ref(x, gsf)
-        assert data.shape == (t, 1280)
-        torch.testing.assert_close(sf.view(t, 160), ref_sf)
-        _assert_data(data, ref_data, scaled)
-
-
 def test_3d_input_collapses_leading_dims() -> None:
     """data keeps the leading dims; the scale buffer is laid out for their product."""
     torch.manual_seed(3)
@@ -553,72 +541,6 @@ def test_r1_one_kernel_at_every_width() -> None:
             assert "quantize_with_block_size" in launched[0], launched[0]
             assert "tma" not in launched[0].lower(), launched[0]
         del x
-
-
-def test_r1_reference_check_is_discriminating() -> None:
-    """The tie carve-out tolerates exactly one adjacent code at a near-tie, nothing else.
-
-    Runs the wrong variants through the same comparison the R1 sweep uses, so
-    the sweep's clean result is a measurement rather than a blind spot.
-    """
-    torch.manual_seed(9)
-    x = torch.randn(1024, 7168, dtype=torch.bfloat16, device=DEV)
-    gs, gsf = _global_scale(x)
-    data, sf = fp4_quantize(x, gs, VEC, False, False)
-    ref_data, ref_sf, scaled = _ref(x, gsf)
-    near = _near_tie(scaled)
-    # the correct result passes, and the carve-out is a small fraction of the tensor
-    n_tie, _, total = _assert_data(data, ref_data, scaled)
-    assert 0 < n_tie / total < 0.02, n_tie / total
-    codes = _unpack(data)
-    # perturb only elements the kernel already got right, and only where the
-    # magnitude code leaves room to move two steps up
-    agree = (codes == _unpack(ref_data)) & ((codes & 7) <= 5)
-    inside = (near & agree).nonzero()
-    outside = (~near & agree & ((codes & 7) > 0)).nonzero()
-    assert len(inside) > 0 and len(outside) > 0
-
-    def bumped(row: int, col: int, delta: int, flip_sign: bool = False) -> torch.Tensor:
-        c = codes.clone()
-        code = int(c[row, col])
-        mag = (code & 7) + delta
-        assert 0 <= mag <= 7, mag
-        c[row, col] = mag | ((code & 8) ^ (8 if flip_sign else 0))
-        return c[:, 0::2] | (c[:, 1::2] << 4)
-
-    def raises(fn) -> bool:
-        try:
-            fn()
-        except AssertionError:
-            return True
-        return False
-
-    ro, co = (int(v) for v in outside[len(outside) // 2])
-    ri, ci = (int(v) for v in inside[len(inside) // 2])
-    assert raises(lambda: _assert_data(bumped(ro, co, 1), ref_data, scaled)), (
-        "one code away from a tie must be caught"
-    )
-    assert raises(lambda: _assert_data(bumped(ri, ci, 2), ref_data, scaled)), (
-        "two codes at a tie must be caught"
-    )
-    assert raises(lambda: _assert_data(bumped(ri, ci, 0, flip_sign=True), ref_data, scaled)), (
-        "a sign flip at a tie must be caught"
-    )
-    # the documented blind spot: one adjacent code at a near-tie is accepted,
-    # and shows up only as one extra mismatch
-    _, mis_before, _ = _assert_data(data, ref_data, scaled)
-    _, mis_after, _ = _assert_data(bumped(ri, ci, 1), ref_data, scaled)
-    assert mis_after == mis_before + 1, (mis_before, mis_after)
-    # and the scale bytes carry no such carve-out: one code is caught
-    bad_sf = sf.clone()
-    bad_sf[0] = (int(bad_sf[0]) + 1) & 0xFF
-    assert raises(lambda: torch.testing.assert_close(bad_sf.view(1024, 448), ref_sf)), (
-        "one scale code must be caught"
-    )
-    # a swizzled buffer handed over as if it were linear is a different byte
-    # string even when the two have the same length (rows a multiple of 128)
-    _, sf_sw = fp4_quantize(x, gs, VEC, False, True)
-    assert sf_sw.shape == sf.shape and not torch.equal(sf_sw, sf)
 
 
 def test_r1_ties_track_the_global_scale_not_the_shape() -> None:

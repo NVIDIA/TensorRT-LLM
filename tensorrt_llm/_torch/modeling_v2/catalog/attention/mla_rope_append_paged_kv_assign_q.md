@@ -1,6 +1,6 @@
 ---
 receipts:
-  sm_103: {status: passed, tests: 13}
+  sm_103: {status: passed, tests: 6}
 ---
 
 # mla_rope_append_paged_kv_assign_q

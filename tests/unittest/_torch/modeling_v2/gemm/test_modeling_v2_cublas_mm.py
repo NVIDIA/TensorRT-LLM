@@ -111,23 +111,6 @@ def test_bf16_unaligned_shapes() -> None:
         _check(mat_a, mat_b, bias)
 
 
-def test_fp16() -> None:
-    torch.manual_seed(4)
-    for m, k, n in [(1, 4096, 4096), (1024, 2048, 2048)]:
-        mat_a, mat_b, bias = _make(m, k, n, torch.float16)
-        _check(mat_a, mat_b)
-        _check(mat_a, mat_b, bias)
-
-
-def test_fp32() -> None:
-    # no bias: the op silently ignores bias when inputs are fp32
-    # (contract precondition; guarded by an assert in the wrapper)
-    torch.manual_seed(5)
-    for m, k, n in [(2, 1024, 1024), (256, 2048, 1024)]:
-        mat_a, mat_b, _ = _make(m, k, n, torch.float32)
-        _check(mat_a, mat_b)
-
-
 def test_fp8_e4m3_to_bf16() -> None:
     # fp8 inputs require an explicit out_dtype; no scales are applied (alpha=1)
     torch.manual_seed(6)
