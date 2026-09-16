@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -57,7 +57,6 @@ from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
 from .checkpoints.hf.glm5_next_weight_mapper import (
     Disposition,
     Glm5NextHfWeightMapper,
-    Glm5NextWeightAudit,
     glm5_next_is_quantized,
 )
 from .modeling_deepseekv3 import DeepseekV3Gate
@@ -543,20 +542,6 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         """Use V2 for the shared latent-KV, pool-indexer and recurrent-state cache."""
         return "V2"
 
-    def attention_type(self, layer_idx: int) -> str:
-        """The literal attention module type for ``layer_idx``."""
-        return self.schedule.attention[layer_idx]
-
-    def mlp_type(self, layer_idx: int) -> str:
-        """The literal feed-forward module type for ``layer_idx``."""
-        return self.schedule.mlp[layer_idx]
-
-    def audit_checkpoint(self, keys: Iterable[str]) -> Glm5NextWeightAudit:
-        """Resolve every checkpoint key against this model's destinations."""
-        mapper = Glm5NextHfWeightMapper()
-        mapper.init_model_and_config(self, self.model_config)
-        return mapper.audit(keys)
-
     # -- whole-model materialization --------------------------------------
 
     def load_weights(
@@ -812,23 +797,11 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
 
 
 class Glm5NextLinearAttention(KimiKDALinearAttention):
-    """GLM-5.3-Flash KDA layer: the shared Kimi KDA mixer, configured.
+    """Configure the shared KDA mixer for GLM's low-rank output gate and FP32 gates.
 
-    The recurrence, convolution, projections, mixed context+generation
-    batches and the speculative-verify replay kernel are all the shared
-    module's (``trtllm::kda_prefill`` / ``kda_decode`` / ``kda_mtp_decode``
-    with the FLA fallbacks), reading the ``MambaHybridCacheManagerV2`` pools
-    the way Kimi K3 does. What GLM-5.3-Flash configures differently:
-
-    * the **low-rank output gate** ``g_b_proj(g_a_proj(x))`` (the checkpoint
-      has no full-rank ``g_proj``), selected through the mixer's own
-      ``use_full_rank_gate`` config key and served by its fused
-      ``[f_a | g_a | b]`` / ``[f_b; g_b]`` decode projections;
-    * ``A_log`` / ``dt_bias`` are **published in fp32** and kept so.
-
-    The exact-placement loader shards this rank's head range itself
-    (:meth:`shard_checkpoint_tensor`), as the projections are the mixer's own
-    local-width ``nn.Linear`` modules rather than Mapping-aware ``Linear``.
+    Recurrence, convolution and speculative replay use shared KDA kernels.
+    The loader shards local-width projections by head range; A_log and dt_bias
+    retain the checkpoint's FP32 precision.
     """
 
     #: Checkpoint tensors sharded by this rank's head *channel* range on dim 0.
@@ -869,10 +842,8 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         super().__init__(
             config, layer_idx, mapping=mapping, allreduce_strategy=glm5_next_allreduce_strategy()
         )
-        # The checkpoint publishes ``A_log`` / ``dt_bias`` in fp32 (the mixer
-        # stores them in bf16 by default; the kernels consume fp32 copies
-        # either way). Rebuilt without ``.detach``/``.data``, which MetaInitMode
-        # rejects on meta tensors.
+        # Preserve checkpoint FP32 gate parameters. MetaInitMode rejects detach
+        # on meta tensors, so create empty FP32 parameters on that branch.
         for name in ("A_log", "dt_bias"):
             param = getattr(self, name)
             data = (
@@ -884,8 +855,6 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         self.tp_size = self._kda_tp_size
         self.tp_rank = self._kda_tp_rank
         self.total_num_heads = int(linear["num_heads"])
-        self.qkv_dim = self.proj_size
-        self.total_qkv_dim = self.total_num_heads * self.head_dim
 
     # -- tensor-parallel ownership (consumed by the exact-placement loader) --
 
@@ -925,17 +894,10 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
 def _glm5_linear_kwargs(
     model_config: ModelConfig | None, mapping: Mapping | None
 ) -> dict[str, Any]:
-    """Construction arguments shared by every Mapping-aware ``Linear`` here.
+    """Build BF16 or block-FP8 Linear arguments with attention TP/DP mapping.
 
-    The quant config is the checkpoint's (``FP8_BLOCK_SCALES`` with its
-    published ``modules_to_not_convert``); the base class's
-    ``apply_quant_config_exclude_modules`` then flips the excluded modules to
-    bf16 by *runtime module name* before weights are created, so no
-    model-specific plan is needed. ``disable_deep_gemm`` pins the block-FP8
-    GEMM to ``fp8_quantize_1x128`` + the CuTe DSL Blackwell kernel (the same
-    arithmetic the routed experts run; DeepGEMM is not available here).
-    Direct (harness) construction without a ``model_config`` yields plain
-    bf16 modules over ``mapping``.
+    The base model applies quantization exclusions by runtime module name.
+    Block-FP8 projections use the CuTe DSL GEMM path (disable_deep_gemm=True).
     """
     return {
         "bias": False,
@@ -953,34 +915,12 @@ def _glm5_linear_kwargs(
 
 
 class Glm5NextIndexer(nn.Module):
-    """Pool-compressed DSA indexer (``Glm5NextTextIndexer``).
+    """Select complete key pools and append the incomplete causal tail.
 
-    Stock DeepSeek-V3.2 DSA selects ``index_topk`` individual keys. This one
-    selects ``index_topk / index_kpool`` *compressed pools*, expands each back
-    into its member positions, and always appends the incomplete tail, so the
-    two are not interchangeable even though both end up with ~2048 positions.
-
-    The backend caches each token's key and compression gate, plus the pooled
-    key at each pool's first row. It updates the affected pool when tokens are
-    appended; only complete pools are scored, and the current tail is selected
-    separately so future tokens cannot influence a query.
-
-    Unlike the HF module there is no left padding here: TensorRT-LLM stores
-    exactly one request's tokens per cache slot starting at position 0, so
-    ``first_key`` is always 0 and the packed validity channel HF carries for
-    padded batches is replaced by the request's own ``kv_len``.
-
-    Tensor parallelism: the whole indexer is replicated (the vLLM/SGLang
-    ownership) -- every rank runs all 32 scoring heads on the replicated
-    pool-key path (``wk``, ``k_norm``, the APE and compress gate) and selects
-    identical pool/tail/-1 indices by identical compute, with no collective.
-    The two scoring GEMMs are tiny (1536->4096, 4096->32), far cheaper than
-    the fp32 ``[tokens, pools]`` score all-reduce the sharded-head design
-    needed before top-k.
-
-    Decode and prefill score cached *pool keys* (the trailing
-    ``head_dim`` columns of each pool's first-member cache row, maintained by
-    the backend's ``update_pool_keys``) through the fused paged kernels.
+    The backend caches [key | compression gate | pooled key] per token, storing
+    pooled keys at each pool's first row. Replicated projections and scoring heads
+    produce the same selection on each TP rank without a score all-reduce.
+    Packed requests use visible lengths instead of HF's left-padding mask.
     """
 
     #: ``wk``, the pool-compress gate and ``weights_proj`` all read the same
@@ -1011,9 +951,6 @@ class Glm5NextIndexer(nn.Module):
                 f"glm5_next indexer has {self.total_n_heads} scoring heads, not "
                 f"divisible by tp_size {self.tp_size}"
             )
-        # Replicated scoring heads (vLLM/SGLang ownership): every rank runs
-        # all 32 heads and selects identical indices by identical compute,
-        # so no score collective is needed before top-k.
         self.n_heads = self.total_n_heads
         self.head_dim = int(config.index_head_dim)
         self.index_topk = int(config.index_topk)
@@ -1038,12 +975,8 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.bfloat16)
         )
-        # Decode top-k over the fused pool scores: the DSA indexer's TopK
-        # module. The CuTe-DSL radix kernel is bounded by each request's
-        # candidate count (1-6 us here vs 20-30 us for the CUDA radix kernel
-        # and ~40 us for torch.topk over the capacity-wide row); identical
-        # selections measured. Falls back to the CUDA radix kernel where the
-        # CUTLASS DSL is unavailable.
+        # Reuse DSA's TopK, bounded by each request's candidate count.
+        # Prefer CuTe DSL radix selection, with CUDA radix as the fallback.
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
         from ..modules.top_k import TopK, TopKImplementation
 
@@ -1059,19 +992,8 @@ class Glm5NextIndexer(nn.Module):
 
     @property
     def cache_state_dim(self) -> int:
-        """Width of one indexer cache row: ``[k | gate | pool key]``.
-
-        The trailing ``head_dim`` columns hold, on a pool's first-member row,
-        the pool's compressed key -- maintained incrementally by the backend
-        so decode scores cached pool keys instead of rebuilding every pool
-        from the packed state each step.
-        """
+        """Width of a cached [key | compression gate | pooled key] row."""
         return 3 * self.head_dim
-
-    @property
-    def packed_state_dim(self) -> int:
-        """Width of the cached per-token state: ``[k | gate]``."""
-        return 2 * self.head_dim
 
     def project_state(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """``(packed [k(head_dim) | gate(head_dim)], head weights [n_heads])``
@@ -1080,10 +1002,6 @@ class Glm5NextIndexer(nn.Module):
         hd = self.head_dim
         packed = torch.cat([self.k_norm(out[:, :hd]), out[:, hd : 2 * hd]], dim=-1)
         return packed, out[:, 2 * hd :]
-
-    def packed_state(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Per-token ``[k(head_dim) | gate(head_dim)]`` written to the cache."""
-        return self.project_state(hidden_states)[0]
 
 
 class Glm5NextSparseAttention(nn.Module):
@@ -1210,7 +1128,7 @@ class Glm5NextSparseAttention(nn.Module):
         latent = self.kv_a_layernorm(qa_kva[:, self.q_lora_rank :])
         return q_resid, latent
 
-    def _decode_projections(
+    def _project_attention_and_indexer(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(q_resid, latent, packed [k | gate], index_weights)`` -- the two
@@ -1354,7 +1272,7 @@ class Glm5NextSparseAttention(nn.Module):
             rows = ctx_rows_fn(kpool, device)
         else:
             rows = Glm5NextContextRows.build(cu_seqlens, cached_lens, kpool, device)
-        q_resid, latent, packed, index_weights = self._decode_projections(hidden_states)
+        q_resid, latent, packed, index_weights = self._project_attention_and_indexer(hidden_states)
         self.attn_backend.append_paged_state(
             latent, packed, rows.positions, metadata, request_ids=rows.request_ids
         )
@@ -1399,7 +1317,7 @@ class Glm5NextSparseAttention(nn.Module):
         batch = hidden_states.shape[0]
         positions = kv_lens - 1  # [B]
         indexer = self.indexer
-        q_resid, latent, packed, index_weights = self._decode_projections(hidden_states)
+        q_resid, latent, packed, index_weights = self._project_attention_and_indexer(hidden_states)
         self.attn_backend.append_paged_state(
             latent.unsqueeze(1), packed.unsqueeze(1), positions.unsqueeze(1), metadata
         )
@@ -1463,7 +1381,7 @@ class Glm5NextSparseAttention(nn.Module):
         device = hidden_states.device
         steps = torch.arange(tokens_per_request, device=device)
         positions = (kv_lens - tokens_per_request).unsqueeze(1) + steps  # [B, T]
-        q_resid, latent, packed, index_weights = self._decode_projections(hidden_states)
+        q_resid, latent, packed, index_weights = self._project_attention_and_indexer(hidden_states)
         self.attn_backend.append_paged_state(
             latent.view(batch, tokens_per_request, -1),
             packed.view(batch, tokens_per_request, -1),
@@ -1491,18 +1409,10 @@ class Glm5NextSparseAttention(nn.Module):
 
 
 class Glm5NextGate(DeepseekV3Gate):
-    """The shared DeepSeek noaux_tc gate, kept FP32 end to end.
+    """DeepSeek noaux_tc routing with FP32 weights, logits and correction bias.
 
-    Same routing math and weights as :class:`DeepseekV3Gate` (selection on
-    bias-corrected sigmoid scores, weights gathered from the uncorrected
-    scores, normalization before ``routed_scaling_factor``); the two
-    overrides are the parameter dtypes and the logits GEMM. The correction
-    bias sits around magnitude ~10 while the sigmoid scores it corrects are
-    O(1e-2), so ranking turns on inter-expert gaps of 4e-5 - 6e-4; bf16
-    resolution at that magnitude is ~1e-2, three orders of magnitude too
-    coarse -- it silently changes the top-8 while every aggregate check still
-    passes. The router weight is FP32 in the checkpoint, so the logits are an
-    FP32 ``F.linear`` (the shared bf16 router GEMM does not apply).
+    Preserve small inter-expert score differences when adding the correction bias;
+    rounding it to BF16 can change expert selection.
     """
 
     def __init__(self, config: PretrainedConfig, moe_backend: str = "CUTLASS") -> None:
@@ -1663,24 +1573,11 @@ class Glm5NextMoE(nn.Module):
 def glm5_next_hyper_connection(
     config: PretrainedConfig, dtype: torch.dtype = torch.bfloat16
 ) -> mHC:
-    """Build the shared ``mHC`` for one hyper-connection site.
+    """Configure shared mHC with GLM's normalization and mixing semantics.
 
-    This reuses TensorRT-LLM's existing manifold-constrained hyper-connection
-    rather than adding a model-local one. Two settings are model-specific and
-    were pinned by measurement against the source module, not by assumption:
-
-    * ``post_mult_value=2.0`` -- the source computes ``2 * sigmoid(...)`` for the
-      block-output placement weights. Leaving the default 1.0 halves them and
-      shows up as ``max_abs`` 0.96 on ``post`` against a [0.26, 1.92] range.
-    * ``sinkhorn_iters`` is the config's own ``hc_sinkhorn_iters`` (20), not
-      ``iters - 1``. The source runs one initial column normalization plus
-      ``iters - 1`` row/column rounds, which is what this kernel's ``iters``
-      counts; passing 19 leaves a measurable 1.9e-5 residual on ``comb`` versus
-      1.3e-6 at 20.
-
-    ``norm_eps`` is the decoder's ``rms_norm_eps`` because the source's
-    hyper-connection input norm is constructed with it, while ``eps`` and
-    ``sinkhorn_eps`` are the separate ``hc_eps``.
+    Post weights are 2 * sigmoid(...). Pass the full hc_sinkhorn_iters count:
+    the kernel includes the initial column normalization. Input normalization uses
+    rms_norm_eps; mixing and Sinkhorn use hc_eps.
     """
     from ..modules.mhc.hyper_connection import mHC
 
@@ -1880,13 +1777,10 @@ class Glm5NextDecoderLayer(DecoderLayer):
 
 
 class Glm5NextModel(DecoderModel):
-    """Embedding, the 45 hyper-connected decoder layers, and the final readout.
+    """Carry [tokens, hc_mult, hidden] streams through the decoder layers.
 
-    A ``DecoderModel`` whose hidden state between layers is the four-stream
-    tensor ``[num_tokens, hc_mult, hidden]`` rather than ``[num_tokens,
-    hidden]``: the stream axis opens at the embedding and closes in
-    :meth:`collapse_streams` (unweighted mean plus the final norm), which is
-    this model's equivalent of the base class's trailing ``self.norm``.
+    Expand embeddings into streams, then collapse with an unweighted mean and
+    final RMSNorm.
     """
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
@@ -1894,15 +1788,8 @@ class Glm5NextModel(DecoderModel):
         super().__init__(model_config)
         config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         schedule = resolve_glm5_next_schedule(model_config.pretrained_config)
-        # Pipeline parallelism rides the base machinery wholesale: the
-        # inter-layer activation is the four-stream tensor [tokens, hc_mult,
-        # hidden], and both `forward_after_recv`/`forward_before_send` and
-        # `pp_recv/send` are shape-agnostic — the recv buffer on a non-first
-        # rank is exactly `expand_streams(embed_tokens.skip_forward(...))`,
-        # which is a real contiguous [tokens, hc_mult, hidden] tensor.
-        # `__pp_init__` prunes non-local layers; `load_weights` skips
-        # pruned owners (see `skipped_remote`); the hybrid cache manager
-        # slices its layer masks per rank from `mapping`.
+        # PP transports contiguous [tokens, hc_mult, hidden] streams. The base
+        # class prunes remote layers, which load_weights skips on this rank.
         self.config = config
         self.schedule = schedule
         self.hc_mult = int(config.hc_mult)
@@ -2048,16 +1935,10 @@ class Glm5NextModel(DecoderModel):
 
 
 class Glm5NextMTPHead(nn.Module):
-    """The MTP layer's ``shared_head``: its final norm plus the draft logits.
+    """Normalize MTP hidden states and project draft logits through the target head.
 
-    ``norm`` is applied by :class:`Glm5NextMTP` at the end of its forward (the
-    checkpoint's ``shared_head.norm``); ``forward`` here turns the resulting
-    hidden states into logits through the *target's* ``lm_head`` -- the
-    checkpoint publishes no separate MTP head weight -- the way the
-    speculative worker calls it: ``shared_head(hidden, lm_head, attn_metadata,
-    return_context_logits)``. The LM-head TP handling mirrors the DeepSeek-V3
-    MTP head exactly, because the worker's greedy draft sampler recovers the
-    global argmax from vocab-sharded logits (``is_spec_decoding_head``).
+    Glm5NextMTP applies norm before this forward. The speculative sampler consumes
+    vocab-sharded logits; the checkpoint has no separate MTP head weight.
     """
 
     def __init__(
