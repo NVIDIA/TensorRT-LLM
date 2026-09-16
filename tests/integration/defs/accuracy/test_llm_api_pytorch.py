@@ -5932,9 +5932,7 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
 
         Blackwell-only, so the GVR Top-K prerequisites hold. This is the case
         that keeps both indexer options under accuracy guard: the heuristic
-        Top-K, and the draft loop reusing one selection. It is also the only
-        one of the two ADP4/MTP3 cases that CI currently runs -- the block-FP8
-        one is waived under nvbugs/6767938.
+        Top-K, and the draft loop reusing one selection.
         """
         self._run_evals(
             f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
