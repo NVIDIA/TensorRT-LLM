@@ -149,10 +149,18 @@ python jenkins/scripts/startup_benchmark/submit.py \
   --models-root /shared/models \
   --output /shared/results/startup-plan \
   --image "$RUNTIME_IMAGE" --partition "$PARTITION" \
-  --cases qwen38_27b_nvfp4_tp1 --repeats 3
+  --cases qwen38_27b_nvfp4_tp1 --repeats 1
 ```
 
 This is a **dry-run**: inspect `submission.json` and generated batch scripts.
+The checked-in matrix allows one hour per startup (also the default when
+`timeout_seconds` is omitted). With two policies and `--repeats 1`, the calculated
+per-case allocation is **2h13m** without a reset helper, or **2h23m** with one.
+These are scheduling budgets, not expected runtimes. The CLI default remains
+three repeats (**6h19m** without a helper), which requires a longer-limit QoS or
+partition. Check site limits before submitting; use `--repeats 1` for a pilot.
+For slower models, increase `timeout_seconds` in a custom matrix and request a
+sufficient allocation; `--time` alone does not change the startup deadline.
 To submit, repeat with `--submit` and a **new empty** output directory. Supply
 `--account`, `--constraint`, `--time` and extra `--mount` entries as required by
 the cluster. Checkpoints selected by explicit environment paths must be covered

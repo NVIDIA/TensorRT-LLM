@@ -83,7 +83,7 @@ def _server_info() -> dict:
 def test_matrix_defaults_and_placeholders_are_preserved(tmp_path: Path) -> None:
     matrix = _load(tmp_path, _matrix())
     case = matrix["cases"][0]
-    assert (case["tp"], case["pp"], case["ep"], case["timeout_seconds"]) == (1, 1, 1, 7200)
+    assert (case["tp"], case["pp"], case["ep"], case["timeout_seconds"]) == (1, 1, 1, 3600)
     assert case["model"] == "${MODEL_ROOT}/weights"
 
 

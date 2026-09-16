@@ -17,6 +17,7 @@
 # size_group describes host checkpoint pressure, not a demonstrated HBM fit.
 # All rows still require target-node startup qualification. Optional rows are
 # excluded from the runner's default selection, but have explicit OnDemand tests.
+# One-hour startup deadlines keep a two-policy, one-repeat pilot below four hours.
 version: 1
 variants:
   - name: native
@@ -37,7 +38,7 @@ cases:
     tp: 1
     pp: 1
     ep: 1
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: false
     checkpoint_dirs: []
     notes: Dense 27B NVFP4; checkpoint path and TP1 serving envelope require qualification.
@@ -55,7 +56,7 @@ cases:
     tp: 4
     pp: 1
     ep: 1
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: false
     checkpoint_dirs: []
     notes: Same dense snapshot as TP1; TP4 serving envelope requires qualification.
@@ -75,7 +76,7 @@ cases:
     tp: 8
     pp: 1
     ep: 8
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: false
     checkpoint_dirs: []
     notes: DeepSeek V4 Pro mixed FP4/FP8, TP8/EP8/MTP1; not V4.1 or Pro-Base FP8.
@@ -116,7 +117,7 @@ cases:
     tp: 8
     pp: 1
     ep: 1
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: false
     checkpoint_dirs: []
     notes: Existing MAX NVFP4 TP8/EP1/MTP3 recipe; B300 startup qualification required.
@@ -148,7 +149,7 @@ cases:
     tp: 8
     pp: 1
     ep: 8
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: false
     checkpoint_dirs: []
     notes: Prestage a pinned zai-org/GLM-5.3 FP8 snapshot; cache path needs qualification.
@@ -177,7 +178,7 @@ cases:
     tp: 8
     pp: 1
     ep: 1
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: false
     checkpoint_dirs: []
     notes: Kimi K2.5 NVFP4 accuracy recipe adapted to serving; no speculative decoding.
@@ -198,7 +199,7 @@ cases:
     tp: 8
     pp: 1
     ep: 8
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: true
     checkpoint_dirs: []
     notes: Optional EP8 serving-recipe coverage; not a controlled EP1/EP8 speedup comparison.
@@ -229,7 +230,7 @@ cases:
     tp: 8
     pp: 1
     ep: 1
-    timeout_seconds: 7200
+    timeout_seconds: 3600
     optional: true
     checkpoint_dirs: []
     notes: Optional R1-0528 FP8 TP8/EP1/MTP3 regression anchor, without forced acceptance.

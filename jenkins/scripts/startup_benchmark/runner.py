@@ -144,7 +144,7 @@ def load_matrix(path: Path) -> dict:
             if not isinstance(entry.get("model"), str) or not entry["model"]:
                 raise ValueError(f"{name}: local model path required")
             for field in ("tp", "pp", "ep", "timeout_seconds"):
-                value = entry.get(field, 1 if field != "timeout_seconds" else 7200)
+                value = entry.get(field, 1 if field != "timeout_seconds" else 3600)
                 if type(value) is not int or value <= 0:
                     raise ValueError(f"{name}: {field} must be a positive integer")
                 entry[field] = value

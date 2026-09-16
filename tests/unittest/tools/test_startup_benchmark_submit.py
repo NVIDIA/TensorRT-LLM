@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+import yaml
 
 pytestmark = pytest.mark.cpu_only
 
@@ -220,6 +221,16 @@ class StartupSubmitTest(unittest.TestCase):
         self._run("--time", "1-00:00:00")
         for job in self._manifest()["jobs"]:
             self.assertIn("--time=1-00:00:00", job["command"])
+
+    def test_checked_in_matrix_pilot_fits_four_hour_limit(self) -> None:
+        matrix = yaml.safe_load(
+            (_ROOT / "jenkins/scripts/startup_benchmark/matrix.yaml").read_text(encoding="utf-8")
+        )
+        with patch("runner.load_matrix", return_value=matrix):
+            self._run("--repeats", "1")
+        for job in self._manifest()["jobs"]:
+            self.assertIn("--time=02:13:00", job["command"])
+        self.process.assert_not_called()
 
     def test_cache_retention_is_explicitly_forwarded(self) -> None:
         self._run("--keep-runtime-cache")
