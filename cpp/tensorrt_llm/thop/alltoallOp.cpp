@@ -21,7 +21,6 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
-#include <optional>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -126,13 +125,10 @@ std::vector<torch::Tensor> alltoall_helix(
  * @param workspace Workspace tensor (uint64, strided across ranks)
  * @param cp_rank Current context parallel rank
  * @param cp_size Total number of context parallel ranks
- * @param zero_kv_mask Optional bool mask of rows this rank owns no KV for. The
- * sender replaces them with a no-op contribution, so the caller must not
- * sanitize itself. Its length must divide entry_count.
  * @return tuple of (partial_o_out, softmax_stats_out) with same shapes as inputs
  */
-std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor partial_o, torch::Tensor softmax_stats,
-    torch::Tensor workspace, int64_t cp_rank, int64_t cp_size, std::optional<torch::Tensor> zero_kv_mask)
+std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(
+    torch::Tensor partial_o, torch::Tensor softmax_stats, torch::Tensor workspace, int64_t cp_rank, int64_t cp_size)
 {
 
     // Input validation
@@ -228,21 +224,6 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor par
     params.channelCount = 0; // auto-compute
     params.maxChannelCount = tensorrt_llm::kernels::computeHelixMaxChannelCount(cp_size);
 
-    // Optional zero-local-KV sanitization, applied by the sender in shared memory
-    params.zeroKvMask = nullptr;
-    params.zeroKvMaskDivisor = 1;
-    if (zero_kv_mask.has_value())
-    {
-        auto const& mask = zero_kv_mask.value();
-        CHECK_TH_CUDA(mask);
-        CHECK_CONTIGUOUS(mask);
-        CHECK_TYPE(mask, at::ScalarType::Bool);
-        TORCH_CHECK(mask.numel() > 0 && entry_count % mask.numel() == 0, "zero_kv_mask numel (", mask.numel(),
-            ") must divide the all-to-all entry count (", entry_count, ")");
-        params.zeroKvMask = reinterpret_cast<uint8_t const*>(mask.data_ptr());
-        params.zeroKvMaskDivisor = entry_count / mask.numel();
-    }
-
     // Launch kernel
     auto stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::launchHelixAllToAll(params, allowVariableField1, stream);
@@ -279,7 +260,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
     m.def(
         "alltoall_helix_native(Tensor partial_o, Tensor softmax_stats, Tensor(a!) workspace, int "
-        "cp_rank, int cp_size, Tensor? zero_kv_mask=None) -> (Tensor, Tensor)");
+        "cp_rank, int cp_size) -> (Tensor, Tensor)");
     m.def(
         "initialize_helix_workspace(Tensor(a!) workspace, int cp_rank, int cp_size) "
         "-> ()");
