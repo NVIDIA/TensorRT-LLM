@@ -18,6 +18,7 @@
 
 import java.lang.InterruptedException
 import groovy.transform.Field
+import com.nvidia.bloom.FailureEvidenceCollector
 import trtllm.FailureClassifier
 import trtllm.exceptions.InfraFailure
 
@@ -744,7 +745,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         // ENABLE_INFRA_SCOPED_FAILFAST; off = plain failFast + parallel, as before.
         trtllm_utils.runBranchesWithInfraDefer(pipeline, parallelJobs, enableFailFast,
                 ENABLE_INFRA_SCOPED_FAILFAST) { e, stageName ->
-            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)
+            def evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, e, FailureClassifier.failureEvidenceQueries(InfraFailure.K8S))
+            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S, evidence)
         }
     } // Build stage
 }
