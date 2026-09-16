@@ -359,6 +359,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "enable_locality_domains"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "enable_lora"
     },
     {
