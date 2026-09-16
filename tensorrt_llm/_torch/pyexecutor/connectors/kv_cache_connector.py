@@ -255,6 +255,21 @@ class KvCacheConnectorScheduler(ABC):
             block_ids: The KV cacheblock IDs that were allocated.
         """
 
+    def on_rewind(self, request: LlmRequest, live_block_ids: List[int]):
+        """Notify the scheduler that a request's KV cache was rewound.
+
+        Called after ``rewind_kv_cache`` frees blocks due to speculative-decoding
+        rejection.  The scheduler should trim any per-request block bookkeeping
+        to match ``live_block_ids`` (the post-rewind cache indices).
+
+        Default implementation is a no-op; connectors that track per-request
+        block state (e.g. KVBM) override this to trim stale freed block ids.
+
+        Args:
+            request: The request whose KV cache was rewound.
+            live_block_ids: The post-rewind live cache block IDs for the request.
+        """
+
     def wait_for_initialization(self):
         """
         Some connectors need to wait for some resources to be initialized.
@@ -343,7 +358,7 @@ class KvCacheConnectorSchedulerOutputRequest:
             computed_position = len(tokens) - 1
             num_scheduled_tokens = 1 + get_draft_token_length(
                 req
-            )  # Specdec with draft tokens is not supported yet.
+            )  # Account for the next token plus any spec-dec draft tokens.
 
         # Get retention priority for each new block only if retention config is provided
         # (for priority-based offload filtering)
@@ -410,6 +425,32 @@ class KvCacheConnectorSchedulerOutputManager:
 
     def record_new_matched_tokens(self, request: LlmRequest, num_new_matched_tokens: int):
         self.external_loads[request.request_id] = num_new_matched_tokens
+
+    def on_rewind(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
+        """Re-sync connector bookkeeping after speculative-decoding rewind.
+
+        When draft tokens are rejected and ``rewindKVCache`` frees blocks that
+        crossed a block boundary, the per-request ``block_ids`` list must be
+        trimmed to drop the now-freed block ids.  Without this, the connector
+        retains stale references to freed blocks, which can cause incorrect
+        saves/loads and hangs in ``get_finished`` (cross-rank intersection
+        never completes).
+
+        ``tokens`` is only shrunk (never extended) here: ``on_rewind`` runs
+        after sampling has already appended accepted tokens to the request,
+        so ``req.get_tokens(0)`` may be longer than the stored list.  Extending
+        ``tokens`` would suppress those accepted tokens from the next
+        ``build_scheduler_output``'s ``new_tokens`` delta.  We only trim if the
+        rewind actually shortened the token list (e.g. rejected draft tokens
+        were rolled back).
+        """
+        req_state = self.requests.get(req.request_id)
+        if req_state is None:
+            return
+        req_state.block_ids = list(kv_cache_manager.get_cache_indices(req))
+        live_tokens = list(req.get_tokens(0))
+        if len(live_tokens) < len(req_state.tokens):
+            req_state.tokens = live_tokens
 
 
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
@@ -500,6 +541,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, self.new_async_requests, kv_cache_manager
         )
+
+    def on_rewind(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
+        """Notify the connector that a request's KV cache was rewound.
+
+        Trims the Python-side ``scheduler_output_manager`` bookkeeping and
+        notifies the external scheduler (e.g. KVBM leader) so it can trim
+        its own per-request slot state.
+        """
+        self.scheduler_output_manager.on_rewind(req, kv_cache_manager)
+        if self.scheduler is not None:
+            live_block_ids = kv_cache_manager.get_cache_indices(req)
+            self.scheduler.on_rewind(req, live_block_ids)
 
     def take_scheduled_requests_pending_load(self, scheduled_requests: ScheduledRequests):
         """
