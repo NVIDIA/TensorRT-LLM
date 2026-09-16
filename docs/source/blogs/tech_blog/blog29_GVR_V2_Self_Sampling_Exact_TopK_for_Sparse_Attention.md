@@ -173,7 +173,7 @@ DeepSelect FP32 shows a different pattern: V2's strongest gains move toward long
 
 *Figure 5. DeepSelect FP32 time divided by GVR V2 time, geometrically averaged across layers at each shape. The layout and color scale match Figure 4: values above 1.0 favor V2, and darker teal indicates a larger gain. Cell labels round to one decimal place.*
 
-For **V3.2, the gain reaches 7.66× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.23×** and **4.34×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.996×). The map shows where the FP32 advantage concentrates; the separate BF16 comparison below addresses DeepSelect's faster reduced-precision path.
+For **V3.2, the gain reaches 7.66× around 128K scores at batch size 1** and stays above 6× at that row length through batch size 8. Flash and Pro also show broad gains, with peaks of **4.23×** and **4.34×**. The narrowest margin appears for the longest Flash rows at batch size 128, where the shape average is approximately parity (0.996×).
 
 Two details determine how these gains carry into an application: the actual row-length and batch distribution, and the work each API returns. The next sections make both explicit.
 
@@ -219,7 +219,7 @@ The minimum column exposes individual regressions that a geometric mean can hide
 
 **TensorRT-LLM radix CUDA.** The baseline uses the production dispatcher, including short-row insertion and long-row split-work paths. V2's **4.93×** advantage is consistent with reducing full-row selection passes and matching execution to the workload.
 
-**DeepSelect.** The FP32 comparison requests unsorted INT32 indices. Its $K=2048$ path emphasizes correctness coverage, which helps explain the larger **2.79×** gap on V3.2. BF16 is another important operating point, discussed below.
+**DeepSelect.** The FP32 comparison requests unsorted INT32 indices. Its $K=2048$ path emphasizes correctness coverage, which helps explain the larger **2.79×** gap on V3.2.
 
 **HPC-ops.** FP32 support covers $K \in \lbrace 512,2048\rbrace$. V2's advantage is **2.30×** on Flash and **1.30×** on V3.2, with an overall **1.55×** speedup. HPC-ops retains individual wins on V3.2; Pro is unsupported.
 
@@ -240,12 +240,6 @@ For a concrete large-batch slice, the following times are at $B=1024$ and $N\app
 | V3.2 | **124.0 µs** | 211.0 µs | 388.8 µs | 496.6 µs | 419.6 µs | 159.7 µs |
 
 The contrast between single-row latency and large-batch throughput reflects the importance of selecting the right execution family.
-
-### BF16 Changes the Comparison
-
-With BF16 input, DeepSelect becomes more competitive. GVR V2, still consuming FP32 scores, achieves **1.40×** geometric-mean speedup and wins **86.03%** of comparisons. DeepSelect wins in long-row, large-batch regions, particularly V4 rows around 131K–262K with batches of 256–1024; the minimum GVR speedup is **0.55×**.
-
-BF16 halves the score-read bytes, but rounding can change Top-K membership. Each kernel is checked against its own input dtype. Conversion time is excluded, so this comparison applies when BF16 scores are already available.
 
 ## The Roofline Model: Fewer Passes, More Useful Work
 
