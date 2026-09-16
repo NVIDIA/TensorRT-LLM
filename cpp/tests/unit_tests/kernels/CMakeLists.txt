@@ -103,6 +103,8 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
+add_gtest(hisparseKernelsTest hisparseKernelsTest.cu NO_TLLM_LINKAGE)
+target_link_libraries(hisparseKernelsTest PRIVATE CUDA::cudart)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
