@@ -15,10 +15,6 @@
  * limitations under the License.
  */
 
-// Compiled both by CMake (as part of the wheel) and by torch.utils.cpp_extension during
-// development; it must build identically either way, so it includes only its own kernel
-// header and ATen.
-
 #include "tensorrt_llm/kernels/fusedSampling/fusedSamplingKernels.h"
 
 #include <ATen/cuda/CUDAContext.h>
