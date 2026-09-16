@@ -164,10 +164,8 @@ class Glm5NextVisionAttention(Attention):
             ),
             head_dim=config.hidden_size // config.num_heads,
         )
-        # Hard proof, not just a name check: `get_attention_backend` falls
-        # back to TRTLLM on unknown names and wraps known ones for sparse
-        # configs, so verify the constructed backend object is exactly the
-        # plain TRTLLM implementation.
+        # Backend resolution can substitute an implementation; require plain
+        # TRTLLM metadata and full-attention semantics after construction too.
         if type(self.attn) is not TrtllmAttention:
             raise ValueError(
                 f"{type(self).__name__}: constructed attention backend is "
@@ -195,11 +193,7 @@ class Glm5NextVisionAttention(Attention):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = self.split_qkv(qkv, None, None)
         seq_len = q.shape[0]
-        # Per-head Q/K RMSNorm on the shared module, then table-driven RoPE:
-        # the two-axis (height, width) layout is carried by per-token cos/sin
-        # rows, so the FlashInfer cos/sin-cache RoPE op applies it with
-        # positions = row index (the same path Qwen2.5-VL's tower uses); the
-        # torch helper is the fallback.
+        # Normalize per head, then apply the two-axis RoPE tables by token row.
         q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(seq_len, -1)
         k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(seq_len, -1)
         cos, sin = position_embeddings
@@ -310,8 +304,7 @@ class Glm5NextVisionPatchEmbed(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         weight = self.proj.weight
         # kernel == stride == the packed patch extent, so the Conv3d is exactly
-        # one GEMM over the flattened (C, T, P, P) patch rows (the cuDNN
-        # implicit-GEMM conv is ~10x slower than the cuBLAS GEMM here).
+        # one GEMM over the flattened (C, T, P, P) patch rows.
         hidden_states = hidden_states.reshape(-1, weight.shape[1:].numel()).to(dtype=weight.dtype)
         return nn.functional.linear(hidden_states, weight.view(self.embed_dim, -1), self.proj.bias)
 
@@ -413,13 +406,8 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         self.downsample.bias = nn.Parameter(torch.empty(self.config.out_hidden_size, dtype=dtype))
         self.merger = Glm5NextVisionPatchMerger(model_config)
 
-        # Source rotary: theta 10000 over half the head dim; the two position
-        # axes (h, w) each get head_dim//4 frequencies and the pair is
-        # duplicated over both head halves (neox pairing) — fp32 throughout.
-        # Deliberately NOT a module buffer: the encoder-wide dtype cast would
-        # downcast it to bf16 (the source keeps its non-persistent inv_freq
-        # table in fp32), and a 0.4% frequency error at grid positions ~50
-        # is a ~1e-2 cos error that compounds across the 24 blocks.
+        # Two-axis Neox RoPE uses head_dim//4 frequencies per axis in FP32.
+        # Keep inv_freq outside module buffers so encoder dtype casts preserve it.
         freq_dim = self.head_dim // 2
         # device='cpu' pins the table out of any meta-device construction
         # context (it is data, not a weight to materialize later).
@@ -435,9 +423,7 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
         ] = {}
         self._rope_cache_limit = 64
 
-        # Pinned, not selected: the backend lock above already rejected every
-        # non-TRTLLM configuration, so the metadata class is the TRTLLM one by
-        # construction (no `get_attention_backend` name lookup on this path).
+        # The vision backend is fixed to plain TRTLLM.
         self.metadata_cls = TrtllmAttention.Metadata
         self.attn_metadata: Optional[AttentionMetadata] = None
         self._fixed_max_seq_len = model_config.max_num_tokens
