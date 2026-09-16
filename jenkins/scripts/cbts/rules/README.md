@@ -13,6 +13,7 @@ for the overall CBTS architecture.
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
 | `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
+| `modeling_v2_rule.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/modeling_v2/**` (excl. `.md`) |
 | `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
@@ -253,6 +254,56 @@ Outcomes:
   blocks (True iff any matched block lives in `*_perf_sanity*` yaml).
 - Spec-dec source touched but no spec-dec block found anywhere
   (defensive) → `scope=None` (fallback).
+
+## ModelingV2Rule
+
+Path-only rule. Claims non-documentation source changes under
+`tensorrt_llm/_torch/modeling_v2/`, the self-contained second modeling
+path (one flat forward per checkpoint/arch/parallel triple, assembled
+from a catalog of op wrappers).
+
+`.md` exclusion carries more weight here than elsewhere: every catalog
+entry ships a contract document, so roughly a fifth of the subtree is
+Markdown. Claiming those would let a documentation-only PR pull in
+multi-GPU GB300 stages. Other suffixes are NOT excluded — a data file
+under the subtree could be a fixture, so the rule keeps claiming it
+(safe over-run).
+
+Block selection — entry-pattern based only:
+modeling_v2 has no `condition.terms.backend` of its own; its entries sit
+in `backend: pytorch` blocks beside everything else. A block belongs to
+modeling_v2 iff one of its `tests:` entries matches
+`_MV2_ENTRY_PATTERNS`:
+
+- `unittest/_torch/modeling_v2/` — the op-level catalog matrix, carried
+  as whole-directory entries (one on `l0_gb300`, one on
+  `l0_gb300_multi_gpus` for the 4-rank collectives).
+- `test_modeling_v2_` — the accuracy gates, and any future unit file.
+
+Both markers are exact by construction rather than by luck: every test
+file in the subtree is named `test_modeling_v2_*` precisely so it cannot
+collide with the upstream test of the same op. So unlike `SpecDecRule`'s
+`mtp_nextn`, no substring here can claim an unrelated entry and no
+carve-out is needed.
+
+Outward fallback: not needed, and by design rather than by accident.
+Nothing imports the subtree unless `TRTLLM_MODELING_V2` is set —
+`AutoModelForCausalLM._resolve_class` calls `modeling_v2_resolve`, which
+returns immediately when the switch is off, and the routing modules are
+imported lazily behind it. The one caller outside the subtree,
+`tensorrt_llm/_torch/models/modeling_auto.py`, is deliberately left
+unclaimed: a change to the shared resolver falls back to baseline, which
+is what it deserves.
+
+`sanity_relevant=False` — the subtree ships no user-facing entry point
+and is not imported by `trtllm-serve` or by `import tensorrt_llm`, so
+none of it is what PackageSanityCheck verifies about the wheel.
+`perfsanity_relevant` is dynamic (True only if a matched block lives in
+a `*_perf_sanity*` yaml); there are no modeling_v2 perf-sanity entries
+today, so it aggregates to False.
+
+Source changed but no modeling_v2 block in any yaml (defensive) →
+`scope=None` (fallback).
 
 ## OpenEngineRule
 
