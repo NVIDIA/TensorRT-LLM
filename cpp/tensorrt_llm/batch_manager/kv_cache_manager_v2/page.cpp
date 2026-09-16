@@ -42,20 +42,29 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
 
 Page::~Page()
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
-        "Page destroyed while still held or scheduled for eviction");
-    if (hasValidSlot())
-    {
-        Slot s;
-        s.setSlotId(slotId());
-        s.readyEvent = std::move(readyEvent);
-        resetSlot();
-        // A retained host slot is owned by its copy, even while it is also the page's primary slot.
-        if (!mHostCopy || !mHostCopy->matches(cacheLevel, s.slotId()))
-            manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
-        else
-            mHostCopy->recordUse(std::move(s.readyEvent));
-    }
+    KVCM2_POISON_ON_EXCEPT(
+        [this]()
+        {
+            TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
+                "Page destroyed while still held or scheduled for eviction");
+            if (hasValidSlot())
+            {
+                Slot s;
+                s.setSlotId(slotId());
+                s.readyEvent = std::move(readyEvent);
+                resetSlot();
+                // The retained copy owns the host slot even when it is also the page's primary slot.
+                if (!mHostCopy || !mHostCopy->matches(cacheLevel, s.slotId()))
+                {
+                    manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
+                }
+                else
+                {
+                    mHostCopy->recordUse(std::move(s.readyEvent));
+                    s.resetSlot();
+                }
+            }
+        });
 }
 
 PageStatus Page::status() const noexcept
@@ -117,14 +126,18 @@ CommittedPage::~CommittedPage()
         // the block pointer first. Pass `this` as the expected page: if a newer
         // page already replaced us in the slot (e.g. a larger SSM snapshot), the
         // slot is left alone and prev is nullptr — skip stale-block cleanup then.
-        Block* blk = block;
-        auto* prev = blk->unlinkPage(lifeCycle, this);
-        if (prev != nullptr)
-        {
-            TLLM_CHECK_DEBUG_WITH_INFO(prev == this, "unlinkPage returned unexpected page");
-            LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
-            Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
-        }
+        KVCM2_POISON_ON_EXCEPT(
+            [this]()
+            {
+                Block* blk = block;
+                auto* prev = blk->unlinkPage(lifeCycle, this);
+                if (prev != nullptr)
+                {
+                    TLLM_CHECK_DEBUG_WITH_INFO(prev == this, "unlinkPage returned unexpected page");
+                    LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
+                    Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
+                }
+            });
     }
     // Delegate slot release to Page::~Page().
 }
@@ -155,18 +168,24 @@ UncommittedPage::~UncommittedPage()
         bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
         if (!isSsm)
         {
-            [[maybe_unused]] bool blockRemoved = kvCache->blocks().size() <= ordinal;
-            [[maybe_unused]] bool pageOk = true;
+            bool blockRemoved = kvCache->blocks().size() <= ordinal;
+            bool pageOk = true;
             if (!blockRemoved)
             {
                 auto const& bp = kvCache->blocks()[ordinal].pages[beamIndex][lifeCycle];
-                // The entry can still point to this page during destruction. Borrow
-                // its reference instead of resurrecting a zero-count SharedPtr.
-                auto const& page = blockPageGetPage(bp);
-                pageOk
-                    = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
+                // Raw pointers only: in the self-destruction case below the slot still
+                // holds a SharedPtr to `this` whose use count has already reached zero.
+                // Copying it (or dynamicPointerCast'ing it) would take the count 0 -> 1
+                // and back to 0, re-entering this destructor until the stack overflows.
+                //
+                // A null page covers both an empty slot and one whose SharedPageLock has
+                // already cleared mUniqLock: unlock() resets it before dropping the page
+                // reference that lands here, so the slot names no page by this point.
+                Page const* slotPage = blockPageGetPage(bp).get();
+                pageOk = slotPage == nullptr || slotPage == this
+                    || dynamic_cast<CommittedPage const*>(slotPage) != nullptr;
             }
-            TLLM_CHECK_WITH_INFO(
+            KVCM2_CHECK_FATAL_WITH_INFO(
                 blockRemoved || pageOk, "UncommittedPage destroyed but slot still holds a different uncommitted page");
         }
     }
@@ -219,34 +238,40 @@ PageHolder::PageHolder(SharedPtr<Page> p)
 
 PageHolder::~PageHolder()
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(uniqLock.expired(), "PageHolder destroyed while lock still active");
+    KVCM2_POISON_ON_EXCEPT(
+        [this]()
+        {
+            TLLM_CHECK_DEBUG_WITH_INFO(uniqLock.expired(), "PageHolder destroyed while lock still active");
 
-    page->holder.reset(); // clear back-reference
-    auto const manager = page->manager;
+            page->holder.reset(); // clear back-reference
+            auto const manager = page->manager;
 
-    // If it's a committed page, schedule for eviction (if evictable).
-    if (page->isCommitted())
-    {
-        // Cached GPU pages can be reused without a host replica. Release that
-        // extra allocation when the last request lets go; readers retain it independently.
-        if (page->mHostCopy && !page->mHostCopy->matches(page->cacheLevel, page->slotId()))
-            page->mHostCopy.reset();
-        if (!page->scheduledForEviction())
-            manager->scheduleForEviction(*page);
+            // If it's a committed page, schedule for eviction (if evictable).
+            if (page->isCommitted())
+            {
+                // Release the extra host allocation after the last request lets go.
+                // Open readers retain it independently.
+                if (page->mHostCopy && !page->mHostCopy->matches(page->cacheLevel, page->slotId()))
+                {
+                    page->mHostCopy.reset();
+                }
+                if (!page->scheduledForEviction())
+                    manager->scheduleForEviction(*page);
 
-        // A page that no longer sits in its block's slot (orphaned block, or replaced by a
-        // page with a larger recorded token count) is unreachable for reuse, so keeping it
-        // in the eviction LRU would just pin a slot until memory pressure hits.
-        auto* cp = static_cast<CommittedPage*>(page.get());
-        if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
-            manager->excludeFromEviction(*page);
-    }
-    else
-    {
-        // Uncommitted page: if scheduled for eviction, remove it.
-        if (page->scheduledForEviction())
-            manager->excludeFromEviction(*page);
-    }
+                // A page that no longer sits in its block's slot (orphaned block, or replaced by a
+                // page with a larger recorded token count) is unreachable for reuse, so keeping it
+                // in the eviction LRU would just pin a slot until memory pressure hits.
+                auto* cp = static_cast<CommittedPage*>(page.get());
+                if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
+                    manager->excludeFromEviction(*page);
+            }
+            else
+            {
+                // Uncommitted page: if scheduled for eviction, remove it.
+                if (page->scheduledForEviction())
+                    manager->excludeFromEviction(*page);
+            }
+        });
 }
 
 SharedPageLock PageHolder::lock(
@@ -285,29 +310,32 @@ UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
 
 UniqPageLock::~UniqPageLock()
 {
-    Page& p = *page();
-    TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
-    // Set readyEvent to the merged finish events of all readers. For committed (read-only)
-    // pages, this means the next reader will wait for prior reads to complete, which is
-    // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
-    p.readyEvent = mergeEvents(finishEvents);
+    KVCM2_POISON_ON_EXCEPT(
+        [this]
+        {
+            Page& p = *page();
+            TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
+            // Set readyEvent to the merged finish events of all readers. For committed (read-only)
+            // pages, this means the next reader will wait for prior reads to complete, which is
+            // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
+            p.readyEvent = mergeEvents(finishEvents);
 
-    // Clear the holder's lock reference.
-    TLLM_CHECK_DEBUG(holder);
-    holder->uniqLock.reset();
+            // Clear the holder's lock reference.
+            TLLM_CHECK_DEBUG(holder);
+            holder->uniqLock.reset();
 
-    // Optimized path (mirrors Python): set holder=nullptr, then check if still evictable.
-    auto holderCopy = std::move(holder);
-    holder = nullptr;
+            // Optimized path (mirrors Python): set holder=nullptr, then check if still evictable.
+            holder = nullptr;
 
-    // If the page is not droppable (still held by someone else) and evictable,
-    // schedule for eviction.
-    if (p.status() != PageStatus::DROPPABLE)
-    {
-        auto const manager = p.manager;
-        if (manager->isEvictable(p))
-            manager->scheduleForEviction(p);
-    }
+            // If the page is not droppable (still held by someone else) and evictable,
+            // schedule for eviction.
+            if (p.status() != PageStatus::DROPPABLE)
+            {
+                auto const manager = p.manager;
+                if (manager->isEvictable(p))
+                    manager->scheduleForEviction(p);
+            }
+        });
 }
 
 void UniqPageLock::notifyFinish(CachedCudaEvent event)
@@ -352,7 +380,7 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
 SharedPageLock::~SharedPageLock()
 {
     if (mUniqLock)
-        unlock();
+        KVCM2_POISON_ON_EXCEPT([this]() { unlock(); });
 }
 
 SharedPageLock::SharedPageLock(SharedPageLock&& other) noexcept
@@ -408,11 +436,12 @@ void SharedPageLock::releasePageIndex()
 {
     int oldBaseIndex
         = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, kBadPageIndex.value());
-    // SSM pages have no per-block page-table entry. Attention entries must match
-    // the slot being released; SSM's sentinel ordinal always returns BAD.
-    TLLM_CHECK_DEBUG(oldBaseIndex
-        == (mUser.ordinal == kBadBlockOrdinal ? kBadPageIndex.value() : slotIdToPageIndexValue(page()->slotId())));
+    // SSM pages use kBadBlockOrdinal, for which updateBasePageIndex returns kBadPageIndex.
+    int const expectedBaseIndex
+        = mUser.ordinal == kBadBlockOrdinal ? kBadPageIndex.value() : slotIdToPageIndexValue(page()->slotId());
+    TLLM_CHECK_DEBUG(oldBaseIndex == expectedBaseIndex);
     (void) oldBaseIndex;
+    (void) expectedBaseIndex;
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +482,7 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
         { kvCache._recordDroppedPages(pages, cacheLevel); };
         storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
         // Migrate non-GPU pages.
-        storeMgr->batchedMigrateToGpu(targets, kvCache, migrationRecorder);
+        storeMgr->batchedMigrateToGpu(targets, migrationRecorder);
     }
     catch (...)
     {
@@ -466,11 +495,11 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
 
     // Wait for all ready events on KvCache's stream (deduplicated).
     {
-        std::vector<CachedCudaEvent const*> readyEvents;
+        std::vector<CUevent> readyEvents;
         readyEvents.reserve(targets.size());
         for (auto const& t : targets)
-            readyEvents.push_back(&t.page->readyEvent);
-        streamWaitEvents(reinterpret_cast<CudaStream>(kvCache.cudaStream()), readyEvents);
+            readyEvents.push_back(t.page->readyEvent.handle());
+        streamWaitEvents(reinterpret_cast<CudaStream>(kvCache.cudaStream()), std::move(readyEvents));
     }
 
     // Lock all pages.
@@ -501,13 +530,7 @@ ScratchSlotLock::~ScratchSlotLock()
 {
     if (mSlot.hasValidSlot())
     {
-        try
-        {
-            unlock();
-        }
-        catch (...)
-        {
-        }
+        KVCM2_POISON_ON_EXCEPT([this]() { unlock(); });
     }
 }
 

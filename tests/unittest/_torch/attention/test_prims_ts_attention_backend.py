@@ -19,10 +19,10 @@ import inspect
 import pytest
 import torch
 from backend_case import BackendCase, generate_inputs, run_backend, run_case
-from utils.util import isSM100Family
+from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
-    not isSM100Family(),
+    getSMVersion() not in (100, 103),
     reason="PrimsTS attention kernels require SM100 or SM103",
 )
 
@@ -645,7 +645,8 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
     torch.testing.assert_close(graph_output, reference, atol=3e-2, rtol=3e-3)
 
 
-def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
+@pytest.mark.parametrize("max_seq_len", [64, 1024], ids=["short-kv", "regular-kv"])
+def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchMLADecodePagedTSWrapper,
         get_prims_ts_batch_mla_decode_workspace_size,
@@ -657,7 +658,6 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
     kv_lora_rank = 512
     qk_rope_head_dim = 64
     page_size = 32
-    max_seq_len = 1024
     dtype = torch.bfloat16
     device = torch.device("cuda")
 
@@ -732,6 +732,8 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
     plan_state = wrapper._plan_state
     assert plan_state is not None
     compiled = plan_state.compiled
+    if max_seq_len == 64:
+        assert dict(plan_state.policy)["kernel"] == "throughput_2cta"
     bmm1_scale = (128 + qk_rope_head_dim) ** -0.5
 
     aliased_query = (

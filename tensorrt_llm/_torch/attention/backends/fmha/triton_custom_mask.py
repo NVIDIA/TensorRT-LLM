@@ -55,7 +55,7 @@ class TritonCustomMaskFmha(PhasedFmha):
         self._multi_processor_count: Optional[int] = None
 
     @classmethod
-    def is_available(cls, attn: "TrtllmAttention") -> bool:
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         required_ops = (
             "get_trtllm_gen_context_workspace_layout",
             "trtllm_gen_context_preprocess",
@@ -73,7 +73,7 @@ class TritonCustomMaskFmha(PhasedFmha):
             return False
         return True
 
-    def is_supported(
+    def _is_supported(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],

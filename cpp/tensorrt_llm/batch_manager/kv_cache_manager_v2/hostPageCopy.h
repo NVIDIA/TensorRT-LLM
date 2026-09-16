@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/reentrantSharedMutex.h"
 
 #include <memory>
 #include <vector>
@@ -30,7 +31,7 @@ class HostPageRead;
 
 //! A retained host slot, independent of the page's ordinary GPU/host slot.
 //! StorageManager owns the pools. Pages own copies; external readers also keep
-//! KvCacheManager alive. All accesses follow KVCM's single-threaded CPU contract.
+//! KvCacheManager alive. Callers hold the manager API lock when accessing shared state.
 class HostPageCopy
 {
 public:
@@ -99,7 +100,9 @@ public:
     HostPageRead(HostPageRead const&) = delete;
     HostPageRead& operator=(HostPageRead const&) = delete;
     void close();
+    //! Internal access: hold lockShared() while reading the returned copy.
     HostPageCopy const& copy() const;
+    [[nodiscard]] ReentrantSharedMutex::Guard lockShared() const;
     bool ready();
     int completedTokens();
 

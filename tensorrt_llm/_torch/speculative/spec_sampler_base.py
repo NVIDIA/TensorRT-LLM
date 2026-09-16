@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 
+from ...sampling_params import SamplingParams
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -43,6 +44,79 @@ from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
+
+# Rejection messages for the sampling features the one-model speculative path
+# cannot honor. They are module constants because two places raise them: the
+# executor-side SpecSampler.validate_request below, and the admission-time
+# check LLM._check_arguments runs before the response stream opens. Sharing the
+# text is what keeps the two from drifting apart.
+UNSUPPORTED_MIN_LENGTH_MSG = (
+    "min_length is not supported with one-model speculative decoding. "
+    "Drop min_length from the request, or disable speculative decoding."
+)
+UNSUPPORTED_BAD_WORDS_MSG = (
+    "bad_words is not supported with one-model speculative decoding. "
+    "Drop bad_words from the request, or disable speculative decoding."
+)
+UNSUPPORTED_NO_REPEAT_NGRAM_MSG = (
+    "no_repeat_ngram_size is not supported with one-model speculative "
+    "decoding. Drop no_repeat_ngram_size from the request, or disable "
+    "speculative decoding."
+)
+UNSUPPORTED_EMBEDDING_BIAS_MSG = (
+    "embedding_bias is not supported with one-model speculative decoding. "
+    "Drop embedding_bias from the request, or disable speculative decoding."
+)
+UNSUPPORTED_TOP_P_DECAY_MSG = (
+    "top_p_decay is not supported with one-model speculative decoding. "
+    "Drop top_p_decay / top_p_min from the request, or disable "
+    "speculative decoding."
+)
+UNSUPPORTED_MIN_P_MSG = (
+    "min_p is not supported with one-model speculative decoding. "
+    "Drop min_p from the request, or disable speculative decoding."
+)
+
+
+def one_model_sampling_rejection_reason(sampling_params: Optional[SamplingParams]) -> Optional[str]:
+    """Why ``sampling_params`` cannot be served by the one-model speculative path.
+
+    ``SpecSampler.validate_request`` is the authoritative check, but it runs on
+    the executor's admission path. By then the OpenAI frontend has already
+    answered 200 and opened the response stream, so the rejection reaches the
+    client as an aborted stream (``ClientPayloadError`` /
+    ``TransferEncodingError``) that it cannot tell apart from a network fault.
+    This mirrors the subset of those rules ``SamplingParams`` alone can decide,
+    so the request can be rejected before the stream opens; the executor-side
+    check stays as the backstop for submission paths that bypass the LLM API.
+
+    Returns ``None`` when nothing in ``sampling_params`` is unsupported.
+    """
+    if sampling_params is None:
+        return None
+    # min_tokens is what SamplingParams calls the field LlmRequest carries as
+    # py_min_length. The OpenAI frontend always forwards it, so gate on the
+    # value rather than on its presence -- same reasoning as the LlmRequest
+    # check below.
+    min_tokens = sampling_params.min_tokens
+    if min_tokens and min_tokens > 0:
+        return UNSUPPORTED_MIN_LENGTH_MSG
+    # Either form populates py_bad_words; the string form needs a tokenizer to
+    # resolve, so test the raw fields rather than _get_bad_words().
+    if sampling_params.bad or sampling_params.bad_token_ids:
+        return UNSUPPORTED_BAD_WORDS_MSG
+    if sampling_params.no_repeat_ngram_size:
+        return UNSUPPORTED_NO_REPEAT_NGRAM_MSG
+    if sampling_params.embedding_bias is not None:
+        return UNSUPPORTED_EMBEDDING_BIAS_MSG
+    # The same predicate top_p_decay_active() delegates to, so "active" cannot
+    # mean one thing here and another in the sampler.
+    if SamplingParams.params_imply_top_p_decay_active(sampling_params.top_p_decay):
+        return UNSUPPORTED_TOP_P_DECAY_MSG
+    min_p = sampling_params.min_p
+    if min_p and min_p > 0.0:
+        return UNSUPPORTED_MIN_P_MSG
+    return None
 
 
 @dataclass(kw_only=True)
@@ -120,10 +194,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # min_p lives on the C++ SamplingConfig as an optional scalar.
         min_p = sampling_config.min_p
         if min_p and min_p > 0.0:
-            raise ValueError(
-                "min_p is not supported with one-model speculative decoding. "
-                "Drop min_p from the request, or disable speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_MIN_P_MSG)
         self._validate_unsupported_logits_processors(request)
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
         # allocated when the deploy opted in, so a request asking for them while the
@@ -168,33 +239,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # value, not on its presence.
         min_length = getattr(request, "py_min_length", None)
         if min_length and min_length > 0:
-            raise ValueError(
-                "min_length is not supported with one-model speculative decoding. "
-                "Drop min_length from the request, or disable speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
         if getattr(request, "py_bad_words", None):
-            raise ValueError(
-                "bad_words is not supported with one-model speculative decoding. "
-                "Drop bad_words from the request, or disable speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_BAD_WORDS_MSG)
         if getattr(request, "py_no_repeat_ngram_size", None):
-            raise ValueError(
-                "no_repeat_ngram_size is not supported with one-model speculative "
-                "decoding. Drop no_repeat_ngram_size from the request, or disable "
-                "speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_NO_REPEAT_NGRAM_MSG)
         if getattr(request, "py_embedding_bias", None) is not None:
-            raise ValueError(
-                "embedding_bias is not supported with one-model speculative decoding. "
-                "Drop embedding_bias from the request, or disable speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_EMBEDDING_BIAS_MSG)
         # Reuse the handler's own predicate so "active" cannot drift between paths.
         if top_p_decay_active(_request_get_sampling_params(request)):
-            raise ValueError(
-                "top_p_decay is not supported with one-model speculative decoding. "
-                "Drop top_p_decay / top_p_min from the request, or disable "
-                "speculative decoding."
-            )
+            raise ValueError(UNSUPPORTED_TOP_P_DECAY_MSG)
 
     @dataclass(kw_only=True)
     class Store:

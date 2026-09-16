@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/hostPageCopy.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -32,10 +33,14 @@ HostPageCopy::HostPageCopy(StorageManager& manager, LifeCycleId lifeCycle, Cache
 
 HostPageCopy::~HostPageCopy()
 {
-    TLLM_CHECK(mOpenReaders == 0);
-    mSlot.readyEvent = allUses();
-    mManager->unpinHostCopy(mLevel, poolGroup(), mSlot.readyEvent);
-    mManager->releaseSlot(mLifeCycle, mLevel, std::move(mSlot));
+    KVCM2_POISON_ON_EXCEPT(
+        [this]()
+        {
+            TLLM_CHECK(mOpenReaders == 0);
+            mSlot.readyEvent = allUses();
+            mManager->unpinHostCopy(mLevel, poolGroup(), mSlot.readyEvent);
+            mManager->releaseSlot(mLifeCycle, mLevel, std::move(mSlot));
+        });
 }
 
 bool HostPageCopy::ready()
@@ -133,18 +138,38 @@ HostPageRead::HostPageRead(std::shared_ptr<KvCacheManager> owner, std::shared_pt
     , mCopy(std::move(copy))
     , mStream(stream)
 {
+    KVCM2_API_GUARD();
+    auto const apiLock = mOwner->lockExclusive();
     if (!mCopy)
+    {
         throw LogicError("Page has no retained host copy");
+    }
     mCopy->beginRead(stream);
 }
 
 HostPageRead::~HostPageRead()
 {
-    close();
+    KVCM2_POISON_ON_EXCEPT(
+        [this]()
+        {
+            OptionalGilRelease const gilRelease;
+            close();
+        });
 }
 
 void HostPageRead::close()
 {
+    if (!mOwner)
+    {
+        return;
+    }
+    // Keep the manager alive until the API lock has been released.
+    auto const owner = mOwner;
+    auto const apiLock = owner->lockExclusive();
+    if (Poison::poisoned())
+    {
+        return;
+    }
     if (mCopy)
     {
         mCopy->finishRead(mStream);
@@ -155,13 +180,21 @@ void HostPageRead::close()
 
 bool HostPageRead::ready()
 {
-    copy(); // Reject a closed reader.
+    auto const apiLock = lockShared();
     return mCopy->ready();
 }
 
 int HostPageRead::completedTokens()
 {
-    return ready() ? copy().validTokens() : 0;
+    auto const apiLock = lockShared();
+    return mCopy->ready() ? mCopy->validTokens() : 0;
+}
+
+ReentrantSharedMutex::Guard HostPageRead::lockShared() const
+{
+    KVCM2_REJECT_IF_POISONED();
+    copy(); // Reject a closed reader before accessing its manager.
+    return mOwner->lockShared();
 }
 
 HostPageCopy const& HostPageRead::copy() const

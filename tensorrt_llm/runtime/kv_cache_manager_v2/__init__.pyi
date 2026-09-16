@@ -36,6 +36,21 @@ from typing import (
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
 
+class CorruptedError(Exception):
+    """Raised by every public entry point once a broken invariant has been recorded.
+
+    Only the C++ backend has the latch that raises this; the pure-Python backend never does.
+    """
+
+def poison_reason() -> str | None:
+    """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
+
+def take_poison() -> str | None:
+    """Report the recorded violation and clear it, but only once no manager is alive."""
+
+def num_live_managers() -> int:
+    """Number of constructed, not-yet-destroyed managers."""
+
 class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
@@ -57,7 +72,6 @@ class PlannedDropHandle:
 class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
-    def to_bytes(self) -> bytes: ...
 
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
@@ -343,8 +357,6 @@ class _KVCache:
     @cuda_stream.setter
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
-    def finish_event(self) -> Any: ...
-    @property
     def num_blocks(self) -> int: ...
     def commit_pending_stats(self) -> KVCacheStatsDelta: ...
     def discard_pending_stats(self) -> None: ...
@@ -470,9 +482,19 @@ class PoolGroupDesc:
     pools: Sequence[PoolDesc]
 
 # From _core/_kv_cache_manager.py
+class HalfOpenRange:
+    def __init__(self, beg: int, end: int) -> None: ...
+    @property
+    def beg(self) -> int: ...
+    @property
+    def end(self) -> int: ...
+    def __bool__(self) -> bool: ...
+    def __len__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
+
 @dataclass(slots=True, frozen=True)
 class ScratchDesc:
-    range: tuple[int, int]
+    range: HalfOpenRange
     slot_ids: Sequence[int]
     def __bool__(self) -> bool: ...
 
@@ -505,6 +527,7 @@ class KVCacheManager:
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
+        # C++ backend only; the pure-Python backend does not accept this parameter.
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...

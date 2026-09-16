@@ -26,12 +26,11 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _disable_inductor_compile_worker_quiesce,
     _golden_media_path,
     _lpips_deterministic_algorithms,
-    _lpips_model_path,
     _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
     _save_lpips_video_mp4,
-    _skip_if_missing,
 )
+from test_common.llm_data import get_checkpoint
 
 HUNYUAN_T2V_MODEL_SUBPATH = "HunyuanVideo-1.5-Diffusers-480p_t2v"
 
@@ -65,8 +64,7 @@ def _run_hunyuan_lpips_pipeline():
         VisualGenArgs,
     )
 
-    model_path = _lpips_model_path(HUNYUAN_T2V_MODEL_SUBPATH)
-    _skip_if_missing(model_path, "HunyuanVideo 1.5 480p T2V checkpoint", is_dir=True)
+    model_path = get_checkpoint(HUNYUAN_T2V_MODEL_SUBPATH)
     _disable_inductor_compile_worker_quiesce()
     with _lpips_deterministic_algorithms():
         args = VisualGenArgs(
@@ -136,8 +134,7 @@ def test_hunyuan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     ``configs/hunyuan-t2v-fp8-1gpu.yaml`` work together as documented in the
     README, at the example's own 480p defaults.
     """
-    model_path = _lpips_model_path(HUNYUAN_T2V_MODEL_SUBPATH)
-    _skip_if_missing(model_path, "HunyuanVideo 1.5 480p T2V checkpoint", is_dir=True)
+    model_path = get_checkpoint(HUNYUAN_T2V_MODEL_SUBPATH)
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "hunyuan_example")
     os.makedirs(out_dir, exist_ok=True)

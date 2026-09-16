@@ -43,7 +43,9 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/config.cpp
     kv_cache_manager_v2/lifeCycleRegistry.cpp
     kv_cache_manager_v2/utils/cudaEvent.cpp
+    kv_cache_manager_v2/utils/optionalGilRelease.cpp
     kv_cache_manager_v2/utils/hostMem.cpp
+    kv_cache_manager_v2/utils/poison.cpp
     kv_cache_manager_v2/cudaVirtMem.cpp
     kv_cache_manager_v2/storage/config.cpp
     kv_cache_manager_v2/storage/core.cpp
@@ -52,7 +54,7 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/copyEngine.cpp
     kv_cache_manager_v2/tokenIdExt.cpp
     kv_cache_manager_v2/blockRadixTree.cpp
-    kv_cache_manager_v2/coldPageCopy.cu
+    kv_cache_manager_v2/batchedPageCopy.cu
     kv_cache_manager_v2/coldPageCodec.cpp
     kv_cache_manager_v2/eventManager.cpp
     kv_cache_manager_v2/hostPageCopy.cpp

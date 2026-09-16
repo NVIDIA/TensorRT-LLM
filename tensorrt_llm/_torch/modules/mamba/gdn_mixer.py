@@ -24,7 +24,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
-from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
+from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -46,6 +46,7 @@ from .fuse_elementwise_ops import (
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
 from .mamba2_metadata import Mamba2Metadata
+from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
 
 
@@ -55,12 +56,18 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # (SM100/SM103); on consumer Blackwell (SM120) and other archs it aborts at
 # launch, so we fall back to Triton there. Resolution is deferred to first call
 # (and cached) so importing this module never initializes CUDA.
-@functools.lru_cache(maxsize=1)
-def _resolve_chunk_gated_delta_rule():
-    if (
+def _use_flashinfer_gdn_prefill() -> bool:
+    """Check the prefill backend setting and supported GPU architecture."""
+    return (
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
         and is_flashinfer_gdn_supported_arch()
-    ):
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_chunk_gated_delta_rule():
+    """Resolve and cache the selected prefill implementation."""
+    if _use_flashinfer_gdn_prefill():
         from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as impl
     else:
         from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as impl
@@ -68,7 +75,12 @@ def _resolve_chunk_gated_delta_rule():
 
 
 @torch.compiler.disable
-def chunk_gated_delta_rule(*args, **kwargs):
+def chunk_gated_delta_rule(
+    *args, state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None, **kwargs
+):
+    """Dispatch prefill, omitting unused FlashInfer-only workspace arguments."""
+    if state_workspace is not None:
+        kwargs["state_workspace"] = state_workspace
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
 
 
@@ -170,6 +182,29 @@ def fused_gdn_gating(
         g, A_log, a, dt_bias, a.stride(0), num_heads, beta, threshold, 8, num_warps=1
     )
     return g
+
+
+# The verify path writes each decode request's per-draft-token states into the
+# batch-scoped ``intermediate_conv_window`` / ``intermediate_ssm`` buffers at rows
+# ``[0, num_decodes)``; ``MambaCacheManager.update_mamba_states()`` reads them
+# back from the same rows. The row-index vector is therefore ``arange(num_decodes)``
+# for every GDN layer of a step, so build it once per process instead of once
+# per layer: prefer the cache-manager-owned arange (allocated together with the
+# intermediate buffers), else a cached arange sized to the pool. Slicing a
+# persistent buffer is a view, i.e. no allocation and no kernel launch inside the
+# CUDA graph. `_cached_arange` is shared with Mamba2Mixer so that both mixers
+# hit the same `functools.cache` entry instead of each holding its own copy.
+
+
+def _verify_intermediate_state_indices(
+    kv_cache_manager, num_decodes: int, device: torch.device
+) -> torch.Tensor:
+    indices = getattr(kv_cache_manager, "intermediate_state_indices", None)
+    if indices is None or indices.shape[0] < num_decodes:
+        indices = _cached_arange(
+            max(kv_cache_manager.get_max_resource_count(), num_decodes), device
+        )
+    return indices[:num_decodes]
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -496,9 +531,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # 1. run conv update with per-step intermediate cache writes
             # 2. run recurrent delta rule with intermediate SSM-state cache writes
             # 3. defer final state selection to kv_cache_manager.update_mamba_states()
-            intermediate_state_indices = torch.arange(
-                num_decodes, dtype=torch.int32, device=cache_indices.device
-            )
+            intermediate_state_indices = kwargs["intermediate_state_indices"]
 
             mixed_qkv_reshaped = mixed_qkv.reshape(num_decodes, draft_token_num, -1).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update_triton(
@@ -619,9 +652,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # MambaCacheManager.update_mamba_states(), while initial states are
             # gathered from real slot indices.
             recurrent_state_source = ssm_states[cache_indices[:num_decodes]]
-            recurrent_state_indices = torch.arange(
-                num_decodes, dtype=torch.int32, device=cache_indices.device
-            )
+            recurrent_state_indices = kwargs["intermediate_state_indices"]
 
             output_d = None
             if output is not None:
@@ -753,9 +784,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 assert intermediate_conv_states is not None
                 assert kwargs.get("use_replay", False) or intermediate_ssm_states is not None
 
-                intermediate_state_indices = torch.arange(
-                    num_decodes, dtype=torch.int32, device=state_indices_d.device
-                )
+                intermediate_state_indices = kwargs["intermediate_state_indices"]
                 mixed_qkv_d = mixed_qkv_d.reshape(num_decodes, draft_token_num, -1).transpose(1, 2)
                 mixed_qkv_d = causal_conv1d_update_triton(
                     mixed_qkv_d,
@@ -847,23 +876,30 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if is_target_verify and num_decode_tokens > 0:
             attn_out_prefill = None
             if num_prefill_tokens > 0:
-                recurrent_state_p = ssm_states[state_indices_p]
                 output_p = output[:, :num_prefill_tokens, :, :] if output is not None else None
-                attn_out_prefill, last_recurrent_state = chunk_gated_delta_rule(
+                # Same indexed, in-place state I/O as the non-verify prefill path
+                # below: read each request's initial state from its pool slot and
+                # write the final state back to it inside the kernel, instead of
+                # gathering a [num_prefill, H, V, K] copy and scattering it back.
+                # Preconditions match that path: fresh slots were zeroed in
+                # forward_core, and prefill slots never alias the decode slots
+                # verified in the same step.
+                attn_out_prefill, _ = chunk_gated_delta_rule(
                     q=query_p,
                     k=key_p,
                     v=value_p,
                     g=g_p,
                     beta=beta_p,
-                    initial_state=recurrent_state_p,
-                    output_final_state=True,
+                    initial_state=ssm_states,
+                    initial_state_indices=state_indices_p,
+                    inplace_indexed_state_update=True,
+                    output_final_state=False,
                     cu_seqlens=query_start_loc_long[: num_prefill + 1],
                     head_first=False,
                     use_qk_l2norm_in_kernel=False,
                     output=output_p,
+                    state_workspace=kwargs.get("state_workspace"),
                 )
-                last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-                ssm_states[state_indices_p] = last_recurrent_state
 
             draft_token_num = spec_metadata.runtime_draft_len + 1
             query_d = query_d.reshape(
@@ -939,9 +975,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 ).reshape(num_decodes, draft_token_num, -1)
 
                 recurrent_state_source = ssm_states[state_indices_d]
-                recurrent_state_indices = torch.arange(
-                    num_decodes, dtype=torch.int32, device=state_indices_d.device
-                )
+                recurrent_state_indices = kwargs["intermediate_state_indices"]
 
                 attn_out_decode = fused_recurrent_gated_delta_rule_update(
                     q=query_d,
@@ -980,9 +1014,33 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             head_first=False,
             use_qk_l2norm_in_kernel=False,
             output=output,
+            state_workspace=kwargs.get("state_workspace"),
         )
 
         return core_attn_out
+
+    def _get_prefill_state_workspace(
+        self, attn_metadata: AttentionMetadata, ssm_states: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Reserve maximum state scratch on first use and reuse it across layers."""
+        # Blackwell uses indexed pool I/O directly, without state scratch.
+        if not _use_flashinfer_gdn_prefill() or is_sm_100f():
+            return None
+        key = (ssm_states.device, ssm_states.shape[1:])
+        # First use during warmup reserves the configured maximum, not the current batch.
+        # Sequential layers share this persistent input/output scratch.
+        workspaces = self.model_config.extra_attrs.setdefault("gdn_state_workspaces", {})
+        workspace = workspaces.get(key)
+        capacity = min(
+            attn_metadata.max_num_sequences or attn_metadata.max_num_requests,
+            attn_metadata.max_num_tokens,
+        )
+        if workspace is None or workspace[0].shape[0] < capacity:
+            state_in = torch.empty(
+                (capacity, *ssm_states.shape[1:]), dtype=torch.float32, device=ssm_states.device
+            )
+            workspace = workspaces[key] = (state_in, torch.empty_like(state_in))
+        return workspace
 
     def forward(
         self,
@@ -1061,6 +1119,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             layer_cache.intermediate_conv_window if is_target_verify else None
         )
         intermediate_ssm_states = layer_cache.intermediate_ssm if is_target_verify else None
+        intermediate_state_indices = (
+            _verify_intermediate_state_indices(
+                attn_metadata.kv_cache_manager, num_decodes, state_indices.device
+            )
+            if is_target_verify
+            else None
+        )
         use_replay = is_target_verify and getattr(
             attn_metadata.kv_cache_manager, "use_replay_state_update", False
         )
@@ -1093,6 +1158,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "state_indices_d": state_indices_d,
             "num_prefill": num_prefills,
             "num_decodes": num_decodes,
+            "intermediate_state_indices": intermediate_state_indices,
             "use_replay": use_replay,
             "replay_metadata": replay_metadata,
             "layer_cache": layer_cache,
@@ -1113,6 +1179,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 intermediate_ssm_states=intermediate_ssm_states,
                 is_target_verify=is_target_verify,
                 output=output,
+                state_workspace=self._get_prefill_state_workspace(attn_metadata, ssm_states),
                 **kwargs,
             )
         else:

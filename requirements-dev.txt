@@ -1,8 +1,8 @@
 -r requirements.txt
 # Pin the exact diffusers version VisualGen LPIPS tests run against; install it
 # before pytest collection so already-imported Diffusers modules match the
-# package files. 0.39.0 matches the runtime floor in requirements.txt.
-diffusers==0.39.0
+# package files. 0.40.0 provides the MiniMax-H3 reference implementation.
+diffusers==0.40.0
 # get_sysinfo.py's Linux-distribution probe. Must be explicit: it used to arrive
 # transitively via openai, and openai 3.3.1 dropped it, which silently emptied
 # every sysinfo-rendered CI test list (linux_distribution_name became 'na').

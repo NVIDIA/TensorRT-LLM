@@ -12,6 +12,10 @@ from torch import nn
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType, AttentionMetadata
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import (
     do_multi_stream,
@@ -29,7 +33,26 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.mla import MLA
     from tensorrt_llm._torch.distributed import AllReduceParams
 
-_q_b_proj_cute_dsl_import_ok: Optional[bool] = None
+
+def _q_b_proj_cute_dsl_bf16(q: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Project BF16 queries with the CuTe DSL kernel for the current architecture."""
+    sm_version = get_sm_version()
+    if not IS_CUTLASS_DSL_AVAILABLE or not is_sm_100f(sm_version):
+        return torch.nn.functional.linear(q, weight)
+    if sm_version == 107 and not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return torch.nn.functional.linear(q, weight)
+
+    assert q.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        "q_b_proj cute_dsl path requires bfloat16 inputs"
+    )
+    q = q.contiguous()
+    weight = weight.contiguous()
+    out = q.new_empty((q.shape[0], weight.shape[0]), dtype=torch.bfloat16)
+    if sm_version == 107:
+        torch.ops.trtllm.cute_dsl_bf16_gemm_rubin(q, weight, out)
+    else:
+        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(q, weight, out)
+    return out
 
 
 # Module initialization and weight lifecycle for DeepSeek-V4 MLA.
@@ -161,7 +184,10 @@ def create_sparse_attn_weights(self) -> None:
             ),
             requires_grad=False,
         )
-        if is_sm_100f():
+        from tensorrt_llm._torch.attention.mla import _is_cute_dsl_fp8_bmm_available
+
+        # The FP8 o_a_proj is consumed by the SM-specific CuTe DSL BMM below.
+        if _is_cute_dsl_fp8_bmm_available():
             self.o_a_proj = nn.Parameter(
                 torch.empty(
                     (
@@ -218,8 +244,10 @@ def _run_dsv4_o_lora_bmms(
         o_lora_bmm_input: tuple[torch.Tensor, torch.Tensor],
         phase_o_lora_output: torch.Tensor,
     ) -> None:
+        from tensorrt_llm._torch.attention.mla import _cute_dsl_fp8_bmm_out
+
         attn_fp8, attn_scale = o_lora_bmm_input
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        _cute_dsl_fp8_bmm_out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,
@@ -301,7 +329,14 @@ def project_sparse_attn_output(
 
     # Fuse inverse RoPE with FP8 quantization to avoid a BF16 latent read/write.
     # This is independent of the K/V absorption BMM implementation.
-    fused_inv_rope_fp8 = self.o_a_proj.dtype == torch.float8_e4m3fn and is_sm_100f()
+    from tensorrt_llm._torch.attention.mla import (
+        _cute_dsl_fp8_bmm_out,
+        _is_cute_dsl_fp8_bmm_available,
+    )
+
+    fused_inv_rope_fp8 = (
+        self.o_a_proj.dtype == torch.float8_e4m3fn and _is_cute_dsl_fp8_bmm_available()
+    )
     if fused_inv_rope_fp8:
         heads_per_group = self.num_heads_tp // self.n_local_groups
         attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
@@ -320,7 +355,7 @@ def project_sparse_attn_output(
             device=attn_output_tensor.device,
             dtype=self.dtype,
         )
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
+        _cute_dsl_fp8_bmm_out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,
@@ -349,11 +384,21 @@ def project_sparse_attn_output(
     )
     if self.o_a_proj.dtype == torch.bfloat16:
         # [groups, tokens, dim] @ [groups, dim, rank] -> [groups, tokens, rank]
-        torch.ops.trtllm.bmm_out(
-            attn_output_tensor.view(num_tokens, self.n_local_groups, -1).transpose(0, 1),
-            self.o_a_proj.transpose(1, 2),
-            o_lora.transpose(0, 1),
-        )
+        bmm_input = attn_output_tensor.view(num_tokens, self.n_local_groups, -1).transpose(0, 1)
+        if (
+            self.use_cute_dsl_bf16_bmm
+            and get_sm_version() == 107
+            and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+            and bmm_input.shape[-1] % 8 == 0
+            and self.o_lora_rank % 8 == 0
+        ):
+            torch.ops.trtllm.cute_dsl_bf16_bmm_rubin(
+                bmm_input, self.o_a_proj, o_lora.transpose(0, 1)
+            )
+        else:
+            torch.ops.trtllm.bmm_out(
+                bmm_input, self.o_a_proj.transpose(1, 2), o_lora.transpose(0, 1)
+            )
     elif self.o_a_proj.dtype == torch.float8_e4m3fn:
         from tensorrt_llm._torch.attention.mla import fp8_block_scaling_bmm_out
 
@@ -1036,28 +1081,6 @@ def forward_sparse_attn(
             self, num_generations=num_generations, num_contexts=num_contexts
         )
     )
-
-    def _q_b_proj_cute_dsl_bf16(q: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        global _q_b_proj_cute_dsl_import_ok
-        if _q_b_proj_cute_dsl_import_ok is None:
-            try:
-                from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-                _q_b_proj_cute_dsl_import_ok = IS_CUTLASS_DSL_AVAILABLE
-            except ImportError:
-                _q_b_proj_cute_dsl_import_ok = False
-        if not _q_b_proj_cute_dsl_import_ok or not is_sm_100f():
-            return torch.nn.functional.linear(q, weight)
-
-        assert q.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-            "q_b_proj cute_dsl path requires bfloat16 inputs"
-        )
-        q = q.contiguous()
-        weight = weight.contiguous()
-        m, n = q.shape[0], weight.shape[0]
-        out = q.new_empty((m, n), dtype=torch.bfloat16)
-        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(q, weight, out)
-        return out
 
     def _fused_q_fp8_quant_enabled() -> bool:
         return _is_fused_q_fp8_quant_enabled(
