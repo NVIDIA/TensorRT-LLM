@@ -476,6 +476,46 @@ See `attention/backends/sparse/` and the
 [Sparse Attention Development Guide](../../../docs/source/developer-guide/sparse-attention-development-guide.md)
 for details.
 
+#### 3.2.5 Paged-context FMHA requires a fused kernel
+
+`TrtllmAttentionMetadata` enables `use_paged_context_fmha` whenever chunked
+prefill, KV block reuse or speculative draft tokens are configured. Those
+features all require the context phase to attend to KV that is already in the
+cache, and only the fused context FMHA kernel can do that.
+
+`AttentionOp::initialize()` ends with
+`mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()`, so a
+configuration with no compiled kernel silently clears the flag and the context
+phase runs the unfused path instead. That path builds K and V from the current
+chunk alone: the cached prefix is dropped from attention and then overwritten
+by the chunk's write-back, which turns a missing kernel into a plausible wrong
+answer rather than an error.
+
+`get_attention_op` in `thop/attentionOp.cpp` therefore refuses a non-MLA
+paged-context configuration whose initialization produced no context FMHA
+kernel. The check runs after `initialize()`, because only the initialized op
+reflects the exact Q/KV/output precision, mask type and page size, and outside
+`initialize()` itself, which is `noexcept`.
+
+A kernel can be missing for two different reasons, and the distinction matters
+when triaging the refusal:
+
+- The kernel set genuinely has no kernel for that combination.
+- The build's `--cuda_architectures` does not name the SM of the device it is
+  running on. `cuda_configuration.cmake` stamps `-DEXCLUDE_SM_<arch>` for every
+  architecture the list omits, and that macro compiles the matching block of
+  the trtllm-gen cubin table out, so such a build carries no kernels for that
+  SM at all. Check the architecture list first.
+
+`thop.fused_context_fmha_kernel_exists(head_size, kv_cache_dtype,
+tokens_per_block, output_dtype)` reports whether this build contains a fused
+context FMHA kernel for an ordinary dense causal paged-context configuration
+with matching Q/KV precision and equal Q/KV head counts. It is a diagnostic
+aid: the output dtype is an explicit argument because the runtime chooses it
+independently of the KV cache dtype, and the probe fixes the mask, layout and
+head ratio, so its answer does not by itself describe the configuration a given
+model will run. The op-level refusal above is the authoritative check.
+
 ## 4. Evaluating New Attention
 
 ### 4.1 First-pass fit

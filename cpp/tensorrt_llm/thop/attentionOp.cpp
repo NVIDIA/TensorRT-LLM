@@ -1135,6 +1135,20 @@ static std::shared_ptr<AttentionOp> get_attention_op(
         "Attention op for layer %lld is not cached, cache key: %s", local_layer_idx, to_string(cache_key).c_str());
     std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
     op->initialize();
+    // initialize() ends with mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported(), so the flag
+    // reflects the exact Q/KV/output precision, mask type and page size this op will run with. Checking here rather
+    // than inside initialize() keeps the throw out of that noexcept function.
+    //
+    // Paged-context attention exists to attend to KV already in the cache. The unfused fallback builds K and V from
+    // the current chunk alone, so it drops the cached prefix and then overwrites it: without this check a missing
+    // kernel produces a plausible wrong answer instead of an error.
+    TLLM_CHECK_WITH_INFO(!op->mPagedContextFMHA || !op->mPagedKVCache || op->mIsMLAEnabled || op->mEnableContextFMHA,
+        "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
+        "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
+        "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
+        "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding. "
+        "Attention configuration: %s",
+        to_string(cache_key).c_str());
     runner->prepare(*op);
     auto [iter, _] = op_cache.try_emplace(cache_key, op);
     return iter->second;
