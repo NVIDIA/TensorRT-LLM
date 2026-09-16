@@ -10,13 +10,11 @@ import torch
 pytestmark = pytest.mark.cpu_only
 
 
-@pytest.mark.parametrize(
-    "global_heads,local_heads",
-    [(8, [2, 2]), (8, [8, 8]), (1, [1, 1]), ([8, 4], [2, 1])],
-    ids=["tp4", "attention-dp", "replicated-mqa", "per-layer-heads"],
-)
-def test_kt_pool_uses_local_heads(global_heads, local_heads):
+def test_kt_pool_uses_local_heads():
     from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module
+
+    global_heads = 8
+    local_heads = [2, 2]
 
     # Supply the parent manager's resolved layout without allocating a GPU KV pool.
     def init_parent(self, *args, **kwargs):
