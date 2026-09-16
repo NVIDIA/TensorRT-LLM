@@ -112,6 +112,13 @@ reviews:
           State that the result applies only to the reported SHA pair and must
           be rerun after either branch changes.
 
+          Begin the explanation with exactly one machine-readable result line:
+          SEMANTIC_RESULT head=<SHA> target=<SHA> merge_base=<SHA> verdict=<VERDICT>
+          Replace each SHA with the inspected full lowercase 40-character SHA;
+          VERDICT must be PASS, FAIL, or INCONCLUSIVE. Do not emit this line if
+          any SHA cannot be verified; explain the missing evidence instead.
+          This line is used to publish the advisory GitHub Check for this pair.
+
   path_filters:
     # Vendored/adapted FlashInfer kernels; excluded from review.
     - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"

@@ -181,10 +181,25 @@ best-effort and warning-only; missing revision/history evidence is Inconclusive.
 
 For a non-draft PR targeting `main`, maintainers can add the
 `ai: semantic-conflict` label to opt into automatic rechecks on PR and main
-updates. The `CodeRabbit Semantic Conflict Review` workflow only posts requests;
-its success is not an AI verdict. Read CodeRabbit's result and verify its head
-and target SHAs still match the live branches. Use workflow dispatch with the
-PR number to retry a request, or comment `@coderabbitai run pre-merge checks`.
+updates. The `CodeRabbit Semantic Conflict Review` workflow requests analysis
+and publishes results; its request job succeeding is not an AI verdict. The independent
+`Semantic conflict with target branch` GitHub Check starts neutral while
+awaiting analysis. The workflow publishes CodeRabbit's result only after
+verifying the bot author, requested head/target pair, and merge-base SHA.
+PASS becomes success; conflicts and Inconclusive results stay neutral with
+a warning title and a link to the analysis. GitHub has no warning conclusion;
+the publishing job emits a warning annotation but can still succeed.
+Read the result and verify its SHAs still match the live branches.
+
+Use workflow dispatch with the PR number to retry only that PR, or comment
+`@coderabbitai run pre-merge checks`. Automatic events sweep all opted-in PRs.
+Only requested revision pairs receive published results; unrelated manual
+fixture experiments do not change a PR's semantic Check. Missing results stay
+neutral, and stale results cannot mark a newer pair as passing.
+
+`CodeRabbit Semantic Review Tests` is a separate, read-only workflow for the
+automation's unit tests; passing it is not a semantic verdict. These tests
+are not part of the existing `Pre-commit Check`.
 The custom check requires CodeRabbit Custom Pre-Merge Checks access. This
 advisory pilot does not provide a merge-queue check or block merges.
 
