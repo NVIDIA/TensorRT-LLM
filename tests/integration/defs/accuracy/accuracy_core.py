@@ -121,19 +121,21 @@ class HypothesisTestingParams:
     sigma: float = 50.0
     higher_is_better: bool = True
     theta: float = field(init=False)
-    threshold: float = field(init=False)
+    # An explicit threshold replaces the one computed from the reference row.
+    threshold: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.theta = compute_theta(self.num_samples,
                                    sigma=self.sigma,
                                    alpha=self.alpha,
                                    beta=self.beta)
-        self.threshold = compute_threshold(
-            self.num_samples,
-            self.ref_accuracy,
-            sigma=self.sigma,
-            alpha=self.alpha,
-            higher_is_better=self.higher_is_better)
+        if self.threshold is None:
+            self.threshold = compute_threshold(
+                self.num_samples,
+                self.ref_accuracy,
+                sigma=self.sigma,
+                alpha=self.alpha,
+                higher_is_better=self.higher_is_better)
 
     def report(self, accuracy: Optional[float] = None) -> str:
         metric_name = self.metric_name.upper()
@@ -366,7 +368,8 @@ class AccuracyTask:
             sigma=entry.get("sigma", self.SIGMA),
             num_samples=entry.get("num_samples", self.NUM_SAMPLES),
             higher_is_better=entry.get("higher_is_better",
-                                       self.HIGHER_IS_BETTER))
+                                       self.HIGHER_IS_BETTER),
+            threshold=entry.get("threshold"))
 
     def evaluate(self,
                  llm: Union[PyTorchLLM, AutoDeployLLM],
@@ -588,6 +591,26 @@ class GSM8K(AccuracyTask):
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
     EVALUATE_KWARGS = dict(scores_filter=None)
+
+
+class GSM8KInferenceX(AccuracyTask):
+    # InferenceX-protocol GSM8K, see tensorrt_llm.evaluate.GSM8KInferenceX.
+    DATASET = "gsm8k_inferencex"
+    DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 1319  # Full sample
+
+    MAX_INPUT_LEN = 4096
+    MAX_OUTPUT_LEN = 12288
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8KInferenceX
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+    # InferenceX reports the strict-match score.
+    EVALUATE_KWARGS = dict(scores_filter="exact_match,strict-match")
 
 
 class GPQADiamond(AccuracyTask):

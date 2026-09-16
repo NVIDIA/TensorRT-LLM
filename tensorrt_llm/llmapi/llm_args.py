@@ -71,7 +71,8 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
-from ..tokenizer import TOKENIZER_ALIASES
+from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
+from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -1601,16 +1602,18 @@ class MoeLoadBalancerConfig(StrictBaseModel):
         return assignments
 
 
+_MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM",
+                      "DENSEGEMM", "VANILLA", "TRITON", "MARLIN",
+                      "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
-    backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
-        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
-        "MEGAMOE_CUTEDSL"] = Field(
-            default='AUTO',
-            description="MoE backend to use. "
-            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
-        )
+    backend: _MoeBackend = Field(
+        default='AUTO',
+        description="MoE backend to use. "
+        "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+    )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -1638,12 +1641,13 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 
-# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) is
-# imported from `tensorrt_llm.tokenizer`, which is where the built-in custom
-# tokenizers live. It used to be duplicated here, and the copy drifted: it was
-# missing every alias added after it, so `--custom_tokenizer <alias>` failed
-# with "not enough values to unpack" for those while the identical alias worked
-# through `load_custom_tokenizer`.
+# `TOKENIZER_ALIASES` (alias -> full "module.ClassName" import path) lives in
+# `tensorrt_llm.tokenizer`, where the built-in custom tokenizers register
+# themselves, and is re-exported from here. It used to be duplicated here, and
+# the copy drifted: it was missing every alias added after it, so
+# `--custom_tokenizer <alias>` failed with "not enough values to unpack" for
+# those. `custom_tokenizer` now resolves through `load_custom_tokenizer`, the
+# same loader every other entry point uses.
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
@@ -1730,8 +1734,8 @@ class AttentionDpConfig(StrictBaseModel):
         default=False,
         description=
         "Enable explicit conversation-affinity routing for attention DP. When "
-        "True, the first request of each conversation is round-robined across "
-        "ranks and every subsequent request carrying the same "
+        "True, the first request is placed by kv_cache_routing_new_conv_placement "
+        "and every subsequent request carrying the same "
         "conversation_params.conversation_id is pinned to that conversation's "
         "first-turn rank. OpenAI requests use the body conversation_params as "
         "canonical; the serve edge only creates conversation_params from the "
@@ -1740,8 +1744,8 @@ class AttentionDpConfig(StrictBaseModel):
         "block reuse, minimizing cross-rank migration). Unlike "
         "enable_kv_cache_aware_routing (affinity inferred from prefix-match "
         "length, which is lost when blocks are evicted), the conversation->rank "
-        "map is explicit and survives eviction. Falls back to load-balanced "
-        "round-robin when no conversation_id is available. Takes precedence "
+        "map is explicit and survives eviction. The same placement policy is "
+        "used when no conversation_id is available. Takes precedence "
         "over enable_kv_cache_aware_routing when both are set.")
     kv_cache_routing_max_sessions: int = Field(
         default=65536,
@@ -1751,18 +1755,17 @@ class AttentionDpConfig(StrictBaseModel):
         "are tracked, bounding memory on long-running servers. Only used when "
         "kv_cache_routing_conversation_affinity is True.")
     kv_cache_routing_new_conv_placement: Literal[
-        "round_robin", "least_queued"] = Field(
+        "round_robin", "least_queued", "least_tokens"] = Field(
             default="round_robin",
             description=
             "Placement policy in conversation-affinity routing for requests "
             "with no pinned rank yet (first turn of a conversation, requests "
             "without a conversation_id, sticky overflow). 'round_robin' "
-            "(default) equalizes per-rank conversation counts. 'least_queued' "
-            "places them on the rank with the fewest live requests instead: "
-            "per-conversation load (turn rate, fan-out, prefill length) is "
-            "not uniform, so count-uniform round-robin can leave some ranks "
-            "with deep queues while others idle; steering new conversations "
-            "by queue depth evens that out and cuts tail TTFT. Existing "
+            "(default) rotates across eligible ranks. 'least_queued' chooses "
+            "the fewest live requests. 'least_tokens' chooses the fewest active "
+            "prompt tokens, including requests assigned in the current batch; "
+            "ties use live request count, then the rotating rank cursor. "
+            "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
 
@@ -1964,6 +1967,21 @@ class DecodingBaseConfig(StrictBaseModel):
         "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
         "target's embedded mtp.* weights.")
 
+    moe_backend: Optional[_MoeBackend] = Field(
+        default=None,
+        description=(
+            "MoE backend override for a neural draft model or embedded MTP "
+            "layers on the PyTorch backend. None inherits the target model's "
+            "backend. AUTO resolves from the draft checkpoint or embedded MTP "
+            "layer quantization, and a concrete backend applies only to the "
+            "draft model or layers. Resolution may fall back based on model, "
+            "quantization, and hardware support. Replacement-head MTP "
+            "checkpoints are unsupported because their independent "
+            "quantization metadata is not loaded. Nemotron-H embedded MTP "
+            "layers must inherit the target backend because their checkpoint "
+            "mapper uses a shared backend-dependent layout. Decoding methods "
+            "without a neural draft model ignore this option."))
+
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
@@ -2163,6 +2181,19 @@ class DecodingBaseConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    def _validate_moe_backend_compatibility(self,
+                                            *,
+                                            model_config_resolved: bool = False
+                                            ) -> None:
+        if (self.moe_backend is None or not model_config_resolved
+                or not self.uses_replacement_heads):
+            return
+        raise ValueError(
+            "speculative_config.moe_backend does not support replacement-head "
+            "MTP checkpoints because their independent quantization metadata "
+            "is not loaded. Leave moe_backend unset to inherit the target "
+            "backend, or use a full external draft-model checkpoint.")
 
     @property
     def uses_replacement_heads(self) -> bool:
@@ -4650,8 +4681,15 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
-    )
+        "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
+        "coalesces a request's scattered per-block KV for a single multi-rail "
+        "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
+        "the per-block path, >0 enables bounce at that capacity. By default "
+        "two buffers of this size are allocated (one for send, one for recv); "
+        "with agent_bounce_buffer_enable a single shared buffer is allocated "
+        "instead and the size should be a power of two (256/512/1024). "
+        "Requires the Python (v2) transceiver (transceiver_runtime); the C++ "
+        "transceiver does not support bounce and ignores this field.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -4659,9 +4697,77 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Transfer each completed prefill chunk's KV cache while later chunks "
         "compute. Requires Python NIXL, generation-first scheduling, chunked "
         "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
-        "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
-        "reuse disabled or set to all_reusable. Invalid static settings fail at "
+        "peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent "
+        "bounce selected by agent_bounce_buffer_enable is allowed) or "
+        "Mamba/hybrid cache, and block reuse disabled or set to all_reusable. "
+        "Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
+
+    agent_bounce_buffer_enable: bool = Field(
+        default=False,
+        description=
+        "Run the KV-cache bounce in the C++ transfer agent instead of the "
+        "Python transceiver, using one shared kv_cache_bounce_size_mb buffer "
+        "(use a power of two). Set this identically on context and "
+        "generation; kv_cache_bounce_size_mb matters only when its usable "
+        "capacity (rounded down to a power of two) is below max_chunk_size; "
+        "both sides must then clamp to the same chunk cap, otherwise the pair "
+        "falls back to standard NIXL. By default only writes with "
+        "many small descriptors (>= 1024, <= 16 KiB average, i.e. "
+        "head-mismatch layouts) take the path; head-matched layouts (MLA, "
+        "symmetric TP) stay on standard NIXL unless agent_bounce_params "
+        "relaxes the gate. Requires the Python (v2) transceiver; see the "
+        "disaggregated-serving docs.")
+
+    agent_bounce_params: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see "
+        "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
+        "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
+        "Precedence: this dict > environment variable > built-in default. "
+        "Requires agent_bounce_buffer_enable. request_timeout_ms and the "
+        "effective max_chunk_size (after the arena clamp) must match between "
+        "context and generation. "
+        "max_average_descriptor_size=0 stops outbound routing only (arena, "
+        "handshake and inbound scatter stay active); set "
+        "agent_bounce_buffer_enable=False to turn the feature off.")
+
+    @field_validator('agent_bounce_params', mode='before')
+    @classmethod
+    def coerce_agent_bounce_params_to_str(cls, v):
+        """Coerce agent_bounce_params values to strings (YAML often yields ints/bools)."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"agent_bounce_params must be a dict of str to str, got "
+                f"{type(v).__name__}")
+        return {str(k): str(val) for k, val in v.items()}
+
+    @model_validator(mode='after')
+    def validate_bounce_config(self) -> 'CacheTransceiverConfig':
+        if self.agent_bounce_buffer_enable and self.kv_cache_bounce_size_mb == 0:
+            raise ValueError(
+                "agent_bounce_buffer_enable selects the C++ transfer-agent "
+                "bounce implementation, but kv_cache_bounce_size_mb is 0 "
+                "(bounce disabled); set a positive capacity.")
+        if self.agent_bounce_params:
+            if not self.agent_bounce_buffer_enable:
+                raise ValueError(
+                    "agent_bounce_params only applies to the C++ transfer-agent "
+                    "bounce implementation; set agent_bounce_buffer_enable=True "
+                    "or drop the params.")
+            # Lazy: importing tensorrt_llm._torch at module scope is circular.
+            from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
+                AGENT_BOUNCE_PARAM_KEYS
+            unknown = sorted(
+                set(self.agent_bounce_params) - AGENT_BOUNCE_PARAM_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown agent_bounce_params key(s) {unknown}; valid keys "
+                    f"are {sorted(AGENT_BOUNCE_PARAM_KEYS)}.")
+        return self
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
@@ -5211,27 +5317,15 @@ class BaseLlmArgs(StrictBaseModel):
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            # Resolve short aliases via the module-level TOKENIZER_ALIASES.
-            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
-                                                   self.custom_tokenizer)
-
-            # Dynamically import and use custom tokenizer
-            from importlib import import_module
-            try:
-                module_path, class_name = tokenizer_path.rsplit('.', 1)
-                module = import_module(module_path)
-                tokenizer_class = getattr(module, class_name)
-                # Use tokenizer path if specified, otherwise use model path
-                load_path = self.tokenizer if self.tokenizer else self.model
-                self.tokenizer = tokenizer_class.from_pretrained(
-                    load_path,
-                    trust_remote_code=self.trust_remote_code,
-                    use_fast=self.tokenizer_mode != 'slow')
-            except (ValueError, ImportError, AttributeError) as e:
-                raise ValueError(
-                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
-                    "Expected format: 'module.path.ClassName' or a recognized alias."
-                ) from e
+            # Use tokenizer path if specified, otherwise use model path.
+            load_path = self.tokenizer if self.tokenizer else self.model
+            # The one loader for aliases and import paths; it raises
+            # ValueError("Failed to load custom tokenizer ...") on failure.
+            self.tokenizer = load_custom_tokenizer(
+                self.custom_tokenizer,
+                load_path,
+                trust_remote_code=self.trust_remote_code,
+                use_fast=self.tokenizer_mode != 'slow')
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
@@ -6010,12 +6104,17 @@ class TorchLlmArgs(BaseLlmArgs):
     use_cute_dsl_bf16_bmm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        "If true, use CuTe DSL BF16 BMM on Blackwell (SM100/SM103) and Rubin (SM107), "
+        "including the DeepSeek-V4 o_a projection on Rubin when DSL support and "
+        "dimension alignment permit. Defaults to false; automatically enabled "
+        "with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
     use_cute_dsl_bf16_gemm: bool = Field(
         default=False,
         description=
-        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
+        "If true, use CuTe DSL BF16 persistent GEMM for Linear layers on Blackwell "
+        "(SM100/SM103) and Rubin (SM107) when supported. Defaults to false; "
+        "automatically enabled with pipeline_parallel_size > 1 on SM100/SM103/SM107.",
         status="prototype")
 
     # PrivateVars
@@ -6212,6 +6311,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            self.speculative_config._validate_moe_backend_compatibility()
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
@@ -6750,7 +6851,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if (not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
                 and self.pipeline_parallel_size > 1 and is_sm_100f()):
             logger.info("Automatically enabling CuTe DSL BF16 BMM and GEMM for "
-                        "SM100/SM103 PP.")
+                        "SM100/SM103/SM107 with pipeline_parallel_size > 1.")
             self.use_cute_dsl_bf16_bmm = True
             self.use_cute_dsl_bf16_gemm = True
 
@@ -6760,7 +6861,7 @@ class TorchLlmArgs(BaseLlmArgs):
             if sm < 100:
                 raise ValueError(
                     f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
-                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"supported on SM >= 100 (Blackwell or newer), but current device has "
                     f"sm {sm}.")
         return self
 

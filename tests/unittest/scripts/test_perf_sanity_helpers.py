@@ -42,14 +42,14 @@ def _assignment(
 
 @pytest.mark.parametrize(
     ("build_number", "expected_bucket", "expected_arm"),
-    [(100, 0, "native"), (101, 1, "auto"), (102, 2, "auto"), (103, 3, "auto")],
+    [(100, 0, "native"), (101, 1, "auto"), (102, 0, "native"), (103, 1, "auto")],
 )
-def test_checkpoint_io_experiment_uses_postmerge_build_for_deterministic_75_25_split(
+def test_checkpoint_io_experiment_uses_postmerge_build_for_deterministic_50_50_split(
     build_number: int,
     expected_bucket: int,
     expected_arm: str,
 ) -> None:
-    configs = [{}, {}]
+    configs = [{}, {"checkpoint_loader": None}]
 
     assignment = perf_sanity.assign_checkpoint_io_experiment(
         configs,
@@ -62,6 +62,7 @@ def test_checkpoint_io_experiment_uses_postmerge_build_for_deterministic_75_25_s
         },
     )
 
+    assert assignment.version == "checkpoint-io-v4-postmerge-50-auto-50-native"
     assert assignment.bucket == expected_bucket
     assert assignment.assigned_arm == expected_arm
     assert assignment.assignment_source == "postmerge_build_number"
@@ -69,7 +70,7 @@ def test_checkpoint_io_experiment_uses_postmerge_build_for_deterministic_75_25_s
     assert assignment.root_build_number == build_number
     assert configs == [
         {"checkpoint_io_policy": expected_arm},
-        {"checkpoint_io_policy": expected_arm},
+        {"checkpoint_loader": None, "checkpoint_io_policy": expected_arm},
     ]
 
 
@@ -163,28 +164,38 @@ def test_checkpoint_io_experiment_preserves_explicit_policy() -> None:
     assert configs == [{"checkpoint_io_policy": "rank_striped_read_ahead"}, {}]
 
 
+@pytest.mark.parametrize("is_post_merge", [False, True])
 @pytest.mark.parametrize(
     "config",
     [
         {"backend": "_autodeploy"},
         {"checkpoint_format": "MX"},
         {"load_format": "dummy"},
+        {"checkpoint_loader": "custom"},
         {"extra_llm_api_config_path": "purpose-built.yaml"},
     ],
 )
-def test_checkpoint_io_experiment_excludes_incompatible_config(config: dict) -> None:
-    original = dict(config)
+def test_checkpoint_io_experiment_excludes_incompatible_config(
+    config: dict, is_post_merge: bool
+) -> None:
+    configs = [{}, config]
+    original = [dict(item) for item in configs]
 
     assignment = perf_sanity.assign_checkpoint_io_experiment(
-        [config],
+        configs,
         telemetry_eligible=True,
         environment={},
-        job_info={"b_is_pr_job": True, "s_trigger_mr_id": "100"},
+        job_info={
+            "b_is_pr_job": not is_post_merge,
+            "b_is_post_merge": is_post_merge,
+            "s_trigger_mr_id": "100",
+            "s_job_id": "100",
+        },
     )
 
     assert assignment.assigned_arm == "unassigned"
     assert assignment.assignment_source == "ineligible_config"
-    assert config == original
+    assert configs == original
 
 
 @pytest.mark.parametrize(

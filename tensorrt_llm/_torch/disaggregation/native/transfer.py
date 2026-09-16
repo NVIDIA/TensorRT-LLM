@@ -24,7 +24,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -616,14 +616,12 @@ class KVSendTask(SendTaskBase):
         params: DisaggregatedParams,
         slice_id: int,
         prompt_len: Optional[int] = None,
-        beam_width: int = 1,
     ):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
         self._prompt_len = prompt_len
-        self._beam_width = beam_width
 
 
 class Sender(SenderBase):
@@ -1293,18 +1291,10 @@ class Sender(SenderBase):
         )
 
     @staticmethod
-    def _beam0_block_count(block_ids: np.ndarray, total_blocks: int, beam_width: int) -> int:
-        """Return the number of beam-0 blocks in a packed 1-D beam layout."""
-        if beam_width <= 1 or block_ids.size <= total_blocks:
-            return block_ids.size
-        return max(0, block_ids.size - (beam_width - 1))
-
-    @staticmethod
     def _trim_receiver_window_head(
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
         peer_window_size: Optional[int],
-        beam_width: int,
     ) -> np.ndarray:
         """Drop the receiver's extra leading blocks for a windowed layer group.
 
@@ -1320,7 +1310,7 @@ class Sender(SenderBase):
         block_diff = dst_block_ids.size - src_block_ids.size
         if block_diff <= 0:
             return dst_block_ids
-        if peer_window_size is None or beam_width > 1:
+        if peer_window_size is None:
             raise ValueError(
                 f"src/dst block count mismatch: {src_block_ids.size} vs "
                 f"{dst_block_ids.size} (dst must not exceed src)"
@@ -1419,20 +1409,17 @@ class Sender(SenderBase):
                     src_block_ids,
                     dst_block_ids,
                     peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
-                    beam_width=task._beam_width,
                 )
-                src_beam0 = Sender._beam0_block_count(src_block_ids, total_blocks, task._beam_width)
-                dst_beam0 = Sender._beam0_block_count(dst_block_ids, total_blocks, task._beam_width)
-                assert src_beam0 <= total_blocks, (
-                    f"src beam-0 block list ({src_beam0}) exceeds total slice "
+                assert src_block_ids.size <= total_blocks, (
+                    f"src block list ({src_block_ids.size}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                assert dst_beam0 <= total_blocks, (
-                    f"dst beam-0 block list ({dst_beam0}) exceeds total slice "
+                assert dst_block_ids.size <= total_blocks, (
+                    f"dst block list ({dst_block_ids.size}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                src_start = (total_blocks - src_beam0) * tpb
-                dst_start = (total_blocks - dst_beam0) * tpb
+                src_start = (total_blocks - src_block_ids.size) * tpb
+                dst_start = (total_blocks - dst_block_ids.size) * tpb
                 if req_info.dst_start_token is not None:
                     dst_start = max(dst_start, req_info.dst_start_token)
                 if window_size is not None:
@@ -1920,13 +1907,9 @@ class TxSession(TxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
-        beam_width: int = 1,
         overall_timeout_s: Optional[float] = None,
     ):
-        super().__init__(
-            sender,
-            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
-        )
+        super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
@@ -2000,7 +1983,6 @@ class TxSession(TxSessionBase):
                 params,
                 slice_id,
                 prompt_len=self._base_args.prompt_len,
-                beam_width=self._base_args.beam_width,
             )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
@@ -2982,12 +2964,8 @@ class RxSession(RxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
-        beam_width: int = 1,
     ):
-        super().__init__(
-            receiver,
-            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
-        )
+        super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
@@ -3676,7 +3654,13 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
+def _create_nixl_agent(
+    name: str,
+    rank: int,
+    world_size: int,
+    agent_buffer_size_mb: int = 0,
+    agent_bounce_params: Optional[Dict[str, str]] = None,
+) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
@@ -3687,6 +3671,8 @@ def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAge
         num_threads=num_threads,
         rank=rank,
         world_size=world_size,
+        agent_buffer_size_mb=agent_buffer_size_mb,
+        agent_bounce_params=agent_bounce_params,
         **kwargs,
     )
 
@@ -3718,6 +3704,15 @@ class TransferWorkerConfig:
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
     enforce_physical_ownership: bool = False
+    # Transfer-agent staging (bounce v2) buffer size in MiB; 0 disables the
+    # fast path. Derived upstream from CacheTransceiverConfig: it equals
+    # kv_cache_bounce_size_mb when agent_bounce_buffer_enable is set (in which
+    # case `bounce` above is off) and 0 otherwise.
+    agent_buffer_size_mb: int = 0
+    # Expert bounce knobs (TRTLLM_NIXL_BOUNCE_* names without the prefix and the
+    # trailing _BYTES, lowercased); dict > env > default. Ignored when
+    # agent_buffer_size_mb == 0.
+    agent_bounce_params: Optional[Dict[str, str]] = None
 
 
 class TransferWorker:
@@ -3751,7 +3746,6 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
-            beam_width=request.py_beam_width,
             overall_timeout_s=self._config.tx_overall_timeout_s,
         )
 
@@ -3765,7 +3759,6 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.rx_timeout_s,
             prompt_len=request.prompt_len,
-            beam_width=request.py_beam_width,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
@@ -3788,7 +3781,22 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             rank=mapping.rank,
             world_size=mapping.world_size,
+            agent_buffer_size_mb=self._config.agent_buffer_size_mb,
+            agent_bounce_params=self._config.agent_bounce_params,
         )
+        # The pure-Python agent has no bounce_enabled attribute and already warns on its own.
+        if (
+            self._config.agent_buffer_size_mb > 0
+            and hasattr(self._agent, "bounce_enabled")
+            and not self._agent.bounce_enabled
+        ):
+            logger.warning(
+                f"TransferWorker: the C++ transfer-agent bounce was requested "
+                f"(agent_bounce_buffer_enable=True, kv_cache_bounce_size_mb="
+                f"{self._config.agent_buffer_size_mb}) but is inactive on agent "
+                f"{self._agent.name} (init failed); standard per-descriptor NIXL "
+                "transfers are in use."
+            )
         self._registered_mem: list = []
         try:
             self._register_kv_cache()
@@ -3898,6 +3906,14 @@ class TransferWorker:
         # (e.g. when the KV cache manager is recreated after profiling).
         agent = getattr(self, "_agent", None)
         if agent is not None:
+            try:
+                if getattr(agent, "bounce_enabled", False):
+                    logger.info(
+                        f"TransferWorker.shutdown: agent {agent.name} bounce_submit_count="
+                        f"{agent.bounce_submit_count} bounce_reject_count={agent.bounce_reject_count}"
+                    )
+            except Exception as e:  # observability only; never skip deregister/shutdown below
+                logger.debug(f"TransferWorker.shutdown: bounce counters unavailable: {e}")
             registered = getattr(self, "_registered_mem", [])
             while registered:
                 desc = registered.pop(0)

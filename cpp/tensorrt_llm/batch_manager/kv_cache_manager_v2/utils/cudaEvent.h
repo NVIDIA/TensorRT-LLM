@@ -375,45 +375,17 @@ private:
 // Stream-level helpers.
 // ---------------------------------------------------------------------------
 
-// Wait for all events on the given stream. Deduplicates internally.
-// Mirrors Python's stream_wait_events() which converts to set() before iterating.
-inline void streamWaitEvents(CudaStream stream, std::vector<CachedCudaEvent const*> const& events)
+// Wait for all events on the given stream, skipping nulls and issuing one wait per distinct
+// event. Mirrors Python's stream_wait_events(), which converts to set() before iterating.
+// Waiting does not consume an event, so raw CUevent values suffice and a caller-owned
+// CachedCudaEvent need not outlive the call.
+inline void streamWaitEvents(CudaStream stream, std::vector<CUevent> events)
 {
-    thread_local std::vector<CUevent> handles;
-    handles.clear();
-    handles.reserve(events.size());
-    for (auto const* ev : events)
-    {
-        if (ev != nullptr)
-        {
-            if (CUevent evh = ev->handle(); evh != nullptr)
-                handles.push_back(evh);
-        }
-    }
-    std::sort(handles.begin(), handles.end());
-    handles.erase(std::unique(handles.begin(), handles.end()), handles.end());
-    for (CUevent h : handles)
+    events.erase(std::remove(events.begin(), events.end(), nullptr), events.end());
+    std::sort(events.begin(), events.end());
+    events.erase(std::unique(events.begin(), events.end()), events.end());
+    for (CUevent h : events)
         cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), h, 0));
-}
-
-// Synchronize and close all events. Deduplicates internally.
-// Mirrors Python's set()-based synchronization pattern.
-inline void synchronizeAll(std::vector<CachedCudaEvent*> const& events)
-{
-    thread_local std::vector<CUevent> handles;
-    handles.clear();
-    handles.reserve(events.size());
-    for (auto* ev : events)
-    {
-        if (CUevent evh = ev->handle(); evh != nullptr)
-            handles.push_back(evh);
-    }
-    std::sort(handles.begin(), handles.end());
-    handles.erase(std::unique(handles.begin(), handles.end()), handles.end());
-    for (CUevent h : handles)
-        cuCheck(cuEventSynchronize(h));
-    for (auto* ev : events)
-        ev->close();
 }
 
 // ---------------------------------------------------------------------------
@@ -437,9 +409,9 @@ public:
     }
 
     // Wait for all events on this stream. Deduplicates internally.
-    void waitEvents(std::vector<CachedCudaEvent const*> const& events)
+    void waitEvents(std::vector<CUevent> events)
     {
-        streamWaitEvents(reinterpret_cast<CudaStream>(handle()), events);
+        streamWaitEvents(reinterpret_cast<CudaStream>(handle()), std::move(events));
     }
 
     CachedCudaEvent recordEvent() noexcept;
@@ -468,7 +440,7 @@ class TemporaryCudaStream
 {
 public:
     // Acquire a stream from pool and issue cuStreamWaitEvent for each prior event.
-    explicit TemporaryCudaStream(std::vector<CachedCudaEvent const*> const& priorEvents);
+    explicit TemporaryCudaStream(std::vector<CUevent> priorEvents);
 
     // Begin a scoped block. Destructor records the finish event, including during stack unwinding.
     [[nodiscard]] auto enter()
