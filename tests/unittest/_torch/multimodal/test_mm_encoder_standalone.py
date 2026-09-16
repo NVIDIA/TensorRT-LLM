@@ -1298,7 +1298,8 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
 
     create_llm = functools.partial(_create_mm_disagg_llm,
                                    model_dir,
-                                   enable_block_reuse=False)
+                                   enable_block_reuse=False,
+                                   force_kv_cache_manager_v2=True)
 
     llm_prefill, llm_decode = _instantiate_models(
         functools.partial(create_llm, disable_overlap_scheduler=True),
