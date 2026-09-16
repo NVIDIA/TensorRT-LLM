@@ -145,7 +145,7 @@ kv_cache_config:
 EOF
 ```
 
-To use FP8 KV cache with any of these aggregated-serving configurations, add `dtype: fp8` under `kv_cache_config`. This halves latent KV storage; indexer and KDA state precision are unchanged. Selected KV rows are dequantized in bounded query chunks before attention. For large prefills, repeated staging and attention calls can increase time to first token and reduce prefill throughput, in addition to decode overhead. Leave `dtype: auto` (BF16) when prioritizing latency or prefill throughput. The performance curves below use BF16 KV cache.
+To use FP8 KV cache with any of these aggregated-serving configurations, add `dtype: fp8` under `kv_cache_config`. This halves latent KV storage; indexer and KDA state precision are unchanged. Selected KV rows are dequantized in bounded query chunks before attention. For large prefills, repeated staging and attention calls can increase time to first token and reduce prefill throughput, in addition to decode overhead. Use BF16 KV when prioritizing latency or prefill throughput. `dtype: auto` inherits the checkpoint's KV-cache quantization metadata, so BF16 also requires that metadata not to enable FP8 KV quantization. The performance curves below use BF16 KV cache.
 
 ### Launch the TensorRT LLM Server
 
