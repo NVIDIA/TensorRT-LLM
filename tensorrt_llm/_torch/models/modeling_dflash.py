@@ -337,6 +337,10 @@ class DFlashForCausalLM(nn.Module):
     # has a third implementation they cannot express.
     _default_attention_backend = "VANILLA"
     _supported_attention_backends = ("VANILLA", "TRTLLM", "FA4")
+    # Where AUTO lands when the preferred backend cannot run. None means AUTO
+    # propagates the reason instead: a family whose only deployable target can
+    # run the fast kernel gains nothing from a silently slower path.
+    _auto_fallback_attention_backend = "VANILLA"
 
     # Whether the drafter's context KV lives in the draft KV cache manager's
     # paged pool rather than a private arena dense in max_seq_len. Orthogonal
@@ -353,26 +357,58 @@ class DFlashForCausalLM(nn.Module):
 
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
-        """Turn ``AUTO`` into a concrete backend for this drafter family.
-
-        Only TRTLLM degrades: its ops are an optional dependency and the two
-        drafter families that prefer it differ in whether a build can load
-        them. CUTEDSL does not -- a build that cannot run it raises in
-        ``MLADSparkForCausalLM.__init__`` with the reason, which is the
-        intended behaviour for the only hardware that lacks it.
-        """
+        """Turn ``AUTO`` into a concrete backend for this drafter family."""
         want = cls._default_attention_backend
-        if want != "TRTLLM":
-            return want
-        reason = dflash_trtllm_gen_unavailability_reason()
+        reason = cls._attention_backend_unavailability_reason(want)
         if reason is None:
-            return "TRTLLM"
+            return want
+        fallback = cls._auto_fallback_attention_backend
+        if fallback is None:
+            raise ValueError(
+                f"{cls.__name__} has no usable attention backend: its default "
+                f"{want!r} is unavailable ({reason}) and this family does not "
+                f"degrade."
+            )
         logger.info_once(
-            f"{cls.__name__} prefers the TRTLLM attention backend but it is "
-            f"unavailable ({reason}); falling back to VANILLA.",
+            f"{cls.__name__} prefers the {want} attention backend but it is "
+            f"unavailable ({reason}); falling back to {fallback}.",
             key=f"dflash_auto_backend_fallback_{cls.__name__}",
         )
-        return "VANILLA"
+        return fallback
+
+    @classmethod
+    def _attention_backend_unavailability_reason(cls, backend: str) -> Optional[str]:
+        """Why this build cannot run ``backend``, or None. Overridden per family.
+
+        The same backend NAME resolves to different kernels per drafter family
+        -- GQA TRTLLM is the trtllm-gen FMHA op set, MLA TRTLLM is flashinfer's
+        absorbed-MLA paged decode -- so the probe belongs to the class rather
+        than to the resolver, which only knows the name.
+        """
+        if backend == "TRTLLM":
+            return dflash_trtllm_gen_unavailability_reason()
+        return None
+
+    @classmethod
+    def check_valid_attention_backend(cls, backend: str) -> None:
+        """Raise unless this build can actually run ``backend``.
+
+        Both halves are fatal on an EXPLICIT request: a typo, and a backend the
+        build cannot serve. Silently running something else is what this
+        replaces -- the MLA drafter used to fall through to its eager reference,
+        correct but orders slower, with nothing raised.
+        """
+        if backend not in cls._supported_attention_backends:
+            raise ValueError(
+                f"{cls.__name__} attention backend must be one of "
+                f"{list(cls._supported_attention_backends)}, got {backend!r}."
+            )
+        reason = cls._attention_backend_unavailability_reason(backend)
+        if reason is not None:
+            raise ValueError(
+                f"attention_backend={backend!r} was requested but it is "
+                f"unavailable for {cls.__name__}: {reason}."
+            )
 
     def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         """Build the draft model, resolving its architecture from the draft config
@@ -428,12 +464,7 @@ class DFlashForCausalLM(nn.Module):
         if dflash_attention_backend == "AUTO":
             dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend
-        if self.dflash_attention_backend not in self._supported_attention_backends:
-            raise ValueError(
-                f"{type(self).__name__} attention backend must be one of "
-                f"{list(self._supported_attention_backends)}, got "
-                f"{self.dflash_attention_backend!r}."
-            )
+        self.check_valid_attention_backend(self.dflash_attention_backend)
         # Each backend loads only its own ops; the rest stay None so the
         # shared paged prologue can read them unconditionally.
         self._dflash_flash_attention = None

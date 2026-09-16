@@ -1565,3 +1565,51 @@ def test_mla_drafter_rejects_a_partial_fused_component_set():
 
     with pytest.raises(ValueError, match="WEIGHTS_SHARED_WITH_TARGET"):
         drafter.load_weights(truncated)
+
+
+def test_mla_dspark_raises_when_the_requested_backend_cannot_run(monkeypatch):
+    """An explicit backend the build cannot serve must not degrade silently.
+
+    The old behaviour fell through ``_mla_block_decode_variant`` to the eager
+    reference: identical output, orders slower, nothing raised. Only a log line
+    distinguished it, and that line named the GQA op set this drafter never
+    loads.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    monkeypatch.setattr(MLADSparkForCausalLM, "_mla_decode_op", staticmethod(lambda: None))
+    model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="VANILLA")
+    with pytest.raises(ValueError, match="trtllm_batch_decode_with_kv_cache_mla"):
+        MLADSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM")
+
+
+def test_mla_dspark_auto_does_not_degrade_to_the_eager_reference(monkeypatch):
+    """AUTO on this family propagates the reason instead of falling back.
+
+    The GQA drafter degrades because VANILLA/FlashAttention is a real path on a
+    smaller part. This drafter needs a 288 GB Blackwell part to hold the target
+    at all, so the eager reference is never the answer -- see
+    ``_auto_fallback_attention_backend = None``.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    monkeypatch.setattr(MLADSparkForCausalLM, "_mla_decode_op", staticmethod(lambda: None))
+    model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="VANILLA")
+    with pytest.raises(ValueError, match="does not degrade"):
+        MLADSparkForCausalLM(model_config, dflash_attention_backend="AUTO")
+
+
+def test_gqa_dspark_auto_still_degrades(monkeypatch):
+    """The base policy is unchanged: a GQA drafter falls back rather than raise."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_dflash
+    from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
+
+    monkeypatch.setattr(
+        modeling_dflash, "dflash_trtllm_gen_unavailability_reason", lambda: "probe says no"
+    )
+    model_config = ModelConfig(pretrained_config=_tiny_config(True), attn_backend="VANILLA")
+    drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="AUTO")
+    assert drafter.dflash_attention_backend == "VANILLA"
