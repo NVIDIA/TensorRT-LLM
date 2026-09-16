@@ -1,4 +1,7 @@
-
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
 
 # DSA KV offload on KVCacheManagerV2
 
@@ -171,18 +174,28 @@ cannot read disk.
 
 ### 3.4 Find GPU hits, fetch misses, and give attention its indices
 
-**Use** `load_cache_to_device_buffer_kernel` **directly behind** `ensure_resident`**.** It combines these
-operations in one GPU kernel for each layer:
+**Pass logical selections directly to `ensure_resident()`, backed by HiSparse's
+`load_cache_to_device_buffer_kernel`.** Its inputs are `SelectedEntries`, the entry layout and
+host view with protected host sources, and mutable GPU-cache state. It handles:
 
-1. Keep selected entries already on GPU.
-2. Choose replaceable LRU entries for misses, following section 3.3.
-3. Fetch missing KV from host and order attention after those copies.
-4. Return the selected GPU-cache indices for attention.
+1. Validate selection IDs and bounds.
+2. Find GPU hits and choose replaceable LRU entries for misses.
+3. Resolve valid host sources for misses and fetch their KV.
+4. Produce attention indices and protect the selected GPU slots through attention.
 
-Allocate buffers before graph capture. Keep the model's top-K selection before this call and
-attention after it. The KVCM integration must handle host layouts/scales, duplicate and padded
-selections, request-slot reuse, source validity, and protection through attention. Keep required
-checks on GPU and report unavailable selected data; no per-layer CPU allocation or synchronization.
+The HiSparse kernel combines lookup, LRU, and copying. Attention must run after its copies finish;
+returning from the Python call does not wait for GPU completion. Keep host sources alive through
+copy completion and prevent selected GPU slots from being replaced until attention finishes.
+
+`resolve_entries()` is an optional helper for tests, validation, or other backends. It writes an
+`EntryResolution`: selection validity, host offsets, and current GPU hits or misses. It does not
+fetch KV or protect slots, and its results can become stale after mappings change. The HiSparse
+path skips this helper and performs its own hit lookup once. Its cache state need not maintain
+the helper's separate `GpuCacheView` mapping.
+
+Allocate buffers before graph capture. The KVCM integration must handle layouts/scales,
+duplicate and padded selections, request-slot reuse, and source validity. Keep required checks
+on GPU and report unavailable selected data; no per-layer CPU allocation or synchronization.
 
 Attention must use this new mapping. The existing `convert_req_index_to_global` returns `-1` for
 missing GPU page entries; using it before fetch would lose host-resident selections.
@@ -225,8 +238,8 @@ Each layer runs these steps on GPU:
 
 1. **Write** new KV and scoring data. Wait for prior uses before overwriting a slot.
 2. **Select** the KV to read. IndexShare layers can share a selection but need their own KV.
-3. **Fetch** missing KV with the HiSparse kernel through `ensure_resident`. New KV can use its
-  protected GPU copy while backup is pending.
+3. **Fetch** missing KV by passing the selection, layout/host view, and GPU-cache state directly
+  to `ensure_resident()`. New KV can use its protected GPU copy while backup is pending.
 4. **Run attention** using the returned indices, after the required copies finish.
 
 Copy newly completed KV to host after its writes. This may overlap attention when both read the

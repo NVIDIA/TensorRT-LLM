@@ -5,6 +5,10 @@
 These views describe storage; they do not allocate KV, hold pages, copy bytes,
 change page residency, or choose victims. Owners must keep tables and storage
 alive and stable through GPU use. Build views and outputs before graph capture.
+
+resolve_entries is an optional lookup helper for tests, validation, and other
+backends. The planned HiSparse ensure_resident path takes logical selections,
+layout/host views, and its own mutable cache state directly, without this helper.
 """
 
 from dataclasses import dataclass
@@ -115,7 +119,10 @@ class HostStorageView:
 
 @dataclass(frozen=True)
 class GpuCacheView:
-    """Per-entry GPU mapping for one layer/lifecycle, separate from Page.cacheLevel.
+    """Per-entry GPU mapping read by the optional resolve_entries helper.
+
+    This describes one layer/lifecycle, separately from Page.cacheLevel.
+    HiSparse's mutable cache state need not maintain this additional mapping.
 
     request_ids: CUDA int64 [requests], current owners of mapping rows.
     entry_indices: CUDA int32 [requests, logical_capacity], maps logical positions
@@ -144,14 +151,19 @@ class GpuCacheView:
 
 
 @dataclass(frozen=True)
-class ResolvedEntries:
-    """Caller-owned CUDA outputs, in the same row/column order as the selection.
+class EntryResolution:
+    """Observed locations and availability, in the selection's row/column order.
+
+    These caller-owned CUDA outputs do not fetch KV or protect storage. Locations
+    can become stale when mappings change; this result does not track updates.
+    Storage owners must provide ordering and protection for any later reads.
 
     valid: bool [queries, top_k], logical selection validity.
     host_valid: bool [queries, top_k], all components have a completed host copy.
     host_offsets: int64 [queries, top_k, components], bytes from each component's
         pool base; -1 if host data is unavailable. Sizes come from EntryLayout.
-    gpu_indices: int32 [queries, top_k], ready entry indices or -1 on a miss.
+    gpu_indices: int32 [queries, top_k], GPU hits observed during lookup, or -1.
+        Hits rely on the cache owner to publish ready entries and protect use.
     A valid selection can miss both stores: the caller must arrange backup/fetch
     or report failure, never silently remove it from attention.
     """
@@ -166,9 +178,17 @@ def resolve_entries(
     selection: SelectedEntries,
     host: HostStorageView,
     gpu: GpuCacheView,
-    out: ResolvedEntries,
+    out: EntryResolution,
 ) -> None:
-    """Resolve on GPU into preallocated outputs, with no copies or residency changes.
+    """Look up current locations on GPU for tests, validation, or other backends.
+
+    Writes EntryResolution without copying KV, changing residency, or protecting
+    slots. Order table updates before this call and keep tables stable while it
+    runs. Outputs describe the lookup at execution time and may become stale
+    afterward. The caller must order later GPU use after this asynchronous call.
+
+    The planned HiSparse ensure_resident path consumes SelectedEntries and its
+    storage/cache inputs directly, so it does not repeat this helper's hit lookup.
 
     Table rows follow SelectionContext.request_ids. Stored IDs must also match;
     a reused row with an old ID is a storage miss, not someone else's KV. Missing

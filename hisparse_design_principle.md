@@ -52,9 +52,13 @@ Use these interfaces:
 - **`SelectionPolicy`** — returns logical entries selected by the model.
 - **Layout and storage views** — describe entry bytes, host locations, and GPU
   mappings. KVCM owns pages and host copies; read handles keep host addresses valid.
-- **`ensure_resident()`** — uses HiSparse to find hits, replace GPU copies with
-  LRU, fetch misses, and return attention indices. Read protection lasts through
-  attention and ends at `release()`.
+- **`ensure_resident()`** — takes logical selections, layout/host views, and
+  mutable GPU-cache state directly. HiSparse finds hits, replaces GPU copies with
+  LRU, fetches misses, and returns indices protected through attention.
+
+`resolve_entries()` is an optional lookup helper for tests, validation, or other
+backends. Its `EntryResolution` reports current locations without fetching or
+protecting KV. HiSparse skips this helper to avoid repeating hit lookup.
 
 HiSparse is the only GPU-cache implementation. Future experiments can replace
 its kernel adapter while keeping selection, layout, and ownership interfaces.

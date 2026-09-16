@@ -74,10 +74,11 @@ before GPU page-table conversion. `SelectionContext` carries request/layer/lifec
 per-query valid lengths. Positions keep their order and duplicates.
 
 `EntryLayout` describes KV and scale bytes, including compressed entries. `HostStorageView`
-and `GpuCacheView` describe separate pools and mappings over the existing per-request `KvCache`.
-`resolve_entries()` writes host offsets and GPU entry indices on GPU into preallocated outputs.
-It does not move KV or change page residency. Pool ownership/backup follows in 4, replacement
-in 5, and model wiring in 7, 9, and 10.
+describes host locations over the existing per-request `KvCache`. The optional `resolve_entries()`
+helper reads it and a `GpuCacheView`, writing current availability and locations into
+`EntryResolution`. It does not move KV or protect storage; mappings can change after lookup.
+Use it for tests, validation, or other backends. HiSparse takes logical selections directly and
+does its own lookup in step 5. Pool ownership/backup follows in 4, and model wiring in 7, 9, and 10.
 
 **Validation:** 35 focused tests passed on GB300 using isolated source imports. Coverage includes
 DSA context/decode and IndexShare, duplicates, empty/partial/invalid selections, page boundaries,
@@ -122,6 +123,8 @@ See [host-copy usage and layout](docs/source/developer-guide/kv-cache-host-copie
 
 **Work:** Use SGLang's [HiSparse kernels][hisparse-kernel] directly behind `ensure_resident()`.
 
+- Accept `SelectedEntries`, the layout/host view, and mutable GPU-cache state directly.
+  Skip `resolve_entries()` and its separate GPU mapping so HiSparse performs hit lookup once.
 - Integrate `load_cache_to_device_buffer_kernel` for GPU lookup, LRU replacement, host copies,
   and attention indices. Record the upstream revision and preserve its license.
 - Check host readiness, request IDs, capacity, duplicate/padded selections, layouts/scales,
@@ -133,6 +136,7 @@ See [host-copy usage and layout](docs/source/developer-guide/kv-cache-host-copie
 
 **Validation:** Check fetched KV/scales against host bytes. Test hits, misses, full capacity,
 newest entries, host ownership, shared plans, side-stream readers, and changing graph inputs.
+Check that decode skips the optional resolver and protects selected slots through attention.
 Run CUDA memory and race checks. Record cache memory use and hit/miss timings; broader tuning
 and model measurements follow in later steps.
 

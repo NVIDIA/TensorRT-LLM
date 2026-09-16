@@ -11,9 +11,9 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.selection import DSASelec
 from tensorrt_llm._torch.attention.backends.sparse.kv_layout import (
     EntryComponent,
     EntryLayout,
+    EntryResolution,
     GpuCacheView,
     HostStorageView,
-    ResolvedEntries,
     resolve_entries,
 )
 from tensorrt_llm._torch.attention.backends.sparse.selection import (
@@ -39,8 +39,8 @@ def _layout(layer_id: int = 7, life_cycle_id: int = 3) -> EntryLayout:
     )
 
 
-def _outputs(shape: tuple[int, int], components: int = 3) -> ResolvedEntries:
-    return ResolvedEntries(
+def _outputs(shape: tuple[int, int], components: int = 3) -> EntryResolution:
+    return EntryResolution(
         torch.empty(shape, dtype=torch.bool, device="cuda"),
         torch.empty(shape, dtype=torch.bool, device="cuda"),
         torch.empty((*shape, components), dtype=torch.int64, device="cuda"),
@@ -50,7 +50,7 @@ def _outputs(shape: tuple[int, int], components: int = 3) -> ResolvedEntries:
 
 def _inputs(
     positions: list[list[int]],
-) -> tuple[SelectedEntries, HostStorageView, GpuCacheView, ResolvedEntries]:
+) -> tuple[SelectedEntries, HostStorageView, GpuCacheView, EntryResolution]:
     device = "cuda"
     ids = torch.tensor([100, 200], dtype=torch.int64, device=device)
     context = SelectionContext(
