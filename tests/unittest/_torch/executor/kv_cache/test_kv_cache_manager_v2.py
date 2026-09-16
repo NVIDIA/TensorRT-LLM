@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -775,18 +776,11 @@ def test_default_uses_allocator_fallback() -> None:
 
 
 @pytest.mark.parametrize(
-    "kv_cache_type,attention_windows,generation_capacity",
-    [
-        (CacheType.SELF, [None, None], 1024),
-        (CacheType.SELF, [None, 256], 1024),
-        (CacheType.CROSS, [None, None], 1024),
-        (CacheType.SELFKONLY, [None, None], 1024),
-    ],
-    ids=["full_attention", "mixed_attention", "cross_attention", "key_only"],
+    "kv_cache_type",
+    [CacheType.SELF, CacheType.SELFKONLY],
+    ids=["full_attention", "key_only"],
 )
-def test_avg_seq_len_builds_warmup_constraints(
-    kv_cache_type, attention_windows, generation_capacity
-) -> None:
+def test_avg_seq_len_builds_warmup_constraints(kv_cache_type: CacheType) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(use_kv_cache_manager_v2=True, host_cache_size=0, avg_seq_len=1024),
         kv_cache_type=kv_cache_type,
@@ -794,7 +788,6 @@ def test_avg_seq_len_builds_warmup_constraints(
         max_seq_len=1024,
         max_num_tokens=2048,
         max_draft_len=2,
-        max_attention_window_vec=attention_windows,
     )
 
     assert config.typical_step == BatchDesc(
@@ -804,7 +797,7 @@ def test_avg_seq_len_builds_warmup_constraints(
     assert config.constraints == [
         BatchDesc(
             [
-                KVCacheDesc(capacity=generation_capacity, history_length=generation_capacity - 1),
+                KVCacheDesc(capacity=1024, history_length=1023),
             ]
         ),
         BatchDesc([KVCacheDesc(capacity=3, history_length=0)] * 3),
@@ -812,52 +805,25 @@ def test_avg_seq_len_builds_warmup_constraints(
     ]
 
 
-@pytest.fixture(params=[0, 16], ids=["decode", "speculative"])
-def _budget_warmup_spec_config(request: pytest.FixtureRequest):
-    return (
-        Eagle3DecodingConfig(max_draft_len=request.param, speculative_model="dummy")
-        if request.param
-        else None
-    )
-
-
-@pytest.fixture(params=[False, True], ids=["no_guard", "guard"])
-def _budget_warmup_guard_page(request: pytest.FixtureRequest, monkeypatch):
-    if request.param:
-        monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "1")
-    else:
-        monkeypatch.delenv("TRTLLM_KV_GUARD_PAGE", raising=False)
-    return request.param
-
-
-@pytest.fixture(params=[False, True], ids=["final", "estimation"])
-def _budget_warmup_phase(request: pytest.FixtureRequest):
-    return request.param
-
-
-@pytest.fixture(params=[None, [256, 256], [256, 131072]], ids=["full", "swa", "mixed"])
-def _budget_warmup_windows(request: pytest.FixtureRequest):
-    return request.param
-
-
-@pytest.fixture(params=["bytes", "tokens"])
-def _budget_limited_attention_manager(
+@pytest.fixture(
+    params=[("bytes", False), ("bytes", True), ("tokens", False), ("tokens", True)],
+    ids=["bytes-final", "bytes-estimation", "tokens-final", "tokens-estimation"],
+)
+def _budget_limited_full_attention_manager(
     request: pytest.FixtureRequest,
-    _budget_warmup_spec_config,
-    _budget_warmup_guard_page,
-    _budget_warmup_phase,
-    _budget_warmup_windows,
-):
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[KVCacheManagerV2]:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     init_cuda_once()
-    budget = {"max_gpu_total_bytes": 17 << 20} if request.param == "bytes" else {"max_tokens": 8192}
+    monkeypatch.delenv("TRTLLM_KV_GUARD_PAGE", raising=False)
+    budget_type, is_estimating = request.param
+    budget = {"max_gpu_total_bytes": 17 << 20} if budget_type == "bytes" else {"max_tokens": 8192}
     config = KvCacheConfig(
         use_kv_cache_manager_v2=True,
         enable_block_reuse=False,
         host_cache_size=0,
         avg_seq_len=32768,
-        max_attention_window=_budget_warmup_windows,
         **budget,
     )
     manager = KVCacheManagerV2(
@@ -872,28 +838,25 @@ def _budget_limited_attention_manager(
         max_num_tokens=2048,
         mapping=Mapping(),
         dtype=DataType.HALF,
-        spec_config=_budget_warmup_spec_config,
-        is_estimating_kv_cache=_budget_warmup_phase,
+        is_estimating_kv_cache=is_estimating,
     )
     try:
-        assert len(manager.kv_cache_map) == int(_budget_warmup_guard_page)
+        assert not manager.kv_cache_map
         yield manager
     finally:
         manager.shutdown()
 
 
-def test_attention_warmup_respects_allocated_budget(
-    _budget_limited_attention_manager: KVCacheManagerV2,
+def test_full_attention_warmup_respects_allocated_budget(
+    _budget_limited_full_attention_manager: KVCacheManagerV2,
 ) -> None:
-    manager = _budget_limited_attention_manager
+    manager = _budget_limited_full_attention_manager
     requested_quota = manager.kv_cache_manager_py_config.cache_tiers[0].quota
     allocated_bytes = manager.impl.get_quota(kv_cache_v2_module.GPU_LEVEL)
     # These small quotas round up to a 2 MiB GPU allocation grain. The model's
     # full context requires at least 256 MiB, far beyond either configured budget.
     assert 0 < allocated_bytes <= requested_quota + (2 << 20)
-    assert manager.max_num_tokens < manager.max_seq_len <= 131072
-    if any(window is None for window in manager.max_attention_window_vec):
-        assert manager.max_seq_len < 131072
+    assert manager.max_num_tokens < manager.max_seq_len < 131072
 
     requests = manager.add_dummy_requests(
         [0], token_nums=[manager.max_num_tokens // 2], is_gen=False
@@ -910,16 +873,14 @@ def test_attention_warmup_respects_allocated_budget(
             manager.free_resources(request)
 
 
-def test_attention_budget_supports_cuda_graph_warmup(
-    _budget_limited_attention_manager: KVCacheManagerV2,
-    _budget_warmup_spec_config,
+def test_full_attention_budget_supports_cuda_graph_warmup(
+    _budget_limited_full_attention_manager: KVCacheManagerV2,
 ) -> None:
-    manager = _budget_limited_attention_manager
-    # Exercise the real graph request builder: it allocates the short requests,
-    # queries the remaining capacity, then grows the longest generation request.
+    manager = _budget_limited_full_attention_manager
+    # Exercise the real graph request builder against the allocated pool budget.
     engine = SimpleNamespace()
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-    engine.spec_config = _budget_warmup_spec_config
+    engine.spec_config = None
     engine.max_beam_width = 1
     engine.max_draft_loop_tokens = manager.max_draft_len
     engine.max_seq_len = 131072

@@ -3192,6 +3192,73 @@ class PyTorchModelEngine(ModelEngine):
         if num_mixed_contexts >= batch_size:
             return None
 
+        # Add one dummy request with the maximum possible sequence length.
+        max_seq_len = min(
+            self.max_seq_len if max_seq_len is None else max_seq_len,
+            kv_cache_manager.max_seq_len)
+
+        # Use max_draft_loop_tokens for capacity estimation to account
+        # for the actual KV reservation per request.
+        _kv_draft = self.max_draft_loop_tokens
+
+        # Determine the input bound before allocating the warmup batch.
+        token_num = max_seq_len - 1 - get_num_extra_kv_tokens(
+            self.spec_config) - _kv_draft
+        model_config = self.model.model_config.pretrained_config
+        max_position_embeddings = getattr(model_config,
+                                          'max_position_embeddings', None)
+        if is_enc_dec:
+            # For enc-dec models the engine max_seq_len covers the encoder
+            # sequence, which may exceed the decoder's position table (e.g.
+            # Whisper: 1500 encoder positions vs max_target_positions=448).
+            decoder_position_limit = getattr(model_config,
+                                             'max_target_positions', None)
+            if decoder_position_limit is not None:
+                max_position_embeddings = (
+                    decoder_position_limit if max_position_embeddings is None
+                    else min(max_position_embeddings, decoder_position_limit))
+        if max_position_embeddings is not None:
+            token_num = min(token_num, max_position_embeddings - _kv_draft)
+
+        if isinstance(kv_cache_manager, KVCacheManagerV2):
+            # V2 adds one generation token beyond the draft/extra reservation.
+            # Include that token in the existing query, then return input length.
+            available_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=token_num + 1,
+                batch_size=batch_size,
+                max_num_draft_tokens=_kv_draft)
+            if draft_kv_cache_manager is not None:
+                available_tokens = min(
+                    available_tokens,
+                    draft_kv_cache_manager.get_num_available_tokens(
+                        token_num_upper_bound=token_num + 1,
+                        batch_size=batch_size,
+                        max_num_draft_tokens=_kv_draft))
+            token_num = min(token_num, available_tokens - 1)
+            minimum_tokens = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1
+            if token_num < minimum_tokens:
+                return None
+        else:
+            available_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=max_seq_len,
+                batch_size=batch_size,
+                max_num_draft_tokens=_kv_draft)
+            if draft_kv_cache_manager is not None:
+                available_tokens = min(
+                    available_tokens,
+                    draft_kv_cache_manager.get_num_available_tokens(
+                        token_num_upper_bound=max_seq_len,
+                        batch_size=batch_size,
+                        max_num_draft_tokens=_kv_draft))
+            token_num = max(
+                ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
+                min(token_num, available_tokens))
+            if max_position_embeddings is not None:
+                token_num = min(token_num, max_position_embeddings - _kv_draft)
+
+        token_num = int(
+            token_num)  # Ensure int for range() in add_dummy_requests
+
         # Add (batch_size - 1) dummy requests with the minimal sequence
         # length. Mixed capture must create its context rows as real context
         # requests; converting generation dummies afterward leaves their
@@ -3260,67 +3327,6 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager.free_resources(r)
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache_manager.free_resources(r)
-
-        # Add one dummy request with the maximum possible sequence length.
-        max_seq_len = min(
-            self.max_seq_len if max_seq_len is None else max_seq_len,
-            kv_cache_manager.max_seq_len)
-
-        # Use max_draft_loop_tokens for capacity estimation to account
-        # for the actual KV reservation per request.
-        _kv_draft = self.max_draft_loop_tokens
-
-        # Apply every static limit before the V2 query. Changing its result
-        # afterward can increase SWA page demand at a different page phase.
-        token_num = max_seq_len - 1 - get_num_extra_kv_tokens(
-            self.spec_config) - _kv_draft
-        model_config = self.model.model_config.pretrained_config
-        max_position_embeddings = getattr(model_config,
-                                          'max_position_embeddings', None)
-        if is_enc_dec:
-            # For enc-dec models the engine max_seq_len covers the encoder
-            # sequence, which may exceed the decoder's position table (e.g.
-            # Whisper: 1500 encoder positions vs max_target_positions=448).
-            decoder_position_limit = getattr(model_config,
-                                             'max_target_positions', None)
-            if decoder_position_limit is not None:
-                max_position_embeddings = (
-                    decoder_position_limit if max_position_embeddings is None
-                    else min(max_position_embeddings, decoder_position_limit))
-        if max_position_embeddings is not None:
-            token_num = min(token_num, max_position_embeddings - _kv_draft)
-
-        if isinstance(kv_cache_manager, KVCacheManagerV2):
-            assert draft_kv_cache_manager is None or isinstance(
-                draft_kv_cache_manager, KVCacheManagerV2)
-            token_num = kv_cache_manager.get_warmup_token_capacity(
-                token_num_upper_bound=token_num,
-                max_num_draft_tokens=_kv_draft,
-                draft_kv_cache_manager=draft_kv_cache_manager)
-            minimum_tokens = ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1
-            if token_num < minimum_tokens:
-                free_warmup_requests()
-                return None
-        else:
-            available_tokens = kv_cache_manager.get_num_available_tokens(
-                token_num_upper_bound=max_seq_len,
-                batch_size=batch_size,
-                max_num_draft_tokens=_kv_draft)
-            if draft_kv_cache_manager is not None:
-                available_tokens = min(
-                    available_tokens,
-                    draft_kv_cache_manager.get_num_available_tokens(
-                        token_num_upper_bound=max_seq_len,
-                        batch_size=batch_size,
-                        max_num_draft_tokens=_kv_draft))
-            token_num = max(
-                ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
-                min(token_num, available_tokens))
-            if max_position_embeddings is not None:
-                token_num = min(token_num, max_position_embeddings - _kv_draft)
-
-        token_num = int(
-            token_num)  # Ensure int for range() in add_dummy_requests
 
         max_seq_len_request = kv_cache_manager.add_dummy_requests(
             request_ids=[batch_size - 1],
