@@ -3084,6 +3084,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.enable_iter_perf_stats = False
         ex.enable_attention_dp = False
         ex.speculation_permanently_disabled = False
+        ex._last_runtime_draft_len = 0
         ex.active_requests = active_requests
         ex.waiting_queue = []
 
