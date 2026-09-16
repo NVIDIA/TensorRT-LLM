@@ -1437,12 +1437,14 @@ void KvCache::_decreaseCapacity(BlockOrdinal newNumBlocks)
 
 void KvCache::setBeamWidth(BeamIndex beamWidth)
 {
+    KVCM2_API_GUARD();
     if (beamWidth < BeamIndex{1})
         throw std::invalid_argument("beam_width must be positive");
     if (beamWidth == mBeamWidth)
         return;
     if (mStatus == Status::CLOSED)
         throw LogicError("Cannot change beam_width after close()");
+    auto const apiLock = mManager->lockExclusive();
     if (mManager->enablePartialCommit())
         throw AssertionError("beam_width changes are not supported with partial commit");
 
@@ -1543,12 +1545,12 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
         mBasePageIndices.push_back(std::move(pageIndices));
     }
 
-    std::vector<CachedCudaEvent const*> readyEvents;
+    std::vector<CUevent> readyEvents;
     for (auto const& lcSlots : newSlots)
         for (auto const& slot : lcSlots)
-            readyEvents.push_back(&slot.readyEvent);
+            readyEvents.push_back(slot.readyEvent.handle());
     if (!readyEvents.empty())
-        streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), readyEvents);
+        streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(readyEvents));
 
     auto copyPage = [&](SharedPtr<Page> const& sourcePage, Slot& slot, BlockOrdinal ordinal, LifeCycleId lc,
                         BeamIndex beamIdx) -> BlockPage
