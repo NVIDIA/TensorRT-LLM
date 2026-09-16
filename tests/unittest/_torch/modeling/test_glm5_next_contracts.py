@@ -9,15 +9,16 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.distributed import AllReduce
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper import (
-    Disposition,
     audit_glm5_next_checkpoint,
 )
 from tensorrt_llm._torch.models.modeling_glm5_next import (
     SPARSE_MLP,
+    Glm5NextAllReduce,
     Glm5NextDecoderLayer,
+    Glm5NextForCausalLM,
     Glm5NextLinearAttention,
     Glm5NextMTP,
     Glm5NextRuntimeContext,
@@ -25,8 +26,11 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
     build_glm5_next_runtime_context,
     glm5_next_tp_reduces,
 )
-from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextVisionModelBase
-from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_masks
+from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
+    Glm5NextVisionModelBase,
+    Glm5NextVLM,
+)
+from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_masks, is_glm5_next
 from tensorrt_llm.mapping import Mapping
 
 
@@ -84,6 +88,60 @@ def _config():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("override", [None, "NCCL", "TWOSHOT"])
+def test_allreduce_defaults_honor_user_strategy(override):
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model", **({"allreduce_strategy": override} if override else {})
+    )
+    apply_model_defaults_to_llm_args(args, Glm5NextVLM.get_model_defaults(args))
+    assert args.allreduce_strategy == (override or "ONESHOT")
+    strategy = AllReduceStrategy[args.allreduce_strategy]
+    with patch(
+        "tensorrt_llm._torch.distributed.AllReduce", side_effect=lambda **kw: Mock()
+    ) as create:
+        reduction = Glm5NextAllReduce(Mapping(world_size=4, tp_size=4), strategy=strategy)
+    assert create.call_args_list[0].kwargs["strategy"] == strategy
+    reduction(torch.zeros(512, 8))
+    reduction(torch.zeros(513, 8))
+    if override:
+        assert reduction.small is reduction.large
+        assert reduction.small.call_count == 2
+    else:
+        assert create.call_args_list[1].kwargs["strategy"] == AllReduceStrategy.NCCL
+        reduction.small.assert_called_once()
+        reduction.large.assert_called_once()
+
+
+@pytest.mark.cpu_only
+def test_mtp_rejects_unsupported_attention_dp_lm_head_sharding():
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    mapping = Mapping(
+        world_size=4, tp_size=4, enable_attention_dp=True, enable_lm_head_tp_in_adp=True
+    )
+    with pytest.raises(NotImplementedError, match="tensor-parallel LM head"):
+        Glm5NextForCausalLM(
+            ModelConfig(
+                pretrained_config=_config(),
+                mapping=mapping,
+                spec_config=MTPDecodingConfig(max_draft_len=3),
+            )
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_type", ["glm5_next", "glm5_next_text"])
+def test_model_type_recognition_does_not_hide_missing_schedule(model_type):
+    config = SimpleNamespace(model_type=model_type, num_hidden_layers=1)
+    assert is_glm5_next(config)
+    with pytest.raises(ValueError, match="layer_types"):
+        get_glm5_next_layer_masks(config)
+
+
+@pytest.mark.cpu_only
 def test_layer_masks_accept_composite_and_text_configs():
     config = _config()
     expected = ([False, True], [True, False])
@@ -119,13 +177,13 @@ def test_runtime_context_uses_prepared_schedules_and_live_lengths(is_cuda_graph)
     context = build_glm5_next_runtime_context(metadata)
     assert context.ctx_cu_seqlens is prepared.glm_ctx_cu_seqlens
     assert context.cached_lens is prepared.glm_cached_lens_host
-    assert context.gen_phase == "verify"
     assert context.gen_tokens_per_request == 4
-    torch.testing.assert_close(context.kv_lens, live_lengths.long())
+    torch.testing.assert_close(context.kv_lens, live_lengths)
+    assert context.kv_lens.data_ptr() == live_lengths.data_ptr()
     # MTP rewinds the device lengths without changing the host prefill schedule.
     live_lengths[1] -= 2
     torch.testing.assert_close(
-        build_glm5_next_runtime_context(metadata).kv_lens, torch.tensor([6, 7])
+        build_glm5_next_runtime_context(metadata).kv_lens, torch.tensor([6, 7], dtype=torch.int32)
     )
     prepared.glm_block_tables = None
     with pytest.raises(RuntimeError, match="requires prepared glm_block_tables"):
@@ -148,8 +206,8 @@ def test_checkpoint_routes_vision_and_optional_mtp_separately():
     ]
     plain = audit_glm5_next_checkpoint(keys, config)
     mtp = audit_glm5_next_checkpoint(keys, config, num_mtp_layers=1)
-    assert plain.disposition[keys[0]] == Disposition.IGNORED
-    assert plain.disposition[keys[2]] == Disposition.IGNORED
+    assert keys[0] in plain.ignored
+    assert keys[2] in plain.ignored
     assert mtp.destinations["model.layers.2.eh_proj.weight"] == keys[2]
     assert mtp.destinations["model.layers.0.self_attn.A_log"] == keys[1]
     assert mtp.unresolved == ["unexpected.weight"]
@@ -187,16 +245,21 @@ def test_cache_manager_routing_guards(route, monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("fp8_kv_cache", [False, True], ids=["bf16-kv", "fp8-kv"])
-def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache):
+@pytest.mark.parametrize(
+    "verify_kernel", [None, True, False], ids=["no-mtp", "fused-mtp", "sequential-mtp"]
+)
+def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel):
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextCacheManager
     from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
     from tensorrt_llm.bindings import DataType
-    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization import QuantAlgo
 
+    spec_config = MTPDecodingConfig(max_draft_len=3) if verify_kernel is not None else None
     config = ModelConfig(
         pretrained_config=_config().text_config,
+        spec_config=spec_config,
         quant_config=QuantConfig(
             quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
             kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv_cache else None,
@@ -206,11 +269,20 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache):
     class AllocationReached(Exception):
         pass
 
-    with patch.object(Glm5NextCacheManager, "__new__", side_effect=AllocationReached) as allocate:
+    allocate = Mock(side_effect=AllocationReached)
+
+    class RecordingManager(Glm5NextCacheManager):
+        def __init__(self, *args, **kwargs):
+            allocate(*args, **kwargs)
+
+    with patch(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        return_value=verify_kernel is True,
+    ):
         with pytest.raises(AllocationReached):
             _create_kv_cache_manager(
                 model_engine=None,
-                kv_cache_manager_cls=Glm5NextCacheManager,
+                kv_cache_manager_cls=RecordingManager,
                 model_config=config,
                 mapping=Mapping(),
                 kv_cache_config=KvCacheConfig(
@@ -219,7 +291,7 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache):
                 tokens_per_block=32,
                 max_seq_len=128,
                 max_batch_size=1,
-                spec_config=None,
+                spec_config=spec_config,
                 sparse_attention_config=None,
                 max_num_tokens=64,
                 max_beam_width=1,
@@ -227,10 +299,12 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache):
                 dtype=torch.bfloat16,
                 is_draft=False,
             )
-        allocate.assert_called_once()
-        assert allocate.call_args.kwargs["dtype"] == (
-            DataType.FP8 if fp8_kv_cache else DataType.BF16
-        )
+    allocate.assert_called_once()
+    assert allocate.call_args.kwargs["dtype"] == (DataType.FP8 if fp8_kv_cache else DataType.BF16)
+    if verify_kernel is True:
+        assert allocate.call_args.kwargs["kda_replay_num_spec"] == 3
+    else:
+        assert "kda_replay_num_spec" not in allocate.call_args.kwargs
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -271,6 +345,7 @@ def test_kda_shards_preserve_fp32_gate_parameters():
             assert layer.A_log.dtype == layer.dt_bias.dtype == torch.float32
             biases.append(layer.shard_checkpoint_tensor("dt_bias", full_bias))
             logs.append(layer.shard_checkpoint_tensor("A_log", full_log))
+    assert "use_full_rank_gate" not in config.linear_attn_config
     torch.testing.assert_close(torch.cat(biases), full_bias)
     torch.testing.assert_close(torch.cat(logs), full_log)
 
@@ -440,9 +515,8 @@ def test_mixed_batches_keep_one_full_batch_moe_call(
         )
         hidden = torch.arange(counts[rank] * 4 * 8, dtype=torch.float32).view(-1, 4, 8)
         reduction = Mock(side_effect=lambda value: value)
-        attention = SimpleNamespace(
-            tp_all_reduce=reduction if glm5_next_tp_reduces(mapping) else None
-        )
+        attention = torch.nn.Module()
+        attention.tp_all_reduce = reduction if glm5_next_tp_reduces(mapping) else None
 
         def attend(x, *args, reduce=True, **kwargs):
             return attention.tp_all_reduce(x) if reduce and attention.tp_all_reduce else x
@@ -456,7 +530,7 @@ def test_mixed_batches_keep_one_full_batch_moe_call(
                 f"forward_{phase}",
                 create_autospec(implementation, side_effect=attend),
             )
-        attention.forward_mixed = MethodType(Glm5NextSparseAttention.forward_mixed, attention)
+        attention.forward = MethodType(Glm5NextSparseAttention.forward, attention)
         connection = SimpleNamespace(
             pre_mapping=lambda streams: (None, None, streams.mean(dim=1)),
             post_mapping=lambda output, residual, post, comb: residual + output.unsqueeze(1),
@@ -474,7 +548,6 @@ def test_mixed_batches_keep_one_full_batch_moe_call(
         )
         if layer_kind == "decoder":
             attn_input = hidden.mean(dim=1)
-            layer.forward_direct = MethodType(Glm5NextDecoderLayer.forward_direct, layer)
             layer.run_mlp = MethodType(Glm5NextDecoderLayer.run_mlp, layer)
             result = Glm5NextDecoderLayer.forward(layer, hidden_states=hidden, runtime_ctx=context)
             expected = hidden + attn_input.unsqueeze(1)
@@ -514,7 +587,9 @@ def test_mixed_batches_keep_one_full_batch_moe_call(
             )
         else:
             attention.forward_prefill.assert_not_called()
-        generation = getattr(attention, f"forward_{context.gen_phase}")
+        generation = (
+            attention.forward_decode if tokens_per_request == 1 else attention.forward_verify
+        )
         if generations:
             generation.assert_called_once()
             assert generation.call_args.kwargs["metadata"] is metadata
@@ -532,7 +607,7 @@ def test_mixed_batches_keep_one_full_batch_moe_call(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("generation_phase", ["decode", "verify"])
 @pytest.mark.parametrize("reduce_output", [False, True], ids=["attention-dp", "tp"])
-def test_mixed_attention_splits_only_attention_and_reduces_once(generation_phase, reduce_output):
+def test_packed_attention_splits_phases_and_reduces_once(generation_phase, reduce_output):
     gen_tokens = 4 if generation_phase == "verify" else 1
     hidden = torch.randn(3 + gen_tokens, 8)
     ctx = torch.zeros(3, 8)
@@ -544,14 +619,18 @@ def test_mixed_attention_splits_only_attention_and_reduces_once(generation_phase
         forward_verify=Mock(return_value=gen),
         tp_all_reduce=reduction,
     )
-    result = Glm5NextSparseAttention.forward_mixed(
-        attention,
-        hidden,
+    metadata = SimpleNamespace()
+    context = Glm5NextRuntimeContext(
+        num_contexts=1,
         num_ctx_tokens=3,
-        prefill={"marker": "context"},
-        generation={"marker": "generation"},
-        generation_phase=generation_phase,
+        num_generations=1,
+        ctx_cu_seqlens=[0, 3],
+        cached_lens=[0, 8],
+        kv_lens=torch.tensor([3, 8 + gen_tokens]),
+        metadata=metadata,
+        gen_tokens_per_request=gen_tokens,
     )
+    result = Glm5NextSparseAttention.forward(attention, hidden, metadata, runtime_ctx=context)
     expected = torch.cat([ctx, gen]) + (10 if reduce_output else 0)
     torch.testing.assert_close(result, expected)
     attention.forward_prefill.assert_called_once()

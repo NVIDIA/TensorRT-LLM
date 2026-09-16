@@ -204,13 +204,8 @@ def is_glm5_next(config: transformers.PretrainedConfig) -> bool:
     the composite VLM config (model_type "glm5_next" with a nested
     text_config).
     """
-    model_type = getattr(config, "model_type", None)
-    if model_type == "glm5_next_text":
-        return getattr(config, "layer_types", None) is not None
-    if model_type == "glm5_next":
-        text_config = getattr(config, "text_config", None)
-        return text_config is not None and is_glm5_next(text_config)
-    return False
+    return getattr(config, "model_type",
+                   None) in ("glm5_next", "glm5_next_text")
 
 
 def unwrap_glm5_next_text_config(
@@ -239,7 +234,8 @@ def get_glm5_next_layer_masks(
     checkpoint.
     """
     config = unwrap_glm5_next_text_config(config)
-    if len(config.layer_types) != config.num_hidden_layers:
+    if (getattr(config, "layer_types", None) is None
+            or len(config.layer_types) != config.num_hidden_layers):
         raise ValueError(
             "glm5_next layer_types must contain num_hidden_layers entries")
     full_mask, kda_mask = [], []
