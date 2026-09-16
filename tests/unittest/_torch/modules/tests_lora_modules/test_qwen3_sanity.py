@@ -236,7 +236,9 @@ def _run_mixed_lora_cuda_graph_test(
             max_batch_size=4,
             max_num_tokens=256,
         ) as llm:
-            sampling = SamplingParams(max_tokens=20, temperature=0.0, logprobs=0)
+            # Prevent adapter EOS from shrinking the mixed batch and changing
+            # BF16 GEMM rounding relative to the all-base reference.
+            sampling = SamplingParams(max_tokens=20, temperature=0.0, logprobs=0, ignore_eos=True)
             prompts = [
                 "The capital of France is",
                 "The capital of France is",
