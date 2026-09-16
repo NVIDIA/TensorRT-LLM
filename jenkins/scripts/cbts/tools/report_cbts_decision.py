@@ -230,6 +230,10 @@ def build_document(
         "s_coverage_db_drift_status": decision.get("coverage_db_drift_status") or "",
         # Freshness-gate verdict on that drift: ok / stale / unknown; empty when no DB was consulted.
         "s_coverage_freshness": decision.get("coverage_freshness") or "",
+        "s_coverage_compatibility": decision.get("coverage_compatibility") or "not_attempted",
+        "s_coverage_decline_reason": decision.get("coverage_decline_reason") or "",
+        "s_coverage_decline_category": decision.get("coverage_decline_category") or "",
+        "l_coverage_residual_files": len(decision.get("coverage_residual_files") or []),
         # This field is consumed directly by the CBTS OpenSearch dashboard.
         "d_case_skip_rate": round(case_skip_rate, 4),
         "b_case_skip_rate_valid": case_skip_rate_valid,

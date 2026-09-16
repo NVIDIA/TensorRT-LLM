@@ -203,6 +203,12 @@ def _fmt_summary(
     lines.append(f"scopes:               {result.get('scopes', [])}")
     lines.append(f"sanity_required:      {result.get('sanity_required')}")
     lines.append(f"perfsanity_required:  {result.get('perfsanity_required')}")
+    lines.append(f"coverage_compatibility: {result.get('coverage_compatibility')}")
+    lines.append(f"coverage_decline_category: {result.get('coverage_decline_category')!r}")
+    lines.append(f"coverage_decline_reason: {result.get('coverage_decline_reason')!r}")
+    residual = result.get("coverage_residual_files", [])
+    lines.append(f"coverage_residual_files ({len(residual)}):")
+    lines.extend(f"  - {path}" for path in residual)
     override = result.get("test_db_dir_override")
     lines.append(f"test_db_dir_override: {override!r}")
     stages = result.get("affected_stages", [])
@@ -373,9 +379,15 @@ def _write_index(
     range_expr: Optional[str] = None,
 ) -> None:
     counts: dict[Optional[str], int] = {}
+    compatibility_counts: dict[str, int] = {}
+    decline_counts: dict[str, int] = {}
     for _, _, _, _, result, _ in rows:
         scope = result.get("scope") if "_error" not in result else "ERROR"
         counts[scope] = counts.get(scope, 0) + 1
+        compatibility = result.get("coverage_compatibility") or "not_attempted"
+        compatibility_counts[compatibility] = compatibility_counts.get(compatibility, 0) + 1
+        category = result.get("coverage_decline_category") or "none"
+        decline_counts[category] = decline_counts.get(category, 0) + 1
 
     trigger = "/bot run --post-merge" if post_merge else "/bot run"
     if range_expr:
@@ -411,6 +423,12 @@ def _write_index(
     lines += ["", "## Scope distribution", ""]
     for scope, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         lines.append(f"- {scope or 'None (fallback)'}: {n}")
+    lines += ["", "## Coverage compatibility distribution", ""]
+    for compatibility, n in sorted(compatibility_counts.items(), key=lambda kv: -kv[1]):
+        lines.append(f"- {compatibility}: {n}")
+    lines += ["", "## Coverage decline distribution", ""]
+    for category, n in sorted(decline_counts.items(), key=lambda kv: -kv[1]):
+        lines.append(f"- {category}: {n}")
     (out_dir / "INDEX.md").write_text("\n".join(lines) + "\n")
 
 

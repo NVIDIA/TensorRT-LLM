@@ -102,13 +102,16 @@ class CoverageArtifactTest(unittest.TestCase):
             _git(repo, "config", "user.email", "cbts@example.com")
             _git(repo, "config", "user.name", "CBTS Test")
             source = repo / "source.py"
+            waives = repo / "waives.txt"
             source.write_text("first\nbase\nlast\n")
-            _git(repo, "add", "source.py")
+            waives.write_text("base\n")
+            _git(repo, "add", "source.py", "waives.txt")
             _git(repo, "commit", "-m", "base")
             base = _git(repo, "rev-parse", "HEAD")
 
             _git(repo, "checkout", "-b", "pr")
             source.write_text("first\npr\nlast\n")
+            waives.write_text("pr\n")
             _git(repo, "commit", "-am", "pr")
             head = _git(repo, "rev-parse", "HEAD")
 
@@ -122,6 +125,11 @@ class CoverageArtifactTest(unittest.TestCase):
             source.write_text("first\ndb\nlast\n")
             _git(repo, "commit", "-am", "conflicting db")
             conflicting_db = _git(repo, "rev-parse", "HEAD")
+
+            _git(repo, "checkout", "-b", "db-irrelevant-conflict", base)
+            waives.write_text("db\n")
+            _git(repo, "commit", "-am", "conflicting non-residual file")
+            irrelevant_conflict_db = _git(repo, "rev-parse", "HEAD")
             _git(repo, "checkout", "pr")
 
             self.assertEqual(
@@ -129,6 +137,28 @@ class CoverageArtifactTest(unittest.TestCase):
             )
             self.assertEqual(
                 artifact._patch_apply_status(base, head, conflicting_db, repo, str(repo)),
+                "conflict",
+            )
+            self.assertEqual(
+                artifact._patch_apply_status(
+                    base,
+                    head,
+                    irrelevant_conflict_db,
+                    repo,
+                    str(repo),
+                    ["source.py"],
+                ),
+                "clean",
+            )
+            self.assertEqual(
+                artifact._patch_apply_status(
+                    base,
+                    head,
+                    irrelevant_conflict_db,
+                    repo,
+                    str(repo),
+                    ["waives.txt"],
+                ),
                 "conflict",
             )
             with mock.patch.dict(artifact.os.environ, {artifact.COVERAGE_GIT_REPO_ENV: ""}):
@@ -208,12 +238,17 @@ class CoverageArtifactTest(unittest.TestCase):
                 mock.patch.object(artifact, "download", side_effect=download),
                 mock.patch.object(artifact, "extract", side_effect=extract),
             ):
-                ready = artifact.prepare(str(output_dir), "pr-head")
+                ready = artifact.prepare(str(output_dir), "pr-head", ["tensorrt_llm/source.py"])
 
             self.assertIsNotNone(ready)
             assert ready is not None
             select.assert_called_once_with("pr-base")
-            apply.assert_called_once_with("pr-base", "pr-head", "coverage-commit")
+            apply.assert_called_once_with(
+                "pr-base",
+                "pr-head",
+                "coverage-commit",
+                relevant_paths=["tensorrt_llm/source.py"],
+            )
             connection = sqlite3.connect(ready["path"])
             try:
                 tests = {
@@ -509,6 +544,10 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
         "H100-PyTorch-1": 1,
         "H100-4_GPUs-PyTorch-1": 1,
     }
+    decision["coverage_compatibility"] = "conflict"
+    decision["coverage_decline_reason"] = "residual conflict"
+    decision["coverage_decline_category"] = "compatibility_conflict"
+    decision["coverage_residual_files"] = ["tensorrt_llm/source.py"]
 
     document = report_module.build_document(
         decision,
@@ -525,6 +564,10 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
     assert document["b_case_skip_rate_valid"] is True
     assert document["b_non_cbts_multi_gpu_required"] is True
     assert document["b_multi_gpu_label_gate_open"] is False
+    assert document["s_coverage_compatibility"] == "conflict"
+    assert document["s_coverage_decline_reason"] == "residual conflict"
+    assert document["s_coverage_decline_category"] == "compatibility_conflict"
+    assert document["l_coverage_residual_files"] == 1
     assert document["flat_detail"]["hit_stages"] == [
         "H100-PyTorch-1",
         "H100-PyTorch-2",

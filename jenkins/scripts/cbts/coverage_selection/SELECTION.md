@@ -17,7 +17,9 @@ Tier 2  coverage   residual is all core Python and all present in the DB → sco
         full fallback                                                     scope=null
 ```
 
-Tier 2 only ever looks at the **residual**: the files no Tier 1 rule claimed.
+Tier 2 only ever looks at the **residual**: the files no Tier 1 rule claimed. The Git
+compatibility gate uses that same residual. Conflicts in files already claimed by Tier 1, such as
+`waives.txt`, do not disable Tier 2.
 
 ## 2. The qualname concepts
 
@@ -156,6 +158,7 @@ stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
 ### 8.1 Resolution
 
 ```
+run Tier 1                                      → Tier-2 residual paths
 GitHub compare main...<PR head>                 → PR base commit
 Jenkins REST lastBuild                          → newest build number N
 for b in N .. N-49:                              (_MAX_PROBE)
@@ -166,8 +169,8 @@ for b in N .. N-49:                              (_MAX_PROBE)
 fetch PR head locally; fetch base and latest DB from the normal CI Git mirror
 create a squashed PR commit with `commit-tree`, parented at the PR base
 cherry-pick it onto the DB revision
-   clean                                          → continue
-   conflict / unavailable revision                → decline Tier 2
+   no unmerged residual path                       → continue
+   residual conflict / unavailable revision       → decline Tier 2
 ```
 
 Requiring the pair prevents the selector from narrowing only one CPU architecture. Builds are
@@ -199,7 +202,7 @@ routinely already spent). An unmeasurable candidate-to-base relation is rejected
 candidate's main-tip lag may remain `null`.
 
 The token comes from the `github-cred-trtllm-ci` credential — the one `getGithubMRChangedFile`
-already uses — bound around the `--print-selection` call in `_cbtsCoverageAudit` and read from
+already uses — bound around the artifact selection call in `_cbtsCoverageAudit` and read from
 `GITHUB_API_TOKEN`.
 
 This number reports overall freshness. It does not select the DB.
@@ -212,25 +215,28 @@ freshness gate and telemetry. `ahead`, `behind`, and `identical` describe valid 
 diverged and unknown relations decline Tier 2.
 
 `commit-tree` represents the complete base-to-head PR change as one commit, and `cherry-pick`
-tests that commit against the latest DB without serializing through patch format. This check is
-independent of whether the DB is older than, equal to, or newer than the PR base. A conflict or an
-unmeasurable check declines before the large DB artifacts are downloaded. If it passes, Tier 2 uses
-the original forge PR payload. `--coverage-max-drift` applies a second fail-closed bound: beyond 30
-commits Tier 2 declines and the PR runs in full.
+tests that commit against the latest DB without serializing through patch format. When the
+cherry-pick reports conflicts, only unmerged paths in the Tier-2 residual count; conflicts in
+Tier-1-owned files are ignored. This check is independent of whether the DB is older than, equal
+to, or newer than the PR base. A residual conflict or an unmeasurable check declines before the
+large DB artifacts are downloaded. If it passes, Tier 2 uses the original forge PR payload.
+`--coverage-max-drift` applies a second fail-closed bound: beyond 30 commits Tier 2 declines and
+the PR runs in full.
 
 
 ### 8.3 What happens with the result
 
-`--prepare DIR` does the whole fetch in one call: resolve the PR base, select the latest complete
-pair, validate compatibility, stream both tarballs down, unpack their identically named SQLite
-files separately, and union them with `compact_db.merge_databases`. It writes the selection JSON
+After Tier 1 computes the residual, `--prepare DIR --paths-json PATH` resolves the PR base, selects
+the latest complete pair, validates residual compatibility, streams both tarballs down, unpacks
+their identically named SQLite files separately, and unions them with `compact_db.merge_databases`.
+It writes the selection JSON
 beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
 credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.
-Any failure anywhere is caught and non-fatal: no prepared DB is returned, Tier 2 never runs, and the
-PR gets a full run.
+On a residual conflict it returns `{path: null, meta}` so the decline remains observable without
+downloading the DB. Any failure is non-fatal: Tier 2 never runs and the PR gets a full run.
 
-Those two paths reach `main.py` as `--coverage-db` and `--coverage-db-meta`, so a new selection
-field needs no Groovy change. `main.py` records all of it and **gates on the drift**: past
+The metadata path always reaches `main.py`; the DB path is added only when compatibility is clean.
+`main.py` records all of it and **gates on the drift**: past
 `--coverage-max-drift` (default 30) the tier declines and the PR runs in full, on the grounds that
 a DB that far from the PR's base no longer describes who touches what in the code under test. A
 drift that could not be measured — including a meta file that is missing or unreadable — is
@@ -247,6 +253,10 @@ All of it lands in the decision and in OpenSearch:
 | `coverage_db_drift` | `l_coverage_db_drift` | **the gated number**; `null` / `-1` when unmeasurable |
 | `coverage_db_drift_status` | `s_coverage_db_drift_status` | `ahead` / `behind` / `identical` for every selected DB |
 | `coverage_freshness` | `s_coverage_freshness` | `ok` / `stale` / `unknown`, empty when no DB |
+| `coverage_compatibility` | `s_coverage_compatibility` | `clean` / `conflict` / `unknown` / `not_attempted` |
+| `coverage_decline_reason` | `s_coverage_decline_reason` | human-readable Tier-2 decline detail |
+| `coverage_decline_category` | `s_coverage_decline_category` | aggregation-safe decline category |
+| count of `coverage_residual_files` | `l_coverage_residual_files` | Tier-2 opportunity size |
 
 so the decline rate is queryable per verdict rather than only readable in `s_reason`.
 
@@ -267,6 +277,10 @@ so the decline rate is queryable per verdict rather than only readable in `s_rea
   "coverage_db_base_commit": "9f0da65d...",
   "coverage_db_drift": 7,
   "coverage_db_drift_status": "ahead",
+  "coverage_residual_files": ["tensorrt_llm/example.py"],
+  "coverage_compatibility": "clean",
+  "coverage_decline_reason": "",
+  "coverage_decline_category": "",
   "coverage_no_diff_files": 0,
   "reasons": [{"source": "coverage", "impacted": 118, "untrusted": 104, ...}]
 }
