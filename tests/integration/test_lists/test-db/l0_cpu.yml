@@ -48,7 +48,8 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
   - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_fp8_main_kv_cache
-  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_index_projection_is_explicit_and_shards_index_heads
+  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_index_projection_preserves_index_head_groups
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_replicates_index_rows
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_uses_one_engine_speculative_base
   - unittest/_torch/models/test_minimax_m3.py::test_setup_aliases_preserves_one_engine_draft_weight_loading
   - unittest/_torch/models/test_minimax_m3.py::test_eagle_capture_precedes_next_layer_norm

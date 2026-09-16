@@ -7367,7 +7367,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, fuse_qkv_index_projection, eval_mode):
+                          overlap_scheduler, fuse_qkv_index_projection,
+                          eval_mode):
         # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
         # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K, or
         # InferenceX GSM8K, plus a chat-GSM8K acceptance probe, since accuracy

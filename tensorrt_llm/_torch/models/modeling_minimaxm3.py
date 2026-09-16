@@ -85,12 +85,13 @@ def _moe_routed_output_is_global(experts: nn.Module) -> bool:
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
-    """Five-way MiniMax-M3 projection with vLLM-compatible TP sharding.
+    """Five-way MiniMax-M3 projection preserving unfused TP head mapping.
 
     Each rank emits ``[Q | K | V | index-Q | index-K]``. Q follows normal
-    attention head sharding, K/V/index-Q follow KV-head sharding (including
-    replication when TP exceeds the KV-head count), and the single index-K
-    head is replicated. The underlying :class:`Linear` remains the standard
+    attention head sharding, K/V follow KV-head sharding (including
+    replication when TP exceeds the KV-head count), and all index-Q heads
+    and the single index-K head are replicated, just as in index_qk_proj.
+    The underlying :class:`Linear` remains the standard
     quantized implementation; only checkpoint packing is model-specific.
     """
 
@@ -150,12 +151,12 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         self.index_head_dim = int(index_head_dim)
         self.local_num_heads = total_num_heads // tp_size
         self.local_num_kv_heads = local_num_kv_heads
-        self.local_num_index_heads = local_num_kv_heads
+        self.local_num_index_heads = total_num_index_heads
         self.local_output_sizes = (
             self.local_num_heads * head_dim,
             local_num_kv_heads * head_dim,
             local_num_kv_heads * head_dim,
-            local_num_kv_heads * index_head_dim,
+            total_num_index_heads * index_head_dim,
             index_head_dim,
         )
         local_out_features = sum(self.local_output_sizes)
@@ -182,12 +183,10 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         """Return effective (world size, rank) for one checkpoint shard."""
         if shard_name == "q":
             return self.tp_size, self.tp_rank
-        if shard_name == "index_k":
+        if shard_name in ("index_q", "index_k"):
             return 1, 0
 
-        total_heads = (
-            self.total_num_index_heads if shard_name == "index_q" else self.total_num_kv_heads
-        )
+        total_heads = self.total_num_kv_heads
         if self.tp_size <= total_heads:
             return self.tp_size, self.tp_rank
         replicas = self.tp_size // total_heads
@@ -1076,7 +1075,7 @@ class MiniMaxM3Attention(Attention):
 
         Mirrors :meth:`apply_qk_norm` for the index branch: reshapes
         ``idx_q`` (shape ``[..., num_index_heads * sparse_index_dim]``,
-        possibly TP-sharded along the head axis) and ``idx_k`` (shape
+        replicated across TP ranks) and ``idx_k`` (shape
         ``[..., sparse_index_dim]`` — single replicated head, not per
         index head) to per-head rows of width ``sparse_index_dim``,
         applies :attr:`index_q_norm` / :attr:`index_k_norm`, and reshapes
@@ -1289,7 +1288,7 @@ class MiniMaxM3Attention(Attention):
             or position_ids is None
             or self.head_dim != 128
             or self.sparse_index_dim != 128
-            or self.sparse_num_index_heads != self.num_key_value_heads
+            or self.sparse_num_index_heads % self.num_key_value_heads != 0
             or not self.use_gemma_norm
             or self.pos_embd_params is None
             or not self.pos_embd_params.is_neox

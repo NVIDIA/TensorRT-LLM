@@ -804,8 +804,8 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
     TLLM_CHECK_WITH_INFO(page_size == kMinimaxM3PageSize, "MiniMax-M3 horizontal producer requires page_size=128");
     TLLM_CHECK_WITH_INFO(num_heads_q > 0 && num_heads_kv > 0 && num_heads_index > 0,
         "MiniMax-M3 horizontal producer requires Q, KV, and index heads");
-    TLLM_CHECK_WITH_INFO(
-        num_heads_index == num_heads_kv, "MiniMax-M3 horizontal producer requires index heads to equal KV heads");
+    TLLM_CHECK_WITH_INFO(num_heads_index % num_heads_kv == 0,
+        "MiniMax-M3 horizontal producer requires index heads to be divisible by KV heads");
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;

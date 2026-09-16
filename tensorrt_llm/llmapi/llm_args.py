@@ -860,9 +860,8 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description=
-        "Checkpoint index-attention head count. The compatibility projection "
-        "replicates these heads on each TP rank; the fused QKV/index projection "
-        "shards them with the KV heads.",
+        "Checkpoint index-attention head count, replicated on each TP rank "
+        "with either the separate or fused QKV/index projection.",
     )
     sparse_index_dim: int = Field(
         default=128,
@@ -906,7 +905,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=False,
         description=
         "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q "
-        "is sharded with the KV heads and index-K is replicated. MSA batches "
+        "and index-K remain replicated across TP ranks. MSA batches "
         "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
         "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
         "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
@@ -1008,7 +1007,6 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             global_num_kv_heads=num_kv_heads,
             num_index_heads=self.sparse_num_index_heads,
             topk=self.sparse_topk_blocks,
-            fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
 
 

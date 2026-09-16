@@ -42,11 +42,12 @@ def _index_cache(num_pages, stride_scale=5):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 129])
-def test_minimax_m3_horizontal_producer_matches_separate_producers(num_tokens):
+@pytest.mark.parametrize("num_kv_heads,num_index_heads", [(4, 4), (2, 4), (1, 4)])
+def test_minimax_m3_horizontal_producer_matches_separate_producers(
+    num_tokens, num_kv_heads, num_index_heads
+):
     torch.manual_seed(1234)
     num_heads_q = 8
-    num_kv_heads = 2
-    num_index_heads = num_kv_heads
     num_pages = max(4, (num_tokens + 127) // 128 + 2)
     total_heads = num_heads_q + 2 * num_kv_heads + num_index_heads + 1
     packed = torch.randn(
