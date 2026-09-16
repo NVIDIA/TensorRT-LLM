@@ -29,10 +29,25 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .wan_vae import WanVAE, WanVAEConfig, _nvfp4_supported_sm_names, _supports_nvfp4_device
+from .wan_vae import (
+    WanVAE,
+    WanVAEConfig,
+    _nvfp4_supported_sm_names,
+    _prepare_wan_decoder_norm_silu,
+    _supports_nvfp4_device,
+)
 
 TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
+TLLM_WAN_VAE_FUSED_RMSNORM_SILU = "TLLM_WAN_VAE_FUSED_RMSNORM_SILU"
 _NVFP4_DYNAMIC_MIN_CHANNELS = 64
+
+
+def _use_fused_rmsnorm_silu() -> bool:
+    """Read the experimental BF16 decoder override once during native loading."""
+    value = os.environ.get(TLLM_WAN_VAE_FUSED_RMSNORM_SILU, "0").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"{TLLM_WAN_VAE_FUSED_RMSNORM_SILU} must be 0 or 1.")
+    return value == "1"
 
 
 def _resolve_nvfp4_device_support(
@@ -423,4 +438,8 @@ def load_wan_vae(
         )
         if n_static:
             raise RuntimeError("Load-time NVFP4 quantization unexpectedly produced static scales")
+    elif _use_fused_rmsnorm_silu():
+        # Only the ordinary BF16 checkpoint route opts in. Existing NVFP4 and
+        # packed-checkpoint dequantization paths retain their dispatch.
+        _prepare_wan_decoder_norm_silu(wan_vae)
     return wan_vae
