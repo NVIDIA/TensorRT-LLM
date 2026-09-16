@@ -400,6 +400,19 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                # A 4xx from the worker is the request's own fault (malformed
+                # body, context length exceeded, ...) and will fail the same way
+                # every time, so retrying only burns another prefill attempt.
+                # It reaches this block only because the 4xx is re-raised above
+                # as an aiohttp.ClientResponseError -- a ClientError subclass --
+                # to carry the response body up; the retry budget here is meant
+                # for transport failures, not for server-side rejections.
+                if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
+                    logger.error(
+                        f"Client error to {url}: {e} - not retrying, {e.status} is deterministic",
+                        traceback.format_exc(),
+                    )
+                    raise
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",

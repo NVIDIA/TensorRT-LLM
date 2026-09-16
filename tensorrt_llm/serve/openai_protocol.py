@@ -866,6 +866,12 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # TODO: and use a JSON-safe handle to refer to the server-side output
     mm_embedding_handle: Optional[Dict[str, Any]] = None
 
+    # Ids of the generated tokens. RL rollouts need exactly what the engine
+    # sampled -- re-tokenizing the decoded text is lossy -- and these models are
+    # extra="forbid", so without a declared field the ids cannot survive the
+    # disaggregated server's re-validation of a worker's response.
+    token_ids: Optional[List[int]] = None
+
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 

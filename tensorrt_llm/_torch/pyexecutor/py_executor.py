@@ -122,6 +122,14 @@ if TYPE_CHECKING:
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
+# How long a drain=True control request waits on KV transfers that have left the
+# scheduler queues but are not yet pulled by the generation engine (see
+# _handle_control_request). Generous relative to a transfer, which is one RDMA of
+# a request's KV blocks, but finite: a lost transfer must not park a refit
+# forever. Override with TLLM_CONTROL_DRAIN_TRANSFER_TIMEOUT_S.
+_CONTROL_DRAIN_TRANSFER_TIMEOUT_S = float(
+    os.environ.get("TLLM_CONTROL_DRAIN_TRANSFER_TIMEOUT_S", "30"))
+
 
 class _ADPForwardIntent(IntEnum):
     # MAX reduction gives context precedence when ADP ranks have mixed work.
@@ -915,6 +923,9 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        # Deadline for a drain=True control request that is only waiting on KV
+        # transfers; None whenever no such wait is in progress.
+        self._control_drain_transfer_deadline: Optional[float] = None
         self._active_control_id: Optional[str] = None
         self._sleep_wakeup_pending_aborts: Dict[str, str] = {}
         self._sleep_wakeup_pending_abort_lock = threading.Lock()
@@ -4464,11 +4475,24 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _num_inflight_kv_transfers(self) -> int:
+        """Context-only requests whose KV has not been pulled yet.
+
+        Zero on an aggregated engine (no transceiver, hence no transfer manager)
+        and on mocks that never build one, so callers can treat it as a plain
+        count without guarding.
+        """
+        manager = getattr(self, "async_transfer_manager", None)
+        if manager is None:
+            return 0
+        return len(manager.requests_in_transfer())
+
     def _handle_control_request(self):
         """Fire the next pending control action at the next step boundary.
 
-        drain=True  (default): wait until ``active_requests`` and
-            ``waiting_queue`` are empty — exclusive engine access.
+        drain=True  (default): wait until ``active_requests``, ``waiting_queue``
+            and any KV transfers still in flight are done — exclusive engine
+            access with nothing holding KV built under the current weights.
         drain=False: as soon as a fetched batch contains a control request,
             fire the action first, then continue forwarding requests.
         """
@@ -4485,15 +4509,49 @@ class PyExecutor:
 
         pending = self.control_requests[0]
 
+        # Under disaggregated serving a context-only request leaves both queues
+        # the moment its forward ends: start_transfer() frees its scheduler slot
+        # and parks it in AsyncTransferManager, keeping the KV blocks pinned
+        # until the generation engine pulls them. Draining only the two queues
+        # would therefore let a weight update land while that KV is still in
+        # flight, and the generation engine would decode weights-N KV under
+        # weights-N+1. Wait for the transfers as well.
+        #
+        # Bounded: a stuck or lost transfer must not park the control request
+        # forever -- a refit that never fires hangs the whole training loop,
+        # which is worse than the staleness this avoids. Past the deadline, warn
+        # and proceed.
+        transfers_in_flight = self._num_inflight_kv_transfers()
         if pending.control_requires_drain and (len(self.active_requests) != 0
-                                               or len(self.waiting_queue) != 0):
-            # drain=True: keep the sentinel parked until the engine drains.
-            return
+                                               or len(self.waiting_queue) != 0
+                                               or transfers_in_flight > 0):
+            if transfers_in_flight > 0 and not (self.active_requests
+                                                or self.waiting_queue):
+                deadline = getattr(self, "_control_drain_transfer_deadline", None)
+                if deadline is None:
+                    deadline = time.time() + _CONTROL_DRAIN_TRANSFER_TIMEOUT_S
+                    self._control_drain_transfer_deadline = deadline
+                if time.time() < deadline:
+                    return
+                logger.warning(
+                    "[control_action] %d KV transfer(s) still in flight after "
+                    "%.0fs; firing the control request anyway. A generation "
+                    "engine may decode this KV under the updated weights.",
+                    transfers_in_flight,
+                    _CONTROL_DRAIN_TRANSFER_TIMEOUT_S,
+                )
+            else:
+                # Queues are still draining; restart the transfer deadline so it
+                # only measures time spent waiting on transfers alone.
+                self._control_drain_transfer_deadline = None
+                return
+        self._control_drain_transfer_deadline = None
 
         logger.debug(f"[control_action] firing control request "
                      f"drain={pending.control_requires_drain} "
                      f"active_requests={len(self.active_requests)} "
-                     f"waiting_queue={len(self.waiting_queue)}")
+                     f"waiting_queue={len(self.waiting_queue)} "
+                     f"kv_transfers_in_flight={transfers_in_flight}")
         # Quiesce the device before the action mutates GPU state. Under the
         # overlap scheduler a previous batch's forward/sample kernels may still
         # be in flight, so an in-place update_weights reload (or sleep/wakeup
