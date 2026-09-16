@@ -762,11 +762,11 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
     )
 
     assert session._deadline_monotonic_s is None
-    session.send(Mock(is_last_slice=False))
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
 
     clock.advance(0.5)
-    session.send(Mock(is_last_slice=False))
+    session.send(Mock(is_last=False))
     assert session._deadline_monotonic_s == 12.0
     assert sender.dispatch_task.call_count == 2
     session.close()
@@ -1027,7 +1027,7 @@ def test_generation_first_tx_session_nonblocking_missing_aux_stays_pending() -> 
     session = _make_tx_session([task], need_aux=True)
 
     assert session.wait_complete(blocking=False) is None
-    assert session.status == SessionStatus.KV_TRANSFERRED
+    assert session.status == SessionStatus.TRANSFERRING
     assert session.exception is None
     assert task.wait_calls == []
 

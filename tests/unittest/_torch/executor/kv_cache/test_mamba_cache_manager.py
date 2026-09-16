@@ -943,10 +943,10 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
         py_request_id=123,
     )
 
-    kv_slice = transceiver._create_kv_slice(request)
+    chunk = transceiver._create_chunk(request)
 
     # No mamba layer group → no STATE entries in block_ids
-    assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
+    assert all(ids.size == 0 for ids in chunk.block_ids_per_layer_groups)
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
@@ -958,7 +958,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
-    # Provide a mamba layer group so _create_kv_slice places the slot ID
+    # Provide a mamba layer group so _create_chunk places the slot ID
     mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
@@ -970,10 +970,10 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         py_request_id=123,
     )
 
-    kv_slice = transceiver._create_kv_slice(request)
+    chunk = transceiver._create_chunk(request)
 
     # Slot index 7 should be in the STATE group's block_ids
-    assert kv_slice.block_ids_per_layer_groups[0][0] == 7
+    assert chunk.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
 

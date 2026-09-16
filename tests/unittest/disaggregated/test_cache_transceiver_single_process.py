@@ -824,7 +824,7 @@ def verify_all_requests(
         for layer_idx in range(num_layers):
             # Compute expected_valid: the number of non-stale blocks that
             # were actually transferred, using the same eviction formula as
-            # _create_kv_slice.  Only compare these blocks in verification.
+            # _create_chunk.  Only compare these blocks in verification.
             expected_valid = None
             win = layer_to_window.get(layer_idx)
             if win is not None and win < MAX_SEQ_LEN:
