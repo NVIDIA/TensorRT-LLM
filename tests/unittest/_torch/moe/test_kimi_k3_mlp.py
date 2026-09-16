@@ -218,6 +218,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -228,7 +229,13 @@ def test_kimi_k3_shared_expert_parallel_construction(
     class _FakeMoE(ConfigurableMoE):
         def __init__(self):
             nn.Module.__init__(self)
-            self.backend = SimpleNamespace(initial_local_expert_ids=[0, 1, 2, 3])
+            # ``scheduler_kind`` is a class attribute on the ``MoE`` interface
+            # (default ``EXTERNAL_COMM``), so every real backend carries it and
+            # the runtime reads it unguarded; the stand-in must too.
+            self.backend = SimpleNamespace(
+                initial_local_expert_ids=[0, 1, 2, 3],
+                scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+            )
             self.comm = None
             self.layer_load_balancer = None
             self.all_reduce = _FakeAllReduce()

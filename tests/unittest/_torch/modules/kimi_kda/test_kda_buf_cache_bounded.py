@@ -183,7 +183,8 @@ def test_g_sentinel_cache_is_bounded(clean_caches):
     _settle()
     live = torch.cuda.memory_allocated(dev) - base
 
-    cap = mod._G_SENTINEL_CACHE_MAX_ENTRIES
+    # _g_sentinel_cache is bounded by the padded-input scratch cap it shares.
+    cap = mod._PAD_CACHE_MAX_ENTRIES
     t_max = T0 + BT * (N_SHAPES - 1)
     budget = int(1.25 * cap * t_max * H * K_DIM * 2) + (8 << 20)
 

@@ -507,6 +507,17 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
         "_apply_attn_res",
         unexpected_fallback,
     )
+    # The shipped default ceiling is 1 (persistent port off means "behaviour
+    # unchanged", i.e. fused at the decode shape only), so the multi-token
+    # arms would legitimately fall back. Raise it for the dispatch assertion
+    # only -- after the reference above was computed under the default -- so
+    # this test keeps covering the multi-token fused kernel without changing
+    # what production does by default.
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "_FUSED_ATTN_RES_MAX_TOKENS",
+        max(num_tokens, modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS),
+    )
     actual = _apply_attn_res_and_rmsnorm(
         prefix_sum,
         block_kernel_layout,
