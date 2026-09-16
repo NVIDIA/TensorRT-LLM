@@ -957,9 +957,8 @@ class CuteDslFusedMoE(MoEImplBase):
         # This two-op path executes SwiGLU and Relu2 only. Both act-fusion
         # kernels declare ``SUPPORTED_ACTIVATION_TYPES = (Swiglu, Relu2)`` and
         # neither takes a SiTU soft-cap parameter, so admitting SiTu here only
-        # moves the failure into ``validate_activation_type``. SiTU on Rubin is
-        # ``CuteDslFc12FusedMoE``, whose fused kernel has the gated epilogue and
-        # which declares SiTu in its own ``activation_support``.
+        # moves the failure into ``validate_activation_type``. SiTU is served by
+        # the backends that declare it in their own ``activation_support``.
         #
         # ``self.activation_type`` may be a plain int, so do not format it with
         # ``.name``: that turns the rejection itself into an AttributeError and
