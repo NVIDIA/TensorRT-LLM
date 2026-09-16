@@ -3171,7 +3171,28 @@ class GvrMainKernel:
                             okm = cutlass.Int32(1)
                         if okm != cutlass.Int32(0):
                             stg_b = cutlass.Int32(s_stg.iterator.toint())
-                            itm = tidx
+                            fq = cute.make_rmem_tensor((4,), cutlass.Float32)
+                            i4m = tidx
+                            while i4m < (n >> cutlass.Int32(2)):
+                                C.ld_g_f32x4(atom128, x_addr, i4m, fq)
+                                for qm in cutlass.range_constexpr(4):
+                                    uqm = C.fkey(fq[qm])
+                                    if uqm >= cutlass.Uint32(klo):
+                                        if uqm <= cutlass.Uint32(khi):
+                                            pm = C.atomic_add_cta(
+                                                s_scal.iterator + 0, cutlass.Int32(1)
+                                            )
+                                            if pm > cutlass.Int32(MCAP):
+                                                pm = cutlass.Int32(MCAP)
+                                            _st_s_v2_u32(
+                                                stg_b + pm * cutlass.Int32(8),
+                                                C.u32_of_f32(fq[qm]),
+                                                cutlass.Uint32(
+                                                    (i4m << cutlass.Int32(2)) + cutlass.Int32(qm)
+                                                ),
+                                            )
+                                i4m = i4m + cutlass.Int32(BLK)
+                            itm = (n & cutlass.Int32(~3)) + tidx
                             while itm < n:
                                 xm = C.ldg_f32(x_addr, itm)
                                 uqm = C.fkey(xm)
