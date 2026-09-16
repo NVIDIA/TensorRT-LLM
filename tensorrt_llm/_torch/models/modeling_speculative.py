@@ -1413,7 +1413,7 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         # The user's value, NOT the engine's. py_executor_creator raises
         # model_engine_max_seq_len past this and never writes it back, so a
         # drafter that indexes absolute positions must read the raised value at
-        # runtime (DFlashDrafter publishes it as _runtime_position_ceiling)
+        # runtime (DFlashWorker publishes it as _runtime_position_ceiling)
         # rather than have this line predict it -- reproducing that arithmetic
         # here is what let the two drift apart in the first place.
         max_seq_len=model_config.max_seq_len,

@@ -20,6 +20,7 @@ except ImportError:
     _flashinfer_rope = None
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
+    dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
     get_dflash_paged_append,
@@ -329,6 +330,14 @@ class DFlashForCausalLM(nn.Module):
     # dependencies, and the worker's per-backend shape checks do not apply.
     _uses_worker_attention_backend = True
 
+    # What ``attention_backend="AUTO"`` resolves to, and what the field may say
+    # at all. Per drafter family, because the fastest kernel that can express
+    # the shape differs: GQA DFlash cross-attention is what the two worker op
+    # sets were built for, while an MLA drafter runs its own block decode and
+    # has a third implementation they cannot express.
+    _default_attention_backend = "VANILLA"
+    _supported_attention_backends = ("VANILLA", "TRTLLM", "FA4")
+
     # Whether the drafter's context KV lives in the draft KV cache manager's
     # paged pool rather than a private arena dense in max_seq_len. Orthogonal
     # to the attention backend: paging is about where the KV lives, the backend
@@ -342,7 +351,30 @@ class DFlashForCausalLM(nn.Module):
     # tests), so the config cap stands.
     _runtime_position_ceiling = None
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    @classmethod
+    def _resolve_auto_attention_backend(cls) -> str:
+        """Turn ``AUTO`` into a concrete backend for this drafter family.
+
+        Only TRTLLM degrades: its ops are an optional dependency and the two
+        drafter families that prefer it differ in whether a build can load
+        them. CUTEDSL does not -- a build that cannot run it raises in
+        ``MLADSparkForCausalLM.__init__`` with the reason, which is the
+        intended behaviour for the only hardware that lacks it.
+        """
+        want = cls._default_attention_backend
+        if want != "TRTLLM":
+            return want
+        reason = dflash_trtllm_gen_unavailability_reason()
+        if reason is None:
+            return "TRTLLM"
+        logger.info_once(
+            f"{cls.__name__} prefers the TRTLLM attention backend but it is "
+            f"unavailable ({reason}); falling back to VANILLA.",
+            key=f"dflash_auto_backend_fallback_{cls.__name__}",
+        )
+        return "VANILLA"
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         """Build the draft model, resolving its architecture from the draft config
         (falling back to a model_type-derived name when the checkpoint uses a
         custom DFlash architecture label)."""
@@ -389,13 +421,17 @@ class DFlashForCausalLM(nn.Module):
         )
 
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
+        # Upstream keeps the dflash_config override; rubin-advance dropped it.
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
+        if dflash_attention_backend == "AUTO":
+            dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend
-        if self.dflash_attention_backend not in ("VANILLA", "TRTLLM", "FA4"):
+        if self.dflash_attention_backend not in self._supported_attention_backends:
             raise ValueError(
-                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
+                f"{type(self).__name__} attention backend must be one of "
+                f"{list(self._supported_attention_backends)}, got "
                 f"{self.dflash_attention_backend!r}."
             )
         # Each backend loads only its own ops; the rest stay None so the
@@ -409,7 +445,8 @@ class DFlashForCausalLM(nn.Module):
             # but no op set is loaded: this drafter calls none of them.
             logger.info_once(
                 f"{type(self).__name__} brings its own block decode; "
-                f"attention_backend={self.dflash_attention_backend!r} is not used.",
+                f"attention_backend={self.dflash_attention_backend!r} selects "
+                f"among its implementations, not the shared DFlash op sets.",
                 key=f"dflash_own_attention_{type(self).__name__}",
             )
         elif self.dflash_attention_backend == "VANILLA":
@@ -1858,7 +1895,7 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
             if isinstance(dflash_config, dict):
                 config.block_size = dflash_config.get("block_size", None)
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
         (context input_layernorm, causal sliding blocks); reject non-per-head
         gating."""

@@ -3074,18 +3074,24 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
-    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
-        default="VANILLA",
+    attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
+        default="AUTO",
         description=
-        "Attention backend for the pooled-context cross-attention of a "
-        "standalone DSpark drafter (one shipped as its own checkpoint rather "
-        "than inside the target's mtp.* namespace). Ignored by the embedded "
-        "DeepSeek-V4-Pro draft, which uses its own captured-context attention. "
-        "This is independent of the backend used to construct the drafter's "
-        "standard attention modules. TRTLLM requires FlashInfer and an NVIDIA "
-        "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
-        "with a private paged context cache; VANILLA uses FlashAttention with "
-        "a contiguous cache.")
+        "Attention backend for the block decode of a standalone DSpark drafter "
+        "(one shipped as its own checkpoint rather than inside the target's "
+        "mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft, which "
+        "uses its own captured-context attention. This is independent of the "
+        "backend used to construct the drafter's standard attention modules. "
+        "AUTO picks per drafter family and degrades when a kernel is "
+        "unavailable: TRTLLM for a GQA-backboned drafter, CUTEDSL for an "
+        "MLA-backboned one. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
+        "GPU with SM100 or SM103; for a GQA backbone it uses generated FMHA "
+        "kernels with a private paged context cache, and for an MLA backbone "
+        "the absorbed-MLA paged decode plus a block-local fixup. VANILLA uses "
+        "FlashAttention with a contiguous cache on a GQA backbone and the eager "
+        "torch reference on an MLA one. CUTEDSL is MLA-only: one cute-dsl pass "
+        "over context and block that replaces the fixup; it does not degrade, "
+        "and a build that cannot run it raises with the reason.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

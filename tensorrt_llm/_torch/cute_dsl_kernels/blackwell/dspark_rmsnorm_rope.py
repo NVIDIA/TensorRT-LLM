@@ -3,6 +3,8 @@
 
 """Fused DSpark RMSNorm and adjacent-pair RoPE for Blackwell."""
 
+from typing import Optional
+
 import cutlass
 import cutlass.cute as cute
 
@@ -27,6 +29,8 @@ class DSparkRMSNormRoPEKernel:
         apply_rmsnorm: bool,
         inverse_rope: bool,
         norm_dim: int | None = None,
+        out_rope_offset: int | None = None,
+        write_nope: bool = True,
     ):
         if hidden_dim % self.num_threads != 0:
             raise ValueError(
@@ -56,6 +60,22 @@ class DSparkRMSNormRoPEKernel:
                 f"({self.nope_dim}); got {self.norm_dim}"
             )
         self.norm_covers_rope = self.norm_dim == hidden_dim
+        # Where the rotated pairs land in `output`. None means "same column as in
+        # the input", which is every caller that rewrites a row in place. The MLA
+        # drafter instead reads a 192-wide q row and writes into the rope half of
+        # a 576-wide fused query, so its input and output offsets differ and it
+        # wants the nope half left to bmm_out.
+        self.out_rope_offset = self.nope_dim if out_rope_offset is None else out_rope_offset
+        if self.out_rope_offset < 0 or self.out_rope_offset % 2 != 0:
+            raise ValueError(
+                f"out_rope_offset must be even and non-negative; got {self.out_rope_offset}"
+            )
+        self.write_nope = write_nope
+        if not self.write_nope and self.norm_covers_rope:
+            # The rope lanes would need the RMS scale computed over a row whose
+            # nope half is never written -- readable, but no caller wants it and
+            # it would silently pair a raw-passthrough offset with a scaled rope.
+            raise ValueError("write_nope=False requires norm_dim == nope_dim")
         if self.norm_dim % self.num_threads != 0:
             raise ValueError(
                 f"norm_dim must be divisible by {self.num_threads}; got {self.norm_dim}"
@@ -77,11 +97,19 @@ class DSparkRMSNormRoPEKernel:
     def __call__(
         self,
         x: cute.Tensor,
-        weight: cute.Tensor,
+        weight: Optional[cute.Tensor],
         freqs: cute.Tensor,
         output: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        """weight is None exactly when apply_weight is False.
+
+        Both reads sit behind const_expr(self.apply_weight), so with the flag
+        off the operand never reaches the generated signature -- which is the
+        point: a rope-only caller has no weight and should not have to
+        materialize one. The compile wrappers derive both from the same flag,
+        so they cannot disagree.
+        """
         self.kernel(x, weight, freqs, output).launch(
             grid=[x.shape[0], 1, 1],
             block=[self.num_threads, 1, 1],
@@ -92,7 +120,7 @@ class DSparkRMSNormRoPEKernel:
     def kernel(
         self,
         x: cute.Tensor,
-        weight: cute.Tensor,
+        weight: Optional[cute.Tensor],
         freqs: cute.Tensor,
         output: cute.Tensor,
     ):
@@ -109,12 +137,13 @@ class DSparkRMSNormRoPEKernel:
             sum_sq = cute.arch.warp_reduction_sum(sum_sq)
             inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
 
-        for item in cutlass.range_constexpr(self.nope_elements_per_thread):
-            dim = tidx + item * self.num_threads
-            value = cutlass.Float32(x[row, dim]) * inverse_rms
-            if cutlass.const_expr(self.apply_weight):
-                value *= cutlass.Float32(weight[dim])
-            output[row, dim] = value.to(output.element_type)
+        if cutlass.const_expr(self.write_nope):
+            for item in cutlass.range_constexpr(self.nope_elements_per_thread):
+                dim = tidx + item * self.num_threads
+                value = cutlass.Float32(x[row, dim]) * inverse_rms
+                if cutlass.const_expr(self.apply_weight):
+                    value *= cutlass.Float32(weight[dim])
+                output[row, dim] = value.to(output.element_type)
 
         if cutlass.const_expr(self.rope_pairs > 0):
             freq_row = row // self.num_heads
@@ -122,6 +151,8 @@ class DSparkRMSNormRoPEKernel:
                 pair = tidx + item * self.num_threads
                 real_dim = self.nope_dim + pair * 2
                 imag_dim = real_dim + 1
+                out_real = self.out_rope_offset + pair * 2
+                out_imag = out_real + 1
                 real = cutlass.Float32(x[row, real_dim])
                 imag = cutlass.Float32(x[row, imag_dim])
                 # Outside norm_dim the rope lanes are passed through raw: no RMS
@@ -136,8 +167,8 @@ class DSparkRMSNormRoPEKernel:
                 sin = cutlass.Float32(freqs[freq_row, pair, 1])
                 if cutlass.const_expr(self.inverse_rope):
                     sin = -sin
-                output[row, real_dim] = (real * cos - imag * sin).to(output.element_type)
-                output[row, imag_dim] = (imag * cos + real * sin).to(output.element_type)
+                output[row, out_real] = (real * cos - imag * sin).to(output.element_type)
+                output[row, out_imag] = (imag * cos + real * sin).to(output.element_type)
 
 
 class DSparkRMSNormRoPECacheWriteKernel(DSparkRMSNormRoPEKernel):
