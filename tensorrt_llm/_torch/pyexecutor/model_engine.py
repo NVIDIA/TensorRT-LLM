@@ -3778,11 +3778,15 @@ class PyTorchModelEngine(ModelEngine):
             encoder_cache.clear()
 
     def _build_multimodal_data_for_llm(
-            self, request: LlmRequest) -> Optional[Dict[str, Any]]:
+        self,
+        request: LlmRequest,
+        runtime: Optional[MultimodalRuntimeData] = None
+    ) -> Optional[Dict[str, Any]]:
         """Attach cached item outputs when item scheduling owns the request."""
         if self._mm_item_scheduler is None:
             return request.py_multimodal_data
-        return self._mm_item_scheduler.build_multimodal_data_for_llm(request)
+        return self._mm_item_scheduler.build_multimodal_data_for_llm(
+            request, runtime)
 
     def _set_up_spec_metadata(
             self, spec_resource_manager: Optional[BaseResourceManager]):
@@ -5025,7 +5029,8 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_input=_build_request_multimodal_input(
                     request, self._mm_encoder_cache_enabled),
-                multimodal_data=self._build_multimodal_data_for_llm(request),
+                multimodal_data=self._build_multimodal_data_for_llm(
+                    request, py_multimodal_runtime),
                 multimodal_runtime=py_multimodal_runtime,
                 mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx)
