@@ -272,11 +272,22 @@ def test_audio_tensors_are_skipped_behind_a_loud_named_guard(trtllm_warnings):
     assert len(guard) == 1, "the guard must fire exactly once per load, not per tensor"
     assert "modalities.soft_audio_perception" in guard[0]
     assert str(N_AUDIO) in guard[0], "the guard reports the count it found"
-    assert "NO audio support" in guard[0]
+    assert "NO audio tower" in guard[0]
 
 
 def test_audio_guard_stays_quiet_when_there_are_no_audio_tensors(trtllm_warnings):
     classify_keys(text_keys(), 4)
+    assert not [r for r in trtllm_warnings if "AC-MM-09" in r.getMessage()]
+
+
+def test_load_audio_leaves_the_audio_keys_for_the_tower_walk(trtllm_warnings):
+    """With an audio tower, the 72 tensors stop being 'skipped' and the guard
+    stays quiet: they are left unbucketed for the audio walk to consume."""
+    keys = text_keys() + all_perception_keys()
+    accounting = classify_keys(keys, num_hidden_layers=4, load_vision=True, load_audio=True)
+
+    assert accounting.ignored_audio == set()
+    assert len(accounting.ignored_perception) == N_DUPLICATE + N_STALE
     assert not [r for r in trtllm_warnings if "AC-MM-09" in r.getMessage()]
 
 

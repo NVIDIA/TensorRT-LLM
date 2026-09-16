@@ -84,9 +84,16 @@ DUPLICATE_VISION_PREFIX = "modalities.vision_perception.encoder.vision_model."
 #: fused column-parallel layout that neither reference consumes. Skipped.
 STALE_FUSED_QKV_PREFIX = "modalities.vision_perception.encoder.vision_module."
 
-#: 72 audio tensors. Skipped behind a loud guard, never silently -- see
-#: :func:`_warn_unconsumed_audio`.
+#: 72 audio tensors. Consumed by the audio tower when the model builds one
+#: (``load_audio=True``); otherwise skipped behind a loud guard, never
+#: silently -- see :func:`_warn_unconsumed_audio`.
 AUDIO_PREFIX = "modalities.soft_audio_perception."
+
+#: Where the tower tensors actually live under :data:`AUDIO_PREFIX`. Verified
+#: against the shipped checkpoint index: exactly 72 keys, all BF16, no
+#: quantization scales -- the tower stays BF16 (see musespark_open_audio.py for
+#: why the exemption cannot come from hf_quant_config.json's exclude_modules).
+AUDIO_ENCODER_PREFIX = f"{AUDIO_PREFIX}interaction_encoder."
 
 #: ln_1 (2) + ln_2 (2) + q/k/v proj (6) + out_proj (2) + mlp.c_fc (2) +
 #: mlp.c_proj (2). 16 x 50 layers = 800, plus the 8 tensors outside the layer
@@ -135,7 +142,9 @@ class WeightAccounting:
         }
 
 
-def _classify_perception_key(key: str, accounting: WeightAccounting, load_vision: bool) -> None:
+def _classify_perception_key(
+    key: str, accounting: WeightAccounting, load_vision: bool, load_audio: bool
+) -> None:
     """Route one perception key to its named bucket.
 
     Longest prefix first: :data:`AUDIO_PREFIX` and the two
@@ -149,7 +158,10 @@ def _classify_perception_key(key: str, accounting: WeightAccounting, load_vision
         accounting.ignored_stale_fused_qkv.add(key)
         return
     if key.startswith(AUDIO_PREFIX):
-        accounting.ignored_audio.add(key)
+        # Left unbucketed when an audio tower will consume it, exactly as the
+        # canonical vision keys are for the vision walk.
+        if not load_audio:
+            accounting.ignored_audio.add(key)
         return
     if key in (VISION_PROJECTION_KEY, VISION_PROJECTION_ALIAS) or key.startswith(
         CANONICAL_VISION_PREFIX
@@ -180,17 +192,18 @@ def _warn_unconsumed_audio(accounting: WeightAccounting) -> None:
         return
     logger.warning(
         f"MuseSparkOpen: SKIPPING {count} audio-perception tensors under "
-        f"'{AUDIO_PREFIX}interaction_encoder.'. This build has NO audio support: "
-        "the tensors are present in the checkpoint and are deliberately left "
-        "unconsumed, so any audio content in a request will NOT be transcribed. "
-        "Audio enablement is the named follow-on project and is gated by AC-MM-09; "
-        "this message is that gate's marker, not a load error. See config.json "
-        "'use_audio_perception' / 'audio_perception_modality_args' for what the "
-        "follow-on inherits."
+        f"'{AUDIO_ENCODER_PREFIX}'. This model instance built NO audio tower "
+        "(text-only model, mm encoder disabled, or config "
+        "audio_perception_modality_args.input_mode != 'wav'), so audio content "
+        "in a request will NOT be perceived. The tensors are present in the "
+        "checkpoint and are deliberately left unconsumed; this message is the "
+        "AC-MM-09 gate's marker, not a load error."
     )
 
 
-def classify_keys(keys, num_hidden_layers: int, load_vision: bool = False) -> WeightAccounting:
+def classify_keys(
+    keys, num_hidden_layers: int, load_vision: bool = False, load_audio: bool = False
+) -> WeightAccounting:
     """Split checkpoint keys into in-range text keys and ignorable ones.
 
     In-range keys are left out of the accounting object; the loader adds them
@@ -200,11 +213,13 @@ def classify_keys(keys, num_hidden_layers: int, load_vision: bool = False) -> We
         load_vision: when set, the canonical tower keys and the vision
             projection are left unbucketed for the tower walk to consume,
             instead of being recorded as skipped.
+        load_audio: when set, the audio tensors are left unbucketed for the
+            audio-tower walk instead of being skipped behind the guard.
     """
     accounting = WeightAccounting()
     for key in keys:
         if key.startswith(PERCEPTION_KEY_PREFIXES) or key == VISION_PROJECTION_ALIAS:
-            _classify_perception_key(key, accounting, load_vision)
+            _classify_perception_key(key, accounting, load_vision, load_audio)
             continue
         match = _LAYER_KEY.match(key)
         if match is not None and int(match.group(1)) >= num_hidden_layers:
@@ -569,16 +584,67 @@ def load_musespark_open_weights(model, weights, accounting=None) -> Dict[str, in
     return summary
 
 
-def load_musespark_open_omni_weights(model, weights) -> Dict[str, int]:
-    """Load the vision tower and the text decoder from one checkpoint.
+def load_musespark_open_audio_weights(audio_encoder, weights, accounting: WeightAccounting) -> None:
+    """Load the 72 audio-tower tensors under :data:`AUDIO_ENCODER_PREFIX`.
 
-    The tower goes first: it is the only consumer of the perception subtree, and
-    dropping the 780 skipped perception tensors before the decoder walk keeps
-    peak host memory at the text model's footprint rather than the sum.
+    The tower's module tree mirrors the checkpoint suffixes one for one
+    (asserted by ``test_musespark_open_omni_audio.py``), so the walk is the
+    tower's own ``state_dict`` with the prefix prepended. All tensors are BF16
+    in the checkpoint and the tower's parameters are BF16; ``_copy_param``'s
+    cast is a no-op. The tower is deliberately NOT quantized -- see the module
+    docstring of ``musespark_open_audio.py``.
     """
+    from ...musespark_open_audio import audio_state_dict_to_checkpoint_keys
+
+    state = dict(audio_encoder.named_parameters())
+    consumed_keys: List[str] = []
+    missing: List[str] = []
+    for param_name, ckpt_key in audio_state_dict_to_checkpoint_keys(
+        audio_encoder, AUDIO_ENCODER_PREFIX
+    ):
+        if ckpt_key not in weights:
+            missing.append(ckpt_key)
+            continue
+        _copy_param(state[param_name], _materialize(weights, ckpt_key, accounting))
+        consumed_keys.append(ckpt_key)
+    if missing:
+        raise ValueError(
+            f"MuseSparkOpen audio tower: checkpoint is missing {len(missing)} tensors, "
+            f"e.g. {missing[:4]}; refusing to serve a tower with zeroed weights"
+        )
+    extra = [
+        key
+        for key in weights.keys()
+        if key.startswith(AUDIO_PREFIX) and key not in accounting.consumed
+    ]
+    if extra:
+        raise ValueError(
+            f"MuseSparkOpen audio tower: checkpoint carries {len(extra)} audio tensors "
+            f"the tower has no home for, e.g. {sorted(extra)[:4]}; the checkpoint "
+            "layout is not what the tower was written against"
+        )
+    weights.mark_consumed_keys(consumed_keys)
+
+
+def load_musespark_open_omni_weights(model, weights) -> Dict[str, int]:
+    """Load the audio tower, the vision tower and the text decoder from one checkpoint.
+
+    The towers go first: they are the only consumers of the perception subtree,
+    and dropping the skipped perception tensors before the decoder walk keeps
+    peak host memory at the text model's footprint rather than the sum. The
+    audio walk runs only when the model built a tower (``input_mode == "wav"``
+    and the mm encoder enabled); otherwise the 72 tensors keep today's
+    loud-guard skip.
+    """
+    audio_encoder = getattr(model, "audio_encoder", None)
     accounting = classify_keys(
-        list(weights.keys()), model.config.num_hidden_layers, load_vision=True
+        list(weights.keys()),
+        model.config.num_hidden_layers,
+        load_vision=True,
+        load_audio=audio_encoder is not None,
     )
+    if audio_encoder is not None:
+        load_musespark_open_audio_weights(audio_encoder, weights, accounting)
     load_musespark_open_vision_weights(model.vision_tower, weights, accounting)
     return load_musespark_open_weights(model.llm, weights, accounting)
 

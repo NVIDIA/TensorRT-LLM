@@ -150,7 +150,9 @@ VISION_TOKEN_IDS: dict[str, int] = {
     "vid_end": 200083,  # <|vid_end|>
     "vid_frame_separator": 200087,  # <|vid_frame_separator|>
     "video": 200091,  # <|video|>       -- carries video embeddings
-    "audio": 200038,  # <|audio|>       -- guard only, audio is out of scope
+    "audio": 200038,  # <|audio|>       -- carries audio embeddings; the audio
+    # path (expansion, delimiters, tower) lives in musespark_open_audio.py, whose
+    # AUDIO_TOKEN_IDS is the audio-side pin of this same id.
 }
 
 # Ids whose positions the merge overwrites with encoder rows. Everything else in
