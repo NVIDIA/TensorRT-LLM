@@ -76,7 +76,8 @@ from ..utils import (get_model_extra_attrs,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
-                                CUDAGraphRunner, CUDAGraphRunnerConfig)
+                                CUDAGraphRunner, CUDAGraphRunnerConfig,
+                                get_mrope_dummy_seq_slot)
 from .engine.cuda_graph import (filter_cuda_graph_batch_sizes,
                                 resolve_cuda_graph_batch_sizes)
 from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
@@ -4592,7 +4593,8 @@ class PyTorchModelEngine(ModelEngine):
         # that carry no MRoPE metadata at all. The cache is zero-initialized and
         # the write path only ever targets real ``py_seq_slot``s, so this slot
         # permanently reads back a zero delta.
-        mrope_dummy_seq_slot = self.max_num_tokens * self.mapping.pp_size
+        mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(self.max_num_tokens,
+                                                        self.mapping.pp_size)
         num_accepted_draft_tokens = []  # per request
         is_enc_dec = self._is_encoder_decoder_model()
         cross_encoder_hidden_states: List[torch.Tensor] = []
