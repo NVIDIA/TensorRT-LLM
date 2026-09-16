@@ -2181,6 +2181,43 @@ class SpecWorkerBase(nn.Module, ABC):
         return flashinfer_sampling.compute_probs_from_logits(
             logits, temperatures, top_ks, top_ps)
 
+    @staticmethod
+    def _zero_padding_rows(logits: torch.Tensor, spec_metadata,
+                           num_contexts: int, batch_size: int,
+                           rows_per_request: int) -> torch.Tensor:
+        """Zero the logits rows belonging to CUDA-graph padding requests.
+
+        A padding request decodes from an uninitialized KV/hidden state, so its
+        logits can be non-finite and its probs degenerate. flashinfer's
+        ``chain_speculative_sampling`` then rejects at a position whose
+        ``relu(target - draft)`` residual has no mass, where it reads an
+        uninitialized shared-memory slot and emits an out-of-range token id.
+        Zeroed logits give a uniform -- and therefore legal -- distribution.
+
+        Padding requests are the ones ``populate_sampling_params_for_one_model``
+        routed to ``dummy_slot_row`` (``py_seq_slot is None``), so this needs no
+        extra host-side state. Shapes are static: CUDA-graph safe. No-op while
+        ``dummy_slot_row`` is still 0, which is a live request's row rather than
+        a padding marker.
+
+        Args:
+            logits: ``[(batch_size - num_contexts) * rows_per_request, vocab]``;
+                returned unchanged if the row count does not match.
+            rows_per_request: logits rows each request contributes.
+        Returns:
+            ``logits`` with the padding requests' rows zeroed.
+        """
+        slot_ids = getattr(spec_metadata, "batch_slot_ids", None)
+        dummy_slot_row = getattr(spec_metadata, "dummy_slot_row", 0)
+        num_gens = batch_size - num_contexts
+        if (slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0
+                or logits.shape[0] != num_gens * rows_per_request):
+            return logits
+        is_padding = slot_ids[num_contexts:batch_size] == dummy_slot_row
+        if rows_per_request > 1:
+            is_padding = is_padding.repeat_interleave(rows_per_request)
+        return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -2210,6 +2247,10 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1 +
                                                    (draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
+            # The proposal stored below is read back by next iteration's
+            # rejection kernel, so a padding row must not poison it either.
+            logits = self._zero_padding_rows(logits, spec_metadata, 0,
+                                             batch_size, 1)
             draft_tokens, probs = self._sample_from_logits_with_probs(
                 spec_metadata.advanced_sampling_mode,
                 logits,
@@ -2381,6 +2422,9 @@ class SpecWorkerBase(nn.Module, ABC):
             gen_end = num_contexts + num_gen_logits
 
             temperatures = spec_metadata.temperatures[gen_start:gen_end]
+            gen_logits = self._zero_padding_rows(gen_logits, spec_metadata,
+                                                 num_contexts, batch_size,
+                                                 runtime_draft_len + 1)
             # The target distribution the acceptance test divides by. It must be
             # filtered exactly as the draft probs were (see advanced_sample_draft),
             # which is why both use the same backend selection on the same mode --
@@ -2657,6 +2701,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    step_offset=1)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
+            flat_logits = self._zero_padding_rows(flat_logits, spec_metadata,
+                                                  num_contexts, batch_size, K)
             flat_tokens, flat_probs = self._sample_from_logits_with_probs(
                 spec_metadata.advanced_sampling_mode,
                 flat_logits,
