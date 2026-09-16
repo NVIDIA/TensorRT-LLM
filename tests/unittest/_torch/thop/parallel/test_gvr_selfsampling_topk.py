@@ -1961,8 +1961,8 @@ def _split_sample_line(row, n, rt):
     return T, int((row[:n].float() >= T).sum()), t_floor
 
 
-def _split_miss_plan(rows, k):
-    cr, msl_c = 4, 262144
+def _split_miss_plan(rows, k, msl_c=262144):
+    cr = 4
     plan = ss_host.route(rows, msl_c, msl_c, k)
     assert plan["kernel"] == "main" and plan["rt"]["R"] > 1, plan
     return cr, msl_c, plan["rt"]
@@ -1977,13 +1977,24 @@ def _split_miss_run(lg, k, cr, msl_c):
     _check_varlen_against_reference(lg, out, ref, "split-miss")
 
 
-@pytest.mark.parametrize("rows,k", [(1, 512), (1, 1024), (4, 512), (4, 1024)])
-def test_selfsampling_split_line_miss_over(rows, k):
+@pytest.mark.parametrize(
+    "rows,k,msl_c",
+    [
+        (1, 512, 262144),
+        (1, 1024, 262144),
+        (4, 512, 262144),
+        (4, 1024, 262144),
+        (1, 512, 1048576),
+        (1, 1024, 1048576),
+    ],
+    ids=lambda v: f"{v // 1024}k" if v >= 4096 else str(v),
+)
+def test_selfsampling_split_line_miss_over(rows, k, msl_c):
     """Forced SPLIT line miss, OVER case (count(>= T) > slab capacity): a dense
     uniform [0, 1) bulk plus a few +100 outliers planted at sampled positions
     make the 256-bin sample histogram so coarse that the one-shot line lands
     inside the bulk.  The alive CTA must stay tie-aware exact (R = 64 / 37)."""
-    cr, msl_c, rt = _split_miss_plan(rows, k)
+    cr, msl_c, rt = _split_miss_plan(rows, k, msl_c)
     torch.manual_seed(1000 + rows * 7 + k)
     lg = torch.rand(rows, msl_c, dtype=torch.float32, device=_DEV)
     base = _split_sample_positions(rt)
@@ -1997,10 +2008,20 @@ def test_selfsampling_split_line_miss_over(rows, k):
 
 
 @pytest.mark.parametrize(
-    "rows,k,clusters",
-    [(1, 512, 2), (1, 1024, 2), (4, 512, 2), (4, 1024, 2), (1, 512, 30), (4, 1024, 30)],
+    "rows,k,clusters,msl_c",
+    [
+        (1, 512, 2, 262144),
+        (1, 1024, 2, 262144),
+        (4, 512, 2, 262144),
+        (4, 1024, 2, 262144),
+        (1, 512, 30, 262144),
+        (4, 1024, 30, 262144),
+        (1, 512, 2, 1048576),
+        (1, 1024, 2, 1048576),
+    ],
+    ids=lambda v: f"{v // 1024}k" if v >= 4096 else str(v),
 )
-def test_selfsampling_split_line_miss_under(rows, k, clusters):
+def test_selfsampling_split_line_miss_under(rows, k, clusters, msl_c):
     """Forced SPLIT line miss, UNDER case (count(>= T) < k): `clusters` whole
     sample clusters (8 positions each) are set to 50.0 on a randn row, so the
     sample's TGT-th value is 50 while only 8*clusters < k row values are.
@@ -2010,7 +2031,7 @@ def test_selfsampling_split_line_miss_under(rows, k, clusters):
     (floor unusable -> whole-row narrowing fallback).  Both must
     be tie-aware exact.  The planted positions mirror the kernel's sampler
     (see _split_sample_line); update them if the sampling scheme changes."""
-    cr, msl_c, rt = _split_miss_plan(rows, k)
+    cr, msl_c, rt = _split_miss_plan(rows, k, msl_c)
     torch.manual_seed(2000 + rows * 7 + k + clusters)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
     base = _split_sample_positions(rt)
