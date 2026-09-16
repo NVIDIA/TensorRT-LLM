@@ -21,3 +21,17 @@ l0_vr200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[CUTEDSL]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
   # - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
+  # ------------- SM107-only unit tests (skip on other archs) ---------------
+  - unittest/_torch/thop/parallel/test_cute_dsl_bf16_dense_rubin.py
+  - unittest/_torch/thop/parallel/test_cute_dsl_quant_dense_rubin.py
+  - unittest/_torch/thop/parallel/test_cute_dsl_moe.py -k "rubin" TIMEOUT (120)
+  - unittest/_torch/thop/parallel/test_fp8_block_scale_gemm.py -k "rubin"
+  - unittest/_torch/thop/parallel/test_locality_domain_utils.py
+  - unittest/_torch/thop/parallel/test_locality_domain_planner.py
+  - unittest/_torch/moe/test_moe_runner.py -k "rubin or 107"
+  - unittest/_torch/moe/test_moe_backend.py -k "rubin or 107"
+  - unittest/_torch/modules/test_mhc.py
+  - unittest/_torch/misc/test_rubin_kernel_arch.py
+  # ------------- fine-grained MoE sync (SM107a kernels only) ---------------
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu_fine_grained_sync[True-True-autotuner]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4_fine_grained_sync[True-True-mxfp8-autotuner]
