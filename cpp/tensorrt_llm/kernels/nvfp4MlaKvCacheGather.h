@@ -32,6 +32,15 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
     int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream = 0);
 
+size_t getNvFp4MlaContextKvCacheGatherDirectWorkspaceSize(
+    int32_t numRequests, int32_t maxKvTokens, cudaStream_t stream = 0);
+
+void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* localTopKIndices, int32_t const* queryReqIndices, int32_t const* compressedKvLengths,
+    int32_t* globalIndices, __nv_fp8_e4m3* output, float const* globalDequantScale, void* workspace,
+    size_t workspaceSize, int32_t numQueryRows, int32_t topK, int32_t numRequests, int32_t maxKvTokens,
+    int32_t outputCapacity, int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream = 0);
+
 size_t getNvFp4MlaContextKvCacheGatherWorkspaceSize(int32_t totalKvTokens, cudaStream_t stream = 0);
 
 void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,

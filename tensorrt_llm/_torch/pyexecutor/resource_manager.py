@@ -1771,10 +1771,8 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
-        beam_width: Optional[int] = 1,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
-        beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
                 window_size = self._resolve_window_size(
@@ -1789,12 +1787,7 @@ class KVCacheManager(BaseResourceManager):
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
-            beams = [list(beam) for beam in result[i]]
-            assert len(beams) == beam_width, (
-                f"Expected {beam_width} index arrays per request, got {len(beams)}"
-            )
-            result[i] = beams[
-                0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
+            result[i] = list(result[i][0])
             if num_blocks_per_seq is not None:
                 result[i] = result[i][:num_blocks_per_seq[i]]
         return result
@@ -1818,22 +1811,6 @@ class KVCacheManager(BaseResourceManager):
         for block_ids, n in zip(block_ids_per_seq, num_blocks):
             indices_list.extend(block_ids[:n])
         return torch.tensor(indices_list, dtype=torch.int32)
-
-    @staticmethod
-    def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:
-        """Pack beam-search blocks into a flat beam-0 layout.
-
-        The first beam owns the shared prompt blocks. For every other beam,
-        append only the final block when it differs from beam 0's final block.
-        """
-        if not beams:
-            return []
-        packed = list(beams[0])
-        beam0_last = beams[0][-1] if beams[0] else None
-        for beam in beams[1:]:
-            if beam and beam[-1] != beam0_last:
-                packed.append(beam[-1])
-        return packed
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:

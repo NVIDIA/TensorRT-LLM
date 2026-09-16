@@ -167,7 +167,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
     def test_tep_nvfp4kv(self, tp_size, ep_size):
-        """Exercise the GLM-5.2 NVFP4 KV cache decode path."""
+        """Exercise GLM-5.2 NVFP4 KV cache prefill and decode paths."""
         model_name = "zai-org/GLM-5.2"
         model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
         kv_cache_config = KvCacheConfig(
@@ -180,7 +180,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=128, enable_padding=True),
             moe_config=MoeConfig(backend="CUTEDSL"),
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=True,
         )
 
         with LLM(
@@ -190,6 +190,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             moe_expert_parallel_size=ep_size,
             kv_cache_config=kv_cache_config,
             max_seq_len=8192,
+            max_num_tokens=512,
             **pytorch_config,
         ) as llm:
             assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
