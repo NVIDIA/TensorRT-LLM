@@ -1,0 +1,81 @@
+{
+  "_comment": [
+    "Skip rules for QA test selection.",
+    "",
+    "'reason'    the reason= string of a pytest.mark.skipif decorator in",
+    "            tests/integration/defs/conftest.py, copied byte for byte.",
+    "'skip_when' every field, and every operator under it, must hold for the",
+    "            target machine to skip the test.",
+    "'note'      free text for the reader.",
+    "",
+    "Fields:  sm, device_name, cpu_arch, device_memory_mib, gpu_count, max_gpu_per_node",
+    "Numeric: lt, le, gt, ge, eq, ne      String: eq, ne, contains, not_contains",
+    "",
+    "'sm' is major * 10 + minor: Ada 89, Hopper 90, Blackwell 100,",
+    "Blackwell-Ultra 103, Rubin 107.",
+    "",
+    "A decorator absent from this file is kept for every machine."
+  ],
+
+  "rules": [
+    {
+      "reason": "This test is not supported in pre-Ada architecture",
+      "skip_when": {"sm": {"lt": 89}}
+    },
+    {
+      "reason": "This test is not supported in pre-Hopper architecture",
+      "skip_when": {"sm": {"lt": 90}}
+    },
+    {
+      "reason": "This test is not supported in post-Hopper architecture",
+      "skip_when": {"sm": {"gt": 90}}
+    },
+    {
+      "reason": "This test is not supported in pre-Blackwell architecture",
+      "skip_when": {"sm": {"lt": 100}}
+    },
+    {
+      "reason": "This test is not supported in post-Blackwell architecture",
+      "skip_when": {"sm": {"ge": 100}}
+    },
+    {
+      "reason": "This test is not supported in post-Blackwell-Ultra architecture",
+      "skip_when": {"sm": {"ge": 103}}
+    },
+    {
+      "reason": "This test is not supported in pre-Rubin architecture",
+      "skip_when": {"sm": {"lt": 107}}
+    },
+    {
+      "reason": "This test is only supported in Rubin architecture",
+      "skip_when": {"sm": {"ne": 107}}
+    },
+    {
+      "reason": "This test is only  supported in Hopper architecture",
+      "note": "Double space after 'only' is intentional: it is in the decorator.",
+      "skip_when": {"sm": {"ne": 90}}
+    },
+    {
+      "reason": "This test is for SM120",
+      "skip_when": {"sm": {"ne": 120}}
+    },
+    {
+      "reason": "This test is not supported on GB200 or GB100",
+      "note": "device_name is the first line of `nvidia-smi -L`; matching is case-sensitive.",
+      "skip_when": {"device_name": {"contains": "GB200"}}
+    },
+    {
+      "reason": "nvbugs/5446119: MXFP4 swizzle not supported on H20",
+      "note": "'H20' is a substring of 'H200'; not_contains keeps H200 selected.",
+      "skip_when": {"device_name": {"contains": "H20", "not_contains": "H200"}}
+    },
+    {
+      "reason": "This test is not supported on ARM architecture",
+      "skip_when": {"cpu_arch": {"eq": "aarch64"}}
+    },
+    {
+      "reason": "This test is not supported on x86 architecture",
+      "skip_when": {"cpu_arch": {"eq": "x86_64"}}
+    }
+  ]
+}
