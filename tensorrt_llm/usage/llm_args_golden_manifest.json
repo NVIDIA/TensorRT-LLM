@@ -356,9 +356,7 @@
       "path": "enable_locality_domains"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "enable_lora"
     },
