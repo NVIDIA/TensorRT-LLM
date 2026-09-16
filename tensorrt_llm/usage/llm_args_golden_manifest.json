@@ -115,9 +115,7 @@
       "path": "batch_wait_timeout_ms"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "cache_transceiver_config.agent_bounce_buffer_enable"
     },
@@ -686,44 +684,32 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
+      "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.check_interval"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'float'>",
-      "converter": "",
+      "capture_policy": "float",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.cooldown_secs"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
+      "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'float'>",
-      "converter": "",
+      "capture_policy": "float",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.moving_average_decay"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'float'>",
-      "converter": "",
+      "capture_policy": "float",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.ratio_tolerance"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
+      "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval"
     },
