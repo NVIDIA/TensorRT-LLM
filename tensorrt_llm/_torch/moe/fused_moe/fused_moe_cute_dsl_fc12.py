@@ -309,10 +309,22 @@ class CuteDslFc12FusedMoE(MoEImplBase):
     def run_moe(self, ctx: MoERunContext, *, workspace: Optional[dict] = None) -> torch.Tensor:
         del workspace  # the fused kernel allocates its own intermediates
         plan = require_comm_plan(self, ctx)
+        token_final_scales = ctx.token_final_scales
+        if token_final_scales is None:
+            # With apply_router_weight_on_input the scheduler folds the routing
+            # weights into x and, on the non-DeepEP path, drops the scales
+            # (moe_scheduler: ``token_final_scales = None``). The fused kernel
+            # still sizes moe_output from them and applies them in its finalize,
+            # so feed identity weights: the real weights are already in x
+            # (top-1 only, see _check_configs).
+            assert self.apply_router_weight_on_input, (
+                "token_final_scales is None without apply_router_weight_on_input"
+            )
+            token_final_scales = torch.ones_like(ctx.token_selected_experts, dtype=torch.float32)
         return self.run_moe_nvfp4(
             x=ctx.x,
             token_selected_experts=ctx.token_selected_experts,
-            token_final_scales=ctx.token_final_scales,
+            token_final_scales=token_final_scales,
             x_sf=ctx.x_sf,
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,
