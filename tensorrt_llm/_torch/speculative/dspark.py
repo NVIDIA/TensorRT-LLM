@@ -136,19 +136,18 @@ class DSparkSpecMetadata(SpecMetadata):
             # without this, all concurrent gen requests fall through to the shared
             # scratch row below and corrupt each other's draft window at batch
             # size > 1 (GitHub #16767). Context-prefix entries are left to
-            # ``_seed_context_windows``. CUDA-graph metadata is an explicit
-            # engine contract: its synthetic generation rows get resettable
-            # per-request slots, independent of their numeric request IDs.
-            # Outside that path, ADP-idle and padding dummies use scratch.
+            # ``_seed_context_windows``. CUDA-graph capture dummies and real
+            # generation requests acquire a persistent slot only once; prepare()
+            # runs before every replay, so it must never reset a live slot.
+            # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
-            is_graph_warmup = self.is_cuda_graph and num_seqs > 0
             for rid in self.request_ids[num_contexts:]:
-                if is_graph_warmup or (
+                if (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    worker._assign_slot(rid, reset=is_graph_warmup)
+                    worker._assign_slot(rid, reset=False)
             # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
             # requests, or disagg seed forwards without a real id) map to the
             # dedicated throwaway scratch row so they cannot overwrite a live
