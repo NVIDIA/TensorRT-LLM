@@ -234,11 +234,12 @@ function resultHarness(body = resultBody()) {
 }
 
 test('verified conflicts and inconclusive results publish neutral checks and annotations', async () => {
-  for (const verdict of ['FAIL', 'INCONCLUSIVE']) {
-    const h = resultHarness(resultBody(verdict));
+  for (const body of [resultBody('FAIL'), resultBody('INCONCLUSIVE'), resultBody('FAIL').toLowerCase()]) {
+    const h = resultHarness(body);
     await h.run();
     assert.equal(h.updated[0].conclusion, 'neutral');
     assert.match(h.updated[0].output.title, /⚠️/);
+    assert.match(h.updated[0].output.title, body.includes('INCONCLUSIVE') ? /inconclusive/ : /Possible semantic conflict/);
     assert.equal(h.updated[0].details_url, h.comment.html_url);
     assert.equal(h.warnings.length, 1);
   }
