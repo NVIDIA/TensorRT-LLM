@@ -21,7 +21,7 @@ clamped-SwiGLU experts, and hyper-connections. The composite checkpoint's
 
 from __future__ import annotations
 
-import os
+import copy
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -45,6 +45,7 @@ from ..attention.backends.sparse.glm_kpool import (
     GlmKpoolSparseParams,
 )
 from ..attention.backends.utils import create_attention
+from ..distributed import AllReduceStrategy
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -55,16 +56,15 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
 from .checkpoints.hf.glm5_next_weight_mapper import (
-    Disposition,
     Glm5NextHfWeightMapper,
     glm5_next_is_quantized,
+    glm5_next_weight_owner,
 )
 from .modeling_deepseekv3 import DeepseekV3Gate
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
 if TYPE_CHECKING:
-    from ..distributed import AllReduceStrategy
     from ..modules.mamba.mamba2_metadata import Mamba2Metadata
     from ..modules.mhc.hyper_connection import mHC
     from .checkpoints.base_weight_mapper import BaseWeightMapper
@@ -150,24 +150,6 @@ def resolve_glm5_next_schedule(config: PretrainedConfig) -> Glm5NextSchedule:
     return schedule
 
 
-def glm5_next_allreduce_strategy() -> AllReduceStrategy:
-    """Select the small-message TP all-reduce strategy (default: ONESHOT).
-
-    TLLM_GLM5_ALLREDUCE overrides the strategy for tuning. Large messages use NCCL
-    regardless of this setting; a fixed strategy avoids AUTO's runtime autotuning.
-    """
-    from ..distributed import AllReduceStrategy
-
-    name = os.environ.get("TLLM_GLM5_ALLREDUCE", "ONESHOT").strip().upper()
-    try:
-        return AllReduceStrategy[name]
-    except KeyError as exc:
-        raise ValueError(
-            f"TLLM_GLM5_ALLREDUCE={name!r} is not an AllReduceStrategy name: "
-            f"{[m.name for m in AllReduceStrategy]}"
-        ) from exc
-
-
 def glm5_next_tp_reduces(mapping: Mapping | None) -> bool:
     """Whether a TP branch output is a partial that needs one all-reduce.
 
@@ -201,21 +183,27 @@ def glm5_next_attention_mapping(mapping: Mapping | None) -> Mapping | None:
 class Glm5NextAllReduce(nn.Module):
     """Use the configured TP collective for small messages and NCCL for large ones.
 
-    Dispatch depends only on tensor shape, so CUDA graph capture fixes the choice.
+    The 512-token ONESHOT/NCCL crossover is tuned for TP4 BF16 messages;
+    it is independent of the C++ workspace-capacity fallback. Other explicitly
+    selected strategies apply at every size. Dispatch is fixed at graph capture.
     """
 
     # TP4/BF16 tuning uses fused collectives up to 512 tokens, then NCCL.
     SMALL_MAX_TOKENS = 512
 
-    def __init__(self, mapping: Mapping, dtype: torch.dtype = torch.bfloat16) -> None:
+    def __init__(
+        self,
+        mapping: Mapping,
+        dtype: torch.dtype = torch.bfloat16,
+        strategy: AllReduceStrategy = AllReduceStrategy.ONESHOT,
+    ) -> None:
         super().__init__()
-        from ..distributed import AllReduce, AllReduceStrategy
+        from ..distributed import AllReduce
 
-        strategy = glm5_next_allreduce_strategy()
         self.small = AllReduce(mapping=mapping, strategy=strategy, dtype=dtype)
         self.large = (
             self.small
-            if strategy == AllReduceStrategy.NCCL
+            if strategy != AllReduceStrategy.ONESHOT
             else AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL, dtype=dtype)
         )
 
@@ -333,37 +321,6 @@ class Glm5NextRuntimeContext:
             self.ctx_rows_cache[kpool] = rows
         return rows
 
-    @property
-    def gen_phase(self) -> str:
-        """Select single-token decode or multi-token speculative verification."""
-        return "decode" if self.gen_tokens_per_request == 1 else "verify"
-
-    def mixed_kwargs(self) -> dict[str, Any]:
-        """Split sparse attention by phase while keeping the rest of the batch together."""
-        return {
-            "num_ctx_tokens": self.num_ctx_tokens,
-            "prefill": self.sparse_kwargs("prefill"),
-            "generation": self.sparse_kwargs(self.gen_phase),
-            "generation_phase": self.gen_phase,
-        }
-
-    def sparse_kwargs(self, phase: str) -> dict[str, Any]:
-        # Schedule only: the backend (keyed by its own layer_idx) derives the
-        # slot-indexed latent/indexer views, block tables, and lengths from
-        # the prepared metadata itself.
-        kwargs: dict[str, Any] = {"metadata": self.metadata}
-        if phase == "prefill":
-            kwargs.update(
-                cached_lens=self.cached_lens[: self.num_contexts],
-                cu_seqlens=self.ctx_cu_seqlens,
-                ctx_rows_fn=self.context_rows,
-            )
-        else:
-            kwargs.update(kv_lens=self.kv_lens[self.num_contexts :])
-            if phase == "verify":
-                kwargs.update(tokens_per_request=self.gen_tokens_per_request)
-        return kwargs
-
 
 def _glm5_gen_tokens_per_request(attn_metadata: AttentionMetadata, num_generations: int) -> int:
     """Tokens per generation request, from the metadata's host token counts.
@@ -414,7 +371,7 @@ def build_glm5_next_runtime_context(attn_metadata: AttentionMetadata) -> Glm5Nex
         num_generations=num_generations,
         ctx_cu_seqlens=mamba_metadata.glm_ctx_cu_seqlens,
         cached_lens=mamba_metadata.glm_cached_lens_host,
-        kv_lens=live_lengths[:batch].to(torch.long),
+        kv_lens=live_lengths[:batch],
         metadata=attn_metadata,
         gen_tokens_per_request=_glm5_gen_tokens_per_request(attn_metadata, num_generations),
     )
@@ -428,12 +385,26 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
     routes text and MTP tensors and excludes the vision namespace.
     """
 
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        # Avoid AUTO autotuning on TP decode; honor explicit user overrides.
+        return {"allreduce_strategy": "ONESHOT"}
+
     @property
     def mamba_metadata_cls(self) -> type[Mamba2Metadata]:
         """Metadata with paged tables refreshed before CUDA graph replay."""
         return Glm5NextMamba2Metadata
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
+        if (
+            model_config.mapping.enable_attention_dp
+            and model_config.mapping.enable_lm_head_tp_in_adp
+            and model_config.spec_config is not None
+            and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
+        ):
+            raise NotImplementedError(
+                "glm5_next MTP with attention DP and a tensor-parallel LM head is not supported"
+            )
         text_config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         # tie_word_embeddings is false on this checkpoint, so lm_head is a real
         # weight rather than a view of the embedding; it is asserted, not assumed.
@@ -548,8 +519,6 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         self,
         weights: Any,
         weight_mapper: BaseWeightMapper | None = None,
-        *,
-        device_map: dict[Any, Any] | None = None,
     ) -> None:
         """Load checkpoint tensors one owner at a time to bound peak memory.
 
@@ -560,9 +529,6 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         Args:
             weights: Mapping of checkpoint keys to tensors or lazy safetensors slices.
             weight_mapper: Initialized Glm5NextHfWeightMapper, or None to create one.
-            device_map: Optional owner-to-device map. Owners are layer indices or
-                "embed", "norm", and "head". Modules are materialized from meta
-                directly onto their target devices.
         """
         if weight_mapper is None:
             weight_mapper = Glm5NextHfWeightMapper()
@@ -602,11 +568,8 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         }
 
         by_owner: dict[Any, list[tuple[str, str]]] = {}
-        for key, disposition in audit.disposition.items():
-            if disposition == Disposition.IGNORED:
-                continue
-            dest = weight_mapper.destination(key)
-            owner = weight_mapper.owner(dest, num_layers) if dest else None
+        for dest, key in audit.destinations.items():
+            owner = glm5_next_weight_owner(dest, num_layers)
             if owner is None:
                 raise ValueError(f"glm5_next has no destination owner for {key!r} -> {dest!r}")
             if owner in remote:
@@ -615,11 +578,10 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         if audit.unresolved:
             raise ValueError(f"glm5_next cannot place {sorted(audit.unresolved)[:5]}")
 
-        default_device = torch.device("cuda", torch.cuda.current_device())
+        device = torch.device("cuda", torch.cuda.current_device())
         for owner, (module, prefix) in targets.items():
             if owner in remote:
                 continue
-            device = torch.device((device_map or {}).get(owner, default_device))
             module.to_empty(device=device)
             self._fill_module(module, owner, prefix, by_owner.get(owner, []), weights, device)
         # The shared KDA mixer's post-load kernel constants (built from the
@@ -829,19 +791,20 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         layer_idx: int,
         dtype: torch.dtype = torch.bfloat16,
         mapping: Mapping | None = None,
+        allreduce_strategy: AllReduceStrategy = AllReduceStrategy.ONESHOT,
     ) -> None:
         del dtype  # the shared mixer is bf16 (fp32 gate parameters and pools)
         # The checkpoint's ``linear_attn_config`` does not name the gate rank:
         # GLM-5.3-Flash's output gate is always the low-rank ``g_a``/``g_b``
         # pair, which the shared mixer reads from the same key Kimi K3 uses.
+        config = copy.copy(config)
+        config.linear_attn_config = dict(config.linear_attn_config)
         config.linear_attn_config.setdefault("use_full_rank_gate", False)
-        linear = dict(config.linear_attn_config)
+        linear = config.linear_attn_config
         # The mixer's own row-parallel o_proj AllReduce (fixed strategy; the
         # size-aware Glm5NextAllReduce used elsewhere is a perf option, not a
         # correctness requirement, and AUTO's autotuner raced at TP4 decode).
-        super().__init__(
-            config, layer_idx, mapping=mapping, allreduce_strategy=glm5_next_allreduce_strategy()
-        )
+        super().__init__(config, layer_idx, mapping=mapping, allreduce_strategy=allreduce_strategy)
         # Preserve checkpoint FP32 gate parameters. MetaInitMode rejects detach
         # on meta tensors, so create empty FP32 parameters on that branch.
         for name in ("A_log", "dt_bias"):
@@ -909,7 +872,11 @@ def _glm5_linear_kwargs(
         "skip_create_weights_in_init": (
             model_config.skip_create_weights_in_init if model_config is not None else False
         ),
-        "allreduce_strategy": glm5_next_allreduce_strategy(),
+        "allreduce_strategy": (
+            model_config.allreduce_strategy
+            if model_config is not None
+            else AllReduceStrategy.ONESHOT
+        ),
         "disable_deep_gemm": True,
     }
 
@@ -1091,7 +1058,16 @@ class Glm5NextSparseAttention(nn.Module):
             reduce_output=False,
             **lin_kwargs,
         )
-        self.tp_all_reduce = Glm5NextAllReduce(mapping) if glm5_next_tp_reduces(mapping) else None
+        self.tp_all_reduce = (
+            Glm5NextAllReduce(
+                mapping,
+                strategy=model_config.allreduce_strategy
+                if model_config is not None
+                else AllReduceStrategy.ONESHOT,
+            )
+            if glm5_next_tp_reduces(mapping)
+            else None
+        )
         self.indexer = Glm5NextIndexer(
             config, layer_idx, mapping=mapping, model_config=model_config
         )
@@ -1335,22 +1311,52 @@ class Glm5NextSparseAttention(nn.Module):
             reduce=reduce,
         )
 
-    def forward_mixed(
+    def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         *,
-        num_ctx_tokens: int,
-        prefill: dict[str, Any],
-        generation: dict[str, Any],
-        generation_phase: str = "decode",
+        runtime_ctx: Glm5NextRuntimeContext | None = None,
     ) -> torch.Tensor:
-        """Split attention by phase and reduce the concatenated output once."""
-        if generation_phase not in ("decode", "verify"):
-            raise ValueError(f"Unsupported generation phase: {generation_phase}")
-        ctx = self.forward_prefill(hidden_states[:num_ctx_tokens], reduce=False, **prefill)
-        generation_forward = getattr(self, f"forward_{generation_phase}")
-        gen = generation_forward(hidden_states[num_ctx_tokens:], reduce=False, **generation)
-        out = torch.cat([ctx, gen], dim=0)
+        """Process a packed batch, splitting phases only inside attention.
+
+        Reuse the model's per-forward schedules and row cache across layers.
+        Reduce the complete output once, including context/verify mixtures.
+        """
+        ctx = (
+            runtime_ctx
+            if runtime_ctx is not None
+            else build_glm5_next_runtime_context(attn_metadata)
+        )
+        parts = []
+        if ctx.num_contexts:
+            parts.append(
+                self.forward_prefill(
+                    hidden_states[: ctx.num_ctx_tokens],
+                    cu_seqlens=ctx.ctx_cu_seqlens,
+                    cached_lens=ctx.cached_lens[: ctx.num_contexts],
+                    metadata=ctx.metadata,
+                    ctx_rows_fn=ctx.context_rows,
+                    reduce=False,
+                )
+            )
+        if ctx.num_generations:
+            generation = hidden_states[ctx.num_ctx_tokens :]
+            lengths = ctx.kv_lens[ctx.num_contexts :]
+            if ctx.gen_tokens_per_request == 1:
+                out = self.forward_decode(
+                    generation, kv_lens=lengths, metadata=ctx.metadata, reduce=False
+                )
+            else:
+                out = self.forward_verify(
+                    generation,
+                    kv_lens=lengths,
+                    metadata=ctx.metadata,
+                    tokens_per_request=ctx.gen_tokens_per_request,
+                    reduce=False,
+                )
+            parts.append(out)
+        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
         return out if self.tp_all_reduce is None else self.tp_all_reduce(out)
 
     def forward_verify(
@@ -1519,7 +1525,9 @@ class Glm5NextMoE(nn.Module):
         # attention DP the fused layer combines across ranks itself and the
         # shared expert is replicated, so there is nothing to reduce here.
         self.moe_all_reduce = (
-            Glm5NextAllReduce(self.mapping) if glm5_next_tp_reduces(self.mapping) else None
+            Glm5NextAllReduce(self.mapping, strategy=model_config.allreduce_strategy)
+            if glm5_next_tp_reduces(self.mapping)
+            else None
         )
         # Shared expert: TP-sharded over ``model_config.mapping`` with
         # ``reduce_output=False``, so its output is a rank partial summed with
@@ -1620,8 +1628,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
 
     Each connection collapses [tokens, hc_mult, hidden] streams for the sublayer
     and mixes its output back into the streams. Attention and MLP types come from
-    the explicit per-layer schedules. forward derives runtime arguments;
-    forward_direct applies the same math with explicit attention arguments.
+    the explicit per-layer schedules.
     """
 
     def __init__(
@@ -1641,7 +1648,11 @@ class Glm5NextDecoderLayer(DecoderLayer):
         mapping = model_config.mapping
         if self.attention_type == LINEAR_ATTENTION:
             self.self_attn: nn.Module = Glm5NextLinearAttention(
-                config, layer_idx, dtype=dtype, mapping=mapping
+                config,
+                layer_idx,
+                dtype=dtype,
+                mapping=mapping,
+                allreduce_strategy=model_config.allreduce_strategy,
             )
         else:
             self.self_attn = Glm5NextSparseAttention(
@@ -1672,7 +1683,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
             )
         )
         self.mlp_all_reduce = (
-            Glm5NextAllReduce(mapping)
+            Glm5NextAllReduce(mapping, strategy=model_config.allreduce_strategy)
             if self.mlp_type != SPARSE_MLP and glm5_next_tp_reduces(mapping)
             else None
         )
@@ -1691,79 +1702,25 @@ class Glm5NextDecoderLayer(DecoderLayer):
         runtime_ctx: Glm5NextRuntimeContext | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Runtime entry: derive this layer's cache arguments from metadata.
-
-        The executor packs context requests first, then generation requests;
-        attention handles the two phases separately, while the remaining
-        operations run once over the packed batch to preserve DP collectives.
-        ``position_ids`` is unused: the text path is fully NoPE and the
-        indexer derives its positions from the cached lengths.
-        """
+        """Run attention and one full-batch FFN between the mHC connections."""
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
-        all_rank_num_tokens = getattr(runtime_ctx.metadata, "all_rank_num_tokens", None)
-        if self.attention_type == LINEAR_ATTENTION:
-            # The shared KDA mixer splits context / generation rows (prefill,
-            # decode, verify) itself from the prepared metadata.
-            return self.forward_direct(
-                hidden_states,
-                all_rank_num_tokens=all_rank_num_tokens,
-                attn_metadata=runtime_ctx.metadata,
-            )
-        derive = runtime_ctx.sparse_kwargs
-        if runtime_ctx.num_contexts > 0 and runtime_ctx.num_generations > 0:
-            # Only attention is phase-specific. MoE must see the complete
-            # packed batch exactly once: DP ranks can have different phase
-            # mixes, but must issue the same collective sequence and counts.
-            return self.forward_direct(
-                hidden_states,
-                phase="mixed",
-                all_rank_num_tokens=all_rank_num_tokens,
-                **runtime_ctx.mixed_kwargs(),
-            )
-        if runtime_ctx.num_contexts > 0:
-            return self.forward_direct(
-                hidden_states,
-                phase="prefill",
-                all_rank_num_tokens=all_rank_num_tokens,
-                **derive("prefill"),
-            )
-        # "decode" (one token per request) or "verify" (golden + drafts per
-        # request while a speculative-decoding target scores them).
-        phase = runtime_ctx.gen_phase
-        return self.forward_direct(
-            hidden_states,
-            phase=phase,
-            all_rank_num_tokens=all_rank_num_tokens,
-            **derive(phase),
-        )
-
-    def forward_direct(
-        self,
-        hidden_streams: torch.Tensor,
-        phase: str = "prefill",
-        all_rank_num_tokens: list[int] | None = None,
-        **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        """``hidden_streams`` is ``[num_tokens, hc_mult, hidden]``.
-
-        A KDA layer takes ``attn_metadata`` and runs the shared mixer over all
-        rows; a sparse layer's ``attn_kwargs`` are forwarded verbatim to its
-        ``forward_<phase>``. ``all_rank_num_tokens`` (attention DP) reaches the
-        fused MoE.
-        """
-        residual = hidden_streams
-        post, comb, collapsed = self.hc_attn.pre_mapping(hidden_streams)
+        metadata = runtime_ctx.metadata
+        residual = hidden_states
+        post, comb, collapsed = self.hc_attn.pre_mapping(hidden_states)
         normed = self.input_layernorm(collapsed)
         if self.attention_type == LINEAR_ATTENTION:
-            attn_out = self.self_attn(normed, attn_kwargs["attn_metadata"])
+            attn_out = self.self_attn(normed, metadata)
         else:
-            attn_out = getattr(self.self_attn, f"forward_{phase}")(normed, **attn_kwargs)
-        hidden_streams = self.hc_attn.post_mapping(attn_out, residual, post, comb)
+            attn_out = self.self_attn(normed, metadata, runtime_ctx=runtime_ctx)
+        hidden_states = self.hc_attn.post_mapping(attn_out, residual, post, comb)
 
-        residual = hidden_streams
-        post, comb, collapsed = self.hc_ffn.pre_mapping(hidden_streams)
-        mlp_out = self.run_mlp(self.post_attention_layernorm(collapsed), all_rank_num_tokens)
+        residual = hidden_states
+        post, comb, collapsed = self.hc_ffn.pre_mapping(hidden_states)
+        # ADP ranks may have different phase mixes; every rank calls MoE once.
+        mlp_out = self.run_mlp(
+            self.post_attention_layernorm(collapsed), getattr(metadata, "all_rank_num_tokens", None)
+        )
         return self.hc_ffn.post_mapping(mlp_out, residual, post, comb)
 
     def run_mlp(self, x: torch.Tensor, all_rank_num_tokens: list[int] | None) -> torch.Tensor:
@@ -1784,7 +1741,6 @@ class Glm5NextModel(DecoderModel):
     """
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
-        _normalize_glm5_next_top_config(model_config.pretrained_config)
         super().__init__(model_config)
         config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         schedule = resolve_glm5_next_schedule(model_config.pretrained_config)
@@ -1877,13 +1833,10 @@ class Glm5NextModel(DecoderModel):
         previous site, ``pre_mapping`` of the next, and the next sublayer's
         RMSNorm; ``mHC.fused_hc`` (the in-tree DeepSeek-V4 boundary op) runs
         the three as one kernel, so a layer costs 2 fused boundaries instead
-        of 4 mappings + 2 norms. Same math as :meth:`Glm5NextDecoderLayer.
-        forward_direct` chained over the stack; the first pre-mapping and the
-        last post-mapping stay unfused. Only generation-only batches use it
-        (see :meth:`forward`); the phase is still derived here so the loop
-        stays valid for a pure-context batch.
+        of 4 mappings + 2 norms. The math matches the per-layer forward; the
+        first pre-mapping and last post-mapping stay unfused. Only generation-only batches use it
+        (see :meth:`forward`).
         """
-        phase = "prefill" if runtime_ctx.num_generations == 0 else runtime_ctx.gen_phase
         num_layers = self.schedule.num_layers
         first = self.layers[0]
         residual = streams
@@ -1894,9 +1847,7 @@ class Glm5NextModel(DecoderModel):
             if layer.attention_type == LINEAR_ATTENTION:
                 attn_out = layer.self_attn(x, runtime_ctx.metadata)
             else:
-                attn_out = getattr(layer.self_attn, f"forward_{phase}")(
-                    x, **runtime_ctx.sparse_kwargs(phase)
-                )
+                attn_out = layer.self_attn(x, runtime_ctx.metadata, runtime_ctx=runtime_ctx)
             residual, post, comb, x = layer.hc_ffn.fused_hc(
                 attn_out,
                 residual,
@@ -2004,7 +1955,6 @@ class Glm5NextMTP(nn.Module):
             raise NotImplementedError(
                 "glm5_next MTP runs one-model speculative decoding only (MTP / MTP_EAGLE_ONE_MODEL)"
             )
-        _normalize_glm5_next_top_config(model_config.pretrained_config)
         config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         schedule = resolve_glm5_next_schedule(model_config.pretrained_config)
         num_nextn = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
@@ -2071,13 +2021,7 @@ class Glm5NextMTP(nn.Module):
         runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
         residual = hidden_states
         attn_in = self.input_layernorm(hidden_states)
-        if runtime_ctx.num_contexts > 0 and runtime_ctx.num_generations > 0:
-            attn_out = self.self_attn.forward_mixed(attn_in, **runtime_ctx.mixed_kwargs())
-        else:
-            phase = "prefill" if runtime_ctx.num_contexts > 0 else runtime_ctx.gen_phase
-            attn_out = getattr(self.self_attn, f"forward_{phase}")(
-                attn_in, **runtime_ctx.sparse_kwargs(phase)
-            )
+        attn_out = self.self_attn(attn_in, attn_metadata, runtime_ctx=runtime_ctx)
         hidden_states = residual + attn_out
 
         residual = hidden_states
