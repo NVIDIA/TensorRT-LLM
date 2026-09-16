@@ -30,8 +30,10 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
+from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
+                                                              RoleLayout)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
-    BlockReusePolicy, KVCacheManagerV2, Role)
+    _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -3361,6 +3363,43 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return None
         return conv, ngram
 
+    def get_disagg_role_mapper_kinds(self) -> Dict[DataRole, MapperKind]:
+        """Recurrent roles and how they reshard across TP.
+
+        Convolution state is SECTIONED: its flat per-layer buffer is a
+        concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
+        that are each TP-sharded independently. SSM state keeps the INDEXED
+        default (sharded by head). PLE state is computed from replicated
+        inputs, so every rank holds identical bytes and the transfer copies
+        whole per-layer regions.
+        """
+        return {
+            **super().get_disagg_role_mapper_kinds(),
+            MambaRole.CONV_STATE:
+            MapperKind.SECTIONED,
+            MambaRole.PLE_CONV_STATE:
+            MapperKind.REPLICATED,
+            MambaRole.PLE_NGRAM_CONTEXT:
+            MapperKind.REPLICATED,
+        }
+
+    def get_disagg_role_layouts(self) -> Dict[DataRole, RoleLayout]:
+        """Per-layer geometry for resharding conv and SSM state."""
+        if self.local_num_mamba_layers == 0:
+            return {}
+        d_conv_m1 = int(self.conv_state_shape[1])
+        conv_elem_size = self.conv_state_dtype.itemsize
+        _, head_dim, d_state = self.ssm_state_shape
+        return {
+            MambaRole.CONV_STATE:
+            RoleLayout(section_bytes=tuple(
+                int(dim) * d_conv_m1 * conv_elem_size
+                for dim in self.conv_section_dims)),
+            MambaRole.SSM_STATE:
+            RoleLayout(bytes_per_head=int(head_dim) * int(d_state) *
+                       self.ssm_state_dtype.itemsize),
+        }
+
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         return getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
@@ -4130,7 +4169,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return max(1, cache_bytes)
 
     def get_num_free_blocks(self) -> int:
-        assert len(self.kv_cache_map) == 0, (
+        # Mirror the base: the guard page, when enabled, is held by a
+        # permanent reservation made at construction (not by a request), so
+        # exclude reserved ids before asserting the manager is otherwise empty.
+        reserved = set(self.kv_cache_map) & _RESERVED_REQUEST_IDS
+        assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
         attention_pages = []
@@ -4167,19 +4210,29 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return None
         return super().get_buffers(layer_idx, kv_layout)
 
-    def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
+    def _iter_cache_buffers_for_invalid_check(
+            self) -> Iterable[Tuple[int, torch.Tensor]]:
         for global_layer_id, local_layer_id in self.layer_offsets.items():
             if self._is_local_mamba_layer(local_layer_id):
                 continue
             # A layer group is a lifecycle, not a physical memory pool.
             # Differently sized attention buffers can share one lifecycle,
             # so scan every attention layer in this diagnostic path.
-            yield KVCacheManagerV2.get_buffers(self, global_layer_id)
+            yield global_layer_id, KVCacheManagerV2.get_buffers(
+                self, global_layer_id)
 
-        yield from self.all_ssm_states
-        yield from self.all_conv_states
-        yield from self._ple_ngram_contexts.values()
-        yield from self._ple_conv_states.values()
+        # SSM / conv / PLE tensors are not attention layers and hold no guard
+        # page, so yield a sentinel layer id (-1). The base consumer looks the
+        # id up via self._guard_page_by_layer.get(layer_id), which returns None
+        # for an unknown id and correctly skips guard restoration for them.
+        for buffer in self.all_ssm_states:
+            yield -1, buffer
+        for buffer in self.all_conv_states:
+            yield -1, buffer
+        for buffer in self._ple_ngram_contexts.values():
+            yield -1, buffer
+        for buffer in self._ple_conv_states.values():
+            yield -1, buffer
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         super()._reset_context_mamba_slots(num_contexts)
