@@ -1,8 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Vendored from https://github.com/NVlabs/Sana (Apache-2.0); see
-# THIRD_PARTY_NOTICES.md in this directory for the pin and scope.
 """Public Sol-Attn interface."""
 
 from __future__ import annotations
@@ -12,13 +7,12 @@ import functools
 import torch
 
 BLOCK_SIZE = 64
-# The vendored kernel lives in ``sm100/`` and serves both datacenter Blackwell
-# steppings: the CuTe DSL JIT targets whatever device it compiles on, and the
-# kernel body uses no sm100-exclusive construct. Measured identical on both --
-# see THIRD_PARTY_NOTICES.md.
+# TensorRT-LLM ships the SM100 kernel only. It serves both datacenter Blackwell
+# steppings: the CuTe DSL JIT targets the device it compiles on and the kernel
+# body uses no SM100-exclusive construct (measured identical on B200 and B300).
 _CUTE_BACKENDS = {
     (10, 0): "cute_sm100",  # B200 / GB200
-    (10, 3): "cute_sm100",  # B300 / GB300 (Blackwell Ultra)
+    (10, 3): "cute_sm100",  # B300 / GB300
 }
 _compiled = {}
 
@@ -75,12 +69,10 @@ def _backend_for_arch(
     *,
     cute_available: bool | None = None,
 ) -> str:
-    """Select the CuTe kernel for ``arch``, or raise if there isn't one.
+    """Select the CuTe kernel for ``arch``, or raise if there is none.
 
-    Unsupported architectures raise rather than silently degrading: the caller
-    (``_run_sol_attn_bthd``) turns that into an explicit dense-SDPA fallback
-    with a warning, so a missing kernel is visible instead of showing up only
-    as absent speedup.
+    TensorRT-LLM raises instead of falling back to the Triton reference so a
+    missing kernel is visible; the caller decides what to do about it.
     """
 
     cute_backend = _CUTE_BACKENDS.get(arch)
@@ -90,7 +82,11 @@ def _backend_for_arch(
             f"architectures are "
             f"{', '.join(f'SM{a}{b}' for a, b in sorted(_CUTE_BACKENDS))}."
         )
-    available = _cute_runtime_available() if cute_available is None else cute_available
+    available = (
+        _cute_runtime_available()
+        if cute_available is None
+        else cute_available
+    )
     if not available:
         raise RuntimeError(
             "Sol-Attn requires the CuTe DSL runtime (cutlass.cute and "
@@ -204,10 +200,8 @@ def _sol_attn_cute(
 
         if arch not in _CUTE_BACKENDS:
             # Unreachable via sol_attn(): _backend_for_arch raises first. Kept
-            # explicit because the alternative on a missed guard is returning
-            # the uninitialised `output` buffer, i.e. silently wrong results.
-            # Keyed off _CUTE_BACKENDS rather than a literal so widening the
-            # dispatch map cannot leave this guard behind.
+            # explicit so a missed guard cannot return the uninitialised
+            # `output` buffer. Keyed off _CUTE_BACKENDS, not a literal.
             raise ValueError(f"no Sol-Attn CuTe kernel for SM{arch[0]}{arch[1]}")
         sink_start_block, sink_end_block = _sink_block_range(
             tokens,

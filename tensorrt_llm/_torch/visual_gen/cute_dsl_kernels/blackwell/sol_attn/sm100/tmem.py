@@ -1,8 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Vendored from https://github.com/NVlabs/Sana (Apache-2.0); see
-# THIRD_PARTY_NOTICES.md in this directory for the pin and scope.
 """TMEM load helpers used by the SM100 mainloop."""
 
 from __future__ import annotations
@@ -11,6 +6,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
+
 
 M = 64
 D = 128
@@ -80,7 +76,9 @@ def _o_copy_views(
     assert o_template.element_type == Float32
     assert cute.size(o_template) == M * D
     relative = _zero_based_tmem_tensor(Float32, o_template.layout)
-    coordinates = pv_thread.partition_C(cute.make_identity_tensor((M, D)))
+    coordinates = pv_thread.partition_C(
+        cute.make_identity_tensor((M, D))
+    )
     tiler = (
         (
             cute.size(relative, mode=[0, 0]),
@@ -114,7 +112,9 @@ def load_m64_o_fp32_256b(
         thread_copy.partition_S(relative),
         physical_tmem_base + Int32(O_OFFSET),
     )
-    register_coordinates = thread_copy.partition_D(coordinates)[None, None, Int32(0)]
+    register_coordinates = thread_copy.partition_D(coordinates)[
+        None, None, Int32(0)
+    ]
     registers = cute.make_rmem_tensor(
         register_coordinates.shape,
         Float32,

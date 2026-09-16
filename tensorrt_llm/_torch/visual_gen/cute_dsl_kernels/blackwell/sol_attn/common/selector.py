@@ -1,8 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Vendored from https://github.com/NVlabs/Sana (Apache-2.0); see
-# THIRD_PARTY_NOTICES.md in this directory for the pin and scope.
 """CTA-local routing-mask helpers shared by the CuTe architecture backends."""
 
 import cutlass
@@ -78,7 +73,10 @@ def _test_exact_bit(
 ) -> cutlass.Boolean:
     word = offset // Int32(32)
     bit = offset - word * Int32(32)
-    return (_mask_word(mask0, mask1, mask2, mask3, word) & (Int32(1) << bit)) != Int32(0)
+    return (
+        _mask_word(mask0, mask1, mask2, mask3, word)
+        & (Int32(1) << bit)
+    ) != Int32(0)
 
 
 @cute.jit

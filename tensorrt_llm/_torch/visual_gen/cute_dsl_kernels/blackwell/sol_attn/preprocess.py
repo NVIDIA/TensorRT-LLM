@@ -1,8 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Vendored from https://github.com/NVlabs/Sana (Apache-2.0); see
-# THIRD_PARTY_NOTICES.md in this directory for the pin and scope.
 """Block summaries and routing thresholds shared by both CuTe kernels."""
 
 from __future__ import annotations
@@ -11,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+
 
 BLOCK_SIZE = 64
 HEAD_DIM = 128
@@ -43,7 +39,9 @@ def _reduce_kc_kernel(
     )
     batch, head = batch_head // H, batch_head % H
     block_len = tl.minimum(BLOCK, T - block * BLOCK)
-    values = k_desc.load([batch, block * BLOCK, head, d_tile * TILE_D]).reshape([BLOCK, TILE_D])
+    values = k_desc.load(
+        [batch, block * BLOCK, head, d_tile * TILE_D]
+    ).reshape([BLOCK, TILE_D])
     summary = tl.sum(values, axis=0) / block_len
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     tl.store(
@@ -78,7 +76,9 @@ def _reduce_vc_kernel(
         tl.program_id(2),
     )
     batch, head = batch_head // H, batch_head % H
-    values = v_desc.load([batch, block * BLOCK, head, d_tile * TILE_D]).reshape([BLOCK, TILE_D])
+    values = v_desc.load(
+        [batch, block * BLOCK, head, d_tile * TILE_D]
+    ).reshape([BLOCK, TILE_D])
     summary = tl.sum(values, axis=0)
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     tl.store(
@@ -113,11 +113,9 @@ def _reduce_kc_stats_kernel(
     count = tl.full((), 0.0, dtype=tl.float32)
     for start in range(0, N, GROUP):
         valid = start + block_offsets < N
-        values = (
-            kc_desc.load([batch, start, head, d_tile * TILE_D])
-            .reshape([GROUP, TILE_D])
-            .to(tl.float32)
-        )
+        values = kc_desc.load(
+            [batch, start, head, d_tile * TILE_D]
+        ).reshape([GROUP, TILE_D]).to(tl.float32)
         values = tl.where(valid[:, None], values, 0.0)
         total += tl.sum(values, axis=0)
         total_sq += tl.sum(values * values, axis=0)
@@ -162,7 +160,9 @@ def _diag_threshold_kernel(
     q_len = tl.minimum(BLOCK, T - q_start).to(tl.float32)
     d_offsets = tl.arange(0, TILE_D)
     valid_d = d_offsets < D
-    q_values = q_desc.load([batch, q_start, head, 0]).reshape([BLOCK, TILE_D])
+    q_values = q_desc.load(
+        [batch, q_start, head, 0]
+    ).reshape([BLOCK, TILE_D])
     q_centroid = tl.sum(q_values.to(tl.float32), axis=0) / q_len
     mean_kc = tl.load(
         kc_mean + batch_head * D + d_offsets,
@@ -176,7 +176,9 @@ def _diag_threshold_kernel(
     )
     log2_scale = softmax_scale * 1.4426950408889634
     mean = tl.sum(q_centroid * mean_kc, axis=0) * log2_scale
-    variance = tl.sum(q_centroid * q_centroid * var_kc, axis=0) * (log2_scale * log2_scale)
+    variance = tl.sum(
+        q_centroid * q_centroid * var_kc, axis=0
+    ) * (log2_scale * log2_scale)
     std = tl.sqrt(tl.maximum(variance, 0.0) + 1.0e-6)
     tl.store(
         global_threshold + (batch * N + q_block) * H + head,
@@ -200,7 +202,9 @@ def _pool_query_kernel(
     q_start = q_block * BLOCK
     q_len = tl.minimum(BLOCK, T - q_start).to(tl.float32)
     offsets = tl.arange(0, TILE_D)
-    values = q_desc.load([batch, q_start, head, 0]).reshape([BLOCK, TILE_D])
+    values = q_desc.load([batch, q_start, head, 0]).reshape(
+        [BLOCK, TILE_D]
+    )
     centroid = tl.sum(values.to(tl.float32), axis=0) / q_len
     tl.store(
         q_bar + (batch_head * N + q_block) * D + offsets,
@@ -240,7 +244,10 @@ def _exact_fused_threshold_kernel(
         other=0.0,
     )
     second_moment = tl.load(
-        kc_second_moment + batch_head * D * D + offsets[:, None] * D + offsets[None, :],
+        kc_second_moment
+        + batch_head * D * D
+        + offsets[:, None] * D
+        + offsets[None, :],
         mask=valid_d[:, None] & valid_d[None, :],
         other=0.0,
     )
@@ -344,7 +351,9 @@ def _compute_diag_threshold(
         kc,
         [1, THRESHOLD_GROUP_SIZE, 1, tile_d],
     )
-    _reduce_kc_stats_kernel[(triton.cdiv(head_dim, tile_d), batch * heads)](
+    _reduce_kc_stats_kernel[
+        (triton.cdiv(head_dim, tile_d), batch * heads)
+    ](
         kc_desc,
         kc_mean,
         kc_var_diag,
