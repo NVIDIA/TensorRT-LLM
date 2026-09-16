@@ -351,6 +351,59 @@ def test_dynamic_split_sizing_from_durations(tmp_path):
     assert ray_shards == ['Shared-Ray-PyTorch-1']
 
 
+def test_dynamic_split_sizing_normalizes_directive_suffixes(tmp_path):
+    """A directive suffix on a YAML entry must not defeat duration lookup.
+
+    A `TIMEOUT (n)`/`ISOLATION` suffix in the raw YAML entry must be
+    stripped before matching: .test_durations is keyed by the bare pytest
+    node id, while block.tests carries the raw YAML entry verbatim.
+    """
+    (tmp_path / 'jenkins' / 'scripts').mkdir(parents=True)
+    (tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json').write_text(
+        json.dumps({
+            'configs': [{
+                'name': 'Directive-PyTorch',
+                'arch': 'x86',
+                'slurm': False,
+                'platform': 'x',
+                'testDB': 'l0_directive',
+                'splits': 1  # hardcoded fallback; overridden below
+            }]
+        }))
+    db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
+    db_dir.mkdir(parents=True)
+    (db_dir / 'l0_directive.yml').write_text(
+        'version: 0.0.1\nl0_directive:\n- condition:\n    terms:\n'
+        '      stage: pre_merge\n      backend: pytorch\n'
+        '  tests:\n'
+        '  - unittest/test_directive_a.py::test_a TIMEOUT (180)\n'
+        '  - unittest/test_directive_b.py::test_b ISOLATION\n')
+    durations_path = tmp_path / 'tests' / 'integration' / 'defs' / '.test_durations'
+    durations_path.parent.mkdir(parents=True)
+    # Keyed by the bare node id (as pytest-split writes it), not the raw YAML
+    # entry. An unrelated, much cheaper test is mixed in so a failed lookup
+    # (falling back to the global average) yields a visibly smaller split
+    # count than the correct one, rather than accidentally matching anyway.
+    durations_path.write_text(
+        json.dumps({
+            'unittest/test_directive_a.py::test_a': 9000.0,
+            'unittest/test_directive_b.py::test_b': 9000.0,
+            'unittest/unrelated.py::test_cheap': 10.0,
+        }))
+
+    query = StageQuery(
+        str(tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json'),
+        str(db_dir), str(durations_path))
+    shards = sorted(s for s in query.stage_to_yaml
+                    if s.startswith('Directive-PyTorch-'))
+    # 9000 + 9000 = 18000s -> ceil(18000 / 7200) = 3 shards. Without
+    # normalization both entries would miss .test_durations and fall back to
+    # the global average (~6003s each), giving only 2 shards.
+    assert shards == [
+        'Directive-PyTorch-1', 'Directive-PyTorch-2', 'Directive-PyTorch-3'
+    ]
+
+
 @pytest.mark.parametrize("direction",
                          ["test_to_stage", "stage_to_test", "roundtrip"])
 def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
