@@ -335,8 +335,7 @@ class DFlashWorker(SpecWorkerBase):
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
         # The DFlash 2 selector indexes full-vocab codebooks by draft-token
-        # id, so a d2t-remapped draft vocab would score the wrong tokens. This
-        # is an explicit raise rather than an assert so it survives `python -O`.
+        # id, so a d2t-remapped draft vocab would score the wrong tokens.
         if self._d2t is not None and getattr(draft_model, "is_dflash2", False):
             raise NotImplementedError(
                 "DFlash 2 candidate selection requires a shared draft/target vocab "
