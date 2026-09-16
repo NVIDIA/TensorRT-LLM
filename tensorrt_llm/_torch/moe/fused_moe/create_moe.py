@@ -178,12 +178,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    # ``issubclass`` for the same reason as the DeepGEMM and MegaMoE branches
-    # below: the Rubin FC12 backend subclasses ``CuteDslFusedMoE`` and takes the
-    # same argument set, so it must not fall through to the ``Unsupported moe
-    # backend`` raise. Every class dispatched after this branch derives from
-    # ``MoEImplBase`` / ``MoE``, so widening the match steals nothing.
-    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslB12xFusedMoE)):
+    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
         # The narrower CuteDsl argument set: these kernels take no expert bias.
         return moe_cls(
             routing_method=routing_method,

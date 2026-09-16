@@ -897,8 +897,7 @@
         "TRITON",
         "MARLIN",
         "MEGAMOE_DEEPGEMM",
-        "MEGAMOE_CUTEDSL",
-        "CUTEDSL_FC12"
+        "MEGAMOE_CUTEDSL"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
