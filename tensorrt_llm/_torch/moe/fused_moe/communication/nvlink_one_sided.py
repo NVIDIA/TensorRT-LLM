@@ -57,10 +57,10 @@ from tensorrt_llm.math_utils import pad_up
 from .base import Communication
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
-_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
+_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
-_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
-FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
 _CFT_MIN_DRIVER_BRANCH = 615
 
@@ -347,7 +347,7 @@ class NVLinkOneSided(Communication):
 
         CFT is selected automatically on supported platforms using separate
         dispatch/combine token-count thresholds (128 by default).
-        TRTLLM_MOE_A2A_FORCE_CFT=0 selects fence; 1 bypasses the thresholds,
+        TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 selects fence; 1 bypasses the thresholds,
         but not capability or payload-alignment requirements. CFT requires
         sm_100+, a build against CUDA 13.4+, an NVLink fabric, and a driver
         exporting the Logical Endpoint API (615.00+). Unsupported devices or
@@ -465,10 +465,10 @@ class NVLinkOneSided(Communication):
                 eplb_stats_num_experts=self.eplb_stats_num_experts,
                 can_use_cft_counted_writes=self.can_use_cft_counted_writes,
             )
-        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        workspace_mb_env = os.environ.get("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB")
         if workspace_mb_env:
             self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
-            msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env})."
+            msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB={workspace_mb_env})."
             if auto_workspace_size is not None:
                 msg += f"Automatically calculated workspace size is {auto_workspace_size} bytes."
                 msg += "Auto calculation is conservative, so only consider overriding it if you have a specific reason."

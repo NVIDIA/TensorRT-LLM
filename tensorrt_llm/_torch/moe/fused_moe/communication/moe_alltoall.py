@@ -43,12 +43,12 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
-_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
+_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
 # CFT combine wins at small/medium batch and ties/regresses at large batch, so
 # it is gated by the same per-call token-count threshold as dispatch.
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
-_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
-FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
+_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
 _CFT_ALIGNMENT_BYTES = 16
 
 
@@ -300,12 +300,13 @@ class MoeAlltoAll:
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
         """
         # Check for environment variable override
-        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
+        workspace_mb_env = os.environ.get(
+            "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB")
         if workspace_mb_env:
             workspace_size_env = int(workspace_mb_env) * 1024 * 1024
             tllm_logger.warning(
                 f"Overriding automatically calculated workspace_size_per_rank ({workspace_size_per_rank} bytes) with "
-                f"TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env} ({workspace_size_env} bytes)."
+                f"TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB={workspace_mb_env} ({workspace_size_env} bytes)."
                 f"Automatically calculated workspace_size_per_rank is conservatively large, please only consider overriding it if you have a specific reason."
             )
             workspace_size_per_rank = workspace_size_env

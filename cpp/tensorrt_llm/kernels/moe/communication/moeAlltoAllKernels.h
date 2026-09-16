@@ -234,7 +234,7 @@ struct MoeA2ADispatchParams
 // No collective separates a rank's first-touch JIT/autotune work from its dispatch
 // launch, so this device-side budget is in effect a deadline on the slowest peer's
 // host-side progress. Warmup therefore uses a larger budget than steady state.
-// Overridable via TRTLLM_MOE_A2A_TIMEOUT_SEC / TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC.
+// Overridable via TRTLLM_NVLINK_ONE_SIDED_A2A_TIMEOUT_SEC / TRTLLM_NVLINK_ONE_SIDED_A2A_WARMUP_TIMEOUT_SEC.
 // See nvbugs/6482566.
 int64_t moeA2AGetTimeoutCycles(bool is_warmup);
 

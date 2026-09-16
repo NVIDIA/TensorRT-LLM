@@ -580,7 +580,7 @@ def create_comm_object(
         # Reset class-level singleton to avoid assertion failures when
         # test params change across MPI process reuse.
         NVLinkOneSided._WORKSPACE = None
-        os.environ["TRTLLM_MOE_A2A_WORKSPACE_MB"] = NVLINK_WORKSPACE_MB
+        os.environ["TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB"] = NVLINK_WORKSPACE_MB
 
         return NVLinkOneSided(
             mapping=mapping,

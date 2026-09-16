@@ -105,8 +105,9 @@ int64_t moeA2AGetTimeoutCycles(bool is_warmup)
         return parsed;
     };
 
-    static int64_t const sSteadySec = readEnv("TRTLLM_MOE_A2A_TIMEOUT_SEC", kDefaultTimeoutSec);
-    static int64_t const sWarmupSec = readEnv("TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC", kDefaultWarmupTimeoutSec);
+    static int64_t const sSteadySec = readEnv("TRTLLM_NVLINK_ONE_SIDED_A2A_TIMEOUT_SEC", kDefaultTimeoutSec);
+    static int64_t const sWarmupSec
+        = readEnv("TRTLLM_NVLINK_ONE_SIDED_A2A_WARMUP_TIMEOUT_SEC", kDefaultWarmupTimeoutSec);
     static bool const sLogged = []()
     {
         TLLM_LOG_INFO(
@@ -1241,7 +1242,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
     }
 
-    int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+    constexpr int kBlockSize = 256;
 
     int grid_size = params.local_num_tokens;
     if (grid_size == 0)
@@ -2081,10 +2082,10 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
         le_ids.active_rank_mask[w] = params.active_rank_mask[w];
 
     // Push parallelism is env-overridable for tuning:
-    //   TRTLLM_CFT_PUSH_WARPS           : warps per block (default kCombinePushWarpsPerBlock)
-    //   TRTLLM_CFT_PUSH_BLOCKS_PER_RANK : blocks per source rank == grid.y
+    //   TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_PUSH_WARPS           : warps per block (default kCombinePushWarpsPerBlock)
+    //   TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_PUSH_BLOCKS_PER_RANK : blocks per source rank == grid.y
     int push_warps = kCombinePushWarpsPerBlock;
-    if (char const* e = std::getenv("TRTLLM_CFT_PUSH_WARPS"))
+    if (char const* e = std::getenv("TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_PUSH_WARPS"))
     {
         int v = std::atoi(e);
         if (v >= 1)
@@ -2096,7 +2097,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
         blocks_per_rank = 1;
     if (blocks_per_rank > 32)
         blocks_per_rank = 32;
-    if (char const* e = std::getenv("TRTLLM_CFT_PUSH_BLOCKS_PER_RANK"))
+    if (char const* e = std::getenv("TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_PUSH_BLOCKS_PER_RANK"))
     {
         int v = std::atoi(e);
         if (v >= 1)
@@ -2162,6 +2163,8 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
 
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 {
+    constexpr int kBlockSize = 256;
+
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
@@ -2187,7 +2190,6 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         {
             cft_grid = 1;
         }
-        int const cft_block = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
 
         CombineKernelPointers kp = {};
         kp.src_data_ptrs[0] = params.output_data;
@@ -2232,7 +2234,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
                 SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
                     SWITCH_TOP_K(params.top_k, TOP_K, {
                         auto kernel_fn = moeA2ACombineCountedWriteKernel<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
-                        launchWithPdlWhenEnabled("moeA2ACombineCountedWriteKernel", kernel_fn, cft_grid, cft_block, 0,
+                        launchWithPdlWhenEnabled("moeA2ACombineCountedWriteKernel", kernel_fn, cft_grid, kBlockSize, 0,
                             params.stream, kp, params.max_tokens_per_rank, params.elements_per_token,
                             params.local_num_tokens, params.ep_rank);
                     });
@@ -2243,7 +2245,6 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     }
 
     // Configure kernel launch (one block per token).
-    int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
     int grid = params.local_num_tokens;
     // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the synchronization.
     if (grid == 0)
