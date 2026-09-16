@@ -54,12 +54,11 @@ class DisaggLoopDelegates:
     """Executor callables the coordinator still forwards to.
 
     Transitional: each field is removed once the corresponding logic moves
-    into the coordinator (admission, receive completion).
+    into the coordinator (admission).
     """
 
     admit: Callable[[List[LlmRequest]], Tuple[List[LlmRequest], bool]]
     revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
-    prepare_transmission_completed: Callable[["ScheduledRequests"], None]
 
 
 class DisaggTransferCoordinator:
@@ -319,9 +318,35 @@ class DisaggTransferCoordinator:
 
     # -- batch execution -----------------------------------------------------
 
-    def prepare_transmission_completed(self, scheduled_batch: "ScheduledRequests") -> None:
-        """Turn gen requests whose receive completed into running requests."""
-        self._d.prepare_transmission_completed(scheduled_batch)
+    def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
+        """Generation requests in the batch whose KV receive has completed.
+
+        Read-only: the executor prepares batch-level resources for these
+        requests while they are still transmission-complete, then calls
+        ``try_finish_gen_receive`` for each request in the batch.
+        """
+        return [
+            req
+            for req in scheduled_batch.generation_requests
+            if req.is_disagg_generation_transmission_complete
+        ]
+
+    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+        """Close out a completed KV receive and hand the request to generation.
+
+        Returns False, touching nothing, when the request is no longer
+        transmission-complete (batch-level preparation may have failed and
+        terminated it). Errors from the transfer side propagate.
+        """
+        if not request.is_disagg_generation_transmission_complete:
+            return False
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        # commit_blocks_for_reuse requires the position to be at the prompt end.
+        request.context_current_position = request.prompt_len
+        self._transceiver.commit_blocks_for_reuse(request)
+        request.py_kv_transfer_start_time = None
+        request.py_kv_transfer_timed_out = False
+        return True
 
     def send_completed_context(self, requests: List[LlmRequest]) -> None:
         """Start async KV sends for finished context-only requests."""
@@ -723,6 +748,12 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         return None
+
+    def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
+        return []
+
+    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+        return False
 
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         return None

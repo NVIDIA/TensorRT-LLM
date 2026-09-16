@@ -111,6 +111,14 @@ def test_noop_coordinator_admits_everything_unchanged() -> None:
     assert NoopDisaggCoordinator().admit(fitting) == (fitting, False)
 
 
+def test_noop_coordinator_has_no_completed_receives_to_finish() -> None:
+    """Without a transceiver no receive can complete: the query is empty and
+    finishing is declined, so the executor never runs its receive tail."""
+    noop = NoopDisaggCoordinator()
+    assert noop.completed_gen_receives(Mock(generation_requests=[Mock()])) == []
+    assert noop.try_finish_gen_receive(Mock()) is False
+
+
 def test_noop_coordinator_overrides_every_entry_point() -> None:
     """The no-op coordinator has no services; any inherited implementation
     would dereference None on the first loop iteration."""

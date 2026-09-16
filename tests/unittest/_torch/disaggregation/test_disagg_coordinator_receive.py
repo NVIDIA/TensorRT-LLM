@@ -1,17 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Receive start: ``receive_gen_init`` prepares executor resources for the
+"""The generation side of a KV transfer.
+
+Receive start: ``receive_gen_init`` prepares executor resources for the
 admitted gen-init requests and starts their KV receive in the transfer mode
-the environment selects.
+the environment selects. Receive completion: the executor's
+``_prepare_disagg_gen_transmission_complete`` prepares the batch, then asks the
+coordinator to finish each completed receive before initialising the request
+for generation.
 
 Single-rank cases run one ``CoordinatorHarness``; the multi-rank case runs one
 per rank over a ``FakeDistGroup``.
 """
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
 from fake_dist import FakeDistGroup
 
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
+    DisaggTransferCoordinator,
+    NoopDisaggCoordinator,
+)
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
@@ -203,3 +218,249 @@ def test_gen_only_benchmark_marks_requests_complete_without_a_transceiver_call(
     assert h.transceiver.call_log == []
     assert h.effects.prepared == [admitted]
     assert h.effects.failed == []
+
+
+# -- receive completion -------------------------------------------------------
+
+_COMPLETE = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+_RECEIVING = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+
+class _GenRequest(TransferRequest):
+    """Generation request stub with the fields the receive tail reads and
+    writes; ``events`` (if given) records the first-token writes in order."""
+
+    def __init__(self, rid: int, events=None, **overrides) -> None:
+        defaults = dict(
+            is_context_only_request=False,
+            state=_COMPLETE,
+            prompt_len=8,
+            context_current_position=0,
+            decoding_iter=0,
+            py_decoding_iter=0,
+            py_draft_tokens=None,
+            py_beam_width=1,
+            py_seq_slot=None,
+            context_phase_params=SimpleNamespace(first_gen_tokens=[40 + rid], draft_tokens=None),
+        )
+        defaults.update(overrides)
+        super().__init__(rid, **defaults)
+        self.events = events
+        self.new_tokens = []
+
+    @property
+    def is_disagg_generation_transmission_complete(self) -> bool:
+        # Derived from ``state`` so a request terminated mid-way (e.g. by the
+        # executor error path) stops reporting itself as complete.
+        return self.state == _COMPLETE
+
+    def add_new_token(self, token: int, beam: int) -> None:
+        self.new_tokens.append((token, beam))
+        if self.events is not None:
+            self.events.append(("token", self.py_request_id))
+
+
+def _batch(*generation_requests) -> ScheduledRequests:
+    batch = ScheduledRequests()
+    batch.generation_requests = list(generation_requests)
+    return batch
+
+
+def test_completed_gen_receives_reports_only_completed_requests_in_batch_order() -> None:
+    """The query picks the transmission-complete generation requests, keeps
+    the batch order and changes nothing."""
+    h = CoordinatorHarness()
+    done_a, done_b = _GenRequest(1), _GenRequest(3)
+    receiving = _GenRequest(2, state=_RECEIVING)
+    running = _GenRequest(4, state=LlmRequestState.GENERATION_IN_PROGRESS)
+
+    completed = h.coordinator.completed_gen_receives(_batch(done_a, receiving, done_b, running))
+
+    assert [req.py_request_id for req in completed] == [1, 3]
+    assert [req.state for req in (done_a, receiving, done_b, running)] == [
+        _COMPLETE,
+        _RECEIVING,
+        _COMPLETE,
+        LlmRequestState.GENERATION_IN_PROGRESS,
+    ]
+    assert h.transceiver.call_log == []
+
+
+def test_try_finish_gen_receive_hands_a_completed_request_to_generation() -> None:
+    """The request leaves the transfer state, its blocks are committed for
+    reuse with the position already at the prompt end (the fake transceiver
+    asserts that precondition), and the transfer timer fields are cleared."""
+    h = CoordinatorHarness()
+    req = _GenRequest(1, py_kv_transfer_start_time=5.0, py_kv_transfer_timed_out=True)
+
+    assert h.coordinator.try_finish_gen_receive(req) is True
+
+    assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert req.context_current_position == req.prompt_len
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+    assert req.py_kv_transfer_start_time is None
+    assert req.py_kv_transfer_timed_out is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        LlmRequestState.DISAGG_GENERATION_INIT,
+        _RECEIVING,
+        LlmRequestState.DISAGG_TRANS_ERROR,
+        LlmRequestState.GENERATION_COMPLETE,
+    ],
+)
+def test_try_finish_gen_receive_declines_requests_that_did_not_complete(state) -> None:
+    """A request that is not transmission-complete is left exactly as it is:
+    no state or position change, no reuse commit, timers untouched."""
+    h = CoordinatorHarness()
+    req = _GenRequest(1, state=state, py_kv_transfer_start_time=5.0, py_kv_transfer_timed_out=True)
+
+    assert h.coordinator.try_finish_gen_receive(req) is False
+
+    assert req.state == state
+    assert req.context_current_position == 0
+    assert h.transceiver.call_log == []
+    assert (req.py_kv_transfer_start_time, req.py_kv_transfer_timed_out) == (5.0, True)
+
+
+def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyExecutor:
+    """Bare executor whose receive tail runs for real over ``coordinator``.
+
+    Seq-slot preparation, sampler setup, each finish attempt and the
+    first-token logprobs step append to ``events`` in call order; the two
+    batch-level steps record the request states they observed.
+    """
+    executor = object.__new__(PyExecutor)
+    executor._disagg_coordinator = coordinator
+
+    def record_batch(name):
+        def _record(batch):
+            events.append((name, [req.state for req in batch.context_requests_last_chunk]))
+
+        return _record
+
+    executor.resource_manager = SimpleNamespace(
+        resource_managers={
+            ResourceManagerType.SEQ_SLOT_MANAGER: SimpleNamespace(
+                prepare_resources=record_batch("seq_slot")
+            )
+        }
+    )
+    executor.sampler = SimpleNamespace(setup_sampler_step=record_batch("sampler"))
+    executor.model_engine = SimpleNamespace(enable_spec_decode=False)
+    executor._handle_errors = Mock()
+
+    finish = coordinator.try_finish_gen_receive
+
+    def finish_and_record(req):
+        finished = finish(req)
+        events.append(("finish", req.py_request_id, finished))
+        return finished
+
+    coordinator.try_finish_gen_receive = finish_and_record
+
+    prepend = executor._maybe_prepend_logprobs_and_logits
+
+    def prepend_and_record(req, beam_width):
+        events.append(("logprobs", req.py_request_id))
+        prepend(req, beam_width)
+
+    executor._maybe_prepend_logprobs_and_logits = prepend_and_record
+    return executor
+
+
+def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None:
+    """Order contract: seq slots and the sampler are prepared for the whole
+    batch while its requests are still transmission-complete; only then is
+    each completed request finished and initialised for generation, in batch
+    order, while a request still receiving is declined and left alone."""
+    h = CoordinatorHarness()
+    events = []
+    executor = _executor_over(h.coordinator, events)
+    first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
+    receiving = _GenRequest(3, events=events, state=_RECEIVING)
+
+    executor._prepare_disagg_gen_transmission_complete(_batch(first, receiving, second))
+
+    assert events == [
+        ("seq_slot", [_COMPLETE, _COMPLETE]),
+        ("sampler", [_COMPLETE, _COMPLETE]),
+        ("finish", 1, True),
+        ("token", 1),
+        ("logprobs", 1),
+        ("finish", 3, False),
+        ("finish", 2, True),
+        ("token", 2),
+        ("logprobs", 2),
+    ]
+    for req, token in ((first, 41), (second, 42)):
+        assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+        assert (req.decoding_iter, req.py_decoding_iter) == (1, 1)
+        assert req.py_draft_tokens == []
+        assert req.new_tokens == [(token, 0)]
+    assert receiving.state == _RECEIVING
+    assert receiving.new_tokens == []
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1", "commit_blocks_for_reuse:2"]
+    executor._handle_errors.assert_not_called()
+
+
+@pytest.mark.parametrize("coordinator_kind", ["real", "noop"])
+def test_receive_tail_does_nothing_without_a_completed_receive(coordinator_kind) -> None:
+    """With nothing to finish the batch-level preparation is skipped and no
+    request is asked; the no-op coordinator reports nothing to finish even
+    for a request that claims to be complete."""
+    events = []
+    if coordinator_kind == "real":
+        coordinator = CoordinatorHarness().coordinator
+        request = _GenRequest(1, events=events, state=_RECEIVING)
+    else:
+        coordinator = NoopDisaggCoordinator()
+        request = _GenRequest(1, events=events)
+    executor = _executor_over(coordinator, events)
+
+    executor._prepare_disagg_gen_transmission_complete(_batch(request))
+
+    assert events == []
+    assert request.new_tokens == []
+    assert (request.decoding_iter, request.context_current_position) == (0, 0)
+
+
+def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> None:
+    """When sampler setup raises, the executor error path fails and terminates
+    the batch's requests; they must not be finished afterwards: no reuse
+    commit, no first token, and their terminal state stays. The real
+    ``_setup_sampler_step`` runs; only ``_handle_errors`` is replaced, with
+    the state change the real one makes."""
+    h = CoordinatorHarness()
+    events = []
+    executor = _executor_over(h.coordinator, events)
+    first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
+    executor.active_requests = [first, second]
+
+    def raise_in_sampler(_requests):
+        raise RuntimeError("sampler setup failed")
+
+    executor.sampler = SimpleNamespace(setup_sampler_step=raise_in_sampler)
+
+    def terminate_all(error_msg, **_kwargs):
+        events.append(("handle_errors", error_msg))
+        for req in executor.active_requests:
+            req.state = LlmRequestState.GENERATION_COMPLETE
+        executor.active_requests = []
+
+    executor._handle_errors = Mock(side_effect=terminate_all)
+
+    executor._prepare_disagg_gen_transmission_complete(_batch(first, second))
+
+    assert events == [
+        ("seq_slot", [_COMPLETE, _COMPLETE]),
+        ("handle_errors", "sampler setup failed"),
+        ("finish", 1, False),
+        ("finish", 2, False),
+    ]
+    assert [req.state for req in (first, second)] == [LlmRequestState.GENERATION_COMPLETE] * 2
+    assert h.transceiver.call_log == []
+    assert [req.new_tokens for req in (first, second)] == [[], []]
+    assert [req.decoding_iter for req in (first, second)] == [0, 0]

@@ -200,6 +200,16 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         # entered every iteration, with or without requests.
         self.call_log.append(f"prepare_context_requests:{[req.py_request_id for req in requests]}")
 
+    def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
+        self._assert_alive("commit_blocks_for_reuse")
+        # The reuse adapter behind the real transceivers requires the position
+        # to be at the prompt end when the blocks are committed.
+        assert req.context_current_position == req.prompt_len, (
+            f"commit_blocks_for_reuse for request {req.py_request_id} before "
+            "context_current_position was set to prompt_len"
+        )
+        self.call_log.append(f"commit_blocks_for_reuse:{req.py_request_id}")
+
     def get_disaggregated_params(self) -> Dict[str, object]:
         return {}
 

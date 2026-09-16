@@ -2763,7 +2763,8 @@ class PyExecutor:
 
                     self._add_inflight_ids(scheduled_batch)
 
-                    self.disagg.prepare_transmission_completed(scheduled_batch)
+                    self._prepare_disagg_gen_transmission_complete(
+                        scheduled_batch)
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
@@ -3702,8 +3703,6 @@ class PyExecutor:
                 admit=self._apply_disagg_transfer_admission,
                 revert_deferred_gen_init=self.
                 _revert_deferred_disagg_gen_init_alloc,
-                prepare_transmission_completed=self.
-                _prepare_disagg_gen_transmission_complete,
             ))
 
     def _get_disagg_transfer_admission_controller(
@@ -4420,7 +4419,8 @@ class PyExecutor:
                 can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
-                    self.disagg.prepare_transmission_completed(scheduled_batch)
+                    self._prepare_disagg_gen_transmission_complete(
+                        scheduled_batch)
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
@@ -5257,7 +5257,8 @@ class PyExecutor:
                     scheduled_batch)
 
                 if can_queue:
-                    self.disagg.prepare_transmission_completed(scheduled_batch)
+                    self._prepare_disagg_gen_transmission_complete(
+                        scheduled_batch)
 
                     has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
                         scheduled_batch)
@@ -7268,65 +7269,58 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
-        cache_trans_complete_requests = []
-        for req in scheduled_batch.generation_requests:
-            if req.is_disagg_generation_transmission_complete:
-                cache_trans_complete_requests.append(req)
-        if len(cache_trans_complete_requests) > 0:
-            requests = ScheduledRequests()
-            requests.context_requests_last_chunk = cache_trans_complete_requests
-            self.resource_manager.resource_managers[
-                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
-                    requests)
-            self._setup_sampler_step(requests)
-            # KDA fused-verify replay caches: the ctx->gen state transfer
-            # populates only the base mamba conv/ssm pools; with one-model
-            # spec decoding (e.g. SA) the first forward for these requests
-            # takes the fused verify path, which reads the per-slot
-            # kda_conv_* replay caches instead of the conv pool. Seed them
-            # from the transferred conv states before the first step
-            # (otherwise the recurrent state is permanently contaminated by
-            # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
-            if self.model_engine.enable_spec_decode:
-                kv_mgr = self.resource_manager.resource_managers.get(
-                    ResourceManagerType.KV_CACHE_MANAGER)
-                seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
-                               None)
-                if seed is not None:
-                    seed([
-                        req.py_request_id
-                        for req in cache_trans_complete_requests
-                    ])
+        cache_trans_complete_requests = self.disagg.completed_gen_receives(
+            scheduled_batch)
+        if not cache_trans_complete_requests:
+            return
+        requests = ScheduledRequests()
+        requests.context_requests_last_chunk = cache_trans_complete_requests
+        self.resource_manager.resource_managers[
+            ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(requests)
+        self._setup_sampler_step(requests)
+        # KDA fused-verify replay caches: the ctx->gen state transfer
+        # populates only the base mamba conv/ssm pools; with one-model
+        # spec decoding (e.g. SA) the first forward for these requests
+        # takes the fused verify path, which reads the per-slot
+        # kda_conv_* replay caches instead of the conv pool. Seed them
+        # from the transferred conv states before the first step
+        # (otherwise the recurrent state is permanently contaminated by
+        # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
+        if self.model_engine.enable_spec_decode:
+            kv_mgr = self.resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
+                           None)
+            if seed is not None:
+                seed([
+                    req.py_request_id for req in cache_trans_complete_requests
+                ])
 
         for req in scheduled_batch.generation_requests:
-            if req.is_disagg_generation_transmission_complete:
-                req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.context_current_position = req.prompt_len
-                if self.kv_cache_transceiver is not None:
-                    self.kv_cache_transceiver.commit_blocks_for_reuse(req)
-                req.decoding_iter = 1
-                req.py_decoding_iter = 1
-                req.py_kv_transfer_start_time = None
-                req.py_kv_transfer_timed_out = False
-                first_gen_tokens = req.context_phase_params.first_gen_tokens
-                ctx_draft_tokens = req.context_phase_params.draft_tokens
-                if not ctx_draft_tokens and self.model_engine.enable_spec_decode:
-                    # CTX has no speculative decoding — fill dummy draft tokens
-                    # so model_engine builds the correct input shape (1 + draft_len
-                    # tokens per gen request). Dummies will be rejected on verify,
-                    # and the draft model will produce real tokens for next step.
-                    ctx_draft_tokens = [
-                        0
-                    ] * self.model_engine.max_total_draft_tokens
-                req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
-                beam_width = req.py_beam_width
-                if not self._update_sampler_state_for_disagg_gen_request(
-                        req, beam_width, first_gen_tokens):
-                    continue
-                for beam in range(0, beam_width):
-                    req.add_new_token(first_gen_tokens[beam], beam)
+            # Re-checked per request: the sampler setup above may have failed
+            # and terminated the request, leaving nothing to finish.
+            if not self.disagg.try_finish_gen_receive(req):
+                continue
+            req.decoding_iter = 1
+            req.py_decoding_iter = 1
+            first_gen_tokens = req.context_phase_params.first_gen_tokens
+            ctx_draft_tokens = req.context_phase_params.draft_tokens
+            if not ctx_draft_tokens and self.model_engine.enable_spec_decode:
+                # CTX has no speculative decoding — fill dummy draft tokens
+                # so model_engine builds the correct input shape (1 + draft_len
+                # tokens per gen request). Dummies will be rejected on verify,
+                # and the draft model will produce real tokens for next step.
+                ctx_draft_tokens = [0
+                                    ] * self.model_engine.max_total_draft_tokens
+            req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+            beam_width = req.py_beam_width
+            if not self._update_sampler_state_for_disagg_gen_request(
+                    req, beam_width, first_gen_tokens):
+                continue
+            for beam in range(0, beam_width):
+                req.add_new_token(first_gen_tokens[beam], beam)
 
-                self._maybe_prepend_logprobs_and_logits(req, beam_width)
+            self._maybe_prepend_logprobs_and_logits(req, beam_width)
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
