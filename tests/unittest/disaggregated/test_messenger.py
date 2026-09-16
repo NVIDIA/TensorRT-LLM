@@ -1,11 +1,32 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import socket
 import time
 import unittest
+from threading import Lock, Thread, get_ident
+from types import SimpleNamespace
 
 import pytest
 from parameterized import parameterized
 
-from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native import messenger as messenger_module
+from tensorrt_llm._torch.disaggregation.native.messenger import (
+    ZMQDealerPool,
+    ZMQMessenger,
+    decode_message,
+)
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
 TEST_CASES = [
@@ -140,6 +161,187 @@ def test_zmq_messenger_double_start_listener(dynamic_endpoint):
     with pytest.raises(RuntimeError, match="Listener already running"):
         messenger.start_listener(lambda msgs: None)
     messenger.stop()
+
+
+def test_zmq_messengers_share_process_context(dynamic_endpoint):
+    first = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+    second = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+
+    try:
+        assert first._context is second._context
+        first.stop()
+        assert not second._context.closed
+    finally:
+        first.stop()
+        second.stop()
+
+
+def test_zmq_messenger_parallel_creation_uses_one_context(dynamic_endpoint):
+    contexts = []
+    errors = []
+    lock = Lock()
+
+    def create_and_stop() -> None:
+        try:
+            messenger = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+            with lock:
+                contexts.append(messenger._context)
+            messenger.stop()
+        except BaseException as error:
+            with lock:
+                errors.append(error)
+
+    threads = [Thread(target=create_and_stop) for _ in range(32)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(contexts) == len(threads)
+    assert len({id(context) for context in contexts}) == 1
+
+
+def test_zmq_sync_socket_rejects_cross_thread_use(dynamic_endpoint):
+    messenger = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+    errors = []
+
+    def send_from_non_owner():
+        try:
+            messenger.send([b"message"])
+        except Exception as error:
+            errors.append(error)
+
+    thread = Thread(target=send_from_non_owner)
+    thread.start()
+    thread.join(timeout=5)
+    messenger.stop()
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "owner thread" in str(errors[0])
+
+
+def test_zmq_listener_socket_lifecycle_stays_on_owner_thread(monkeypatch):
+    calls = []
+    lock = Lock()
+
+    def record(operation):
+        with lock:
+            calls.append((operation, get_ident()))
+
+    class FakeSocket:
+        def __init__(self):
+            self.closed = False
+            self.endpoint = None
+
+        def bind(self, endpoint):
+            record("bind")
+            self.endpoint = endpoint
+
+        def getsockopt_string(self, _option):
+            record("getsockopt")
+            return self.endpoint
+
+        def send_multipart(self, _messages):
+            record("send")
+
+        def setsockopt(self, _option, _value):
+            record("setsockopt")
+
+        def close(self):
+            record("close")
+            self.closed = True
+
+    class FakeContext:
+        @staticmethod
+        def instance():
+            return FakeContext()
+
+        def socket(self, _socket_type):
+            record("create")
+            return FakeSocket()
+
+    class FakePoller:
+        def register(self, _socket, _event):
+            record("register")
+
+        def poll(self, timeout):
+            time.sleep(timeout / 1000)
+            return []
+
+    fake_zmq = SimpleNamespace(
+        Context=FakeContext,
+        Poller=FakePoller,
+        POLLIN=1,
+        LAST_ENDPOINT=2,
+        LINGER=3,
+        ZMQError=RuntimeError,
+    )
+    monkeypatch.setattr(messenger_module, "zmq", fake_zmq)
+
+    caller_thread = get_ident()
+    messenger = ZMQMessenger("ROUTER", endpoint="tcp://127.0.0.1:12345")
+    messenger.start_listener(lambda _messages: True)
+    messenger.send([b"message"])
+    messenger.stop()
+
+    assert calls
+    socket_threads = {thread_id for _, thread_id in calls}
+    assert socket_threads == {messenger._listener_thread.ident}
+    assert caller_thread not in socket_threads
+    assert [operation for operation, _ in calls].count("close") == 1
+
+
+def test_zmq_dealer_pool_confines_sockets_to_owner_thread(monkeypatch):
+    socket_threads = set()
+    lock = Lock()
+
+    class FakeMessenger:
+        def __init__(self, mode, endpoint):
+            assert mode == "DEALER"
+            assert endpoint in {"tcp://peer-a:1", "tcp://peer-b:2"}
+            with lock:
+                socket_threads.add(get_ident())
+
+        def send(self, messages):
+            assert messages
+            with lock:
+                socket_threads.add(get_ident())
+
+        def stop(self):
+            with lock:
+                socket_threads.add(get_ident())
+
+    monkeypatch.setattr(messenger_module, "ZMQMessenger", FakeMessenger)
+    pool = ZMQDealerPool()
+    threads = [
+        Thread(
+            target=pool.send,
+            args=(
+                f"tcp://peer-{'a' if index % 2 == 0 else 'b'}:{1 if index % 2 == 0 else 2}",
+                [b"x"],
+            ),
+        )
+        for index in range(32)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    pool.stop()
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(socket_threads) == 1
+
+
+def test_zmq_dealer_pool_rejects_send_after_stop():
+    pool = ZMQDealerPool()
+    pool.stop()
+    with pytest.raises(RuntimeError, match="closed"):
+        pool.send("tcp://peer:1", [b"late"])
 
 
 if __name__ == "__main__":
