@@ -1650,8 +1650,10 @@ class KvCacheCreator:
         """
         if not self._is_kv_cache_manager_v2:
             return False
+        # Pairing depends on the draft pool's support: it holds only the
+        # speculation layers, so it can support what the target pool cannot.
         if not getattr(self._kv_cache_manager_cls,
-                       "_supports_reuse_match_backoff", False):
+                       "_supports_draft_reuse_match_backoff", False):
             return False
         return draft_prompt_lookahead(self._speculative_config) is not None
 

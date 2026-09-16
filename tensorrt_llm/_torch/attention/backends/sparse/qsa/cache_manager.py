@@ -49,6 +49,11 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
     paged cache different shapes or page strides.
     """
 
+    # The parent opts in because its draft pool is attention-only. QSA's is
+    # not: each draft layer adds a Role.INDEX_KEY buffer and a
+    # QSA_INDEX_POSITION page, unvalidated for cross-request reuse.
+    _supports_draft_reuse_match_backoff = False
+
     def __init__(
         self,
         *args,
