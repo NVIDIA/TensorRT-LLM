@@ -311,6 +311,104 @@
       "gvr_median_us": 9.651
     }
   },
+  "roofline_reachable_rate": {
+    "batch": 1024,
+    "reference": "Calibrated roof at each plotted intensity",
+    "aggregation": "Arithmetic mean and maximum of plotted-point reachable rates",
+    "by_model": {
+      "flash": {
+        "gvr_v2": {
+          "points": 9,
+          "average_percent": 41.59262449083251,
+          "peak_percent": 77.98454391932714
+        },
+        "sglang": {
+          "points": 9,
+          "average_percent": 24.722370525640997,
+          "peak_percent": 41.20468486380641
+        },
+        "flashinfer": {
+          "points": 9,
+          "average_percent": 17.530384259598836,
+          "peak_percent": 31.973142176533667
+        },
+        "radix_cuda": {
+          "points": 9,
+          "average_percent": 7.73037106360671,
+          "peak_percent": 16.904373664943286
+        },
+        "deepselect": {
+          "points": 9,
+          "average_percent": 21.163519529351618,
+          "peak_percent": 64.37510759356354
+        },
+        "hpc_ops": {
+          "points": 9,
+          "average_percent": 23.01430056542999,
+          "peak_percent": 40.99358662670424
+        }
+      },
+      "pro": {
+        "gvr_v2": {
+          "points": 9,
+          "average_percent": 39.0022042727297,
+          "peak_percent": 68.41314746484473
+        },
+        "sglang": {
+          "points": 9,
+          "average_percent": 24.712160489392073,
+          "peak_percent": 41.256004328890995
+        },
+        "flashinfer": {
+          "points": 9,
+          "average_percent": 15.824095934200326,
+          "peak_percent": 31.904758031346407
+        },
+        "radix_cuda": {
+          "points": 9,
+          "average_percent": 7.832445928048165,
+          "peak_percent": 16.38668927402192
+        },
+        "deepselect": {
+          "points": 9,
+          "average_percent": 19.2699960099983,
+          "peak_percent": 56.36077032065703
+        }
+      },
+      "v32": {
+        "gvr_v2": {
+          "points": 7,
+          "average_percent": 41.297662352832006,
+          "peak_percent": 65.08393175529055
+        },
+        "sglang": {
+          "points": 7,
+          "average_percent": 27.070908293403967,
+          "peak_percent": 37.95389274750273
+        },
+        "flashinfer": {
+          "points": 7,
+          "average_percent": 15.121383923634395,
+          "peak_percent": 20.294356158047773
+        },
+        "radix_cuda": {
+          "points": 7,
+          "average_percent": 8.288326206074565,
+          "peak_percent": 17.77349626674448
+        },
+        "deepselect": {
+          "points": 7,
+          "average_percent": 14.419005752929042,
+          "peak_percent": 34.77047716555635
+        },
+        "hpc_ops": {
+          "points": 7,
+          "average_percent": 31.59216128492162,
+          "peak_percent": 53.07637384676913
+        }
+      }
+    }
+  },
   "evolution_vs_radix": {
     "temporal_r0": {
       "geomean": 2.5865458712068374,

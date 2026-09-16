@@ -265,15 +265,28 @@ $$
 
 The calibrated limits are **6.912 TB/s** sustained read bandwidth and **37.047 Tcompare/s** semantic comparison throughput. They meet at **5.36 compare/byte**, more than 21 times the maximum ideal Top-K intensity. The entire workload band sits on the bandwidth slope in Figure 7A.
 
-![A clean two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale zoom panels compare GVR V2 and five baselines at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
+![A clean two-level roofline: the full B200 hardware model highlights Top-K's narrow bandwidth-limited band; three linear-scale Pareto curve panels compare GVR V2 and five baselines at batch 1024, with GVR V2 highlighted in green.](../media/gvr_v2/roofline.svg)
 
-*Figure 7.* A: the full theoretical and calibrated roofs. B: the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
+*Figure 7.* A: the full theoretical and calibrated roofs. B: Pareto curves in the Top-K band at $B=1024$, plotting useful throughput $P=BN/t$ against intensity $I=N/[4(N+K)]$ on linear axes. Green highlights V2; the dotted line is the calibrated bandwidth roof. All kernels share the same minimum-traffic model $Q_{\min}$, while extra reads and output work remain in measured time.
 
-### Compare Useful Work at the Same Intensity
+### Compare Pareto Curves and Reachable Rates
 
-At fixed $N$ and $K$, every implementation has the same horizontal position. A faster kernel moves **upward**, toward the bandwidth roof. Figure 7B fixes the batch at 1,024 so the curves expose throughput with substantial parallel work available; Figure 6 retains the contrasting single-row view, and Figures 4 and 5 cover all 11 batch sizes. The linear vertical scale makes the remaining distance to the roof directly visible.
+Each operator's **Pareto curve** in Figure 7B traces useful throughput across intensities at $B=1024$. At fixed $N$ and $K$, every implementation has the same horizontal position; a faster kernel moves **upward**, toward the calibrated roof. Figure 6 retains the contrasting single-row view, and Figures 4 and 5 cover all 11 batch sizes.
 
-For the Flash slice in Figure 6, $B=1024$, $N=131{,}075$, and $K=512$ give an optimistic minimum time of **78.0 µs**. GVR V2 takes **113.1 µs**, reaching about **69%** of the calibrated roof under this shared-work normalization. SGLang takes 196.8 µs, or about **40%** of that roof; radix CUDA takes 461.3 µs, or about **17%**. All three solve the same logical selection problem. Their different vertical positions reflect how much elapsed time they spend beyond its minimum traffic requirement.
+The **reachable rate** is $P(I)/P_{\mathrm{calibrated}}(I)$, expressed as a percentage. The table compares **average / peak reachable rate** along each Pareto curve. The average weights the plotted intensity points equally; the peak is their maximum. Both use the same layer-averaged timings as Figure 7B.
+
+| Operator | V4 Flash | V4 Pro | V3.2 |
+| :--- | ---: | ---: | ---: |
+| **GVR V2** | **41.6% / 78.0%** | **39.0% / 68.4%** | **41.3% / 65.1%** |
+| SGLang, plan + transform | 24.7% / 41.2% | 24.7% / 41.3% | 27.1% / 38.0% |
+| FlashInfer | 17.5% / 32.0% | 15.8% / 31.9% | 15.1% / 20.3% |
+| TensorRT-LLM radix CUDA | 7.7% / 16.9% | 7.8% / 16.4% | 8.3% / 17.8% |
+| DeepSelect FP32 | 21.2% / 64.4% | 19.3% / 56.4% | 14.4% / 34.8% |
+| HPC-ops FP32 | 23.0% / 41.0% | — | 31.6% / 53.1% |
+
+*Each cell shows average / peak. HPC-ops does not support the Pro configuration.*
+
+GVR V2 leads both measures on all three models: its average reachable rate is **39.0–41.6%**, with peaks of **65.1–78.0%**. The nearest baseline varies by model. On V3.2, HPC-ops reaches **31.6% / 53.1%**, compared with V2's **41.3% / 65.1%**. On Flash, DeepSelect reaches a **64.4%** peak but averages **21.2%**, while SGLang averages **24.7%**. Reporting both measures captures the best operating point and the performance sustained across the curve.
 
 ### Interpret the Remaining Gap
 

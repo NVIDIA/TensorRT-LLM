@@ -510,6 +510,38 @@ def _latency(rows: list[dict]) -> None:
     _save(fig, "latency")
 
 
+def _roofline_reachable_rates(rows: list[dict]) -> dict:
+    calibration = json.loads((ROOT / "provenance.json").read_text())["roofline_model"]
+    by_model = {}
+    for model in MODELS:
+        matched = _matching(rows, model)
+        k = matched[0]["k"]
+        by_model[model] = {}
+        for arm in ["gvr_v2", *ARMS]:
+            if model == "pro" and arm == "hpc_ops":
+                continue
+            widths, times = _line_data(matched, arm, 1024)
+            rates = []
+            for n, us in zip(widths, times):
+                intensity = n / (4 * (n + k))
+                roof = min(
+                    calibration["measured_compare_t_s"],
+                    calibration["measured_bandwidth_tb_s"] * intensity,
+                )
+                rates.append(100 * (1024 * n / (us * 1e6)) / roof)
+            by_model[model][arm] = {
+                "points": len(rates),
+                "average_percent": mean(rates),
+                "peak_percent": max(rates),
+            }
+    return {
+        "batch": 1024,
+        "reference": "Calibrated roof at each plotted intensity",
+        "aggregation": "Arithmetic mean and maximum of plotted-point reachable rates",
+        "by_model": by_model,
+    }
+
+
 def _roofline(rows: list[dict]) -> None:
     model_data = json.loads((ROOT / "provenance.json").read_text())["roofline_model"]
     bw = model_data["measured_bandwidth_tb_s"]
@@ -631,7 +663,7 @@ def _roofline(rows: list[dict]) -> None:
     fig.text(
         0.075,
         0.515,
-        "B. Zoom in: how close do measured kernels get?",
+        "B. Pareto curves across intensities",
         fontsize=13,
         weight="bold",
         color="#17202b",
@@ -765,6 +797,7 @@ def main() -> None:
         "sglang_transform_only": _stats(rows, "sglang_transform"),
         "deepselect_bf16": _stats(rows, "deepselect_bf16", "gvr_bf16_run"),
         "temporal_vs_v2": {a: _stats(rows, a) for a in TEMPORAL},
+        "roofline_reachable_rate": _roofline_reachable_rates(rows),
         "evolution_vs_radix": {
             a: {
                 "geomean": geometric_mean(r["radix_cuda_us"] / r[a + "_us"] for r in rows),

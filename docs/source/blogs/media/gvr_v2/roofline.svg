@@ -1914,7 +1914,7 @@ L 914.04562 445.469797
    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #52616f" x="9.038281" y="50.228719" transform="rotate(-0 9.038281 50.228719)">A. The full B200 roofline  ·  Top-K intensity stays far below the compute knee</text>
   </g>
   <g id="text_51">
-   <text style="font-weight: 700; font-size: 13px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202b" x="49.358281" y="324.332719" transform="rotate(-0 49.358281 324.332719)">B. Zoom in: how close do measured kernels get?</text>
+   <text style="font-weight: 700; font-size: 13px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #17202b" x="49.358281" y="324.332719" transform="rotate(-0 49.358281 324.332719)">B. Pareto curves across intensities</text>
   </g>
   <g id="text_52">
    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #52616f" x="49.358281" y="346.667119" transform="rotate(-0 49.358281 346.667119)">B = 1024  ·  identical layers per model  ·  higher is faster</text>

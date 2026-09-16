@@ -80,7 +80,11 @@ The logical work is `W = B*N` abstract comparisons and the minimum traffic is `Q
 
 The full model is `min(R, BW*I)`. The theoretical parameters are `R=37.224960 Tcompare/s` and `BW=8 TB/s`; calibrated parameters are `R=37.047490 Tcompare/s` and `BW=6.912116 TB/s`. Their knees are 4.65312 and approximately 5.35979 compare/byte, above Top-K's ideal `[0.125, 0.25)` intensity range. The semantic comparison convention counts two binary comparisons per FMNMX3 result; it is not FP32 FLOPS.
 
-The zoom panels fix B=1024 and use linear axes. They show a throughput-oriented slice rather than a fitted upper envelope. Figure 6 also shows B=1, and both heatmaps cover all 11 batches. The illustrative Flash fractions of the calibrated roof are minimum time divided by measured mean kernel time: approximately 69% for V2, 40% for SGLang, and 17% for radix CUDA. The read-dominated roof is optimistic; mixed read/write behavior and additional kernel work can lower achievable throughput.
+Figure 7B uses linear axes at B=1024. In this article, a Pareto curve denotes each operator's plotted intensity–throughput curve at that fixed batch. Figure 6 also shows B=1, and both heatmaps cover all 11 batches.
+
+Reachable rate is `100 * P / min(R, BW*I)` percent, using the calibrated roof. Compute each point from the arithmetic-mean duration across the same matched layers used in Figure 7B. The average reachable rate is the unweighted arithmetic mean of these point-level percentages, and the peak is their maximum. Flash and Pro each contribute nine intensity points; V3.2 contributes seven. The average is not weighted by row length or serving frequency. Unsupported HPC-ops Pro results remain absent. `summary.json` records the point counts and average/peak percentages under `roofline_reachable_rate`.
+
+The read-dominated roof is optimistic; mixed read/write behavior and additional kernel work can lower achievable throughput. Reachable rate describes useful selection work relative to this model, not measured DRAM bandwidth utilization.
 
 ## Serving Results
 
