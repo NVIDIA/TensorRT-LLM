@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 version: 0.0.1
 l0_h100:
 - condition:
@@ -86,6 +89,9 @@ l0_h100:
   # Breakable prefill CUDA graphs (BCG) on the hybrid Mamba path; mpi_ray_parity (Ray id runs in the ray stage below).
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph[tp1] TIMEOUT (90)
   - unittest/_torch/modeling/test_multimodal_encoder_graph.py
+  # Register the full EXAONE suite on Hopper to include the SM90-only
+  # chunked-prefill and KV-cache-reuse scenarios.
+  - unittest/_torch/modeling/test_modeling_exaone4_5.py
   # Qwen3.5-MoE-VL is hybrid (Mamba SSM + attention); FlashInfer's
   # chunk_gated_delta_rule GDN prefill kernel is sm90+ only, so this
   # test must run on Hopper-or-newer GPUs. Peer Qwen3-VL / Qwen3-VL-MoE
