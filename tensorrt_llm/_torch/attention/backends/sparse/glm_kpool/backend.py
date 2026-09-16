@@ -12,59 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GLM-5.3-Flash k-pool sparse MLA: the fully-NoPE branch of the TRTLLM family.
+"""GLM-5.3-Flash pool-compressed sparse MLA in the TRTLLM backend family.
 
-``glm5_next`` sparse layers are fully NoPE MLA (``qk_rope_head_dim == 0``,
-``qk_nope_head_dim == 256``, ``kv_lora_rank == 512``) whose visible set is
-selected by a *pool-compressed* indexer: size-``index_kpool`` pools of keys are
-scored, the top ``index_topk / index_kpool`` pools expand back into member
-positions, and the incomplete tail is always appended, padded with ``-1`` to a
-fixed logical width. Stock DeepSeek-V3.2 DSA selects individual keys and
-assumes the 576-wide rope'd DeepSeek geometry (its SM100 absorption route
-applies RoPE through ``mla_rope_append_paged_kv_assign_q``, and the shared
-``MLA`` module's DSA hook requires the fused ``[q_a|kv_a|k_pe]`` projection and
-``qk_rope_head_dim > 0``), so it cannot express this contract without inventing
-a fake rotary width.
+The model projects queries and selects pools; this backend owns paged latent
+and indexer state, pool-key updates, and FlashMLA attention. Selection arrives
+as global latent-cache row IDs in GlmKpoolBackendForwardArgs.topk_rows.
 
-:class:`GlmKpoolSparseAttention` is therefore a narrow **subclass of
-:class:`~..trtllm.TrtllmAttention`** -- a sibling of
-:class:`~.dsa.backend.DSATrtllmAttention` inside the TRTLLM sparse family --
-rather than a fork outside it:
-
-* **Family** -- it inherits the TRTLLM backend's identity wholesale:
-  ``support_mla()`` is true, ``is_mla_enable`` is true through a fully-NoPE
-  :class:`~..interface.MLAParams`, and ``Metadata`` is
-  :class:`~..trtllm.TrtllmAttentionMetadata`, the typed metadata class the
-  engine constructs from ``attn_backend.Metadata``.
-* **Selection** -- ``get_attention_backend("TRTLLM", sparse_params)`` resolves
-  ``SparseParams(algorithm="glm_kpool")`` to this class next to the DSA branch
-  in the sparse registry, and the standard ``create_attention(...)`` dispatch
-  constructs it.
-* **Contract** -- :meth:`forward` keeps the exact
-  ``AttentionBackend.forward(q, k, v, metadata, forward_args)`` signature:
-  options merge through :func:`~..interface.merge_attention_forward_args`
-  (which rejects unknown or mixed arguments), the model layer's pool-expanded
-  selection arrives through the typed
-  ``AttentionForwardArgs.sparse_backend_args.topk_indices`` carrier, and the
-  phase is declared through ``forward_args.attention_input_type``.
-* **Cache ownership** -- every paged read and write is derived from the
-  prepared ``metadata``: the one hybrid ``KVCacheManagerV2`` reached through
-  ``metadata.kv_cache_manager`` owns the latent pages and the packed indexer
-  state, and the per-request block tables / visible lengths come from the
-  ``prepare()``-refreshed ``mamba_metadata.glm_*`` buffers. Callers never hand
-  raw pool tensors to this backend.
-* **Execution** -- the absorbed sparse-MLA core dispatches
-  ``tensorrt_llm.flash_mla.flash_mla_sparse_fwd``, the FlashMLA sparse kernel
-  of the DSA stack (``sparse/dsa/module.py``), which natively supports
-  ``d_qk == d_v == 512`` and 64 query heads (``HEAD_DIM_512`` /
-  ``Fwd_Sm100_Head64_Impl`` in FlashMLA's ``sparse_fwd.h``) with the same
-  ``-1``/out-of-range invalid-index contract this model's indexer emits.
-
-The model layer (``modeling_glm5_next.Glm5NextSparseAttention``) keeps the
-module math -- projections, norms, the pool indexer's scoring/selection
-(model-layer sparse prediction, as in MiniMax-M3), query absorption, and the
-output projection -- and drives this backend only through the standard
-contract entry points.
+Queries have no rotary component and are absorbed into the 512-wide latent
+space. FlashMLA consumes BF16 rows; FP8 cache rows are gathered and dequantized
+in bounded query chunks. Prepared GLM page tables and live TRTLLM lengths
+provide the same cache contract for prefill, decode and verification.
 """
 
 from __future__ import annotations
@@ -87,11 +44,7 @@ from .params import INDEX_SENTINEL, GlmKpoolSparseParams
 
 
 def _flash_mla_sparse_fwd() -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """The production sparse-MLA kernel entry point (lazy import).
-
-    Resolved at call time so a test can intercept the module attribute to
-    prove the backend is the one dispatching it.
-    """
+    """Resolve the FlashMLA sparse kernel lazily."""
     try:
         from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
     except ImportError as exc:  # pragma: no cover - wheel always bundles it
@@ -107,26 +60,12 @@ def paged_slot_indices(
     positions: torch.Tensor,
     tokens_per_block: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(page, within_page)`` indices for ``positions`` in a paged pool.
+    """Return (page, within_page) indices for positions in a paged pool.
 
-    ``block_table`` is ``[..., max_pages]`` and ``positions`` is broadcastable
-    against its leading dimensions. The pair addresses a pool shaped
-    ``[num_pages, tokens_per_block, ...]``.
-
-    Returning the pair rather than one flat ``page * tokens_per_block + offset``
-    index is required, not stylistic. ``KVCacheManagerV2`` coalesces buffers
-    whose per-page size differs from K/V's into a shared pool, so the
-    ``Role.INDEX_KEY`` view it hands back is **strided**: its page stride is the
-    slot stride, not its own payload size. Measured on this model the indexer
-    buffer is ``[16, 64, 1, 256]`` with page stride 32768 against a 16384-element
-    payload. A flat index is only correct for a densely packed pool, and
-    flattening that view is not merely wrong -- ``.view`` raises and ``.reshape``
-    silently *copies*, so every cache write would land in a temporary and be
-    lost. The pair is also what the accessor's own contract prescribes.
-
-    Callers must mask invalid positions themselves -- this deliberately does not
-    invent a fallback page, because a silently wrong page is exactly the
-    cross-request leak the hybrid cache has to rule out.
+    block_table is [..., max_pages]; positions matches its leading dimensions.
+    Use this pair to index [slots, tokens_per_block, ...] pools: V2 coalesced page
+    strides may include other buffers, so flattening would copy or misaddress
+    storage. Callers must supply valid positions.
     """
     page = torch.div(positions, tokens_per_block, rounding_mode="floor")
     offset = positions - page * tokens_per_block
@@ -134,26 +73,14 @@ def paged_slot_indices(
 
 
 def latent_pool_rows(latent_pool: torch.Tensor) -> tuple[torch.Tensor, int, int]:
-    """Row-space view of the latent pool's storage for the sparse kernel.
+    """View coalesced latent storage as uniformly strided [N, 1, dim] rows.
 
-    ``latent_pool`` is the slot-major ``[slots, tokens_per_block, dim]`` view
-    from ``Glm5NextCacheManager.get_latent_state_buffer``. V2 coalesces
-    several buffers into one pool, so the slot stride is larger than the
-    payload and the pool cannot be flattened with ``view`` (it would raise)
-    or ``reshape`` (it would silently copy every step). The kernel, however,
-    only needs *uniformly strided rows*: it reads ``kv_ptr + idx * stride``.
-    Every latent row already sits at a multiple of ``dim`` elements inside
-    the storage, so the whole storage is reinterpreted as ``[N, 1, dim]``
-    rows and positions are translated to row ids instead.
-
-    Returns ``(rows, base_row, rows_per_slot)`` where the row id of cache
-    position ``(slot, t)`` is ``base_row + slot * rows_per_slot + t``. Rows
-    belonging to other coalesced buffers are addressable but never indexed:
-    only ids produced by that formula (or ``-1`` sentinels) reach the kernel.
-    Pure metadata work -- no device kernel -- so it is CUDA-graph safe.
+    Input is [slots, tokens_per_block, dim]. Returns (rows, base_row, rows_per_slot),
+    with row_id = base_row + slot * rows_per_slot + within_page. Only valid latent
+    row IDs or -1 sentinels may reach FlashMLA; storage also contains other buffers.
+    No allocation or device work is needed, so the view is CUDA-graph safe.
     """
-    slots, tokens_per_block, dim = latent_pool.shape
-    del slots, tokens_per_block
+    dim = latent_pool.shape[-1]
     if latent_pool.stride(2) != 1 or latent_pool.stride(1) != dim:
         raise ValueError(
             "glm_kpool latent pool rows must be contiguous within a page; got "
@@ -172,39 +99,12 @@ def latent_pool_rows(latent_pool: torch.Tensor) -> tuple[torch.Tensor, int, int]
     return rows, offset // dim, slot_stride // dim
 
 
-def positions_to_pool_rows(
-    positions: torch.Tensor,
-    block_table: torch.Tensor,
-    tokens_per_block: int,
-    base_row: int,
-    rows_per_slot: int,
-) -> torch.Tensor:
-    """Request-local cache positions -> global row ids for the sparse kernel.
-
-    ``positions`` is int32 ``[..., width]`` with :data:`INDEX_SENTINEL` in
-    invalid slots; ``block_table`` holds base slot ids per request. Sentinels
-    are preserved as ``-1`` (the kernel's own invalid marker) rather than
-    clamped -- a clamped sentinel would address a real row. Fixed shapes,
-    gathers, and ``where`` only, so a captured decode graph replays this
-    against prepare()-refreshed tables.
-    """
-    safe = positions.clamp(min=0).long()
-    page = torch.div(safe, tokens_per_block, rounding_mode="floor")
-    slot = torch.gather(block_table, -1, page)
-    rows = base_row + slot * rows_per_slot + (safe - page * tokens_per_block)
-    return torch.where(positions >= 0, rows, positions.long()).to(torch.int32)
-
-
 @dataclass(frozen=True)
 class _GlmKpoolCacheState:
-    """One layer's cache state, derived from prepared attention metadata.
+    """Layer-local pool views and prepared tables/lengths in context-first order.
 
-    ``latent_pool``/``index_pool`` are the slot-major ``[slots,
-    tokens_per_block, dim]`` views over the hybrid manager's coalesced pools;
-    ``block_tables``/``kv_lens`` cover the whole batch in executor order
-    (contexts first). Everything here is a view or a host int -- deriving it
-    launches no kernel, so it is safe inside a CUDA-graph capture as long as
-    the underlying buffers are the persistent ``prepare()``-refreshed ones.
+    Pool views are [slots, tokens_per_block, dim]. Device tables and lengths retain
+    their prepared addresses for CUDA graph replay.
     """
 
     latent_pool: torch.Tensor
@@ -216,14 +116,7 @@ class _GlmKpoolCacheState:
 
 
 class GlmKpoolSparseAttention(TrtllmAttention):
-    """Fully-NoPE k-pool sparse-MLA branch of the TRTLLM attention family.
-
-    See the module docstring for the family/contract rationale. Constructed
-    under the standard ``create_attention(...)`` dispatch when
-    ``SparseParams(algorithm="glm_kpool")`` is configured on the TRTLLM
-    backend slot; the sparse registry resolves it next to
-    ``DSATrtllmAttention``.
-    """
+    """NoPE k-pool MLA backend selected by SparseParams(algorithm="glm_kpool")."""
 
     Metadata = TrtllmAttentionMetadata
 
@@ -232,15 +125,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     #: semantics-free by the kernel's own contract.
     _KERNEL_TOPK_ALIGN = 64
 
-    #: Query-head counts the FlashMLA sparse kernel instantiates
-    #: (``Fwd_Sm100_Head64_Impl``/``Head128`` in ``sparse_fwd``; any other
-    #: ``h_q`` raises ``Unsupported h_q``). Under tensor parallelism the local
-    #: head count (16 of 64 at TP4) is below the smallest instantiation, so
-    #: :meth:`_dispatch_sparse_core` zero-pads the query-head axis up to the
-    #: next instantiated count and slices the output back -- the in-tree DSA
-    #: precedent (``sparse/dsa/module.py`` pads its TP-local heads the same
-    #: way). Attention is per-head, so zero query lanes cannot perturb real
-    #: lanes; their outputs are discarded by the slice.
+    # FlashMLA instantiates 64/128 query heads. Pad TP-local heads to the next
+    # size and discard the extra outputs; heads attend independently.
     _KERNEL_HEAD_COUNTS = (64, 128)
 
     # Bound selected-KV staging independently of the configured context length.
@@ -339,16 +225,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     # -- metadata-derived cache state ----------------------------------------
 
     def _cache_state(self, metadata) -> _GlmKpoolCacheState:
-        """Derive this layer's cache state from the prepared metadata.
+        """Read slot-major pool views, prepared GLM tables and live TRTLLM lengths.
 
-        The single source of cache truth for every entry point below. The
-        production path is the persistent one: ``prepare()`` with the
-        ``Glm5NextCacheManager`` attached refreshes the ``mamba_metadata``'s
-        ``glm_block_tables``/``glm_kv_lens`` device buffers, so a captured
-        decode graph replays against fresh values at stable addresses.
-        Harness metadata whose manager does not attach those buffers falls
-        back to an eager host-side derivation, which is refused under CUDA
-        graphs exactly like the model's runtime-context builder used to.
+        kv_lens_cuda includes overlap corrections and MTP rewinds. Constructing this
+        state uses views only, with no allocation, H2D copy or host synchronization.
         """
         if metadata is None:
             raise ValueError(
@@ -382,60 +262,19 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         num_contexts = int(metadata.num_contexts)
 
         tables = getattr(mamba_metadata, "glm_block_tables", None)
-        if tables is not None:
-            # Persistent path: slices of prepare()-refreshed buffers. No
-            # allocation, no H2D, no host sync -- CUDA-graph safe. Visible
-            # lengths prefer the metadata's device-corrected kv_lens_cuda
-            # (overlap scheduler + speculative decoding rewinds it in-graph;
-            # see modeling_glm5_next.glm5_next_visible_lens).
-            # Kept in the metadata's own integer width: every consumer here
-            # (comparisons, the fused kernels) accepts int32 or int64, and a
-            # per-call cast would launch one kernel per entry point per layer.
-            live = getattr(metadata, "kv_lens_cuda", None)
-            kv_lens = live[:batch] if live is not None else mamba_metadata.glm_kv_lens[:batch]
-            return _GlmKpoolCacheState(
-                latent_pool=latent,
-                index_pool=index,
-                block_tables=tables[:batch],
-                kv_lens=kv_lens,
-                tokens_per_block=tokens_per_block,
-                num_contexts=num_contexts,
-            )
-
-        # Legacy eager derivation for harness managers that do not attach the
-        # GLM buffers. It allocates and copies, so it must never run inside a
-        # captured region.
-        if getattr(metadata, "is_cuda_graph", False):
+        if tables is None:
             raise RuntimeError(
-                "glm_kpool CUDA-graph execution requires the persistent "
-                "prepare()-refreshed glm_block_tables/glm_kv_lens buffers; the "
-                "attached mamba_metadata has no glm_block_tables"
+                "glm_kpool requires prepared glm_block_tables; call metadata.prepare() "
+                "with Glm5NextMamba2Metadata before eager execution or CUDA graph capture"
             )
-        kv_params = getattr(metadata, "kv_cache_params", None)
-        if kv_params is None or kv_params.num_cached_tokens_per_seq is None:
-            raise ValueError("glm_kpool requires kv_cache_params.num_cached_tokens_per_seq")
-        lens = [int(n) for n in metadata.seq_lens[:batch]]
-        cached = [int(n) for n in kv_params.num_cached_tokens_per_seq[:batch]]
-        device = latent.device
-        # Raw base-slot IDs, NOT get_batch_cache_indices: the latent/index
-        # views are slot-major, and V2's standard accessor scales page ids for
-        # its own flattened per-layer views.
-        pages = manager.get_batch_slot_tables(list(metadata.request_ids)[:batch])
-        max_pages = max((len(p) for p in pages), default=1) or 1
-        block_tables = torch.zeros(batch, max_pages, dtype=torch.long, device=device)
-        for row, page_ids in enumerate(pages):
-            if page_ids:
-                block_tables[row, : len(page_ids)] = torch.as_tensor(
-                    page_ids, dtype=torch.long, device=device
-                )
-        kv_lens = torch.as_tensor(
-            [c + n for c, n in zip(cached, lens)], dtype=torch.long, device=device
-        )
+        kv_lens = getattr(metadata, "kv_lens_cuda", None)
+        if kv_lens is None:
+            raise ValueError("glm_kpool requires prepared metadata.kv_lens_cuda")
         return _GlmKpoolCacheState(
             latent_pool=latent,
             index_pool=index,
-            block_tables=block_tables,
-            kv_lens=kv_lens,
+            block_tables=tables[:batch],
+            kv_lens=kv_lens[:batch],
             tokens_per_block=tokens_per_block,
             num_contexts=num_contexts,
         )
@@ -449,19 +288,13 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         positions: torch.Tensor,
         metadata,
         *,
-        request_index: int | None = None,
         request_ids: torch.Tensor | None = None,
     ) -> None:
-        """Write new tokens' latent and packed indexer state to the pools.
+        """Write latent rows and packed [k | gate] state into the paged cache.
 
-        ``positions`` carries the tokens' cache positions (schedule, owned by
-        the model layer); which pools and tables they land in is derived from
-        ``metadata``. ``request_index`` selects one context request's table
-        row; ``request_ids`` (``[tokens]`` int32, executor request index per
-        packed context token) addresses all context requests at once;
-        ``None`` for both addresses the generation rows, with ``positions``
-        shaped ``[num_generations, 1]``. Callers pass only positions they own
-        -- see :func:`paged_slot_indices` for why no fallback page is invented.
+        For packed context, positions and request_ids are [tokens], identifying each
+        row's request. Otherwise positions is [generation_requests, tokens_per_request]
+        and uses the generation slice of the prepared block tables.
         """
         state = self._cache_state(metadata)
         if request_ids is not None:
@@ -471,10 +304,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             offset = positions - page_idx * state.tokens_per_block
             page = state.block_tables[request_ids.long(), page_idx]
         else:
-            if request_index is None:
-                table = state.block_tables[state.num_contexts :]
-            else:
-                table = state.block_tables[request_index]
+            table = state.block_tables[state.num_contexts :]
             page, offset = paged_slot_indices(table, positions, state.tokens_per_block)
         if state.latent_pool.dtype == torch.float8_e4m3fn:
             quantized = (latent.float() * self.kv_scale_orig_quant).clamp(-448, 448)
@@ -490,58 +320,23 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         packed_dim = self.sparse_params.packed_state_dim
         state.index_pool[page, offset, :packed_dim] = packed.to(state.index_pool.dtype)
 
-    def gather_paged_prefix(
-        self,
-        length: int,
-        metadata,
-        *,
-        request_index: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One context request's cached latent and packed-indexer prefix (host
-        loop path: prefill only, never captured)."""
-        state = self._cache_state(metadata)
-        positions = torch.arange(length, device=state.latent_pool.device)
-        page, offset = paged_slot_indices(
-            state.block_tables[request_index], positions, state.tokens_per_block
-        )
-        packed = state.index_pool[page, offset][..., : self.sparse_params.packed_state_dim]
-        if state.latent_pool.dtype == torch.float8_e4m3fn:
-            latent = state.latent_pool.view(torch.uint8)[page, offset].view(torch.float8_e4m3fn)
-            latent = (latent.float() * self.kv_scale_quant_orig).to(torch.bfloat16)
-        else:
-            latent = state.latent_pool[page, offset]
-        return latent, packed
-
     def _rows(
         self,
         state: _GlmKpoolCacheState,
-        request_index: int | None,
-        num_rows: int,
         rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """``(block_tables, kv_lens)`` for the rows the fast-path kernels see.
+        """Select generation tables, or all tables for packed context request IDs.
 
-        ``None`` addresses the generation rows: one row per generation request
-        (visible length from the metadata), or ``rows_per_request`` rows per
-        request -- a speculative verification pass -- whose block tables are
-        repeated per row and whose per-row visible lengths the caller
-        supplies. An ``int`` addresses one context request: its single block
-        table is broadcast (stride 0) over the request's ``num_rows`` query
-        tokens, whose per-row visible lengths the caller supplies (each query
-        sees its own prefix). ``request_ids`` addresses the packed rows of all
-        context requests: the kernels index the batch's block tables through
-        it (row ``i`` -> table ``request_ids[i]``), so nothing is gathered.
+        Verification repeats generation tables per token; callers supply each
+        query's visible length for verification and packed context rows.
         """
         if request_ids is not None:
             return state.block_tables, None
-        if request_index is None:
-            gen = slice(state.num_contexts, None)
-            if rows_per_request > 1:
-                return state.block_tables[gen].repeat_interleave(rows_per_request, dim=0), None
-            return state.block_tables[gen], state.kv_lens[gen]
-        table = state.block_tables[request_index].unsqueeze(0).expand(num_rows, -1)
-        return table, None
+        gen = slice(state.num_contexts, None)
+        if rows_per_request > 1:
+            return state.block_tables[gen].repeat_interleave(rows_per_request, dim=0), None
+        return state.block_tables[gen], state.kv_lens[gen]
 
     def update_pool_keys(
         self,
@@ -549,21 +344,16 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         ape: torch.Tensor,
         metadata,
         *,
-        request_index: int | None = None,
         request_ids: torch.Tensor | None = None,
     ) -> None:
-        """Refresh the pool containing each of ``positions``.
+        """Refresh the pool containing each position using compression APE.
 
-        Generation rows (``request_index=None``): ``positions`` is
-        ``[num_generations]``, the cache position each request just wrote.
-        One context request: ``positions`` are that request's pool-final
-        positions written this chunk (one per pool, so no two programs write
-        the same pool). ``ape`` is the indexer's ``[kpool, head_dim]``
-        compress APE. All context requests at once: ``request_ids`` maps each
-        position to its request. One fused kernel, in place, CUDA-graph safe.
+        positions is [rows]; ape is [kpool, head_dim]. Generation has one position per
+        request. For packed context, request_ids maps each row to a request and only
+        pool-final positions are supplied, avoiding concurrent writes to one pool.
         """
         state = self._cache_state(metadata)
-        tables, _ = self._rows(state, request_index, positions.shape[0], request_ids=request_ids)
+        tables, _ = self._rows(state, request_ids=request_ids)
         kpool_update(
             state.index_pool,
             tables,
@@ -583,26 +373,19 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         *,
         q_scale: float,
         w_scale: float,
-        request_index: int | None = None,
         kv_lens: torch.Tensor | None = None,
         rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fused pool scoring -> ``[N, P_cap]`` fp32.
+        """Score complete pools into FP32 [rows, pool_capacity].
 
-        ``q`` is ``[N, n_heads, head_dim]``, ``weights`` ``[N, n_heads]``.
-        Reads the cached pool keys directly (work proportional to each row's
-        visible length, not to the buffer capacity); pools that are not yet
-        complete hold the fp32 minimum. Generation rows by default; for one
-        context request pass ``request_index`` and the per-query-token
-        visible lengths ``kv_lens`` (``position + 1``); for a speculative
-        verification pass over the generation rows pass ``rows_per_request``
-        (tokens per request) and the per-row ``kv_lens``.
+        q is [rows, heads, head_dim], weights is [rows, heads]. Packed context uses
+        request_ids; verification repeats generation tables rows_per_request times.
+        Both supply per-query kv_lens. Single-token decode uses live metadata lengths.
+        Incomplete/invisible pools receive the FP32 minimum before top-k.
         """
         state = self._cache_state(metadata)
-        tables, gen_lens = self._rows(
-            state, request_index, q.shape[0], rows_per_request, request_ids=request_ids
-        )
+        tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
         capacity = state.block_tables.shape[1] * state.tokens_per_block
         kpool = self.sparse_params.index_kpool
         return kpool_score(
@@ -622,7 +405,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             precision="tf32",
             # Context rows: the query tokens of a request share its block
             # table, so a program gathers each pool-key block once for 16 rows.
-            rows_per_program=1 if request_index is None and request_ids is None else 16,
+            rows_per_program=1 if request_ids is None else 16,
             request_ids=request_ids,
         )
 
@@ -631,7 +414,6 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         selected: torch.Tensor,
         metadata,
         *,
-        request_index: int | None = None,
         kv_lens: torch.Tensor | None = None,
         rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
@@ -644,9 +426,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         row addressing as :meth:`score_pools`.
         """
         state = self._cache_state(metadata)
-        tables, gen_lens = self._rows(
-            state, request_index, selected.shape[0], rows_per_request, request_ids=request_ids
-        )
+        tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
         _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
         return kpool_expand(
             selected,
@@ -672,15 +452,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         is_gen_only: bool = False,
         **kwargs,
     ) -> list[torch.Tensor]:
-        """Allocate the standard flat output buffer for this absorbed branch.
+        """Allocate [tokens, num_heads * kv_lora_rank] for absorbed attention.
 
-        Reconciles the inherited ``TrtllmAttention.create_output``, whose MLA
-        context leg allocates ``num_heads * v_head_dim``: the absorbed
-        formulation emits the *latent* width ``num_heads * kv_lora_rank`` in
-        **both** phases (the model layer applies the absorbed V projection to
-        it afterwards, so ``v_head_dim`` never appears at this boundary).
-        Quantized/NVFP4 output modes are not implemented on this branch and
-        are rejected loudly rather than silently mis-allocated.
+        Both phases emit latent-width outputs; the model applies the V projection.
+        Quantized outputs are unsupported.
         """
         del metadata, attention_mask, is_gen_only, kwargs
         if is_quantize_output:
@@ -751,14 +526,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     def _finalize_output(
         self, out_latent: torch.Tensor, output: torch.Tensor | None
     ) -> torch.Tensor:
-        """Flatten the kernel output to ``[T, num_heads * kv_lora]``.
+        """Flatten to [tokens, num_heads * kv_lora_rank], filling output when supplied.
 
-        With no caller buffer the kernel's own (contiguous) allocation is
-        returned viewed flat -- same shape/dtype/device as
-        :meth:`create_output` would allocate, without a redundant copy. A
-        caller-provided ``forward_args.output`` (already validated in
-        :meth:`forward`) is written in place and returned, matching the
-        TRTLLM family's caller-owned-buffer semantics.
+        Without a caller-owned buffer, flattening the contiguous head/feature axes
+        preserves the view even when token strides include padded query heads.
         """
         if output is None:
             # The real heads remain contiguous within each token even when
@@ -777,60 +548,33 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         forward_args: AttentionForwardArgs | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Standard ``AttentionBackend.forward`` for the k-pool sparse core.
+        """Run sparse attention against paged latent rows.
 
-        Arguments follow the base contract exactly:
+        Args:
+            q: Absorbed queries [tokens, num_heads, kv_lora_rank], or the flattened
+                [tokens, num_heads * kv_lora_rank] view.
+            k: Must be None; KV rows come from the prepared cache metadata.
+            v: Must be None; latent rows serve as both K and V.
+            metadata: Prepared TRTLLM metadata with Glm5NextMamba2Metadata tables.
+            forward_args: Must provide topk_rows (int32 [tokens, width], -1 invalid)
+                and a context_only or generation_only phase. An optional flat output
+                buffer is validated and filled in place. Quantized outputs are unsupported.
+            **kwargs: Legacy argument carrier, merged by the shared base contract.
 
-        ``q``
-            Absorbed latent-space queries, ``[T, num_heads * kv_lora]`` or the
-            equivalent ``[T, num_heads, kv_lora]`` view.
-        ``k``
-            Context phase: the request's contiguous cached latent prefix
-            ``[KV, kv_lora]`` (``num_kv_heads == 1``), gathered from the same
-            metadata through :meth:`gather_paged_prefix`. Generation phase:
-            ``None`` -- the kernel reads the paged latent pool directly
-            through the storage row view derived from ``metadata``.
-        ``v``
-            Must be ``None``: the latent rows serve as both K and V, exactly
-            as in absorbed MLA; the model layer applies the absorbed V
-            projection to the returned latent output.
-        ``metadata``
-            The engine's prepared typed metadata. Required: the paged pools,
-            block tables, and visible lengths are derived from it (see
-            :meth:`_cache_state`); ``None`` or unprepared metadata is a loud
-            error.
-        ``forward_args`` / ``**kwargs``
-            Merged through :func:`merge_attention_forward_args`, which
-            rejects unknown kwargs and forward_args/kwargs mixing. The
-            model layer's pool-expanded selection travels in the typed
-            ``sparse_backend_args.topk_indices`` field (int32
-            ``[T, output_width]``, request-local positions,
-            :data:`INDEX_SENTINEL` padding), and
-            ``attention_input_type`` declares the phase -- this backend is
-            phase-explicit, so ``mixed`` is rejected. A caller-provided
-            ``forward_args.output`` is validated (shape/dtype/device),
-            written in place, and returned -- the TRTLLM family's
-            caller-owned-buffer semantics. Quantized-output modes
-            (``out_scale``/``out_scale_sf``/``output_sf``) are not
-            implemented here and are rejected loudly.
-
-        Returns the flat latent-space attention output
-        ``[T, num_heads * kv_lora]`` -- the base contract's
-        ``(num_q_tokens, num_heads * head_dim)`` with this backend's
-        ``head_dim == kv_lora_rank``. The model layer views it per-head for
-        the absorbed V projection.
+        Returns:
+            Latent output [tokens, num_heads * kv_lora_rank].
         """
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         sparse_args = forward_args.sparse_backend_args
-        topk_indices = sparse_args.topk_indices if sparse_args is not None else None
         topk_rows = getattr(sparse_args, "topk_rows", None)
-        if topk_indices is None and topk_rows is None:
-            raise NotImplementedError(
-                "GlmKpoolSparseAttention needs the model layer's pool-expanded "
-                "selection in forward_args.sparse_backend_args.topk_indices; the "
-                "k-pool scoring/selection is module math -- see "
-                "modeling_glm5_next.Glm5NextSparseAttention."
+        if topk_rows is None:
+            raise ValueError(
+                "glm_kpool requires pool-expanded selection in sparse_backend_args.topk_rows"
             )
+        if sparse_args.topk_indices is not None:
+            raise ValueError("glm_kpool accepts topk_rows, not request-local topk_indices")
+        if k is not None:
+            raise ValueError("glm_kpool reads paged latent rows from metadata; k must be None")
         if v is not None:
             raise ValueError("glm_kpool consumes latent rows as both K and V; v must be None")
         if q.dim() == 2:
@@ -861,63 +605,12 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                     f"{output.device}"
                 )
 
-        state = self._cache_state(metadata)
         input_type = forward_args.attention_input_type
-        if topk_rows is not None:
-            # Fast path (either phase): the selection was expanded and
-            # translated to latent-pool row ids by expand_selection, so the
-            # kernel reads the paged pool directly; k must not be passed.
-            if k is not None:
-                raise ValueError("glm_kpool: topk_rows addresses the paged pool; k must be None")
-            if input_type not in (
-                AttentionInputType.context_only,
-                AttentionInputType.generation_only,
-            ):
-                raise ValueError(f"glm_kpool forward is phase-explicit, got {input_type!r}")
-            kv_rows, _, _ = latent_pool_rows(state.latent_pool)
-            return self._finalize_output(self._dispatch_sparse_core(q, kv_rows, topk_rows), output)
-        if input_type == AttentionInputType.context_only:
-            if k is None:
-                raise ValueError(
-                    "glm_kpool context forward needs the request's contiguous "
-                    "latent prefix as k (see gather_paged_prefix)"
-                )
-            if topk_indices is None:
-                raise ValueError(
-                    "glm_kpool context forward selects over the request's own "
-                    "contiguous prefix; pass request-local topk_indices, not rows"
-                )
-            kv_len = k.shape[0]
-            out_latent = self._dispatch_sparse_core(
-                q, k.view(kv_len, 1, self.kv_lora_rank), topk_indices
-            )
-            return self._finalize_output(out_latent, output)
-        if input_type == AttentionInputType.generation_only:
-            if k is not None:
-                raise ValueError(
-                    "glm_kpool generation forward reads the paged latent pool "
-                    "from metadata; k must be None"
-                )
-            gen_tables = state.block_tables[state.num_contexts :]
-            num_gens = gen_tables.shape[0]
-            if num_gens == 0 or q.shape[0] % num_gens:
-                raise ValueError(
-                    f"glm_kpool generation forward got {q.shape[0]} query rows for "
-                    f"{num_gens} generation requests in the metadata"
-                )
-            kv_rows, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
-            # Speculative verification packs ``1 + runtime_draft_len`` query
-            # rows per generation request, request-major; every row of a
-            # request resolves its selection through that request's table.
-            tokens_per_request = q.shape[0] // num_gens
-            if tokens_per_request > 1:
-                gen_tables = gen_tables.repeat_interleave(tokens_per_request, dim=0)
-            topk_rows = positions_to_pool_rows(
-                topk_indices, gen_tables, state.tokens_per_block, base_row, rows_per_slot
-            )
-            return self._finalize_output(self._dispatch_sparse_core(q, kv_rows, topk_rows), output)
-        raise ValueError(
-            "glm_kpool forward is phase-explicit: set "
-            "forward_args.attention_input_type to context_only or "
-            f"generation_only, got {input_type!r}"
-        )
+        if input_type not in (
+            AttentionInputType.context_only,
+            AttentionInputType.generation_only,
+        ):
+            raise ValueError(f"glm_kpool forward is phase-explicit, got {input_type!r}")
+        state = self._cache_state(metadata)
+        kv_rows, _, _ = latent_pool_rows(state.latent_pool)
+        return self._finalize_output(self._dispatch_sparse_core(q, kv_rows, topk_rows), output)
