@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-302 captured fields.
+304 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -54,6 +54,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `batch_wait_max_tokens_ratio` | `float` | `value` |  |
 | `batch_wait_timeout_iters` | `int` | `value` |  |
 | `batch_wait_timeout_ms` | `float` | `value` |  |
+| `cache_transceiver_config.agent_bounce_buffer_enable` | `bool` | `value` |  |
 | `cache_transceiver_config.backend` | `literal\|none` | `categorical` | `DEFAULT`, `UCX`, `NIXL`, `MOONCAKE`, `MPI` |
 | `cache_transceiver_config.enable_pipelined_transfer` | `bool` | `value` |  |
 | `cache_transceiver_config.kv_cache_bounce_size_mb` | `int` | `value` |  |
@@ -138,7 +139,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.enable_block_reuse` | `bool` | `value` |  |
 | `kv_cache_config.enable_kv_pool_rebalance` | `bool` | `value` |  |
 | `kv_cache_config.enable_partial_reuse` | `bool` | `value` |  |
-| `kv_cache_config.enable_swa_scratch_reuse` | `bool` | `value` |  |
+| `kv_cache_config.enable_swa_scratch_reuse` | `bool\|literal` | `categorical` | `auto` |
 | `kv_cache_config.event_buffer_max_size` | `int` | `value` |  |
 | `kv_cache_config.fp8_context_mla_kv_len_cap` | `int\|none` | `value` |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `float\|none` | `value` |  |
@@ -309,6 +310,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_matching_ngram_size` | `int` | `value` |  |
 | `speculative_config.max_non_leaves_per_layer` | `int\|none` | `value` |  |
 | `speculative_config.max_total_draft_tokens` | `int\|none` | `value` |  |
+| `speculative_config.moe_backend` | `literal\|none` | `categorical` | `AUTO`, `CUTLASS`, `CUTEDSL`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
 | `speculative_config.num_eagle_layers` | `int\|none` | `value` |  |
 | `speculative_config.num_nextn_predict_layers` | `int\|none` | `value` |  |
 | `speculative_config.relaxed_delta` | `float` | `value` |  |

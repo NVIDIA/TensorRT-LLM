@@ -89,6 +89,24 @@ struct KVCacheIterationStatsDelta
     int64_t iterIntraDeviceCopyBytes = 0;
     int64_t iterHostDroppedBlocks = 0;
     int64_t iterHostDroppedBytes = 0;
+    // SWA scratch reuse attribution. Scratch blocks are excluded from iterAlloc* by design, so
+    // these are the only accounting for the saving: iterAllocNewBlocks drops by exactly
+    // iterScratchBlocks.
+    //
+    // The two fields have DIFFERENT semantics, which the names carry deliberately:
+    //   iterScratchBlocks       - a COUNT. Blocks served from shared scratch sub-pages during
+    //                             this iteration. Additive: summing over iterations gives the
+    //                             total number of blocks ever served from scratch.
+    //   iterScratchSlotsInUse   - a GAUGE, sampled per lifecycle as slots are recorded and
+    //                             therefore summed across lifecycles WITHIN one iteration to
+    //                             give the slots concurrently in use. It is reset every
+    //                             iteration along with the rest of the delta. Accumulating it
+    //                             ACROSS iterations is meaningless - it is an occupancy, not a
+    //                             flow. Consumers that sum every int field indiscriminately
+    //                             will produce a nonsense number here; the "InUse" suffix is
+    //                             the contract.
+    int64_t iterScratchBlocks = 0;
+    int64_t iterScratchSlotsInUse = 0;
 
     void add(KVCacheIterationStatsDelta const& other) noexcept
     {
@@ -107,6 +125,8 @@ struct KVCacheIterationStatsDelta
         iterIntraDeviceCopyBytes += other.iterIntraDeviceCopyBytes;
         iterHostDroppedBlocks += other.iterHostDroppedBlocks;
         iterHostDroppedBytes += other.iterHostDroppedBytes;
+        iterScratchBlocks += other.iterScratchBlocks;
+        iterScratchSlotsInUse += other.iterScratchSlotsInUse;
     }
 
     void subtract(KVCacheIterationStatsDelta const& other) noexcept
@@ -126,6 +146,8 @@ struct KVCacheIterationStatsDelta
         iterIntraDeviceCopyBytes -= other.iterIntraDeviceCopyBytes;
         iterHostDroppedBlocks -= other.iterHostDroppedBlocks;
         iterHostDroppedBytes -= other.iterHostDroppedBytes;
+        iterScratchBlocks -= other.iterScratchBlocks;
+        iterScratchSlotsInUse -= other.iterScratchSlotsInUse;
     }
 
     void clear() noexcept
@@ -144,7 +166,8 @@ struct KVCacheIterationStatsDelta
             && iterFullReusedBlocks == 0 && iterPartialReusedBlocks == 0 && iterMissedBlocks == 0
             && iterGenAllocBlocks == 0 && iterOnboardBlocks == 0 && iterOnboardBytes == 0 && iterOffloadBlocks == 0
             && iterOffloadBytes == 0 && iterIntraDeviceCopyBlocks == 0 && iterIntraDeviceCopyBytes == 0
-            && iterHostDroppedBlocks == 0 && iterHostDroppedBytes == 0;
+            && iterHostDroppedBlocks == 0 && iterHostDroppedBytes == 0 && iterScratchBlocks == 0
+            && iterScratchSlotsInUse == 0;
     }
 
     [[nodiscard]] double iterCacheHitRate() const noexcept
@@ -168,7 +191,8 @@ struct KVCacheIterationStatsDelta
             && iterIntraDeviceCopyBlocks == other.iterIntraDeviceCopyBlocks
             && iterIntraDeviceCopyBytes == other.iterIntraDeviceCopyBytes
             && iterHostDroppedBlocks == other.iterHostDroppedBlocks
-            && iterHostDroppedBytes == other.iterHostDroppedBytes;
+            && iterHostDroppedBytes == other.iterHostDroppedBytes && iterScratchBlocks == other.iterScratchBlocks
+            && iterScratchSlotsInUse == other.iterScratchSlotsInUse;
     }
 };
 

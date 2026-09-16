@@ -614,8 +614,11 @@
       "path": "kv_cache_config.enable_partial_reuse"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
+      "allowed_values": [
+        "auto"
+      ],
+      "capture_policy": "bool|literal",
+      "kind": "categorical",
       "path": "kv_cache_config.enable_swa_scratch_reuse"
     },
     {
