@@ -59,6 +59,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
                                                       SsmLayerConfig,
                                                       TokenIdExt, _KVCache)
 
+# Shared with the KV budget estimator so allocator and budgeting can never
+# diverge on the sharding rule (config_utils is import-cycle-free).
+from .config_utils import mamba_effective_tp_size as _mamba_effective_tp_size
+
 GB = 1 << 30
 
 
@@ -166,19 +170,6 @@ class MambaRole:
     CONV_STATE = DataRole("conv_state")
     PLE_NGRAM_CONTEXT = DataRole("ple_ngram_context")
     PLE_CONV_STATE = DataRole("ple_conv_state")
-
-
-def _mamba_effective_tp_size(mapping: Mapping) -> int:
-    """TP degree for sizing per-rank mamba/KDA state pools.
-
-    Attention-DP replicates the state and takes precedence; helix
-    repurposes CP ranks as plain TP for recurrent-state layers.
-    """
-    if mapping.enable_attention_dp:
-        return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
-    return mapping.tp_size
 
 
 def get_tensor_size_bytes(tensor):
