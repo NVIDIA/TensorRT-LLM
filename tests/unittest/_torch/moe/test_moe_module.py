@@ -86,7 +86,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     create_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -123,6 +123,18 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+
+def test_duplicate_layer_ids_preserve_all_moe_registrations() -> None:
+    model_config = ModelConfig(skip_create_weights_in_init=True)
+    moe_layers = [torch.nn.Module() for _ in range(3)]
+    for layer in moe_layers:
+        layer.layer_idx = 0
+        layer.layer_idx_str = "0"
+        MoE._register_layer(layer, model_config)
+
+    assert [layer.layer_idx_str for layer in moe_layers] == ["0", "0_0", "0_1"]
+    assert [ref() for ref in model_config.extra_attrs["moe_layers"].values()] == moe_layers
 
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:

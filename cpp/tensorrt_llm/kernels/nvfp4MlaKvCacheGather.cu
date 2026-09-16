@@ -35,9 +35,11 @@ constexpr int32_t kWarpsPerBlock = 8;
 constexpr int32_t kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
 constexpr int32_t kBlocksPerSm = 6;
 constexpr int32_t kGenerationBlocksPerSm = 6;
+constexpr int32_t kDirectBlocksPerSm = 8;
 constexpr int32_t kAsyncCopyBytes = 16;
 constexpr int32_t kScaleCopyBytes = 8;
 constexpr int32_t kNarrowScaleCopyBytes = 4;
+constexpr int32_t kDsv4HeadDim = 512;
 constexpr int32_t kMlaHeadDim = 576;
 constexpr int32_t kMlaResidualDim = 64;
 constexpr int32_t kMlaPackedHeadDim = kMlaHeadDim / 2;
@@ -595,6 +597,104 @@ __global__ void nvFp4MlaKvCacheGatherGenericKernel(uint8_t const* __restrict__ d
     }
 }
 
+template <int32_t kResidualDim>
+__global__ __launch_bounds__(kThreadsPerBlock, kDirectBlocksPerSm) void nvFp4MlaKvCacheGatherDirectKernel(
+    uint8_t const* __restrict__ dataPool, __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* globalIndices,
+    __nv_fp8_e4m3* __restrict__ output, int32_t* compactIndices, float const* __restrict__ globalDequantScale,
+    int32_t numPairs, int64_t numPoolTokens)
+{
+    int32_t const warp = threadIdx.x / kWarpSize;
+    int32_t const lane = threadIdx.x % kWarpSize;
+    float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
+    int32_t pair = static_cast<int32_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    int32_t const pairStride = static_cast<int32_t>(gridDim.x) * kWarpsPerBlock;
+    for (; pair < numPairs; pair += pairStride)
+    {
+        int32_t globalIdx = -1;
+        if (lane == 0)
+        {
+            globalIdx = globalIndices[pair];
+            bool const valid = globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens;
+            compactIndices[pair] = valid ? pair : -1;
+            globalIdx = valid ? globalIdx : -1;
+        }
+        globalIdx = __shfl_sync(0xFFFFFFFFU, globalIdx, 0);
+        if (globalIdx >= 0)
+        {
+            if (dequantScale == 1.F)
+            {
+                dequantizeRow<true>(
+                    dataPool, scalePool, output, globalIdx, pair, kDsv4HeadDim, kResidualDim, 1.F, lane);
+            }
+            else
+            {
+                dequantizeRow<false>(
+                    dataPool, scalePool, output, globalIdx, pair, kDsv4HeadDim, kResidualDim, dequantScale, lane);
+            }
+        }
+    }
+}
+
+__global__ void markContextGlobalTopKKernel(int32_t const* __restrict__ localTopKIndices,
+    int32_t const* __restrict__ queryReqIndices, int32_t const* __restrict__ cuKvLengths,
+    int32_t const* __restrict__ globalIndices, int32_t* __restrict__ selectedFlags,
+    int32_t* __restrict__ selectedGlobalIndices, int64_t numPairs, int32_t topK, int32_t numRequests,
+    int32_t maxKvTokens, int64_t numPoolTokens)
+{
+    for (int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; pair < numPairs;
+         pair += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        int32_t const row = static_cast<int32_t>(pair / topK);
+        int32_t const request = queryReqIndices[row];
+        int32_t const token = localTopKIndices[pair];
+        int32_t const globalIdx = globalIndices[pair];
+        if (request < 0 || request >= numRequests || token < 0 || globalIdx < 0
+            || static_cast<int64_t>(globalIdx) >= numPoolTokens)
+        {
+            continue;
+        }
+
+        int32_t const requestStart = cuKvLengths[request];
+        int32_t const requestLength = cuKvLengths[request + 1] - requestStart;
+        int64_t const packedToken = static_cast<int64_t>(requestStart) + token;
+        if (token < requestLength && packedToken >= 0 && packedToken < maxKvTokens
+            && atomicCAS(selectedFlags + packedToken, 0, 1) == 0)
+        {
+            selectedGlobalIndices[packedToken] = globalIdx;
+        }
+    }
+}
+
+__global__ void remapContextGlobalTopKKernel(int32_t const* __restrict__ localTopKIndices,
+    int32_t const* __restrict__ queryReqIndices, int32_t const* __restrict__ cuKvLengths,
+    int32_t const* __restrict__ selectedFlags, int32_t const* __restrict__ selectedOffsets,
+    int32_t* __restrict__ globalIndices, int64_t numPairs, int32_t topK, int32_t numRequests, int32_t maxKvTokens,
+    int64_t numPoolTokens)
+{
+    for (int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; pair < numPairs;
+         pair += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        int32_t const row = static_cast<int32_t>(pair / topK);
+        int32_t const request = queryReqIndices[row];
+        int32_t const token = localTopKIndices[pair];
+        int32_t const globalIdx = globalIndices[pair];
+        int32_t compact = -1;
+        if (request >= 0 && request < numRequests && token >= 0 && globalIdx >= 0
+            && static_cast<int64_t>(globalIdx) < numPoolTokens)
+        {
+            int32_t const requestStart = cuKvLengths[request];
+            int32_t const requestLength = cuKvLengths[request + 1] - requestStart;
+            int64_t const packedToken = static_cast<int64_t>(requestStart) + token;
+            if (token < requestLength && packedToken >= 0 && packedToken < maxKvTokens
+                && selectedFlags[packedToken] != 0)
+            {
+                compact = selectedOffsets[packedToken];
+            }
+        }
+        globalIndices[pair] = compact;
+    }
+}
+
 __global__ void markContextTopKKernel(int32_t const* __restrict__ localTopKIndices,
     int32_t const* __restrict__ queryReqIndices, int64_t const* __restrict__ cuKvLengths,
     int32_t const* __restrict__ blockTable, int32_t* __restrict__ selectedFlags,
@@ -740,11 +840,27 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     int64_t const numPairs = static_cast<int64_t>(numRows) * topK;
     TLLM_CHECK_WITH_INFO(
         numPairs <= std::numeric_limits<int32_t>::max(), "NVFP4 MLA gather compact indices exceed int32 capacity");
-    int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
     int32_t const packedHeadDim = (headDim + residualDim) / 2;
     bool const compactLayout = reinterpret_cast<uint8_t const*>(scalePool) == dataPool + packedHeadDim;
-    if (headDim == kMlaHeadDim && residualDim == 0)
+    if (headDim == kDsv4HeadDim && (residualDim == 0 || residualDim == kMlaResidualDim))
     {
+        int32_t const blocks = getPersistentBlockCount(numPairs, kDirectBlocksPerSm);
+        if (residualDim == kMlaResidualDim)
+        {
+            nvFp4MlaKvCacheGatherDirectKernel<kMlaResidualDim><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool,
+                scalePool, globalIndices, output, compactIndices, globalDequantScale, static_cast<int32_t>(numPairs),
+                numPoolTokens);
+        }
+        else
+        {
+            nvFp4MlaKvCacheGatherDirectKernel<0><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
+                globalIndices, output, compactIndices, globalDequantScale, static_cast<int32_t>(numPairs),
+                numPoolTokens);
+        }
+    }
+    else if (headDim == kMlaHeadDim && residualDim == 0)
+    {
+        int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
         if (compactLayout)
         {
             nvFp4MlaKvCacheGatherKernel<0, true><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
@@ -758,6 +874,7 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     }
     else if (headDim == kMlaHeadDim && residualDim == kMlaResidualDim)
     {
+        int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
         if (compactLayout)
         {
             nvFp4MlaKvCacheGatherKernel<kMlaResidualDim, true><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool,
@@ -771,9 +888,95 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     }
     else
     {
+        int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
         nvFp4MlaKvCacheGatherGenericKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, globalIndices,
             output, compactIndices, globalDequantScale, numPairs, headDim, residualDim, numPoolTokens);
     }
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+size_t getNvFp4MlaContextKvCacheGatherDirectWorkspaceSize(int32_t numRequests, int32_t maxKvTokens, cudaStream_t stream)
+{
+    if (numRequests <= 0 || maxKvTokens <= 0)
+    {
+        return 0;
+    }
+    size_t requestScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr, requestScanWorkspaceSize,
+        static_cast<int32_t const*>(nullptr), static_cast<int32_t*>(nullptr), numRequests, stream));
+    size_t tokenScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, tokenScanWorkspaceSize, static_cast<int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr), maxKvTokens, stream));
+    size_t const tensorWorkspaceSize
+        = alignUp((static_cast<size_t>(numRequests) + 1 + static_cast<size_t>(maxKvTokens) * 3) * sizeof(int32_t),
+            kWorkspaceAlignment);
+    return tensorWorkspaceSize + std::max(requestScanWorkspaceSize, tokenScanWorkspaceSize);
+}
+
+void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* localTopKIndices, int32_t const* queryReqIndices, int32_t const* compressedKvLengths,
+    int32_t* globalIndices, __nv_fp8_e4m3* output, float const* globalDequantScale, void* workspace,
+    size_t workspaceSize, int32_t numQueryRows, int32_t topK, int32_t numRequests, int32_t maxKvTokens,
+    int32_t outputCapacity, int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream)
+{
+    if (numQueryRows == 0 || topK == 0 || maxKvTokens == 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
+        "NVFP4 MLA direct context gather requires head_dim to be a positive multiple of 16, got %d", headDim);
+    TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
+        "NVFP4 MLA direct context gather residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
+    TLLM_CHECK_WITH_INFO(numRequests > 0, "num_requests must be positive");
+    int64_t const numPairs = static_cast<int64_t>(numQueryRows) * topK;
+    TLLM_CHECK_WITH_INFO(
+        numPairs <= std::numeric_limits<int32_t>::max(), "NVFP4 MLA direct context gather exceeds int32 capacity");
+    TLLM_CHECK_WITH_INFO(outputCapacity >= std::min<int64_t>(maxKvTokens, numPairs),
+        "NVFP4 MLA direct context gather output capacity is too small");
+
+    size_t requestScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr, requestScanWorkspaceSize,
+        static_cast<int32_t const*>(nullptr), static_cast<int32_t*>(nullptr), numRequests, stream));
+    size_t tokenScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, tokenScanWorkspaceSize, static_cast<int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr), maxKvTokens, stream));
+    size_t const tensorWorkspaceSize
+        = alignUp((static_cast<size_t>(numRequests) + 1 + static_cast<size_t>(maxKvTokens) * 3) * sizeof(int32_t),
+            kWorkspaceAlignment);
+    size_t const scanWorkspaceSize = std::max(requestScanWorkspaceSize, tokenScanWorkspaceSize);
+    TLLM_CHECK_WITH_INFO(workspaceSize >= tensorWorkspaceSize + scanWorkspaceSize,
+        "NVFP4 MLA direct context gather workspace is too small");
+
+    auto* cuKvLengths = static_cast<int32_t*>(workspace);
+    auto* selectedFlags = cuKvLengths + numRequests + 1;
+    auto* selectedOffsets = selectedFlags + maxKvTokens;
+    auto* selectedGlobalIndices = selectedOffsets + maxKvTokens;
+    auto* scanWorkspace = reinterpret_cast<uint8_t*>(workspace) + tensorWorkspaceSize;
+
+    TLLM_CUDA_CHECK(cudaMemsetAsync(cuKvLengths, 0, sizeof(int32_t), stream));
+    TLLM_CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        scanWorkspace, requestScanWorkspaceSize, compressedKvLengths, cuKvLengths + 1, numRequests, stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(selectedFlags, 0, static_cast<size_t>(maxKvTokens) * sizeof(int32_t), stream));
+
+    int32_t const pairBlocks = std::max(1,
+        std::min(static_cast<int32_t>((numPairs + kThreadsPerBlock - 1) / kThreadsPerBlock),
+            tensorrt_llm::common::getMultiProcessorCount() * kBlocksPerSm));
+    markContextGlobalTopKKernel<<<pairBlocks, kThreadsPerBlock, 0, stream>>>(localTopKIndices, queryReqIndices,
+        cuKvLengths, globalIndices, selectedFlags, selectedGlobalIndices, numPairs, topK, numRequests, maxKvTokens,
+        numPoolTokens);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+    TLLM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        scanWorkspace, tokenScanWorkspaceSize, selectedFlags, selectedOffsets, maxKvTokens, stream));
+
+    int32_t const gatherBlocks = getPersistentBlockCount(maxKvTokens);
+    nvFp4MlaContextKvCacheGatherKernel<<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
+        selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, maxKvTokens, outputCapacity,
+        headDim, residualDim, numPoolTokens);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+
+    remapContextGlobalTopKKernel<<<pairBlocks, kThreadsPerBlock, 0, stream>>>(localTopKIndices, queryReqIndices,
+        cuKvLengths, selectedFlags, selectedOffsets, globalIndices, numPairs, topK, numRequests, maxKvTokens,
+        numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
