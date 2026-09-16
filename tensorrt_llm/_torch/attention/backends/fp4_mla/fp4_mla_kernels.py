@@ -1379,6 +1379,9 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     q_sf_out_ptr,
     kv_lens_ptr,
     prompt_lens_ptr,
+    helix_position_offsets_ptr,
+    helix_local_slots_ptr,
+    helix_is_inactive_rank_ptr,
     page_ids_ptr,
     hp_page_ids_ptr,
     paged_kv_indptr_ptr,
@@ -1417,6 +1420,8 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     K_RESIDUAL_D: tl.constexpr,
     STORE_K_RESIDUAL: tl.constexpr,
     FUSE_ROPE_CACHE_STORE: tl.constexpr,
+    USE_HELIX: tl.constexpr,
+    USE_HELIX_LOCAL_SLOTS: tl.constexpr,
     WRITE_V_PACKED: tl.constexpr,
     MAX_GEN_TILES: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -1457,6 +1462,20 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     # Generation tokens are request-major. Deriving their absolute position
     # here avoids materializing per-token metadata in a CUDA graph.
     first_new_pos = kv_len - gen_len
+    rope_first_new_pos = first_new_pos
+    if USE_HELIX:
+        rope_first_new_pos = tl.load(helix_position_offsets_ptr + seq_idx * gen_len)
+    if USE_HELIX_LOCAL_SLOTS:
+        # Helix owns a contiguous rank-local subset of a linear verify group,
+        # but that subset can begin at any token in the group.
+        first_new_pos = kv_len
+        for token_idx in tl.static_range(0, MAX_GEN_TILES * HP_BLOCK):
+            local_slot = tl.load(
+                helix_local_slots_ptr + seq_idx * gen_len + token_idx,
+                mask=token_idx < gen_len,
+                other=-1,
+            )
+            first_new_pos = tl.minimum(first_new_pos, tl.where(local_slot >= 0, local_slot, kv_len))
     if FUSE_ROPE_CACHE_STORE:
         work_idx = tl.program_id(1)
         dim_block = work_idx
@@ -1585,7 +1604,9 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                                 mask=row_mask[:, None],
                             )
                 else:
-                    position = (first_new_pos + q_token_idx).to(tl.int64)
+                    position = (rope_first_new_pos + q_token_idx).to(tl.int64)
+                    if USE_HELIX_LOCAL_SLOTS:
+                        position = tl.load(helix_position_offsets_ptr + q_token).to(tl.int64)
                     valid_position = position >= 0
                     pair_offsets = tl.arange(0, ROPE_PAIR_BLOCK)
                     pair_mask = pair_offsets < ROPE_DIM // 2
@@ -1710,6 +1731,12 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                     return
     else:
         dim_block = tl.program_id(2)
+    if USE_HELIX_LOCAL_SLOTS:
+        if first_new_pos >= kv_len:
+            return
+    elif USE_HELIX:
+        if tl.load(helix_is_inactive_rank_ptr + seq_idx):
+            return
     if FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1:
         if dim_block * FP4_BLOCK > V_HEAD_D:
             return
@@ -2046,9 +2073,22 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
 
         abs_positions = block_base_pos + token_offsets
         valid_tokens = abs_positions < kv_len
-        from_latent = abs_positions >= first_new_pos
         hp_slots = abs_positions % HP_POOL_SIZE
-        new_token_offsets = abs_positions - first_new_pos
+        if USE_HELIX_LOCAL_SLOTS:
+            from_latent = abs_positions < 0
+            new_token_offsets = abs_positions - abs_positions
+            for token_idx in tl.static_range(0, MAX_GEN_TILES * HP_BLOCK):
+                local_slot = tl.load(
+                    helix_local_slots_ptr + seq_idx * gen_len + token_idx,
+                    mask=token_idx < gen_len,
+                    other=-1,
+                )
+                is_local_token = abs_positions == local_slot
+                from_latent = from_latent | is_local_token
+                new_token_offsets = tl.where(is_local_token, token_idx, new_token_offsets)
+        else:
+            from_latent = abs_positions >= first_new_pos
+            new_token_offsets = abs_positions - first_new_pos
         # Linear MTP uses a uniform generation length, so each sequence
         # occupies one contiguous gen_len slice in latent_cache.
         latent_tokens = seq_idx * gen_len + new_token_offsets
@@ -2129,7 +2169,13 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
 
         if FUSE_ROPE_CACHE_STORE and not q1_shared_main:
             if dim_block * FP4_BLOCK >= V_HEAD_D:
-                positions = abs_positions.to(tl.int64)
+                positions = (rope_first_new_pos + new_token_offsets).to(tl.int64)
+                if USE_HELIX_LOCAL_SLOTS:
+                    positions = tl.load(
+                        helix_position_offsets_ptr + safe_latent_tokens,
+                        mask=valid_tokens & from_latent,
+                        other=-1,
+                    ).to(tl.int64)
                 valid_position = valid_tokens & from_latent & (positions >= 0)
                 rope_pair_offsets = (safe_even_d - V_HEAD_D) // 2
                 rope_dim_mask = mask_even_d & (even_d >= V_HEAD_D) & (odd_d < V_HEAD_D + ROPE_DIM)
