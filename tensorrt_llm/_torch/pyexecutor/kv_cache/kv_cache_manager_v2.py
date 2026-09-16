@@ -71,7 +71,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
-    LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
@@ -2447,9 +2446,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
         window_sizes: Dict[int, int] = {}
         for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
+            layer_config = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
             if attention_only:
-                life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
-                if not isinstance(life_cycle, AttnLifeCycle):
+                # The Python implementation exposes its internal life-cycle
+                # registry, but the C++ backend deliberately does not. The
+                # public layer configuration carries the same distinction and
+                # keeps this selection backend-independent.
+                if not isinstance(layer_config, AttentionLayerConfig):
                     continue
             window_sizes[int(layer_group_id)] = get_event_window_size(int(layer_ids[0]))
         return window_sizes
