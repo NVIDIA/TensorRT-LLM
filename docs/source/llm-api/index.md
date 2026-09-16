@@ -133,13 +133,12 @@ The following tips typically assist new LLM API users who are familiar with othe
 ### FlashInfer JIT workspaces for MPI workers
 
 `trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers
-isolate FlashInfer JIT workspaces by default. Each process normally claims a
-locked, persistent cache slot under `~/.cache/tensorrt_llm/flashinfer`, and
-FlashInfer derives its downloaded-artifact cache from that slot as well. This
-prevents concurrent MPI processes from writing the same generated source files,
-and from replacing a downloaded trtllm-gen export header while a peer is
-compiling against it, without forcing a cold JIT compilation on every launch.
-Set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
+isolate FlashInfer JIT workspaces by default. Each process claims a locked,
+persistent cache slot under `~/.cache/tensorrt_llm/flashinfer` that holds its
+generated sources, compiled modules and downloaded FlashInfer artifacts, so
+concurrent MPI processes never write to each other's compiler inputs while JIT
+artifacts stay warm across launches. Set
+`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
 creating the LLM instance to disable this behavior.
 
 Persistent slots are not pruned automatically, so their count can grow with
@@ -148,14 +147,15 @@ slots may be deleted safely; subsequent launches rebuild the removed JIT
 artifacts.
 
 If persistent workspace setup is unavailable, each process falls back to a
-process-unique temporary workspace that is removed when the process exits.
-Persistent cache reuse is not available for this fallback.
+process-unique temporary workspace that is removed, artifacts included, when
+the process exits.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
-launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is also preserved,
-which is the supported way to share downloaded artifacts between ranks. Only do
-that when the artifacts are already populated: concurrent downloads into a
-shared directory can replace a header a peer rank is compiling against.
+launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is propagated
+unchanged to every rank and is the way to share downloaded artifacts between
+ranks; populate it before the multi-rank launch, either by installing the
+`flashinfer-cubin` package matching `flashinfer-python` or with a single-rank
+warm-up run.
 
 ### Cannot quit after generation
 

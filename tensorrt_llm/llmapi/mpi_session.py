@@ -107,16 +107,9 @@ except Exception as error:  # noqa: BLE001
 
 os.environ["TRTLLM_FLASHINFER_WORKSPACE_MANAGED"] = "1"
 
-# Leave FLASHINFER_CUBIN_DIR unset so the downloaded-artifact cache follows the
-# isolated workspace. FlashInfer downloads the trtllm-gen export headers into
-# that directory and symlinks them onto the JIT include path, which makes them
-# compiler inputs rather than plain runtime cubins. Its fetch path verifies the
-# checksum before taking the download lock, so several ranks can fetch the same
-# header concurrently and each complete with an atomic rename. A shared
-# directory therefore replaces a header's inode while another rank is compiling
-# a translation unit that includes it, and nvcc then sees the declarations
-# twice. An explicit FLASHINFER_CUBIN_DIR still wins, and an installed
-# flashinfer-cubin package is read-only, so both remain safe to share.
+# FLASHINFER_CUBIN_DIR is left unset so FlashInfer keeps downloaded artifacts,
+# which include compiler inputs, inside the per-rank workspace. A caller-set
+# value is preserved. See docs/source/llm-api/index.md.
 
 from mpi4py.futures.server import main
 

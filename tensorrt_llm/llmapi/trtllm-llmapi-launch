@@ -31,14 +31,6 @@ function mpi_world_size {
     fi
 }
 
-# FLASHINFER_CUBIN_DIR is deliberately left alone so the downloaded-artifact
-# cache follows the isolated workspace. FlashInfer downloads the trtllm-gen
-# export headers into that directory and symlinks them onto the JIT include
-# path, so they are compiler inputs rather than plain runtime cubins, and its
-# fetch path verifies the checksum before taking the download lock. Sharing the
-# directory therefore lets one rank's atomic rename replace a header while
-# another rank is still compiling a translation unit that includes it.
-
 function cleanup_flashinfer_temporary_workspace {
     local exit_status=$?
 
@@ -88,6 +80,9 @@ except (ImportError, OSError, TypeError, ValueError) as error:
 PY
 }
 
+# FLASHINFER_CUBIN_DIR is left unset so FlashInfer keeps downloaded artifacts,
+# which include compiler inputs, inside the per-rank workspace. A caller-set
+# value is preserved. See docs/source/llm-api/index.md.
 function configure_flashinfer_workspace {
     # PMI_RANK or PMI_ID still proves that this process is launcher-managed
     # when PMI_SIZE is unavailable. Isolate even rank 0 in that case so rank-0
