@@ -22,7 +22,7 @@ Rubin only: locality domains need hardware that exposes two locality domains.
 ``TRT_LLM_MOCK_LOCALIZATION_SUPPORT`` is deliberately not used here -- it only
 reaches the KV cache allocator, so the fork/join runtime would still fail.
 
-Model: Llama-3.2-1B (same as test_kv_cache_v2_scheduler.py).
+Model: Qwen3-4B.
 """
 
 import gc
@@ -32,8 +32,10 @@ import torch
 
 from ..conftest import llm_models_root, skip_no_rubin
 
-# Model: Llama-3.2-1B (same as TestKVCacheV2Llama)
-_MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
+# Qwen3-4B: dense GQA, so attention arrives as a single mixed call -- the path
+# an MLA model never exercises. Suggested by the feature author over Llama,
+# which is P1.
+_MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-4B"
 
 SHORT_PROMPTS = [
     "What is 2+2? Answer in one number.",
@@ -99,7 +101,7 @@ def _assert_outputs_match(baseline, localized, prompts):
 class TestStreamLocalizationEquivalence:
     """Verify that localized (split->forward->merge) matches single-batch forward.
 
-    Uses the LLM API with Llama-3.2-1B to run the same prompts with and
+    Uses the LLM API with Qwen3-4B to run the same prompts with and
     without locality domains, comparing generated text at temperature=0.
     """
 
