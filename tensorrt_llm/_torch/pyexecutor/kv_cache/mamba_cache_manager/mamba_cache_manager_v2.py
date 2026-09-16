@@ -124,6 +124,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _supports_additional_snapshot_offsets = True
     # Recurrent snapshots use their own commit/history endpoints without draft backoff.
     _supports_reuse_match_backoff = False
+    # get_layer_masks() returns an all-False mamba mask for a draft pool, so
+    # local_num_mamba_layers == 0 and the truncation above cannot apply to it.
+    _supports_draft_reuse_match_backoff = True
+    # It still applies to the paired target, which the scheduler caps at the
+    # draft's claim; waive the trim so it cannot leave the snapshot grid.
+    _drop_advisory_draft_lookahead = True
 
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
@@ -1279,6 +1285,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
+        if self.is_draft:
+            # Attention-only pool: no recurrent state, so the snapshot-boundary
+            # gate below does not apply. expect_snapshot_points is target
+            # geometry. Commit on the base class's block cadence instead.
+            return super().try_commit_blocks(request)
         should_block_reuse = (
             self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
         )
@@ -1330,6 +1341,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        if self.is_draft:
+            # Attention-only pool; see try_commit_blocks.
+            return super().update_context_resources(scheduled_batch)
         for request in scheduled_batch.context_requests:
             kv_cache = self.kv_cache_map.get(request.py_request_id)
             if kv_cache is None or not kv_cache.is_active:

@@ -180,6 +180,12 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     paged cache different shapes or page strides.
     """
 
+    # The parent opts in because its draft pool is attention-only. QSA's is
+    # not: each draft layer adds a Role.INDEX_KEY buffer and a
+    # QSA_INDEX_POSITION page, unvalidated for cross-request reuse.
+    # KvCacheCreator reads this off the class, so dense Qwen4-Exp opts out too.
+    _supports_draft_reuse_match_backoff = False
+
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """PLE state and request-wide QSA positions are replicated across TP."""
