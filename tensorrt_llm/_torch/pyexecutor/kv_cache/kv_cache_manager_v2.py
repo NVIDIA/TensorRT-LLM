@@ -47,6 +47,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime import kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -1282,8 +1283,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     "will return no events."
                 )
             assert kv_events_config is not None
-            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
-            # publish/replay port ranges, all before any socket is bound.
+            # Reject unsupported parallelism and colliding publish/replay port ranges
+            # before any socket is bound.
             validate_streaming_support(
                 kv_events_config,
                 pp_size=mapping.pp_size,
@@ -1297,11 +1298,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Constructing it is side-effect free; start() below binds the socket
                 # and starts the publisher thread once every other check has passed.
                 event_rank = mapping.rank if mapping.enable_attention_dp else 0
+                native_event_sink = (
+                    kv_cache_manager_v2_runtime.StreamingEventSink(
+                        tokens_per_block=self.tokens_per_block,
+                    )
+                    if KV_CACHE_MANAGER_V2_BACKEND == "cpp"
+                    else None
+                )
                 self.event_manager = StreamingKVCacheEventManager(
                     kv_events_config,
                     data_parallel_rank=event_rank,
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
+                    native_event_sink=native_event_sink,
                 )
         elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -1503,10 +1512,15 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         candidate: Optional[KVCacheManagerPy] = None
+        event_sink = (
+            self.event_manager.event_sink
+            if isinstance(self.event_manager, StreamingKVCacheEventManager)
+            else self.event_manager
+        )
         if not has_host_cache_tier:
             candidate = KVCacheManagerPy(
                 config,
-                event_manager=self.event_manager,
+                event_manager=event_sink,
                 cold_page_codec=create_cold_page_codec(config),
             )
         else:
@@ -1515,7 +1529,7 @@ class KVCacheManagerV2(BaseResourceManager):
             try:
                 candidate = KVCacheManagerPy(
                     config,
-                    event_manager=self.event_manager,
+                    event_manager=event_sink,
                     cold_page_codec=create_cold_page_codec(config),
                 )
             except Exception as error:
@@ -1555,7 +1569,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     candidate = KVCacheManagerPy(
                         config,
-                        event_manager=self.event_manager,
+                        event_manager=event_sink,
                         cold_page_codec=create_cold_page_codec(config),
                     )
                 except Exception as error:

@@ -282,12 +282,12 @@ kv_cache_config = KvCacheConfig(
 )
 ```
 
-**Constraints.** The streaming path requires KV cache manager V2 running on its Python
-backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
-consume the Python event sink and raises an error naming this variable. Pipeline
-parallelism and context parallelism are rejected. Events are not published for draft
-models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
-returns an empty list rather than raising.
+**Constraints.** The streaming path supports both KV cache manager V2 backends. With the
+default `cpp` backend, a native event sink captures compact semantic event data and Python
+converts it to the wire structs at the once-per-iteration flush boundary; no Python callback
+runs from the native cache hot path. Pipeline parallelism and context parallelism are
+rejected. Events are not published for draft models or during KV-cache-size estimation.
+When streaming is enabled the buffered pull API returns an empty list rather than raising.
 
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
 **global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
