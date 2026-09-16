@@ -197,13 +197,14 @@ jobs:
               .sort((a, b) => b.id - a.id)[0];
             if (!check) return; // Includes unrelated manual fixture evaluations.
 
-            const pattern = /SEMANTIC_RESULT head=([a-f0-9]{40}) target=([a-f0-9]{40}) merge_base=([a-f0-9]{40}) verdict=(PASS|FAIL|INCONCLUSIVE)\b/g;
-            const records = [...new Set([...result.matchAll(pattern)].map(match => match[0]))];
+            const pattern = /semantic_result head=([a-f0-9]{40}) target=([a-f0-9]{40}) merge_base=([a-f0-9]{40}) verdict=(pass|fail|inconclusive)\b/g;
+            const records = [...new Set([...result.toLowerCase().matchAll(pattern)].map(match => match[0]))];
             let verdict = 'INCONCLUSIVE';
             let reason = 'The result has no unique, verifiable revision record.';
             if (records.length === 1) {
-              const [, reportedHead, reportedBase, mergeBase, reportedVerdict] =
+              const [, reportedHead, reportedBase, mergeBase, rawVerdict] =
                 [...records[0].matchAll(pattern)][0];
+              const reportedVerdict = rawVerdict.toUpperCase();
               // A stale comment must never overwrite the current revision's result.
               if (reportedHead !== head || reportedBase !== base) return;
               const {data: comparison} = await github.request(
