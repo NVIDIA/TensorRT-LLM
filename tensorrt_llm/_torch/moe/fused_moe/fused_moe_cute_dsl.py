@@ -1309,9 +1309,9 @@ class CuteDslFusedMoE(MoEImplBase):
         # ``act_alpha`` / ``act_beta`` are where ``SiTuActivation.constants()``
         # lands: gate_softcap -> alpha, linear_softcap -> beta, both reduced to
         # a uniform scalar by the shape this backend declares. Only forwarded
-        # for SiTU so every other activation keeps hitting the op's sentinel
-        # default -- passing them unconditionally would make the op signature
-        # lie about which kinds have soft-caps.
+        # for SiTU so every other activation keeps the op's ``None`` default --
+        # passing them unconditionally would make the op signature lie about
+        # which kinds have soft-caps.
         if self.activation_type == ActivationType.SiTu:
             gather_act_kwargs["situ_beta"] = self.act_alpha
             gather_act_kwargs["situ_linear_beta"] = self.act_beta

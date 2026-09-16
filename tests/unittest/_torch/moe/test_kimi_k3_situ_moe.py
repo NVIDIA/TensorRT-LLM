@@ -122,27 +122,6 @@ def test_kimi_situ_betas_must_be_positive(situ_beta, situ_linear_beta):
         modeling_kimi_linear._resolve_kimi_situ_betas(cfg)
 
 
-def test_situ_beta_sentinel_is_the_only_value_that_disables():
-    """Only ``SITU_BETA_DISABLED`` means "this layer is not SiTU".
-
-    The op signature cannot take ``Optional[float]``, so the absence of a
-    soft-cap travels as a sentinel. Canonicalizing the whole non-positive
-    range instead would make ``situ_beta=0.0`` on a SwiGLU layer read as
-    "none supplied" and be accepted, when it should reach the kernel and be
-    refused there.
-    """
-    pytest.importorskip("cutlass")
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-        SITU_BETA_DISABLED,
-        _canonicalize_situ_beta,
-    )
-
-    assert _canonicalize_situ_beta(SITU_BETA_DISABLED) is None
-    assert _canonicalize_situ_beta(None) is None
-    for forwarded in (0.0, -2.0, 1.0, 4.0, 25.0):
-        assert _canonicalize_situ_beta(forwarded) == forwarded
-
-
 @pytest.mark.parametrize(
     "situ_beta,situ_linear_beta",
     [
@@ -652,38 +631,54 @@ def test_kimi_k3_routed_config_logs_megamoe_capacity_override(monkeypatch):
 
 
 def test_kimi_k3_allow_list_matches_what_the_backends_declare():
-    """The K3 allow-list must be exactly the backends that execute SiTU.
+    """The K3 allow-list must be *exactly* the backends that execute SiTU.
 
-    Asserting agreement with each backend's own ``activation_support``
-    rather than against a literal list: a hand-maintained second copy of a
-    capability set is the defect this module already exists to catch, and
-    it is how CUTEDSL stayed shut after its kernels grew the epilogue.
+    Both sides are derived, neither is written down here. The expected set
+    comes from each family's own ``activation_support``; the actual set comes
+    from asking the allow-list. A hand-maintained second copy of a capability
+    set is the defect this module exists to catch -- it is how CUTEDSL stayed
+    shut for weeks after its kernel grew the epilogue -- and a test that
+    restates the list has the same defect.
+
+    Checking both directions matters: inclusion alone would pass while the
+    allow-list offered a backend that cannot serve SiTU, which resolves and
+    then fails at construction instead of being declined.
+
+    ``any`` rather than ``all`` over a family: resolution walks family members
+    in ``IMPL_PRIORITY`` order, so a family serves SiTU when one member does.
+    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` does not
+    declare it, ``CuteDslFusedMoE`` does.
     """
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import MegaMoECuteDsl
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm import MegaMoEDeepGemm
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import BACKEND_FAMILY
     from tensorrt_llm._torch.utils import ActivationType
 
-    declares_situ = {
-        "CUTLASS": CutlassFusedMoE,
-        "TRTLLM": TRTLLMGenFusedMoE,
-        "CUTEDSL": CuteDslFusedMoE,
-        "MEGAMOE_CUTEDSL": MegaMoECuteDsl,
-        "MEGAMOE_DEEPGEMM": MegaMoEDeepGemm,
-    }
-    for name, cls in declares_situ.items():
-        assert ActivationType.SiTu in cls.activation_support.kinds, (
-            f"{name} lost SiTU from activation_support; the K3 allow-list "
-            "still offers it, so a layer would resolve here and then fail."
-        )
+    def admits_situ(name):
         model_config = ModelConfig(
             mapping=Mapping(world_size=1, rank=0, tp_size=1),
             moe_backend=name,
         )
-        # Must not raise: this is the gate that kept CUTEDSL out.
-        KimiK3MoERuntime._routed_moe_model_config(model_config)
+        try:
+            KimiK3MoERuntime._routed_moe_model_config(model_config)
+        except ValueError:
+            return False
+        return True
+
+    declares_situ = {
+        name
+        for name, family in BACKEND_FAMILY.items()
+        if any(ActivationType.SiTu in cls.activation_support.kinds for cls in family)
+    }
+    allow_listed = {name for name in BACKEND_FAMILY if admits_situ(name)}
+
+    assert allow_listed == declares_situ, (
+        "Kimi K3's routed-expert allow-list disagrees with the backends' own "
+        f"activation_support.\n"
+        f"  offered but cannot serve SiTU: {sorted(allow_listed - declares_situ)}\n"
+        f"  serves SiTU but not offered:   {sorted(declares_situ - allow_listed)}"
+    )
+    # The set is derived, so guard against it being derived as empty -- that
+    # would satisfy the equality above while testing nothing.
+    assert "CUTEDSL" in declares_situ
 
 
 def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass():
@@ -1869,11 +1864,18 @@ def test_nvfp4_experts_match_situ_reference(moe_backend, input_scale):
     assert cosine > 0.95, f"cosine={cosine.item()}, rel_l2={rel_l2.item()}"
 
 
-def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, beta):
-    """Same routing/geometry as the SiTU reference, but CUTLASS's SwigluBias.
+def _plain_swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3):
+    """Same routing/geometry as the SiTU reference, but plain SwiGLU.
 
-    ``gate*sigmoid(gate*alpha)*(linear+beta)`` -- what the FC1 epilogue would
-    compute if the activation enum did not resolve to SiTu.
+    ``up * silu(gate)`` -- what the FC1 epilogue actually computes when it
+    does not run SiTU. This is the realistic wrong answer, so it is the one
+    worth measuring against: an earlier revision compared with SwigluBias
+    (``gate*sigmoid(gate*alpha)*(up+beta)``), which no epilogue on this path
+    computes, so a genuine SwiGLU fallback sat far from both references and
+    still satisfied a "closer to SiTU" ordering.
+
+    The dequant alpha is already folded into ``g`` and ``u`` here, exactly as
+    the kernel applies it to the accumulator before either epilogue.
     """
     ids, weights = routing_method.apply(router_logits)
     out = torch.zeros_like(x, dtype=torch.float32)
@@ -1883,7 +1885,7 @@ def _swiglu_reference_moe(x, router_logits, routing_method, w1, w2, w3, alpha, b
             e = int(ids[token, slot])
             g = xf[token] @ w1[e].float().t()
             u = xf[token] @ w3[e].float().t()
-            h = g * torch.sigmoid(g * alpha) * (u + beta)
+            h = u * (g * torch.sigmoid(g))
             out[token] += float(weights[token, slot]) * (h @ w2[e].float().t())
     return out
 
@@ -1947,9 +1949,7 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
     situ = _situ_reference_moe(
         x, router_logits, gate.routing_method, w1, w2, w3, beta=4.0, linear_beta=25.0
     )
-    swiglu = _swiglu_reference_moe(
-        x, router_logits, gate.routing_method, w1, w2, w3, alpha=4.0, beta=25.0
-    )
+    swiglu = _plain_swiglu_reference_moe(x, router_logits, gate.routing_method, w1, w2, w3)
 
     def score(ref):
         cos = torch.nn.functional.cosine_similarity(actual.flatten(), ref.flatten(), dim=0)
@@ -1958,15 +1958,17 @@ def test_nvfp4_kernel_actually_applies_situ(moe_backend):
 
     situ_cos, situ_l2 = score(situ)
     swiglu_cos, swiglu_l2 = score(swiglu)
+    # Printed, not yet asserted on: the bounds below are set from measured
+    # spread rather than guessed, so the numbers have to be visible first.
     print(
-        f"NVFP4[{moe_backend}] kernel vs SiTU ref:   "
+        f"NVFP4[{moe_backend}] kernel vs SiTU ref:         "
         f"cosine={situ_cos:.6f} rel_l2={situ_l2:.6f}\n"
-        f"NVFP4[{moe_backend}] kernel vs SwiGLU ref: "
+        f"NVFP4[{moe_backend}] kernel vs plain SwiGLU ref: "
         f"cosine={swiglu_cos:.6f} rel_l2={swiglu_l2:.6f}"
     )
     assert situ_cos > swiglu_cos, (
-        f"the NVFP4 {moe_backend} kernel matches a SwiGLU reference better than "
-        f"the SiTU one (situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the "
+        f"the NVFP4 {moe_backend} kernel matches a plain SwiGLU reference better "
+        f"than the SiTU one (situ={situ_cos:.6f}, swiglu={swiglu_cos:.6f}): the "
         f"quantized path is not applying SiTU"
     )
 
