@@ -132,6 +132,7 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
+  - unittest/llmapi/test_llm_args.py::test_deepseek_v32_context_forward
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/scaffolding
   - unittest/usage/test_transport.py
