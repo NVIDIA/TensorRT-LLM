@@ -525,22 +525,41 @@ class KimiKDALinearAttention(nn.Module):
         # and for prefix-cache hits (block reuse), where the previous
         # conv/recurrent state was onboarded into this request's slot.
         has_init = mamba_metadata.has_initial_states[:num_prefills]
+        slot_indices_long = slot_indices.long()
+        # The indexed prefill op updates fp32 V-first pool rows in place, so
+        # ``can_use_indexed_prefill`` rejects a bf16 pool outright. Staging the
+        # addressed rows through a dense fp32 copy keeps prefill on that
+        # fixed-configuration kernel instead of dropping it onto the FLA
+        # fallback, whose Triton kernels are autotuned per process and
+        # therefore do not reproduce run to run. The copy is rounded back into
+        # the pool once the kernel has finished with it.
+        staged_state = None
+        kernel_pool, kernel_indices = ssm_pool, slot_indices
+        if ssm_pool.dtype != torch.float32:
+            staged_state = ssm_pool.index_select(0, slot_indices_long).float()
+            kernel_pool = staged_state
+            # Staged rows are dense, so the kernel addresses them by position.
+            kernel_indices = mamba_metadata._arange_buffer[:num_prefills]
         use_indexed_state = self._dispatch.can_use_indexed_prefill(
-            state_pool=ssm_pool,
-            state_indices=slot_indices,
+            state_pool=kernel_pool,
+            state_indices=kernel_indices,
             has_initial_states=has_init,
             cu_seqlens=cu_seqlens,
             num_sequences=num_prefills,
             num_tokens=x2d.shape[0],
             chunk_indices=chunk_indices,
         )
-        slot_indices_long = slot_indices.long()
         recurrent_in = None
         if use_indexed_state:
             # The packed convolution clears fresh convolution rows itself.
-            reset_recurrent_state_rows(ssm_pool, slot_indices, has_init)
+            reset_recurrent_state_rows(kernel_pool, kernel_indices, has_init)
         elif mamba_metadata.use_initial_states:
-            recurrent_in = ssm_pool.index_select(0, slot_indices_long)
+            # The FLA core carries the state in fp32 (no-op for fp32 pools).
+            recurrent_in = (
+                staged_state
+                if staged_state is not None
+                else ssm_pool.index_select(0, slot_indices_long)
+            )
             recurrent_in[~has_init] = 0
 
         # Reuse GDN's packed variable-length causal convolution. It reads
@@ -590,8 +609,8 @@ class KimiKDALinearAttention(nn.Module):
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
-            state_pool=ssm_pool if use_indexed_state else None,
-            state_indices=slot_indices if use_indexed_state else None,
+            state_pool=kernel_pool if use_indexed_state else None,
+            state_indices=kernel_indices if use_indexed_state else None,
             varlen_is_aligned=varlen_is_aligned,
             single_sequence_length=single_sequence_length,
         )
@@ -601,6 +620,8 @@ class KimiKDALinearAttention(nn.Module):
             ssm_pool.index_copy_(0, slot_indices_long, final_state.to(ssm_pool.dtype))
         else:
             assert use_indexed_state
+            if staged_state is not None:
+                ssm_pool.index_copy_(0, slot_indices_long, staged_state.to(ssm_pool.dtype))
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).

@@ -46,9 +46,14 @@ class _Cfg:
 
 
 class _LayerCache:
-    """Only what the plain-decode path reads; no fused-verify replay caches."""
+    """Only what the plain-decode path reads; no fused-verify replay caches.
 
-    kda_kg_cache = None
+    ``has_kda_replay_caches`` mirrors the manager's property, which is
+    ``kda_qkg_cache is not None``; the mixer reads it unguarded.
+    """
+
+    kda_qkg_cache = None
+    has_kda_replay_caches = False
 
 
 class _MambaMetadata:
@@ -148,7 +153,10 @@ def _prefill_metadata(
 @pytest.mark.parametrize(
     "sequence_lengths,use_initial_states,has_initial_states",
     [
-        ([17, 31, 64], False, [False, False, False]),
+        # >= 4 chunks of 64 tokens in total: below that the optimized prefill
+        # op would launch a zero-size grid, so the dispatch keeps such batches
+        # on the FLA reference path and neither pool reaches the indexed kernel.
+        ([17, 31, 64, 40], False, [False, False, False, False]),
         ([1, 129], True, [True, False]),
     ],
 )
