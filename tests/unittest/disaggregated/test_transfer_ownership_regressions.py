@@ -1138,7 +1138,11 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
-    transceiver._mapping = SimpleNamespace(pp_size=1, enable_attention_dp=False, world_size=1)
+    # `rank` is read only when the timing-output env var is set, so leaving it out is a failure
+    # that waits for whoever sets that variable process-wide.
+    transceiver._mapping = SimpleNamespace(
+        pp_size=1, enable_attention_dp=False, world_size=1, rank=0
+    )
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
     transceiver._gen_allgather = Mock()

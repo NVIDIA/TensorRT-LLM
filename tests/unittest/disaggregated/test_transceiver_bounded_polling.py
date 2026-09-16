@@ -827,8 +827,14 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     )
     monkeypatch.setattr(KvCacheTransceiverV2, "_init_sync_policy", lambda _self: None)
     monkeypatch.setattr(KvCacheTransceiverV2, "_exchange_rank_info", lambda _self: None)
+    # Everything the constructor can reach, not only what it reaches with these values: the
+    # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
         cp_size=1,
+        world_size=1,
+        pp_size=1,
+        has_cp_helix=lambda: False,
+        cp_config={},
         tp_rank=0,
         tp_size=1,
         enable_attention_dp=False,
