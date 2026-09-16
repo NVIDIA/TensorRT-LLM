@@ -32,7 +32,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pynvml
 import torch
 
-from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlCheckpointCommunicator, MnnvlMemory
+from tensorrt_llm._mnnvl_utils import (
+    CftMnnvlMemory,
+    MnnvlCheckpointCommunicator,
+    MnnvlMemory,
+    cuda,
+)
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -53,8 +58,6 @@ from .base import Communication
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
-# CFT combine wins at small/medium batch and ties/regresses at large batch, so it is gated by the
-# same per-call token-count threshold as dispatch.
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_MOE_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_MOE_A2A_FORCE_CFT"
@@ -113,15 +116,34 @@ def cft_driver_is_supported(driver_version: str | bytes | None) -> bool:
 
 
 def resolve_cft_counted_writes(
-    can_use_cft: bool,
     force_cft: bool | None,
     driver_version: str | bytes | None,
 ) -> bool:
-    if not can_use_cft or force_cft is False:
-        return False
-    if force_cft is True:
-        return True
-    return cft_driver_is_supported(driver_version)
+    """Allow automatic or forced CFT only on a supported driver."""
+    return force_cft is not False and cft_driver_is_supported(driver_version)
+
+
+def _cft_device_support_reason() -> str | None:
+    """Return why the current device cannot use counted-write fabric endpoints."""
+    major, minor = torch.cuda.get_device_capability()
+    if major < 10:
+        return f"SM{major}{minor} requires SM100 or newer"
+    try:
+        attributes = (
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
+        )
+    except AttributeError:
+        return "CUDA Python bindings do not expose Logical Endpoint capabilities"
+    device = torch.cuda.current_device()
+    for attribute in attributes:
+        status, supported = cuda.cuDeviceGetAttribute(attribute, device)
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            return f"querying {attribute.name} failed with {status.name}"
+        if not supported:
+            return f"device does not support {attribute.name}"
+    return None
 
 
 def should_use_cft(
@@ -186,11 +208,11 @@ def _get_cft_max_batch(env_name: str, default: int) -> int:
     return threshold
 
 
-def _get_cft_max_batch_for_dispatch() -> int | None:
+def _get_cft_max_batch_for_dispatch() -> int:
     return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_DISPATCH_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH)
 
 
-def _get_cft_max_batch_for_combine() -> int | None:
+def _get_cft_max_batch_for_combine() -> int:
     return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
 
 
@@ -315,7 +337,6 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
-        can_use_cft_counted_writes: bool = False,
         ep_group_health: EPGroupHealthLike | None = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
@@ -323,6 +344,14 @@ class NVLinkOneSided(Communication):
     ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
+
+        CFT is selected automatically on supported platforms using separate
+        dispatch/combine token-count thresholds (128 by default).
+        TRTLLM_MOE_A2A_FORCE_CFT=0 selects fence; 1 bypasses the thresholds,
+        but not capability or payload-alignment requirements. CFT requires
+        sm_100+, a build against CUDA 13.4+, an NVLink fabric, and a driver
+        exporting the Logical Endpoint API (615.00+). Unsupported devices or
+        payloads fall back to fence with a one-time warning.
 
         Args:
             mapping: TensorRT-LLM Mapping object containing rank information
@@ -338,14 +367,6 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
-            can_use_cft_counted_writes: If True, allow CFT handle-based counted
-                writes (fabric.try_put.counted via Logical Endpoints) for dispatch.
-                Requires sm_100+ (Blackwell or later), a build against CUDA 13.4+, an
-                NVLink fabric, and a driver exporting the CUDA logical endpoint API.
-                Defaults to False: CFT is opt-in, so the fence-based path remains the
-                default on every architecture. Callers that have verified the CFT
-                prerequisites may pass True, or set TRTLLM_MOE_A2A_FORCE_CFT=1 to force
-                CFT for supported workloads (0 forces the fence path).
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
@@ -386,31 +407,28 @@ class NVLinkOneSided(Communication):
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
         self._force_cft = get_force_cft()
-        # Opt-in only: no caller passes can_use_cft_counted_writes=True, so
-        # without the override the CFT path cannot be reached at all. Leaving
-        # the variable unset keeps CFT disabled, as before.
-        can_use_cft_counted_writes = resolve_can_use_cft(can_use_cft_counted_writes)
-
-
         driver_version = None
-        if can_use_cft_counted_writes and self._force_cft is None:
+        if self._force_cft is not False:
             driver_version = _get_nvidia_driver_version()
         can_use_cft_counted_writes = resolve_cft_counted_writes(
-            can_use_cft_counted_writes,
             self._force_cft,
             driver_version,
         )
-        if (
-            not can_use_cft_counted_writes
-            and self._force_cft is None
-            and driver_version is not None
-        ):
+        if not can_use_cft_counted_writes and driver_version is not None:
             tllm_logger.warning_once(
                 "CFT counted writes disabled: NVIDIA driver "
                 f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
                 "Falling back to fence-based dispatch.",
                 key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
             )
+        if can_use_cft_counted_writes:
+            unsupported_reason = _cft_device_support_reason()
+            if unsupported_reason is not None:
+                can_use_cft_counted_writes = False
+                tllm_logger.warning_once(
+                    f"CFT counted writes disabled: {unsupported_reason}. Falling back to fence.",
+                    key=f"moe_a2a_cft_device_unsupported_{unsupported_reason}",
+                )
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
@@ -419,15 +437,13 @@ class NVLinkOneSided(Communication):
             self.cft_max_batch_for_dispatch = None
             self.cft_max_batch_for_combine = None
         if can_use_cft_counted_writes:
-            tllm_logger.info(
-                "NVLinkOneSided AlltoAll: CFT handle-based counted writes enabled for dispatch"
-            )
             if self._force_cft is True:
                 tllm_logger.info("NVLinkOneSided AlltoAll: CFT forced for supported workloads")
-            elif self.cft_max_batch_for_dispatch is not None:
+            else:
                 tllm_logger.info(
-                    "NVLinkOneSided AlltoAll: CFT dispatch disabled above "
-                    f"runtime_max_tokens_per_rank={self.cft_max_batch_for_dispatch}"
+                    "NVLinkOneSided AlltoAll: automatic CFT enabled with token-count limits "
+                    f"dispatch={self.cft_max_batch_for_dispatch}, "
+                    f"combine={self.cft_max_batch_for_combine}"
                 )
         else:
             tllm_logger.info(
