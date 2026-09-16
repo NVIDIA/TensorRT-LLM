@@ -92,15 +92,32 @@ def tokenize_harmony_chat_request(
 def render_chat_request_for_tokenizer(
     request: ChatCompletionRequest, tokenizer: object
 ) -> str | list[int]:
+    from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwargs
+    from tensorrt_llm.inputs.utils import resolve_hf_chat_template
+    from tensorrt_llm.serve.chat_utils import _parse_assistant_message_content
+
     chat_template_kwargs = (
         dict(request.chat_template_kwargs) if getattr(request, "chat_template_kwargs", None) else {}
     )
-    chat_template_kwargs["tools"] = get_chat_completion_tool_dicts(request)
+    tools = get_chat_completion_tool_dicts(request)
+    template_selection = request.chat_template
+    if template_selection is None:
+        template_selection = chat_template_kwargs.get("chat_template")
+    template = resolve_hf_chat_template(tokenizer, None, template_selection, tools)
+    validate_chat_template_kwargs(template, chat_template_kwargs)
+    messages = [dict(msg) for msg in request.messages]
+    if isinstance(template, str):
+        # Match the server's assistant metadata normalization without loading
+        # media or changing the content representation expected by tokenizers.
+        for message in messages:
+            if message["role"] == "assistant":
+                message.update(_parse_assistant_message_content(message))
+    chat_template_kwargs["tools"] = tools
     chat_template_kwargs["documents"] = request.documents
     if request.chat_template is not None:
         chat_template_kwargs["chat_template"] = request.chat_template
     rendered = tokenizer.apply_chat_template(
-        [msg if isinstance(msg, dict) else dict(msg) for msg in request.messages],
+        messages,
         add_generation_prompt=request.add_generation_prompt,
         tokenize=False,
         return_dict=False,

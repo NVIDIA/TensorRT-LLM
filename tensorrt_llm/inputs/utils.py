@@ -18,6 +18,8 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm.inputs.chat_template_guard import \
+    validate_chat_template_kwargs
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.data import prompt_inputs
@@ -648,6 +650,9 @@ def resolve_hf_chat_template(
 
     # 1. If chat_template is not None, return it
     if chat_template is not None:
+        templates = getattr(tokenizer, "chat_template", None)
+        if isinstance(templates, dict) and chat_template in templates:
+            return templates[chat_template]
         return chat_template
 
     # 2. If tool is not provided, use the processor's default chat template
@@ -789,6 +794,8 @@ def apply_chat_template(
     if hf_chat_template is None:
         raise ValueError(
             "No chat template found for the given tokenizer and tools.")
+
+    validate_chat_template_kwargs(hf_chat_template, chat_template_kwargs)
 
     # Determine content format and prepare conversation accordingly
     content_format = _resolve_content_format(model_type, hf_chat_template)
