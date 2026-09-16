@@ -973,7 +973,7 @@ void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_
         scanWorkspace, tokenScanWorkspaceSize, selectedFlags, selectedOffsets, maxKvTokens, stream));
 
     int32_t const gatherBlocks = getPersistentBlockCount(maxKvTokens);
-    nvFp4MlaContextKvCacheGatherKernel<<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
+    nvFp4MlaContextKvCacheGatherKernel<false><<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
         selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, maxKvTokens, outputCapacity,
         headDim, residualDim, numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
