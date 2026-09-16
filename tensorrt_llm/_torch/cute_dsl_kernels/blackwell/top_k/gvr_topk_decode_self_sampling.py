@@ -3258,7 +3258,9 @@ class GvrMainKernel:
                                 )
                                 out_row[im] = gvy
                                 im = im + cutlass.Int32(BLK)
-                            T3 = s_tsh[0]
+                            T3 = cutlass.Float32(_NEG_INF)
+                            if cutlass.const_expr(self.shd or self.tshg):
+                                T3 = s_tsh[0]
                             if T3 > cutlass.Float32(_NEG_INF):
                                 if T3 < TF:
                                     okm = cutlass.Int32(1)

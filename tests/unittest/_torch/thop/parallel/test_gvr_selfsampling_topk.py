@@ -1823,6 +1823,8 @@ def _check_varlen_against_reference(lg, out, ref, tag=""):
             want = row[ref[r].long().clamp_min(0)].sort().values
             assert torch.equal(got, want), f"{tag} row {r} value multiset mismatch"
             assert torch.equal(out[r] < 0, ref[r] < 0), f"{tag} row {r} pad mask mismatch"
+            valid = out[r][out[r] >= 0]
+            assert valid.unique().numel() == valid.numel(), f"{tag} row {r} duplicate index"
         else:
             assert torch.equal(out[r], ref[r]), f"{tag} row {r} expected all -1"
 
