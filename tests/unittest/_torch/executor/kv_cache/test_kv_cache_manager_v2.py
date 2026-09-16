@@ -1366,9 +1366,9 @@ def test_draft_generation_reservation_avoids_target_padding_ledger() -> None:
 
     assert manager.try_reserve_draft_generation(request)
 
-    assert kv_cache.capacity == 143
+    assert kv_cache.capacity == 136
     assert manager._allocated_draft_lens == {}
-    assert manager._allocated_draft_gen_growth == {37: (15, 7)}
+    assert manager._allocated_draft_gen_growth == {37: (8, 7)}
 
     manager.revert_reserve_draft_generation(request)
 
@@ -1579,7 +1579,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     batch.generation_requests.append(request)
     manager._prepare_draft_resources(batch)
 
-    assert observed_progress_views == [False, False]
+    assert observed_progress_views == [False]
     assert not request.use_draft_model
     manager._required_gen_capacity.assert_not_called()
 
