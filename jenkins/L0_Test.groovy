@@ -145,7 +145,7 @@ RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim()
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
-REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x", "gr100-ts1"]
 
 // Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
 // Recognised failure patterns are tagged with scope=SLURM or BOTH in the
@@ -6276,6 +6276,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // Disable RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1 and RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2 due to some nodes are offline temporarily.
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        "GR100-PyTorch-Post-Merge-1": ["gr100-ts1", "l0_gr100", 1, 1],
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
