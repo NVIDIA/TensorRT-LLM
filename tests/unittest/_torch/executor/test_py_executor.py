@@ -1151,90 +1151,6 @@ class TestDisaggTransferIdleProgress:
 
         transceiver.check_gen_transfer_status.assert_not_called()
 
-    def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        executor = object.__new__(PyExecutor)
-        executor.kv_cache_transceiver = Mock()
-        executor._disagg_coordinator = Mock()
-        requests = [
-            Mock(state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE),
-            Mock(state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE),
-        ]
-
-        PyExecutor._recv_disagg_gen_cache(executor, requests)
-
-        assert [
-            call.args[0]
-            for call in executor.kv_cache_transceiver.request_and_receive_sync.call_args_list
-        ] == requests
-        executor.kv_cache_transceiver.request_and_receive_async.assert_not_called()
-        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
-        executor._disagg_coordinator.check_transfer_errors.assert_called_once_with(
-            "generation requests"
-        )
-
-    def test_sync_receive_drains_batch_before_rank_aligned_error_vote(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        executor = object.__new__(PyExecutor)
-        executor.kv_cache_transceiver = Mock()
-        executor.enable_attention_dp = True
-        executor.dist = Mock(world_size=4, rank=0)
-        local_vote = {"error_ids": [1], "blocked_ids": []}
-        executor.dist.tp_allgather.return_value = [
-            local_vote,
-            {"error_ids": [], "blocked_ids": []},
-            {"error_ids": [], "blocked_ids": []},
-            {"error_ids": [], "blocked_ids": []},
-        ]
-        executor._handle_errors = Mock()
-        executor.canceled_req_ids = []
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.requests_in_transfer.return_value = {}
-        error_request = Mock(
-            py_request_id=1,
-            state=LlmRequestState.DISAGG_GENERATION_INIT,
-            is_child=False,
-        )
-        following_request = Mock(
-            py_request_id=2,
-            state=LlmRequestState.DISAGG_GENERATION_INIT,
-            is_child=False,
-        )
-        executor.active_requests = [error_request, following_request]
-
-        def complete_or_error(req):
-            req.state = (
-                LlmRequestState.DISAGG_TRANS_ERROR
-                if req is error_request
-                else LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            )
-
-        executor.kv_cache_transceiver.request_and_receive_sync.side_effect = complete_or_error
-        # Build the real coordinator now that its inputs are set; observe the
-        # rank-local check without replacing it.
-        executor.disagg.check_transfer_errors = Mock(wraps=executor.disagg.check_transfer_errors)
-
-        PyExecutor._recv_disagg_gen_cache(executor, [error_request, following_request])
-
-        assert [
-            call.args[0]
-            for call in executor.kv_cache_transceiver.request_and_receive_sync.call_args_list
-        ] == [error_request, following_request]
-        assert error_request.state == LlmRequestState.DISAGG_TRANS_ERROR
-        assert following_request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-        executor.kv_cache_transceiver.cancel_request.assert_not_called()
-        executor._handle_errors.assert_not_called()
-        executor.disagg.check_transfer_errors.assert_called_once_with("generation requests")
-
-        executor.disagg.handle_errors_synced()
-
-        executor.dist.tp_allgather.assert_called_once_with(local_vote)
-        executor._handle_errors.assert_called_once_with(
-            error_msg="Disagg KV cache transfer error",
-            requests=[error_request],
-            charge_budget=False,
-        )
-
 
 class TestIdleDisaggLoopPacing:
     """Pacing must cost nothing unless a KV transfer is what holds the loop back."""
@@ -1478,11 +1394,11 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     executor.scheduler.schedule_request.return_value = types.SimpleNamespace(
         fitting_disagg_gen_init_requests=[local_canonical, local_only]
     )
-    executor._prepare_disagg_gen_init = Mock(side_effect=StopAfterReconciliation)
-    # Gen-transfer polling lives in the coordinator, so stub it there rather
-    # than on the executor. Touch ``executor.disagg`` only after the delegate
+    # Gen-transfer polling and the receive start live in the coordinator, so
+    # stub them there. Touch ``executor.disagg`` only after the delegate
     # targets above are stubbed: the coordinator binds them at construction.
     executor.disagg.poll_gen_transfers = Mock()
+    executor.disagg.receive_gen_init = Mock(side_effect=StopAfterReconciliation)
 
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device",
@@ -3090,7 +3006,6 @@ class TestOneModelMTPDraftTokenScheduling:
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prefetch_for_context_requests = Mock()
-        ex._prepare_disagg_gen_init = Mock()
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
         return ex
 

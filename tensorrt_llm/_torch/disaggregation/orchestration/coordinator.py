@@ -54,12 +54,11 @@ class DisaggLoopDelegates:
     """Executor callables the coordinator still forwards to.
 
     Transitional: each field is removed once the corresponding logic moves
-    into the coordinator (CS-3: admission, receive).
+    into the coordinator (admission, receive completion).
     """
 
     admit: Callable[[List[LlmRequest]], Tuple[List[LlmRequest], bool]]
     revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
-    receive_gen_init: Callable[[List[LlmRequest]], None]
     prepare_transmission_completed: Callable[["ScheduledRequests"], None]
 
 
@@ -144,7 +143,7 @@ class DisaggTransferCoordinator:
 
         if not (self._enable_attention_dp and self._dist.world_size != 1):
             if pending_requests:
-                self.check_transfer_errors("context requests")
+                self._check_transfer_errors("context requests")
             return
 
         local_error_requests = [
@@ -264,9 +263,39 @@ class DisaggTransferCoordinator:
         """Release KV allocated for candidates that were not admitted."""
         self._d.revert_deferred_gen_init(candidates, admitted)
 
+    @nvtx_range("receive_gen_init")
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
-        """Prepare resources and start the KV receive for admitted requests."""
-        self._d.receive_gen_init(admitted)
+        """Prepare executor resources for the admitted gen-init requests, then
+        start their KV receive in the configured transfer mode."""
+        if not admitted:
+            return
+        self._effects.prepare_gen_resources(admitted)
+
+        # gen_only_no_context has no CTX worker, so mark each request as
+        # transmission-complete immediately.
+        if is_gen_only_no_context_benchmark():
+            for req in admitted:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            return
+
+        if not uses_async_gen_transfer():
+            # Resources have already been prepared for every request in this
+            # batch. Drain all synchronous receives even after one fails so no
+            # prepared request is left in DISAGG_GENERATION_INIT.
+            for req in admitted:
+                self._transceiver.request_and_receive_sync(req)
+            self._check_transfer_errors("generation requests")
+            return
+
+        for req in admitted:
+            self._transceiver.request_and_receive_async(req)
+
+        if self._transceiver.kv_transfer_timeout_ms is not None:
+            for req in admitted:
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.monotonic()
+
+        self.reap_gen_receives(0)
 
     def poll_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
@@ -390,7 +419,7 @@ class DisaggTransferCoordinator:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
                 self.release_transfer(request)
 
-        self.check_transfer_errors("context requests")
+        self._check_transfer_errors("context requests")
 
     @nvtx_range("reap_gen_receives")
     def reap_gen_receives(self, at_least: int = 0) -> None:
@@ -403,7 +432,7 @@ class DisaggTransferCoordinator:
                 if req_id not in user_canceled_ids:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
         if not self.inflight_cancel_active():
-            self.check_transfer_errors("generation requests")
+            self._check_transfer_errors("generation requests")
 
     def release_transfer(self, request: LlmRequest) -> None:
         """Release one transfer claim and terminate once the last owner releases.
@@ -608,12 +637,11 @@ class DisaggTransferCoordinator:
 
     # -- transfer errors -----------------------------------------------------
 
-    def check_transfer_errors(self, kind: str) -> None:
+    def _check_transfer_errors(self, kind: str) -> None:
         """Fail requests whose transfer errored, rank-locally.
 
         Under multi-rank ADP this is a no-op: errors are handled by
-        ``handle_errors_synced`` at the loop top. Public only because the
-        executor's synchronous receive path still calls it (CS-3 moves it).
+        ``handle_errors_synced`` at the loop top.
         """
         if self._enable_attention_dp and self._dist.world_size != 1:
             return
@@ -693,6 +721,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
         return fitting_gen_init, False
 
+    def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
+        return None
+
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         return None
 
@@ -719,9 +750,6 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             "release_transfer has no transceiver to serve; connector-only "
             "releases are handled by the executor"
         )
-
-    def check_transfer_errors(self, kind: str) -> None:
-        return None
 
     def inflight_cancel_active(self) -> bool:
         return False

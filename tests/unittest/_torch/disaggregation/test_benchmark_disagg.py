@@ -92,10 +92,11 @@ def _make_v2_kv_cache_manager() -> Mock:
 
 
 def _stub_transfer_entry_points(ex) -> None:
-    """Mock the coordinator's transfer polls once the executor builds it.
+    """Mock the coordinator's transfer polls and receive start once the
+    executor builds it.
 
     The build stays lazy so a test can still swap delegated executor methods
-    (admission, gen init) before the first ``ex.disagg`` use.
+    (admission) before the first ``ex.disagg`` use.
     """
     build = ex._build_disagg_coordinator
 
@@ -104,6 +105,7 @@ def _stub_transfer_entry_points(ex) -> None:
         coordinator.poll_gen_transfers = Mock()
         coordinator.check_transfer_timeouts = Mock()
         coordinator.reap_context_sends = Mock()
+        coordinator.receive_gen_init = Mock()
         return coordinator
 
     ex._build_disagg_coordinator = build_and_stub
@@ -879,7 +881,6 @@ class TestPrepareAndScheduleBatchNoBlock:
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
-        ex._prepare_disagg_gen_init = Mock()
 
         ex._prepare_and_schedule_batch()
 
@@ -1270,7 +1271,6 @@ class TestFailFastDuringBenchmarkFill:
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
-        ex._prepare_disagg_gen_init = Mock()
         ex._handle_errors = Mock()
 
         scheduled = ScheduledRequests()
@@ -1318,7 +1318,7 @@ class TestFailFastDuringBenchmarkFill:
 
         assert result is not None
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
-        ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
+        ex.disagg.receive_gen_init.assert_called_once_with([admitted_req])
         ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
@@ -1351,7 +1351,7 @@ class TestFailFastDuringBenchmarkFill:
             "that transfer admission temporarily deferred"
         )
         ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
-        ex._prepare_disagg_gen_init.assert_called_once_with([])
+        ex.disagg.receive_gen_init.assert_called_once_with([])
         ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
@@ -1541,7 +1541,6 @@ class TestFillPhaseEndToEnd:
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
-        ex._prepare_disagg_gen_init = Mock()
         ex._handle_errors = Mock()
 
         scheduled = ScheduledRequests()

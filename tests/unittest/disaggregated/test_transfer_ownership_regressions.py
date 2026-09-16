@@ -1476,7 +1476,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     )
     executor.active_requests = [request]
     # The reap's trailing rank-local error check is not under test here.
-    executor.disagg.check_transfer_errors = Mock()
+    executor.disagg._check_transfer_errors = Mock()
 
     executor.disagg.reap_context_sends(0)
 

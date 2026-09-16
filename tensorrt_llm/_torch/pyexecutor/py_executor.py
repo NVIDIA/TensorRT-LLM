@@ -3702,7 +3702,6 @@ class PyExecutor:
                 admit=self._apply_disagg_transfer_admission,
                 revert_deferred_gen_init=self.
                 _revert_deferred_disagg_gen_init_alloc,
-                receive_gen_init=self._prepare_disagg_gen_init,
                 prepare_transmission_completed=self.
                 _prepare_disagg_gen_transmission_complete,
             ))
@@ -7239,35 +7238,33 @@ class PyExecutor:
         # `_handle_responses` is not reached this iteration.
         self._pending_adp_dummy_request = dummy_request
 
-    @nvtx_range("_prepare_disagg_gen_init")
-    def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
-        if fitting_disagg_gen_init_requests:
-            disagg_gen_init_to_prepare = ScheduledRequests()
-            disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
+    @nvtx_range("_prepare_disagg_gen_resources")
+    def _prepare_disagg_gen_resources(self, requests: List[LlmRequest]):
+        """Prepare resource-manager state for gen-init requests about to
+        receive their KV cache; the coordinator calls this right before it
+        starts the receive."""
+        disagg_gen_init_to_prepare = ScheduledRequests()
+        disagg_gen_init_to_prepare.context_requests_last_chunk = requests
 
-            for resource_mgr_type in (
-                    ResourceManagerType.KV_CACHE_MANAGER,
-                    ResourceManagerType.SPEC_RESOURCE_MANAGER,
-                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
-                if (resource_mgr_type in self.resource_manager.resource_managers
-                        and self.resource_manager.
-                        resource_managers[resource_mgr_type] is not None):
-                    self.resource_manager.resource_managers[
-                        resource_mgr_type].prepare_resources(
-                            disagg_gen_init_to_prepare)
+        for resource_mgr_type in (ResourceManagerType.KV_CACHE_MANAGER,
+                                  ResourceManagerType.SPEC_RESOURCE_MANAGER,
+                                  ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+            if (resource_mgr_type in self.resource_manager.resource_managers and
+                    self.resource_manager.resource_managers[resource_mgr_type]
+                    is not None):
+                self.resource_manager.resource_managers[
+                    resource_mgr_type].prepare_resources(
+                        disagg_gen_init_to_prepare)
 
-            # Reporting this mini-batch to the KV connector used to happen
-            # inside KVCacheManager.prepare_resources; it now runs after the
-            # token-budget trim, which this path does not go through. Kept here
-            # so the connector's per-request state advances exactly as before.
-            kv_cache_manager = self.resource_manager.resource_managers.get(
-                ResourceManagerType.KV_CACHE_MANAGER)
-            if hasattr(kv_cache_manager, "report_batch_to_connector"):
-                kv_cache_manager.report_batch_to_connector(
-                    disagg_gen_init_to_prepare)
-
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+        # Reporting this mini-batch to the KV connector used to happen
+        # inside KVCacheManager.prepare_resources; it now runs after the
+        # token-budget trim, which this path does not go through. Kept here
+        # so the connector's per-request state advances exactly as before.
+        kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+            kv_cache_manager.report_batch_to_connector(
+                disagg_gen_init_to_prepare)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
@@ -7486,37 +7483,6 @@ class PyExecutor:
         if disagg_params is None:
             return False
         return getattr(disagg_params, 'first_gen_logits', None) is not None
-
-    @nvtx_range("_recv_disagg_gen_cache")
-    def _recv_disagg_gen_cache(self, new_gen_reqs):
-
-        # gen_only_no_context has no CTX worker, so mark each request as
-        # transmission-complete immediately.
-        if self._is_disagg_gen_only_no_context_benchmark():
-            for req in new_gen_reqs:
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            return
-
-        if not self._uses_async_disagg_gen_transfer():
-            # Resources have already been prepared for every request in this
-            # batch. Drain all synchronous receives even after one fails so no
-            # prepared request is left in DISAGG_GENERATION_INIT.
-            for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_sync(req)
-            self.disagg.check_transfer_errors("generation requests")
-            return
-
-        for req in new_gen_reqs:
-            self.kv_cache_transceiver.request_and_receive_async(req)
-
-        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-            for req in new_gen_reqs:
-                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                    req.py_kv_transfer_start_time = time.monotonic()
-
-        self.disagg.reap_gen_receives(0)
-
-        return
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
