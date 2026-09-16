@@ -115,9 +115,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_p = sampling_config.min_p
         if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(
-                "min_p requires 'advanced_sampling_mode: fused' in the speculative "
-                "decoding config when using one-model speculative decoding. Set that "
-                "mode, drop min_p from the request, or disable speculative decoding."
+                "min_p requires 'advanced_sampling_mode: full' in the speculative "
+                "decoding config when using one-model speculative decoding. Restore "
+                "that default, drop min_p from the request, or disable speculative "
+                "decoding."
             )
         self._validate_unsupported_logits_processors(request)
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
