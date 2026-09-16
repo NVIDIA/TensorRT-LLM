@@ -198,23 +198,26 @@ function resultBody(verdict = 'FAIL', head = HEAD, target = BASE) {
 /** Exercise the result publisher without checking out or executing PR code. */
 function resultHarness(body = resultBody()) {
   const request = harness();
-  const comment = {body, user: {login: 'coderabbitai[bot]', type: 'Bot'},
+  const comment = {id: 123, body, user: {login: 'coderabbitai[bot]', type: 'Bot'},
     html_url: 'https://github.com/example/repo/pull/12#issuecomment-123'};
+  const comments = [comment];
   const checks = [{id: 1, app: {slug: 'github-actions'},
     external_id: `semantic-conflict:12:${HEAD}:${BASE}`}];
   const updated = [];
   const warnings = [];
+  const failures = [];
+  const summaries = [];
   let mergeBase = MERGE_BASE;
   let target = BASE;
   let afterCompare = () => {};
   const github = {
     rest: {
-      issues: {getComment: async () => ({data: comment})},
+      issues: {getComment: async () => ({data: comment}), listComments: 'list-comments'},
       pulls: {get: async () => ({data: request.pr})},
       git: {getRef: async () => ({data: {object: {sha: target}}})},
       checks: {listForRef: 'list-checks', update: async args => {updated.push(args);}},
     },
-    paginate: async () => checks,
+    paginate: async method => method === 'list-comments' ? comments : checks,
     request: async (route, args) => {
       assert.equal(route, 'GET /repos/{owner}/{repo}/compare/{basehead}');
       assert.equal(args.basehead, `${BASE}...${HEAD}`);
@@ -222,27 +225,40 @@ function resultHarness(body = resultBody()) {
       return {data: {merge_base_commit: {sha: mergeBase}}};
     },
   };
-  const core = {warning: text => warnings.push(text),
-    summary: {addRaw() {return this;}, async write() {}}};
-  return {comment, checks, updated, warnings, pr: request.pr,
+  const core = {warning: text => warnings.push(text), setFailed: text => failures.push(text),
+    summary: {addRaw(text) {summaries.push(text); return this;}, async write() {}}};
+  return {comment, comments, checks, updated, warnings, failures, summaries, pr: request.pr,
     setMergeBase: sha => {mergeBase = sha;},
     setTarget: sha => {target = sha;},
     afterCompare: callback => {afterCompare = callback;},
-    run: () => publish(github, {repo: {owner: 'example', repo: 'repo'},
-      payload: {issue: {number: 12}, comment: {id: 123}}}, core),
+    run: (eventName = 'issue_comment') => publish(github, {repo: {owner: 'example', repo: 'repo'},
+      eventName, payload: {issue: {number: 12}, comment: {id: 123},
+        pull_request: {number: 12, head: {sha: HEAD}}}}, core),
   };
 }
 
-test('verified conflicts and inconclusive results publish neutral checks and annotations', async () => {
-  for (const body of [resultBody('FAIL'), resultBody('INCONCLUSIVE'), resultBody('FAIL').toLowerCase()]) {
+test('verified conflicts publish failure with a false-positive and non-blocking notice', async () => {
+  for (const body of [resultBody('FAIL'), resultBody('FAIL').toLowerCase()]) {
     const h = resultHarness(body);
     await h.run();
-    assert.equal(h.updated[0].conclusion, 'neutral');
-    assert.match(h.updated[0].output.title, /⚠️/);
-    assert.match(h.updated[0].output.title, body.includes('INCONCLUSIVE') ? /inconclusive/ : /Possible semantic conflict/);
+    assert.equal(h.updated[0].conclusion, 'failure');
+    assert.match(h.updated[0].output.title, /Possible semantic conflict/);
+    assert.match(h.updated[0].output.summary, /CodeRabbit can make mistakes, including false positives/);
+    assert.match(h.updated[0].output.summary, /must remain non-required; its failure does not block merging/);
     assert.equal(h.updated[0].details_url, h.comment.html_url);
-    assert.equal(h.warnings.length, 1);
+    assert.equal(h.failures.length, 1);
+    assert.match(h.failures[0], /does not block merging/);
+    assert.match(h.summaries[0], /false positives/);
   }
+});
+
+test('inconclusive results stay neutral and warn without failing the job', async () => {
+  const h = resultHarness(resultBody('INCONCLUSIVE'));
+  await h.run();
+  assert.equal(h.updated[0].conclusion, 'neutral');
+  assert.match(h.updated[0].output.title, /inconclusive/);
+  assert.equal(h.warnings.length, 1);
+  assert.equal(h.failures.length, 0);
 });
 
 test('only a verified pass publishes success, including a passed table without full details', async () => {
@@ -254,6 +270,7 @@ test('only a verified pass publishes success, including a passed table without f
     await h.run();
     assert.equal(h.updated[0].conclusion, 'success');
     assert.equal(h.warnings.length, 0);
+    assert.equal(h.failures.length, 0);
   }
 });
 
@@ -313,4 +330,53 @@ test('a retry updates only the newest matching check', async () => {
   h.checks.push({...h.checks[0], id: 2});
   await h.run();
   assert.equal(h.updated[0].check_run_id, 2);
+});
+
+test('PR preview uses the same verdict mapping without writing a Check, even for drafts', async () => {
+  for (const verdict of ['PASS', 'FAIL', 'INCONCLUSIVE']) {
+    const h = resultHarness(resultBody(verdict).toLowerCase());
+    h.pr.draft = true;
+    h.pr.labels = [];
+    h.checks.length = 0;
+    await h.run('pull_request');
+    assert.deepEqual(h.updated, []);
+    assert.equal(h.failures.length, verdict === 'FAIL' ? 1 : 0);
+    assert.equal(h.warnings.length, verdict === 'INCONCLUSIVE' ? 1 : 0);
+    assert.match(h.summaries[0], /Read-only PR preview/);
+    assert.match(h.summaries[0], /non-required/);
+  }
+});
+
+test('PR preview cannot reuse another SHA pair, an untrusted reply, or an older PR run', async () => {
+  for (const change of [
+    h => {h.comment.body = resultBody('FAIL', NEW_BASE);},
+    h => {h.comment.body = resultBody('FAIL', HEAD, NEW_BASE);},
+    h => {h.comment.user.login = 'someone-else';},
+    h => {h.comment.user.type = 'User';},
+    h => {h.comments.length = 0;},
+    h => {h.pr.head.sha = NEW_BASE;},
+  ]) {
+    const h = resultHarness();
+    change(h);
+    await h.run('pull_request');
+    assert.deepEqual(h.updated, []);
+    assert.deepEqual(h.failures, []);
+    assert.equal(h.warnings.length, 1);
+  }
+});
+
+test('PR preview chooses the latest matching reply and rechecks live refs', async () => {
+  const h = resultHarness(resultBody('FAIL'));
+  h.comments.push({...h.comment, id: 124, body: resultBody('PASS')});
+  await h.run('pull_request');
+  assert.deepEqual(h.failures, []);
+  assert.match(h.summaries[0], /No semantic conflict found/);
+  for (const change of [h => {h.pr.head.sha = NEW_BASE;}, h => h.setTarget(NEW_BASE)]) {
+    const stale = resultHarness();
+    stale.afterCompare(() => change(stale));
+    await stale.run('pull_request');
+    assert.deepEqual(stale.updated, []);
+    assert.deepEqual(stale.failures, []);
+    assert.equal(stale.warnings.length, 1);
+  }
 });

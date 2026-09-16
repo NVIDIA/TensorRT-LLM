@@ -177,7 +177,8 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 
 CodeRabbit's `Semantic conflict with target branch` pre-merge check in
 `.coderabbit.yaml` looks for behavioral incompatibilities across branches. It is
-best-effort and warning-only; missing revision/history evidence is Inconclusive.
+best-effort; missing revision/history evidence is Inconclusive. The CodeRabbit
+comment uses warning mode; GitHub Check conclusions are published separately.
 
 For a non-draft PR targeting `main`, maintainers can add the
 `ai: semantic-conflict` label to opt into automatic rechecks on PR and main
@@ -186,9 +187,13 @@ and publishes results; its request job succeeding is not an AI verdict. The inde
 `Semantic conflict with target branch` GitHub Check starts neutral while
 awaiting analysis. The workflow publishes CodeRabbit's result only after
 verifying the bot author, requested head/target pair, and merge-base SHA.
-PASS becomes success; conflicts and Inconclusive results stay neutral with
-a warning title and a link to the analysis. GitHub has no warning conclusion;
-the publishing job emits a warning annotation but can still succeed.
+PASS becomes success; a verified FAIL makes both the semantic Check and its
+publishing job fail (red). Inconclusive results stay neutral with a warning
+annotation. Results explain that CodeRabbit can make mistakes, including false
+positives. Keep this advisory Check and workflow non-required: their failures
+then do not block merging. Reviewers can document a false positive and merge
+once the other requirements are met. This workflow does not change repository
+rules; adding it to required checks would make failures block merging.
 Read the result and verify its SHAs still match the live branches.
 
 Use workflow dispatch with the PR number to retry only that PR, or comment
@@ -202,6 +207,18 @@ automation's unit tests; passing it is not a semantic verdict. These tests
 are not part of the existing `Pre-commit Check`.
 The custom check requires CodeRabbit Custom Pre-Merge Checks access. This
 advisory pilot does not provide a merge-queue check or block merges.
+
+Changes to the semantic automation also run `Semantic conflict preview
+(advisory)` on `pull_request`, including fork drafts. It reads real CodeRabbit
+replies for the current head/main pair with read-only permissions and uses the
+same verification and verdict mapping as the publisher, without writing Checks.
+Before the configuration is merged, request `@coderabbitai evaluate custom
+pre-merge check` with `--name "Semantic conflict with target branch"`,
+`--mode warning`, and `--instructions` containing the check instructions from
+`.coderabbit.yaml` and the current head/main SHAs. After the reply arrives,
+rerun the preview job. A missing reply produces a warning and no AI verdict;
+a verified conflict makes the preview job red. Previewing does not validate
+the production event triggers or privileged Check writes.
 
 ### Trouble Shooting
 

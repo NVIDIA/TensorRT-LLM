@@ -111,6 +111,9 @@ reviews:
           If either branch changes during analysis, return Inconclusive.
           State that the result applies only to the reported SHA pair and must
           be rerun after either branch changes.
+          Explain that CodeRabbit can make mistakes, including false positives.
+          This is an advisory check: a failure does not block merging while the
+          check remains non-required. Other merge requirements still apply.
 
           Begin the explanation with exactly one machine-readable result line:
           SEMANTIC_RESULT head=<SHA> target=<SHA> merge_base=<SHA> verdict=<VERDICT>
