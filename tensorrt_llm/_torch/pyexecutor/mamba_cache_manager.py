@@ -1450,9 +1450,15 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             pool_configurations=pool_configurations,
         )
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True):
         MambaCacheManager.prepare_resources(self, scheduled_batch)
-        KVCacheManager.prepare_resources(self, scheduled_batch)
+        KVCacheManager.prepare_resources(
+            self,
+            scheduled_batch,
+            publish_connector_output=publish_connector_output)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         MambaCacheManager.free_resources(self, request)
@@ -2193,8 +2199,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._setup_state_indices()
         self._reset_context_mamba_slots(len(scheduled_batch.context_requests))
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        super().prepare_resources(scheduled_batch)
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True):
+        super().prepare_resources(
+            scheduled_batch, publish_connector_output=publish_connector_output)
         if self.local_num_mamba_layers == 0:
             return
         self._prepare_resources(scheduled_batch)
@@ -3081,8 +3091,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        super().prepare_resources(scheduled_batch)
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True):
+        super().prepare_resources(
+            scheduled_batch, publish_connector_output=publish_connector_output)
         if self.local_num_mamba_layers == 0:
             return
         requests = (scheduled_batch.context_requests +
