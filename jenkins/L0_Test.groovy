@@ -1619,6 +1619,10 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 }
 // End of Methods to run Slurm job with Jenkins Agent
 
+boolean isStartupBenchmarkStage(String stageName) {
+    return stageName ==~ /DGX_B300-8_GPUs-PyTorch-Startup-OnDemand-\d+/
+}
+
 def getNodeArgs(int nodeCount, int gpuCount, boolean setSegment = false) {
     int gpusPerNode = ((gpuCount / nodeCount) as BigDecimal).setScale(0, BigDecimal.ROUND_CEILING).intValue()
     def args = nodeCount == 1 ? [
@@ -1649,7 +1653,8 @@ def getPytestBaseCommandLine(
     int containerPortNum = 0
 ) {
     def extraInternalEnv = ""
-    def pytestTestTimeout = "3600"
+    // One startup row compares two variants, each with a 7200-second deadline.
+    def pytestTestTimeout = isStartupBenchmarkStage(stageName) ? "15000" : "3600"
     def cbtsMode = isCbtsStage(stageName)
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
@@ -2049,6 +2054,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 taskArgs = [
                     *taskArgs,
                 ]
+                if (isStartupBenchmarkStage(stageName)) {
+                    // Cache-state qualification requires the whole host, including host RAM.
+                    taskArgs += ["--exclusive", "--mem=0"]
+                }
 
                 def containerImageArg = container
                 def srunPrologue = ""
@@ -2152,6 +2161,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 envVarNames.each { varName ->
                     envVarsToExport[varName] = env."${varName}"
                 }
+                if (isStartupBenchmarkStage(stageName)) {
+                    // Export this assertion only beside the exclusive SBATCH allocation above.
+                    envVarsToExport['TRTLLM_STARTUP_BENCHMARK_ENABLE'] = '1'
+                    envVarsToExport['TRTLLM_STARTUP_BENCHMARK_EXCLUSIVE_NODE'] = '1'
+                    envVarsToExport['TRTLLM_STARTUP_BENCHMARK_RUNTIME_IMAGE'] = LLM_DOCKER_IMAGE
+                    ['QWEN38_27B_MODEL', 'GLM53_MODEL'].each { varName ->
+                        envVarsToExport[varName] = env."${varName}"
+                    }
+                }
 
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
@@ -2167,6 +2185,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
+                }
+                if (isStartupBenchmarkStage(stageName)) {
+                    srunArgs.add("--container-env=TRTLLM_STARTUP_BENCHMARK_JOB_ID")
                 }
 
                 def exemptionComment = ""
@@ -2195,7 +2216,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
                     ${slurmExcludeDirective}
-                    ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
+                    ${isStartupBenchmarkStage(stageName) ? "#SBATCH --time=05:00:00" : (partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}")}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
 
                     # SBATCH directives must appear before any executable commands.
@@ -2226,6 +2247,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
+                    ${isStartupBenchmarkStage(stageName) ? 'export TRTLLM_STARTUP_BENCHMARK_JOB_ID="$SLURM_JOB_ID"' : ''}
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
@@ -6385,6 +6407,17 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
     ]
+    // Each explicitly requested startup shard runs one matrix row on an exclusive host.
+    // The -OnDemand- name keeps these out of every automatic stage selection below.
+    x86SlurmTestConfigs += buildStageConfigs(
+        "DGX_B300-8_GPUs-PyTorch-Startup-OnDemand",
+        "auto:dgx-b300-flex",
+        "l0_b300_startup_ondemand",
+        8,
+        8,
+        1,
+        true
+    )
     // B200 PerfSanity post-merge disaggregated
     // 2 Nodes
     x86SlurmTestConfigs += buildStageConfigs(

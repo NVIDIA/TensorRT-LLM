@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+version: 0.0.1
+l0_b300_startup_ondemand:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # Eight explicit-only shards, one case each; each compares both I/O variants.
+  # Qwen27B and GLM5.3 require qualified QWEN38_27B_MODEL / GLM53_MODEL paths.
+  - perf/test_startup_benchmark.py::test_startup_benchmark[qwen38_27b_nvfp4_tp1] TIMEOUT (250)
+  - perf/test_startup_benchmark.py::test_startup_benchmark[qwen38_27b_nvfp4_tp4] TIMEOUT (250)
+  - perf/test_startup_benchmark.py::test_startup_benchmark[deepseek_v4_pro_fp4_tp8] TIMEOUT (250)
+  - perf/test_startup_benchmark.py::test_startup_benchmark[qwen38_max_nvfp4_tp8_mtp3] TIMEOUT (250)
+  - perf/test_startup_benchmark.py::test_startup_benchmark[glm53_fp8_tp8_ep8] TIMEOUT (250)
+  - perf/test_startup_benchmark.py::test_startup_benchmark[kimi_k25_nvfp4_tp8_ep1] TIMEOUT (250)
+  - perf/test_startup_benchmark.py::test_startup_benchmark[kimi_k25_nvfp4_tp8_ep8] TIMEOUT (250)
+  - perf/test_startup_benchmark.py::test_startup_benchmark[deepseek_r1_fp8_tp8_mtp3] TIMEOUT (250)
