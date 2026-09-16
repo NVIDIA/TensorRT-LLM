@@ -223,6 +223,8 @@ class _ModelEngine:
     model: _TextModel | _MultimodalModel
     mm_encoder_output_budget_bytes: int | None = None
     mm_encoder_cache: TensorLRUCache | None = None
+    mm_encoder_item_scheduling_enabled: bool = False
+    bytes_per_mm_encoder_embedding: int = 8
 
 
 def _make_reserve_creator(
@@ -230,6 +232,7 @@ def _make_reserve_creator(
     *,
     mm_encoder_output_budget_bytes: int | None = None,
     disable_mm_encoder: bool = False,
+    max_num_tokens: int = 1,
 ) -> KvCacheCreator:
     llm_args = TorchLlmArgs(
         model="dummy",
@@ -252,6 +255,7 @@ def _make_reserve_creator(
         model=model,
         mm_encoder_output_budget_bytes=mm_encoder_output_budget_bytes,
         mm_encoder_cache=TensorLRUCache(cache_bytes) if cache_bytes else None,
+        mm_encoder_item_scheduling_enabled=mm_encoder_output_budget_bytes is not None,
     )
     return KvCacheCreator(
         model_engine=model_engine,
@@ -259,7 +263,7 @@ def _make_reserve_creator(
         mapping=Mapping(),
         net_max_seq_len=1,
         kv_connector_manager=None,
-        max_num_tokens=1,
+        max_num_tokens=max_num_tokens,
         max_beam_width=1,
         tokens_per_block=1,
         max_seq_len=1,
@@ -545,12 +549,23 @@ def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
     assert creator._get_multimodal_encoder_memory_reserve() == 0
 
 
-def test_reserve_adds_only_unprofiled_output_capacity():
+@pytest.mark.parametrize(
+    ("cache_bytes", "profiled_bytes", "max_num_tokens", "expected"),
+    [
+        (512, 400, 4, 112 + 64),
+        (512, 600, 4, 64),  # A profiled store never cancels unprofiled joins.
+        (64, 0, 16, 64 + 256),  # Shared entries can be copied by many requests.
+    ],
+)
+def test_reserve_adds_unprofiled_store_and_chunk_copies(
+    cache_bytes, profiled_bytes, max_num_tokens, expected
+):
     creator = _make_reserve_creator(
         _MultimodalModel(0),
-        mm_encoder_output_budget_bytes=512,
+        mm_encoder_output_budget_bytes=cache_bytes,
+        max_num_tokens=max_num_tokens,
     )
-    assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
+    assert creator._get_multimodal_encoder_memory_reserve(profiled_bytes) == expected
 
 
 def test_downstream_pp_rank_without_encoder_store_reserves_no_memory() -> None:
