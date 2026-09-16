@@ -121,9 +121,15 @@ class GatedMLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
-            use_cute_dsl_nvfp4_swiglu_blackwell=(use_cute_dsl_blockscaling_mm
-                                                 and activation == F.silu
-                                                 and not bias),
+            # The fused CuteDSL NVFP4 SwiGLU epilogue applies no clamp, so a
+            # layer carrying a real ``swiglu_limit`` must stay on the Triton
+            # kernel. ``_is_plain_swiglu`` deliberately covers only alpha/beta;
+            # the limit is gated here (as on ``rubin-advance``). Without this
+            # the clamp is silently dropped -- wrong numerics, no error.
+            use_cute_dsl_nvfp4_swiglu_blackwell=(
+                use_cute_dsl_blockscaling_mm
+                and activation == F.silu and not bias
+                and (swiglu_limit is None or swiglu_limit == float("inf"))),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
