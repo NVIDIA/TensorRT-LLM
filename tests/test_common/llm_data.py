@@ -53,7 +53,6 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     # AutoDeploy accuracy tests - overlapping with model registry
-    "google/gemma-3-1b-it": "gemma/gemma-3-1b-it",
     "google/gemma-3n-E2B-it": "gemma/gemma-3n-E2B-it",
     "google/gemma-4-E2B-it": "gemma/gemma-4-E2B-it",
     "nvidia/Qwen3.5-397B-A17B-NVFP4": "Qwen3.5-397B-A17B-NVFP4",
@@ -85,6 +84,17 @@ def llm_models_root(check: bool = False) -> Optional[Path]:
         )
 
     return root if root.exists() else None
+
+
+def get_checkpoint(model_subdir: str) -> str:
+    """Resolve a checkpoint under LLM_MODELS_ROOT, or fail loudly if missing."""
+    root = llm_models_root(check=True)
+    path = root / model_subdir
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {path}. Stage '{model_subdir}' under LLM_MODELS_ROOT to run this test."
+        )
+    return str(path)
 
 
 def llm_datasets_root() -> str:

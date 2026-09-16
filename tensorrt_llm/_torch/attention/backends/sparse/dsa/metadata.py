@@ -31,13 +31,14 @@ from .indexer import (
     _pick_dsl_expand,
     _select_indexer_compress_ratio,
 )
-from .params import DSAMetadataParams
+from .params import DSAMetadataParams, use_self_sampling_gvr
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 # Indexer MQA-logits are currently always fp32. The dtype is part of the
 # CuTe DSL Top-K compile key, so warmup must use the runtime dtype.
 _INDEXER_LOGITS_DTYPE = torch.float32
+_MAX_RADIX_BLOCKS_PER_ROW = 10
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
@@ -84,6 +85,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     num_sparse_topk: int
     # TopK for dynamic sparse MLA
     sparse_mla_topk: int
+    radix_aux_indices: Optional[torch.Tensor] = field(default=None, init=False)
+    radix_aux_logits: Optional[torch.Tensor] = field(default=None, init=False)
     # max number of draft tokens
     max_draft_tokens: int = 0
     # Indexer head dimension
@@ -120,6 +123,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
+    # Temporal-GVR prior state: allocated only when the two-level dispatch
+    # selects the temporal engine (the self-sampling engine keeps no
+    # cross-step state).
+    needs_gvr_prior: bool = field(default=False, init=False)
+    gvr_prior_indices: Optional[torch.Tensor] = field(default=None, init=False)
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -154,6 +162,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._group_remap_batched = {}
         self.num_ctx_mla_kv_tokens = 0
         self.nvfp4_mla_context_fp8_scratch = None
+        self._radix_rows_per_sequence = 1
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -203,6 +212,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if hasattr(self.kv_cache_manager, "compressed_block_sizes"):
             tpb = tpb // _effective_compress_ratio_divisor(self._indexer_compress_ratio)
         self._tokens_per_block = tpb
+        # Mirror the indexer's two-level GVR decision. The representative
+        # compress ratio matches every live indexer: the DeepSeek-V4 backend
+        # only builds indexers on cr=4 layers and plain DSA uses cr=1.
+        self.use_self_sampling_topk = use_self_sampling_gvr(
+            enable_heuristic_topk=self.enable_gvr_topk,
+            use_self_sampling_topk=sparse_metadata_params.use_self_sampling_topk,
+            index_topk=self.num_sparse_topk,
+            compress_ratio=self._indexer_compress_ratio,
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            sm_version=get_sm_version(),
+        )
+        self.needs_gvr_prior = (
+            self.enable_gvr_topk
+            and IS_CUTLASS_DSL_AVAILABLE
+            and get_sm_version() in (100, 103)
+            and not self.use_self_sampling_topk
+        )
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
@@ -382,18 +408,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         warmed keys are the ones dispatch actually looks up. Batches outside
         this set still compile lazily on first touch. The helper enumerates
         one representative row per distinct engine compile key, so large
-        batch lists warm in bounded time and memory. No-op unless the opt-in
-        gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        batch lists warm in bounded time and memory. No-op unless the
+        two-level dispatch (enable_heuristic_topk + use_self_sampling_topk)
+        selects the self-sampling engine.
         """
-        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
-            return
-        # same hardware gates as the dispatch flag (indexer __init__): never
-        # compile these kernels on unsupported stacks during warmup
+        # same two-level dispatch and hardware gates as the indexer __init__:
+        # never compile these kernels on unsupported stacks during warmup
         if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
             return
         if not self.enable_gvr_topk or self.kv_cache_manager is None:
             return
-        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not self.use_self_sampling_topk:
+            return
+        top_k = self.sparse_mla_topk
         if not top_k or int(top_k) not in (512, 1024, 2048):
             return
         cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
@@ -414,6 +441,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         for bs in batch_sizes or ():
             rows.add(int(bs) * nn)
         msl_c = int(self.get_indexer_max_seq_len())
+        # Prefill leg first: the decode-stride guard below may return early for
+        # an odd msl_c, but the DeepGEMM prefill stride is always 256-aligned.
+        try:
+            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768))
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(
+                "self-sampling GVR prefill warmup ran out of memory; prefill "
+                "engines will JIT-compile lazily on first touch instead."
+            )
         if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
             # mirror the DSL paged-MQA arena stride (rows round up to 256
             # elements). A drift here only degrades warmup to unused keys —
@@ -641,11 +677,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def _compute_kv_lens_row_reorder(self) -> None:
         """Prepare the longest-job-first GVR row order once per forward step."""
         next_n = 1 + self.max_draft_tokens
-        if (
-            self.enable_gvr_topk
-            and self.use_cute_dsl_topk
-            and self.num_generations * next_n >= 2 * self.num_sms
-        ):
+        if self.needs_gvr_prior and self.num_generations * next_n >= 2 * self.num_sms:
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
             order = torch.argsort(gen_kv_lens, descending=True).to(torch.int32)
             self.kv_lens_row_reorder_buffer[: self.num_generations].copy_(order)
@@ -747,6 +779,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             (max_gen_tokens, self.num_sparse_topk),
             cache_name="nvfp4_mla_compact_indices",
             dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+    def _create_radix_aux_buffers(self, capture_graph: bool) -> None:
+        max_num_rows = self.max_num_sequences * self._radix_rows_per_sequence
+        radix_shape = (max_num_rows, _MAX_RADIX_BLOCKS_PER_ROW, self.num_sparse_topk)
+        self.radix_aux_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            radix_shape,
+            cache_name="radix_aux_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.radix_aux_logits = self.get_empty(
+            self.cuda_graph_buffers,
+            radix_shape,
+            cache_name="radix_aux_logits",
+            dtype=torch.float32,
             capture_graph=capture_graph,
         )
 
@@ -955,7 +1005,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-        if self.enable_gvr_topk:
+        if self.needs_gvr_prior:
             self.gvr_prior_indices = self.get_empty(
                 self.cuda_graph_buffers,
                 (
@@ -968,14 +1018,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             self.gvr_prior_indices.zero_()
-            if self.use_cute_dsl_topk:
-                self.kv_lens_row_reorder_buffer = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (self.max_num_sequences,),
-                    cache_name="kv_lens_row_reorder_buffer",
-                    dtype=torch.int32,
-                    capture_graph=capture_graph,
-                )
+            self.kv_lens_row_reorder_buffer = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences,),
+                cache_name="kv_lens_row_reorder_buffer",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+        self._create_radix_aux_buffers(capture_graph)
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
@@ -1075,6 +1125,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_contexts=num_contexts,
         )
         self.max_draft_tokens = max_draft_len
+        rows_per_sequence = max(1 + max_draft_len, 1 + (max_total_draft_tokens or 0))
+        if is_spec_dec_dynamic_tree and spec_tree_manager is not None:
+            rows_per_sequence = max(rows_per_sequence, spec_tree_manager._internal_buf_dim)
+        resize_radix_workspace = rows_per_sequence != self._radix_rows_per_sequence
+        self._radix_rows_per_sequence = rows_per_sequence
         capture_graph = self.is_cuda_graph
         max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
         if (
@@ -1087,6 +1142,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
+        if resize_radix_workspace:
+            self._create_radix_aux_buffers(capture_graph)
 
     def _update_indexer_k_cache_block_offsets(self) -> torch.Tensor:
         """Refresh INDEX_KEY offsets and return their physical pool slots."""

@@ -17,9 +17,9 @@
 These run correctly with or without the dependencies installed: the "missing" case is
 simulated so it is meaningful in every environment, and the "present" case is
 guarded with ``importorskip``. That matters most for OpenEngine, whose bindings
-resolve only from a custom index and are therefore installed on just one CI stage
-(see the gateway install guard in jenkins/L0_Test.groovy) -- the simulated case
-below is the OpenEngine coverage that every other stage still gets.
+resolve only from a custom index and are therefore installed on only a few CI
+stages (see the gateway install guard in jenkins/L0_Test.groovy) -- the simulated
+case below is the OpenEngine coverage that every other stage still gets.
 """
 
 import asyncio

@@ -10,7 +10,16 @@ import yaml
 
 from agent_flow.workflows.perf_optimize import progress as progress_module
 
-_ROLES = ("benchmarker", "projector", "analyzer", "optimizer", "evaluator", "qa", "reporter")
+_ROLES = (
+    "benchmarker",
+    "projector",
+    "analyzer",
+    "optimizer",
+    "evaluator",
+    "integrator",
+    "qa",
+    "reporter",
+)
 
 
 def _call(handler, args: dict[str, Any]) -> dict[str, Any]:
@@ -82,7 +91,61 @@ def test_every_role_has_append_and_read_tools(tmp_path):
 
     # The read tool's `agent` enum exposes every role.
     read = _tool(tools, "optimizer", "read_latest_progress")
-    assert sorted(read.input_schema["properties"]["agent"]["enum"]) == sorted(_ROLES)
+    assert sorted(read.input_schema["properties"]["agent"]["enum"]) == sorted(
+        (*_ROLES, "optimizer_evaluator")
+    )
+
+
+def test_item_append_writes_global_first_and_item_local(tmp_path):
+    global_path = tmp_path / "progress.yaml"
+    item_path = tmp_path / "item" / "progress.yaml"
+    item_path.parent.mkdir()
+    progress_module.init_progress_file(global_path)
+    progress_module.init_progress_file(item_path)
+    ctx = progress_module.ProgressContext(
+        path=item_path,
+        global_path=global_path,
+        global_lock=progress_module.Lock(),
+        current_step=1,
+        current_round=1,
+        current_attempt=1,
+        current_item_id="opt-001",
+    )
+    tools = progress_module.build_progress_tools(ctx)
+    _call(
+        _tool(tools, "optimizer", "append_optimizer_progress").handler,
+        {"summary": "candidate"},
+    )
+    global_entry = progress_module.read_progress(global_path)["optimization"][0]
+    local_entry = progress_module.read_progress(item_path)["optimization"][0]
+    assert global_entry["item_id"] == local_entry["item_id"] == "opt-001"
+    assert global_entry["step"] == local_entry["step"] == 1
+
+
+def test_integrator_tool_records_authoritative_verdict(tmp_path):
+    path = tmp_path / "progress.yaml"
+    progress_module.init_progress_file(path)
+    tools = progress_module.build_progress_tools(
+        progress_module.ProgressContext(path=path, current_step=1, current_round=1)
+    )
+    append = _tool(tools, "integrator", "append_integrator_progress")
+    _call(
+        append.handler,
+        {
+            "summary": "combined candidates passed",
+            "decision": "APPROVE",
+            "included_item_ids": ["opt-001", "opt-002"],
+            "dropped_item_ids": [],
+            "remediation_attempts": 0,
+            "measured_gain_pct": 11.0,
+            "measured_value": 111.0,
+            "required_gain_pct": 7.4,
+            "best_candidate_id": "opt-001",
+        },
+    )
+    entry = progress_module.latest_entry(path, "integrator")
+    assert entry["decision"] == "APPROVE"
+    assert entry["included_item_ids"] == ["opt-001", "opt-002"]
 
 
 def test_summary_tool_handlers_stamp_loop_position(tmp_path):

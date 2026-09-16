@@ -37,6 +37,7 @@ Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
 """
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Optional, TypeAlias, cast
 
 import torch
@@ -51,6 +52,30 @@ DEFAULT_BEAM_IDX = 0
 DEFAULT_STEP_IDX = 0
 
 FinishReasonsList: TypeAlias = list[list[list[int]]]
+
+
+class SampleType(Enum):
+    """Sampling tiers, ordered by capability.
+
+    A batch is dispatched to the simplest tier its requests allow:
+
+    - ``FAST``: only temperature / top_p / top_k. Sampled inside the graph.
+    - ``FULL``: every sampling feature. Sampled eagerly after the forward.
+
+    There is deliberately no argmax tier: greedy sampling is two cheap kernels,
+    so capturing it saves about as much launch overhead as staging for it costs
+    (measured on Qwen2-0.5B it was a wash), and greedy batches take the eager
+    stable-greedy fast path instead.
+
+    Lives in this base module so the CUDA graph runner can key its graph cache
+    on the tier without importing the sampler orchestration module and its heavy
+    dependency chain. The tier set is expected to change: beam search may become
+    one of its own, and ``FAST`` should grow as more features gain
+    graph-capturable kernels.
+    """
+
+    FAST = auto()
+    FULL = auto()
 
 
 @dataclass(frozen=True, kw_only=True)

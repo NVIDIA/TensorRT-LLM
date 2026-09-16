@@ -23,6 +23,7 @@ sampler advances ``py_decoding_iter``.
 """
 
 import math
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -222,6 +223,9 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         # with zero reserve tokens the rewind math is unchanged.
         is_draft=True,
         _kv_reserve_draft_tokens=0,
+        # No scheduler ran, so nothing recorded a generation allocation; the
+        # rewind falls back to the reserve width.
+        _allocated_draft_lens={},
         kv_cache_map={7: kv},
         kv_compression_manages_history=False,
         _has_cp_helix=True,
@@ -332,6 +336,11 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
     sched = SimpleNamespace(
         has_cp_helix=True,
         kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
+        draft_kv_cache_manager=None,
+        enable_joint_kv_cache_reuse=False,
+    )
+    sched._try_allocate_generation = types.MethodType(
+        KVCacheV2Scheduler._try_allocate_generation, sched
     )
     req = SimpleNamespace(
         py_request_id=7,

@@ -560,8 +560,10 @@ def _make_trtllm_gen_moe(
     top_k: int = 2,
     hidden_size: int = 512,
     intermediate_size: int = 256,
+    tp_size: int = 1,
+    tp_rank: int = 0,
 ) -> TRTLLMGenFusedMoE:
-    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override."""
+    """A TRTLLM-Gen MoE, with or without the SiTu override."""
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
     pretrained_config.hidden_size = hidden_size
@@ -570,7 +572,7 @@ def _make_trtllm_gen_moe(
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        mapping=Mapping(world_size=tp_size, tp_size=tp_size, rank=tp_rank),
         moe_backend="TRTLLM",
     )
     return TRTLLMGenFusedMoE(
@@ -740,18 +742,20 @@ def test_nvfp4_trtllm_gen_resolve_alignments_matches_create_weights(
 
 
 @_situ_supported
-def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
-    """Why the MoE-TP check cannot read the class attribute.
+def test_nvfp4_trtllm_gen_tp_accepts_logical_group_aligned_shard() -> None:
+    """Logical TP alignment is independent of the padded kernel layout."""
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        situ=True,
+        hidden_size=7168,
+        intermediate_size=3072,
+        tp_size=16,
+    )
 
-    ``hidden=1536``/``intermediate=192`` resolves to a 128 weight alignment.
-    192 is divisible by the class default (32) but not by 128, so validating
-    against ``NVFP4TRTLLMGenFusedMoEMethod.weight_alignment`` admits a shard
-    the loader cannot lay out. Pins the gap, so reverting the check to the
-    class attribute fails here rather than in a multi-GPU accuracy run.
-    """
-    resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
-    assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
-    assert 192 % resolved != 0
+    assert backend.intermediate_size_per_partition == 192
+    assert backend.intermediate_size_per_partition % 16 == 0
+    assert backend.quant_method.weight_alignment == 128
+    assert backend.intermediate_size_per_partition % backend.quant_method.weight_alignment != 0
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
@@ -889,6 +893,40 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
     quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
+def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
+    """The GMS read-only reader reaches the override through the wrapper.
+
+    ``ConfigurableMoE`` marks itself ``_weights_removed`` so the loader does not
+    run the wrapper's hooks on top of the backend's, which leaves the backend
+    reachable only as a registered submodule. Losing the override there is
+    silent -- the SymmBuffer simply never gets allocated and the failure
+    surfaces as the assert in ``run_moe`` -- so the walk itself is asserted,
+    not just the override in isolation.
+    """
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    # ``__new__`` rather than the constructor: the real ``__init__`` would want
+    # MPI, a process group, and a DG SymmBuffer, none of which this walk needs.
+    backend = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = SimpleNamespace(cache_derived_state=MagicMock())
+    backend._alloc_symm_buffer = MagicMock()
+
+    wrapper = torch.nn.Module()
+    wrapper._weights_removed = True
+    wrapper.cache_derived_state = MagicMock()
+    wrapper.backend = backend
+
+    model = torch.nn.Module()
+    model.moe = wrapper
+
+    ModelLoader._walk_cache_state(model)
+
+    backend._alloc_symm_buffer.assert_called_once_with()
+    backend.quant_method.cache_derived_state.assert_called_once_with(backend)
+    wrapper.cache_derived_state.assert_not_called()
+
+
 def test_megamoe_bakes_situ_softcaps_as_uniform_scalars():
     # MegaMoE declares UNIFORM_SCALAR for alpha/beta because the kernels bake
     # them at codegen time, so a per-expert tensor is reduced here.
@@ -985,6 +1023,8 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
         moe_backend=MoeBackendType.MEGAMOE_DEEPGEMM.value,
     )
 
+    # The check runs inside ``__init__``, before any distributed setup, so the
+    # rejection is reachable without a process group.
     with pytest.raises(
         ValueError,
         match=r"MegaMoEDeepGemm requires num_slots \(10\) divisible by ep_size \(4\)",

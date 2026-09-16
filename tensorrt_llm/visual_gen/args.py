@@ -45,7 +45,7 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / FLASHINFER / CUTEDSL backends).
+    """Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).
 
     Specifies Q/K and V quantization formats and their optional block sizes.
 
@@ -63,12 +63,12 @@ class QuantAttentionConfig(StrictBaseModel):
             "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
         ),
     )
-    v_dtype: Literal["fp8", "nvfp4"] = Field(
+    v_dtype: Literal["fp8", "mxfp8", "nvfp4"] = Field(
         "fp8",
         status="prototype",
         description=(
-            "V quantization dtype. The current kernels always load V in FP8 (e4m3) "
-            "or block-scaled NVFP4."
+            "V quantization format. fp8 is the 8-bit floating-point element format; mxfp8 and "
+            "nvfp4 are block-scaled formats."
         ),
     )
     q_block_size: int = Field(
@@ -103,16 +103,16 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FLASHINFER", "FA4", "CUTEDSL"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4"] = Field(
         "VANILLA",
         status="prototype",
-        description=("Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FLASHINFER, FA4, CUTEDSL"),
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, CUDNN, FLASHINFER, CUTEDSL, FA4",
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM / FLASHINFER / CUTEDSL backends). "
+            "Quantized-attention recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -135,6 +135,11 @@ class AttentionConfig(StrictBaseModel):
             ("int8", "fp8", (1, 16, 1)),
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
+        }
+        # cuDNN fused SDPA quantizes both GEMMs with the same element format.
+        CUDNN_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
+            ("mxfp8", "mxfp8", (0, 0, 0)),
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
@@ -181,6 +186,15 @@ class AttentionConfig(StrictBaseModel):
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
                     f"{sorted(CUTEDSL_RECIPES)}."
                 )
+        elif self.backend == "CUDNN":
+            if recipe not in CUDNN_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='CUDNN'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(CUDNN_RECIPES)}. Omit quant_attention_config to run "
+                    f"unquantized attention."
+                )
         elif self.backend == "FLASHINFER":
             if recipe not in FLASHINFER_RECIPES:
                 raise ValueError(
@@ -191,7 +205,7 @@ class AttentionConfig(StrictBaseModel):
                 )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'FLASHINFER', 'CUTEDSL'), "
+                f"quant_attention_config requires backend in ('TRTLLM', 'CUDNN', 'FLASHINFER', 'CUTEDSL'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )
@@ -236,6 +250,19 @@ class AttentionConfig(StrictBaseModel):
                 "or the sparse VSA path, not both)."
             )
         return self
+
+
+class VAEConfig(StrictBaseModel):
+    """Configuration for the variational autoencoder."""
+
+    quant_conv_config: Optional[Union[QuantConfig, Dict[str, Any]]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Quantization config for VAE convolution operators, independent "
+            "from transformer linear-layer and attention quantization."
+        ),
+    )
 
 
 class ParallelConfig(StrictBaseModel):
@@ -714,6 +741,11 @@ class VisualGenArgs(StrictBaseModel):
         default_factory=AttentionConfig,
         status="prototype",
     )
+    vae_config: VAEConfig = Field(
+        default_factory=VAEConfig,
+        status="prototype",
+        description="Configuration for VAE execution.",
+    )
     parallel_config: ParallelConfig = Field(
         default_factory=ParallelConfig,
         status="prototype",
@@ -808,6 +840,7 @@ __all__ = [
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
     "AttentionConfig",
+    "VAEConfig",
     "ParallelConfig",
     "BaseCacheConfig",
     "TeaCacheConfig",

@@ -771,9 +771,6 @@ struct SpeculativeDecodingFastLogitsInfo
 
     /// @brief MPI world rank of the draft model leader
     int32_t draftParticipantId;
-
-    /// @brief Returns the struct serialized into a tensor that can be used as generation logits input
-    [[nodiscard]] Tensor toTensor() const;
 };
 
 struct AdditionalOutput
@@ -978,8 +975,6 @@ private:
 class KvCacheConfig
 {
 public:
-    static constexpr auto kDefaultGpuMemFraction = 0.9F;
-
     explicit KvCacheConfig(bool enableBlockReuse = true, std::optional<SizeType32> const& maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,

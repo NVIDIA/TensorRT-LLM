@@ -26,6 +26,7 @@ def _piecewise_boundary_ops():
         "mla_custom_op_inplace",
         "mla_dsa_attn_inplace",
         "gdn_custom_op_inplace",
+        "mamba2_custom_op_inplace",
         "minimax_m3_attn_custom_op_inplace",
     ]
     return [

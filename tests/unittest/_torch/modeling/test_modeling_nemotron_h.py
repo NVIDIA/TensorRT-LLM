@@ -1,12 +1,14 @@
 import pytest
 import torch
 from utils.llm_data import llm_models_root
-from utils.util import skip_fp8_pre_ada, skip_gpu_memory_less_than
+from utils.util import (skip_fp8_pre_ada, skip_gpu_memory_less_than,
+                        skip_single_gpu)
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, LoadFormat
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, LoadFormat,
+                                          PrefillCudaGraphBackend)
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -216,3 +218,187 @@ def test_nemotron_h_chunked_prefill():
                    ) > 0, f"Prompt {i}: chunked prefill produced empty output"
         assert len(output.outputs[0].text
                    ) > 0, f"Prompt {i}: chunked prefill produced empty text"
+
+
+# Breakable prefill CUDA graphs (BCG) on the hybrid path. Under BCG the Mamba2
+# layers run through the eager_on_graph boundary op (mamba2_mixer.py), so this
+# covers the NemotronH-specific bridge rather than the generic BCG runner
+# (which unittest/_torch/executor/test_breakable_cuda_graph.py exercises).
+_BCG_MAX_NUM_TOKENS = 256
+_BCG_CAPTURE_NUM_TOKENS = [64, 128, 256]
+# Probability-ratio bound shared with ray_orchestrator/multi_gpu/
+# test_accuracy_with_allreduce_strategy.py::compare_logprobs (e^-2.30 ~ 0.1x).
+_BCG_LOGPROB_TOLERANCE = 2.30
+# Context batches: an exact capture bucket, one token past a bucket (padded
+# replay), two context requests of unequal length in one batch, and a prompt
+# longer than max_num_tokens (chunked prefill: 256 + 44).
+_BCG_CONTEXT_BATCHES = [
+    [[17] * 128],
+    [[17] * 129],
+    [[17] * 64, [23] * 65],
+    [[31] * 300],
+]
+# The mixed-batch section adds the streaming decode request and the context
+# request admitted while it decodes.
+_BCG_MIXED_BATCH_REQUESTS = 2
+# Decode length of that streaming request: with EOS ignored this is a ~1 s
+# generation window, orders of magnitude longer than the client-side gap
+# before the second request is submitted.
+_BCG_STREAM_MAX_TOKENS = 64
+# One (token_ids, logprobs) entry per request from each backend run.
+_BCG_NUM_REQUESTS = (sum(len(batch) for batch in _BCG_CONTEXT_BATCHES) +
+                     _BCG_MIXED_BATCH_REQUESTS)
+
+
+def _first_step_logprobs(output) -> torch.Tensor:
+    """Log-probabilities of the first generated position for one request."""
+    return torch.log_softmax(
+        output.outputs[0].generation_logits[0].float().cpu(), dim=-1)
+
+
+def _assert_mixed_batch_overlap(decoding_out, admitted_out) -> None:
+    """Prove that `admitted` was prefilled while `decoding` was still decoding.
+
+    Both requests return per-request iteration metrics taken from the engine's
+    iteration counter. With the overlap scheduler disabled, a batch capacity of
+    4 and 65 + 1 tokens inside the token budget, the scheduler runs every active
+    generation request each iteration, so admitted's first iteration (its
+    context chunk) falling inside decoding's generation window means that
+    iteration carried a context chunk and a decode token together.
+    """
+    dec = decoding_out.outputs[0].request_perf_metrics
+    adm = admitted_out.outputs[0].request_perf_metrics
+    assert dec is not None and adm is not None, "request_perf_metrics missing"
+    assert None not in (dec.first_iter, dec.last_iter, adm.first_iter), (
+        f"iteration metrics not populated: decoding {dec.first_iter}.."
+        f"{dec.last_iter}, admitted {adm.first_iter}")
+    assert dec.first_iter < adm.first_iter <= dec.last_iter, (
+        f"no mixed batch: decoding ran iterations [{dec.first_iter}, "
+        f"{dec.last_iter}] but admitted was prefilled at iteration "
+        f"{adm.first_iter}")
+
+
+def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
+                                    tp_size: int):
+    """Run the fixed prompt schedule with one prefill CUDA graph backend.
+
+    Returns one (token_ids, first_step_logprobs) pair per request, in a
+    deterministic order shared by both backends.
+    """
+    # ignore_eos on every compared request: the two backends may legitimately
+    # pick different greedy tokens after the first step (see the test
+    # docstring), and if one of them is EOS the arms would stop at different
+    # lengths for a difference the test otherwise accepts.
+    sampling_params = SamplingParams(max_tokens=4,
+                                     temperature=0.0,
+                                     ignore_eos=True,
+                                     return_generation_logits=True)
+    per_request = []
+    with LLM(
+            model=f"{llm_models_root(check=True)}/{_NANO_30B_BF16}",
+            tensor_parallel_size=tp_size,
+            # Pin NCCL so the allreduce path under BCG is the plain one on
+            # every platform (AUTO may pick MNNVL on multi-node NVLink).
+            allreduce_strategy="NCCL",
+            max_batch_size=4,
+            max_num_tokens=_BCG_MAX_NUM_TOKENS,
+            enable_chunked_prefill=True,
+            disable_overlap_scheduler=True,
+            gather_generation_logits=True,
+            kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32"),
+            cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                              max_batch_size=4),
+            prefill_cuda_graph_backend=backend,
+            prefill_capture_num_tokens=_BCG_CAPTURE_NUM_TOKENS,
+    ) as llm:
+        # The validator must not have downgraded the requested backend.
+        assert llm.args.prefill_cuda_graph_backend == backend
+        for batch in _BCG_CONTEXT_BATCHES:
+            for output in llm.generate(batch, sampling_params=sampling_params):
+                per_request.append((list(output.outputs[0].token_ids),
+                                    _first_step_logprobs(output)))
+
+        # Mixed batch: admit a context request while another request is
+        # decoding, so BCG replays a batch that carries both a context chunk
+        # and decode tokens. The overlap is proved afterwards from the two
+        # requests' iteration metrics rather than assumed.
+        decoding = llm.generate_async([17] * 128,
+                                      sampling_params=SamplingParams(
+                                          max_tokens=_BCG_STREAM_MAX_TOKENS,
+                                          temperature=0.0,
+                                          ignore_eos=True,
+                                          return_generation_logits=True,
+                                          return_perf_metrics=True),
+                                      streaming=True)
+        # In streaming mode every response carries only the newest step's
+        # logits, so the first-step distribution must be read from the first
+        # streamed response, before the stream moves on.
+        next(decoding)
+        decoding_first_step_logprobs = _first_step_logprobs(decoding)
+        admitted = llm.generate_async([23] * 65,
+                                      sampling_params=SamplingParams(
+                                          max_tokens=4,
+                                          temperature=0.0,
+                                          ignore_eos=True,
+                                          return_generation_logits=True,
+                                          return_perf_metrics=True),
+                                      streaming=False)
+        decoding_out = decoding.result()
+        admitted_out = admitted.result()
+        _assert_mixed_batch_overlap(decoding_out, admitted_out)
+        per_request.append((list(decoding_out.outputs[0].token_ids),
+                            decoding_first_step_logprobs))
+        per_request.append((list(admitted_out.outputs[0].token_ids),
+                            _first_step_logprobs(admitted_out)))
+    return per_request
+
+
+@skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)
+@pytest.mark.mpi_ray_parity
+@pytest.mark.parametrize("tp_size", [
+    1,
+    pytest.param(2, marks=skip_single_gpu),
+],
+                         ids=lambda n: f"tp{n}")
+def test_nemotron_h_breakable_prefill_cuda_graph(tp_size):
+    """Real-weight Nano: breakable prefill CUDA graphs vs eager prefill.
+
+    Same context / chunked-prefill / mixed-admission schedule with
+    prefill_cuda_graph_backend DISABLED and BREAKABLE. The first generated
+    token is the direct product of the (captured) prefill, so its
+    distribution is compared per request within the repo's accepted
+    probability-ratio bound and BCG's greedy pick must be one of eager's top-2.
+    Full-sequence greedy equality is reported but not required: Nano-30B-A3B
+    is MoE and flips greedy tokens under padding-induced numeric drift (see
+    the note above test_nemotron_h_sanity). NCCL allreduce is pinned: tp1 has
+    no allreduce at all, tp2 (skipped below 2 GPUs) runs the NCCL allreduce inside the captured
+    segments. Runs under the MPI executor and, with --run-ray, under the Ray
+    executor (mpi_ray_parity). The mixed-admission overlap is proved from the
+    two requests' iteration metrics, not assumed.
+    """
+    eager = _run_nemotron_h_prefill_backend(PrefillCudaGraphBackend.DISABLED,
+                                            tp_size)
+    bcg = _run_nemotron_h_prefill_backend(PrefillCudaGraphBackend.BREAKABLE,
+                                          tp_size)
+    assert len(eager) == len(bcg) == _BCG_NUM_REQUESTS
+
+    identical = 0
+    worst_diff = 0.0
+    for i, ((eager_ids, eager_lp), (bcg_ids,
+                                    bcg_lp)) in enumerate(zip(eager, bcg)):
+        assert len(bcg_ids) == len(eager_ids) > 0, (
+            f"request {i}: BCG produced {len(bcg_ids)} tokens, "
+            f"eager {len(eager_ids)}")
+        eager_top1 = eager_ids[0]
+        diff = (eager_lp[eager_top1] - bcg_lp[eager_top1]).abs().item()
+        worst_diff = max(worst_diff, diff)
+        assert diff < _BCG_LOGPROB_TOLERANCE, (
+            f"request {i}: BCG log-prob of eager's first token differs by "
+            f"{diff:.3f} nats (bound {_BCG_LOGPROB_TOLERANCE})")
+        eager_top2 = torch.topk(eager_lp, 2).indices.tolist()
+        assert bcg_ids[0] in eager_top2, (
+            f"request {i}: BCG first token {bcg_ids[0]} not in eager top-2 "
+            f"{eager_top2}")
+        identical += int(bcg_ids == eager_ids)
+    print(f"BCG vs eager: {identical}/{len(eager)} sequences identical, "
+          f"worst first-token log-prob diff {worst_diff:.3f} nats")

@@ -28,6 +28,8 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._utils import CUASSERT, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.modelopt_config import canonicalize_quant_algo
 
 from .hyper_connection import GroupedRMSNorm
 from .ple_kernels import (
@@ -48,6 +50,8 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
 _PLE_HOST_OFFLOAD_ENV = "TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"
+# Substring both quantization schemas use to name the PLE n-gram table.
+_NGRAM_TABLE_MARKER = "ple.ple_embedding.ngram_embedding"
 
 
 def _uses_ple_host_offload() -> bool:
@@ -65,13 +69,21 @@ def _uses_scaled_fp8_ngram_table(config: object) -> bool:
     quantization_config = getattr(config, "quantization_config", None)
     if not isinstance(quantization_config, dict):
         return False
+
+    quantized = quantization_config.get("quantized_layers")
+    if isinstance(quantized, dict):
+        return any(
+            _NGRAM_TABLE_MARKER in name
+            and canonicalize_quant_algo(spec.get("quant_algo")) == QuantAlgo.FP8
+            for name, spec in quantized.items()
+        )
+
     if quantization_config.get("quant_method") != "fp8":
         return False
-    excluded = quantization_config.get("modules_to_not_convert") or ()
-    if isinstance(excluded, str):
-        excluded = (excluded,)
-    marker = "ple.ple_embedding.ngram_embedding"
-    return not any(marker in module_name for module_name in excluded)
+    skipped = quantization_config.get("modules_to_not_convert") or ()
+    if isinstance(skipped, str):
+        skipped = (skipped,)
+    return not any(_NGRAM_TABLE_MARKER in name for name in skipped)
 
 
 def _first_eos_token_id(value: object) -> int:

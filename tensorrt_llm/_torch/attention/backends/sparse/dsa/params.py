@@ -20,6 +20,31 @@ if TYPE_CHECKING:
     pass
 
 
+def use_self_sampling_gvr(
+    *,
+    enable_heuristic_topk: bool,
+    use_self_sampling_topk: bool,
+    index_topk: int | None,
+    compress_ratio: int,
+    is_cute_dsl_available: bool,
+    sm_version: int,
+) -> bool:
+    """Return whether the two-level dispatch picks the self-sampling engine.
+
+    Shared by the indexer (per-layer TopK construction) and the attention
+    metadata (prior-state allocation and warmup) so both sides of the
+    dispatch agree.
+    """
+    return (
+        enable_heuristic_topk
+        and use_self_sampling_topk
+        and is_cute_dsl_available
+        and sm_version in (100, 103)
+        and index_topk in (512, 1024, 2048)
+        and compress_ratio in (1, 4)
+    )
+
+
 @dataclass(kw_only=True, slots=True)
 class DSABackendForwardArgs(SparseBackendForwardArgs):
     """DSA inputs passed from the MLA module to its backend."""
@@ -41,6 +66,8 @@ class DSAMetadataParams(SparseMetadataParams):
     q_split_threshold: int
     has_shared_indexer_layers: bool = False
     mtp_index_share: bool = False
+    use_self_sampling_topk: bool = True
+    use_gvr_emission: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +85,13 @@ class DSAParams(SparseParams):
     q_split_threshold: int = 8192
     indexer_rope_interleave: bool = False
     enable_heuristic_topk: bool = False
+    # Second-level GVR dispatch: hint-free self-sampling engine (True) vs
+    # temporal previous-step-hint engines (False). Only meaningful when
+    # enable_heuristic_topk is set.
+    use_self_sampling_topk: bool = True
+    # Emission block-skip for the temporal-hint engine; only meaningful with
+    # enable_heuristic_topk=True and use_self_sampling_topk=False on FP4.
+    use_gvr_emission: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True

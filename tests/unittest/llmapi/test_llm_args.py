@@ -52,7 +52,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           MoeConfig, MTPDecodingConfig,
                                           MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
-                                          PeftCacheConfig,
+                                          NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
                                           RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
@@ -183,6 +183,81 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     assert explicit_config.max_draft_len == 1
     assert explicit_config.max_total_draft_tokens == 1
     assert "max_draft_len" in explicit_config.model_fields_set
+
+
+@pytest.mark.cpu_only
+class TestDecodingBaseConfigMoeBackend:
+
+    def test_defaults_to_none(self) -> None:
+        config = DecodingBaseConfig()
+
+        assert config.moe_backend is None
+        assert config.model_dump()["moe_backend"] is None
+
+    @pytest.mark.parametrize(
+        "moe_backend",
+        [None, *get_args(MoeConfig.model_fields["backend"].annotation)],
+    )
+    def test_accepts_every_moe_backend(self, moe_backend: str | None) -> None:
+        config = DecodingBaseConfig(moe_backend=moe_backend)
+
+        assert config.moe_backend == moe_backend
+
+    @pytest.mark.parametrize("moe_backend", ["INVALID", "cutlass", 0])
+    def test_rejects_invalid_moe_backend(self, moe_backend: object) -> None:
+        with pytest.raises(ValidationError, match="moe_backend"):
+            DecodingBaseConfig(moe_backend=moe_backend)
+
+    def test_model_dump_and_yaml_parsing(self) -> None:
+        config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
+
+        assert config.model_dump()["moe_backend"] == "CUTLASS"
+
+        yaml_config = yaml.safe_load("""
+decoding_type: MTP
+max_draft_len: 1
+moe_backend: TRTLLM
+""")
+        restored = TypeAdapter(SpeculativeConfig).validate_python(yaml_config)
+
+        assert isinstance(restored, MTPDecodingConfig)
+        assert restored.moe_backend == "TRTLLM"
+        assert restored.model_dump()["moe_backend"] == "TRTLLM"
+
+    def test_autodeploy_rejects_override(self) -> None:
+        spec_config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
+
+        with pytest.raises(ValidationError,
+                           match="available only with the PyTorch backend"):
+            AutoDeployLlmArgs(model="/target", speculative_config=spec_config)
+
+    def test_accepts_explicit_vanilla_mtp_override(self) -> None:
+        spec_config = MTPDecodingConfig(max_draft_len=1,
+                                        moe_backend="CUTLASS",
+                                        use_mtp_vanilla=True)
+
+        llm_args = TorchLlmArgs(model=llama_model_path,
+                                speculative_config=spec_config)
+
+        assert llm_args.speculative_config.moe_backend == "CUTLASS"
+
+    def test_defers_checkpoint_dependent_mtp_eagle_override_validation(
+            self) -> None:
+        spec_config = MTPDecodingConfig(max_draft_len=1, moe_backend="CUTLASS")
+
+        llm_args = TorchLlmArgs(model=llama_model_path,
+                                speculative_config=spec_config)
+
+        assert llm_args.speculative_config.moe_backend == "CUTLASS"
+
+    def test_ignores_override_without_neural_drafter(self) -> None:
+        spec_config = NGramDecodingConfig(max_draft_len=1,
+                                          moe_backend="CUTLASS")
+
+        llm_args = TorchLlmArgs(model=llama_model_path,
+                                speculative_config=spec_config)
+
+        assert llm_args.speculative_config.moe_backend == "CUTLASS"
 
 
 @pytest.mark.cpu_only
@@ -737,11 +812,13 @@ class TestKvCacheManagerV2AutoResolution:
 
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
 
-    def test_registered_models_prefer_v2(self):
+    def test_registered_models_prefer_v2(self) -> None:
         from tensorrt_llm._torch.models.modeling_utils import \
             get_registered_model_class
 
         architectures = (
+            "LlamaForCausalLM",
+            "Llama4ForConditionalGeneration",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
@@ -764,13 +841,16 @@ class TestKvCacheManagerV2AutoResolution:
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
 
-    def test_registered_models_keep_v2_on_nixl(self):
+    def test_registered_models_keep_v2_on_nixl(self) -> None:
         """Models preferring V2 and the Python transceiver keep V2 on NIXL.
 
         Both sentinels start at 'auto'; production resolves the transceiver
@@ -783,6 +863,7 @@ class TestKvCacheManagerV2AutoResolution:
             get_registered_model_class
 
         architectures = (
+            "Llama4ForConditionalGeneration",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
@@ -804,6 +885,9 @@ class TestKvCacheManagerV2AutoResolution:
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
             "Gemma4UnifiedForConditionalGeneration",
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
@@ -2364,58 +2448,6 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert kept == [128, 256]
         assert unrecordable == []
 
-    @pytest.mark.parametrize("backend", [
-        PrefillCudaGraphBackend.PIECEWISE,
-        PrefillCudaGraphBackend.BREAKABLE,
-    ])
-    def test_piecewise_and_breakable_use_identical_padding(self, backend):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            PyTorchModelEngine
-
-        engine = object.__new__(PyTorchModelEngine)
-        engine.enable_attention_dp = False
-        engine.prefill_cuda_graph_backend = backend
-        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        assert engine._get_padding_params(129, 1, None) == (256, True, None)
-
-    def test_attention_dp_prefill_graph_uses_all_rank_decision(self):
-        from tensorrt_llm._torch.pyexecutor.model_engine import \
-            PyTorchModelEngine
-
-        class NoExchangeDist:
-            """Fails on any collective.
-
-            The all-rank decision is derived from the already-gathered
-            per-rank counts, so no further exchange may be issued.
-            """
-
-            def __getattr__(self, name):
-                raise AssertionError(f"unexpected collective {name}")
-
-        engine = object.__new__(PyTorchModelEngine)
-        engine.enable_attention_dp = True
-        engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
-        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        engine.dist = NoExchangeDist()
-
-        # A peer rank holds the only context request: every rank pads.
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
-        all_rank_num_tokens = [1, 129, 1, 1]
-        assert engine._get_padding_params(1, 0,
-                                          all_rank_num_tokens) == (256, True,
-                                                                   [256] * 4)
-
-        # No rank has a context request: nobody runs the prefill graph.
-        engine._get_all_rank_ctx_requests = lambda _: [0, 0, 0, 0]
-        assert engine._get_padding_params(
-            1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
-
-        # A peer exceeds the largest captured size: nobody runs it either.
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
-        too_long = [1, 513, 1, 1]
-        assert engine._get_padding_params(1, 0,
-                                          too_long) == (1, False, too_long)
-
     def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
             self):
         config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
@@ -2642,7 +2674,6 @@ class TestTorchLlmArgs:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model_dir="/path/to/model",
-            eagle3_one_model=False,
         )
 
         args = TorchLlmArgs(model=llama_model_path,
