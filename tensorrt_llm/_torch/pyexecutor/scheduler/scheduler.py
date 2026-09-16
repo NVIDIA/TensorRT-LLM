@@ -626,8 +626,9 @@ class MultimodalScheduler(RequestScheduler):
         """Acquire every missing item cache entry, or undo the attempt if full."""
         stable_keys = self.get_item_cache_keys(request)
         if stable_keys is None:
-            # Give items without reusable keys a temporary key so they can use
-            # the same cache path.
+            # Hashing can fail or callers can supply processed inputs without
+            # hashes. These items still need cache-backed output storage, but
+            # their request-local keys must not enable cross-request reuse.
             item_cache_keys = [
                 make_mm_encoder_transient_cache_key(request.request_id, item_idx)
                 for item_idx in range(state.num_items)

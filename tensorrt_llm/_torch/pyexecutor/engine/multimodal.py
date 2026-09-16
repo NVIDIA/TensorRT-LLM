@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """MM encoder item scheduling for decoder-family multimodal engines.
 
 The second driving surface of a multimodal LLM: the executor encodes
@@ -505,15 +508,30 @@ class MultimodalItemScheduler:
                 request_ids=requests_using_cache_keys(scheduled_cache_keys),
             )
 
+        try:
+            expected_dtype = self.model.embedding_dtype
+        except (AttributeError, NotImplementedError):
+            expected_dtype = self.model.model_config.torch_dtype
+        expected_width = self.bytes_per_embedding // expected_dtype.itemsize
+
+        # Validate the entire batch before publishing any output. Otherwise a
+        # bad later item could leave earlier items READY and later requests
+        # admitted to prefill without committed outputs.
         for output, (item_idx, cache_key, expected_rows) in zip(
             outputs, output_targets, strict=True
         ):
-            if output.shape[0] != expected_rows:
+            if (
+                not isinstance(output, torch.Tensor)
+                or output.shape != (expected_rows, expected_width)
+                or output.dtype != expected_dtype
+            ):
                 raise MultimodalEncoderRequestError(
-                    f"MM item {item_idx} produced {output.shape[0]} embeddings; "
-                    f"expected {expected_rows}",
+                    f"MM item {item_idx} must produce a {expected_dtype} tensor "
+                    f"with shape ({expected_rows}, {expected_width})",
                     request_ids=requests_using_cache_keys({cache_key}),
                 )
+
+        for output, (_, cache_key, _) in zip(outputs, output_targets, strict=True):
             encoder_cache.commit(cache_key, output)
             for live_request in requests:
                 live_state = live_request.py_mm_encoder_state
