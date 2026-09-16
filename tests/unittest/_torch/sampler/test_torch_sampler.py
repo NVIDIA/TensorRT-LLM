@@ -928,7 +928,6 @@ class TestFinishReasons:
     END_ID = FinishReason.END_ID
     LENGTH = FinishReason.LENGTH
 
-    @pytest.mark.cpu_only
     @pytest.mark.parametrize("new_token", [5, 7, 9, 11])
     def test_single_step_greedy_checks_all_stop_tokens(self, new_token):
         sampler = object.__new__(TorchSampler)
