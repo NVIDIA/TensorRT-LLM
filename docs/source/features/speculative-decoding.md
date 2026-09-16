@@ -121,6 +121,18 @@ llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 
 MTP can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
+#### Draft-only top-k/top-p bypass
+
+Set `draft_skip_top_k_top_p=True` to sample stochastic drafts using the request temperature without top-k/top-p filtering. Target sampling and greedy behavior remain unchanged. Rejection sampling is optional.
+
+```python
+speculative_config = MTPDecodingConfig(max_draft_len=3, draft_skip_top_k_top_p=True)
+```
+
+Default: `False`; restart to change. Implemented for PyTorch linear MTP, including vanilla/multi-layer MTP. Dynamic trees and AutoDeploy use different sampling paths and are unsupported. Existing rejection-sampling restrictions still apply, including its incompatibility with SA. The target top-k used by relaxed acceptance is unchanged.
+
+For vanilla MTP with ADP + LM-head TP, enabling either this flag or rejection sampling uses local full-vocabulary draft logits for both greedy and stochastic batches. This also corrects the rejection-sampling layout when this flag is `False`.
+
 ### PARD
 
 PARD (PARallel Draft) is a target-independent speculative decoding method that predicts all draft tokens in a single forward pass using mask tokens. Unlike MTP or EAGLE 3 which generate drafts one token at a time, PARD produces K draft tokens in parallel.

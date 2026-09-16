@@ -339,6 +339,10 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False,
                       max_seq_len=262144,
                       num_seq_slots=None):
+    if getattr(spec_config, "draft_skip_top_k_top_p", False):
+        # Check again after checkpoint-dependent MTP mode resolution, before
+        # allocating metadata or capturing an unsupported sampling path.
+        spec_config.validate_draft_skip_top_k_top_p()
     metadata = _build_spec_metadata(spec_config,
                                     model_config,
                                     max_num_requests,
@@ -390,6 +394,7 @@ def _build_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
             advanced_sampling_mode=spec_config.advanced_sampling_mode,
+            draft_skip_top_k_top_p=spec_config.draft_skip_top_k_top_p,
             vocab_size=vocab_size,
             num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
@@ -405,6 +410,7 @@ def _build_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
             use_rejection_sampling=use_rejection_sampling,
+            draft_skip_top_k_top_p=spec_config.draft_skip_top_k_top_p,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
@@ -868,6 +874,10 @@ def update_spec_config_from_model_config(spec_config,
 
     if not spec_config.use_dynamic_tree:
         spec_config.max_total_draft_tokens = spec_config.max_draft_len
+
+    if spec_config.draft_skip_top_k_top_p:
+        # Revalidate the effective mode before resource setup.
+        spec_config.validate_draft_skip_top_k_top_p()
 
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:

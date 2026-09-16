@@ -837,18 +837,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # weight) is only usable when the consumer is an argmax: the
                 # distributed greedy sampler recovers the global argmax from
                 # vocab-shard maxima without materializing full distributions.
-                # Advanced (rejection) sampling needs each request's full-vocab
+                # Advanced draft sampling needs each request's full-vocab
                 # distribution, so a batch headed for the advanced path
                 # bypasses LM-head-TP and computes full-vocab logits locally --
                 # under ADP the lm_head weight is replicated (the sliced-shard
                 # trick is a runtime optimization), exactly like the target
-                # head. With rejection off, non-greedy batches keep the
-                # LM-head-TP argmax path unconditionally, where the per-rank
-                # greedy flag never enters control flow. This branch is safe
-                # to take group-uniformly because is_all_greedy_sample is
-                # group-synchronized whenever rejection+ADP+LM-head-TP are
-                # combined -- see SpecMetadata.group_all_greedy_sample (anchor
-                # for the group-sync semantics).
+                # head. Non-greedy batches use this path with rejection sampling
+                # or an explicit temperature-only draft proposal override.
+                # This branch is group-uniform because is_all_greedy_sample is
+                # group-synchronized whenever either option is enabled with
+                # ADP+LM-head-TP -- see SpecMetadata.group_all_greedy_sample
+                # (anchor for the group-sync semantics).
                 advanced_draft_sampling = (
                     spec_metadata.wants_advanced_draft_sampling)
                 # enable_lm_head_tp_in_adp implies enable_attention_dp
