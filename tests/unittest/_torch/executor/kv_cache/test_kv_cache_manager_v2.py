@@ -158,6 +158,7 @@ def _make_cache_config_for_test(
     cache_manager.enable_joint_kv_cache_reuse = False
     cache_manager.reuse_match_backoff = 0
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
+    cache_manager._get_max_tokens_from_quota = lambda _: max_seq_len
     # Mirrors __init__: without helix the ledger block equals the physical
     # page (the helper re-enacts construction for partial instances).
     cache_manager._ledger_tokens_per_block = 128
@@ -833,7 +834,7 @@ def test_default_uses_allocator_fallback() -> None:
 @pytest.mark.parametrize(
     "kv_cache_type,attention_windows,generation_capacity",
     [
-        (CacheType.SELF, [None, None], 3),
+        (CacheType.SELF, [None, None], 1024),
         (CacheType.SELF, [None, 256], 1024),
         (CacheType.CROSS, [None, None], 1024),
         (CacheType.SELFKONLY, [None, None], 1024),
@@ -861,10 +862,9 @@ def test_avg_seq_len_builds_warmup_constraints(
         BatchDesc(
             [
                 KVCacheDesc(capacity=generation_capacity, history_length=generation_capacity - 1),
-                KVCacheDesc(capacity=3, history_length=0),
-                KVCacheDesc(capacity=3, history_length=0),
             ]
         ),
+        BatchDesc([KVCacheDesc(capacity=3, history_length=0)] * 3),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
     ]
 
@@ -887,11 +887,23 @@ def _budget_warmup_guard_page(request: pytest.FixtureRequest, monkeypatch):
     return request.param
 
 
+@pytest.fixture(params=[False, True], ids=["final", "estimation"])
+def _budget_warmup_phase(request: pytest.FixtureRequest):
+    return request.param
+
+
+@pytest.fixture(params=[None, [256, 256], [256, 131072]], ids=["full", "swa", "mixed"])
+def _budget_warmup_windows(request: pytest.FixtureRequest):
+    return request.param
+
+
 @pytest.fixture(params=["bytes", "tokens"])
-def _budget_limited_full_attention_manager(
+def _budget_limited_attention_manager(
     request: pytest.FixtureRequest,
     _budget_warmup_spec_config,
     _budget_warmup_guard_page,
+    _budget_warmup_phase,
+    _budget_warmup_windows,
 ):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -902,6 +914,7 @@ def _budget_limited_full_attention_manager(
         enable_block_reuse=False,
         host_cache_size=0,
         avg_seq_len=32768,
+        max_attention_window=_budget_warmup_windows,
         **budget,
     )
     manager = KVCacheManagerV2(
@@ -917,6 +930,7 @@ def _budget_limited_full_attention_manager(
         mapping=Mapping(),
         dtype=DataType.HALF,
         spec_config=_budget_warmup_spec_config,
+        is_estimating_kv_cache=_budget_warmup_phase,
     )
     try:
         assert len(manager.kv_cache_map) == int(_budget_warmup_guard_page)
@@ -925,16 +939,18 @@ def _budget_limited_full_attention_manager(
         manager.shutdown()
 
 
-def test_full_attention_warmup_respects_allocated_budget(
-    _budget_limited_full_attention_manager: KVCacheManagerV2,
+def test_attention_warmup_respects_allocated_budget(
+    _budget_limited_attention_manager: KVCacheManagerV2,
 ) -> None:
-    manager = _budget_limited_full_attention_manager
+    manager = _budget_limited_attention_manager
     requested_quota = manager.kv_cache_manager_py_config.cache_tiers[0].quota
     allocated_bytes = manager.impl.get_quota(kv_cache_v2_module.GPU_LEVEL)
     # These small quotas round up to a 2 MiB GPU allocation grain. The model's
     # full context requires at least 256 MiB, far beyond either configured budget.
     assert 0 < allocated_bytes <= requested_quota + (2 << 20)
-    assert manager.max_num_tokens < manager.max_seq_len < 131072
+    assert manager.max_num_tokens < manager.max_seq_len <= 131072
+    if any(window is None for window in manager.max_attention_window_vec):
+        assert manager.max_seq_len < 131072
 
     requests = manager.add_dummy_requests(
         [0], token_nums=[manager.max_num_tokens // 2], is_gen=False
@@ -951,11 +967,11 @@ def test_full_attention_warmup_respects_allocated_budget(
             manager.free_resources(request)
 
 
-def test_full_attention_budget_supports_cuda_graph_warmup(
-    _budget_limited_full_attention_manager: KVCacheManagerV2,
+def test_attention_budget_supports_cuda_graph_warmup(
+    _budget_limited_attention_manager: KVCacheManagerV2,
     _budget_warmup_spec_config,
 ) -> None:
-    manager = _budget_limited_full_attention_manager
+    manager = _budget_limited_attention_manager
     # Exercise the real graph request builder: it allocates the short requests,
     # queries the remaining capacity, then grows the longest generation request.
     engine = SimpleNamespace()
@@ -1246,7 +1262,7 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     )
 
     assert config.typical_step == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
-    assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
+    assert config.constraints[2] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
 
 
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
