@@ -138,7 +138,7 @@ test('closed, draft, unlabelled, and release PRs are not reviewed', async () => 
     {base: {ref: 'release/1.0'}}]) {
     const h = harness(overrides);
     await h.run();
-    await h.run('workflow_dispatch', '12');
+    await assert.rejects(h.run('workflow_dispatch', '12'), /retry not posted/);
     assert.equal(h.posted.length, 0);
     assert.ok(!h.calls.some(c => c[0] === 'get-ref'));
   }
@@ -151,6 +151,12 @@ test('invalid dispatch inputs and unsupported events cannot post comments', asyn
     assert.equal(h.posted.length, 0);
   }
   await assert.rejects(harness().run('issue_comment'), /Unsupported event/);
+});
+
+test('a nonexistent manual retry fails even if another PR received a request', async () => {
+  const h = harness();
+  await assert.rejects(h.run('workflow_dispatch', '99'), /PR #99: retry not posted/);
+  assert.deepEqual(h.posted.map(c => c.issue_number), [12]);
 });
 
 test('a coalesced event sweeps all opted-in PRs; manual retry is limited to its PR', async () => {
