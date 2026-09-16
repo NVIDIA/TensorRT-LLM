@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import sys
@@ -1043,6 +1057,11 @@ class TestClaudeBackendCreateClient:
             backend=ClaudeCodeBackend(reasoning_effort="medium"),
         )
         assert options.effort == "medium"
+
+    async def test_create_client_uses_resolved_claude_cli(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/usr/bin/claude")
+        options = await self._capture_options(monkeypatch)
+        assert options.cli_path == "/usr/bin/claude"
 
     async def test_create_client_denies_disabled_skills(self, monkeypatch):
         options = await self._capture_options(
@@ -2182,6 +2201,10 @@ class TestClaudeBackendVersion:
 
         monkeypatch.setattr(cc_mod.subprocess, "run", fake_run)
         assert cc_mod._claude_cli_version() == "2.1.123"
+
+    def test_find_cli_prefers_system_install(self, monkeypatch):
+        monkeypatch.setattr(cc_mod.shutil, "which", lambda name: "/usr/bin/claude")
+        assert cc_mod._find_claude_cli() == "/usr/bin/claude"
 
     def test_cli_version_returns_empty_on_failure(self, monkeypatch):
         monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/bin/claude")

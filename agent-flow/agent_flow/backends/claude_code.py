@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import shutil
@@ -373,14 +387,16 @@ def _claude_sdk_version() -> str:
 def _find_claude_cli() -> str | None:
     """Locate the ``claude`` CLI binary the SDK would actually launch.
 
-    Mirrors the SDK's lookup order — bundled binary first, then ``PATH``.
-    Returns ``None`` when nothing is found so the caller can simply omit
-    the CLI version from the rendered string.
+    Prefer the independently updated CLI on ``PATH``. New models can require
+    a newer Claude Code release than the SDK currently bundles. Fall back to
+    the bundled binary so installations without a system CLI keep working.
     """
+    if system_cli := shutil.which("claude"):
+        return system_cli
     bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
     if bundled.is_file():
         return str(bundled)
-    return shutil.which("claude")
+    return None
 
 
 def _claude_cli_version() -> str:
@@ -515,6 +531,7 @@ class ClaudeCodeBackend(Backend):
             mcp_servers=mcp_servers,
             model=model,
             effort=self._reasoning_effort,
+            cli_path=_find_claude_cli(),
             cwd=cwd or Path.cwd(),
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
