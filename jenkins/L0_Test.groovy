@@ -2477,7 +2477,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     tail -f ${slurmJobLogPath} &
                     tailPid=\$!
 
-                    noLogTimeoutSecs=10800
+                    noLogTimeoutSecs=7200
                     lastLogSize=-1
                     lastLogChangeEpoch=\$(date +%s)
 
