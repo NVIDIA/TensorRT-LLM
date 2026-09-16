@@ -665,11 +665,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         }
     }
 
-    def wheelDockerImage = env.wheelDockerImagePy310
-    if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
-        wheelDockerImage = env.dockerImage
-    }
-
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     buildConfigs = [
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
