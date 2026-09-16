@@ -110,7 +110,7 @@ class EagerWorkspaceReclaimer:
                     # resize_(smaller) retains storage. Release first, then
                     # allocate; pure scratch has no payload to preserve.
                     metadata.workspace = None
-                    metadata.workspace = torch.empty(target, dtype=torch.uint8, device=device)
+                    metadata.workspace = torch.empty(target, dtype=torch.int8, device=device)
                     logger.debug(
                         f"Shrank eager attention workspace from {capacity} to {target} bytes"
                     )

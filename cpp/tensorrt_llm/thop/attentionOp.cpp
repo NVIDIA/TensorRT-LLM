@@ -1467,7 +1467,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             if (capacity < static_cast<size_t>(workspace_size))
             {
                 TLLM_LOG_WARNING(
-                    "Attention workspace size is not enough, increase the size from %ld bytes to %ld bytes", capacity,
+                    "Attention workspace size is not enough, increase the size from %zu bytes to %ld bytes", capacity,
                     workspace_size);
             }
             workspace_.value().resize_({workspace_size});

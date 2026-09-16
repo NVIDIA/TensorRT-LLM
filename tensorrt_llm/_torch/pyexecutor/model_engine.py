@@ -1555,7 +1555,7 @@ class PyTorchModelEngine(ModelEngine):
                 or self.sparse_attention_config is not None
                 or self._torch_compile_backend is not None
                 or self.breakable_cuda_graph_runner is not None):
-            logger.warning(
+            logger.info(
                 "Eager workspace reclamation is disabled for speculative, "
                 "CP, encoder-decoder, sparse, compiled, or breakable-graph models"
             )
@@ -1564,7 +1564,7 @@ class PyTorchModelEngine(ModelEngine):
                 or not metadata.workspace_reclaimable
                 or metadata.workspace is None
                 or metadata.workspace.untyped_storage().nbytes() == 0):
-            logger.warning(
+            logger.info(
                 "Eager workspace reclamation requires warmup of pure fallback scratch"
             )
             return

@@ -66,7 +66,7 @@ class TestWorkspaceShrinkPolicy(unittest.TestCase):
 class TestEagerWorkspaceReclaimer(unittest.TestCase):
     def setUp(self) -> None:
         # Test ownership with real CPU storage and mocked CUDA interfaces.
-        self.metadata = _ScratchMetadata(torch.empty(4096, dtype=torch.uint8))
+        self.metadata = _ScratchMetadata(torch.empty(4096, dtype=torch.int8))
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(patch("torch.cuda.is_current_stream_capturing", return_value=False))
@@ -105,6 +105,7 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
                 self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 16384)
             self.assertEqual(self.reclaimer.policy.remaining, remaining)
         self.assertIsNone(previous())
+        self.assertEqual(self.metadata.workspace.dtype, torch.int8)
         self.assertEqual(self.metadata.workspace.untyped_storage().nbytes(), 8192)
         for _ in range(3):
             self.report_forward(2048)
@@ -130,7 +131,7 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
         self.metadata.workspace.resize_(16384)
         self.report_forward(4096)
         self.metadata.is_cuda_graph = True
-        self.metadata.cuda_graph_workspace = torch.empty(4096, dtype=torch.uint8)
+        self.metadata.cuda_graph_workspace = torch.empty(4096, dtype=torch.int8)
         graph_tensor = self.metadata.cuda_graph_workspace
         with self.reclaimer.forward(self.metadata):
             self.assertEqual(self.metadata.workspace.numel(), 4096)
@@ -175,7 +176,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.breakable_cuda_graph_runner = None
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
-        self.metadata.workspace = torch.empty(4096, dtype=torch.uint8)
+        self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
         self.engine.attn_metadata = self.metadata
         self.engine.model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
@@ -241,7 +242,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.metadata.workspace_reclaimable = True
-        self.metadata.workspace = torch.empty(0, dtype=torch.uint8)
+        self.metadata.workspace = torch.empty(0, dtype=torch.int8)
         self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
 
