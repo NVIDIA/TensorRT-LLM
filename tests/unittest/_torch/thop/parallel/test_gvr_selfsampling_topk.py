@@ -1910,6 +1910,126 @@ def test_selfsampling_varlen_split_periodic_rows(rows, k, period):
     _check_varlen_against_reference(lg, out, ref, "periodic")
 
 
+_SPLIT_MISS_GCAP = 32768  # gvr_main per-row slab capacity (C.GCAP)
+
+
+def _split_sample_positions(rt):
+    """First float index of every sample cluster of the SPLIT main's self-sample."""
+    SMP, SS2 = int(rt["SMP"]), int(rt["SS2"])
+    t = torch.arange(SMP, dtype=torch.int64)
+    h = (t * 2654435761) % (1 << 32)
+    off = (((h >> 20) & 0xFFF) * SS2) >> 12
+    return 8 * (t * SS2 + off)
+
+
+def _split_sample_line(row, n, rt):
+    """CPU mirror of the SPLIT main's one-shot line: the self-sample (cluster t
+    of SMP covers float indices 8*(t*SS2 + off_t) .. +7, off_t =
+    (((t*2654435761 mod 2^32) >> 20 & 0xFFF) * SS2) >> 12), a 256-bin linear
+    histogram over [min, max] and the descending scan_cross0 walk for TGT and
+    2*TGT.  Returns (T, count(row >= T), T_floor) with T_floor = None when the
+    rank-2*TGT floor is unavailable or not below T.  SMP/SS2/TGT are taken
+    from the host mirror (route()["rt"]); the in-kernel derivation may drift
+    by +-1 in rare rounding cases -- if the kernel's sample positions change,
+    update this mirror together with the miss tests below."""
+    TGT = int(rt["TGT"])
+    pos = _split_sample_positions(rt)[:, None] + torch.arange(8, dtype=torch.int64)[None, :]
+    samp = row[pos.reshape(-1)].float()
+    smin, smax = samp.min(), samp.max()
+    assert smax > smin
+    w = ((smax - smin) * torch.tensor(1.0 / 256.0)).float()
+    bq = ((samp - smin) * (1.0 / w)).trunc().long().clamp(0, 255)
+    hist = torch.bincount(bq, minlength=256)
+    tot = int(hist.sum())
+
+    def cross(target):
+        after = 0
+        for gb in range(255, -1, -1):
+            cq = int(hist[gb])
+            if after < target and (after + cq >= target or gb == 0):
+                return gb
+            after += cq
+        return 0
+
+    assert tot >= TGT
+    T = float(smin + cross(TGT) * w)
+    t_floor = None
+    if tot >= 2 * TGT:
+        t3 = float(smin + cross(2 * TGT) * w)
+        if t3 < T:
+            t_floor = t3
+    return T, int((row[:n].float() >= T).sum()), t_floor
+
+
+def _split_miss_plan(rows, k):
+    cr, msl_c = 4, 262144
+    plan = ss_host.route(rows, msl_c, msl_c, k)
+    assert plan["kernel"] == "main" and plan["rt"]["R"] > 1, plan
+    return cr, msl_c, plan["rt"]
+
+
+def _split_miss_run(lg, k, cr, msl_c):
+    kv = torch.full((lg.shape[0],), msl_c * cr, dtype=torch.int32, device=_DEV)
+    ref = _reference_varlen_indices(lg, kv, 1, cr, k)
+    out = torch.full((lg.shape[0], k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    _check_varlen_against_reference(lg, out, ref, "split-miss")
+
+
+@pytest.mark.parametrize("rows,k", [(1, 512), (1, 1024), (4, 512), (4, 1024)])
+def test_selfsampling_split_line_miss_over(rows, k):
+    """Forced SPLIT line miss, OVER case (count(>= T) > slab capacity): a dense
+    uniform [0, 1) bulk plus a few +100 outliers planted at sampled positions
+    make the 256-bin sample histogram so coarse that the one-shot line lands
+    inside the bulk.  The alive CTA must stay tie-aware exact (R = 64 / 37)."""
+    cr, msl_c, rt = _split_miss_plan(rows, k)
+    torch.manual_seed(1000 + rows * 7 + k)
+    lg = torch.rand(rows, msl_c, dtype=torch.float32, device=_DEV)
+    base = _split_sample_positions(rt)
+    for r in range(rows):
+        for t in range(1, 11):
+            lg[r, int(base[t * 13])] = 100.0
+    for r in range(rows):
+        T, cnt, _ = _split_sample_line(lg[r].cpu(), msl_c, rt)
+        assert T < 1.0 and cnt > _SPLIT_MISS_GCAP, (r, T, cnt)
+    _split_miss_run(lg, k, cr, msl_c)
+
+
+@pytest.mark.parametrize(
+    "rows,k,clusters",
+    [(1, 512, 2), (1, 1024, 2), (4, 512, 2), (4, 1024, 2), (1, 512, 30), (4, 1024, 30)],
+)
+def test_selfsampling_split_line_miss_under(rows, k, clusters):
+    """Forced SPLIT line miss, UNDER case (count(>= T) < k): `clusters` whole
+    sample clusters (8 positions each) are set to 50.0 on a randn row, so the
+    sample's TGT-th value is 50 while only 8*clusters < k row values are.
+    clusters=2 (16 >= TGT = 15) leaves 14 of the 30 ranks of the sample's
+    rank-2*TGT floor in the randn bulk (floor ~ 14/(8*SMP) of the row >= k:
+    the cheap re-stage path); clusters=30 pushes the floor to 50 as well
+    (floor unusable -> whole-row narrowing fallback).  Both must
+    be tie-aware exact.  The planted positions mirror the kernel's sampler
+    (see _split_sample_line); update them if the sampling scheme changes."""
+    cr, msl_c, rt = _split_miss_plan(rows, k)
+    torch.manual_seed(2000 + rows * 7 + k + clusters)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    base = _split_sample_positions(rt)
+    assert 8 * clusters >= int(rt["TGT"]) and 8 * clusters < k
+    step = max(len(base) // clusters, 1)
+    for r in range(rows):
+        for c in range(clusters):
+            p = int(base[c * step])
+            lg[r, p : p + 8] = 50.0
+    for r in range(rows):
+        T, cnt, t_floor = _split_sample_line(lg[r].cpu(), msl_c, rt)
+        assert 40.0 < T <= 50.0 and cnt < k, (r, T, cnt)
+        if clusters == 2:
+            assert t_floor is not None and int((lg[r] >= t_floor).sum()) >= k, (r, t_floor)
+        else:
+            assert t_floor is None
+    _split_miss_run(lg, k, cr, msl_c)
+
+
 def test_selfsampling_block_skip_beyond_table_runs_dense():
     """Rows longer than the skip table (262144 compressed positions) fall back
     to the dense scan inside the kernel and stay exact."""
