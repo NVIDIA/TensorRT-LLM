@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import IndexMapper
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
@@ -1134,12 +1135,13 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
 def test_generation_allocation_reserves_dynamic_width() -> None:
     request = SimpleNamespace(
         py_request_id=80,
+        py_beam_width=1,
         py_num_accepted_draft_tokens=2,
         py_rewind_len=2,
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         max_beam_num_tokens=103,
     )
-    kv_cache = Mock(is_active=True, capacity=100)
+    kv_cache = Mock(is_active=True, capacity=100, beam_width=1)
 
     def resize(capacity, history_length=None):
         if capacity is not None:
@@ -1148,6 +1150,8 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
 
     kv_cache.resize.side_effect = resize
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
+    manager.max_beam_width = 1
     manager.is_draft = True
     manager._has_cp_helix = False
     manager.kv_cache_map = {request.py_request_id: kv_cache}
@@ -1242,8 +1246,10 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     request.context_chunk_size = 128
     request.move_to_next_context_chunk()
 
-    kv_cache = Mock(num_committed_tokens=64, is_active=True, capacity=192)
+    kv_cache = Mock(num_committed_tokens=64, is_active=True, capacity=192, beam_width=1)
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
+    manager.max_beam_width = 1
     manager.is_draft = True
     manager.enable_block_reuse = True
     manager.enable_joint_kv_cache_reuse = True

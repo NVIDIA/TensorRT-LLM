@@ -1835,7 +1835,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tokens_per_block", &kv::KvCache::tokensPerBlock)
         .def_prop_rw(
             "beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); },
-            [](kv::KvCache& self, int beamWidth) { self.setBeamWidth(kv::BeamIndex{beamWidth}); })
+            [](kv::KvCache& self, int beamWidth)
+            {
+                nb::gil_scoped_release release;
+                self.setBeamWidth(kv::BeamIndex{beamWidth});
+            })
         .def_prop_rw(
             "cuda_stream",
             [](kv::KvCache const& self) -> intptr_t { return reinterpret_cast<intptr_t>(self.cudaStream()); },
